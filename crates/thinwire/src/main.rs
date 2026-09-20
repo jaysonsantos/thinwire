@@ -11,6 +11,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 720.0])
             .with_title("thinwire"),
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 

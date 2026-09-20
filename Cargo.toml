@@ -18,8 +18,19 @@ dbg_macro = "deny"
 todo = "deny"
 
 [workspace.dependencies]
-eframe = { version = "0.36", default-features = true }
+# Glow only (council GUI A). Do not enable wgpu or wgpu_no_default_features.
+# Cargo rejects `winit/default` on a consumer of eframe; thinwire depends on
+# `winit` with default features so unification matches eframe's default set.
+eframe = { version = "0.36", default-features = false, features = [
+  "accesskit",
+  "default_fonts",
+  "glow",
+  "links",
+  "wayland",
+  "x11",
+] }
 egui = "0.36"
+winit = "0.30"
 thinwire-protocol = { path = "crates/thinwire-protocol" }
 tokio = { version = "1", features = [
   "rt-multi-thread",
