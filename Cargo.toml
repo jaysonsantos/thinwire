@@ -21,6 +21,11 @@ todo = "deny"
 eframe = { version = "0.31", default-features = true }
 egui = "0.31"
 thinwire-protocol = { path = "crates/thinwire-protocol" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

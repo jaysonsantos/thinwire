@@ -180,15 +180,14 @@ impl Snapshot {
 
     pub(crate) fn set_filter(&mut self, filter: InboxFilter) {
         self.filter = filter;
-        if !filter.matches(self.selected_protocol) {
-            if let Some(first) = self
+        if !filter.matches(self.selected_protocol)
+            && let Some(first) = self
                 .accounts
                 .iter()
                 .find(|row| filter.matches(row.caps.id))
                 .map(|row| row.caps.id)
-            {
-                self.select_protocol(first);
-            }
+        {
+            self.select_protocol(first);
         }
     }
 

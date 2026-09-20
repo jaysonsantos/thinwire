@@ -1,8 +1,5 @@
 [default]
-extend-ignore-re = [
-  "api_id",
-  "api_hash",
-]
+extend-ignore-re = ["api_id", "api_hash"]
 
 [default.extend-words]
 tdlib = "tdlib"

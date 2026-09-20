@@ -22,9 +22,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Refuse a run outside the default branch
         if: github.ref_name != github.event.repository.default_branch
@@ -32,7 +33,7 @@ jobs:
           echo "A release runs on the default branch only." >&2
           exit 1
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
 
       - name: Make the release commit and the tag
         env:
