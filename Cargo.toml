@@ -18,8 +18,8 @@ dbg_macro = "deny"
 todo = "deny"
 
 [workspace.dependencies]
-eframe = { version = "0.31", default-features = true }
-egui = "0.31"
+eframe = { version = "0.36", default-features = true }
+egui = "0.36"
 thinwire-protocol = { path = "crates/thinwire-protocol" }
 tokio = { version = "1", features = [
   "rt-multi-thread",
