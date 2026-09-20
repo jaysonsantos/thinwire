@@ -2,7 +2,7 @@
 
 ## Product lock (S2)
 
-- v1 protocols: Telegram, WhatsApp (experimental), Discord (bot/OAuth only), Slack
+- v1 protocols: Telegram, WhatsApp (experimental), Discord (bot/OAuth inbox only), Slack OAuth
 - Signal is out of v1 — do not link AGPL libsignal / Presage into the MIT binary
 - README must keep the three risk bullets
 - Never claim WhatsApp or Discord personal clients are “reliable”
@@ -14,7 +14,7 @@
 - Rust 2024 workspace, egui/eframe, tokio for async adapters
 - Telegram: TDLib / tdlib-rs preferred
 - WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk
-- Discord: bot/OAuth only — no self-bots / personal DMs
+- Discord: bot/OAuth inbox only — no self-bots / personal DMs
 - Slack: official OAuth only
 - Signal: out of v1 (S2); no libsignal / Presage
 

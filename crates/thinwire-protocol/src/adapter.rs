@@ -45,7 +45,7 @@ pub enum SupportClass {
     Supported,
     /// Unofficial or unsupported; ToS or breakage risk.
     Experimental,
-    /// Official bot/OAuth only; no user self-bots.
+    /// Official bot/OAuth inbox only; no user self-bots.
     Constrained,
 }
 

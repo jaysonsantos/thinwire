@@ -8,7 +8,7 @@ The UI thread must never block; protocol I/O runs async off the main thread.
 
 Inbox shell (account switcher + conversations on the left, thread in the center) with protocol adapters behind a tokio channel. The UI only polls events; workers must not call egui APIs.
 
-v1 protocols are Telegram, WhatsApp, Discord (bot/OAuth), and Slack. Signal is out of v1; this MIT binary does not link libsignal or Presage.
+v1 protocols are Telegram, WhatsApp (experimental), Discord (bot/OAuth inbox only), and Slack OAuth. Signal is out of v1; this MIT binary does not link libsignal or Presage.
 
 First-run offers Telegram (TDLib) and Slack (workspace OAuth). WhatsApp and Discord sit behind an experimental gate that shows the Critic risk notice before any QR or token step. Discord user-account / self-bot fields do not exist. Default builds stay compile-safe stubs (`--features telegram-tdlib` compiles the TDLib hook, still without login or secrets).
 
@@ -19,13 +19,13 @@ First-run offers Telegram (TDLib) and Slack (workspace OAuth). WhatsApp and Disc
 | Telegram | Official TDLib via Rust bindings (`tdlib-rs` planned) | Supported goal |
 | Slack | Official Slack OAuth / API (workspace app) | Supported goal |
 | WhatsApp | Unofficial Web / linked-device style (ZapFast / whatsapp-rust inspired) | **Experimental** |
-| Discord | Bot/OAuth only — no Discord user self-bots | Constrained / experimental |
+| Discord | Bot/OAuth inbox only — no Discord user self-bots / personal DMs | Constrained / experimental |
 
 ## Risk notice (required)
 
 1. WhatsApp (unofficial Web/linked-device) and Discord (user-account / self-bot) can get the user’s personal account banned or terminated. License-clean crates do not grant Meta or Discord permission.
-2. Do not call WhatsApp or Discord “reliable.” Unofficial WhatsApp clients and Discord user-account / self-bot paths can break or violate ToS. Signal is out of v1; this MIT binary does not link libsignal or Presage.
-3. “Fast and reliable” applies only to Telegram via official TDLib and Slack via official OAuth (workspace app, not a personal desktop clone). WhatsApp is experimental and Discord is bot/OAuth only. The app must not market them as production messaging.
+2. Do not call WhatsApp or Discord “reliable.” Unofficial WhatsApp clients and Discord user-account / self-bot paths can break or violate ToS.
+3. “Fast and reliable” applies only to Telegram via official TDLib and Slack via official OAuth (workspace app, not a personal desktop clone). WhatsApp is experimental and Discord is bot/OAuth inbox only. The app must not market them as production messaging.
 
 ## License
 

@@ -6,10 +6,10 @@ use super::ProtocolId;
 pub const CRITIC_BULLET_1: &str = "WhatsApp (unofficial Web/linked-device) and Discord (user-account / self-bot) can get the user’s personal account banned or terminated. License-clean crates do not grant Meta or Discord permission.";
 
 /// Critic bullet 2. Do not soften.
-pub const CRITIC_BULLET_2: &str = "Do not call WhatsApp or Discord “reliable.” Unofficial WhatsApp clients and Discord user-account / self-bot paths can break or violate ToS. Signal is out of v1; this MIT binary does not link libsignal or Presage.";
+pub const CRITIC_BULLET_2: &str = "Do not call WhatsApp or Discord “reliable.” Unofficial WhatsApp clients and Discord user-account / self-bot paths can break or violate ToS.";
 
 /// Critic bullet 3. Do not soften.
-pub const CRITIC_BULLET_3: &str = "“Fast and reliable” applies only to Telegram via official TDLib and Slack via official OAuth (workspace app, not a personal desktop clone). WhatsApp is experimental and Discord is bot/OAuth only. The app must not market them as production messaging.";
+pub const CRITIC_BULLET_3: &str = "“Fast and reliable” applies only to Telegram via official TDLib and Slack via official OAuth (workspace app, not a personal desktop clone). WhatsApp is experimental and Discord is bot/OAuth inbox only. The app must not market them as production messaging.";
 
 /// All three Critic bullets, in order.
 pub const CRITIC_RISK_BULLETS: [&str; 3] = [CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3];
@@ -63,6 +63,39 @@ mod tests {
             readme.contains("Signal is out of v1"),
             "README must state that Signal is out of v1"
         );
+        assert!(
+            readme.contains("bot/OAuth inbox only"),
+            "README must describe Discord v1 as bot/OAuth inbox only"
+        );
+    }
+
+    #[test]
+    fn docs_purge_five_protocol_language() {
+        let docs = [
+            include_str!("../../../README.md"),
+            include_str!("../../../AGENTS.md"),
+            include_str!("../../../decisions/0001-option-b-multi-protocol.md"),
+            include_str!("../../../decisions/0004-signal-out-of-v1.md"),
+        ];
+        for doc in docs {
+            let lower = doc.to_ascii_lowercase();
+            assert!(
+                !lower.contains("all-five"),
+                "docs must not use all-five filename or phrasing"
+            );
+            assert!(
+                !has_word(&lower, "five"),
+                "docs must not use five-protocol language"
+            );
+        }
+        let adr4 = include_str!("../../../decisions/0004-signal-out-of-v1.md");
+        assert!(adr4.contains("0001-option-b-multi-protocol.md"));
+        assert!(!adr4.contains("0001-option-b-all-five-protocols.md"));
+    }
+
+    fn has_word(hay: &str, word: &str) -> bool {
+        hay.split(|ch: char| !ch.is_ascii_alphabetic())
+            .any(|token| token == word)
     }
 
     #[test]
@@ -81,13 +114,15 @@ mod tests {
             critic_bullets_for(ProtocolId::Discord),
             CRITIC_RISK_BULLETS.as_slice()
         );
-        assert!(
-            !CRITIC_BULLET_2.contains("shipped") && CRITIC_BULLET_2.contains("Signal is out of v1"),
-            "bullet 2 must not describe Signal as a shipped v1 module"
-        );
-        assert!(
-            !CRITIC_BULLET_3.contains("other three"),
-            "bullet 3 must not count Signal as a v1 experimental module"
-        );
+        for bullet in CRITIC_RISK_BULLETS {
+            assert!(
+                !bullet.contains("Signal"),
+                "shipped-risk bullets must not treat Signal as an in-app module: {bullet}"
+            );
+            assert!(
+                !bullet.contains("five"),
+                "shipped-risk bullets must not use five-protocol language: {bullet}"
+            );
+        }
     }
 }

@@ -59,7 +59,10 @@ fn choose_protocol(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         if ui.button("WhatsApp · Experimental · ban risk").clicked() {
             snapshot.choose_protocol(ProtocolId::WhatsApp);
         }
-        if ui.button("Discord · Constrained · bot/OAuth").clicked() {
+        if ui
+            .button("Discord · Constrained · bot/OAuth inbox")
+            .clicked()
+        {
             snapshot.choose_protocol(ProtocolId::Discord);
         }
     });
@@ -139,7 +142,7 @@ fn whatsapp_qr(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
 
 fn discord_choose(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     ui.label(
-        "Discord is bot/OAuth only. User login can ban an account. No user-token field exists.",
+        "Discord is bot/OAuth inbox only. User login can ban an account. No user-token field exists.",
     );
     ui.horizontal(|ui| {
         if ui.button("Bot stub").clicked() {

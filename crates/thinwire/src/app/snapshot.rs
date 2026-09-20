@@ -331,7 +331,8 @@ impl Snapshot {
             }
             ProtocolId::Discord => {
                 self.auth = AuthScreen::DiscordChoose;
-                self.status_text = "Discord bot/OAuth only. User-account login is refused.".into();
+                self.status_text =
+                    "Discord bot/OAuth inbox only. User-account login is refused.".into();
             }
             ProtocolId::Telegram | ProtocolId::Slack => {
                 return Err(self.gate_error(
@@ -405,7 +406,7 @@ impl Snapshot {
         self.pending.push(AdapterCommand::ConnectDiscord { mode });
         self.finish_stub(
             ProtocolId::Discord,
-            "Discord bot/OAuth stub noted. No user-account session.",
+            "Discord bot/OAuth inbox stub noted. No user-account session.",
         );
     }
 

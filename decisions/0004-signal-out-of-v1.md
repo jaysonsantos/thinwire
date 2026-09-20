@@ -4,24 +4,24 @@
 
 ## Context
 
-Option B ([0001](0001-option-b-all-five-protocols.md)) put Telegram, WhatsApp, Signal, Discord, and Slack in v1 with honest ToS language. A public MIT binary that talks to Signal would pull AGPL libsignal / Presage into the product.
+Option B ([0001](0001-option-b-multi-protocol.md)) chose a multi-protocol shell with honest ToS language over Telegram-only. The original option B list included Signal. A public MIT binary that talks to Signal would pull AGPL libsignal / Presage into the product.
 
 Council lock S2 (2026-09-20) takes Signal out of v1.
 
 ## Decision
 
-Signal is **out of v1**. Do not link AGPL libsignal or Presage into the MIT thinwire binary. Do not offer Signal in the shell, catalog, or experimental gate.
+Signal is **out of v1**. Do not link AGPL libsignal or Presage into the MIT thinwire binary. Do not offer Signal in the shell, catalog, or experimental gate. Critic shipped-risk bullets must not treat Signal as an in-app module.
 
 v1 protocols are only:
 
 - Telegram (TDLib / supported goal)
-- WhatsApp (experimental, unofficial linked-device)
-- Discord bot/OAuth only (not personal DMs; no self-bots)
+- WhatsApp (experimental, unofficial linked-device; ToS / ban risk stays)
+- Discord bot/OAuth inbox only (not personal DMs; no self-bots)
 - Slack OAuth
 
-README protocol table and Critic bullets stay honest: WhatsApp is experimental, Discord self-bots are refused, unofficial clients are not called “reliable.” They must not describe Signal as a shipped v1 module.
+README protocol table and Critic bullets stay honest: WhatsApp is experimental, Discord self-bots are refused, unofficial clients are not called “reliable.”
 
-This supersedes the Signal-in-v1 portion of ADR 0001. Option B otherwise stands (four remaining protocols, honest ToS language, Discord constrained).
+This supersedes the Signal-in-v1 portion of ADR 0001. Option B otherwise stands (multi-protocol shell, honest ToS language, Discord constrained).
 
 ## Consequences
 
