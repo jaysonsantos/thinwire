@@ -35,21 +35,14 @@ impl InboxFilter {
             Self::All => true,
             Self::Telegram => matches!(protocol, ProtocolId::Telegram),
             Self::Slack => matches!(protocol, ProtocolId::Slack),
-            Self::Experimental => matches!(
-                protocol,
-                ProtocolId::WhatsApp | ProtocolId::Signal | ProtocolId::Discord
-            ),
+            Self::Experimental => matches!(protocol, ProtocolId::WhatsApp | ProtocolId::Discord),
         }
     }
 
     /// Inbox filters hide supported accounts; experimental chips stay in the switcher.
     #[must_use]
     pub(crate) const fn shows_in_switcher(self, protocol: ProtocolId) -> bool {
-        self.matches(protocol)
-            || matches!(
-                protocol,
-                ProtocolId::WhatsApp | ProtocolId::Signal | ProtocolId::Discord
-            )
+        self.matches(protocol) || matches!(protocol, ProtocolId::WhatsApp | ProtocolId::Discord)
     }
 }
 
@@ -64,7 +57,6 @@ pub(crate) enum AuthScreen {
     TelegramCode,
     Telegram2fa,
     WhatsAppQr,
-    SignalLink,
     DiscordChoose,
     DiscordBot,
     DiscordOAuth,
@@ -304,10 +296,10 @@ impl Snapshot {
         match protocol {
             ProtocolId::Telegram => self.open_telegram(),
             ProtocolId::Slack => self.open_slack(),
-            ProtocolId::WhatsApp | ProtocolId::Signal | ProtocolId::Discord => {
+            ProtocolId::WhatsApp | ProtocolId::Discord => {
                 self.set_error(
                     "Experimental gate was skipped.",
-                    "WhatsApp, Signal, and Discord must show Critic risk facts first.",
+                    "WhatsApp and Discord must show Critic risk facts first.",
                     "Use Add account and accept the risk checkbox.",
                 );
             }
@@ -337,13 +329,10 @@ impl Snapshot {
                 self.status_text =
                     "WhatsApp linked-device placeholder. No QR session is live.".into();
             }
-            ProtocolId::Signal => {
-                self.auth = AuthScreen::SignalLink;
-                self.status_text = "Signal link placeholder. Breakage expected. No session.".into();
-            }
             ProtocolId::Discord => {
                 self.auth = AuthScreen::DiscordChoose;
-                self.status_text = "Discord bot/OAuth only. User-account login is refused.".into();
+                self.status_text =
+                    "Discord bot/OAuth inbox only. User-account login is refused.".into();
             }
             ProtocolId::Telegram | ProtocolId::Slack => {
                 return Err(self.gate_error(
@@ -395,13 +384,6 @@ impl Snapshot {
         );
     }
 
-    pub(crate) fn finish_signal_placeholder(&mut self) {
-        self.finish_stub(
-            ProtocolId::Signal,
-            "Signal stub noted. Unsupported third-party path; no live link.",
-        );
-    }
-
     pub(crate) fn open_discord_bot(&mut self) {
         self.auth = AuthScreen::DiscordBot;
         self.status_text = "Discord bot stub. No token is stored or requested.".into();
@@ -424,7 +406,7 @@ impl Snapshot {
         self.pending.push(AdapterCommand::ConnectDiscord { mode });
         self.finish_stub(
             ProtocolId::Discord,
-            "Discord bot/OAuth stub noted. No user-account session.",
+            "Discord bot/OAuth inbox stub noted. No user-account session.",
         );
     }
 
@@ -614,7 +596,6 @@ mod tests {
     fn experimental_chips_stay_in_switcher_under_every_filter() {
         for filter in InboxFilter::ALL {
             assert!(filter.shows_in_switcher(ProtocolId::WhatsApp));
-            assert!(filter.shows_in_switcher(ProtocolId::Signal));
             assert!(filter.shows_in_switcher(ProtocolId::Discord));
         }
         assert!(!InboxFilter::Telegram.shows_in_switcher(ProtocolId::Slack));
@@ -622,24 +603,11 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_gate_uses_critic_bullets_one_two_and_three() {
+    fn whatsapp_gate_uses_all_three_critic_bullets() {
         let mut snapshot = Snapshot::new();
         snapshot.choose_protocol(ProtocolId::WhatsApp);
         let lines = snapshot.critic_lines();
         assert_eq!(lines, thinwire_protocol::CRITIC_RISK_BULLETS.as_slice());
-    }
-
-    #[test]
-    fn signal_gate_uses_critic_bullets_two_and_three() {
-        let mut snapshot = Snapshot::new();
-        snapshot.choose_protocol(ProtocolId::Signal);
-        assert_eq!(
-            snapshot.critic_lines(),
-            &[
-                thinwire_protocol::CRITIC_BULLET_2,
-                thinwire_protocol::CRITIC_BULLET_3
-            ]
-        );
     }
 
     #[test]

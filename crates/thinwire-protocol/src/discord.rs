@@ -9,8 +9,8 @@ use super::adapter::{
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Discord,
     support: SupportClass::Constrained,
-    short_label: "Constrained · bot/OAuth only",
-    detail: "Bot/OAuth only. No Discord user-account self-bots. User login can ban an account.",
+    short_label: "Constrained · bot/OAuth inbox only",
+    detail: "Bot/OAuth inbox only. No Discord user-account self-bots or personal DMs. User login can ban an account.",
     official_api: true,
     allows_user_account_automation: false,
 };
@@ -60,7 +60,7 @@ impl DiscordAdapter {
                 conversation_id: "discord:example-guild".into(),
                 id: "discord:example-guild:1".into(),
                 sender: "thinwire".into(),
-                body: "Discord is constrained to bot/OAuth. User-account / self-bot paths are refused.".into(),
+                body: "Discord is constrained to bot/OAuth inbox only. User-account / self-bot paths are refused.".into(),
                 outbound: false,
             },
         );
