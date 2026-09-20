@@ -1,9 +1,9 @@
 //! Test double used to prove workers push events without calling UI APIs.
 
 use super::adapter::{
-    emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
-    ChatMessage, Conversation, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    SupportClass,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
+    emit_message, emit_status,
 };
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
@@ -64,6 +64,7 @@ impl ProtocolAdapter for FakeAdapter {
                         id: "fake:chat".into(),
                         title: "Fake chat".into(),
                         preview: "Pushed from the worker.".into(),
+                        unread: 0,
                     },
                 );
                 emit_message(

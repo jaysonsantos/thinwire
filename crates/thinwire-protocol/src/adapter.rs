@@ -151,6 +151,7 @@ pub struct Conversation {
     pub id: String,
     pub title: String,
     pub preview: String,
+    pub unread: u32,
 }
 
 /// Message shown in the right pane.

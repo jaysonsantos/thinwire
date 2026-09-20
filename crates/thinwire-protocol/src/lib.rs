@@ -4,6 +4,7 @@ mod adapter;
 mod discord;
 mod fake;
 mod host;
+mod risk;
 mod signal;
 mod slack;
 mod telegram;
@@ -16,6 +17,10 @@ pub use adapter::{
 pub use discord::DiscordAdapter;
 pub use fake::FakeAdapter;
 pub use host::AdapterHost;
+pub use risk::{
+    CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3, CRITIC_RISK_BULLETS, critic_bullets_for,
+    requires_experimental_gate,
+};
 pub use signal::SignalAdapter;
 pub use slack::SlackAdapter;
 pub use telegram::TelegramAdapter;

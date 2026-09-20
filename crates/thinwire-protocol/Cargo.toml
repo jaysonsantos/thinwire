@@ -1,0 +1,22 @@
+[package]
+name = "thinwire-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Protocol adapters and capability metadata for thinwire"
+
+[features]
+default = []
+# Compile-safe hook for a later official TDLib client via `tdlib-rs`.
+# Default builds stay stubbed so CI does not need system TDLib or secrets.
+telegram-tdlib = []
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,3 +1,5 @@
+mod app;
+
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
@@ -15,6 +17,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "thinwire",
         options,
-        Box::new(|_cc| Ok(Box::new(thinwire::app::ThinwireApp::new()))),
+        Box::new(|_cc| Ok(Box::new(app::ThinwireApp::new()))),
     )
 }

@@ -6,9 +6,9 @@
 //! never commit them.
 
 use super::adapter::{
-    emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
-    ChatMessage, Conversation, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    SupportClass,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
+    emit_message, emit_status,
 };
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
@@ -55,6 +55,7 @@ impl TelegramAdapter {
                 id: "telegram:saved".into(),
                 title: "Saved Messages".into(),
                 preview: "Placeholder. TDLib is not connected.".into(),
+                unread: 1,
             },
         );
         emit_conversation(
@@ -64,6 +65,7 @@ impl TelegramAdapter {
                 id: "telegram:family".into(),
                 title: "Family".into(),
                 preview: "Official TDLib path — stub only.".into(),
+                unread: 0,
             },
         );
         emit_message(

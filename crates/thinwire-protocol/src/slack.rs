@@ -1,9 +1,9 @@
 //! Slack official OAuth / workspace-app stub. Not a personal desktop clone.
 
 use super::adapter::{
-    emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
-    ChatMessage, Conversation, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    SupportClass,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
+    emit_message, emit_status,
 };
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
@@ -39,6 +39,7 @@ impl SlackAdapter {
                 id: "slack:example-channel".into(),
                 title: "#general".into(),
                 preview: "OAuth workspace stub — not connected.".into(),
+                unread: 1,
             },
         );
         emit_message(

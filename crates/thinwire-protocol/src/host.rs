@@ -1,9 +1,9 @@
 //! Tokio host: adapters run here; the UI only polls the event channel.
 
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use super::{registry, AdapterCommand, AdapterEvent, ProtocolAdapter};
+use super::{AdapterCommand, AdapterEvent, ProtocolAdapter, registry};
 
 /// Bridge between the UI thread and protocol workers.
 pub struct AdapterHost {

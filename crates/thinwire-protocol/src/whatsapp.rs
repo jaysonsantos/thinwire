@@ -3,15 +3,15 @@
 //! Experimental. ToS / ban risk. Not a reliable personal client. No networking.
 
 use super::adapter::{
-    emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
-    ChatMessage, Conversation, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    SupportClass,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
+    emit_message, emit_status,
 };
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::WhatsApp,
     support: SupportClass::Experimental,
-    short_label: "Experimental · ToS risk",
+    short_label: "Experimental · ban risk",
     detail: "Unofficial Web / linked-device style (ZapFast / whatsapp-rust inspired). Ban risk. Not reliable.",
     official_api: false,
     allows_user_account_automation: false,
@@ -41,6 +41,7 @@ impl WhatsAppAdapter {
                 id: "whatsapp:placeholder".into(),
                 title: "Placeholder chat".into(),
                 preview: "Experimental unofficial path — not connected.".into(),
+                unread: 1,
             },
         );
         emit_message(

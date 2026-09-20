@@ -1,9 +1,9 @@
 //! Discord official bot/OAuth stub. User-account self-bots are refused.
 
 use super::adapter::{
-    emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
-    ChatMessage, Conversation, DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities,
-    ProtocolId, SupportClass,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, DiscordAuthMode,
+    EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
+    emit_message, emit_status,
 };
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
@@ -49,6 +49,7 @@ impl DiscordAdapter {
                 id: "discord:example-guild".into(),
                 title: "Example guild #general".into(),
                 preview: "Bot/OAuth stub — no user-account session.".into(),
+                unread: 1,
             },
         );
         emit_message(

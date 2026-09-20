@@ -1,13 +1,13 @@
-//! eframe application: polls adapter events and draws the three-pane shell.
+//! eframe application: polls adapter events and draws the shell.
 
+mod auth;
 mod snapshot;
 mod ui;
 
 use std::time::Duration;
 
 use eframe::egui;
-
-use crate::protocols::AdapterHost;
+use thinwire_protocol::AdapterHost;
 
 use snapshot::Snapshot;
 
@@ -35,6 +35,12 @@ impl ThinwireApp {
             self.snapshot.apply(event);
         }
     }
+
+    fn flush_commands(&mut self) {
+        for command in self.snapshot.take_commands() {
+            self.host.send(command);
+        }
+    }
 }
 
 impl Default for ThinwireApp {
@@ -47,6 +53,7 @@ impl eframe::App for ThinwireApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         ui::draw(ctx, &mut self.snapshot);
+        self.flush_commands();
         // Poll the channel while idle so worker events do not wait on input.
         ctx.request_repaint_after(Duration::from_millis(100));
     }

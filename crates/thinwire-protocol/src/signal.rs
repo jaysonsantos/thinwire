@@ -3,9 +3,9 @@
 //! Experimental. Breakage expected. Not a reliable personal client. No networking.
 
 use super::adapter::{
-    emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
-    ChatMessage, Conversation, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    SupportClass,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
+    emit_message, emit_status,
 };
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
@@ -41,6 +41,7 @@ impl SignalAdapter {
                 id: "signal:placeholder".into(),
                 title: "Placeholder chat".into(),
                 preview: "Unsupported third-party path — not connected.".into(),
+                unread: 1,
             },
         );
         emit_message(

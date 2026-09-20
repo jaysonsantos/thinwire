@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use thinwire::protocols::{
+use thinwire_protocol::{
     AdapterCommand, AdapterEvent, AdapterStatus, FakeAdapter, ProtocolAdapter, ProtocolId,
 };
 use tokio::sync::mpsc::unbounded_channel;
@@ -77,7 +77,7 @@ async fn fake_adapter_pushes_events_from_worker_without_ui_apis() {
 async fn telegram_stub_emits_tdlib_status_from_worker() {
     let (tx, mut rx) = unbounded_channel();
     let worker = tokio::spawn(async move {
-        let mut adapter = thinwire::protocols::TelegramAdapter;
+        let mut adapter = thinwire_protocol::TelegramAdapter;
         adapter.start(tx);
     });
 

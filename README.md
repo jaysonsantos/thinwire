@@ -6,9 +6,9 @@ The UI thread must never block; protocol I/O runs async off the main thread.
 
 ## Status
 
-Three-pane shell (accounts / conversations / messages) with protocol adapters behind a tokio channel. The UI only polls events; workers must not call egui APIs.
+Inbox shell (account switcher + conversations on the left, thread in the center) with protocol adapters behind a tokio channel. The UI only polls events; workers must not call egui APIs.
 
-Telegram is wired toward official TDLib (`tdlib-rs`); the default build is a compile-safe stub (`--features telegram-tdlib` compiles the binding hook, still without login or secrets). WhatsApp, Signal, Discord, and Slack expose honest capability metadata only. Discord user-account / self-bot paths are refused. None of these adapters are production-ready.
+First-run offers Telegram (TDLib) and Slack (workspace OAuth). WhatsApp, Signal, and Discord sit behind an experimental gate that shows the Critic risk notice before any QR or token step. Discord user-account / self-bot fields do not exist. Default builds stay compile-safe stubs (`--features telegram-tdlib` compiles the TDLib hook, still without login or secrets).
 
 ## Protocol support (honest)
 
@@ -32,20 +32,29 @@ MIT. Keep third-party notices (including Boost for TDLib if bundled).
 
 ## Build
 
-`rust-toolchain.toml` pins Rust 1.88 (clippy + rustfmt). rustup installs it automatically.
+`rust-toolchain.toml` pins Rust 1.88. A Nix flake supplies the same tools as CI. `.envrc` stays local.
 
 ```bash
-cargo build
-cargo test
-cargo clippy -- -D warnings
-cargo run
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo run -p thinwire
+```
+
+With Nix:
+
+```bash
+nix develop --command scripts/lint.sh
+nix develop --command scripts/test.sh
 ```
 
 Optional later (local TDLib install; never commit `api_id` / `api_hash` / session strings):
 
 ```bash
-cargo build --features telegram-tdlib
+cargo build -p thinwire --features telegram-tdlib
 ```
+
+There is no distroless GUI container. This is a desktop egui app.
 
 ## Design rules
 

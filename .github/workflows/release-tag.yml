@@ -1,0 +1,48 @@
+# Manual tag. There is no distroless GUI image: thinwire is a desktop egui app.
+name: Release tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, for example 0.2.0. Empty takes the next version from the commits."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Refuse a run outside the default branch
+        if: github.ref_name != github.event.repository.default_branch
+        run: |
+          echo "A release runs on the default branch only." >&2
+          exit 1
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Make the release commit and the tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$VERSION" ]; then
+            nix develop --command scripts/release.sh "$VERSION"
+          else
+            nix develop --command scripts/release.sh
+          fi
+          git push --atomic --follow-tags
