@@ -175,6 +175,13 @@ fn account_chip(ui: &mut egui::Ui, account: &AccountRow, selected: bool, unread:
             .small()
             .color(MUTED),
     );
+    if !matches!(caps.id, ProtocolId::Telegram) {
+        ui.label(
+            RichText::new("not ready — no login UI this beat")
+                .small()
+                .color(MUTED),
+        );
+    }
     response.clicked()
 }
 
@@ -245,7 +252,7 @@ fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) 
     ui.add_space(12.0);
     ui.label(
         RichText::new(
-            "WhatsApp, Discord, and Slack stay in the shell as stubs. Their login UI is not in this beat.",
+            "WhatsApp, Discord, and Slack are not ready. They are stubs, not login peers of Telegram this beat.",
         )
         .color(EXPERIMENTAL),
     );

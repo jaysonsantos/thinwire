@@ -9,7 +9,7 @@
 - Discord: no self-bots / user-account automation
 - UI: egui + eframe; protocol work off the UI thread
 - First-run / Add account this beat: Telegram only (no WA / Discord / Slack auth UI)
-- Theme default is System (follow OS light/dark; persist System \| Light \| Dark)
+- Theme default is System (follow OS light/dark live via egui `system_theme`; persist System \| Light \| Dark)
 
 ## Stack
 
@@ -19,8 +19,7 @@
 - Discord: bot/OAuth inbox only — no self-bots / personal DMs
 - Slack: official OAuth only
 - Signal: out of v1 (S2); no libsignal / Presage
-- Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets.
-- Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets.
+- Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets.
 
 ## Layout
 

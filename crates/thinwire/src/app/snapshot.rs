@@ -91,6 +91,7 @@ pub(crate) struct Snapshot {
     pub status_text: String,
     pub compose: String,
     pending: Vec<AdapterCommand>,
+    keychain_flush: bool,
 }
 
 impl Snapshot {
@@ -122,6 +123,7 @@ impl Snapshot {
             status_text: "Adapters are stubs. No live network session.".into(),
             compose: String::new(),
             pending: Vec::new(),
+            keychain_flush: false,
         }
     }
 
@@ -157,6 +159,11 @@ impl Snapshot {
 
     pub(crate) fn take_commands(&mut self) -> Vec<AdapterCommand> {
         std::mem::take(&mut self.pending)
+    }
+
+    #[must_use]
+    pub(crate) fn take_keychain_flush(&mut self) -> bool {
+        std::mem::take(&mut self.keychain_flush)
     }
 
     pub(crate) fn has_primary_account(&self) -> bool {
@@ -284,10 +291,11 @@ impl Snapshot {
                     self.set_error(
                         "Telegram credentials were not stored.",
                         &error.to_string(),
-                        "Set THINWIRE_KEYRING=memory for a local-only session, or unlock the OS keychain.",
+                        "Cancel and try again. Values are not logged.",
                     );
                     return;
                 }
+                self.keychain_flush = true;
                 self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
                 self.auth = AuthScreen::TelegramPhone;
                 self.error = None;
@@ -320,10 +328,11 @@ impl Snapshot {
                     self.set_error(
                         "Telegram session was not stored.",
                         &error.to_string(),
-                        "Set THINWIRE_KEYRING=memory for a local-only session, or unlock the OS keychain.",
+                        "Cancel and try again. Values are not logged.",
                     );
                     return;
                 }
+                self.keychain_flush = true;
                 self.queue_telegram_step(TelegramAuthStep::Complete);
                 self.finish_telegram();
             }
@@ -492,6 +501,9 @@ mod tests {
         assert!(!src.contains("WhatsApp"));
         assert!(!src.contains("Discord"));
         assert!(!src.contains("Slack"));
+        let ui = include_str!("ui.rs");
+        assert!(ui.contains("not ready"));
+        assert!(ui.contains("not login peers"));
         assert!(!src.contains("UserAccount"));
         assert!(!src.contains("user_token"));
     }
@@ -583,6 +595,7 @@ mod tests {
         let debug = format!("{commands:?}");
         assert!(!debug.contains("11111"));
         assert!(!debug.contains("hash-value"));
+        assert!(snapshot.take_keychain_flush());
     }
 
     #[test]

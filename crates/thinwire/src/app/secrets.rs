@@ -1,17 +1,20 @@
 //! OS secret store for Telegram `api_id`, `api_hash`, and session material.
 //!
-//! Never log or persist these values in the git repo. Headless CI and a missing
-//! desktop keychain fall back to an in-memory store for the process only.
+//! The UI thread only touches an in-memory map. OS keychain I/O runs on a
+//! tokio `spawn_blocking` worker so egui never waits on keyutils / Keychain /
+//! Credential Manager. Never log or persist these values in the git repo.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use keyring::Entry;
 use thinwire_protocol::{
     TELEGRAM_SECRET_API_HASH, TELEGRAM_SECRET_API_ID, TELEGRAM_SECRET_SERVICE,
     TELEGRAM_SECRET_SESSION,
 };
+use tokio::runtime::Handle;
 
 /// Set `THINWIRE_KEYRING=memory` to skip the OS keychain (CI / local headless).
 pub const KEYRING_ENV: &str = "THINWIRE_KEYRING";
@@ -26,6 +29,8 @@ pub enum SecretKey {
 }
 
 impl SecretKey {
+    pub const ALL: [Self; 3] = [Self::ApiId, Self::ApiHash, Self::Session];
+
     #[must_use]
     pub const fn account(self) -> &'static str {
         match self {
@@ -68,31 +73,116 @@ impl fmt::Display for SecretError {
 
 impl std::error::Error for SecretError {}
 
-enum Backend {
-    Os,
-    Memory(Mutex<HashMap<SecretKey, String>>),
-}
-
-/// Keychain-backed store with an in-memory fallback for CI and headless Linux.
+/// Memory-first store. OS keychain attach/flush is worker-only.
 pub struct SecretStore {
-    backend: Backend,
+    memory: Mutex<HashMap<SecretKey, String>>,
+    os: AtomicBool,
 }
 
 impl SecretStore {
-    /// Prefer the OS keychain. Fall back to memory when it is unavailable.
+    /// UI-safe constructor. Does not talk to the OS keychain.
+    #[must_use]
+    pub fn memory() -> Self {
+        Self {
+            memory: Mutex::new(HashMap::new()),
+            os: AtomicBool::new(false),
+        }
+    }
+
+    /// UI constructor plus a worker that attaches the OS keychain if available.
+    #[must_use]
+    pub fn for_ui(handle: &Handle) -> Arc<Self> {
+        let store = Arc::new(Self::memory());
+        store.spawn_os_attach(handle);
+        store
+    }
+
+    /// Blocking attach used by tests. The app calls [`Self::for_ui`] instead.
+    #[cfg(test)]
     #[must_use]
     pub fn open() -> Self {
+        let store = Self::memory();
+        store.attach_os_keychain();
+        store
+    }
+
+    #[must_use]
+    pub fn backend_name(&self) -> &'static str {
+        if self.os.load(Ordering::Relaxed) {
+            "os-keychain"
+        } else {
+            "memory"
+        }
+    }
+
+    /// UI thread: update the in-memory map only.
+    pub fn set(&self, key: SecretKey, value: &str) -> Result<(), SecretError> {
+        let trimmed = value.trim();
+        let mut map = self
+            .memory
+            .lock()
+            .map_err(|_| SecretError::new("memory secret store is poisoned"))?;
+        if trimmed.is_empty() {
+            map.remove(&key);
+        } else {
+            map.insert(key, trimmed.to_string());
+        }
+        Ok(())
+    }
+
+    /// UI thread: read the in-memory map only.
+    pub fn get(&self, key: SecretKey) -> Result<Option<String>, SecretError> {
+        Ok(self
+            .memory
+            .lock()
+            .map_err(|_| SecretError::new("memory secret store is poisoned"))?
+            .get(&key)
+            .cloned())
+    }
+
+    #[cfg(test)]
+    pub fn delete(&self, key: SecretKey) -> Result<(), SecretError> {
+        self.set(key, "")
+    }
+
+    pub fn spawn_os_attach(self: &Arc<Self>, handle: &Handle) {
         if memory_requested() {
             tracing::info!(
                 "{KEYRING_ENV}={KEYRING_MEMORY}; Telegram secrets stay in memory this session"
             );
-            return Self::memory();
+            return;
+        }
+        let store = Arc::clone(self);
+        handle.spawn_blocking(move || store.attach_os_keychain());
+    }
+
+    pub fn spawn_os_flush(self: &Arc<Self>, handle: &Handle) {
+        if !self.os.load(Ordering::Relaxed) {
+            return;
+        }
+        let store = Arc::clone(self);
+        handle.spawn_blocking(move || {
+            if let Err(error) = store.flush_os() {
+                tracing::warn!(error = %error, "OS keychain flush failed; secrets stay in memory");
+            }
+        });
+    }
+
+    /// Blocking. Worker / tests only.
+    pub fn attach_os_keychain(&self) {
+        if memory_requested() {
+            return;
         }
         match probe_os() {
             Ok(()) => {
-                tracing::info!("using the OS keychain for Telegram secrets");
-                Self {
-                    backend: Backend::Os,
+                self.os.store(true, Ordering::Relaxed);
+                if let Err(error) = self.hydrate_from_os() {
+                    tracing::warn!(
+                        error = %error,
+                        "OS keychain attached but hydrate failed; memory stays empty"
+                    );
+                } else {
+                    tracing::info!("using the OS keychain for Telegram secrets");
                 }
             }
             Err(error) => {
@@ -100,64 +190,27 @@ impl SecretStore {
                     error = %error,
                     "OS keychain unavailable; Telegram secrets stay in memory this session and are not written to disk"
                 );
-                Self::memory()
             }
         }
     }
 
-    /// Process-local store used by tests and `THINWIRE_KEYRING=memory`.
-    #[must_use]
-    pub fn memory() -> Self {
-        Self {
-            backend: Backend::Memory(Mutex::new(HashMap::new())),
-        }
-    }
-
-    #[must_use]
-    pub fn backend_name(&self) -> &'static str {
-        match self.backend {
-            Backend::Os => "os-keychain",
-            Backend::Memory(_) => "memory",
-        }
-    }
-
-    pub fn set(&self, key: SecretKey, value: &str) -> Result<(), SecretError> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return self.delete(key);
-        }
-        match &self.backend {
-            Backend::Os => os_set(key, trimmed),
-            Backend::Memory(map) => {
-                map.lock()
-                    .map_err(|_| SecretError::new("memory secret store is poisoned"))?
-                    .insert(key, trimmed.to_string());
-                Ok(())
+    fn hydrate_from_os(&self) -> Result<(), SecretError> {
+        for key in SecretKey::ALL {
+            if let Some(value) = os_get(key)? {
+                self.set(key, &value)?;
             }
         }
+        Ok(())
     }
 
-    pub fn get(&self, key: SecretKey) -> Result<Option<String>, SecretError> {
-        match &self.backend {
-            Backend::Os => os_get(key),
-            Backend::Memory(map) => Ok(map
-                .lock()
-                .map_err(|_| SecretError::new("memory secret store is poisoned"))?
-                .get(&key)
-                .cloned()),
-        }
-    }
-
-    pub fn delete(&self, key: SecretKey) -> Result<(), SecretError> {
-        match &self.backend {
-            Backend::Os => os_delete(key),
-            Backend::Memory(map) => {
-                map.lock()
-                    .map_err(|_| SecretError::new("memory secret store is poisoned"))?
-                    .remove(&key);
-                Ok(())
+    fn flush_os(&self) -> Result<(), SecretError> {
+        for key in SecretKey::ALL {
+            match self.get(key)? {
+                Some(value) => os_set(key, &value)?,
+                None => os_delete(key)?,
             }
         }
+        Ok(())
     }
 }
 
@@ -265,6 +318,17 @@ mod tests {
         assert!(matches!(store.backend_name(), "os-keychain" | "memory"));
         let debug = format!("{store:?}");
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn ui_set_does_not_require_os_keychain() {
+        let store = SecretStore::memory();
+        assert_eq!(store.backend_name(), "memory");
+        store.set(SecretKey::ApiId, "11111").expect("memory set");
+        assert_eq!(
+            store.get(SecretKey::ApiId).expect("get").as_deref(),
+            Some("11111")
+        );
     }
 
     #[test]

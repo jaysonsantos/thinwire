@@ -6,6 +6,7 @@ mod settings;
 mod snapshot;
 mod ui;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
@@ -16,13 +17,14 @@ use snapshot::Snapshot;
 
 pub use settings::Settings;
 
-/// Native thinwire window. Protocol work stays on the stored tokio runtime.
+/// Native thinwire window. Protocol and keychain work stay off the UI thread.
 pub struct ThinwireApp {
-    _runtime: tokio::runtime::Runtime,
+    runtime: tokio::runtime::Runtime,
     host: AdapterHost,
     snapshot: Snapshot,
     settings: Settings,
-    secrets: SecretStore,
+    secrets: Arc<SecretStore>,
+    last_os_theme: Option<egui::Theme>,
 }
 
 impl ThinwireApp {
@@ -30,18 +32,19 @@ impl ThinwireApp {
     pub fn new(settings: Settings) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime for protocol adapters");
         let host = AdapterHost::spawn(runtime.handle());
-        let secrets = SecretStore::open();
+        let secrets = SecretStore::for_ui(runtime.handle());
         let mut snapshot = Snapshot::new();
         snapshot.status_text = format!(
             "Adapters are stubs. Secret store: {}.",
             secrets.backend_name()
         );
         Self {
-            _runtime: runtime,
+            runtime,
             host,
             snapshot,
             settings,
             secrets,
+            last_os_theme: None,
         }
     }
 
@@ -55,13 +58,18 @@ impl ThinwireApp {
         for command in self.snapshot.take_commands() {
             self.host.send(command);
         }
+        if self.snapshot.take_keychain_flush() {
+            self.secrets.spawn_os_flush(self.runtime.handle());
+        }
     }
 }
 
 impl eframe::App for ThinwireApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
-        self.settings.apply(ctx);
+        if self.settings.follow_os_live(ctx, &mut self.last_os_theme) {
+            ctx.request_repaint();
+        }
         // Poll the worker channel while idle so events do not wait on input.
         // logic() still runs when the window is hidden after a repaint request.
         ctx.request_repaint_after(Duration::from_millis(100));

@@ -64,9 +64,9 @@ Telegram `api_id`, `api_hash`, and session material go to the OS secret store (`
 | Linux | Kernel keyring (keyutils). Session-scoped; no D-Bus Secret Service required. |
 | Linux headless / CI | Same keyutils probe, then in-memory if the kernel store is unavailable. Not written to a file. |
 
-Set `THINWIRE_KEYRING=memory` to skip the OS keychain (CI and local headless). Never put secrets in the repo, `.env` committed files, or logs. Tests use the memory backend and stay green without a desktop keychain or TDLib.
+Set `THINWIRE_KEYRING=memory` to skip the OS keychain (CI and local headless). The UI thread only reads/writes an in-memory map; OS keychain attach and flush run on a tokio `spawn_blocking` worker. Never put secrets in the repo, `.env` committed files, logs, or CI artifacts. Tests use the memory backend and stay green without a desktop keychain or TDLib.
 
-Theme preference is `System` (follow the OS, including live changes), `Light`, or `Dark`. A missing `settings.toml` means System. The file lives under the platform config dir (`~/.config/thinwire/settings.toml` on Linux) and stores only the mode enum.
+Theme preference is `System` (follow the OS, including live `ThemeChanged` updates), `Light`, or `Dark`. A missing `settings.toml` means System. The file lives under the platform config dir (`~/.config/thinwire/settings.toml` on Linux) and stores only the mode enum.
 
 There is no distroless GUI container. This is a desktop egui app.
 

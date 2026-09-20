@@ -88,9 +88,20 @@ impl Settings {
 
     /// Apply the stored mode. System follows the OS and updates when it changes.
     pub fn apply(&self, ctx: &egui::Context) {
-        ctx.options_mut(|options| {
-            options.theme_preference = self.theme.to_egui();
-        });
+        ctx.set_theme(self.theme.to_egui());
+    }
+
+    /// Keep System mode in sync with live OS changes (egui-winit `ThemeChanged`).
+    ///
+    /// Returns true when the OS light/dark preference changed this frame so the
+    /// caller can request an immediate repaint.
+    pub fn follow_os_live(
+        &self,
+        ctx: &egui::Context,
+        last_os_theme: &mut Option<egui::Theme>,
+    ) -> bool {
+        self.apply(ctx);
+        live_os_theme_changed(self.theme, last_os_theme, ctx.system_theme())
     }
 
     /// Update the in-memory mode and write the config file.
@@ -112,6 +123,23 @@ impl Settings {
             self.theme.as_str()
         )
     }
+}
+
+/// True when preference is System and the polled OS theme changed.
+#[must_use]
+pub fn live_os_theme_changed(
+    mode: ThemeMode,
+    last: &mut Option<egui::Theme>,
+    current: Option<egui::Theme>,
+) -> bool {
+    if mode != ThemeMode::System {
+        return false;
+    }
+    let changed = last.zip(current).is_some_and(|(prev, now)| prev != now);
+    if current.is_some() {
+        *last = current;
+    }
+    changed
 }
 
 fn default_path() -> PathBuf {
@@ -193,5 +221,38 @@ mod tests {
         for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
             assert_eq!(ThemeMode::from_egui(mode.to_egui()), mode);
         }
+    }
+
+    #[test]
+    fn system_mode_follows_live_os_theme_changes() {
+        let mut last = None;
+        assert!(!live_os_theme_changed(
+            ThemeMode::System,
+            &mut last,
+            Some(egui::Theme::Dark)
+        ));
+        assert_eq!(last, Some(egui::Theme::Dark));
+        assert!(live_os_theme_changed(
+            ThemeMode::System,
+            &mut last,
+            Some(egui::Theme::Light)
+        ));
+        assert_eq!(last, Some(egui::Theme::Light));
+        assert!(!live_os_theme_changed(
+            ThemeMode::System,
+            &mut last,
+            Some(egui::Theme::Light)
+        ));
+    }
+
+    #[test]
+    fn light_or_dark_override_ignores_os_changes() {
+        let mut last = Some(egui::Theme::Dark);
+        assert!(!live_os_theme_changed(
+            ThemeMode::Light,
+            &mut last,
+            Some(egui::Theme::Light)
+        ));
+        assert_eq!(last, Some(egui::Theme::Dark));
     }
 }
