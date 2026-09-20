@@ -1,20 +1,31 @@
-[package]
-name = "thinwire"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
-description = "Thin multi-protocol desktop messenger (Rust + egui)"
-repository = "https://github.com/jaysonsantos/thinwire"
-readme = "README.md"
+[workspace]
+resolver = "3"
+members = ["crates/thinwire", "crates/thinwire-protocol"]
 
-[dependencies]
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+publish = false
+repository = "https://github.com/jaysonsantos/thinwire"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[workspace.dependencies]
 eframe = { version = "0.31", default-features = true }
 egui = "0.31"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+thinwire-protocol = { path = "crates/thinwire-protocol" }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[profile.release]
-lto = true
-codegen-units = 1
-strip = true

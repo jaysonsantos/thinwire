@@ -1,0 +1,4 @@
+[resolver]
+# Prefer crates that still parse and build on the package MSRV (1.83).
+# Unconstrained crates.io resolution pulls edition2024 manifests.
+incompatible-rust-versions = "fallback"

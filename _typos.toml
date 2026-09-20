@@ -1,0 +1,10 @@
+[default]
+extend-ignore-re = ["api_id", "api_hash"]
+
+[default.extend-words]
+tdlib = "tdlib"
+tdjson = "tdjson"
+eframe = "eframe"
+egui = "egui"
+zizmor = "zizmor"
+prek = "prek"

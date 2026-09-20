@@ -1,0 +1,25 @@
+[package]
+name = "thinwire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Thin multi-protocol desktop messenger (Rust + egui)"
+readme = "../../README.md"
+
+[features]
+default = []
+telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+thinwire-protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
