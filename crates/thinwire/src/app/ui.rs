@@ -11,15 +11,15 @@ const EXPERIMENTAL: Color32 = Color32::from_rgb(214, 160, 64);
 const CONSTRAINED: Color32 = Color32::from_rgb(196, 148, 88);
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
 
-pub(crate) fn draw(ctx: &egui::Context, snapshot: &mut Snapshot) {
-    top_bar(ctx, snapshot);
-    status_strip(ctx, snapshot);
-    left_panel(ctx, snapshot);
-    center_panel(ctx, snapshot);
+pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+    top_bar(ui, snapshot);
+    status_strip(ui, snapshot);
+    left_panel(ui, snapshot);
+    center_panel(ui, snapshot);
 }
 
-fn top_bar(ctx: &egui::Context, snapshot: &mut Snapshot) {
-    egui::TopBottomPanel::top("top").show(ctx, |ui| {
+fn top_bar(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+    egui::Panel::top("top").show(ui, |ui| {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.heading("thinwire");
@@ -50,8 +50,8 @@ fn top_bar(ctx: &egui::Context, snapshot: &mut Snapshot) {
     });
 }
 
-fn status_strip(ctx: &egui::Context, snapshot: &mut Snapshot) {
-    egui::TopBottomPanel::top("status").show(ctx, |ui| {
+fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+    egui::Panel::top("status").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Status").strong());
             ui.label(&snapshot.status_text);
@@ -84,12 +84,12 @@ fn status_strip(ctx: &egui::Context, snapshot: &mut Snapshot) {
     });
 }
 
-fn left_panel(ctx: &egui::Context, snapshot: &mut Snapshot) {
-    egui::SidePanel::left("switcher")
+fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+    egui::Panel::left("switcher")
         .resizable(true)
-        .default_width(280.0)
-        .width_range(220.0..=400.0)
-        .show(ctx, |ui| {
+        .default_size(280.0)
+        .size_range(220.0..=400.0)
+        .show(ui, |ui| {
             ui.heading("Accounts");
             ui.label(
                 RichText::new("Experimental chips stay visible")
@@ -189,8 +189,8 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     }
 }
 
-fn center_panel(ctx: &egui::Context, snapshot: &mut Snapshot) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+    egui::CentralPanel::default().show(ui, |ui| {
         if snapshot.auth != super::snapshot::AuthScreen::Idle {
             auth::draw(ui, snapshot);
             return;
