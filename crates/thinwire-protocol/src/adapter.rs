@@ -9,31 +9,23 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Unbounded event sink from a worker into the UI poller.
 pub type EventTx = UnboundedSender<AdapterEvent>;
 
-/// Product-lock protocol identifiers.
+/// v1 protocol identifiers (S2: Signal is out of v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolId {
     Telegram,
     WhatsApp,
-    Signal,
     Discord,
     Slack,
 }
 
 impl ProtocolId {
-    pub const ALL: [Self; 5] = [
-        Self::Telegram,
-        Self::WhatsApp,
-        Self::Signal,
-        Self::Discord,
-        Self::Slack,
-    ];
+    pub const ALL: [Self; 4] = [Self::Telegram, Self::WhatsApp, Self::Discord, Self::Slack];
 
     #[must_use]
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::Telegram => "Telegram",
             Self::WhatsApp => "WhatsApp",
-            Self::Signal => "Signal",
             Self::Discord => "Discord",
             Self::Slack => "Slack",
         }

@@ -30,7 +30,6 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         AuthScreen::TelegramCode => telegram_code(ui, snapshot),
         AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot),
         AuthScreen::WhatsAppQr => whatsapp_qr(ui, snapshot),
-        AuthScreen::SignalLink => signal_link(ui, snapshot),
         AuthScreen::DiscordChoose => discord_choose(ui, snapshot),
         AuthScreen::DiscordBot => discord_bot(ui, snapshot),
         AuthScreen::DiscordOAuth => discord_oauth(ui, snapshot),
@@ -59,12 +58,6 @@ fn choose_protocol(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     ui.horizontal(|ui| {
         if ui.button("WhatsApp · Experimental · ban risk").clicked() {
             snapshot.choose_protocol(ProtocolId::WhatsApp);
-        }
-        if ui
-            .button("Signal · Experimental · breakage expected")
-            .clicked()
-        {
-            snapshot.choose_protocol(ProtocolId::Signal);
         }
         if ui.button("Discord · Constrained · bot/OAuth").clicked() {
             snapshot.choose_protocol(ProtocolId::Discord);
@@ -141,21 +134,6 @@ fn whatsapp_qr(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     });
     if ui.button("Close stub").clicked() {
         snapshot.finish_whatsapp_placeholder();
-    }
-}
-
-fn signal_link(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.colored_label(WARN, "Experimental. Breakage expected.");
-    ui.label("Link QR/code placeholder. Signal has no supported third-party client API.");
-    ui.group(|ui| {
-        ui.label(
-            RichText::new("[ link code placeholder ]")
-                .italics()
-                .color(MUTED),
-        );
-    });
-    if ui.button("Close stub").clicked() {
-        snapshot.finish_signal_placeholder();
     }
 }
 

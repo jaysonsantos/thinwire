@@ -2,6 +2,8 @@
 
 **Status:** accepted
 
+**Supersession:** Council lock S2 takes Signal out of v1. See [0004-signal-out-of-v1.md](0004-signal-out-of-v1.md). This ADR remains the record of option B versus Telegram-only; do not treat Signal-in-v1 as current product lock.
+
 ## Context
 Product-council (2026-09-20) locked a public MIT Rust+egui desktop multi-messenger for Windows, macOS, and Linux. The user chose option B over Telegram-first. Repo: https://github.com/jaysonsantos/thinwire (name filament was rejected for Google PBR collision).
 

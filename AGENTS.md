@@ -1,10 +1,11 @@
 # thinwire — agent notes
 
-## Product lock (option B)
+## Product lock (S2)
 
-- All five protocols in scope for the shell: Telegram, WhatsApp, Signal, Discord, Slack
+- v1 protocols: Telegram, WhatsApp (experimental), Discord (bot/OAuth only), Slack
+- Signal is out of v1 — do not link AGPL libsignal / Presage into the MIT binary
 - README must keep the three risk bullets
-- Never claim WhatsApp / Signal / Discord personal clients are “reliable”
+- Never claim WhatsApp or Discord personal clients are “reliable”
 - Discord: no self-bots / user-account automation
 - UI: egui + eframe; protocol work off the UI thread
 
@@ -13,8 +14,9 @@
 - Rust 2024 workspace, egui/eframe, tokio for async adapters
 - Telegram: TDLib / tdlib-rs preferred
 - WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk
-- Signal: unsupported third-party path — breakage expected
+- Discord: bot/OAuth only — no self-bots / personal DMs
 - Slack: official OAuth only
+- Signal: out of v1 (S2); no libsignal / Presage
 
 ## Layout
 
