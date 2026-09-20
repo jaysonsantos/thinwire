@@ -2,6 +2,7 @@
 name = "thinwire"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 description = "Thin multi-protocol desktop messenger (Rust + egui)"
 repository = "https://github.com/jaysonsantos/thinwire"

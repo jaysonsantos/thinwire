@@ -2,7 +2,7 @@
 //!
 //! Experimental. ToS / ban risk. Not a reliable personal client. No networking.
 
-use super::{
+use super::adapter::{
     emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
     ChatMessage, Conversation, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
     SupportClass,
@@ -18,7 +18,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 };
 
 /// Experimental WhatsApp stub. Does not open a linked-device session.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WhatsAppAdapter;
 
 impl WhatsAppAdapter {

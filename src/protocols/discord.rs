@@ -1,6 +1,6 @@
 //! Discord official bot/OAuth stub. User-account self-bots are refused.
 
-use super::{
+use super::adapter::{
     emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
     ChatMessage, Conversation, DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities,
     ProtocolId, SupportClass,
@@ -18,7 +18,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 const SELF_BOT_REFUSAL: &str = "Discord user-account / self-bot automation is refused. Official bot/OAuth only. License-clean crates do not grant Discord permission to automate a personal account.";
 
 /// Constrained Discord stub. Never starts a user-account client.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DiscordAdapter;
 
 impl DiscordAdapter {

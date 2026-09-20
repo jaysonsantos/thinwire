@@ -1,6 +1,6 @@
 //! Test double used to prove workers push events without calling UI APIs.
 
-use super::{
+use super::adapter::{
     emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
     ChatMessage, Conversation, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
     SupportClass,
@@ -45,7 +45,7 @@ impl ProtocolAdapter for FakeAdapter {
     fn start(&mut self, events: EventTx) {
         self.started = true;
         emit_status(
-            events,
+            &events,
             ProtocolId::Telegram,
             AdapterStatus::Ready,
             "fake adapter ready",

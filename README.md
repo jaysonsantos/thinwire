@@ -32,6 +32,8 @@ MIT. Keep third-party notices (including Boost for TDLib if bundled).
 
 ## Build
 
+`rust-toolchain.toml` pins Rust 1.88 (clippy + rustfmt). rustup installs it automatically.
+
 ```bash
 cargo build
 cargo test

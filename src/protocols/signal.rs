@@ -2,7 +2,7 @@
 //!
 //! Experimental. Breakage expected. Not a reliable personal client. No networking.
 
-use super::{
+use super::adapter::{
     emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
     ChatMessage, Conversation, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
     SupportClass,
@@ -18,7 +18,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 };
 
 /// Experimental Signal stub. Does not talk to Signal servers.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SignalAdapter;
 
 impl SignalAdapter {

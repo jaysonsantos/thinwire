@@ -1,6 +1,6 @@
 //! Slack official OAuth / workspace-app stub. Not a personal desktop clone.
 
-use super::{
+use super::adapter::{
     emit_conversation, emit_message, emit_status, AdapterCommand, AdapterError, AdapterStatus,
     ChatMessage, Conversation, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
     SupportClass,
@@ -16,7 +16,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 };
 
 /// Official Slack path. OAuth login is out of scope for this revision.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SlackAdapter;
 
 impl SlackAdapter {

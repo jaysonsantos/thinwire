@@ -77,7 +77,7 @@ async fn fake_adapter_pushes_events_from_worker_without_ui_apis() {
 async fn telegram_stub_emits_tdlib_status_from_worker() {
     let (tx, mut rx) = unbounded_channel();
     let worker = tokio::spawn(async move {
-        let mut adapter = thinwire::protocols::TelegramAdapter::default();
+        let mut adapter = thinwire::protocols::TelegramAdapter;
         adapter.start(tx);
     });
 

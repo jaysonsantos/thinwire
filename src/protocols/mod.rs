@@ -34,11 +34,11 @@ pub fn catalog() -> [ProtocolCapabilities; 5] {
 
 pub(crate) fn registry() -> Vec<Box<dyn ProtocolAdapter>> {
     vec![
-        Box::new(TelegramAdapter::default()),
-        Box::new(WhatsAppAdapter::default()),
-        Box::new(SignalAdapter::default()),
-        Box::new(DiscordAdapter::default()),
-        Box::new(SlackAdapter::default()),
+        Box::new(TelegramAdapter),
+        Box::new(WhatsAppAdapter),
+        Box::new(SignalAdapter),
+        Box::new(DiscordAdapter),
+        Box::new(SlackAdapter),
     ]
 }
 
