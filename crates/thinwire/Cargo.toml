@@ -17,6 +17,7 @@ telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
 eframe.workspace = true
 egui.workspace = true
 thinwire-protocol.workspace = true
+winit.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
