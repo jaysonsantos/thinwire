@@ -50,11 +50,15 @@ impl Default for ThinwireApp {
 }
 
 impl eframe::App for ThinwireApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
-        ui::draw(ctx, &mut self.snapshot);
-        self.flush_commands();
-        // Poll the channel while idle so worker events do not wait on input.
+        // Poll the worker channel while idle so events do not wait on input.
+        // logic() still runs when the window is hidden after a repaint request.
         ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        ui::draw(ui, &mut self.snapshot);
+        self.flush_commands();
     }
 }

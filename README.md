@@ -32,7 +32,7 @@ MIT. Keep third-party notices (including Boost for TDLib if bundled).
 
 ## Build
 
-`rust-toolchain.toml` pins Rust 1.88. A Nix flake supplies the same tools as CI. `.envrc` stays local.
+`rust-toolchain.toml` pins Rust 1.98.1. A Nix flake supplies the same tools as CI. `.envrc` stays local.
 
 ```bash
 cargo build --workspace
