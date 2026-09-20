@@ -57,6 +57,8 @@ cargo build -p thinwire --features telegram-tdlib
 
 There is no distroless GUI container. This is a desktop egui app.
 
+Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows. Retention is 7 days. These zips are not a release. They are not signed.
+
 ## Design rules
 
 - MIT public repo under `jaysonsantos/thinwire`
