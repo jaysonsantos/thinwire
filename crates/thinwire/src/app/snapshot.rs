@@ -3,10 +3,11 @@
 use std::collections::{HashMap, HashSet};
 
 use thinwire_protocol::{
-    AdapterCommand, AdapterEvent, AdapterStatus, CRITIC_BULLET_1, ChatMessage, Conversation,
-    DiscordAuthMode, ProtocolCapabilities, ProtocolId, catalog, critic_bullets_for,
-    requires_experimental_gate,
+    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, ProtocolCapabilities,
+    ProtocolId, TelegramAuthStep, catalog,
 };
+
+use super::secrets::{SecretKey, SecretStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InboxFilter {
@@ -46,21 +47,14 @@ impl InboxFilter {
     }
 }
 
-/// Non-modal auth steps. Credential field values never leave this snapshot.
+/// Non-modal Telegram login steps. Credential field values never leave this snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthScreen {
     Idle,
-    ChooseProtocol,
-    ExperimentalGate { protocol: ProtocolId },
     TelegramApi,
     TelegramPhone,
     TelegramCode,
     Telegram2fa,
-    WhatsAppQr,
-    DiscordChoose,
-    DiscordBot,
-    DiscordOAuth,
-    SlackOAuth,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +82,6 @@ pub(crate) struct Snapshot {
     pub filter: InboxFilter,
     pub search: String,
     pub auth: AuthScreen,
-    pub risk_understood: bool,
     pub telegram_api_id: String,
     pub telegram_api_hash: String,
     pub telegram_phone: String,
@@ -120,7 +113,6 @@ impl Snapshot {
             filter: InboxFilter::All,
             search: String::new(),
             auth: AuthScreen::Idle,
-            risk_understood: false,
             telegram_api_id: String::new(),
             telegram_api_hash: String::new(),
             telegram_phone: String::new(),
@@ -168,9 +160,9 @@ impl Snapshot {
     }
 
     pub(crate) fn has_primary_account(&self) -> bool {
-        self.accounts.iter().any(|row| {
-            row.linked && matches!(row.caps.id, ProtocolId::Telegram | ProtocolId::Slack)
-        })
+        self.accounts
+            .iter()
+            .any(|row| row.linked && matches!(row.caps.id, ProtocolId::Telegram))
     }
 
     pub(crate) fn select_protocol(&mut self, protocol: ProtocolId) {
@@ -266,155 +258,77 @@ impl Snapshot {
         self.status_text = "Refresh queued on the tokio worker. The UI thread stays free.".into();
     }
 
-    pub(crate) fn open_add_account(&mut self) {
-        self.error = None;
-        self.risk_understood = false;
-        self.auth = AuthScreen::ChooseProtocol;
-        self.status_text =
-            "Add account — pick Telegram or Slack, or an experimental module.".into();
-    }
-
-    pub(crate) fn start_supported(&mut self, protocol: ProtocolId) {
-        match protocol {
-            ProtocolId::Telegram => self.open_telegram(),
-            ProtocolId::Slack => self.open_slack(),
-            other => self.choose_protocol(other),
-        }
-    }
-
-    pub(crate) fn choose_protocol(&mut self, protocol: ProtocolId) {
-        self.error = None;
-        self.risk_understood = false;
-        if requires_experimental_gate(protocol) {
-            self.auth = AuthScreen::ExperimentalGate { protocol };
-            self.status_text = format!(
-                "Risk gate for {name}. Read the notice before any QR or token step.",
-                name = protocol.display_name()
-            );
-            return;
-        }
-        match protocol {
-            ProtocolId::Telegram => self.open_telegram(),
-            ProtocolId::Slack => self.open_slack(),
-            ProtocolId::WhatsApp | ProtocolId::Discord => {
-                self.set_error(
-                    "Experimental gate was skipped.",
-                    "WhatsApp and Discord must show Critic risk facts first.",
-                    "Use Add account and accept the risk checkbox.",
-                );
-            }
-        }
-    }
-
-    pub(crate) fn continue_experimental(&mut self) -> Result<(), UserError> {
-        let AuthScreen::ExperimentalGate { protocol } = self.auth else {
-            return Err(self.gate_error(
-                "No experimental gate is open.",
-                "Continue only applies on the risk step.",
-                "Choose an experimental protocol from Add account.",
-            ));
-        };
-        if !self.risk_understood {
-            let err = self.gate_error(
-                "Continue is blocked.",
-                "The risk checkbox is still unchecked.",
-                "Read the Critic notice and tick “I understand the risk”.",
-            );
-            self.error = Some(err.clone());
-            return Err(err);
-        }
-        match protocol {
-            ProtocolId::WhatsApp => {
-                self.auth = AuthScreen::WhatsAppQr;
-                self.status_text =
-                    "WhatsApp linked-device placeholder. No QR session is live.".into();
-            }
-            ProtocolId::Discord => {
-                self.auth = AuthScreen::DiscordChoose;
-                self.status_text =
-                    "Discord bot/OAuth inbox only. User-account login is refused.".into();
-            }
-            ProtocolId::Telegram | ProtocolId::Slack => {
-                return Err(self.gate_error(
-                    "This protocol has no experimental gate.",
-                    "Telegram and Slack are supported paths.",
-                    "Add them from the first-run buttons.",
-                ));
-            }
-        }
-        self.error = None;
-        Ok(())
+    pub(crate) fn open_add_account(&mut self, store: &SecretStore) {
+        self.open_telegram(store);
     }
 
     pub(crate) fn cancel_auth(&mut self) {
         self.clear_secrets();
         self.auth = AuthScreen::Idle;
-        self.risk_understood = false;
         self.error = None;
         self.status_text = "Account linking cancelled.".into();
     }
 
-    pub(crate) fn advance_telegram(&mut self) {
+    pub(crate) fn advance_telegram(&mut self, store: &SecretStore) {
         match self.auth {
             AuthScreen::TelegramApi => {
+                let api_id = self.telegram_api_id.clone();
+                let api_hash = self.telegram_api_hash.clone();
+                if !self.require_field("api_id", &api_id) {
+                    return;
+                }
+                if !self.require_field("api_hash", &api_hash) {
+                    return;
+                }
+                if let Err(error) = persist_api(store, &api_id, &api_hash) {
+                    self.set_error(
+                        "Telegram credentials were not stored.",
+                        &error.to_string(),
+                        "Set THINWIRE_KEYRING=memory for a local-only session, or unlock the OS keychain.",
+                    );
+                    return;
+                }
+                self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
                 self.auth = AuthScreen::TelegramPhone;
-                self.status_text =
-                    "Telegram stub: enter a phone number locally. Nothing is stored.".into();
+                self.error = None;
+                self.status_text = "Telegram: enter a phone number. The api_id and api_hash are in the secret store.".into();
             }
             AuthScreen::TelegramPhone => {
+                let phone = self.telegram_phone.clone();
+                if !self.require_field("phone number", &phone) {
+                    return;
+                }
+                self.queue_telegram_step(TelegramAuthStep::Phone);
                 self.auth = AuthScreen::TelegramCode;
-                self.status_text = "Telegram stub: code step. TDLib is not connected.".into();
+                self.error = None;
+                self.status_text =
+                    "Telegram: code step. TDLib is not started in this build.".into();
             }
             AuthScreen::TelegramCode => {
+                let code = self.telegram_code.clone();
+                if !self.require_field("login code", &code) {
+                    return;
+                }
+                self.queue_telegram_step(TelegramAuthStep::Code);
                 self.auth = AuthScreen::Telegram2fa;
-                self.status_text = "Telegram stub: optional 2FA. Leave blank to skip.".into();
+                self.error = None;
+                self.status_text = "Telegram: optional 2FA. Leave blank to skip.".into();
             }
-            AuthScreen::Telegram2fa => self.finish_stub(
-                ProtocolId::Telegram,
-                "Telegram stub linked. TDLib client not started; fields were discarded.",
-            ),
-            _ => {}
+            AuthScreen::Telegram2fa => {
+                self.queue_telegram_step(TelegramAuthStep::TwoFactor);
+                if let Err(error) = persist_session(store) {
+                    self.set_error(
+                        "Telegram session was not stored.",
+                        &error.to_string(),
+                        "Set THINWIRE_KEYRING=memory for a local-only session, or unlock the OS keychain.",
+                    );
+                    return;
+                }
+                self.queue_telegram_step(TelegramAuthStep::Complete);
+                self.finish_telegram();
+            }
+            AuthScreen::Idle => {}
         }
-    }
-
-    pub(crate) fn finish_whatsapp_placeholder(&mut self) {
-        self.finish_stub(
-            ProtocolId::WhatsApp,
-            "WhatsApp stub noted. Unofficial linked-device path; no live QR.",
-        );
-    }
-
-    pub(crate) fn open_discord_bot(&mut self) {
-        self.auth = AuthScreen::DiscordBot;
-        self.status_text = "Discord bot stub. No token is stored or requested.".into();
-    }
-
-    pub(crate) fn open_discord_oauth(&mut self) {
-        self.auth = AuthScreen::DiscordOAuth;
-        self.status_text = "Discord OAuth stub. User-account login is not offered.".into();
-    }
-
-    pub(crate) fn finish_discord(&mut self, mode: DiscordAuthMode) {
-        if mode == DiscordAuthMode::UserAccount {
-            self.set_error(
-                "Discord user-account login was refused.",
-                CRITIC_BULLET_1,
-                "Use a bot token or OAuth app owned by you. Never paste a user token.",
-            );
-            return;
-        }
-        self.pending.push(AdapterCommand::ConnectDiscord { mode });
-        self.finish_stub(
-            ProtocolId::Discord,
-            "Discord bot/OAuth inbox stub noted. No user-account session.",
-        );
-    }
-
-    pub(crate) fn finish_slack(&mut self) {
-        self.finish_stub(
-            ProtocolId::Slack,
-            "Slack OAuth stub noted. Workspace app path; not a personal desktop clone.",
-        );
     }
 
     pub(crate) fn send_compose_stub(&mut self) {
@@ -453,38 +367,58 @@ impl Snapshot {
             "Compose stub queued on the UI snapshot only. No protocol I/O ran.".into();
     }
 
-    pub(crate) fn critic_lines(&self) -> &'static [&'static str] {
-        match self.auth {
-            AuthScreen::ExperimentalGate { protocol } => critic_bullets_for(protocol),
-            _ => &[],
-        }
-    }
-
-    fn open_telegram(&mut self) {
+    pub(crate) fn open_telegram(&mut self, store: &SecretStore) {
         self.clear_secrets();
+        self.error = None;
+        self.prefill_from_store(store);
         self.auth = AuthScreen::TelegramApi;
         self.status_text =
-            "Telegram (TDLib): create an app at my.telegram.org, then enter api_id and api_hash here. Values stay on this machine and are discarded when you cancel or finish.".into();
+            "Telegram (TDLib): create an app at my.telegram.org, then enter api_id and api_hash here. Values go to the OS keychain when available.".into();
     }
 
-    fn open_slack(&mut self) {
-        self.auth = AuthScreen::SlackOAuth;
+    fn finish_telegram(&mut self) {
+        self.clear_secrets();
+        if let Some(row) = self
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Telegram)
+        {
+            row.linked = true;
+        }
+        self.pending.push(AdapterCommand::Connect {
+            protocol: ProtocolId::Telegram,
+        });
+        self.select_protocol(ProtocolId::Telegram);
+        self.auth = AuthScreen::Idle;
+        self.error = None;
         self.status_text =
-            "Slack workspace OAuth placeholder. Browser sign-in is not started in this revision."
+            "Telegram linked in this shell. TDLib is not started; form fields were discarded."
                 .into();
     }
 
-    fn finish_stub(&mut self, protocol: ProtocolId, status: &str) {
-        self.clear_secrets();
-        if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
-            row.linked = true;
+    fn prefill_from_store(&mut self, store: &SecretStore) {
+        if let Ok(Some(api_id)) = store.get(SecretKey::ApiId) {
+            self.telegram_api_id = api_id;
         }
-        self.pending.push(AdapterCommand::Connect { protocol });
-        self.select_protocol(protocol);
-        self.auth = AuthScreen::Idle;
-        self.risk_understood = false;
-        self.error = None;
-        self.status_text = status.into();
+        if let Ok(Some(api_hash)) = store.get(SecretKey::ApiHash) {
+            self.telegram_api_hash = api_hash;
+        }
+    }
+
+    fn queue_telegram_step(&mut self, step: TelegramAuthStep) {
+        self.pending.push(AdapterCommand::TelegramAuth { step });
+    }
+
+    fn require_field(&mut self, name: &str, value: &str) -> bool {
+        if value.trim().is_empty() {
+            self.set_error(
+                "Telegram login did not advance.",
+                &format!("The {name} field is empty."),
+                "Fill the field, or press Cancel. Values are not logged.",
+            );
+            return false;
+        }
+        true
     }
 
     fn clear_secrets(&mut self) {
@@ -503,14 +437,6 @@ impl Snapshot {
         });
     }
 
-    fn gate_error(&self, happened: &str, why: &str, next: &str) -> UserError {
-        UserError {
-            happened: happened.into(),
-            why: why.into(),
-            next: next.into(),
-        }
-    }
-
     fn ensure_conversation_selection(&mut self) {
         if self.selected_conversation.is_some() {
             return;
@@ -525,63 +451,151 @@ impl Snapshot {
     }
 }
 
+fn persist_api(
+    store: &SecretStore,
+    api_id: &str,
+    api_hash: &str,
+) -> Result<(), super::secrets::SecretError> {
+    store.set(SecretKey::ApiId, api_id)?;
+    store.set(SecretKey::ApiHash, api_hash)?;
+    Ok(())
+}
+
+fn persist_session(store: &SecretStore) -> Result<(), super::secrets::SecretError> {
+    store.set(SecretKey::Session, "tdlib-stub")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn experimental_auth_requires_risk_checkbox() {
-        let mut snapshot = Snapshot::new();
-        snapshot.choose_protocol(ProtocolId::WhatsApp);
-        assert!(matches!(
-            snapshot.auth,
-            AuthScreen::ExperimentalGate {
-                protocol: ProtocolId::WhatsApp
-            }
-        ));
-        assert!(snapshot.continue_experimental().is_err());
-        assert!(matches!(snapshot.auth, AuthScreen::ExperimentalGate { .. }));
-        snapshot.risk_understood = true;
-        snapshot.continue_experimental().expect("gate opens");
-        assert_eq!(snapshot.auth, AuthScreen::WhatsAppQr);
+    fn complete_telegram(snapshot: &mut Snapshot, store: &SecretStore) {
+        snapshot.open_telegram(store);
+        snapshot.telegram_api_id = "11111".into();
+        snapshot.telegram_api_hash = "hash-value".into();
+        snapshot.advance_telegram(store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.advance_telegram(store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramCode);
+        snapshot.telegram_code = "12345".into();
+        snapshot.advance_telegram(store);
+        assert_eq!(snapshot.auth, AuthScreen::Telegram2fa);
+        snapshot.advance_telegram(store);
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
     }
 
     #[test]
-    fn discord_auth_source_has_no_user_token_field() {
+    fn auth_ui_is_telegram_only_this_beat() {
         let src = include_str!("auth.rs");
+        assert!(src.contains("my.telegram.org"));
+        assert!(!src.contains("WhatsApp"));
+        assert!(!src.contains("Discord"));
+        assert!(!src.contains("Slack"));
         assert!(!src.contains("UserAccount"));
         assert!(!src.contains("user_token"));
-        assert!(src.contains("DiscordAuthMode::Bot"));
-        assert!(src.contains("DiscordAuthMode::OAuth"));
-        assert!(src.contains("No user-token field exists"));
     }
 
     #[test]
-    fn discord_ui_never_offers_user_account_mode() {
+    fn add_account_opens_telegram_not_a_protocol_picker() {
+        let store = SecretStore::memory();
         let mut snapshot = Snapshot::new();
-        snapshot.risk_understood = true;
-        snapshot.auth = AuthScreen::ExperimentalGate {
-            protocol: ProtocolId::Discord,
-        };
-        snapshot.continue_experimental().expect("discord gate");
-        assert_eq!(snapshot.auth, AuthScreen::DiscordChoose);
-        snapshot.finish_discord(DiscordAuthMode::UserAccount);
-        assert!(snapshot.error.is_some());
-        assert!(
-            !snapshot
-                .accounts
-                .iter()
-                .any(|row| row.caps.id == ProtocolId::Discord && row.linked)
-        );
-    }
-
-    #[test]
-    fn telegram_and_slack_skip_experimental_gate() {
-        let mut snapshot = Snapshot::new();
-        snapshot.start_supported(ProtocolId::Telegram);
+        snapshot.open_add_account(&store);
         assert_eq!(snapshot.auth, AuthScreen::TelegramApi);
-        snapshot.start_supported(ProtocolId::Slack);
-        assert_eq!(snapshot.auth, AuthScreen::SlackOAuth);
+    }
+
+    #[test]
+    fn empty_api_fields_do_not_advance() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_telegram(&store);
+        snapshot.advance_telegram(&store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramApi);
+        assert!(snapshot.error.is_some());
+        assert!(store.get(SecretKey::ApiId).expect("get").is_none());
+    }
+
+    #[test]
+    fn cancel_always_returns_to_idle_and_clears_fields() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_telegram(&store);
+        snapshot.telegram_api_id = "11111".into();
+        snapshot.telegram_api_hash = "hash-value".into();
+        snapshot.advance_telegram(&store);
+        snapshot.cancel_auth();
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(snapshot.telegram_api_id.is_empty());
+        assert!(snapshot.telegram_api_hash.is_empty());
+        assert!(snapshot.telegram_phone.is_empty());
+    }
+
+    #[test]
+    fn telegram_flow_stores_secrets_and_lands_in_inbox() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:saved".into(),
+                title: "Saved Messages".into(),
+                participant: "you".into(),
+                preview: "secret-preview-should-not-match-search".into(),
+                unread: 2,
+            },
+        });
+        assert!(snapshot.visible_conversations().is_empty());
+        assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 0);
+        complete_telegram(&mut snapshot, &store);
+        assert!(snapshot.has_primary_account());
+        assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:saved")
+        );
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+        assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 2);
+        assert_eq!(
+            store.get(SecretKey::ApiId).expect("id").as_deref(),
+            Some("11111")
+        );
+        assert_eq!(
+            store.get(SecretKey::ApiHash).expect("hash").as_deref(),
+            Some("hash-value")
+        );
+        assert_eq!(
+            store.get(SecretKey::Session).expect("session").as_deref(),
+            Some("tdlib-stub")
+        );
+        let commands = snapshot.take_commands();
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            AdapterCommand::TelegramAuth {
+                step: TelegramAuthStep::Complete
+            }
+        )));
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            AdapterCommand::Connect {
+                protocol: ProtocolId::Telegram
+            }
+        )));
+        let debug = format!("{commands:?}");
+        assert!(!debug.contains("11111"));
+        assert!(!debug.contains("hash-value"));
+    }
+
+    #[test]
+    fn reopen_prefills_api_from_secret_store() {
+        let store = SecretStore::memory();
+        store.set(SecretKey::ApiId, "999").expect("set id");
+        store
+            .set(SecretKey::ApiHash, "stored-hash")
+            .expect("set hash");
+        let mut snapshot = Snapshot::new();
+        snapshot.open_telegram(&store);
+        assert_eq!(snapshot.telegram_api_id, "999");
+        assert_eq!(snapshot.telegram_api_hash, "stored-hash");
     }
 
     #[test]
@@ -600,61 +614,6 @@ mod tests {
         }
         assert!(!InboxFilter::Telegram.shows_in_switcher(ProtocolId::Slack));
         assert!(!InboxFilter::Slack.shows_in_switcher(ProtocolId::Telegram));
-    }
-
-    #[test]
-    fn whatsapp_gate_uses_all_three_critic_bullets() {
-        let mut snapshot = Snapshot::new();
-        snapshot.choose_protocol(ProtocolId::WhatsApp);
-        let lines = snapshot.critic_lines();
-        assert_eq!(lines, thinwire_protocol::CRITIC_RISK_BULLETS.as_slice());
-    }
-
-    #[test]
-    fn discord_gate_uses_all_three_critic_bullets() {
-        let mut snapshot = Snapshot::new();
-        snapshot.choose_protocol(ProtocolId::Discord);
-        assert_eq!(
-            snapshot.critic_lines(),
-            thinwire_protocol::CRITIC_RISK_BULLETS.as_slice()
-        );
-    }
-
-    #[test]
-    fn discord_user_account_error_quotes_critic_bullet_one() {
-        let mut snapshot = Snapshot::new();
-        snapshot.finish_discord(DiscordAuthMode::UserAccount);
-        let error = snapshot.error.expect("refused");
-        assert_eq!(error.happened, "Discord user-account login was refused.");
-        assert_eq!(error.why, CRITIC_BULLET_1);
-        assert!(!error.next.is_empty());
-    }
-
-    #[test]
-    fn first_run_telegram_lands_in_first_inbox() {
-        let mut snapshot = Snapshot::new();
-        snapshot.apply(AdapterEvent::ConversationUpsert {
-            conversation: Conversation {
-                protocol: ProtocolId::Telegram,
-                id: "telegram:saved".into(),
-                title: "Saved Messages".into(),
-                participant: "you".into(),
-                preview: "secret-preview-should-not-match-search".into(),
-                unread: 2,
-            },
-        });
-        assert!(snapshot.visible_conversations().is_empty());
-        assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 0);
-        snapshot.auth = AuthScreen::Telegram2fa;
-        snapshot.advance_telegram();
-        assert!(snapshot.has_primary_account());
-        assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:saved")
-        );
-        assert_eq!(snapshot.visible_conversations().len(), 1);
-        assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 2);
     }
 
     #[test]

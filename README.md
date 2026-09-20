@@ -10,7 +10,7 @@ Inbox shell (account switcher + conversations on the left, thread in the center)
 
 v1 protocols are Telegram, WhatsApp (experimental), Discord (bot/OAuth inbox only), and Slack OAuth. Signal is out of v1; this MIT binary does not link libsignal or Presage.
 
-First-run offers Telegram (TDLib) and Slack (workspace OAuth). WhatsApp and Discord sit behind an experimental gate that shows the Critic risk notice before any QR or token step. Discord user-account / self-bot fields do not exist. Default builds stay compile-safe stubs (`--features telegram-tdlib` compiles the TDLib hook, still without login or secrets).
+First-run and Add account currently offer Telegram (TDLib) only: api_id / api_hash (from my.telegram.org) → phone → code → optional 2FA. Slack, WhatsApp, and Discord protocol stubs remain; their auth UI is not in this beat. Discord user-account / self-bot fields do not exist. Default builds stay compile-safe stubs (`--features telegram-tdlib` compiles the TDLib hook, still without a live network login). Appearance defaults to the OS light/dark theme (System).
 
 ## Protocol support (honest)
 
@@ -55,6 +55,19 @@ Optional later (local TDLib install; never commit `api_id` / `api_hash` / sessio
 cargo build -p thinwire --features telegram-tdlib
 ```
 
+Telegram `api_id`, `api_hash`, and session material go to the OS secret store (`keyring`):
+
+| Platform | Store |
+| --- | --- |
+| macOS | Keychain |
+| Windows | Credential Manager |
+| Linux | Kernel keyring (keyutils). Session-scoped; no D-Bus Secret Service required. |
+| Linux headless / CI | Same keyutils probe, then in-memory if the kernel store is unavailable. Not written to a file. |
+
+Set `THINWIRE_KEYRING=memory` to skip the OS keychain (CI and local headless). Never put secrets in the repo, `.env` committed files, or logs. Tests use the memory backend and stay green without a desktop keychain or TDLib.
+
+Theme preference is `System` (follow the OS, including live changes), `Light`, or `Dark`. A missing `settings.toml` means System. The file lives under the platform config dir (`~/.config/thinwire/settings.toml` on Linux) and stores only the mode enum.
+
 There is no distroless GUI container. This is a desktop egui app.
 
 Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows. Retention is 7 days. These zips are not a release. They are not signed.
@@ -66,3 +79,5 @@ Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows.
 - Prefer official APIs when they exist
 - Never automate Discord as a normal user account
 - Do not link AGPL libsignal / Presage into this binary
+- Never commit or log Telegram `api_id` / `api_hash` / session strings
+- Default appearance is System theme (ADR 0005)

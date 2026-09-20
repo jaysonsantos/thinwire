@@ -1,39 +1,34 @@
-//! Non-modal auth screens. Field values stay in the snapshot and are discarded.
+//! Non-modal Telegram login. Cancel is always available. Secrets stay off disk
+//! except in the OS keychain (or in-memory when the keychain is unavailable).
 
 use eframe::egui::{self, Color32, RichText};
-use thinwire_protocol::{DiscordAuthMode, ProtocolId};
 
+use super::secrets::SecretStore;
 use super::snapshot::{AuthScreen, Snapshot};
 
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
-const WARN: Color32 = Color32::from_rgb(214, 160, 64);
 
-pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
     if snapshot.auth == AuthScreen::Idle {
         return;
     }
 
     ui.separator();
-    ui.heading("Add account");
+    ui.heading("Add Telegram account");
     ui.label(
-        RichText::new("Cancel is always available. This UI does not block the UI thread and does not store secrets.")
-            .small()
-            .color(MUTED),
+        RichText::new(
+            "Cancel is always available. This UI does not block the UI thread. api_id, api_hash, and session material go to the OS keychain when one is available; they are never written to the git repo or logged.",
+        )
+        .small()
+        .color(MUTED),
     );
 
     match snapshot.auth {
         AuthScreen::Idle => {}
-        AuthScreen::ChooseProtocol => choose_protocol(ui, snapshot),
-        AuthScreen::ExperimentalGate { protocol } => gate(ui, snapshot, protocol),
-        AuthScreen::TelegramApi => telegram_api(ui, snapshot),
-        AuthScreen::TelegramPhone => telegram_phone(ui, snapshot),
-        AuthScreen::TelegramCode => telegram_code(ui, snapshot),
-        AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot),
-        AuthScreen::WhatsAppQr => whatsapp_qr(ui, snapshot),
-        AuthScreen::DiscordChoose => discord_choose(ui, snapshot),
-        AuthScreen::DiscordBot => discord_bot(ui, snapshot),
-        AuthScreen::DiscordOAuth => discord_oauth(ui, snapshot),
-        AuthScreen::SlackOAuth => slack_oauth(ui, snapshot),
+        AuthScreen::TelegramApi => telegram_api(ui, snapshot, secrets),
+        AuthScreen::TelegramPhone => telegram_phone(ui, snapshot, secrets),
+        AuthScreen::TelegramCode => telegram_code(ui, snapshot, secrets),
+        AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot, secrets),
     }
 
     ui.add_space(8.0);
@@ -42,135 +37,69 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     }
 }
 
-fn choose_protocol(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.label("Supported first. Experimental modules sit behind a risk gate.");
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        if ui.button("Telegram · Supported · TDLib").clicked() {
-            snapshot.start_supported(ProtocolId::Telegram);
-        }
-        if ui.button("Slack · Supported · OAuth").clicked() {
-            snapshot.start_supported(ProtocolId::Slack);
-        }
-    });
-    ui.add_space(6.0);
-    ui.label(RichText::new("Experimental / constrained").color(WARN));
-    ui.horizontal(|ui| {
-        if ui.button("WhatsApp · Experimental · ban risk").clicked() {
-            snapshot.choose_protocol(ProtocolId::WhatsApp);
-        }
-        if ui
-            .button("Discord · Constrained · bot/OAuth inbox")
-            .clicked()
-        {
-            snapshot.choose_protocol(ProtocolId::Discord);
-        }
-    });
-}
-
-fn gate(ui: &mut egui::Ui, snapshot: &mut Snapshot, protocol: ProtocolId) {
-    ui.colored_label(
-        WARN,
-        format!(
-            "{protocol} is experimental or constrained. Read this before any QR, code, or token step."
-        ),
+fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+    ui.label("1. Open my.telegram.org, sign in, and open API development tools.");
+    ui.label("2. Create an application and copy api_id and api_hash into these fields.");
+    ui.label(
+        RichText::new("Help: https://my.telegram.org — values are stored in the OS keychain, not in the repo.")
+            .small()
+            .color(MUTED),
     );
-    ui.add_space(4.0);
-    for (index, bullet) in snapshot.critic_lines().iter().enumerate() {
-        ui.label(format!("{}. {bullet}", index + 1));
-        ui.add_space(4.0);
-    }
-    ui.checkbox(&mut snapshot.risk_understood, "I understand the risk");
-    ui.add_enabled_ui(snapshot.risk_understood, |ui| {
-        if ui.button("Continue").clicked() {
-            let _ = snapshot.continue_experimental();
-        }
-    });
-}
-
-fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.label("1. Open my.telegram.org, sign in, and create an application.");
-    ui.label("2. Copy api_id and api_hash into these fields. They are not written to disk.");
     ui.horizontal(|ui| {
         ui.label("api_id");
-        ui.text_edit_singleline(&mut snapshot.telegram_api_id);
+        ui.add(
+            egui::TextEdit::singleline(&mut snapshot.telegram_api_id)
+                .hint_text("numeric id from my.telegram.org"),
+        );
     });
     ui.horizontal(|ui| {
         ui.label("api_hash");
-        ui.text_edit_singleline(&mut snapshot.telegram_api_hash);
+        ui.add(
+            egui::TextEdit::singleline(&mut snapshot.telegram_api_hash)
+                .password(true)
+                .hint_text("from my.telegram.org"),
+        );
     });
     if ui.button("Continue").clicked() {
-        snapshot.advance_telegram();
+        snapshot.advance_telegram(secrets);
     }
 }
 
-fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.label("Phone number (local only). TDLib is not started in this build.");
-    ui.text_edit_singleline(&mut snapshot.telegram_phone);
-    if ui.button("Send code (stub)").clicked() {
-        snapshot.advance_telegram();
-    }
-}
-
-fn telegram_code(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.label("Login code (local only).");
-    ui.text_edit_singleline(&mut snapshot.telegram_code);
-    if ui.button("Continue").clicked() {
-        snapshot.advance_telegram();
-    }
-}
-
-fn telegram_2fa(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.label("Optional 2FA password. Leave blank to skip. Never committed.");
-    ui.text_edit_singleline(&mut snapshot.telegram_2fa);
-    if ui.button("Finish stub").clicked() {
-        snapshot.advance_telegram();
-    }
-}
-
-fn whatsapp_qr(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.colored_label(WARN, "Experimental · ban risk");
-    ui.label("QR placeholder. On a phone: Linked devices → Link a device.");
-    ui.group(|ui| {
-        ui.label(RichText::new("[ QR placeholder ]").italics().color(MUTED));
-        ui.label("No linked-device session is open.");
-    });
-    if ui.button("Close stub").clicked() {
-        snapshot.finish_whatsapp_placeholder();
-    }
-}
-
-fn discord_choose(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+    ui.label("Phone number, including country code. The number stays on this machine.");
     ui.label(
-        "Discord is bot/OAuth inbox only. User login can ban an account. No user-token field exists.",
+        RichText::new(
+            "This build does not start TDLib. Enabling feature telegram-tdlib later uses this same screen to request a code.",
+        )
+        .small()
+        .color(MUTED),
     );
-    ui.horizontal(|ui| {
-        if ui.button("Bot stub").clicked() {
-            snapshot.open_discord_bot();
-        }
-        if ui.button("OAuth stub").clicked() {
-            snapshot.open_discord_oauth();
-        }
-    });
-}
-
-fn discord_bot(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.label("Bot application stub. Paste nothing here in this revision.");
-    if ui.button("Finish bot stub").clicked() {
-        snapshot.finish_discord(DiscordAuthMode::Bot);
+    ui.add(egui::TextEdit::singleline(&mut snapshot.telegram_phone).hint_text("+15551234567"));
+    if ui.button("Send code").clicked() {
+        snapshot.advance_telegram(secrets);
     }
 }
 
-fn discord_oauth(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.label("OAuth application stub. Browser sign-in is not started.");
-    if ui.button("Finish OAuth stub").clicked() {
-        snapshot.finish_discord(DiscordAuthMode::OAuth);
+fn telegram_code(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+    ui.label("Login code from Telegram. It is not written to disk.");
+    ui.add(
+        egui::TextEdit::singleline(&mut snapshot.telegram_code)
+            .password(true)
+            .hint_text("login code"),
+    );
+    if ui.button("Continue").clicked() {
+        snapshot.advance_telegram(secrets);
     }
 }
 
-fn slack_oauth(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.label("Slack workspace OAuth. Browser sign-in would open next. Not a personal Slack desktop clone.");
-    if ui.button("Finish OAuth stub").clicked() {
-        snapshot.finish_slack();
+fn telegram_2fa(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+    ui.label("Optional 2FA password. Leave blank to skip. Never committed or logged.");
+    ui.add(
+        egui::TextEdit::singleline(&mut snapshot.telegram_2fa)
+            .password(true)
+            .hint_text("2FA password (optional)"),
+    );
+    if ui.button("Finish").clicked() {
+        snapshot.advance_telegram(secrets);
     }
 }
