@@ -299,7 +299,8 @@ impl Snapshot {
                 self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
                 self.auth = AuthScreen::TelegramPhone;
                 self.error = None;
-                self.status_text = "Telegram: enter a phone number. The api_id and api_hash are in the secret store.".into();
+                self.status_text =
+                    "Telegram stub: phone step. No live TDLib session. Nothing was sent.".into();
             }
             AuthScreen::TelegramPhone => {
                 let phone = self.telegram_phone.clone();
@@ -310,7 +311,8 @@ impl Snapshot {
                 self.auth = AuthScreen::TelegramCode;
                 self.error = None;
                 self.status_text =
-                    "Telegram: code step. TDLib is not started in this build.".into();
+                    "Telegram stub: code step. No live TDLib session. No code was requested."
+                        .into();
             }
             AuthScreen::TelegramCode => {
                 let code = self.telegram_code.clone();
@@ -320,7 +322,9 @@ impl Snapshot {
                 self.queue_telegram_step(TelegramAuthStep::Code);
                 self.auth = AuthScreen::Telegram2fa;
                 self.error = None;
-                self.status_text = "Telegram: optional 2FA. Leave blank to skip.".into();
+                self.status_text =
+                    "Telegram stub: optional 2FA. No live TDLib session. Leave blank to skip."
+                        .into();
             }
             AuthScreen::Telegram2fa => {
                 self.queue_telegram_step(TelegramAuthStep::TwoFactor);
@@ -382,7 +386,7 @@ impl Snapshot {
         self.prefill_from_store(store);
         self.auth = AuthScreen::TelegramApi;
         self.status_text =
-            "Telegram (TDLib): create an app at my.telegram.org, then enter api_id and api_hash here. Values go to the OS keychain when available.".into();
+            "Telegram stub — no live TDLib session yet. Do not paste api_id or api_hash expecting a real login. Cancel is always available.".into();
     }
 
     fn finish_telegram(&mut self) {
@@ -401,7 +405,7 @@ impl Snapshot {
         self.auth = AuthScreen::Idle;
         self.error = None;
         self.status_text =
-            "Telegram linked in this shell. TDLib is not started; form fields were discarded."
+            "Telegram stub finished. No live TDLib session was opened; form fields were discarded."
                 .into();
     }
 
@@ -498,14 +502,41 @@ mod tests {
     fn auth_ui_is_telegram_only_this_beat() {
         let src = include_str!("auth.rs");
         assert!(src.contains("my.telegram.org"));
+        assert!(src.contains(super::super::auth::TELEGRAM_STUB_BANNER));
+        assert!(src.contains("no live TDLib session yet"));
+        assert!(src.contains("Continue (stub)"));
+        assert!(src.contains("Send code (stub)"));
+        assert!(src.contains("Finish (stub)"));
+        assert!(src.contains("Cancel"));
         assert!(!src.contains("WhatsApp"));
         assert!(!src.contains("Discord"));
         assert!(!src.contains("Slack"));
         let ui = include_str!("ui.rs");
+        assert!(ui.contains("Telegram auth is a stub"));
+        assert!(ui.contains("No live TDLib session yet"));
         assert!(ui.contains("not ready"));
         assert!(ui.contains("not login peers"));
         assert!(!src.contains("UserAccount"));
         assert!(!src.contains("user_token"));
+    }
+
+    #[test]
+    fn telegram_auth_status_names_stub_on_every_step() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_telegram(&store);
+        assert!(snapshot.status_text.contains("stub"));
+        assert!(snapshot.status_text.contains("no live TDLib"));
+        snapshot.telegram_api_id = "11111".into();
+        snapshot.telegram_api_hash = "hash-value".into();
+        snapshot.advance_telegram(&store);
+        assert!(snapshot.status_text.contains("stub"));
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.advance_telegram(&store);
+        assert!(snapshot.status_text.contains("stub"));
+        snapshot.telegram_code = "12345".into();
+        snapshot.advance_telegram(&store);
+        assert!(snapshot.status_text.contains("stub"));
     }
 
     #[test]

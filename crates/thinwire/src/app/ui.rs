@@ -89,6 +89,12 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 snapshot.cancel_auth();
             }
         });
+        if snapshot.auth != super::snapshot::AuthScreen::Idle {
+            ui.colored_label(
+                Color32::from_rgb(214, 160, 64),
+                "Telegram auth is a stub. No live TDLib session yet. Do not paste api_id or api_hash expecting a real login. Cancel is always available.",
+            );
+        }
         if let Some(error) = &snapshot.error {
             let happened = &error.happened;
             let why = &error.why;
@@ -243,10 +249,14 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
 }
 
 fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    ui.heading("Start with Telegram");
-    ui.label("Telegram is the first-run path (official TDLib). Create an application at my.telegram.org.");
+    ui.heading("Start with Telegram (TDLib stub)");
+    ui.colored_label(
+        EXPERIMENTAL,
+        "Stub — no live TDLib session yet. The next screens are scaffolding only. Do not paste api_id or api_hash expecting a real Telegram login.",
+    );
+    ui.label("Help: https://my.telegram.org for later, when a real TDLib client is wired.");
     ui.add_space(8.0);
-    if ui.button("Add Telegram").clicked() {
+    if ui.button("Add Telegram (stub)").clicked() {
         snapshot.open_telegram(secrets);
     }
     ui.add_space(12.0);
