@@ -3,8 +3,9 @@
 use std::collections::{HashMap, HashSet};
 
 use thinwire_protocol::{
-    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, DiscordAuthMode,
-    ProtocolCapabilities, ProtocolId, catalog, critic_bullets_for, requires_experimental_gate,
+    AdapterCommand, AdapterEvent, AdapterStatus, CRITIC_BULLET_1, ChatMessage, Conversation,
+    DiscordAuthMode, ProtocolCapabilities, ProtocolId, catalog, critic_bullets_for,
+    requires_experimental_gate,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,16 @@ impl InboxFilter {
                 ProtocolId::WhatsApp | ProtocolId::Signal | ProtocolId::Discord
             ),
         }
+    }
+
+    /// Inbox filters hide supported accounts; experimental chips stay in the switcher.
+    #[must_use]
+    pub(crate) const fn shows_in_switcher(self, protocol: ProtocolId) -> bool {
+        self.matches(protocol)
+            || matches!(
+                protocol,
+                ProtocolId::WhatsApp | ProtocolId::Signal | ProtocolId::Discord
+            )
     }
 }
 
@@ -93,6 +104,7 @@ pub(crate) struct Snapshot {
     pub telegram_2fa: String,
     pub error: Option<UserError>,
     pub status_text: String,
+    pub compose: String,
     pending: Vec<AdapterCommand>,
 }
 
@@ -124,6 +136,7 @@ impl Snapshot {
             telegram_2fa: String::new(),
             error: None,
             status_text: "Adapters are stubs. No live network session.".into(),
+            compose: String::new(),
             pending: Vec::new(),
         }
     }
@@ -192,6 +205,9 @@ impl Snapshot {
     }
 
     pub(crate) fn visible_conversations(&self) -> Vec<&Conversation> {
+        if !self.protocol_linked(self.selected_protocol) {
+            return Vec::new();
+        }
         let query = self.search.trim().to_ascii_lowercase();
         self.conversations
             .get(&self.selected_protocol)
@@ -200,9 +216,26 @@ impl Snapshot {
             .filter(|row| {
                 query.is_empty()
                     || row.title.to_ascii_lowercase().contains(&query)
-                    || row.preview.to_ascii_lowercase().contains(&query)
+                    || row.participant.to_ascii_lowercase().contains(&query)
             })
             .collect()
+    }
+
+    #[must_use]
+    pub(crate) fn unread_for(&self, protocol: ProtocolId) -> u32 {
+        if !self.protocol_linked(protocol) {
+            return 0;
+        }
+        self.conversations
+            .get(&protocol)
+            .map(|rows| rows.iter().map(|row| row.unread).sum())
+            .unwrap_or(0)
+    }
+
+    fn protocol_linked(&self, protocol: ProtocolId) -> bool {
+        self.accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.linked)
     }
 
     pub(crate) fn selected_account(&self) -> Option<&AccountRow> {
@@ -263,8 +296,8 @@ impl Snapshot {
         if requires_experimental_gate(protocol) {
             self.auth = AuthScreen::ExperimentalGate { protocol };
             self.status_text = format!(
-                "Risk gate for {}. Read the notice before any QR or token step.",
-                protocol.display_name()
+                "Risk gate for {name}. Read the notice before any QR or token step.",
+                name = protocol.display_name()
             );
             return;
         }
@@ -383,7 +416,7 @@ impl Snapshot {
         if mode == DiscordAuthMode::UserAccount {
             self.set_error(
                 "Discord user-account login was refused.",
-                "User-account / self-bot automation can get a personal account banned. License-clean crates do not grant Discord permission.",
+                CRITIC_BULLET_1,
                 "Use a bot token or OAuth app owned by you. Never paste a user token.",
             );
             return;
@@ -400,6 +433,42 @@ impl Snapshot {
             ProtocolId::Slack,
             "Slack OAuth stub noted. Workspace app path; not a personal desktop clone.",
         );
+    }
+
+    pub(crate) fn send_compose_stub(&mut self) {
+        let Some(conversation_id) = self.selected_conversation.clone() else {
+            self.set_error(
+                "Nothing was sent.",
+                "No conversation is selected.",
+                "Pick a thread in the inbox, then type in the compose field.",
+            );
+            return;
+        };
+        let body = self.compose.trim().to_string();
+        if body.is_empty() {
+            self.set_error(
+                "Nothing was sent.",
+                "The compose field is empty.",
+                "Type a message for the selected thread. This stub does not open a live session.",
+            );
+            return;
+        }
+        self.compose.clear();
+        self.error = None;
+        let id = format!("{conversation_id}:compose-stub");
+        self.messages
+            .entry((self.selected_protocol, conversation_id.clone()))
+            .or_default()
+            .push(ChatMessage {
+                protocol: self.selected_protocol,
+                conversation_id,
+                id,
+                sender: "you".into(),
+                body,
+                outbound: true,
+            });
+        self.status_text =
+            "Compose stub queued on the UI snapshot only. No protocol I/O ran.".into();
     }
 
     pub(crate) fn critic_lines(&self) -> &'static [&'static str] {
@@ -496,6 +565,16 @@ mod tests {
     }
 
     #[test]
+    fn discord_auth_source_has_no_user_token_field() {
+        let src = include_str!("auth.rs");
+        assert!(!src.contains("UserAccount"));
+        assert!(!src.contains("user_token"));
+        assert!(src.contains("DiscordAuthMode::Bot"));
+        assert!(src.contains("DiscordAuthMode::OAuth"));
+        assert!(src.contains("No user-token field exists"));
+    }
+
+    #[test]
     fn discord_ui_never_offers_user_account_mode() {
         let mut snapshot = Snapshot::new();
         snapshot.risk_understood = true;
@@ -529,5 +608,124 @@ mod tests {
         assert!(!InboxFilter::Experimental.matches(ProtocolId::Telegram));
         assert!(InboxFilter::Telegram.matches(ProtocolId::Telegram));
         assert!(InboxFilter::All.matches(ProtocolId::Discord));
+    }
+
+    #[test]
+    fn experimental_chips_stay_in_switcher_under_every_filter() {
+        for filter in InboxFilter::ALL {
+            assert!(filter.shows_in_switcher(ProtocolId::WhatsApp));
+            assert!(filter.shows_in_switcher(ProtocolId::Signal));
+            assert!(filter.shows_in_switcher(ProtocolId::Discord));
+        }
+        assert!(!InboxFilter::Telegram.shows_in_switcher(ProtocolId::Slack));
+        assert!(!InboxFilter::Slack.shows_in_switcher(ProtocolId::Telegram));
+    }
+
+    #[test]
+    fn whatsapp_gate_uses_critic_bullets_one_two_and_three() {
+        let mut snapshot = Snapshot::new();
+        snapshot.choose_protocol(ProtocolId::WhatsApp);
+        let lines = snapshot.critic_lines();
+        assert_eq!(lines, thinwire_protocol::CRITIC_RISK_BULLETS.as_slice());
+    }
+
+    #[test]
+    fn signal_gate_uses_critic_bullets_two_and_three() {
+        let mut snapshot = Snapshot::new();
+        snapshot.choose_protocol(ProtocolId::Signal);
+        assert_eq!(
+            snapshot.critic_lines(),
+            &[
+                thinwire_protocol::CRITIC_BULLET_2,
+                thinwire_protocol::CRITIC_BULLET_3
+            ]
+        );
+    }
+
+    #[test]
+    fn discord_gate_uses_all_three_critic_bullets() {
+        let mut snapshot = Snapshot::new();
+        snapshot.choose_protocol(ProtocolId::Discord);
+        assert_eq!(
+            snapshot.critic_lines(),
+            thinwire_protocol::CRITIC_RISK_BULLETS.as_slice()
+        );
+    }
+
+    #[test]
+    fn discord_user_account_error_quotes_critic_bullet_one() {
+        let mut snapshot = Snapshot::new();
+        snapshot.finish_discord(DiscordAuthMode::UserAccount);
+        let error = snapshot.error.expect("refused");
+        assert_eq!(error.happened, "Discord user-account login was refused.");
+        assert_eq!(error.why, CRITIC_BULLET_1);
+        assert!(!error.next.is_empty());
+    }
+
+    #[test]
+    fn first_run_telegram_lands_in_first_inbox() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:saved".into(),
+                title: "Saved Messages".into(),
+                participant: "you".into(),
+                preview: "secret-preview-should-not-match-search".into(),
+                unread: 2,
+            },
+        });
+        assert!(snapshot.visible_conversations().is_empty());
+        assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 0);
+        snapshot.auth = AuthScreen::Telegram2fa;
+        snapshot.advance_telegram();
+        assert!(snapshot.has_primary_account());
+        assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:saved")
+        );
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+        assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 2);
+    }
+
+    #[test]
+    fn search_v1_matches_title_and_participant_only() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:saved".into(),
+                title: "Saved Messages".into(),
+                participant: "you".into(),
+                preview: "secret-preview-should-not-match-search".into(),
+                unread: 0,
+            },
+        });
+        snapshot
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Telegram)
+            .expect("telegram row")
+            .linked = true;
+        snapshot.search = "secret-preview-should-not-match-search".into();
+        assert!(snapshot.visible_conversations().is_empty());
+        snapshot.search = "you".into();
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+        snapshot.search = "saved".into();
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+    }
+
+    #[test]
+    fn compose_stub_appends_outbound_without_protocol_command() {
+        let mut snapshot = Snapshot::new();
+        snapshot.selected_conversation = Some("telegram:saved".into());
+        snapshot.compose = "hello".into();
+        snapshot.send_compose_stub();
+        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.take_commands().is_empty());
+        let messages = snapshot.selected_messages();
+        assert_eq!(messages.last().map(|m| m.body.as_str()), Some("hello"));
+        assert_eq!(messages.last().map(|m| m.outbound), Some(true));
     }
 }

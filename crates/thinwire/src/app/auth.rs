@@ -60,7 +60,10 @@ fn choose_protocol(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         if ui.button("WhatsApp · Experimental · ban risk").clicked() {
             snapshot.choose_protocol(ProtocolId::WhatsApp);
         }
-        if ui.button("Signal · Experimental").clicked() {
+        if ui
+            .button("Signal · Experimental · breakage expected")
+            .clicked()
+        {
             snapshot.choose_protocol(ProtocolId::Signal);
         }
         if ui.button("Discord · Constrained · bot/OAuth").clicked() {
@@ -73,8 +76,7 @@ fn gate(ui: &mut egui::Ui, snapshot: &mut Snapshot, protocol: ProtocolId) {
     ui.colored_label(
         WARN,
         format!(
-            "{} is experimental or constrained. Read this before any QR, code, or token step.",
-            protocol.display_name()
+            "{protocol} is experimental or constrained. Read this before any QR, code, or token step."
         ),
     );
     ui.add_space(4.0);

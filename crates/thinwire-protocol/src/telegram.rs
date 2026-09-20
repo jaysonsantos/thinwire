@@ -54,6 +54,7 @@ impl TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 id: "telegram:saved".into(),
                 title: "Saved Messages".into(),
+                participant: "you".into(),
                 preview: "Placeholder. TDLib is not connected.".into(),
                 unread: 1,
             },
@@ -64,7 +65,8 @@ impl TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 id: "telegram:family".into(),
                 title: "Family".into(),
-                preview: "Official TDLib path — stub only.".into(),
+                participant: "Family".into(),
+                preview: "TDLib path — stub only.".into(),
                 unread: 0,
             },
         );

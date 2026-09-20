@@ -1,6 +1,6 @@
 //! WhatsApp unofficial linked-device stub (ZapFast / whatsapp-rust inspired).
 //!
-//! Experimental. ToS / ban risk. Not a reliable personal client. No networking.
+//! Experimental. ToS / ban risk. No networking.
 
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
@@ -12,7 +12,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::WhatsApp,
     support: SupportClass::Experimental,
     short_label: "Experimental · ban risk",
-    detail: "Unofficial Web / linked-device style (ZapFast / whatsapp-rust inspired). Ban risk. Not reliable.",
+    detail: "Unofficial Web / linked-device style (ZapFast / whatsapp-rust inspired). Ban risk.",
     official_api: false,
     allows_user_account_automation: false,
 };
@@ -40,6 +40,7 @@ impl WhatsAppAdapter {
                 protocol: ProtocolId::WhatsApp,
                 id: "whatsapp:placeholder".into(),
                 title: "Placeholder chat".into(),
+                participant: "Placeholder contact".into(),
                 preview: "Experimental unofficial path — not connected.".into(),
                 unread: 1,
             },

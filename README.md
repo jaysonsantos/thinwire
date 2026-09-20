@@ -18,7 +18,7 @@ First-run offers Telegram (TDLib) and Slack (workspace OAuth). WhatsApp, Signal,
 | Slack | Official Slack OAuth / API (workspace app) | Supported goal |
 | WhatsApp | Unofficial Web / linked-device style (ZapFast / whatsapp-rust inspired) | **Experimental** |
 | Signal | Unsupported third-party stacks (e.g. presage / libsignal) | **Experimental** |
-| Discord | Official bot/OAuth only — no Discord user self-bots | Constrained / experimental |
+| Discord | Bot/OAuth only — no Discord user self-bots | Constrained / experimental |
 
 ## Risk notice (required)
 

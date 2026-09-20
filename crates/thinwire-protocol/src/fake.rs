@@ -63,6 +63,7 @@ impl ProtocolAdapter for FakeAdapter {
                         protocol: ProtocolId::Telegram,
                         id: "fake:chat".into(),
                         title: "Fake chat".into(),
+                        participant: "worker".into(),
                         preview: "Pushed from the worker.".into(),
                         unread: 0,
                     },

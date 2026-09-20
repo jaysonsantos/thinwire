@@ -144,12 +144,13 @@ pub enum AdapterEvent {
     },
 }
 
-/// Conversation row shown in the middle pane.
+/// Conversation row shown in the inbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversation {
     pub protocol: ProtocolId,
     pub id: String,
     pub title: String,
+    pub participant: String,
     pub preview: String,
     pub unread: u32,
 }

@@ -38,6 +38,7 @@ impl SlackAdapter {
                 protocol: ProtocolId::Slack,
                 id: "slack:example-channel".into(),
                 title: "#general".into(),
+                participant: "workspace".into(),
                 preview: "OAuth workspace stub — not connected.".into(),
                 unread: 1,
             },

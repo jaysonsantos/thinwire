@@ -1,4 +1,4 @@
-//! Discord official bot/OAuth stub. User-account self-bots are refused.
+//! Discord bot/OAuth stub. User-account self-bots are refused.
 
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, DiscordAuthMode,
@@ -10,12 +10,12 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Discord,
     support: SupportClass::Constrained,
     short_label: "Constrained · bot/OAuth only",
-    detail: "Official bot/OAuth only. No Discord user-account self-bots. Not a reliable personal client.",
+    detail: "Bot/OAuth only. No Discord user-account self-bots. User login can ban an account.",
     official_api: true,
     allows_user_account_automation: false,
 };
 
-const SELF_BOT_REFUSAL: &str = "Discord user-account / self-bot automation is refused. Official bot/OAuth only. License-clean crates do not grant Discord permission to automate a personal account.";
+const SELF_BOT_REFUSAL: &str = "Discord user-account / self-bot automation is refused. Bot/OAuth only. License-clean crates do not grant Discord permission to automate a personal account.";
 
 /// Constrained Discord stub. Never starts a user-account client.
 #[derive(Debug)]
@@ -48,6 +48,7 @@ impl DiscordAdapter {
                 protocol: ProtocolId::Discord,
                 id: "discord:example-guild".into(),
                 title: "Example guild #general".into(),
+                participant: "Example guild".into(),
                 preview: "Bot/OAuth stub — no user-account session.".into(),
                 unread: 1,
             },
@@ -59,7 +60,7 @@ impl DiscordAdapter {
                 conversation_id: "discord:example-guild".into(),
                 id: "discord:example-guild:1".into(),
                 sender: "thinwire".into(),
-                body: "Discord is constrained to official bot/OAuth. User-account / self-bot paths are refused.".into(),
+                body: "Discord is constrained to bot/OAuth. User-account / self-bot paths are refused.".into(),
                 outbound: false,
             },
         );

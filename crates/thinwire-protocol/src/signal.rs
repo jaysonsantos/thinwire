@@ -1,6 +1,6 @@
 //! Signal unsupported third-party stub (presage / libsignal-style).
 //!
-//! Experimental. Breakage expected. Not a reliable personal client. No networking.
+//! Experimental. Breakage expected. No networking.
 
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
@@ -12,7 +12,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Signal,
     support: SupportClass::Experimental,
     short_label: "Experimental · breakage expected",
-    detail: "No supported third-party client API. presage/libsignal-style path. Breakage expected. Not reliable.",
+    detail: "No supported third-party client API. presage/libsignal-style path. Breakage expected.",
     official_api: false,
     allows_user_account_automation: false,
 };
@@ -40,6 +40,7 @@ impl SignalAdapter {
                 protocol: ProtocolId::Signal,
                 id: "signal:placeholder".into(),
                 title: "Placeholder chat".into(),
+                participant: "Placeholder contact".into(),
                 preview: "Unsupported third-party path — not connected.".into(),
                 unread: 1,
             },

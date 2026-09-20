@@ -27,9 +27,10 @@ pub const fn requires_experimental_gate(protocol: ProtocolId) -> bool {
 #[must_use]
 pub const fn critic_bullets_for(protocol: ProtocolId) -> &'static [&'static str] {
     match protocol {
-        ProtocolId::WhatsApp => &[CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3],
+        ProtocolId::WhatsApp | ProtocolId::Discord => {
+            &[CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3]
+        }
         ProtocolId::Signal => &[CRITIC_BULLET_2, CRITIC_BULLET_3],
-        ProtocolId::Discord => &[CRITIC_BULLET_1, CRITIC_BULLET_3],
         ProtocolId::Telegram | ProtocolId::Slack => &[],
     }
 }
@@ -67,5 +68,17 @@ mod tests {
         assert!(critic_bullets_for(ProtocolId::Signal).contains(&CRITIC_BULLET_2));
         assert!(critic_bullets_for(ProtocolId::Discord).contains(&CRITIC_BULLET_1));
         assert!(critic_bullets_for(ProtocolId::Telegram).is_empty());
+        assert_eq!(
+            critic_bullets_for(ProtocolId::WhatsApp),
+            CRITIC_RISK_BULLETS.as_slice()
+        );
+        assert_eq!(
+            critic_bullets_for(ProtocolId::Signal),
+            &[CRITIC_BULLET_2, CRITIC_BULLET_3]
+        );
+        assert_eq!(
+            critic_bullets_for(ProtocolId::Discord),
+            CRITIC_RISK_BULLETS.as_slice()
+        );
     }
 }

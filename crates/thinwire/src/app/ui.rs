@@ -60,14 +60,26 @@ fn status_strip(ctx: &egui::Context, snapshot: &mut Snapshot) {
             }
         });
         if let Some(error) = &snapshot.error {
-            ui.colored_label(Color32::from_rgb(200, 80, 80), format!("What happened: {}", error.happened));
-            ui.label(format!("Why: {}", error.why));
-            ui.label(format!("What to do: {}", error.next));
+            let happened = &error.happened;
+            let why = &error.why;
+            let next = &error.next;
+            ui.colored_label(
+                Color32::from_rgb(200, 80, 80),
+                format!("What happened: {happened}"),
+            );
+            ui.label(format!("Why: {why}"));
+            ui.label(format!("What to do: {next}"));
         }
+        ui.colored_label(
+            MUTED,
+            "Offline — no live protocol session. Linking and refresh stay on the tokio worker.",
+        );
         ui.label(
-            RichText::new("No live network session. Telegram (TDLib) and Slack (OAuth) are the supported goals.")
-                .small()
-                .color(MUTED),
+            RichText::new(
+                "Supported goals: Telegram via TDLib and Slack via OAuth. Experimental modules are not marketed here.",
+            )
+            .small()
+            .color(MUTED),
         );
     });
 }
@@ -86,12 +98,22 @@ fn left_panel(ctx: &egui::Context, snapshot: &mut Snapshot) {
             );
             ui.separator();
 
+            let unread_by_protocol: Vec<u32> = snapshot
+                .accounts
+                .iter()
+                .map(|account| snapshot.unread_for(account.caps.id))
+                .collect();
             let mut clicked: Option<ProtocolId> = None;
-            for account in &snapshot.accounts {
-                if !snapshot.filter.matches(account.caps.id) {
+            for (account, unread) in snapshot.accounts.iter().zip(unread_by_protocol) {
+                if !snapshot.filter.shows_in_switcher(account.caps.id) {
                     continue;
                 }
-                if account_chip(ui, account, snapshot.selected_protocol == account.caps.id) {
+                if account_chip(
+                    ui,
+                    account,
+                    snapshot.selected_protocol == account.caps.id,
+                    unread,
+                ) {
                     clicked = Some(account.caps.id);
                 }
                 ui.add_space(4.0);
@@ -107,10 +129,16 @@ fn left_panel(ctx: &egui::Context, snapshot: &mut Snapshot) {
         });
 }
 
-fn account_chip(ui: &mut egui::Ui, account: &AccountRow, selected: bool) -> bool {
+fn account_chip(ui: &mut egui::Ui, account: &AccountRow, selected: bool, unread: u32) -> bool {
     let caps = account.caps;
     let mark = if account.linked { "●" } else { "○" };
-    let response = ui.selectable_label(selected, format!("{mark} {}", caps.id.display_name()));
+    let name = caps.id.display_name();
+    let label = if unread == 0 {
+        format!("{mark} {name}")
+    } else {
+        format!("{mark} {name}  ({unread})")
+    };
+    let response = ui.selectable_label(selected, label);
     ui.colored_label(support_color(caps.support), caps.short_label);
     ui.label(
         RichText::new(format!("status: {}", account.status.as_str()))
@@ -199,7 +227,7 @@ fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     }
 }
 
-fn thread(ui: &mut egui::Ui, snapshot: &Snapshot) {
+fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     match snapshot.selected_conversation_row() {
         Some(conversation) => {
             ui.heading(&conversation.title);
@@ -214,32 +242,50 @@ fn thread(ui: &mut egui::Ui, snapshot: &Snapshot) {
     }
     ui.separator();
 
-    let messages = snapshot.selected_messages();
-    if messages.is_empty() {
-        ui.label(
-            RichText::new("No messages yet. Adapters push placeholders over the channel.")
-                .italics()
-                .color(MUTED),
-        );
-        return;
-    }
+    let messages: Vec<(bool, String, String)> = snapshot
+        .selected_messages()
+        .iter()
+        .map(|message| {
+            (
+                message.outbound,
+                message.sender.clone(),
+                message.body.clone(),
+            )
+        })
+        .collect();
 
     egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
+        .auto_shrink([false, true])
+        .max_height(ui.available_height() - 48.0)
         .show(ui, |ui| {
-            for message in messages {
+            if messages.is_empty() {
+                ui.label(
+                    RichText::new("No messages yet. Adapters push placeholders over the channel.")
+                        .italics()
+                        .color(MUTED),
+                );
+            }
+            for (outbound, sender, body) in messages {
                 ui.group(|ui| {
-                    let who = if message.outbound {
-                        "you"
-                    } else {
-                        message.sender.as_str()
-                    };
+                    let who = if outbound { "you" } else { sender.as_str() };
                     ui.strong(who);
-                    ui.label(&message.body);
+                    ui.label(body);
                 });
                 ui.add_space(4.0);
             }
         });
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut snapshot.compose)
+                .desired_width(ui.available_width() - 72.0)
+                .hint_text("Message"),
+        );
+        if ui.button("Send").clicked() {
+            snapshot.send_compose_stub();
+        }
+    });
 }
 
 fn support_color(support: SupportClass) -> Color32 {

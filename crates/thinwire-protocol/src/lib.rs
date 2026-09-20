@@ -87,4 +87,27 @@ mod tests {
         );
         assert!(!by_id(ProtocolId::Discord).allows_user_account_automation);
     }
+
+    #[test]
+    fn experimental_labels_avoid_banned_marketing_words() {
+        for caps in catalog() {
+            let short = caps.short_label;
+            let detail = caps.detail;
+            let blob = format!("{short} {detail}").to_ascii_lowercase();
+            if matches!(
+                caps.id,
+                ProtocolId::WhatsApp | ProtocolId::Signal | ProtocolId::Discord
+            ) {
+                let name = caps.id.display_name();
+                assert!(!contains_word(&blob, "reliable"), "{name}");
+                assert!(!contains_word(&blob, "production"), "{name}");
+                assert!(!contains_word(&blob, "official"), "{name}");
+            }
+        }
+    }
+
+    fn contains_word(hay: &str, word: &str) -> bool {
+        hay.split(|ch: char| !ch.is_ascii_alphabetic())
+            .any(|token| token == word)
+    }
 }
