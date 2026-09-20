@@ -6,7 +6,9 @@ The UI thread must never block; protocol I/O runs async off the main thread.
 
 ## Status
 
-Scaffold only. Protocol adapters are not production-ready.
+Three-pane shell (accounts / conversations / messages) with protocol adapters behind a tokio channel. The UI only polls events; workers must not call egui APIs.
+
+Telegram is wired toward official TDLib (`tdlib-rs`); the default build is a compile-safe stub (`--features telegram-tdlib` compiles the binding hook, still without login or secrets). WhatsApp, Signal, Discord, and Slack expose honest capability metadata only. Discord user-account / self-bot paths are refused. None of these adapters are production-ready.
 
 ## Protocol support (honest)
 
@@ -31,7 +33,16 @@ MIT. Keep third-party notices (including Boost for TDLib if bundled).
 ## Build
 
 ```bash
+cargo build
+cargo test
+cargo clippy -- -D warnings
 cargo run
+```
+
+Optional later (local TDLib install; never commit `api_id` / `api_hash` / session strings):
+
+```bash
+cargo build --features telegram-tdlib
 ```
 
 ## Design rules
