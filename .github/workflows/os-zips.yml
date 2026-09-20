@@ -1,0 +1,94 @@
+# Unsigned OS zips on main only. These are not releases.
+# pull_request never triggers this workflow, and the job also refuses non-main pushes.
+name: OS zips
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  os-zips:
+    name: zip-${{ matrix.artifact }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: linux-x86_64
+          - os: macos-latest
+            artifact: macos-arm64
+          - os: windows-latest
+            artifact: windows-x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            cmake \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Build release binary
+        run: cargo build --release -p thinwire
+
+      - name: Zip unsigned binary
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [[ -f target/release/thinwire.exe ]]; then
+            cp target/release/thinwire.exe dist/
+          else
+            cp target/release/thinwire dist/
+          fi
+          if command -v python3 >/dev/null; then
+            PY=python3
+          else
+            PY=python
+          fi
+          "$PY" - <<'PY'
+          import os
+          import shutil
+
+          name = os.environ["ARTIFACT"]
+          shutil.make_archive(f"thinwire-{name}", "zip", "dist")
+          PY
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thinwire-${{ matrix.artifact }}
+          path: thinwire-${{ matrix.artifact }}.zip
+          if-no-files-found: error
+          retention-days: 7
