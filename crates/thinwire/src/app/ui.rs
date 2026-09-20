@@ -219,9 +219,7 @@ fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     });
     ui.add_space(12.0);
     ui.label(RichText::new("Experimental modules").color(EXPERIMENTAL));
-    ui.label(
-        "WhatsApp, Signal, and Discord sit behind a risk gate. They are not the first-run path.",
-    );
+    ui.label("WhatsApp and Discord sit behind a risk gate. They are not the first-run path.");
     if ui.button("Add experimental account").clicked() {
         snapshot.open_add_account();
     }
