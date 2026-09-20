@@ -123,7 +123,7 @@ impl SecretStore {
             );
             return Arc::new(Self::memory());
         }
-        let store = Arc::new(Self::blank(AttachPhase::Attaching));
+        let store = Arc::new(Self::blank(AttachPhase::Detached));
         store.spawn_os_attach(handle);
         store
     }
