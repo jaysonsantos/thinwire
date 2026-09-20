@@ -3,10 +3,13 @@
 //! The UI thread only touches an in-memory map. OS keychain I/O runs on a
 //! tokio `spawn_blocking` worker so egui never waits on keyutils / Keychain /
 //! Credential Manager. Never log or persist these values in the git repo.
+//!
+//! Attach is an ordered state machine (`Detached` → `Attaching` → `Ready` or
+//! `MemoryOnly`). UI writes mark keys dirty so a late hydrate cannot overwrite
+//! them. A flush requested before `Ready` is deferred and runs after attach.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use keyring::Entry;
@@ -73,26 +76,54 @@ impl fmt::Display for SecretError {
 
 impl std::error::Error for SecretError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachPhase {
+    Detached,
+    Attaching,
+    Ready,
+    MemoryOnly,
+}
+
+struct Inner {
+    values: HashMap<SecretKey, String>,
+    dirty: HashSet<SecretKey>,
+    flush_pending: bool,
+    phase: AttachPhase,
+}
+
 /// Memory-first store. OS keychain attach/flush is worker-only.
 pub struct SecretStore {
-    memory: Mutex<HashMap<SecretKey, String>>,
-    os: AtomicBool,
+    inner: Mutex<Inner>,
 }
 
 impl SecretStore {
+    fn blank(phase: AttachPhase) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                values: HashMap::new(),
+                dirty: HashSet::new(),
+                flush_pending: false,
+                phase,
+            }),
+        }
+    }
+
     /// UI-safe constructor. Does not talk to the OS keychain.
     #[must_use]
     pub fn memory() -> Self {
-        Self {
-            memory: Mutex::new(HashMap::new()),
-            os: AtomicBool::new(false),
-        }
+        Self::blank(AttachPhase::MemoryOnly)
     }
 
     /// UI constructor plus a worker that attaches the OS keychain if available.
     #[must_use]
     pub fn for_ui(handle: &Handle) -> Arc<Self> {
-        let store = Arc::new(Self::memory());
+        if memory_requested() {
+            tracing::info!(
+                "{KEYRING_ENV}={KEYRING_MEMORY}; Telegram secrets stay in memory this session"
+            );
+            return Arc::new(Self::memory());
+        }
+        let store = Arc::new(Self::blank(AttachPhase::Attaching));
         store.spawn_os_attach(handle);
         store
     }
@@ -101,43 +132,48 @@ impl SecretStore {
     #[cfg(test)]
     #[must_use]
     pub fn open() -> Self {
-        let store = Self::memory();
+        let store = Self::blank(AttachPhase::Detached);
         store.attach_os_keychain();
         store
     }
 
     #[must_use]
     pub fn backend_name(&self) -> &'static str {
-        if self.os.load(Ordering::Relaxed) {
-            "os-keychain"
-        } else {
-            "memory"
+        match self.phase() {
+            AttachPhase::Ready => "os-keychain",
+            AttachPhase::Detached | AttachPhase::Attaching | AttachPhase::MemoryOnly => "memory",
         }
     }
 
-    /// UI thread: update the in-memory map only.
+    fn phase(&self) -> AttachPhase {
+        self.lock()
+            .map(|inner| inner.phase)
+            .unwrap_or(AttachPhase::MemoryOnly)
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, SecretError> {
+        self.inner
+            .lock()
+            .map_err(|_| SecretError::new("memory secret store is poisoned"))
+    }
+
+    /// UI thread: update the in-memory map only. Marks the key dirty so a
+    /// hydrate that finishes later cannot overwrite this write.
     pub fn set(&self, key: SecretKey, value: &str) -> Result<(), SecretError> {
         let trimmed = value.trim();
-        let mut map = self
-            .memory
-            .lock()
-            .map_err(|_| SecretError::new("memory secret store is poisoned"))?;
+        let mut inner = self.lock()?;
         if trimmed.is_empty() {
-            map.remove(&key);
+            inner.values.remove(&key);
         } else {
-            map.insert(key, trimmed.to_string());
+            inner.values.insert(key, trimmed.to_string());
         }
+        inner.dirty.insert(key);
         Ok(())
     }
 
     /// UI thread: read the in-memory map only.
     pub fn get(&self, key: SecretKey) -> Result<Option<String>, SecretError> {
-        Ok(self
-            .memory
-            .lock()
-            .map_err(|_| SecretError::new("memory secret store is poisoned"))?
-            .get(&key)
-            .cloned())
+        Ok(self.lock()?.values.get(&key).cloned())
     }
 
     #[cfg(test)]
@@ -150,6 +186,7 @@ impl SecretStore {
             tracing::info!(
                 "{KEYRING_ENV}={KEYRING_MEMORY}; Telegram secrets stay in memory this session"
             );
+            self.finish_memory_only();
             return;
         }
         let store = Arc::clone(self);
@@ -157,32 +194,70 @@ impl SecretStore {
     }
 
     pub fn spawn_os_flush(self: &Arc<Self>, handle: &Handle) {
-        if !self.os.load(Ordering::Relaxed) {
-            return;
-        }
-        let store = Arc::clone(self);
-        handle.spawn_blocking(move || {
-            if let Err(error) = store.flush_os() {
-                tracing::warn!(error = %error, "OS keychain flush failed; secrets stay in memory");
+        match self.request_flush() {
+            FlushAction::Spawn => {
+                let store = Arc::clone(self);
+                handle.spawn_blocking(move || {
+                    if let Err(error) = store.flush_os() {
+                        tracing::warn!(
+                            error = %error,
+                            "OS keychain flush failed; secrets stay in memory"
+                        );
+                    }
+                });
             }
-        });
+            FlushAction::Defer | FlushAction::Ignore => {}
+        }
+    }
+
+    fn request_flush(&self) -> FlushAction {
+        let Ok(mut inner) = self.lock() else {
+            return FlushAction::Ignore;
+        };
+        match inner.phase {
+            AttachPhase::Ready => FlushAction::Spawn,
+            AttachPhase::Detached | AttachPhase::Attaching => {
+                inner.flush_pending = true;
+                FlushAction::Defer
+            }
+            AttachPhase::MemoryOnly => FlushAction::Ignore,
+        }
     }
 
     /// Blocking. Worker / tests only.
     pub fn attach_os_keychain(&self) {
+        {
+            let Ok(mut inner) = self.lock() else {
+                return;
+            };
+            match inner.phase {
+                AttachPhase::Ready | AttachPhase::MemoryOnly => return,
+                AttachPhase::Detached | AttachPhase::Attaching => {
+                    inner.phase = AttachPhase::Attaching;
+                }
+            }
+        }
         if memory_requested() {
+            self.finish_memory_only();
             return;
         }
         match probe_os() {
             Ok(()) => {
-                self.os.store(true, Ordering::Relaxed);
-                if let Err(error) = self.hydrate_from_os() {
+                let (os_values, hydrate_error) = read_os_snapshot();
+                let should_flush = self.finish_ready(os_values);
+                if let Some(error) = hydrate_error {
                     tracing::warn!(
                         error = %error,
-                        "OS keychain attached but hydrate failed; memory stays empty"
+                        "OS keychain attached but hydrate failed; dirty UI writes are kept"
                     );
                 } else {
                     tracing::info!("using the OS keychain for Telegram secrets");
+                }
+                if should_flush && let Err(error) = self.flush_os() {
+                    tracing::warn!(
+                        error = %error,
+                        "OS keychain flush after attach failed; secrets stay in memory"
+                    );
                 }
             }
             Err(error) => {
@@ -190,20 +265,46 @@ impl SecretStore {
                     error = %error,
                     "OS keychain unavailable; Telegram secrets stay in memory this session and are not written to disk"
                 );
+                self.finish_memory_only();
             }
         }
     }
 
-    fn hydrate_from_os(&self) -> Result<(), SecretError> {
-        for key in SecretKey::ALL {
-            if let Some(value) = os_get(key)? {
-                self.set(key, &value)?;
+    fn finish_memory_only(&self) {
+        if let Ok(mut inner) = self.lock() {
+            inner.phase = AttachPhase::MemoryOnly;
+            inner.flush_pending = false;
+        }
+    }
+
+    /// Merge OS values under the store lock. Dirty UI keys win. Returns
+    /// whether a deferred flush (or any dirty write) must hit the keychain.
+    fn finish_ready(&self, os_values: HashMap<SecretKey, String>) -> bool {
+        let Ok(mut inner) = self.lock() else {
+            return false;
+        };
+        for (key, value) in os_values {
+            if inner.dirty.contains(&key) {
+                continue;
+            }
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                inner.values.remove(&key);
+            } else {
+                inner.values.insert(key, trimmed.to_string());
             }
         }
-        Ok(())
+        inner.phase = AttachPhase::Ready;
+        let should_flush = inner.flush_pending || !inner.dirty.is_empty();
+        inner.flush_pending = false;
+        inner.dirty.clear();
+        should_flush
     }
 
     fn flush_os(&self) -> Result<(), SecretError> {
+        if self.phase() != AttachPhase::Ready {
+            return Ok(());
+        }
         for key in SecretKey::ALL {
             match self.get(key)? {
                 Some(value) => os_set(key, &value)?,
@@ -212,6 +313,27 @@ impl SecretStore {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushAction {
+    Spawn,
+    Defer,
+    Ignore,
+}
+
+fn read_os_snapshot() -> (HashMap<SecretKey, String>, Option<SecretError>) {
+    let mut os_values = HashMap::new();
+    for key in SecretKey::ALL {
+        match os_get(key) {
+            Ok(Some(value)) => {
+                os_values.insert(key, value);
+            }
+            Ok(None) => {}
+            Err(error) => return (os_values, Some(error)),
+        }
+    }
+    (os_values, None)
 }
 
 impl fmt::Debug for SecretStore {
@@ -280,6 +402,21 @@ fn map_keyring_error(error: keyring::Error) -> SecretError {
 mod tests {
     use super::*;
 
+    impl SecretStore {
+        fn force_attaching(&self) {
+            let mut inner = self.lock().expect("lock");
+            inner.phase = AttachPhase::Attaching;
+        }
+
+        fn complete_ready_for_test(&self, os: &[(SecretKey, &str)]) -> bool {
+            let os_values = os
+                .iter()
+                .map(|(key, value)| (*key, (*value).to_string()))
+                .collect();
+            self.finish_ready(os_values)
+        }
+    }
+
     #[test]
     fn memory_round_trip_does_not_leak_in_debug() {
         let store = SecretStore::memory();
@@ -336,5 +473,60 @@ mod tests {
         let err = SecretError::new("OS keychain: no storage access");
         assert!(!err.to_string().contains("api_hash"));
         assert!(!format!("{err:?}").contains("password"));
+    }
+
+    #[test]
+    fn hydrate_does_not_overwrite_dirty_ui_writes() {
+        let store = SecretStore::blank(AttachPhase::Attaching);
+        store.set(SecretKey::ApiId, "11111").expect("ui write");
+        let should_flush = store.complete_ready_for_test(&[
+            (SecretKey::ApiId, "stale-os-id"),
+            (SecretKey::ApiHash, "placeholder-hash"),
+        ]);
+        assert!(should_flush);
+        assert_eq!(store.backend_name(), "os-keychain");
+        assert_eq!(
+            store.get(SecretKey::ApiId).expect("id").as_deref(),
+            Some("11111")
+        );
+        assert_eq!(
+            store.get(SecretKey::ApiHash).expect("hash").as_deref(),
+            Some("placeholder-hash")
+        );
+        let debug = format!("{store:?}");
+        assert!(!debug.contains("11111"));
+        assert!(!debug.contains("stale-os-id"));
+        assert!(!debug.contains("placeholder-hash"));
+    }
+
+    #[test]
+    fn flush_during_attach_is_deferred_until_ready() {
+        let store = SecretStore::blank(AttachPhase::Attaching);
+        store.set(SecretKey::ApiId, "11111").expect("ui write");
+        assert_eq!(store.request_flush(), FlushAction::Defer);
+        assert_eq!(store.backend_name(), "memory");
+        let should_flush = store.complete_ready_for_test(&[(SecretKey::ApiId, "stale-os-id")]);
+        assert!(should_flush);
+        assert_eq!(store.request_flush(), FlushAction::Spawn);
+        assert_eq!(
+            store.get(SecretKey::ApiId).expect("id").as_deref(),
+            Some("11111")
+        );
+    }
+
+    #[test]
+    fn flush_while_memory_only_is_ignored() {
+        let store = SecretStore::memory();
+        store.set(SecretKey::ApiId, "11111").expect("ui write");
+        assert_eq!(store.request_flush(), FlushAction::Ignore);
+        assert_eq!(store.backend_name(), "memory");
+    }
+
+    #[test]
+    fn attaching_phase_stays_memory_until_ready() {
+        let store = SecretStore::blank(AttachPhase::Detached);
+        store.force_attaching();
+        assert_eq!(store.backend_name(), "memory");
+        assert_eq!(store.phase(), AttachPhase::Attaching);
     }
 }

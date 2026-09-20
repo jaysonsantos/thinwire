@@ -59,23 +59,19 @@ fn top_bar(
                 snapshot.open_add_account(secrets);
             }
             ui.separator();
-            theme_control(ui, snapshot, settings);
+            theme_control(ui, settings);
         });
         ui.add_space(2.0);
     });
 }
 
-fn theme_control(ui: &mut egui::Ui, snapshot: &mut Snapshot, settings: &mut Settings) {
+fn theme_control(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.label("Theme");
     let mut preference = settings.theme().to_egui();
     preference.radio_buttons(ui);
     let chosen = ThemeMode::from_egui(preference);
     if chosen != settings.theme() {
-        if let Err(error) = settings.set_theme(chosen) {
-            snapshot.status_text = format!(
-                "Theme is {chosen} this session; the settings file was not written ({error})."
-            );
-        }
+        settings.set_theme(chosen);
         settings.apply(ui.ctx());
     }
 }
