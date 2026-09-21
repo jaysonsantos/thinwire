@@ -40,7 +40,7 @@ tokio = { version = "1", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dirs = "6"
+dirs = "7"
 # No default features: pick OS stores explicitly. Linux uses kernel
 # keyutils so CI compiles without libdbus. Runtime falls back to memory
 # when the platform store is unavailable.
