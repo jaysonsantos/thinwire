@@ -41,6 +41,10 @@ jobs:
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment"'
+          # Cursor Cloud Agent pushes as cursor[bot]; without this the action
+          # fails on pull_request synchronize with a non-human-actor error.
+          # Do not use '*' on this public MIT repo.
+          allowed_bots: 'cursor[bot]'
           # The action hides the output of the SDK. Without this, a run that
           # fails reports `is_error: true` and no message.
           show_full_output: true

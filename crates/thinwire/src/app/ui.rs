@@ -4,6 +4,8 @@ use eframe::egui::{self, Color32, RichText};
 use thinwire_protocol::{ProtocolId, SupportClass};
 
 use super::auth;
+use super::secrets::SecretStore;
+use super::settings::{Settings, ThemeMode};
 use super::snapshot::{AccountRow, InboxFilter, Snapshot};
 
 const SUPPORTED: Color32 = Color32::from_rgb(96, 176, 128);
@@ -11,14 +13,25 @@ const EXPERIMENTAL: Color32 = Color32::from_rgb(214, 160, 64);
 const CONSTRAINED: Color32 = Color32::from_rgb(196, 148, 88);
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
 
-pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    top_bar(ui, snapshot);
+pub(crate) fn draw(
+    ui: &mut egui::Ui,
+    snapshot: &mut Snapshot,
+    settings: &mut Settings,
+    secrets: &SecretStore,
+) {
+    settings.apply(ui.ctx());
+    top_bar(ui, snapshot, settings, secrets);
     status_strip(ui, snapshot);
     left_panel(ui, snapshot);
-    center_panel(ui, snapshot);
+    center_panel(ui, snapshot, secrets);
 }
 
-fn top_bar(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+fn top_bar(
+    ui: &mut egui::Ui,
+    snapshot: &mut Snapshot,
+    settings: &mut Settings,
+    secrets: &SecretStore,
+) {
     egui::Panel::top("top").show(ui, |ui| {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -43,11 +56,24 @@ fn top_bar(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 snapshot.refresh_visible();
             }
             if ui.button("Add account").clicked() {
-                snapshot.open_add_account();
+                snapshot.open_add_account(secrets);
             }
+            ui.separator();
+            theme_control(ui, settings);
         });
         ui.add_space(2.0);
     });
+}
+
+fn theme_control(ui: &mut egui::Ui, settings: &mut Settings) {
+    ui.label("Theme");
+    let mut preference = settings.theme().to_egui();
+    preference.radio_buttons(ui);
+    let chosen = ThemeMode::from_egui(preference);
+    if chosen != settings.theme() {
+        settings.set_theme(chosen);
+        settings.apply(ui.ctx());
+    }
 }
 
 fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
@@ -59,6 +85,12 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 snapshot.cancel_auth();
             }
         });
+        if snapshot.auth != super::snapshot::AuthScreen::Idle {
+            ui.colored_label(
+                Color32::from_rgb(214, 160, 64),
+                "Telegram auth is a stub. No live TDLib session yet. Do not paste api_id or api_hash expecting a real login. Cancel is always available.",
+            );
+        }
         if let Some(error) = &snapshot.error {
             let happened = &error.happened;
             let why = &error.why;
@@ -145,6 +177,13 @@ fn account_chip(ui: &mut egui::Ui, account: &AccountRow, selected: bool, unread:
             .small()
             .color(MUTED),
     );
+    if !matches!(caps.id, ProtocolId::Telegram) {
+        ui.label(
+            RichText::new("not ready — no login UI this beat")
+                .small()
+                .color(MUTED),
+        );
+    }
     response.clicked()
 }
 
@@ -189,15 +228,15 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     }
 }
 
-fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
     egui::CentralPanel::default().show(ui, |ui| {
         if snapshot.auth != super::snapshot::AuthScreen::Idle {
-            auth::draw(ui, snapshot);
+            auth::draw(ui, snapshot, secrets);
             return;
         }
 
         if !snapshot.has_primary_account() {
-            first_run(ui, snapshot);
+            first_run(ui, snapshot, secrets);
             return;
         }
 
@@ -205,24 +244,24 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     });
 }
 
-fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    ui.heading("Start with a supported account");
-    ui.label("Telegram uses TDLib. Slack uses workspace OAuth.");
+fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+    ui.heading("Start with Telegram (TDLib stub)");
+    ui.colored_label(
+        EXPERIMENTAL,
+        "Stub — no live TDLib session yet. The next screens are scaffolding only. Do not paste api_id or api_hash expecting a real Telegram login.",
+    );
+    ui.label("Help: https://my.telegram.org for later, when a real TDLib client is wired.");
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
-        if ui.button("Add Telegram").clicked() {
-            snapshot.start_supported(ProtocolId::Telegram);
-        }
-        if ui.button("Add Slack").clicked() {
-            snapshot.start_supported(ProtocolId::Slack);
-        }
-    });
-    ui.add_space(12.0);
-    ui.label(RichText::new("Experimental modules").color(EXPERIMENTAL));
-    ui.label("WhatsApp and Discord sit behind a risk gate. They are not the first-run path.");
-    if ui.button("Add experimental account").clicked() {
-        snapshot.open_add_account();
+    if ui.button("Add Telegram (stub)").clicked() {
+        snapshot.open_telegram(secrets);
     }
+    ui.add_space(12.0);
+    ui.label(
+        RichText::new(
+            "WhatsApp, Discord, and Slack are not ready. They are stubs, not login peers of Telegram this beat.",
+        )
+        .color(EXPERIMENTAL),
+    );
 }
 
 fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {

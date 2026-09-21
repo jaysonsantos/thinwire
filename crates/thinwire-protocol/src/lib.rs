@@ -12,6 +12,7 @@ mod whatsapp;
 pub use adapter::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Conversation,
     DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass,
+    TelegramAuthStep,
 };
 pub use discord::DiscordAdapter;
 pub use fake::FakeAdapter;
@@ -22,6 +23,10 @@ pub use risk::{
 };
 pub use slack::SlackAdapter;
 pub use telegram::TelegramAdapter;
+pub use telegram::{
+    TELEGRAM_SECRET_API_HASH, TELEGRAM_SECRET_API_ID, TELEGRAM_SECRET_SERVICE,
+    TELEGRAM_SECRET_SESSION,
+};
 pub use whatsapp::WhatsAppAdapter;
 
 /// v1 protocols in shell display order (S2: four protocols, no Signal).

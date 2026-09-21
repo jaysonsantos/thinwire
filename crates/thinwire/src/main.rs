@@ -18,6 +18,11 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "thinwire",
         options,
-        Box::new(|_cc| Ok(Box::new(app::ThinwireApp::new()))),
+        Box::new(|cc| {
+            let settings = app::Settings::load();
+            // First paint follows the stored mode. Missing file → System (ADR 0005).
+            settings.apply(&cc.egui_ctx);
+            Ok(Box::new(app::ThinwireApp::new(settings)))
+        }),
     )
 }

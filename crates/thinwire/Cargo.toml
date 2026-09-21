@@ -14,8 +14,10 @@ default = []
 telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
 
 [dependencies]
+dirs.workspace = true
 eframe.workspace = true
 egui.workspace = true
+keyring.workspace = true
 thinwire-protocol.workspace = true
 winit.workspace = true
 tokio.workspace = true

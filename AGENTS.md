@@ -8,6 +8,8 @@
 - Never claim WhatsApp or Discord personal clients are “reliable”
 - Discord: no self-bots / user-account automation
 - UI: egui + eframe; protocol work off the UI thread
+- First-run / Add account this beat: Telegram only (no WA / Discord / Slack auth UI)
+- Theme default is System (follow OS light/dark live via egui `system_theme`; persist System \| Light \| Dark)
 
 ## Stack
 
@@ -17,13 +19,15 @@
 - Discord: bot/OAuth inbox only — no self-bots / personal DMs
 - Slack: official OAuth only
 - Signal: out of v1 (S2); no libsignal / Presage
+- Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets.
 
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
-| `crates/thinwire/` | Desktop binary: egui shell, first-run, auth stubs, inbox |
+| `crates/thinwire/` | Desktop binary: egui shell, Telegram login, keychain, system theme, inbox |
 | `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings |
+| `decisions/` | ADRs (0002 glow, 0004 Signal out, 0005 system theme) |
 | `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |

@@ -102,12 +102,45 @@ pub enum DiscordAuthMode {
     UserAccount,
 }
 
+/// Telegram login step. Credential values never travel on this command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramAuthStep {
+    ApiCredentials,
+    Phone,
+    Code,
+    TwoFactor,
+    Complete,
+}
+
+impl TelegramAuthStep {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiCredentials => "api credentials",
+            Self::Phone => "phone",
+            Self::Code => "code",
+            Self::TwoFactor => "2fa",
+            Self::Complete => "complete",
+        }
+    }
+}
+
 /// Commands the UI may enqueue for the tokio worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterCommand {
-    Connect { protocol: ProtocolId },
-    Disconnect { protocol: ProtocolId },
-    ConnectDiscord { mode: DiscordAuthMode },
+    Connect {
+        protocol: ProtocolId,
+    },
+    Disconnect {
+        protocol: ProtocolId,
+    },
+    ConnectDiscord {
+        mode: DiscordAuthMode,
+    },
+    /// Advances the Telegram login screens. Secrets stay in the OS keychain.
+    TelegramAuth {
+        step: TelegramAuthStep,
+    },
 }
 
 impl AdapterCommand {
@@ -116,6 +149,7 @@ impl AdapterCommand {
         match *self {
             Self::Connect { protocol } | Self::Disconnect { protocol } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
+            Self::TelegramAuth { .. } => ProtocolId::Telegram,
         }
     }
 }
