@@ -1,7 +1,9 @@
 //! Telegram auth state machine. Reads secrets from the vault; never logs them.
 
+use super::credentials::{parse_resolved_api_id, require_resolved_api};
 use crate::adapter::{AdapterError, ProtocolId, TelegramAuthPhase, TelegramAuthStep};
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
+use crate::telegram::credentials::TelegramApiSource;
 
 /// Pure login stepper. Default builds emit the next UI phase; the live TDLib
 /// client (feature `telegram-tdlib`) consumes the same steps off this thread.
@@ -25,7 +27,7 @@ impl TelegramAuthEngine {
         self.last_phase = None;
     }
 
-    /// Validate the vault for `step` and return the next UI phase.
+    /// Validate the vault / publisher pair for `step` and return the next UI phase.
     ///
     /// When TDLib is compiled in, `TwoFactor` stays on the current screen
     /// (`NeedTwoFactor`) until the client reports [`TelegramAuthPhase::Ready`].
@@ -34,15 +36,16 @@ impl TelegramAuthEngine {
         &mut self,
         step: TelegramAuthStep,
         vault: &dyn TelegramSecretVault,
+        source: &TelegramApiSource,
     ) -> Result<TelegramAuthPhase, AdapterError> {
         let phase = match step {
             TelegramAuthStep::ApiCredentials => {
-                require(vault, TelegramSecretKey::ApiId)?;
-                require(vault, TelegramSecretKey::ApiHash)?;
-                parse_api_id(vault)?;
+                let (api_id, _) = require_resolved_api(vault, source)?;
+                parse_resolved_api_id(&api_id)?;
                 TelegramAuthPhase::NeedPhone
             }
             TelegramAuthStep::Phone => {
+                require_resolved_api(vault, source)?;
                 require(vault, TelegramSecretKey::Phone)?;
                 TelegramAuthPhase::NeedCode
             }
@@ -76,21 +79,6 @@ fn require(
         })
 }
 
-#[cfg(feature = "telegram-tdlib")]
-pub(super) fn parse_api_id_for_client(
-    vault: &dyn TelegramSecretVault,
-) -> Result<i32, AdapterError> {
-    parse_api_id(vault)
-}
-
-fn parse_api_id(vault: &dyn TelegramSecretVault) -> Result<i32, AdapterError> {
-    let raw = require(vault, TelegramSecretKey::ApiId)?;
-    raw.parse::<i32>().map_err(|_| AdapterError::Unavailable {
-        protocol: ProtocolId::Telegram,
-        reason: "telegram api_id must be a number",
-    })
-}
-
 const fn missing_reason(key: TelegramSecretKey) -> &'static str {
     match key {
         TelegramSecretKey::ApiId => "telegram api_id is missing from the secret store",
@@ -99,6 +87,9 @@ const fn missing_reason(key: TelegramSecretKey) -> &'static str {
         TelegramSecretKey::Code => "telegram login code is missing from the secret store",
         TelegramSecretKey::Password => "telegram 2fa password is missing from the secret store",
         TelegramSecretKey::Session => "telegram session is missing from the secret store",
+        TelegramSecretKey::DbEncryption => {
+            "telegram database encryption key is missing from the secret store"
+        }
     }
 }
 
@@ -118,13 +109,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_api_id_does_not_advance() {
+    fn missing_api_credentials_do_not_advance() {
         let vault = MemorySecretVault::new();
-        vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+        let source = TelegramApiSource::empty();
         let mut engine = TelegramAuthEngine::new();
         let err = engine
-            .submit(TelegramAuthStep::ApiCredentials, &vault)
-            .expect_err("missing api_id");
+            .submit(TelegramAuthStep::ApiCredentials, &vault, &source)
+            .expect_err("missing api");
         assert!(matches!(
             err,
             AdapterError::Unavailable {
@@ -132,8 +123,31 @@ mod tests {
                 ..
             }
         ));
-        assert!(!err.to_string().contains("hash-value"));
+        assert!(err.to_string().contains("TELEGRAM_API_ID"));
         assert_eq!(engine.last_phase(), None);
+    }
+
+    #[test]
+    fn publisher_inject_does_not_need_vault_api_keys() {
+        let vault = MemorySecretVault::new();
+        vault.set_secret(TelegramSecretKey::Phone, "+15551234567");
+        let source = TelegramApiSource::with_publisher("11111", "publisher-hash");
+        let mut engine = TelegramAuthEngine::new();
+        assert_eq!(
+            engine
+                .submit(TelegramAuthStep::ApiCredentials, &vault, &source)
+                .expect("api"),
+            TelegramAuthPhase::NeedPhone
+        );
+        assert_eq!(
+            engine
+                .submit(TelegramAuthStep::Phone, &vault, &source)
+                .expect("phone"),
+            TelegramAuthPhase::NeedCode
+        );
+        let debug = format!("{source:?}");
+        assert!(!debug.contains("publisher-hash"));
+        assert!(!debug.contains("11111"));
     }
 
     #[test]
@@ -143,7 +157,11 @@ mod tests {
         vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
         let mut engine = TelegramAuthEngine::new();
         let err = engine
-            .submit(TelegramAuthStep::ApiCredentials, &vault)
+            .submit(
+                TelegramAuthStep::ApiCredentials,
+                &vault,
+                &TelegramApiSource::empty(),
+            )
             .expect_err("bad api_id");
         assert!(err.to_string().contains("must be a number"));
         assert!(!err.to_string().contains("not-a-number"));
@@ -151,27 +169,30 @@ mod tests {
     }
 
     #[test]
-    fn default_build_walks_messenger_ux_steps_then_unavailable() {
+    fn default_build_walks_phone_code_2fa_then_unavailable() {
         let vault = filled_vault();
+        let source = TelegramApiSource::empty();
         let mut engine = TelegramAuthEngine::new();
         assert_eq!(
             engine
-                .submit(TelegramAuthStep::ApiCredentials, &vault)
+                .submit(TelegramAuthStep::ApiCredentials, &vault, &source)
                 .expect("api"),
             TelegramAuthPhase::NeedPhone
         );
         assert_eq!(
             engine
-                .submit(TelegramAuthStep::Phone, &vault)
+                .submit(TelegramAuthStep::Phone, &vault, &source)
                 .expect("phone"),
             TelegramAuthPhase::NeedCode
         );
         assert_eq!(
-            engine.submit(TelegramAuthStep::Code, &vault).expect("code"),
+            engine
+                .submit(TelegramAuthStep::Code, &vault, &source)
+                .expect("code"),
             TelegramAuthPhase::NeedTwoFactor
         );
         let finish = engine
-            .submit(TelegramAuthStep::TwoFactor, &vault)
+            .submit(TelegramAuthStep::TwoFactor, &vault, &source)
             .expect("2fa");
         if crate::telegram::uses_tdlib_hook() {
             assert_eq!(finish, TelegramAuthPhase::NeedTwoFactor);

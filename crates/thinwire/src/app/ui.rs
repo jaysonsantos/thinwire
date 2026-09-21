@@ -58,6 +58,9 @@ fn top_bar(
             if ui.button("Add account").clicked() {
                 snapshot.open_add_account(secrets);
             }
+            if ui.button("Advanced").clicked() {
+                snapshot.open_api_override(secrets);
+            }
             ui.separator();
             theme_control(ui, settings);
         });
@@ -85,11 +88,8 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
                 snapshot.cancel_auth(secrets);
             }
         });
-        if snapshot.auth != super::snapshot::AuthScreen::Idle && !super::auth::tdlib_compiled() {
-            ui.colored_label(
-                Color32::from_rgb(214, 160, 64),
-                super::auth::TDLIB_UNAVAILABLE_BANNER,
-            );
+        if let Some(banner) = super::auth::stub_banner(snapshot) {
+            ui.colored_label(Color32::from_rgb(214, 160, 64), banner);
         }
         if let Some(error) = &snapshot.error {
             let happened = &error.happened;
@@ -246,10 +246,16 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
 
 fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
     ui.heading("Start with Telegram");
-    if !super::auth::tdlib_compiled() {
-        ui.colored_label(EXPERIMENTAL, super::auth::TDLIB_UNAVAILABLE_BANNER);
+    if let Some(banner) = super::auth::stub_banner(snapshot) {
+        ui.colored_label(EXPERIMENTAL, banner);
     }
-    ui.label("Help: https://my.telegram.org — API development tools.");
+    if snapshot.has_api_credentials(secrets) {
+        ui.label("Sign in with your phone number, then the login code, then optional 2FA.");
+    } else {
+        ui.label(
+            "This build has no Telegram API credentials. Official binaries inject them at release time. Dev: rebuild with TELEGRAM_API_ID and TELEGRAM_API_HASH, or use Advanced to set a keychain override.",
+        );
+    }
     ui.add_space(8.0);
     if ui.button("Add Telegram").clicked() {
         snapshot.open_telegram(secrets);

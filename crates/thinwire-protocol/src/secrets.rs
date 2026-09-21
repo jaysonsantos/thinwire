@@ -16,6 +16,8 @@ pub const TELEGRAM_SECRET_API_ID: &str = "telegram.api_id";
 pub const TELEGRAM_SECRET_API_HASH: &str = "telegram.api_hash";
 /// Keychain account for the TDLib session marker.
 pub const TELEGRAM_SECRET_SESSION: &str = "telegram.session";
+/// Keychain account for the TDLib database encryption key.
+pub const TELEGRAM_SECRET_DB_KEY: &str = "telegram.db_key";
 /// Memory-only account for the phone number (never flushed to the OS store).
 pub const TELEGRAM_SECRET_PHONE: &str = "telegram.phone";
 /// Memory-only account for the login code (never flushed to the OS store).
@@ -32,20 +34,27 @@ pub enum TelegramSecretKey {
     Code,
     Password,
     Session,
+    DbEncryption,
 }
 
 impl TelegramSecretKey {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ApiId,
         Self::ApiHash,
         Self::Phone,
         Self::Code,
         Self::Password,
         Self::Session,
+        Self::DbEncryption,
     ];
 
     /// Keys that may be flushed to the OS keychain.
-    pub const PERSISTENT: [Self; 3] = [Self::ApiId, Self::ApiHash, Self::Session];
+    pub const PERSISTENT: [Self; 4] = [
+        Self::ApiId,
+        Self::ApiHash,
+        Self::Session,
+        Self::DbEncryption,
+    ];
 
     /// Keys that stay in the process map only.
     pub const EPHEMERAL: [Self; 3] = [Self::Phone, Self::Code, Self::Password];
@@ -59,12 +68,16 @@ impl TelegramSecretKey {
             Self::Code => TELEGRAM_SECRET_CODE,
             Self::Password => TELEGRAM_SECRET_PASSWORD,
             Self::Session => TELEGRAM_SECRET_SESSION,
+            Self::DbEncryption => TELEGRAM_SECRET_DB_KEY,
         }
     }
 
     #[must_use]
     pub const fn persist_to_os(self) -> bool {
-        matches!(self, Self::ApiId | Self::ApiHash | Self::Session)
+        matches!(
+            self,
+            Self::ApiId | Self::ApiHash | Self::Session | Self::DbEncryption
+        )
     }
 }
 
@@ -77,6 +90,7 @@ impl fmt::Debug for TelegramSecretKey {
             Self::Code => "Code",
             Self::Password => "Password",
             Self::Session => "Session",
+            Self::DbEncryption => "DbEncryption",
         })
     }
 }
@@ -148,7 +162,8 @@ mod tests {
         for key in TelegramSecretKey::EPHEMERAL {
             assert!(!key.persist_to_os());
         }
-        assert_eq!(TelegramSecretKey::ALL.len(), 6);
+        assert_eq!(TelegramSecretKey::ALL.len(), 7);
+        assert!(TelegramSecretKey::DbEncryption.persist_to_os());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::thread;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::engine::parse_api_id_for_client;
+use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
 use crate::adapter::{
     AdapterStatus, ChatMessage, Conversation, EventTx, ProtocolId, TelegramAuthPhase,
     TelegramAuthStep, emit_conversation, emit_message, emit_status, emit_telegram_auth,
@@ -38,10 +38,15 @@ impl TdlibRuntime {
         &mut self,
         step: TelegramAuthStep,
         secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
         events: &EventTx,
     ) {
         if self.commands.is_none() {
-            self.commands = Some(spawn_tdlib_worker(Arc::clone(&secrets), events.clone()));
+            self.commands = Some(spawn_tdlib_worker(
+                Arc::clone(&secrets),
+                source,
+                events.clone(),
+            ));
         }
         if let Some(tx) = &self.commands
             && tx.send(TdlibCommand::Step(step)).is_err()
@@ -64,6 +69,7 @@ impl Default for TdlibRuntime {
 
 fn spawn_tdlib_worker(
     secrets: Arc<dyn TelegramSecretVault>,
+    source: TelegramApiSource,
     events: EventTx,
 ) -> UnboundedSender<TdlibCommand> {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -101,7 +107,7 @@ fn spawn_tdlib_worker(
                     let Some(update) = update else {
                         break;
                     };
-                    apply_update(client_id, update, secrets.as_ref(), &events).await;
+                    apply_update(client_id, update, secrets.as_ref(), &source, &events).await;
                 }
             }
         }
@@ -195,6 +201,7 @@ async fn apply_update(
     client_id: i32,
     update: tdlib_rs::enums::Update,
     secrets: &dyn TelegramSecretVault,
+    source: &TelegramApiSource,
     events: &EventTx,
 ) {
     let tdlib_rs::enums::Update::AuthorizationState(state) = update else {
@@ -202,7 +209,7 @@ async fn apply_update(
     };
     match state.authorization_state {
         tdlib_rs::enums::AuthorizationState::WaitTdlibParameters => {
-            set_parameters(client_id, secrets, events).await;
+            set_parameters(client_id, secrets, source, events).await;
         }
         tdlib_rs::enums::AuthorizationState::WaitPhoneNumber => {
             emit_telegram_auth(events, TelegramAuthPhase::NeedPhone);
@@ -288,8 +295,25 @@ async fn apply_update(
     }
 }
 
-async fn set_parameters(client_id: i32, secrets: &dyn TelegramSecretVault, events: &EventTx) {
-    let Ok(api_id) = parse_api_id_for_client(secrets) else {
+async fn set_parameters(
+    client_id: i32,
+    secrets: &dyn TelegramSecretVault,
+    source: &TelegramApiSource,
+    events: &EventTx,
+) {
+    let (api_id, api_hash) = match require_resolved_api(secrets, source) {
+        Ok(pair) => pair,
+        Err(_) => {
+            emit_status(
+                events,
+                ProtocolId::Telegram,
+                AdapterStatus::Error,
+                "telegram api credentials are missing; set a keychain override or rebuild with TELEGRAM_API_ID",
+            );
+            return;
+        }
+    };
+    let Ok(api_id) = parse_resolved_api_id(&api_id) else {
         emit_status(
             events,
             ProtocolId::Telegram,
@@ -298,21 +322,13 @@ async fn set_parameters(client_id: i32, secrets: &dyn TelegramSecretVault, event
         );
         return;
     };
-    let Some(api_hash) = secrets.get_secret(TelegramSecretKey::ApiHash) else {
-        emit_status(
-            events,
-            ProtocolId::Telegram,
-            AdapterStatus::Error,
-            "telegram api_hash is missing from the secret store",
-        );
-        return;
-    };
     let database_directory = tdlib_data_dir().display().to_string();
+    let encryption_key = ensure_db_key(secrets);
     if tdlib_rs::functions::set_tdlib_parameters(
         false,
         database_directory,
         String::new(),
-        String::new(),
+        encryption_key,
         true,
         true,
         true,
@@ -335,6 +351,32 @@ async fn set_parameters(client_id: i32, secrets: &dyn TelegramSecretVault, event
             "TDLib rejected the client parameters. Check api_id and api_hash.",
         );
     }
+}
+
+fn ensure_db_key(vault: &dyn TelegramSecretVault) -> String {
+    if let Some(existing) = vault.get_secret(TelegramSecretKey::DbEncryption)
+        && !existing.is_empty()
+    {
+        return existing;
+    }
+    let key = generate_db_key();
+    vault.set_secret(TelegramSecretKey::DbEncryption, &key);
+    key
+}
+
+fn generate_db_key() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = DefaultHasher::new();
+    nanos.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    format!("{:016x}{:016x}", hasher.finish(), nanos)
 }
 
 fn tdlib_data_dir() -> PathBuf {

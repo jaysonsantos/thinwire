@@ -9,12 +9,28 @@ use super::snapshot::{AuthScreen, Snapshot};
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
 const WARN: Color32 = Color32::from_rgb(214, 160, 64);
 
-/// Shown only when the live `tdlib-rs` client was not compiled in.
+/// Shown until TDLib reports Ready. Feature-off builds stay on this copy.
 pub(crate) const TDLIB_UNAVAILABLE_BANNER: &str = "TDLib unavailable in this build. Enable feature telegram-tdlib after a local TDLib install. These screens do not open a live Telegram session.";
+
+/// Shown when TDLib is compiled but authorizationStateReady has not arrived.
+pub(crate) const TELEGRAM_STUB_UNTIL_READY: &str =
+    "Telegram is not authorized yet. This banner drops only after TDLib reports Ready.";
 
 #[must_use]
 pub(crate) const fn tdlib_compiled() -> bool {
     cfg!(feature = "telegram-tdlib")
+}
+
+#[must_use]
+pub(crate) fn stub_banner(snapshot: &Snapshot) -> Option<&'static str> {
+    if snapshot.telegram_ready() {
+        return None;
+    }
+    if tdlib_compiled() {
+        Some(TELEGRAM_STUB_UNTIL_READY)
+    } else {
+        Some(TDLIB_UNAVAILABLE_BANNER)
+    }
 }
 
 pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
@@ -23,13 +39,9 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
     }
 
     ui.separator();
-    ui.heading(if tdlib_compiled() {
-        "Add Telegram account"
-    } else {
-        "Add Telegram account (TDLib unavailable)"
-    });
-    if !tdlib_compiled() {
-        ui.colored_label(WARN, TDLIB_UNAVAILABLE_BANNER);
+    ui.heading(auth_heading(snapshot.auth));
+    if let Some(banner) = stub_banner(snapshot) {
+        ui.colored_label(WARN, banner);
     }
     ui.label(
         RichText::new(
@@ -48,6 +60,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
 
     match snapshot.auth {
         AuthScreen::Idle => {}
+        AuthScreen::NeedCredentials => need_credentials(ui, snapshot, secrets),
         AuthScreen::TelegramApi => telegram_api(ui, snapshot, secrets),
         AuthScreen::TelegramPhone => telegram_phone(ui, snapshot, secrets),
         AuthScreen::TelegramCode => telegram_code(ui, snapshot, secrets),
@@ -60,10 +73,38 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
     }
 }
 
+fn auth_heading(auth: AuthScreen) -> &'static str {
+    match auth {
+        AuthScreen::NeedCredentials => "Telegram API credentials are not in this build",
+        AuthScreen::TelegramApi => "Advanced: custom Telegram API credentials",
+        AuthScreen::TelegramPhone | AuthScreen::TelegramCode | AuthScreen::Telegram2fa => {
+            "Add Telegram account"
+        }
+        AuthScreen::Idle => "",
+    }
+}
+
+fn need_credentials(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+    ui.label(
+        "Official / publisher binaries inject TELEGRAM_API_ID and TELEGRAM_API_HASH at compile time. They are not in the MIT git tree and are not set in public CI for fork PRs.",
+    );
+    ui.label(
+        "Dev builds: rebuild with those env vars, or set a keychain override. Never commit sample Telegram credentials.",
+    );
+    ui.add_space(6.0);
+    if ui
+        .button("Advanced: set custom api_id / api_hash")
+        .clicked()
+    {
+        snapshot.open_api_override(secrets);
+    }
+}
+
 fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    ui.label("Help: https://my.telegram.org — API development tools.");
-    ui.label("1. Open my.telegram.org, sign in, and open API development tools.");
-    ui.label("2. Copy api_id and api_hash. They stay in the secret store.");
+    ui.label(
+        "Power-user override. This pair wins over a publisher inject. Help: https://my.telegram.org — API development tools.",
+    );
+    ui.label("Values stay in the OS keychain or memory. They are not logged.");
     ui.horizontal(|ui| {
         ui.label("api_id");
         ui.add(
@@ -79,7 +120,7 @@ fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
                 .hint_text("from my.telegram.org"),
         );
     });
-    continue_button(ui, snapshot, secrets, "Continue");
+    continue_button(ui, snapshot, secrets, "Save override");
 }
 
 fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {

@@ -5,6 +5,7 @@
 //! credentials from [`TelegramSecretVault`] — never put them on commands, never
 //! log them, never commit them.
 
+mod credentials;
 mod engine;
 
 #[cfg(feature = "telegram-tdlib")]
@@ -14,6 +15,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use engine::TelegramAuthEngine;
+
+pub use credentials::{
+    TelegramApiOrigin, TelegramApiSource, resolve_telegram_api, telegram_api_available,
+};
 
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, EventTx, ProtocolAdapter, ProtocolCapabilities,
@@ -40,6 +45,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 /// Official Telegram path. Default builds report TDLib unavailable.
 pub struct TelegramAdapter {
     secrets: Arc<dyn TelegramSecretVault>,
+    api_source: TelegramApiSource,
     engine: TelegramAuthEngine,
     #[cfg(feature = "telegram-tdlib")]
     tdlib: tdlib::TdlibRuntime,
@@ -48,8 +54,17 @@ pub struct TelegramAdapter {
 impl TelegramAdapter {
     #[must_use]
     pub fn new(secrets: Arc<dyn TelegramSecretVault>) -> Self {
+        Self::with_source(secrets, TelegramApiSource::from_build())
+    }
+
+    #[must_use]
+    pub fn with_source(
+        secrets: Arc<dyn TelegramSecretVault>,
+        api_source: TelegramApiSource,
+    ) -> Self {
         Self {
             secrets,
+            api_source,
             engine: TelegramAuthEngine::new(),
             #[cfg(feature = "telegram-tdlib")]
             tdlib: tdlib::TdlibRuntime::new(),
@@ -87,10 +102,17 @@ impl TelegramAdapter {
         step: TelegramAuthStep,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
-        let phase = self.engine.submit(step, self.secrets.as_ref())?;
+        let phase = self
+            .engine
+            .submit(step, self.secrets.as_ref(), &self.api_source)?;
         #[cfg(feature = "telegram-tdlib")]
         {
-            self.tdlib.submit(step, Arc::clone(&self.secrets), events);
+            self.tdlib.submit(
+                step,
+                Arc::clone(&self.secrets),
+                self.api_source.clone(),
+                events,
+            );
             let _ = phase;
             return Ok(());
         }
@@ -118,6 +140,7 @@ impl fmt::Debug for TelegramAdapter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TelegramAdapter")
             .field("tdlib", &uses_tdlib_hook())
+            .field("api_source", &self.api_source)
             .field("last_phase", &self.engine.last_phase())
             .finish()
     }

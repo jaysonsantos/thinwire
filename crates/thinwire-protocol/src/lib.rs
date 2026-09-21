@@ -24,11 +24,14 @@ pub use risk::{
 };
 pub use secrets::{
     MemorySecretVault, TELEGRAM_SECRET_API_HASH, TELEGRAM_SECRET_API_ID, TELEGRAM_SECRET_CODE,
-    TELEGRAM_SECRET_PASSWORD, TELEGRAM_SECRET_PHONE, TELEGRAM_SECRET_SERVICE,
-    TELEGRAM_SECRET_SESSION, TelegramSecretKey, TelegramSecretVault,
+    TELEGRAM_SECRET_DB_KEY, TELEGRAM_SECRET_PASSWORD, TELEGRAM_SECRET_PHONE,
+    TELEGRAM_SECRET_SERVICE, TELEGRAM_SECRET_SESSION, TelegramSecretKey, TelegramSecretVault,
 };
 pub use slack::SlackAdapter;
-pub use telegram::TelegramAdapter;
+pub use telegram::{
+    TelegramAdapter, TelegramApiOrigin, TelegramApiSource, resolve_telegram_api,
+    telegram_api_available,
+};
 pub use whatsapp::WhatsAppAdapter;
 
 /// v1 protocols in shell display order (S2: four protocols, no Signal).

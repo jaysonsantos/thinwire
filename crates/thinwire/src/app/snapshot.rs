@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use thinwire_protocol::{
     AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, ProtocolCapabilities,
-    ProtocolId, TelegramAuthPhase, TelegramAuthStep, TelegramSecretVault, catalog,
+    ProtocolId, TelegramApiSource, TelegramAuthPhase, TelegramAuthStep, TelegramSecretVault,
+    catalog, telegram_api_available,
 };
 
 use super::secrets::{SecretKey, SecretStore};
@@ -51,6 +52,7 @@ impl InboxFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthScreen {
     Idle,
+    NeedCredentials,
     TelegramApi,
     TelegramPhone,
     TelegramCode,
@@ -91,6 +93,8 @@ pub(crate) struct Snapshot {
     pub status_text: String,
     pub compose: String,
     pub auth_busy: bool,
+    pub telegram_authorized: bool,
+    api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
 }
@@ -124,9 +128,18 @@ impl Snapshot {
             status_text: "Adapters are stubs. No live network session.".into(),
             compose: String::new(),
             auth_busy: false,
+            telegram_authorized: false,
+            api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_api_source(source: TelegramApiSource) -> Self {
+        let mut snapshot = Self::new();
+        snapshot.api_source = source;
+        snapshot
     }
 
     pub(crate) fn apply(&mut self, event: AdapterEvent) {
@@ -268,6 +281,16 @@ impl Snapshot {
         self.status_text = "Refresh queued on the tokio worker. The UI thread stays free.".into();
     }
 
+    #[must_use]
+    pub(crate) fn has_api_credentials(&self, store: &SecretStore) -> bool {
+        telegram_api_available(store, &self.api_source)
+    }
+
+    #[must_use]
+    pub(crate) fn telegram_ready(&self) -> bool {
+        self.telegram_authorized
+    }
+
     pub(crate) fn open_add_account(&mut self, store: &SecretStore) {
         self.open_telegram(store);
     }
@@ -277,6 +300,7 @@ impl Snapshot {
         clear_ephemeral(store);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
+        self.telegram_authorized = false;
         self.error = None;
         self.status_text = "Account linking cancelled.".into();
         self.pending.push(AdapterCommand::Disconnect {
@@ -335,7 +359,7 @@ impl Snapshot {
                 self.queue_telegram_step(TelegramAuthStep::TwoFactor);
                 self.mark_auth_busy("Telegram: optional 2FA submitted. Waiting for authorization.");
             }
-            AuthScreen::Idle => {}
+            AuthScreen::NeedCredentials | AuthScreen::Idle => {}
         }
     }
 
@@ -380,13 +404,32 @@ impl Snapshot {
         clear_ephemeral(store);
         self.error = None;
         self.auth_busy = false;
+        if self.has_api_credentials(store) {
+            self.start_phone_login();
+            return;
+        }
+        self.auth = AuthScreen::NeedCredentials;
+        self.status_text = if self.api_source.has_publisher() {
+            "Telegram API credentials are missing from the keychain override. Set Advanced credentials or Cancel.".into()
+        } else {
+            "This build has no Telegram API credentials. Official binaries inject TELEGRAM_API_ID / TELEGRAM_API_HASH at release time. Dev: rebuild with those env vars, or set a keychain override in Advanced.".into()
+        };
+    }
+
+    pub(crate) fn open_api_override(&mut self, store: &SecretStore) {
+        self.clear_secrets();
+        self.error = None;
+        self.auth_busy = false;
         self.prefill_from_store(store);
         self.auth = AuthScreen::TelegramApi;
-        self.status_text = if cfg!(feature = "telegram-tdlib") {
-            "Telegram (TDLib): create an app at my.telegram.org, then enter api_id and api_hash. Values stay in the secret store. Cancel is always available.".into()
-        } else {
-            "TDLib unavailable in this build. Enable feature telegram-tdlib after a local TDLib install. Screens still collect credentials locally; no live session opens.".into()
-        };
+        self.status_text =
+            "Advanced: custom Telegram API credentials. The keychain override wins over the publisher pair. Values are not logged.".into();
+    }
+
+    fn start_phone_login(&mut self) {
+        self.auth = AuthScreen::TelegramPhone;
+        self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
+        self.mark_auth_busy("Telegram: using stored or publisher API credentials. Enter a phone number when the next step is ready.");
     }
 
     fn apply_telegram_phase(&mut self, phase: TelegramAuthPhase) {
@@ -425,6 +468,7 @@ impl Snapshot {
         self.select_protocol(ProtocolId::Telegram);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
+        self.telegram_authorized = true;
         self.error = None;
         self.status_text = "Telegram is ready. TDLib session is live.".into();
     }
@@ -440,6 +484,7 @@ impl Snapshot {
         }
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
+        self.telegram_authorized = false;
         self.error = None;
         self.status_text =
             "TDLib unavailable in this build. No live Telegram session was opened; form fields were discarded."
@@ -532,11 +577,17 @@ mod tests {
         snapshot.apply(AdapterEvent::TelegramAuth { phase });
     }
 
+    fn seed_override(store: &SecretStore) {
+        store.set(SecretKey::ApiId, "11111").expect("id");
+        store.set(SecretKey::ApiHash, "hash-value").expect("hash");
+    }
+
     fn complete_telegram(snapshot: &mut Snapshot, store: &SecretStore) {
+        seed_override(store);
         snapshot.open_telegram(store);
-        snapshot.telegram_api_id = "11111".into();
-        snapshot.telegram_api_hash = "hash-value".into();
-        submit_and_apply(snapshot, store, TelegramAuthPhase::NeedPhone);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
         assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
         snapshot.telegram_phone = "+15551234567".into();
         submit_and_apply(snapshot, store, TelegramAuthPhase::NeedCode);
@@ -546,14 +597,15 @@ mod tests {
         assert_eq!(snapshot.auth, AuthScreen::Telegram2fa);
         submit_and_apply(snapshot, store, TelegramAuthPhase::Ready);
         assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(snapshot.telegram_ready());
     }
 
     #[test]
     fn auth_ui_is_telegram_only_this_beat() {
         let src = include_str!("auth.rs");
+        assert!(src.contains("TELEGRAM_API_ID"));
         assert!(src.contains("my.telegram.org"));
         assert!(src.contains("Cancel"));
-        assert!(src.contains("Continue"));
         assert!(src.contains("Send code"));
         assert!(!src.contains("Continue (stub)"));
         assert!(!src.contains("Send code (stub)"));
@@ -566,21 +618,59 @@ mod tests {
         let ui = include_str!("ui.rs");
         assert!(ui.contains("not ready"));
         assert!(ui.contains("not login peers"));
-        if !cfg!(feature = "telegram-tdlib") {
-            assert!(src.contains(super::super::auth::TDLIB_UNAVAILABLE_BANNER));
-            assert!(ui.contains("TDLIB_UNAVAILABLE_BANNER"));
-        }
+        assert!(!ui.contains("my.telegram.org"));
+        assert!(src.contains(super::super::auth::TDLIB_UNAVAILABLE_BANNER));
+        assert!(ui.contains("stub_banner"));
+    }
+
+    #[test]
+    fn first_run_without_credentials_does_not_open_api_screens() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_add_account(&store);
+        assert_eq!(snapshot.auth, AuthScreen::NeedCredentials);
+        assert!(!snapshot.status_text.contains("my.telegram.org"));
+        snapshot.advance_telegram(&store);
+        assert_eq!(snapshot.auth, AuthScreen::NeedCredentials);
+        assert!(store.get(SecretKey::ApiId).expect("get").is_none());
+    }
+
+    #[test]
+    fn publisher_inject_skips_api_screens() {
+        let store = SecretStore::memory();
+        let mut snapshot =
+            Snapshot::with_api_source(TelegramApiSource::with_publisher("11111", "publisher-hash"));
+        snapshot.open_telegram(&store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert!(snapshot.auth_busy);
+        assert!(!snapshot.telegram_ready());
+        let commands = snapshot.take_commands();
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            AdapterCommand::TelegramAuth {
+                step: TelegramAuthStep::ApiCredentials
+            }
+        )));
+        assert!(!format!("{commands:?}").contains("publisher-hash"));
+    }
+
+    #[test]
+    fn keychain_override_skips_api_screens() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        let mut snapshot = Snapshot::new();
+        snapshot.open_telegram(&store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert!(snapshot.has_api_credentials(&store));
     }
 
     #[test]
     fn telegram_auth_waits_for_adapter_phase_events() {
         let store = SecretStore::memory();
+        seed_override(&store);
         let mut snapshot = Snapshot::new();
         snapshot.open_telegram(&store);
-        snapshot.telegram_api_id = "11111".into();
-        snapshot.telegram_api_hash = "hash-value".into();
-        snapshot.advance_telegram(&store);
-        assert_eq!(snapshot.auth, AuthScreen::TelegramApi);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
         assert!(snapshot.auth_busy);
         snapshot.apply(AdapterEvent::TelegramAuth {
             phase: TelegramAuthPhase::NeedPhone,
@@ -599,16 +689,15 @@ mod tests {
             phase: TelegramAuthPhase::NeedTwoFactor,
         });
         assert_eq!(snapshot.auth, AuthScreen::Telegram2fa);
+        assert!(!snapshot.telegram_ready());
     }
 
     #[test]
     fn busy_submit_does_not_queue_a_second_command() {
         let store = SecretStore::memory();
+        seed_override(&store);
         let mut snapshot = Snapshot::new();
         snapshot.open_telegram(&store);
-        snapshot.telegram_api_id = "11111".into();
-        snapshot.telegram_api_hash = "hash-value".into();
-        snapshot.advance_telegram(&store);
         assert_eq!(snapshot.take_commands().len(), 1);
         snapshot.advance_telegram(&store);
         assert!(snapshot.take_commands().is_empty());
@@ -616,18 +705,10 @@ mod tests {
     }
 
     #[test]
-    fn add_account_opens_telegram_not_a_protocol_picker() {
+    fn empty_override_fields_do_not_advance() {
         let store = SecretStore::memory();
         let mut snapshot = Snapshot::new();
-        snapshot.open_add_account(&store);
-        assert_eq!(snapshot.auth, AuthScreen::TelegramApi);
-    }
-
-    #[test]
-    fn empty_api_fields_do_not_advance() {
-        let store = SecretStore::memory();
-        let mut snapshot = Snapshot::new();
-        snapshot.open_telegram(&store);
+        snapshot.open_api_override(&store);
         snapshot.advance_telegram(&store);
         assert_eq!(snapshot.auth, AuthScreen::TelegramApi);
         assert!(snapshot.error.is_some());
@@ -637,16 +718,18 @@ mod tests {
     #[test]
     fn cancel_always_returns_to_idle_and_clears_fields() {
         let store = SecretStore::memory();
+        seed_override(&store);
         let mut snapshot = Snapshot::new();
         snapshot.open_telegram(&store);
-        snapshot.telegram_api_id = "11111".into();
-        snapshot.telegram_api_hash = "hash-value".into();
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        snapshot.telegram_phone = "+15551234567".into();
         snapshot.advance_telegram(&store);
         snapshot.cancel_auth(&store);
         assert_eq!(snapshot.auth, AuthScreen::Idle);
-        assert!(snapshot.telegram_api_id.is_empty());
-        assert!(snapshot.telegram_api_hash.is_empty());
         assert!(snapshot.telegram_phone.is_empty());
+        assert!(!snapshot.telegram_ready());
     }
 
     #[test]
@@ -711,17 +794,18 @@ mod tests {
         assert!(!debug.contains("hash-value"));
         assert!(!debug.contains("+15551234567"));
         assert!(!debug.contains("12345"));
-        assert!(snapshot.take_keychain_flush());
+        assert!(!snapshot.take_keychain_flush());
     }
 
     #[test]
     fn unavailable_phase_does_not_link_a_live_account() {
         let store = SecretStore::memory();
+        seed_override(&store);
         let mut snapshot = Snapshot::new();
         snapshot.open_telegram(&store);
-        snapshot.telegram_api_id = "11111".into();
-        snapshot.telegram_api_hash = "hash-value".into();
-        submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::NeedPhone);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
         snapshot.telegram_phone = "+15551234567".into();
         submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::NeedCode);
         snapshot.telegram_code = "12345".into();
@@ -729,18 +813,40 @@ mod tests {
         submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::Unavailable);
         assert_eq!(snapshot.auth, AuthScreen::Idle);
         assert!(!snapshot.has_primary_account());
+        assert!(!snapshot.telegram_ready());
         assert!(snapshot.status_text.contains("TDLib unavailable"));
     }
 
     #[test]
-    fn reopen_prefills_api_from_secret_store() {
+    fn stub_banner_drops_only_on_ready() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        assert!(!snapshot.telegram_ready());
+        seed_override(&store);
+        snapshot.open_telegram(&store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert!(!snapshot.telegram_ready());
+        snapshot.telegram_phone = "+15551234567".into();
+        submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::NeedCode);
+        snapshot.telegram_code = "12345".into();
+        submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::NeedTwoFactor);
+        assert!(!snapshot.telegram_ready());
+        submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::Ready);
+        assert!(snapshot.telegram_ready());
+    }
+
+    #[test]
+    fn advanced_override_prefills_from_secret_store() {
         let store = SecretStore::memory();
         store.set(SecretKey::ApiId, "999").expect("set id");
         store
             .set(SecretKey::ApiHash, "stored-hash")
             .expect("set hash");
         let mut snapshot = Snapshot::new();
-        snapshot.open_telegram(&store);
+        snapshot.open_api_override(&store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramApi);
         assert_eq!(snapshot.telegram_api_id, "999");
         assert_eq!(snapshot.telegram_api_hash, "stored-hash");
     }

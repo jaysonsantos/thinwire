@@ -335,7 +335,7 @@ impl SecretStore {
     }
 }
 
-type FlushSnapshot = [(SecretKey, Option<String>); 3];
+type FlushSnapshot = [(SecretKey, Option<String>); 4];
 
 impl TelegramSecretVault for SecretStore {
     fn get_secret(&self, key: TelegramSecretKey) -> Option<String> {
