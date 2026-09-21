@@ -643,7 +643,8 @@ mod tests {
         assert!(six.contains("# Live TDLib replaces the Telegram stub"));
         assert!(six.contains("authorizationStateReady"));
         assert!(six.contains("0007-publisher-telegram-api-credentials"));
-        let seven = include_str!("../../../../decisions/0007-publisher-telegram-api-credentials.md");
+        let seven =
+            include_str!("../../../../decisions/0007-publisher-telegram-api-credentials.md");
         assert!(seven.contains("# Publisher-owned Telegram api_id / api_hash"));
         assert!(seven.contains("Primary login UI: phone/code"));
         assert!(seven.contains("not** the primary login path"));

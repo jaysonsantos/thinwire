@@ -386,7 +386,8 @@ fn tdlib_data_dir() -> PathBuf {
         let mut base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local").join("share"))
             })
             .unwrap_or_else(std::env::temp_dir);
         base.push("thinwire");
