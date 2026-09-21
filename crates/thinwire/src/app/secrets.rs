@@ -324,7 +324,7 @@ impl SecretStore {
 
     fn flush_loop<F>(&self, mut commit: F) -> Result<(), SecretError>
     where
-        F: FnMut(&[(SecretKey, Option<String>); 3]) -> Result<(), SecretError>,
+        F: FnMut(&FlushSnapshot) -> Result<(), SecretError>,
     {
         loop {
             let Some(snapshot) = self.take_flush_snapshot()? else {
@@ -342,7 +342,7 @@ impl SecretStore {
         }
     }
 
-    fn take_flush_snapshot(&self) -> Result<Option<[(SecretKey, Option<String>); 3]>, SecretError> {
+    fn take_flush_snapshot(&self) -> Result<Option<FlushSnapshot>, SecretError> {
         let mut inner = self.lock()?;
         if inner.phase != AttachPhase::Ready {
             inner.flush_in_flight = false;
@@ -365,6 +365,8 @@ impl SecretStore {
         Ok(false)
     }
 }
+
+type FlushSnapshot = [(SecretKey, Option<String>); 3];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlushAction {
@@ -647,10 +649,7 @@ mod tests {
         );
     }
 
-    fn snapshot_value(
-        snapshot: &[(SecretKey, Option<String>); 3],
-        key: SecretKey,
-    ) -> Option<String> {
+    fn snapshot_value(snapshot: &FlushSnapshot, key: SecretKey) -> Option<String> {
         snapshot
             .iter()
             .find(|(item, _)| *item == key)
@@ -659,7 +658,7 @@ mod tests {
 
     #[derive(Clone)]
     struct StallSink {
-        commits: Arc<Mutex<Vec<[(SecretKey, Option<String>); 3]>>>,
+        commits: Arc<Mutex<Vec<FlushSnapshot>>>,
         started_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
         started_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
         release_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
@@ -699,11 +698,11 @@ mod tests {
                 .expect("release");
         }
 
-        fn commits(&self) -> Vec<[(SecretKey, Option<String>); 3]> {
+        fn commits(&self) -> Vec<FlushSnapshot> {
             self.commits.lock().expect("commits").clone()
         }
 
-        fn commit(&self, snapshot: &[(SecretKey, Option<String>); 3]) -> Result<(), SecretError> {
+        fn commit(&self, snapshot: &FlushSnapshot) -> Result<(), SecretError> {
             if let Some(tx) = self.started_tx.lock().expect("started tx").take() {
                 tx.send(()).expect("signal start");
                 self.release_rx
