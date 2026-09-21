@@ -9,8 +9,13 @@ use super::snapshot::{AuthScreen, Snapshot};
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
 const WARN: Color32 = Color32::from_rgb(214, 160, 64);
 
-/// Shown on every Telegram auth screen. Must stay on-screen, not README-only.
-pub(crate) const TELEGRAM_STUB_BANNER: &str = "Stub — no live TDLib session yet. These screens advance locally. Do not paste api_id or api_hash expecting a real Telegram login.";
+/// Shown only when the live `tdlib-rs` client was not compiled in.
+pub(crate) const TDLIB_UNAVAILABLE_BANNER: &str = "TDLib unavailable in this build. Enable feature telegram-tdlib after a local TDLib install. These screens do not open a live Telegram session.";
+
+#[must_use]
+pub(crate) const fn tdlib_compiled() -> bool {
+    cfg!(feature = "telegram-tdlib")
+}
 
 pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
     if snapshot.auth == AuthScreen::Idle {
@@ -18,15 +23,28 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
     }
 
     ui.separator();
-    ui.heading("Add Telegram account (TDLib stub)");
-    stub_banner(ui);
+    ui.heading(if tdlib_compiled() {
+        "Add Telegram account"
+    } else {
+        "Add Telegram account (TDLib unavailable)"
+    });
+    if !tdlib_compiled() {
+        ui.colored_label(WARN, TDLIB_UNAVAILABLE_BANNER);
+    }
     ui.label(
         RichText::new(
-            "Cancel is always available. This UI does not block the UI thread. If you still enter values, they go to the OS keychain when one is available and are never written to the git repo or logged.",
+            "Cancel is always available. This UI does not block the UI thread. Credentials go to the secret store and are never written to the git repo or logged.",
         )
         .small()
         .color(MUTED),
     );
+    if snapshot.auth_busy {
+        ui.label(
+            RichText::new("Waiting for the Telegram adapter. The UI thread stays free.")
+                .small()
+                .color(MUTED),
+        );
+    }
 
     match snapshot.auth {
         AuthScreen::Idle => {}
@@ -38,27 +56,14 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
 
     ui.add_space(8.0);
     if ui.button("Cancel").clicked() {
-        snapshot.cancel_auth();
+        snapshot.cancel_auth(secrets);
     }
 }
 
-fn stub_banner(ui: &mut egui::Ui) {
-    ui.colored_label(WARN, TELEGRAM_STUB_BANNER);
-}
-
 fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    ui.label(
-        "Help: https://my.telegram.org — API development tools. This step does not start TDLib.",
-    );
+    ui.label("Help: https://my.telegram.org — API development tools.");
     ui.label("1. Open my.telegram.org, sign in, and open API development tools.");
-    ui.label("2. Optional practice only: copy api_id and api_hash. Nothing is sent to Telegram.");
-    ui.label(
-        RichText::new(
-            "Stub step. Values, if entered, stay in the OS keychain or memory. Not a live login.",
-        )
-        .small()
-        .color(MUTED),
-    );
+    ui.label("2. Copy api_id and api_hash. They stay in the secret store.");
     ui.horizontal(|ui| {
         ui.label("api_id");
         ui.add(
@@ -74,46 +79,39 @@ fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
                 .hint_text("from my.telegram.org"),
         );
     });
-    if ui.button("Continue (stub)").clicked() {
-        snapshot.advance_telegram(secrets);
-    }
+    continue_button(ui, snapshot, secrets, "Continue");
 }
 
 fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    ui.label("Phone number practice field. No code is sent. No live TDLib session.");
-    ui.label(
-        RichText::new(
-            "Stub step. Enabling feature telegram-tdlib later uses this same screen to request a real code.",
-        )
-        .small()
-        .color(MUTED),
-    );
+    ui.label("Phone number in international format. It stays in the secret store.");
     ui.add(egui::TextEdit::singleline(&mut snapshot.telegram_phone).hint_text("+15551234567"));
-    if ui.button("Send code (stub)").clicked() {
-        snapshot.advance_telegram(secrets);
-    }
+    continue_button(ui, snapshot, secrets, "Send code");
 }
 
 fn telegram_code(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    ui.label("Login code practice field. Telegram did not send a code. No live TDLib session.");
+    ui.label("Login code. It stays in the secret store and is not logged.");
     ui.add(
         egui::TextEdit::singleline(&mut snapshot.telegram_code)
             .password(true)
-            .hint_text("unused in this stub"),
+            .hint_text("login code"),
     );
-    if ui.button("Continue (stub)").clicked() {
-        snapshot.advance_telegram(secrets);
-    }
+    continue_button(ui, snapshot, secrets, "Continue");
 }
 
 fn telegram_2fa(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    ui.label("Optional 2FA practice field. Leave blank to skip. No live TDLib session.");
+    ui.label("Optional 2FA password. Leave blank to skip if this account has none.");
     ui.add(
         egui::TextEdit::singleline(&mut snapshot.telegram_2fa)
             .password(true)
-            .hint_text("unused in this stub"),
+            .hint_text("optional"),
     );
-    if ui.button("Finish (stub)").clicked() {
-        snapshot.advance_telegram(secrets);
-    }
+    continue_button(ui, snapshot, secrets, "Finish");
+}
+
+fn continue_button(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, label: &str) {
+    ui.add_enabled_ui(!snapshot.auth_busy, |ui| {
+        if ui.button(label).clicked() {
+            snapshot.advance_telegram(secrets);
+        }
+    });
 }

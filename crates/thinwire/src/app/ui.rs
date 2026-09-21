@@ -21,7 +21,7 @@ pub(crate) fn draw(
 ) {
     settings.apply(ui.ctx());
     top_bar(ui, snapshot, settings, secrets);
-    status_strip(ui, snapshot);
+    status_strip(ui, snapshot, secrets);
     left_panel(ui, snapshot);
     center_panel(ui, snapshot, secrets);
 }
@@ -76,19 +76,19 @@ fn theme_control(ui: &mut egui::Ui, settings: &mut Settings) {
     }
 }
 
-fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
     egui::Panel::top("status").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Status").strong());
             ui.label(&snapshot.status_text);
             if snapshot.auth != super::snapshot::AuthScreen::Idle && ui.button("Cancel").clicked() {
-                snapshot.cancel_auth();
+                snapshot.cancel_auth(secrets);
             }
         });
-        if snapshot.auth != super::snapshot::AuthScreen::Idle {
+        if snapshot.auth != super::snapshot::AuthScreen::Idle && !super::auth::tdlib_compiled() {
             ui.colored_label(
                 Color32::from_rgb(214, 160, 64),
-                "Telegram auth is a stub. No live TDLib session yet. Do not paste api_id or api_hash expecting a real login. Cancel is always available.",
+                super::auth::TDLIB_UNAVAILABLE_BANNER,
             );
         }
         if let Some(error) = &snapshot.error {
@@ -245,14 +245,13 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
 }
 
 fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    ui.heading("Start with Telegram (TDLib stub)");
-    ui.colored_label(
-        EXPERIMENTAL,
-        "Stub — no live TDLib session yet. The next screens are scaffolding only. Do not paste api_id or api_hash expecting a real Telegram login.",
-    );
-    ui.label("Help: https://my.telegram.org for later, when a real TDLib client is wired.");
+    ui.heading("Start with Telegram");
+    if !super::auth::tdlib_compiled() {
+        ui.colored_label(EXPERIMENTAL, super::auth::TDLIB_UNAVAILABLE_BANNER);
+    }
+    ui.label("Help: https://my.telegram.org — API development tools.");
     ui.add_space(8.0);
-    if ui.button("Add Telegram (stub)").clicked() {
+    if ui.button("Add Telegram").clicked() {
         snapshot.open_telegram(secrets);
     }
     ui.add_space(12.0);

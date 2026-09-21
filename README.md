@@ -10,13 +10,13 @@ Inbox shell (account switcher + conversations on the left, thread in the center)
 
 v1 protocols are Telegram, WhatsApp (experimental), Discord (bot/OAuth inbox only), and Slack OAuth. Signal is out of v1; this MIT binary does not link libsignal or Presage.
 
-First-run and Add account currently offer Telegram (TDLib) only: api_id / api_hash (from my.telegram.org) → phone → code → optional 2FA. Slack, WhatsApp, and Discord protocol stubs remain; their auth UI is not in this beat. Discord user-account / self-bot fields do not exist. Default builds stay compile-safe stubs (`--features telegram-tdlib` compiles the TDLib hook, still without a live network login). Appearance defaults to the OS light/dark theme (System).
+First-run and Add account offer Telegram (TDLib) only: api_id / api_hash (from my.telegram.org) → phone → code → optional 2FA. Slack, WhatsApp, and Discord protocol stubs remain; their auth UI is not in this beat. Discord user-account / self-bot fields do not exist. Default CI builds keep `telegram-tdlib` off so they do not link or download TDLib; the UI then shows a clear “TDLib unavailable” path (no live login). Enable `--features telegram-tdlib` locally after a TDLib install for the live `tdlib-rs` client. Appearance defaults to the OS light/dark theme (System).
 
 ## Protocol support (honest)
 
 | Protocol | Path | Support language |
 | --- | --- | --- |
-| Telegram | Official TDLib via Rust bindings (`tdlib-rs` planned) | Supported goal |
+| Telegram | Official TDLib via Rust bindings (`tdlib-rs`) | Supported goal |
 | Slack | Official Slack OAuth / API (workspace app) | Supported goal |
 | WhatsApp | Unofficial Web / linked-device style (ZapFast / whatsapp-rust inspired) | **Experimental** |
 | Discord | Bot/OAuth inbox only — no Discord user self-bots / personal DMs | Constrained / experimental |
@@ -49,7 +49,9 @@ nix develop --command scripts/lint.sh
 nix develop --command scripts/test.sh
 ```
 
-Optional later (local TDLib install; never commit `api_id` / `api_hash` / session strings):
+CI feature matrix: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` run **without** `telegram-tdlib`. That is the merge-critical default.
+
+Live TDLib (local install; `tdlib-rs` downloads a prebuilt `tdjson`; never commit `api_id` / `api_hash` / session strings):
 
 ```bash
 cargo build -p thinwire --features telegram-tdlib
@@ -81,3 +83,4 @@ Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows.
 - Do not link AGPL libsignal / Presage into this binary
 - Never commit or log Telegram `api_id` / `api_hash` / session strings
 - Default appearance is System theme (ADR 0005)
+- Live Telegram TDLib is feature-gated (ADR 0006). Default CI stays `telegram-tdlib` off.

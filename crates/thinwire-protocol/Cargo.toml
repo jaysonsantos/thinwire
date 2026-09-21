@@ -10,11 +10,15 @@ description = "Protocol adapters and capability metadata for thinwire"
 
 [features]
 default = []
-# Compile-safe hook for a later official TDLib client via `tdlib-rs`.
-# Default builds stay stubbed so CI does not need system TDLib or secrets.
-telegram-tdlib = []
+# Live official TDLib client via `tdlib-rs`. Default CI stays feature-off so
+# jobs do not download or link system TDLib. Local builds: install is handled
+# by the crate's `download-tdlib` feature. Never put api_id / api_hash in CI.
+telegram-tdlib = ["dep:tdlib-rs"]
 
 [dependencies]
+tdlib-rs = { version = "1.4", optional = true, default-features = false, features = [
+  "download-tdlib",
+] }
 tokio.workspace = true
 tracing.workspace = true
 

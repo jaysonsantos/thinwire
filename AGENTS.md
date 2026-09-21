@@ -19,7 +19,8 @@
 - Discord: bot/OAuth inbox only — no self-bots / personal DMs
 - Slack: official OAuth only
 - Signal: out of v1 (S2); no libsignal / Presage
-- Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets.
+- Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session. Phone / code / 2FA stay in the memory vault only. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets. Never put secrets on `AdapterCommand`.
+- Telegram live client is feature `telegram-tdlib` (`tdlib-rs`). Default CI stays feature-off and shows “TDLib unavailable”. ADR 0006.
 
 ## Layout
 
@@ -27,7 +28,7 @@
 | --- | --- |
 | `crates/thinwire/` | Desktop binary: egui shell, Telegram login, keychain, system theme, inbox |
 | `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings |
-| `decisions/` | ADRs (0002 glow, 0004 Signal out, 0005 system theme) |
+| `decisions/` | ADRs (0002 glow, 0004 Signal out, 0005 system theme, 0006 live TDLib) |
 | `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |

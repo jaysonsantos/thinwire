@@ -5,6 +5,7 @@ mod discord;
 mod fake;
 mod host;
 mod risk;
+mod secrets;
 mod slack;
 mod telegram;
 mod whatsapp;
@@ -12,7 +13,7 @@ mod whatsapp;
 pub use adapter::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Conversation,
     DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass,
-    TelegramAuthStep,
+    TelegramAuthPhase, TelegramAuthStep,
 };
 pub use discord::DiscordAdapter;
 pub use fake::FakeAdapter;
@@ -21,12 +22,13 @@ pub use risk::{
     CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3, CRITIC_RISK_BULLETS, critic_bullets_for,
     requires_experimental_gate,
 };
+pub use secrets::{
+    MemorySecretVault, TELEGRAM_SECRET_API_HASH, TELEGRAM_SECRET_API_ID, TELEGRAM_SECRET_CODE,
+    TELEGRAM_SECRET_PASSWORD, TELEGRAM_SECRET_PHONE, TELEGRAM_SECRET_SERVICE,
+    TELEGRAM_SECRET_SESSION, TelegramSecretKey, TelegramSecretVault,
+};
 pub use slack::SlackAdapter;
 pub use telegram::TelegramAdapter;
-pub use telegram::{
-    TELEGRAM_SECRET_API_HASH, TELEGRAM_SECRET_API_ID, TELEGRAM_SECRET_SERVICE,
-    TELEGRAM_SECRET_SESSION,
-};
 pub use whatsapp::WhatsAppAdapter;
 
 /// v1 protocols in shell display order (S2: four protocols, no Signal).
@@ -39,9 +41,11 @@ pub fn catalog() -> [ProtocolCapabilities; 4] {
     ]
 }
 
-pub(crate) fn registry() -> Vec<Box<dyn ProtocolAdapter>> {
+pub(crate) fn registry(
+    secrets: std::sync::Arc<dyn TelegramSecretVault>,
+) -> Vec<Box<dyn ProtocolAdapter>> {
     vec![
-        Box::new(TelegramAdapter),
+        Box::new(TelegramAdapter::new(secrets)),
         Box::new(WhatsAppAdapter),
         Box::new(DiscordAdapter),
         Box::new(SlackAdapter),

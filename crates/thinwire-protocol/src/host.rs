@@ -1,9 +1,11 @@
 //! Tokio host: adapters run here; the UI only polls the event channel.
 
+use std::sync::Arc;
+
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use super::{AdapterCommand, AdapterEvent, ProtocolAdapter, registry};
+use super::{AdapterCommand, AdapterEvent, ProtocolAdapter, TelegramSecretVault, registry};
 
 /// Bridge between the UI thread and protocol workers.
 pub struct AdapterHost {
@@ -14,12 +16,12 @@ pub struct AdapterHost {
 impl AdapterHost {
     /// Spawn the worker that owns every adapter. Safe to call off the UI thread.
     #[must_use]
-    pub fn spawn(handle: &Handle) -> Self {
+    pub fn spawn(handle: &Handle, secrets: Arc<dyn TelegramSecretVault>) -> Self {
         let (event_tx, event_rx) = unbounded_channel();
         let (command_tx, mut command_rx) = unbounded_channel();
 
         handle.spawn(async move {
-            let mut adapters = registry();
+            let mut adapters = registry(secrets);
             for adapter in &mut adapters {
                 adapter.start(event_tx.clone());
             }
