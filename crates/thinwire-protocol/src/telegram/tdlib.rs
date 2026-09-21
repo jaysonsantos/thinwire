@@ -41,16 +41,17 @@ impl TdlibRuntime {
         source: TelegramApiSource,
         events: &EventTx,
     ) {
-        if self.commands.is_none() {
-            self.commands = Some(spawn_tdlib_worker(
-                Arc::clone(&secrets),
-                source,
-                events.clone(),
-            ));
+        if self.try_send(step) {
+            return;
         }
-        if let Some(tx) = &self.commands
-            && tx.send(TdlibCommand::Step(step)).is_err()
-        {
+        self.commands = None;
+        self.commands = Some(spawn_tdlib_worker(
+            Arc::clone(&secrets),
+            source,
+            events.clone(),
+        ));
+        if !self.try_send(step) {
+            self.commands = None;
             emit_status(
                 events,
                 ProtocolId::Telegram,
@@ -58,6 +59,12 @@ impl TdlibRuntime {
                 "TDLib worker is not running. Cancel and try again.",
             );
         }
+    }
+
+    fn try_send(&self, step: TelegramAuthStep) -> bool {
+        self.commands
+            .as_ref()
+            .is_some_and(|tx| tx.send(TdlibCommand::Step(step)).is_ok())
     }
 }
 
@@ -359,24 +366,9 @@ fn ensure_db_key(vault: &dyn TelegramSecretVault) -> String {
     {
         return existing;
     }
-    let key = generate_db_key();
+    let key = super::db_key::generate_db_key();
     vault.set_secret(TelegramSecretKey::DbEncryption, &key);
     key
-}
-
-fn generate_db_key() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let mut hasher = DefaultHasher::new();
-    nanos.hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    format!("{:016x}{:016x}", hasher.finish(), nanos)
 }
 
 fn tdlib_data_dir() -> PathBuf {

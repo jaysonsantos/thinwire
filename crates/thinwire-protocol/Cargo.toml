@@ -19,6 +19,7 @@ telegram-tdlib = ["dep:tdlib-rs"]
 tdlib-rs = { version = "1.4", optional = true, default-features = false, features = [
   "download-tdlib",
 ] }
+getrandom = "0.2"
 tokio.workspace = true
 tracing.workspace = true
 

@@ -6,6 +6,7 @@
 //! log them, never commit them.
 
 mod credentials;
+mod db_key;
 mod engine;
 
 #[cfg(feature = "telegram-tdlib")]
