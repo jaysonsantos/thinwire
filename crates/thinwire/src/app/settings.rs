@@ -2,13 +2,15 @@
 //!
 //! Theme changes update in-memory state on the UI thread. Disk writes run on a
 //! tokio `spawn_blocking` worker so the egui event loop never waits on
-//! `create_dir_all` / `fs::write`.
+//! `create_dir_all` / `fs::write`. Overlapping jobs share a write lock and
+//! re-check the persist epoch under that lock so `settings.toml` always matches
+//! the latest theme.
 
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
@@ -72,12 +74,24 @@ pub struct PersistJob {
     contents: String,
     epoch: u64,
     latest: Arc<AtomicU64>,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl PersistJob {
     /// Blocking write. Caller must run this on `spawn_blocking` / a test thread.
     pub fn run(self) {
-        if self.latest.load(Ordering::Acquire) != self.epoch {
+        self.commit(true);
+    }
+
+    fn commit(self, check_before_lock: bool) {
+        if check_before_lock && !self.is_current() {
+            return;
+        }
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.is_current() {
             return;
         }
         if let Some(parent) = self.path.parent()
@@ -90,6 +104,17 @@ impl PersistJob {
             tracing::warn!(error = %error, "theme settings were not written");
         }
     }
+
+    fn is_current(&self) -> bool {
+        self.latest.load(Ordering::Acquire) == self.epoch
+    }
+
+    /// Skip the opportunistic pre-lock check so tests can overlap jobs that
+    /// already passed a naive epoch load before filesystem I/O.
+    #[cfg(test)]
+    fn run_after_naive_pre_io_check(self) {
+        self.commit(false);
+    }
 }
 
 /// Persisted appearance. Only the theme mode is stored in this beat.
@@ -100,6 +125,7 @@ pub struct Settings {
     persist_pending: bool,
     persist_epoch: u64,
     latest_persist: Arc<AtomicU64>,
+    persist_lock: Arc<Mutex<()>>,
 }
 
 impl Settings {
@@ -118,6 +144,7 @@ impl Settings {
             persist_pending: false,
             persist_epoch: 0,
             latest_persist: Arc::new(AtomicU64::new(0)),
+            persist_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -167,6 +194,7 @@ impl Settings {
             contents: self.render(),
             epoch: self.persist_epoch,
             latest: Arc::clone(&self.latest_persist),
+            write_lock: Arc::clone(&self.persist_lock),
         })
     }
 
@@ -298,6 +326,21 @@ mod tests {
             "stale Dark write must not win"
         );
         latest.run();
+        assert_eq!(Settings::load_from(path).theme(), ThemeMode::Light);
+    }
+
+    #[test]
+    fn overlapping_persist_jobs_that_pass_pre_io_check_commit_latest() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        settings.set_theme(ThemeMode::Dark);
+        let stale = settings.take_persist_job().expect("dark job");
+        settings.set_theme(ThemeMode::Light);
+        let latest = settings.take_persist_job().expect("light job");
+        std::thread::scope(|scope| {
+            scope.spawn(|| stale.run_after_naive_pre_io_check());
+            scope.spawn(|| latest.run_after_naive_pre_io_check());
+        });
         assert_eq!(Settings::load_from(path).theme(), ThemeMode::Light);
     }
 
