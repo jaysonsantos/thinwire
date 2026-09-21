@@ -154,6 +154,12 @@ impl Snapshot {
                     row.detail = detail.clone();
                 }
                 self.status_text = detail;
+                if protocol == ProtocolId::Telegram
+                    && matches!(status, AdapterStatus::Error | AdapterStatus::Refused)
+                    && self.auth != AuthScreen::Idle
+                {
+                    self.auth_busy = false;
+                }
             }
             AdapterEvent::ConversationUpsert { conversation } => {
                 let protocol = conversation.protocol;
@@ -170,6 +176,9 @@ impl Snapshot {
                 self.messages.entry(key).or_default().push(message);
             }
             AdapterEvent::TelegramAuth { phase } => self.apply_telegram_phase(phase),
+            AdapterEvent::FlushSecrets => {
+                self.keychain_flush = true;
+            }
         }
     }
 
@@ -434,7 +443,9 @@ impl Snapshot {
 
     fn apply_telegram_phase(&mut self, phase: TelegramAuthPhase) {
         self.auth_busy = false;
-        self.error = None;
+        if phase != TelegramAuthPhase::Failed {
+            self.error = None;
+        }
         match phase {
             TelegramAuthPhase::NeedPhone => {
                 self.auth = AuthScreen::TelegramPhone;
@@ -453,6 +464,13 @@ impl Snapshot {
             }
             TelegramAuthPhase::Ready => self.finish_telegram_ready(),
             TelegramAuthPhase::Unavailable => self.finish_telegram_unavailable(),
+            TelegramAuthPhase::Failed => {
+                self.set_error(
+                    "Telegram login did not advance.",
+                    "The adapter rejected this step.",
+                    "Correct the field, or press Cancel. Values are not logged.",
+                );
+            }
         }
     }
 
@@ -851,6 +869,57 @@ mod tests {
         assert!(!snapshot.telegram_ready());
         submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::Ready);
         assert!(snapshot.telegram_ready());
+    }
+
+    #[test]
+    fn flush_secrets_event_requests_os_keychain_flush_without_values() {
+        let mut snapshot = Snapshot::new();
+        assert!(!snapshot.take_keychain_flush());
+        snapshot.apply(AdapterEvent::FlushSecrets);
+        assert!(snapshot.take_keychain_flush());
+        assert!(!snapshot.take_keychain_flush());
+        let debug = format!("{:?}", AdapterEvent::FlushSecrets);
+        assert!(debug.contains("FlushSecrets"));
+        assert!(!debug.to_ascii_lowercase().contains("hash"));
+        assert!(!debug.contains("db_key"));
+    }
+
+    #[test]
+    fn failed_phase_clears_busy_and_stays_on_the_current_form() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        let mut snapshot = Snapshot::new();
+        snapshot.open_telegram(&store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.advance_telegram(&store);
+        assert!(snapshot.auth_busy);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Failed,
+        });
+        assert!(!snapshot.auth_busy);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert!(snapshot.error.is_some());
+        assert!(!snapshot.telegram_ready());
+    }
+
+    #[test]
+    fn telegram_error_status_clears_auth_busy() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        let mut snapshot = Snapshot::new();
+        snapshot.open_telegram(&store);
+        assert!(snapshot.auth_busy);
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "telegram api_id must be a number".into(),
+        });
+        assert!(!snapshot.auth_busy);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert!(!snapshot.status_text.contains("11111"));
     }
 
     #[test]

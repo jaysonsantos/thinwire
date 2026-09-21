@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -27,12 +28,21 @@ enum TdlibCommand {
 /// Owns the TDLib client id and the command sink into the worker.
 pub struct TdlibRuntime {
     commands: Option<UnboundedSender<TdlibCommand>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl TdlibRuntime {
     #[must_use]
-    pub const fn new() -> Self {
-        Self { commands: None }
+    pub fn new() -> Self {
+        Self {
+            commands: None,
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.commands = None;
     }
 
     pub fn submit(
@@ -42,8 +52,16 @@ impl TdlibRuntime {
         source: TelegramApiSource,
         events: &EventTx,
     ) {
+        let born = self.generation.load(Ordering::SeqCst);
+        let generation = Arc::clone(&self.generation);
         let sent = super::send_or_respawn(&mut self.commands, TdlibCommand::Step(step), || {
-            spawn_tdlib_worker(Arc::clone(&secrets), source.clone(), events.clone())
+            spawn_tdlib_worker(
+                Arc::clone(&secrets),
+                source.clone(),
+                events.clone(),
+                Arc::clone(&generation),
+                born,
+            )
         });
         if !sent {
             emit_status(
@@ -66,6 +84,8 @@ fn spawn_tdlib_worker(
     secrets: Arc<dyn TelegramSecretVault>,
     source: TelegramApiSource,
     events: EventTx,
+    generation: Arc<AtomicU64>,
+    born: u64,
 ) -> UnboundedSender<TdlibCommand> {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -96,12 +116,18 @@ fn spawn_tdlib_worker(
                     let Some(TdlibCommand::Step(step)) = command else {
                         break;
                     };
+                    if generation.load(Ordering::SeqCst) != born {
+                        break;
+                    }
                     apply_step(client_id, step, secrets.as_ref(), &events).await;
                 }
                 update = update_rx.recv() => {
                     let Some(update) = update else {
                         break;
                     };
+                    if generation.load(Ordering::SeqCst) != born {
+                        break;
+                    }
                     apply_update(client_id, update, secrets.as_ref(), &source, &events).await;
                 }
             }
@@ -128,6 +154,7 @@ async fn apply_step(
         }
         TelegramAuthStep::Phone => {
             let Some(phone) = secrets.get_secret(TelegramSecretKey::Phone) else {
+                emit_telegram_auth(events, TelegramAuthPhase::Failed);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -140,6 +167,7 @@ async fn apply_step(
                 .await
                 .is_err()
             {
+                emit_telegram_auth(events, TelegramAuthPhase::Failed);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -150,6 +178,7 @@ async fn apply_step(
         }
         TelegramAuthStep::Code => {
             let Some(code) = secrets.get_secret(TelegramSecretKey::Code) else {
+                emit_telegram_auth(events, TelegramAuthPhase::Failed);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -162,6 +191,7 @@ async fn apply_step(
                 .await
                 .is_err()
             {
+                emit_telegram_auth(events, TelegramAuthPhase::Failed);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -181,6 +211,7 @@ async fn apply_step(
                 .await
                 .is_err()
             {
+                emit_telegram_auth(events, TelegramAuthPhase::Failed);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -235,6 +266,7 @@ async fn apply_update(
         }
         tdlib_rs::enums::AuthorizationState::Ready => {
             secrets.set_secret(TelegramSecretKey::Session, TDLIB_SESSION_MARKER);
+            super::request_secret_flush(events);
             emit_telegram_auth(events, TelegramAuthPhase::Ready);
             emit_status(
                 events,
@@ -299,6 +331,7 @@ async fn set_parameters(
     let (api_id, api_hash) = match require_resolved_api(secrets, source) {
         Ok(pair) => pair,
         Err(_) => {
+            emit_telegram_auth(events, TelegramAuthPhase::Failed);
             emit_status(
                 events,
                 ProtocolId::Telegram,
@@ -309,6 +342,7 @@ async fn set_parameters(
         }
     };
     let Ok(api_id) = parse_resolved_api_id(&api_id) else {
+        emit_telegram_auth(events, TelegramAuthPhase::Failed);
         emit_status(
             events,
             ProtocolId::Telegram,
@@ -318,7 +352,7 @@ async fn set_parameters(
         return;
     };
     let database_directory = tdlib_data_dir().display().to_string();
-    let encryption_key = ensure_db_key(secrets);
+    let encryption_key = ensure_db_key(secrets, events);
     if tdlib_rs::functions::set_tdlib_parameters(
         false,
         database_directory,
@@ -348,7 +382,7 @@ async fn set_parameters(
     }
 }
 
-fn ensure_db_key(vault: &dyn TelegramSecretVault) -> String {
+fn ensure_db_key(vault: &dyn TelegramSecretVault, events: &EventTx) -> String {
     if let Some(existing) = vault.get_secret(TelegramSecretKey::DbEncryption)
         && !existing.is_empty()
     {
@@ -356,6 +390,7 @@ fn ensure_db_key(vault: &dyn TelegramSecretVault) -> String {
     }
     let key = generate_db_key();
     vault.set_secret(TelegramSecretKey::DbEncryption, &key);
+    super::request_secret_flush(events);
     key
 }
 

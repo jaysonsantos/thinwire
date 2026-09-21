@@ -25,7 +25,8 @@ pub use credentials::{
 
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, EventTx, ProtocolAdapter, ProtocolCapabilities,
-    ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep, emit_status, emit_telegram_auth,
+    ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep, emit_flush_secrets, emit_status,
+    emit_telegram_auth,
 };
 use super::secrets::TelegramSecretVault;
 
@@ -105,9 +106,16 @@ impl TelegramAdapter {
         step: TelegramAuthStep,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
-        let phase = self
+        let phase = match self
             .engine
-            .submit(step, self.secrets.as_ref(), &self.api_source)?;
+            .submit(step, self.secrets.as_ref(), &self.api_source)
+        {
+            Ok(phase) => phase,
+            Err(error) => {
+                emit_telegram_auth(events, TelegramAuthPhase::Failed);
+                return Err(error);
+            }
+        };
         #[cfg(feature = "telegram-tdlib")]
         {
             self.tdlib.submit(
@@ -194,6 +202,8 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
             } => {
                 self.engine.reset();
+                #[cfg(feature = "telegram-tdlib")]
+                self.tdlib.stop();
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -223,6 +233,7 @@ const fn phase_status(phase: TelegramAuthPhase) -> AdapterStatus {
     match phase {
         TelegramAuthPhase::Ready => AdapterStatus::Ready,
         TelegramAuthPhase::Unavailable => AdapterStatus::Stubbed,
+        TelegramAuthPhase::Failed => AdapterStatus::Error,
         TelegramAuthPhase::NeedPhone
         | TelegramAuthPhase::NeedCode
         | TelegramAuthPhase::NeedTwoFactor => AdapterStatus::Connecting,
@@ -234,6 +245,12 @@ fn phase_detail(phase: TelegramAuthPhase, backend: &str) -> String {
         "Telegram {phase} queued. Credentials stay in the secret store. {backend}",
         phase = phase.as_str()
     )
+}
+
+/// Persist vault keys via the UI keychain-flush path. Never puts values on the event.
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn request_secret_flush(events: &EventTx) {
+    emit_flush_secrets(events);
 }
 
 /// Send `message`, spawning a worker if the slot is empty. On a dead sender,
@@ -462,5 +479,82 @@ mod tests {
         }));
         assert_eq!(spawned, 1);
         assert!(slot.is_none());
+    }
+
+    #[test]
+    fn request_secret_flush_event_carries_no_values() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        request_secret_flush(&tx);
+        let event = rx.try_recv().expect("flush");
+        assert_eq!(event, AdapterEvent::FlushSecrets);
+        let debug = format!("{event:?}");
+        assert!(debug.contains("FlushSecrets"));
+        assert!(!debug.contains("api_hash"));
+        assert!(!debug.contains("db_key"));
+    }
+
+    #[test]
+    fn disconnect_resets_engine_and_does_not_emit_ready() {
+        let vault = Arc::new(MemorySecretVault::new());
+        vault.set_secret(TelegramSecretKey::ApiId, "11111");
+        vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+        let mut adapter = TelegramAdapter::new(Arc::clone(&vault) as Arc<dyn TelegramSecretVault>);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::ApiCredentials,
+                },
+                &tx,
+            )
+            .expect("auth");
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Telegram,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        assert_eq!(adapter.engine.last_phase(), None);
+        let mut saw_ready = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::Ready,
+            } = event
+            {
+                saw_ready = true;
+            }
+            let debug = format!("{event:?}");
+            assert!(!debug.contains("11111"));
+            assert!(!debug.contains("hash-value"));
+        }
+        assert!(!saw_ready);
+    }
+
+    #[test]
+    fn nonnumeric_api_id_emits_failed_phase() {
+        let vault = Arc::new(MemorySecretVault::new());
+        vault.set_secret(TelegramSecretKey::ApiId, "not-a-number");
+        vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+        let mut adapter = TelegramAdapter::new(Arc::clone(&vault) as Arc<dyn TelegramSecretVault>);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::ApiCredentials,
+                },
+                &tx,
+            )
+            .expect_err("nonnumeric");
+        assert!(err.to_string().contains("must be a number"));
+        assert!(!err.to_string().contains("not-a-number"));
+        let event = rx.try_recv().expect("failed phase");
+        match event {
+            AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::Failed,
+            } => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

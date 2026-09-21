@@ -133,6 +133,8 @@ pub enum TelegramAuthPhase {
     NeedTwoFactor,
     Ready,
     Unavailable,
+    /// Step rejected. UI stays on the current form and clears `auth_busy`.
+    Failed,
 }
 
 impl TelegramAuthPhase {
@@ -144,6 +146,7 @@ impl TelegramAuthPhase {
             Self::NeedTwoFactor => "need 2fa",
             Self::Ready => "ready",
             Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
         }
     }
 }
@@ -195,6 +198,9 @@ pub enum AdapterEvent {
     TelegramAuth {
         phase: TelegramAuthPhase,
     },
+    /// Ask the UI to flush persistent vault keys to the OS keychain.
+    /// Never carries secret values.
+    FlushSecrets,
 }
 
 /// Conversation row shown in the inbox.
@@ -278,4 +284,9 @@ pub(crate) fn emit_message(events: &EventTx, message: ChatMessage) {
 
 pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
     let _ = events.send(AdapterEvent::TelegramAuth { phase });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_flush_secrets(events: &EventTx) {
+    let _ = events.send(AdapterEvent::FlushSecrets);
 }
