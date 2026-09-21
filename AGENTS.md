@@ -10,6 +10,7 @@
 - UI: egui + eframe; protocol work off the UI thread
 - First-run / Add account this beat: Telegram only (no WA / Discord / Slack auth UI)
 - Theme default is System (follow OS light/dark live via egui `system_theme`; persist System \| Light \| Dark)
+- Ordered next work: see `ROADMAP.md`
 
 ## Stack
 
@@ -30,6 +31,7 @@
 | `crates/thinwire/` | Desktop binary: egui shell, Telegram login, keychain, system theme, inbox |
 | `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings |
 | `decisions/` | ADRs (0002 glow, 0004 Signal out, 0005 system theme, `0006-live-tdlib`, `0007-publisher-telegram-api-credentials`) |
+| `ROADMAP.md` | Ordered product-council todo list (ADRs stay in `decisions/`) |
 | `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |
