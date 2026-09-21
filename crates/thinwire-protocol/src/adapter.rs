@@ -125,6 +125,32 @@ impl TelegramAuthStep {
     }
 }
 
+/// Telegram login phase reported to the UI. Never carries credential values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramAuthPhase {
+    NeedPhone,
+    NeedCode,
+    NeedTwoFactor,
+    Ready,
+    Unavailable,
+    /// Step rejected. UI stays on the current form and clears `auth_busy`.
+    Failed,
+}
+
+impl TelegramAuthPhase {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedPhone => "need phone",
+            Self::NeedCode => "need code",
+            Self::NeedTwoFactor => "need 2fa",
+            Self::Ready => "ready",
+            Self::Unavailable => "unavailable",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Commands the UI may enqueue for the tokio worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterCommand {
@@ -137,7 +163,7 @@ pub enum AdapterCommand {
     ConnectDiscord {
         mode: DiscordAuthMode,
     },
-    /// Advances the Telegram login screens. Secrets stay in the OS keychain.
+    /// Advances the Telegram login screens. Secrets stay in the secret vault.
     TelegramAuth {
         step: TelegramAuthStep,
     },
@@ -168,6 +194,13 @@ pub enum AdapterEvent {
     MessageReceived {
         message: ChatMessage,
     },
+    /// Telegram login state machine. The UI applies this on the next poll.
+    TelegramAuth {
+        phase: TelegramAuthPhase,
+    },
+    /// Ask the UI to flush persistent vault keys to the OS keychain.
+    /// Never carries secret values.
+    FlushSecrets,
 }
 
 /// Conversation row shown in the inbox.
@@ -247,4 +280,13 @@ pub(crate) fn emit_conversation(events: &EventTx, conversation: Conversation) {
 
 pub(crate) fn emit_message(events: &EventTx, message: ChatMessage) {
     let _ = events.send(AdapterEvent::MessageReceived { message });
+}
+
+pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
+    let _ = events.send(AdapterEvent::TelegramAuth { phase });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_flush_secrets(events: &EventTx) {
+    let _ = events.send(AdapterEvent::FlushSecrets);
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
-use thinwire_protocol::AdapterHost;
+use thinwire_protocol::{AdapterHost, TelegramSecretVault};
 
 use secrets::SecretStore;
 use snapshot::Snapshot;
@@ -31,8 +31,11 @@ impl ThinwireApp {
     #[must_use]
     pub fn new(settings: Settings) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime for protocol adapters");
-        let host = AdapterHost::spawn(runtime.handle());
         let secrets = SecretStore::for_ui(runtime.handle());
+        let host = AdapterHost::spawn(
+            runtime.handle(),
+            Arc::clone(&secrets) as Arc<dyn TelegramSecretVault>,
+        );
         let mut snapshot = Snapshot::new();
         snapshot.status_text = secret_store_status_text(secrets.backend_name());
         Self {
@@ -120,7 +123,7 @@ mod tests {
     #[test]
     fn secret_store_status_does_not_clobber_auth_copy() {
         assert_eq!(
-            refreshed_secret_store_status("Telegram stub: phone step.", "os-keychain"),
+            refreshed_secret_store_status("Telegram: enter a phone number.", "os-keychain"),
             None
         );
     }

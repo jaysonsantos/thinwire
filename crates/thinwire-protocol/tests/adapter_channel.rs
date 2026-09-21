@@ -77,7 +77,7 @@ async fn fake_adapter_pushes_events_from_worker_without_ui_apis() {
 async fn telegram_stub_emits_tdlib_status_from_worker() {
     let (tx, mut rx) = unbounded_channel();
     let worker = tokio::spawn(async move {
-        let mut adapter = thinwire_protocol::TelegramAdapter;
+        let mut adapter = thinwire_protocol::TelegramAdapter::memory();
         adapter.start(tx);
     });
 
@@ -99,4 +99,83 @@ async fn telegram_stub_emits_tdlib_status_from_worker() {
     }
 
     worker.await.expect("telegram worker");
+}
+
+#[tokio::test]
+async fn telegram_unavailable_auth_emits_phases_without_secrets_on_the_wire() {
+    use std::sync::Arc;
+
+    use thinwire_protocol::{
+        MemorySecretVault, TelegramAuthPhase, TelegramAuthStep, TelegramSecretKey,
+        TelegramSecretVault,
+    };
+
+    let vault = Arc::new(MemorySecretVault::new());
+    vault.set_secret(TelegramSecretKey::ApiId, "11111");
+    vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+    vault.set_secret(TelegramSecretKey::Phone, "+15551234567");
+    vault.set_secret(TelegramSecretKey::Code, "12345");
+
+    let (tx, mut rx) = unbounded_channel();
+    let worker = tokio::spawn(async move {
+        let mut adapter = thinwire_protocol::TelegramAdapter::new(vault);
+        adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::ApiCredentials,
+                },
+                &tx,
+            )
+            .expect("api");
+        adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::Phone,
+                },
+                &tx,
+            )
+            .expect("phone");
+        adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::Code,
+                },
+                &tx,
+            )
+            .expect("code");
+        adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::TwoFactor,
+                },
+                &tx,
+            )
+            .expect("2fa");
+    });
+
+    let mut phases = Vec::new();
+    while let Ok(Some(event)) = timeout(Duration::from_millis(200), rx.recv()).await {
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("11111"), "{debug}");
+        assert!(!debug.contains("hash-value"), "{debug}");
+        assert!(!debug.contains("+15551234567"), "{debug}");
+        assert!(!debug.contains("12345"), "{debug}");
+        if let AdapterEvent::TelegramAuth { phase } = event {
+            phases.push(phase);
+        }
+    }
+
+    if !cfg!(feature = "telegram-tdlib") {
+        assert_eq!(
+            phases,
+            vec![
+                TelegramAuthPhase::NeedPhone,
+                TelegramAuthPhase::NeedCode,
+                TelegramAuthPhase::NeedTwoFactor,
+                TelegramAuthPhase::Unavailable,
+            ]
+        );
+    }
+
+    worker.await.expect("telegram auth worker");
 }

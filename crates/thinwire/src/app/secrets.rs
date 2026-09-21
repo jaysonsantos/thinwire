@@ -15,46 +15,15 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use keyring::Entry;
-use thinwire_protocol::{
-    TELEGRAM_SECRET_API_HASH, TELEGRAM_SECRET_API_ID, TELEGRAM_SECRET_SERVICE,
-    TELEGRAM_SECRET_SESSION,
-};
+use thinwire_protocol::{TELEGRAM_SECRET_SERVICE, TelegramSecretKey, TelegramSecretVault};
 use tokio::runtime::Handle;
+
+/// Telegram secrets the login screens persist. Re-export keeps call sites short.
+pub type SecretKey = TelegramSecretKey;
 
 /// Set `THINWIRE_KEYRING=memory` to skip the OS keychain (CI / local headless).
 pub const KEYRING_ENV: &str = "THINWIRE_KEYRING";
 const KEYRING_MEMORY: &str = "memory";
-
-/// Telegram secrets the login screens persist.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SecretKey {
-    ApiId,
-    ApiHash,
-    Session,
-}
-
-impl SecretKey {
-    pub const ALL: [Self; 3] = [Self::ApiId, Self::ApiHash, Self::Session];
-
-    #[must_use]
-    pub const fn account(self) -> &'static str {
-        match self {
-            Self::ApiId => TELEGRAM_SECRET_API_ID,
-            Self::ApiHash => TELEGRAM_SECRET_API_HASH,
-            Self::Session => TELEGRAM_SECRET_SESSION,
-        }
-    }
-}
-
-impl fmt::Debug for SecretKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::ApiId => "ApiId",
-            Self::ApiHash => "ApiHash",
-            Self::Session => "Session",
-        })
-    }
-}
 
 /// Recoverable secret-store failure. Display text never includes secret values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,7 +320,7 @@ impl SecretStore {
         }
         inner.flush_pending = false;
         Ok(Some(
-            SecretKey::ALL.map(|key| (key, inner.values.get(&key).cloned())),
+            SecretKey::PERSISTENT.map(|key| (key, inner.values.get(&key).cloned())),
         ))
     }
 
@@ -366,7 +335,19 @@ impl SecretStore {
     }
 }
 
-type FlushSnapshot = [(SecretKey, Option<String>); 3];
+type FlushSnapshot = [(SecretKey, Option<String>); 4];
+
+impl TelegramSecretVault for SecretStore {
+    fn get_secret(&self, key: TelegramSecretKey) -> Option<String> {
+        self.get(key).ok().flatten()
+    }
+
+    fn set_secret(&self, key: TelegramSecretKey, value: &str) {
+        if let Err(error) = self.set(key, value) {
+            tracing::warn!(error = %error, "memory secret write failed");
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlushAction {
@@ -377,7 +358,7 @@ enum FlushAction {
 
 fn read_os_snapshot() -> (HashMap<SecretKey, String>, Option<SecretError>) {
     let mut os_values = HashMap::new();
-    for key in SecretKey::ALL {
+    for key in SecretKey::PERSISTENT {
         match os_get(key) {
             Ok(Some(value)) => {
                 os_values.insert(key, value);
@@ -498,6 +479,22 @@ mod tests {
         assert!(!debug.contains("super-secret-session"));
         store.delete(SecretKey::ApiHash).expect("delete hash");
         assert_eq!(store.get(SecretKey::ApiHash).expect("get hash"), None);
+    }
+
+    #[test]
+    fn ephemeral_keys_are_memory_only() {
+        let store = SecretStore::memory();
+        store.set(SecretKey::Phone, "+15551234567").expect("phone");
+        store.set(SecretKey::Code, "12345").expect("code");
+        store.set(SecretKey::Password, "2fa-secret").expect("2fa");
+        assert!(!SecretKey::Phone.persist_to_os());
+        assert!(!SecretKey::Code.persist_to_os());
+        assert!(!SecretKey::Password.persist_to_os());
+        assert_eq!(store.request_flush(), FlushAction::Ignore);
+        let debug = format!("{store:?}");
+        assert!(!debug.contains("+15551234567"));
+        assert!(!debug.contains("12345"));
+        assert!(!debug.contains("2fa-secret"));
     }
 
     #[test]

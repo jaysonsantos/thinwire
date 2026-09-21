@@ -19,7 +19,9 @@
 - Discord: bot/OAuth inbox only — no self-bots / personal DMs
 - Slack: official OAuth only
 - Signal: out of v1 (S2); no libsignal / Presage
-- Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets.
+- Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session. Phone / code / 2FA stay in the memory vault only. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets. Never put secrets on `AdapterCommand`.
+- Telegram live client is feature `telegram-tdlib` (`tdlib-rs`). Default CI stays feature-off. Unauthorized banner drops only on TDLib Ready. ADR `0006-live-tdlib`.
+- Official `api_id` / `api_hash`: compile-time `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` inject, never in git or public fork-PR CI. Optional Advanced keychain override wins and is not the primary login path. Dev without inject shows credentials missing (not my.telegram.org). ADR `0007-publisher-telegram-api-credentials`. End-user official UX is phone → code → optional 2FA.
 
 ## Layout
 
@@ -27,7 +29,7 @@
 | --- | --- |
 | `crates/thinwire/` | Desktop binary: egui shell, Telegram login, keychain, system theme, inbox |
 | `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings |
-| `decisions/` | ADRs (0002 glow, 0004 Signal out, 0005 system theme) |
+| `decisions/` | ADRs (0002 glow, 0004 Signal out, 0005 system theme, `0006-live-tdlib`, `0007-publisher-telegram-api-credentials`) |
 | `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |
