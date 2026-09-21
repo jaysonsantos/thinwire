@@ -34,10 +34,7 @@ impl ThinwireApp {
         let host = AdapterHost::spawn(runtime.handle());
         let secrets = SecretStore::for_ui(runtime.handle());
         let mut snapshot = Snapshot::new();
-        snapshot.status_text = format!(
-            "Adapters are stubs. Secret store: {}.",
-            secrets.backend_name()
-        );
+        snapshot.status_text = secret_store_status_text(secrets.backend_name());
         Self {
             runtime,
             host,
@@ -51,6 +48,14 @@ impl ThinwireApp {
     fn drain_events(&mut self) {
         for event in self.host.poll_events() {
             self.snapshot.apply(event);
+        }
+    }
+
+    fn refresh_secret_store_status(&mut self) {
+        if let Some(text) =
+            refreshed_secret_store_status(&self.snapshot.status_text, self.secrets.backend_name())
+        {
+            self.snapshot.status_text = text;
         }
     }
 
@@ -70,6 +75,7 @@ impl ThinwireApp {
 impl eframe::App for ThinwireApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.refresh_secret_store_status();
         if self.settings.follow_os_live(ctx, &mut self.last_os_theme) {
             ctx.request_repaint();
         }
@@ -81,5 +87,41 @@ impl eframe::App for ThinwireApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui::draw(ui, &mut self.snapshot, &mut self.settings, &self.secrets);
         self.flush_commands();
+    }
+}
+
+const SECRET_STORE_STATUS_PREFIX: &str = "Adapters are stubs. Secret store: ";
+
+fn secret_store_status_text(backend: &str) -> String {
+    format!("{SECRET_STORE_STATUS_PREFIX}{backend}.")
+}
+
+fn refreshed_secret_store_status(current: &str, backend: &str) -> Option<String> {
+    if !current.starts_with(SECRET_STORE_STATUS_PREFIX) {
+        return None;
+    }
+    let next = secret_store_status_text(backend);
+    (current != next).then_some(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_store_status_updates_from_memory_to_os() {
+        let current = secret_store_status_text("memory");
+        assert_eq!(
+            refreshed_secret_store_status(&current, "os-keychain").as_deref(),
+            Some("Adapters are stubs. Secret store: os-keychain.")
+        );
+    }
+
+    #[test]
+    fn secret_store_status_does_not_clobber_auth_copy() {
+        assert_eq!(
+            refreshed_secret_store_status("Telegram stub: phone step.", "os-keychain"),
+            None
+        );
     }
 }
