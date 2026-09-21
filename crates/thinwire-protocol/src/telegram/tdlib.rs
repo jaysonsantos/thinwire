@@ -19,6 +19,7 @@ use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 /// Marker written to the persistent session key after authorization.
 pub const TDLIB_SESSION_MARKER: &str = "tdlib-ready";
 
+#[derive(Clone, Copy)]
 enum TdlibCommand {
     Step(TelegramAuthStep),
 }
@@ -41,17 +42,10 @@ impl TdlibRuntime {
         source: TelegramApiSource,
         events: &EventTx,
     ) {
-        if self.try_send(step) {
-            return;
-        }
-        self.commands = None;
-        self.commands = Some(spawn_tdlib_worker(
-            Arc::clone(&secrets),
-            source,
-            events.clone(),
-        ));
-        if !self.try_send(step) {
-            self.commands = None;
+        let sent = super::send_or_respawn(&mut self.commands, TdlibCommand::Step(step), || {
+            spawn_tdlib_worker(Arc::clone(&secrets), source.clone(), events.clone())
+        });
+        if !sent {
             emit_status(
                 events,
                 ProtocolId::Telegram,
@@ -59,12 +53,6 @@ impl TdlibRuntime {
                 "TDLib worker is not running. Cancel and try again.",
             );
         }
-    }
-
-    fn try_send(&self, step: TelegramAuthStep) -> bool {
-        self.commands
-            .as_ref()
-            .is_some_and(|tx| tx.send(TdlibCommand::Step(step)).is_ok())
     }
 }
 
@@ -366,9 +354,13 @@ fn ensure_db_key(vault: &dyn TelegramSecretVault) -> String {
     {
         return existing;
     }
-    let key = super::db_key::generate_db_key();
+    let key = generate_db_key();
     vault.set_secret(TelegramSecretKey::DbEncryption, &key);
     key
+}
+
+fn generate_db_key() -> String {
+    super::db_key::generate_db_key()
 }
 
 fn tdlib_data_dir() -> PathBuf {

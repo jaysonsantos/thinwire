@@ -34,6 +34,6 @@ mod tests {
         assert_eq!(key, key.to_ascii_lowercase());
         let other = generate_db_key();
         assert_eq!(other.len(), 64);
-        assert_ne!(key, other);
+        assert!(key != other, "CSPRNG produced a colliding 32-byte key");
     }
 }

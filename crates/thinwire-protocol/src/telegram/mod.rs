@@ -15,6 +15,8 @@ mod tdlib;
 use std::fmt;
 use std::sync::Arc;
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use engine::TelegramAuthEngine;
 
 pub use credentials::{
@@ -234,6 +236,33 @@ fn phase_detail(phase: TelegramAuthPhase, backend: &str) -> String {
     )
 }
 
+/// Send `message`, spawning a worker if the slot is empty. On a dead sender,
+/// clear the slot, spawn once more, and retry the send. Returns `false` only
+/// if both attempts fail (slot is then `None`).
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn send_or_respawn<T: Clone>(
+    slot: &mut Option<UnboundedSender<T>>,
+    message: T,
+    mut spawn: impl FnMut() -> UnboundedSender<T>,
+) -> bool {
+    if slot.is_none() {
+        *slot = Some(spawn());
+    }
+    if slot
+        .as_ref()
+        .is_some_and(|tx| tx.send(message.clone()).is_ok())
+    {
+        return true;
+    }
+    *slot = None;
+    *slot = Some(spawn());
+    if slot.as_ref().is_some_and(|tx| tx.send(message).is_ok()) {
+        return true;
+    }
+    *slot = None;
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +378,89 @@ mod tests {
             assert!(!detail.contains("12345"));
             assert!(!detail.contains("2fa-secret"));
         }
+    }
+
+    #[test]
+    fn tdlib_generate_db_key_does_not_use_weak_entropy() {
+        let src = include_str!("tdlib.rs");
+        let start = src
+            .find("fn generate_db_key()")
+            .expect("generate_db_key must stay in tdlib.rs");
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("super::db_key::generate_db_key") || body.contains("getrandom"),
+            "generate_db_key must use the CSPRNG path"
+        );
+        assert!(!body.contains("DefaultHasher"));
+        assert!(!body.contains("SystemTime"));
+        assert!(!body.contains("UNIX_EPOCH"));
+        assert!(!src.contains("process::id"));
+        assert!(!include_str!("db_key.rs").contains("DefaultHasher"));
+    }
+
+    #[test]
+    fn send_or_respawn_sends_on_a_live_channel() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = Some(tx);
+        let mut spawned = 0;
+        assert!(send_or_respawn(&mut slot, 7u8, || {
+            spawned += 1;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            tx
+        }));
+        assert_eq!(spawned, 0);
+        assert_eq!(rx.try_recv().expect("message"), 7);
+        assert!(slot.is_some());
+    }
+
+    #[test]
+    fn send_or_respawn_spawns_when_slot_is_empty() {
+        let mut slot = None;
+        let mut spawned = 0;
+        let (hold_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(send_or_respawn(&mut slot, 3u8, || {
+            spawned += 1;
+            hold_tx.clone()
+        }));
+        assert_eq!(spawned, 1);
+        assert_eq!(rx.try_recv().expect("message"), 3);
+        assert!(slot.is_some());
+    }
+
+    #[test]
+    fn send_or_respawn_clears_dead_sender_and_retries_once() {
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(dead_rx);
+        let mut slot = Some(dead_tx);
+        let mut spawned = 0;
+        let (live_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(send_or_respawn(&mut slot, 9u8, || {
+            spawned += 1;
+            live_tx.clone()
+        }));
+        assert_eq!(spawned, 1);
+        assert_eq!(rx.try_recv().expect("retried message"), 9);
+        assert!(slot.is_some());
+    }
+
+    #[test]
+    fn send_or_respawn_fails_only_after_retry_dies() {
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(dead_rx);
+        let mut slot = Some(dead_tx);
+        let mut spawned = 0;
+        assert!(!send_or_respawn(&mut slot, 1u8, || {
+            spawned += 1;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            drop(rx);
+            tx
+        }));
+        assert_eq!(spawned, 1);
+        assert!(slot.is_none());
     }
 }
