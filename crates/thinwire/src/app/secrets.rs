@@ -7,6 +7,8 @@
 //! Attach is an ordered state machine (`Detached` → `Attaching` → `Ready` or
 //! `MemoryOnly`). UI writes mark keys dirty so a late hydrate cannot overwrite
 //! them. A flush requested before `Ready` is deferred and runs after attach.
+//! Concurrent Ready flushes coalesce onto one worker so an older OS write
+//! cannot clobber newer credentials.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -88,6 +90,7 @@ struct Inner {
     values: HashMap<SecretKey, String>,
     dirty: HashSet<SecretKey>,
     flush_pending: bool,
+    flush_in_flight: bool,
     phase: AttachPhase,
 }
 
@@ -103,6 +106,7 @@ impl SecretStore {
                 values: HashMap::new(),
                 dirty: HashSet::new(),
                 flush_pending: false,
+                flush_in_flight: false,
                 phase,
             }),
         }
@@ -182,13 +186,6 @@ impl SecretStore {
     }
 
     pub fn spawn_os_attach(self: &Arc<Self>, handle: &Handle) {
-        if memory_requested() {
-            tracing::info!(
-                "{KEYRING_ENV}={KEYRING_MEMORY}; Telegram secrets stay in memory this session"
-            );
-            self.finish_memory_only();
-            return;
-        }
         let store = Arc::clone(self);
         handle.spawn_blocking(move || store.attach_os_keychain());
     }
@@ -215,7 +212,15 @@ impl SecretStore {
             return FlushAction::Ignore;
         };
         match inner.phase {
-            AttachPhase::Ready => FlushAction::Spawn,
+            AttachPhase::Ready => {
+                if inner.flush_in_flight {
+                    inner.flush_pending = true;
+                    FlushAction::Defer
+                } else {
+                    inner.flush_in_flight = true;
+                    FlushAction::Spawn
+                }
+            }
             AttachPhase::Detached | AttachPhase::Attaching => {
                 inner.flush_pending = true;
                 FlushAction::Defer
@@ -274,6 +279,7 @@ impl SecretStore {
         if let Ok(mut inner) = self.lock() {
             inner.phase = AttachPhase::MemoryOnly;
             inner.flush_pending = false;
+            inner.flush_in_flight = false;
         }
     }
 
@@ -298,20 +304,65 @@ impl SecretStore {
         let should_flush = inner.flush_pending || !inner.dirty.is_empty();
         inner.flush_pending = false;
         inner.dirty.clear();
+        if should_flush {
+            inner.flush_in_flight = true;
+        }
         should_flush
     }
 
     fn flush_os(&self) -> Result<(), SecretError> {
-        if self.phase() != AttachPhase::Ready {
-            return Ok(());
-        }
-        for key in SecretKey::ALL {
-            match self.get(key)? {
-                Some(value) => os_set(key, &value)?,
-                None => os_delete(key)?,
+        self.flush_loop(|snapshot| {
+            for (key, value) in snapshot {
+                match value {
+                    Some(value) => os_set(*key, value)?,
+                    None => os_delete(*key)?,
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn flush_loop<F>(&self, mut commit: F) -> Result<(), SecretError>
+    where
+        F: FnMut(&[(SecretKey, Option<String>); 3]) -> Result<(), SecretError>,
+    {
+        loop {
+            let Some(snapshot) = self.take_flush_snapshot()? else {
+                return Ok(());
+            };
+            if let Err(error) = commit(&snapshot) {
+                if self.finish_flush_cycle()? {
+                    continue;
+                }
+                return Err(error);
+            }
+            if !self.finish_flush_cycle()? {
+                return Ok(());
             }
         }
-        Ok(())
+    }
+
+    fn take_flush_snapshot(&self) -> Result<Option<[(SecretKey, Option<String>); 3]>, SecretError> {
+        let mut inner = self.lock()?;
+        if inner.phase != AttachPhase::Ready {
+            inner.flush_in_flight = false;
+            inner.flush_pending = false;
+            return Ok(None);
+        }
+        inner.flush_pending = false;
+        Ok(Some(
+            SecretKey::ALL.map(|key| (key, inner.values.get(&key).cloned())),
+        ))
+    }
+
+    fn finish_flush_cycle(&self) -> Result<bool, SecretError> {
+        let mut inner = self.lock()?;
+        if inner.phase == AttachPhase::Ready && inner.flush_pending {
+            inner.flush_pending = false;
+            return Ok(true);
+        }
+        inner.flush_in_flight = false;
+        Ok(false)
     }
 }
 
@@ -415,6 +466,12 @@ mod tests {
                 .collect();
             self.finish_ready(os_values)
         }
+
+        fn finish_in_flight_flush_for_test(&self) {
+            let mut inner = self.lock().expect("lock");
+            inner.flush_in_flight = false;
+            inner.flush_pending = false;
+        }
     }
 
     #[test]
@@ -507,6 +564,8 @@ mod tests {
         assert_eq!(store.backend_name(), "memory");
         let should_flush = store.complete_ready_for_test(&[(SecretKey::ApiId, "stale-os-id")]);
         assert!(should_flush);
+        assert_eq!(store.request_flush(), FlushAction::Defer);
+        store.finish_in_flight_flush_for_test();
         assert_eq!(store.request_flush(), FlushAction::Spawn);
         assert_eq!(
             store.get(SecretKey::ApiId).expect("id").as_deref(),
@@ -528,5 +587,135 @@ mod tests {
         store.force_attaching();
         assert_eq!(store.backend_name(), "memory");
         assert_eq!(store.phase(), AttachPhase::Attaching);
+    }
+
+    #[test]
+    fn second_ready_flush_is_deferred_while_one_is_in_flight() {
+        let store = SecretStore::blank(AttachPhase::Ready);
+        store.set(SecretKey::ApiId, "11111").expect("set");
+        assert_eq!(store.request_flush(), FlushAction::Spawn);
+        assert_eq!(store.request_flush(), FlushAction::Defer);
+        store.finish_in_flight_flush_for_test();
+        assert_eq!(store.request_flush(), FlushAction::Spawn);
+    }
+
+    #[test]
+    fn overlapping_flush_is_coalesced_and_commits_latest() {
+        let store = Arc::new(SecretStore::blank(AttachPhase::Ready));
+        store.set(SecretKey::ApiId, "old-id").expect("old id");
+        store.set(SecretKey::ApiHash, "old-hash").expect("old hash");
+
+        let dest = StallSink::new();
+        assert_eq!(store.request_flush(), FlushAction::Spawn);
+
+        let worker_store = Arc::clone(&store);
+        let worker_dest = dest.clone();
+        let worker = std::thread::spawn(move || {
+            worker_store
+                .flush_loop(|snapshot| worker_dest.commit(snapshot))
+                .expect("flush");
+        });
+
+        dest.wait_started();
+        store.set(SecretKey::ApiId, "new-id").expect("new id");
+        store.set(SecretKey::ApiHash, "new-hash").expect("new hash");
+        store
+            .set(SecretKey::Session, "new-session")
+            .expect("new session");
+        assert_eq!(store.request_flush(), FlushAction::Defer);
+
+        dest.release();
+        worker.join().expect("join");
+
+        let commits = dest.commits();
+        assert!(
+            commits.len() >= 2,
+            "stale snapshot plus a repeat after the overlapping request"
+        );
+        let last = commits.last().expect("last commit");
+        assert_eq!(
+            snapshot_value(last, SecretKey::ApiId).as_deref(),
+            Some("new-id")
+        );
+        assert_eq!(
+            snapshot_value(last, SecretKey::ApiHash).as_deref(),
+            Some("new-hash")
+        );
+        assert_eq!(
+            snapshot_value(last, SecretKey::Session).as_deref(),
+            Some("new-session")
+        );
+    }
+
+    fn snapshot_value(
+        snapshot: &[(SecretKey, Option<String>); 3],
+        key: SecretKey,
+    ) -> Option<String> {
+        snapshot
+            .iter()
+            .find(|(item, _)| *item == key)
+            .and_then(|(_, value)| value.clone())
+    }
+
+    #[derive(Clone)]
+    struct StallSink {
+        commits: Arc<Mutex<Vec<[(SecretKey, Option<String>); 3]>>>,
+        started_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        started_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+        release_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        release_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    }
+
+    impl StallSink {
+        fn new() -> Self {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            Self {
+                commits: Arc::new(Mutex::new(Vec::new())),
+                started_rx: Arc::new(Mutex::new(Some(started_rx))),
+                started_tx: Arc::new(Mutex::new(Some(started_tx))),
+                release_rx: Arc::new(Mutex::new(Some(release_rx))),
+                release_tx: Arc::new(Mutex::new(Some(release_tx))),
+            }
+        }
+
+        fn wait_started(&self) {
+            self.started_rx
+                .lock()
+                .expect("started rx")
+                .take()
+                .expect("started rx")
+                .recv()
+                .expect("started");
+        }
+
+        fn release(&self) {
+            self.release_tx
+                .lock()
+                .expect("release tx")
+                .take()
+                .expect("release tx")
+                .send(())
+                .expect("release");
+        }
+
+        fn commits(&self) -> Vec<[(SecretKey, Option<String>); 3]> {
+            self.commits.lock().expect("commits").clone()
+        }
+
+        fn commit(&self, snapshot: &[(SecretKey, Option<String>); 3]) -> Result<(), SecretError> {
+            if let Some(tx) = self.started_tx.lock().expect("started tx").take() {
+                tx.send(()).expect("signal start");
+                self.release_rx
+                    .lock()
+                    .expect("release rx")
+                    .take()
+                    .expect("release rx")
+                    .recv()
+                    .expect("release");
+            }
+            self.commits.lock().expect("commits").push(snapshot.clone());
+            Ok(())
+        }
     }
 }
