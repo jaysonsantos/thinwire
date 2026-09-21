@@ -412,7 +412,7 @@ impl Snapshot {
         self.status_text = if self.api_source.has_publisher() {
             "Telegram API credentials are missing from the keychain override. Set Advanced credentials or Cancel.".into()
         } else {
-            "This build has no Telegram API credentials. Official binaries inject TELEGRAM_API_ID / TELEGRAM_API_HASH at release time. Dev: rebuild with those env vars, or set a keychain override in Advanced.".into()
+            "Credentials missing. Official binaries inject TELEGRAM_API_ID / TELEGRAM_API_HASH at release time. Dev: rebuild with those env vars, or set a keychain override in Advanced.".into()
         };
     }
 
@@ -604,6 +604,7 @@ mod tests {
     fn auth_ui_is_telegram_only_this_beat() {
         let src = include_str!("auth.rs");
         assert!(src.contains("TELEGRAM_API_ID"));
+        assert!(src.contains("credentials missing") || src.contains("Credentials missing"));
         assert!(src.contains("my.telegram.org"));
         assert!(src.contains("Cancel"));
         assert!(src.contains("Send code"));
@@ -629,10 +630,24 @@ mod tests {
         let mut snapshot = Snapshot::new();
         snapshot.open_add_account(&store);
         assert_eq!(snapshot.auth, AuthScreen::NeedCredentials);
+        assert!(snapshot.status_text.contains("Credentials missing"));
         assert!(!snapshot.status_text.contains("my.telegram.org"));
         snapshot.advance_telegram(&store);
         assert_eq!(snapshot.auth, AuthScreen::NeedCredentials);
         assert!(store.get(SecretKey::ApiId).expect("get").is_none());
+    }
+
+    #[test]
+    fn council_adrs_use_locked_filenames() {
+        let six = include_str!("../../../../decisions/0006-live-tdlib.md");
+        assert!(six.contains("# Live TDLib replaces the Telegram stub"));
+        assert!(six.contains("authorizationStateReady"));
+        assert!(six.contains("0007-publisher-telegram-api-credentials"));
+        let seven = include_str!("../../../../decisions/0007-publisher-telegram-api-credentials.md");
+        assert!(seven.contains("# Publisher-owned Telegram api_id / api_hash"));
+        assert!(seven.contains("Primary login UI: phone/code"));
+        assert!(seven.contains("not** the primary login path"));
+        assert!(seven.contains("do **not** send every user to my.telegram.org"));
     }
 
     #[test]

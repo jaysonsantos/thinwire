@@ -380,16 +380,24 @@ fn generate_db_key() -> String {
 }
 
 fn tdlib_data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
-        return PathBuf::from(dir);
+    let path = if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let mut base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+            })
+            .unwrap_or_else(std::env::temp_dir);
+        base.push("thinwire");
+        base.push("tdlib");
+        base
+    };
+    let _ = std::fs::create_dir_all(&path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
     }
-    let mut base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.push("thinwire");
-    base.push("tdlib");
-    base
+    path
 }

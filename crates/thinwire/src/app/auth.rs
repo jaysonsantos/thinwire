@@ -75,7 +75,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
 
 fn auth_heading(auth: AuthScreen) -> &'static str {
     match auth {
-        AuthScreen::NeedCredentials => "Telegram API credentials are not in this build",
+        AuthScreen::NeedCredentials => "Telegram API credentials missing",
         AuthScreen::TelegramApi => "Advanced: custom Telegram API credentials",
         AuthScreen::TelegramPhone | AuthScreen::TelegramCode | AuthScreen::Telegram2fa => {
             "Add Telegram account"
@@ -86,10 +86,10 @@ fn auth_heading(auth: AuthScreen) -> &'static str {
 
 fn need_credentials(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
     ui.label(
-        "Official / publisher binaries inject TELEGRAM_API_ID and TELEGRAM_API_HASH at compile time. They are not in the MIT git tree and are not set in public CI for fork PRs.",
+        "Credentials missing. Official / publisher binaries inject TELEGRAM_API_ID and TELEGRAM_API_HASH at compile time. They are not in the MIT git tree and are not set in public CI for fork PRs.",
     );
     ui.label(
-        "Dev builds: rebuild with those env vars, or set a keychain override. Never commit sample Telegram credentials.",
+        "Dev / unofficial builds: rebuild with those env vars, or set a keychain override in Advanced. Never commit sample Telegram credentials.",
     );
     ui.add_space(6.0);
     if ui

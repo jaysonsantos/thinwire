@@ -253,7 +253,7 @@ fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) 
         ui.label("Sign in with your phone number, then the login code, then optional 2FA.");
     } else {
         ui.label(
-            "This build has no Telegram API credentials. Official binaries inject them at release time. Dev: rebuild with TELEGRAM_API_ID and TELEGRAM_API_HASH, or use Advanced to set a keychain override.",
+            "Credentials missing. Official binaries inject them at release time. Dev: rebuild with TELEGRAM_API_ID and TELEGRAM_API_HASH, or use Advanced to set a keychain override.",
         );
     }
     ui.add_space(8.0);

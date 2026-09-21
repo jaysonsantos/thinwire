@@ -7,3 +7,8 @@
 result
 .direnv
 .envrc
+
+# TDLib on-disk artifacts (app-data only; never the repo)
+td.binlog
+**/td.binlog
+*.binlog
