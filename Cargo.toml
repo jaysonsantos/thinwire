@@ -44,7 +44,7 @@ dirs = "6"
 # No default features: pick OS stores explicitly. Linux uses kernel
 # keyutils so CI compiles without libdbus. Runtime falls back to memory
 # when the platform store is unavailable.
-keyring = { version = "3.6", default-features = false, features = [
+keyring = { version = "4.0", default-features = false, features = [
   "apple-native",
   "windows-native",
   "linux-native",
