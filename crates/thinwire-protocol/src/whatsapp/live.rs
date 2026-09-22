@@ -125,7 +125,15 @@ pub(super) async fn run_link(
         return;
     }
 
-    let bot = match build_bot(backend, digits_only(phone), events.clone()).await {
+    let bot = match build_bot(
+        backend,
+        digits_only(phone),
+        events.clone(),
+        Arc::clone(&link),
+        token,
+    )
+    .await
+    {
         Ok(bot) => bot,
         Err(()) => {
             fail(&events, BUILD_FAILED);
@@ -167,22 +175,40 @@ fn digits_only(phone: Option<String>) -> Option<String> {
     }
 }
 
+fn emit_if_current(link: &LiveLink, token: u64, events: &EventTx, event: AdapterEvent) {
+    if !link.is_current(token) {
+        return;
+    }
+    let _ = events.send(event);
+}
+
 async fn build_bot(
     backend: SqliteStore,
     phone_number: Option<String>,
     events: EventTx,
+    link: Arc<LiveLink>,
+    token: u64,
 ) -> Result<Bot, ()> {
     if let Some(phone_number) = phone_number {
         let events_qr = events.clone();
         let events_pair = events;
+        let link_qr = Arc::clone(&link);
+        let link_pair = link;
         Bot::builder()
             .with_backend(backend)
             .on_qr_code(move |code, _timeout: Duration| {
                 let events_qr = events_qr.clone();
+                let link_qr = Arc::clone(&link_qr);
                 async move {
-                    let _ = events_qr.send(AdapterEvent::WhatsAppQr {
-                        code: RedactedPairingSecret::new(code),
-                    });
+                    emit_if_current(
+                        &link_qr,
+                        token,
+                        &events_qr,
+                        AdapterEvent::WhatsAppQr {
+                            code: RedactedPairingSecret::new(code),
+                            generation: token,
+                        },
+                    );
                 }
             })
             .with_pair_code(PairCodeOptions {
@@ -191,10 +217,17 @@ async fn build_bot(
             })
             .on_pair_code(move |code, _timeout: Duration| {
                 let events_pair = events_pair.clone();
+                let link_pair = Arc::clone(&link_pair);
                 async move {
-                    let _ = events_pair.send(AdapterEvent::WhatsAppPairCode {
-                        code: RedactedPairingSecret::new(code),
-                    });
+                    emit_if_current(
+                        &link_pair,
+                        token,
+                        &events_pair,
+                        AdapterEvent::WhatsAppPairCode {
+                            code: RedactedPairingSecret::new(code),
+                            generation: token,
+                        },
+                    );
                 }
             })
             .build()
@@ -205,14 +238,88 @@ async fn build_bot(
             .with_backend(backend)
             .on_qr_code(move |code, _timeout: Duration| {
                 let events = events.clone();
+                let link = Arc::clone(&link);
                 async move {
-                    let _ = events.send(AdapterEvent::WhatsAppQr {
-                        code: RedactedPairingSecret::new(code),
-                    });
+                    emit_if_current(
+                        &link,
+                        token,
+                        &events,
+                        AdapterEvent::WhatsAppQr {
+                            code: RedactedPairingSecret::new(code),
+                            generation: token,
+                        },
+                    );
                 }
             })
             .build()
             .await
             .map_err(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn stale_pairing_events_are_discarded() {
+        let link = LiveLink::new();
+        let stale = link.next_generation();
+        let current = link.next_generation();
+        let (tx, mut rx) = unbounded_channel();
+
+        emit_if_current(
+            &link,
+            stale,
+            &tx,
+            AdapterEvent::WhatsAppQr {
+                code: RedactedPairingSecret::new("old-qr"),
+                generation: stale,
+            },
+        );
+        emit_if_current(
+            &link,
+            stale,
+            &tx,
+            AdapterEvent::WhatsAppPairCode {
+                code: RedactedPairingSecret::new("old-pair"),
+                generation: stale,
+            },
+        );
+        assert!(rx.try_recv().is_err());
+
+        emit_if_current(
+            &link,
+            current,
+            &tx,
+            AdapterEvent::WhatsAppQr {
+                code: RedactedPairingSecret::new("new-qr"),
+                generation: current,
+            },
+        );
+        match rx.try_recv() {
+            Ok(AdapterEvent::WhatsAppQr { generation, code }) => {
+                assert_eq!(generation, current);
+                assert_eq!(code.reveal(), "new-qr");
+            }
+            other => panic!("expected current qr, got {other:?}"),
+        }
+        emit_if_current(
+            &link,
+            current,
+            &tx,
+            AdapterEvent::WhatsAppPairCode {
+                code: RedactedPairingSecret::new("new-pair"),
+                generation: current,
+            },
+        );
+        match rx.try_recv() {
+            Ok(AdapterEvent::WhatsAppPairCode { generation, code }) => {
+                assert_eq!(generation, current);
+                assert_eq!(code.reveal(), "new-pair");
+            }
+            other => panic!("expected current pair code, got {other:?}"),
+        }
     }
 }

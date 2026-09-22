@@ -260,11 +260,15 @@ pub enum AdapterEvent {
     /// Never log [`RedactedPairingSecret::reveal`].
     WhatsAppQr {
         code: RedactedPairingSecret,
+        /// Link generation that produced this payload. Stale generations are dropped.
+        generation: u64,
     },
     /// Experimental WhatsApp pair code. Debug output is redacted.
     /// Never log [`RedactedPairingSecret::reveal`].
     WhatsAppPairCode {
         code: RedactedPairingSecret,
+        /// Link generation that produced this payload. Stale generations are dropped.
+        generation: u64,
     },
 }
 

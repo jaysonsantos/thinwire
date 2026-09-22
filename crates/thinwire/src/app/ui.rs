@@ -24,7 +24,7 @@ pub(crate) fn draw(
 ) {
     settings.apply(ui.ctx());
     #[cfg(feature = "whatsapp-web")]
-    if snapshot.whatsapp_gate_open() {
+    if snapshot.whatsapp_pairing_available() && snapshot.whatsapp_gate_open() {
         super::whatsapp_gate::draw(ui, snapshot, whatsapp_phone);
         return;
     }
@@ -171,7 +171,9 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
             }
 
             #[cfg(feature = "whatsapp-web")]
-            super::whatsapp_gate::risk_entry(ui, snapshot);
+            if snapshot.whatsapp_pairing_available() {
+                super::whatsapp_gate::risk_entry(ui, snapshot);
+            }
 
             ui.add_space(8.0);
             ui.heading("Inbox");

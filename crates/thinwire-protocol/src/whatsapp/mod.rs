@@ -394,7 +394,10 @@ mod tests {
             "WhatsAppCancelLink"
         );
         let secret = RedactedPairingSecret::new("qr-secret-value");
-        let event = AdapterEvent::WhatsAppQr { code: secret };
+        let event = AdapterEvent::WhatsAppQr {
+            code: secret,
+            generation: 1,
+        };
         let debug = format!("{event:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("qr-secret-value"));

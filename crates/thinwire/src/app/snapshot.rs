@@ -235,7 +235,10 @@ impl Snapshot {
             AdapterEvent::FlushSecrets => {
                 self.keychain_flush = true;
             }
-            AdapterEvent::WhatsAppQr { code } => {
+            AdapterEvent::WhatsAppQr {
+                code,
+                generation: _,
+            } => {
                 #[cfg(feature = "whatsapp-web")]
                 {
                     self.whatsapp_qr = Some(code.reveal().to_string());
@@ -245,7 +248,10 @@ impl Snapshot {
                     let _ = code;
                 }
             }
-            AdapterEvent::WhatsAppPairCode { code } => {
+            AdapterEvent::WhatsAppPairCode {
+                code,
+                generation: _,
+            } => {
                 #[cfg(feature = "whatsapp-web")]
                 {
                     self.whatsapp_pair_code = Some(code.reveal().to_string());
@@ -750,14 +756,30 @@ impl Snapshot {
         }
     }
 
+    /// Same predicate as the Telegram-only first-run screen.
+    ///
+    /// Discord has no pairing control on that screen. The WhatsApp entry stays
+    /// unavailable until Telegram is linked, which happens on the Ready path.
+    #[cfg(feature = "whatsapp-web")]
+    #[must_use]
+    pub(crate) fn whatsapp_pairing_available(&self) -> bool {
+        self.has_primary_account()
+    }
+
     #[cfg(feature = "whatsapp-web")]
     #[must_use]
     pub(crate) fn whatsapp_gate_open(&self) -> bool {
-        !matches!(self.whatsapp_screen, WhatsAppScreen::Hidden)
+        self.whatsapp_pairing_available() && !matches!(self.whatsapp_screen, WhatsAppScreen::Hidden)
     }
 
     #[cfg(feature = "whatsapp-web")]
     pub(crate) fn open_whatsapp_risk_gate(&mut self) {
+        if !self.whatsapp_pairing_available() {
+            return;
+        }
+        if self.whatsapp_started {
+            self.pending.push(AdapterCommand::WhatsAppCancelLink);
+        }
         self.whatsapp_screen = WhatsAppScreen::RiskGate;
         self.whatsapp_qr = None;
         self.whatsapp_pair_code = None;
@@ -1253,6 +1275,7 @@ mod tests {
         let mut snapshot = Snapshot::new();
         snapshot.apply(AdapterEvent::WhatsAppQr {
             code: thinwire_protocol::RedactedPairingSecret::new("qr-do-not-log"),
+            generation: 1,
         });
         let row = snapshot
             .accounts
@@ -1278,6 +1301,7 @@ mod tests {
         assert!(app.contains("#[cfg(feature = \"whatsapp-web\")]\nmod whatsapp_gate;"));
         let ui = include_str!("ui.rs");
         assert!(ui.contains("not ready"));
+        assert!(ui.contains("whatsapp_pairing_available"));
         assert!(ui.contains("whatsapp_gate::risk_entry"));
         let gate = include_str!("whatsapp_gate.rs");
         assert!(gate.contains("CRITIC_RISK_BULLETS"));
@@ -1298,10 +1322,61 @@ mod tests {
 
     #[cfg(feature = "whatsapp-web")]
     #[test]
+    fn whatsapp_pairing_entry_hidden_until_telegram_first_run() {
+        let mut snapshot = Snapshot::new();
+        assert!(!snapshot.has_primary_account());
+        assert!(!snapshot.telegram_ready());
+        assert!(!snapshot.whatsapp_pairing_available());
+        snapshot.open_whatsapp_risk_gate();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        assert!(!snapshot.whatsapp_gate_open());
+        assert!(snapshot.take_commands().is_empty());
+
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        assert!(snapshot.has_primary_account());
+        assert!(snapshot.telegram_ready());
+        assert!(snapshot.whatsapp_pairing_available());
+        snapshot.open_whatsapp_risk_gate();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::RiskGate);
+        assert!(snapshot.whatsapp_gate_open());
+        assert!(snapshot.take_commands().is_empty());
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn reopening_risk_gate_cancels_an_active_link() {
+        let phone = thinwire_protocol::WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(snapshot.whatsapp_started);
+        let _ = snapshot.take_commands();
+        snapshot.open_whatsapp_risk_gate();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::RiskGate);
+        assert!(!snapshot.whatsapp_started);
+        assert!(snapshot.whatsapp_qr.is_none());
+        assert!(
+            snapshot
+                .take_commands()
+                .contains(&AdapterCommand::WhatsAppCancelLink)
+        );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
     fn whatsapp_pair_ui_keeps_phone_off_the_command() {
         let phone = thinwire_protocol::WhatsAppPhoneVault::new();
         let mut snapshot = Snapshot::new();
         assert!(!snapshot.whatsapp_gate_open());
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
         snapshot.select_protocol(ProtocolId::WhatsApp);
         assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
         snapshot.open_whatsapp_risk_gate();
@@ -1320,6 +1395,7 @@ mod tests {
         assert!(commands.contains(&AdapterCommand::WhatsAppBeginLink));
         snapshot.apply(AdapterEvent::WhatsAppQr {
             code: thinwire_protocol::RedactedPairingSecret::new("second-secret"),
+            generation: 1,
         });
         assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("second-secret"));
         assert!(!snapshot.status_text.contains("second-secret"));
