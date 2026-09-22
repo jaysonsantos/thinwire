@@ -17,7 +17,7 @@ use super::adapter::{
 };
 #[cfg(feature = "discord-bot")]
 use super::adapter::{ChatMessage, Conversation, emit_conversation, emit_message};
-use token::{DiscordTokenKind, authorization_token, classify_discord_token};
+use token::authorization_token;
 
 pub use install::DiscordOAuthInstall;
 pub use token::{
@@ -34,7 +34,13 @@ const NOT_READY_DETAIL: &str = "Discord bot inbox is not ready in this build. En
 
 const SELF_BOT_REFUSAL: &str = "Discord user-account / self-bot automation is refused. Bot/OAuth only. License-clean crates do not grant Discord permission to automate a personal account.";
 
-const USER_TOKEN_REFUSAL: &str = "Discord user-account tokens are refused. The keychain slot accepts a bot token or an OAuth bearer token.";
+const USER_TOKEN_REFUSAL: &str = "Discord user-account tokens are refused. A Bearer prefix does not prove application or bot provenance or the bot scope, so it is not sent. The keychain slot accepts a bot token.";
+
+/// Detail fragment present only after a bot token was accepted.
+const BOT_TOKEN_PRESENT: &str = "bot token is in the OS keychain";
+/// Detail fragment for a feature-on connect that has no token yet.
+#[cfg(any(test, feature = "discord-bot"))]
+const BOT_TOKEN_MISSING: &str = "bot token is not in the OS keychain";
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Discord,
@@ -64,7 +70,7 @@ impl fmt::Debug for BotHttp {
 #[cfg(feature = "discord-bot")]
 enum TokenGate {
     Missing,
-    Accepted(DiscordTokenKind),
+    Accepted,
 }
 
 /// Constrained Discord adapter. Never starts a user-account client.
@@ -99,6 +105,17 @@ impl DiscordAdapter {
         cfg!(feature = "discord-bot")
     }
 
+    /// Linked-account marker for a guild inbox.
+    ///
+    /// A missing-token placeholder is not linked. The bot token must be present
+    /// and the adapter must not be refused. Gateway `Ready` is not required.
+    #[must_use]
+    pub fn inbox_account_linked(status: AdapterStatus, detail: &str) -> bool {
+        Self::bot_inbox_compiled()
+            && !matches!(status, AdapterStatus::Refused | AdapterStatus::Error)
+            && detail.contains(BOT_TOKEN_PRESENT)
+    }
+
     /// Explicit refusal used by tests and any future connect UI.
     pub fn connect_user_account() -> Result<(), AdapterError> {
         Err(AdapterError::Refused {
@@ -107,19 +124,16 @@ impl DiscordAdapter {
         })
     }
 
-    fn prepared_token(&self) -> Result<Option<(DiscordTokenKind, String)>, AdapterError> {
+    fn prepared_token(&self) -> Result<Option<String>, AdapterError> {
         let Some(raw) = self.secrets.bot_token() else {
             return Ok(None);
         };
-        let kind = classify_discord_token(&raw).map_err(|()| AdapterError::Refused {
-            protocol: ProtocolId::Discord,
-            reason: USER_TOKEN_REFUSAL,
-        })?;
-        let token = authorization_token(&raw).map_err(|()| AdapterError::Refused {
-            protocol: ProtocolId::Discord,
-            reason: USER_TOKEN_REFUSAL,
-        })?;
-        Ok(Some((kind, token)))
+        authorization_token(&raw)
+            .map(Some)
+            .map_err(|()| AdapterError::Refused {
+                protocol: ProtocolId::Discord,
+                reason: USER_TOKEN_REFUSAL,
+            })
     }
 
     fn connect_bot_inbox(&mut self, events: &EventTx) -> Result<(), AdapterError> {
@@ -131,7 +145,7 @@ impl DiscordAdapter {
     fn finish_connect(
         &mut self,
         events: &EventTx,
-        prepared: Option<(DiscordTokenKind, String)>,
+        prepared: Option<String>,
     ) -> Result<(), AdapterError> {
         drop(prepared);
         self.clear_http();
@@ -148,11 +162,11 @@ impl DiscordAdapter {
     fn finish_connect(
         &mut self,
         events: &EventTx,
-        prepared: Option<(DiscordTokenKind, String)>,
+        prepared: Option<String>,
     ) -> Result<(), AdapterError> {
         let gate = match &prepared {
             None => TokenGate::Missing,
-            Some((kind, _)) => TokenGate::Accepted(*kind),
+            Some(_) => TokenGate::Accepted,
         };
         self.arm_http(prepared);
         self.emit_placeholder(events, &gate);
@@ -167,10 +181,10 @@ impl DiscordAdapter {
     }
 
     #[cfg(feature = "discord-bot")]
-    fn arm_http(&mut self, prepared: Option<(DiscordTokenKind, String)>) {
+    fn arm_http(&mut self, prepared: Option<String>) {
         let _ = install::inbox_intents();
         let _ = install::inbox_permissions();
-        let Some((_kind, token)) = prepared else {
+        let Some(token) = prepared else {
             self.http = None;
             return;
         };
@@ -185,11 +199,8 @@ impl DiscordAdapter {
     #[cfg(feature = "discord-bot")]
     fn emit_placeholder(&self, events: &EventTx, gate: &TokenGate) {
         let token_state = match gate {
-            TokenGate::Missing => "bot token is not in the OS keychain",
-            TokenGate::Accepted(DiscordTokenKind::Bot) => "bot token is in the OS keychain",
-            TokenGate::Accepted(DiscordTokenKind::OAuthBearer) => {
-                "OAuth bearer token is in the OS keychain"
-            }
+            TokenGate::Missing => BOT_TOKEN_MISSING,
+            TokenGate::Accepted => BOT_TOKEN_PRESENT,
         };
         let detail = format!(
             "Discord bot inbox placeholder. {token_state}. Gateway is not started. Not a personal Discord client."
@@ -416,6 +427,88 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn missing_token_detail_does_not_mark_the_account_linked() {
+        assert!(
+            !BOT_TOKEN_MISSING.contains(BOT_TOKEN_PRESENT),
+            "the missing-token sentence must not satisfy the armed check"
+        );
+        let missing = format!("Discord bot inbox placeholder. {BOT_TOKEN_MISSING}.");
+        assert!(!DiscordAdapter::inbox_account_linked(
+            AdapterStatus::Stubbed,
+            &missing
+        ));
+        let armed = format!("Discord bot inbox placeholder. {BOT_TOKEN_PRESENT}.");
+        assert_eq!(
+            DiscordAdapter::inbox_account_linked(AdapterStatus::Stubbed, &armed),
+            DiscordAdapter::bot_inbox_compiled()
+        );
+        assert!(!DiscordAdapter::inbox_account_linked(
+            AdapterStatus::Refused,
+            &armed
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_after_hydrate_arms_a_token_that_start_missed() {
+        if !DiscordAdapter::bot_inbox_compiled() {
+            return;
+        }
+        let vault = Arc::new(MemoryDiscordVault::new());
+        let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
+        let (tx, mut rx) = unbounded_channel();
+        adapter.start(tx.clone());
+        let first = drain(&mut rx);
+        assert!(first.iter().any(|event| matches!(
+            event,
+            crate::AdapterEvent::Status { detail, .. } if detail.contains(BOT_TOKEN_MISSING)
+        )));
+        vault.set_bot_token("fixture-bot-token");
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let second = drain(&mut rx);
+        let rendered = format!("{second:?} {adapter:?}");
+        assert!(!rendered.contains("fixture-bot-token"));
+        assert!(second.iter().any(|event| matches!(
+            event,
+            crate::AdapterEvent::Status { status, detail, .. }
+                if *status == AdapterStatus::Stubbed && detail.contains(BOT_TOKEN_PRESENT)
+        )));
+    }
+
+    #[test]
+    fn unverified_bearer_in_the_vault_is_refused_without_a_placeholder() {
+        let vault = Arc::new(MemoryDiscordVault::new());
+        vault.set_bot_token("Bearer oauth-fixture");
+        let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
+        let (tx, mut rx) = unbounded_channel();
+        let err = adapter
+            .handle(
+                AdapterCommand::ConnectDiscord {
+                    mode: DiscordAuthMode::OAuth,
+                },
+                &tx,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AdapterError::Refused {
+                protocol: ProtocolId::Discord,
+                ..
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+        let rendered = format!("{adapter:?}");
+        assert!(!rendered.contains("oauth-fixture"));
+        assert!(!rendered.to_ascii_lowercase().contains("bearer oauth"));
     }
 
     #[test]

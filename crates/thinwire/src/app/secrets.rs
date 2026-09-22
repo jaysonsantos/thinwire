@@ -58,6 +58,16 @@ enum AttachPhase {
     MemoryOnly,
 }
 
+type DiscordHydrateHook = Box<dyn FnOnce() + Send>;
+
+enum DiscordHydrate {
+    /// OS attach has not finished. The hook runs once a token is stored.
+    Waiting { hook: Option<DiscordHydrateHook> },
+    /// Attach finished, or this store never talks to the OS keychain.
+    /// `notify` is set only when attach stored a bot token.
+    Settled { notify: bool },
+}
+
 struct Inner {
     values: HashMap<SecretKey, String>,
     dirty: HashSet<SecretKey>,
@@ -66,6 +76,7 @@ struct Inner {
     flush_pending: bool,
     flush_in_flight: bool,
     phase: AttachPhase,
+    discord_hydrate: DiscordHydrate,
 }
 
 /// Memory-first store. OS keychain attach/flush is worker-only.
@@ -84,6 +95,11 @@ impl SecretStore {
                 flush_pending: false,
                 flush_in_flight: false,
                 phase,
+                discord_hydrate: if phase == AttachPhase::MemoryOnly {
+                    DiscordHydrate::Settled { notify: false }
+                } else {
+                    DiscordHydrate::Waiting { hook: None }
+                },
             }),
         }
     }
@@ -179,6 +195,32 @@ impl SecretStore {
         self.set(key, "")
     }
 
+    /// Run `hook` once OS attach has stored a Discord bot token.
+    ///
+    /// If attach already finished with a token, `hook` runs on the caller.
+    /// The UI thread only enqueues work; it does not read the OS keychain.
+    /// A memory-only store never fires, because nothing is hydrated from the OS.
+    pub fn on_discord_token_hydrated(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut hook = Some(hook);
+        let fire_now = {
+            let Ok(mut inner) = self.lock() else {
+                return;
+            };
+            match &mut inner.discord_hydrate {
+                DiscordHydrate::Waiting { hook: slot } => {
+                    if let Some(hook) = hook.take() {
+                        *slot = Some(Box::new(hook));
+                    }
+                    false
+                }
+                DiscordHydrate::Settled { notify } => *notify && inner.discord_bot_token.is_some(),
+            }
+        };
+        if fire_now && let Some(hook) = hook.take() {
+            hook();
+        }
+    }
+
     pub fn spawn_os_attach(self: &Arc<Self>, handle: &Handle) {
         let store = Arc::clone(self);
         handle.spawn_blocking(move || store.attach_os_keychain());
@@ -238,6 +280,7 @@ impl SecretStore {
         }
         if memory_requested() {
             self.finish_memory_only();
+            self.signal_discord_hydrated();
             return;
         }
         match probe_os() {
@@ -260,6 +303,7 @@ impl SecretStore {
                         "OS keychain flush after attach failed; secrets stay in memory"
                     );
                 }
+                self.signal_discord_hydrated();
             }
             Err(error) => {
                 tracing::warn!(
@@ -267,6 +311,7 @@ impl SecretStore {
                     "OS keychain unavailable; Telegram secrets stay in memory this session and are not written to disk"
                 );
                 self.finish_memory_only();
+                self.signal_discord_hydrated();
             }
         }
     }
@@ -340,6 +385,30 @@ impl SecretStore {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Tell a waiting Discord reconnect that attach has finished.
+    ///
+    /// The hook runs only when a token is now in memory. Callers enqueue a
+    /// connect; they do not construct the HTTP client on this thread.
+    fn signal_discord_hydrated(&self) {
+        let (hook, token_present) = {
+            let Ok(mut inner) = self.lock() else {
+                return;
+            };
+            let DiscordHydrate::Waiting { hook } = &mut inner.discord_hydrate else {
+                return;
+            };
+            let hook = hook.take();
+            let token_present = inner.discord_bot_token.is_some();
+            inner.discord_hydrate = DiscordHydrate::Settled {
+                notify: token_present,
+            };
+            (hook, token_present)
+        };
+        if token_present && let Some(hook) = hook {
+            hook();
+        }
     }
 
     fn store_hydrated_discord_token(&self, value: Result<Option<String>, SecretError>) {
@@ -527,6 +596,22 @@ fn os_delete(key: SecretKey) -> Result<(), SecretError> {
     }
 }
 
+#[cfg(test)]
+impl SecretStore {
+    pub(crate) fn detached_for_test() -> Arc<Self> {
+        Arc::new(Self::blank(AttachPhase::Detached))
+    }
+
+    pub(crate) fn complete_discord_hydrate_for_test(&self, token: Option<&str>) {
+        let value = match token {
+            Some(token) => Ok(Some(token.to_string())),
+            None => Ok(None),
+        };
+        self.store_hydrated_discord_token(value);
+        self.signal_discord_hydrated();
+    }
+}
+
 fn map_keyring_error(error: keyring::Error) -> SecretError {
     let kind = match error {
         keyring::Error::NoEntry => "not found",
@@ -590,6 +675,59 @@ mod tests {
         assert!(!debug.contains("super-secret-session"));
         store.delete(SecretKey::ApiHash).expect("delete hash");
         assert_eq!(store.get(SecretKey::ApiHash).expect("get hash"), None);
+    }
+
+    #[test]
+    fn discord_hydrate_hook_waits_until_a_token_is_stored() {
+        let store = SecretStore::blank(AttachPhase::Detached);
+        let (tx, rx) = std::sync::mpsc::channel();
+        store.on_discord_token_hydrated(move || {
+            tx.send(()).expect("hook");
+        });
+        assert!(rx.try_recv().is_err());
+        store.store_hydrated_discord_token(Ok(None));
+        store.signal_discord_hydrated();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn discord_hydrate_hook_fires_after_the_token_is_stored() {
+        let store = SecretStore::blank(AttachPhase::Detached);
+        let (tx, rx) = std::sync::mpsc::channel();
+        store.on_discord_token_hydrated(move || {
+            tx.send(()).expect("hook");
+        });
+        store.store_hydrated_discord_token(Ok(Some("fixture-bot-token".into())));
+        assert!(rx.try_recv().is_err());
+        store.signal_discord_hydrated();
+        assert!(rx.try_recv().is_ok());
+        let debug = format!("{store:?}");
+        assert!(!debug.contains("fixture-bot-token"));
+    }
+
+    #[test]
+    fn discord_hydrate_hook_fires_when_registered_after_attach() {
+        let store = SecretStore::detached_for_test();
+        store.complete_discord_hydrate_for_test(Some("fixture-bot-token"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        store.on_discord_token_hydrated(move || {
+            tx.send(()).expect("hook");
+        });
+        assert!(rx.try_recv().is_ok());
+        assert!(!format!("{store:?}").contains("fixture-bot-token"));
+    }
+
+    #[test]
+    fn memory_only_store_does_not_emit_a_discord_hydrate_hook() {
+        let store = SecretStore::memory();
+        store
+            .set_discord_bot_token("fixture-bot-token")
+            .expect("memory token");
+        let (tx, rx) = std::sync::mpsc::channel();
+        store.on_discord_token_hydrated(move || {
+            tx.send(()).expect("hook");
+        });
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

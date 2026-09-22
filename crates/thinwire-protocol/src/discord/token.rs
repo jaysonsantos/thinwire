@@ -1,7 +1,11 @@
-//! Discord bot token and OAuth bearer token. Values stay in the secret vault.
+//! Discord bot token. Values stay in the secret vault.
 //!
 //! The vault is memory on the UI thread. OS keychain I/O stays in the desktop
 //! crate on a `spawn_blocking` worker. Tokens never travel on [`crate::AdapterCommand`].
+//!
+//! A `Bearer` prefix is not application or bot provenance and does not prove the
+//! `bot` scope. Those values are refused. Twilight forwards a `Bearer ` token
+//! unchanged, which is how a user OAuth access token would skip the user-token refusal.
 
 use std::fmt;
 use std::sync::Mutex;
@@ -11,16 +15,18 @@ use super::super::adapter::AdapterCommand;
 
 /// Keychain service for the Discord bot token. Same OS store as the rest of thinwire.
 pub const DISCORD_SECRET_SERVICE: &str = "thinwire";
-/// Keychain account for the Discord bot token or OAuth bearer token.
+/// Keychain account for the Discord bot token.
 pub const DISCORD_SECRET_BOT_TOKEN: &str = "discord.bot_token";
 
-/// How a stored Discord credential may be sent. User-account tokens are absent.
+/// Credential that may be handed to the bot HTTP client.
+///
+/// Only the bot authorization scheme is accepted here. OAuth bearer tokens need
+/// a verified application id and the `bot` scope; this spike does not invent
+/// that proof from the `Bearer` prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscordTokenKind {
     /// Bot token. `twilight_http::Client` adds the `Bot ` prefix when it is missing.
     Bot,
-    /// OAuth bearer token for a bot install. Not a user access token.
-    OAuthBearer,
 }
 
 /// Read a Discord bot or OAuth token without logging the value.
@@ -76,41 +82,72 @@ impl fmt::Debug for MemoryDiscordVault {
 }
 
 /// Classify a keychain value. `Err` means the value must not be sent to Discord.
+///
+/// `Bearer` is refused even when the payload is nonempty. The prefix is not a
+/// check of bot/application provenance or allowed scopes.
 pub fn classify_discord_token(raw: &str) -> Result<DiscordTokenKind, ()> {
     let token = raw.trim();
     if token.is_empty() || token.contains(['\n', '\r', '\0']) {
         return Err(());
     }
-    let lower = token.to_ascii_lowercase();
-    if lower.starts_with("mfa.") {
+    let (scheme, payload) = split_authorization_scheme(token);
+    if scheme_is_user_credential(scheme) || payload_is_user_credential(payload) {
         return Err(());
-    }
-    let mut words = token.split_whitespace();
-    let head = words.next().unwrap_or("").to_ascii_lowercase();
-    let has_payload = words.next().is_some();
-    if head == "user" || (head == "bearer" && !has_payload) {
-        return Err(());
-    }
-    if head == "bearer" {
-        return Ok(DiscordTokenKind::OAuthBearer);
     }
     Ok(DiscordTokenKind::Bot)
 }
 
-/// Token string passed to the bot HTTP client. Caller must already have classified it.
+fn scheme_is_user_credential(scheme: Option<&str>) -> bool {
+    matches!(scheme, Some("bearer") | Some("user"))
+}
+
+/// Token string passed to the bot HTTP client.
+///
+/// The returned value never uses the `Bearer` scheme. Twilight leaves a
+/// `Bearer ` prefix in place, so returning one would send a user OAuth token.
 pub fn authorization_token(raw: &str) -> Result<String, ()> {
     let token = raw.trim();
-    match classify_discord_token(token)? {
-        DiscordTokenKind::Bot => Ok(token.to_string()),
-        DiscordTokenKind::OAuthBearer => {
-            let rest = token
-                .split_once(' ')
-                .map(|(_, rest)| rest.trim())
-                .unwrap_or("");
-            if rest.is_empty() {
-                return Err(());
-            }
-            Ok(format!("Bearer {rest}"))
+    classify_discord_token(token)?;
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("bearer ") || lower.starts_with("bearer\t") {
+        return Err(());
+    }
+    Ok(token.to_string())
+}
+
+/// Split a leading `Bot` / `Bearer` / `User` scheme from its payload.
+fn split_authorization_scheme(token: &str) -> (Option<&'static str>, &str) {
+    let Some(head) = token.split_whitespace().next() else {
+        return (None, token);
+    };
+    let scheme = match head.to_ascii_lowercase().as_str() {
+        "bot" => Some("bot"),
+        "bearer" => Some("bearer"),
+        "user" => Some("user"),
+        _ => None,
+    };
+    let Some(scheme) = scheme else {
+        return (None, token);
+    };
+    let payload = token
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or("");
+    (Some(scheme), payload)
+}
+
+/// User-account material, including when it is wrapped in a `Bot` prefix.
+fn payload_is_user_credential(payload: &str) -> bool {
+    let mut payload = payload.trim();
+    loop {
+        if payload.is_empty() || payload.to_ascii_lowercase().starts_with("mfa.") {
+            return true;
+        }
+        let (scheme, inner) = split_authorization_scheme(payload);
+        match scheme {
+            Some("bearer") | Some("user") => return true,
+            Some("bot") => payload = inner,
+            Some(_) | None => return false,
         }
     }
 }
@@ -150,17 +187,38 @@ mod tests {
             Ok(DiscordTokenKind::Bot)
         );
         assert_eq!(
-            classify_discord_token("Bearer oauth-fixture"),
-            Ok(DiscordTokenKind::OAuthBearer)
+            authorization_token("fixture-bot-token").as_deref(),
+            Ok("fixture-bot-token")
         );
         assert_eq!(
-            authorization_token("bearer oauth-fixture").as_deref(),
-            Ok("Bearer oauth-fixture")
+            authorization_token("Bot fixture-bot-token").as_deref(),
+            Ok("Bot fixture-bot-token")
         );
-        assert!(classify_discord_token("User personal-token").is_err());
-        assert!(classify_discord_token("mfa.personal-token").is_err());
-        assert!(classify_discord_token("Bearer ").is_err());
-        assert!(classify_discord_token("").is_err());
+        for refused in [
+            "Bearer oauth-fixture",
+            "bearer oauth-fixture",
+            "Bearer ",
+            "User personal-token",
+            "mfa.personal-token",
+            "Bot mfa.personal-token",
+            "Bot bearer oauth-fixture",
+            "Bot user personal-token",
+            "",
+        ] {
+            assert!(
+                classify_discord_token(refused).is_err(),
+                "{refused} must be refused"
+            );
+            assert!(
+                authorization_token(refused).is_err(),
+                "{refused} must not become an authorization value"
+            );
+        }
+        assert!(
+            authorization_token("Bearer oauth-fixture")
+                .ok()
+                .is_none_or(|value| !value.to_ascii_lowercase().starts_with("bearer"))
+        );
     }
 
     #[test]

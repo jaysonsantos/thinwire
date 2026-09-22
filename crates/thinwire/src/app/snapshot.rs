@@ -185,6 +185,9 @@ impl Snapshot {
                 if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
                     row.status = status;
                     row.detail = detail.clone();
+                    if protocol == ProtocolId::Discord {
+                        row.linked = DiscordAdapter::inbox_account_linked(status, &detail);
+                    }
                 }
                 self.status_text = detail;
                 if protocol == ProtocolId::Telegram
@@ -196,12 +199,6 @@ impl Snapshot {
             }
             AdapterEvent::ConversationUpsert { conversation } => {
                 let protocol = conversation.protocol;
-                if protocol == ProtocolId::Discord
-                    && DiscordAdapter::bot_inbox_compiled()
-                    && let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol)
-                {
-                    row.linked = true;
-                }
                 {
                     let list = self.conversations.entry(protocol).or_default();
                     if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
@@ -1262,6 +1259,97 @@ mod tests {
         assert!(!InboxFilter::Experimental.matches(ProtocolId::Telegram));
         assert!(InboxFilter::Telegram.matches(ProtocolId::Telegram));
         assert!(InboxFilter::All.matches(ProtocolId::Discord));
+    }
+
+    fn discord_guild_placeholder() -> Conversation {
+        Conversation {
+            protocol: ProtocolId::Discord,
+            id: "discord:guild-inbox:general".into(),
+            title: "Bot inbox #general".into(),
+            participant: "guild channel".into(),
+            preview: "placeholder".into(),
+            unread: 1,
+        }
+    }
+
+    fn discord_linked(snapshot: &Snapshot) -> bool {
+        snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Discord)
+            .expect("discord account")
+            .linked
+    }
+
+    fn unlock_telegram_messages(snapshot: &mut Snapshot) {
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:saved".into(),
+                id: "telegram:saved:1".into(),
+                sender: "worker".into(),
+                body: "hello from telegram".into(),
+                outbound: false,
+            },
+        });
+    }
+
+    #[test]
+    fn discord_missing_token_placeholder_stays_unlinked() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: discord_guild_placeholder(),
+        });
+        assert!(!discord_linked(&snapshot));
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Discord,
+            status: AdapterStatus::Stubbed,
+            detail: "Discord bot inbox placeholder. bot token is not in the OS keychain. Gateway is not started.".into(),
+        });
+        assert!(!discord_linked(&snapshot));
+        unlock_telegram_messages(&mut snapshot);
+        snapshot.select_protocol(ProtocolId::Discord);
+        assert!(snapshot.visible_conversations().is_empty());
+        assert_eq!(snapshot.unread_for(ProtocolId::Discord), 0);
+        assert!(!discord_linked(&snapshot));
+    }
+
+    #[test]
+    fn discord_links_only_when_a_bot_token_is_present() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Discord,
+            status: AdapterStatus::Stubbed,
+            detail: "Discord bot inbox placeholder. bot token is in the OS keychain. Gateway is not started.".into(),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: discord_guild_placeholder(),
+        });
+        assert_eq!(
+            discord_linked(&snapshot),
+            DiscordAdapter::bot_inbox_compiled()
+        );
+        unlock_telegram_messages(&mut snapshot);
+        snapshot.select_protocol(ProtocolId::Discord);
+        if DiscordAdapter::bot_inbox_compiled() {
+            assert_eq!(snapshot.selected_protocol, ProtocolId::Discord);
+            assert_eq!(snapshot.visible_conversations().len(), 1);
+            assert_eq!(snapshot.unread_for(ProtocolId::Discord), 1);
+        } else {
+            assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
+            assert!(snapshot.visible_conversations().is_empty());
+            assert!(!discord_linked(&snapshot));
+        }
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Discord,
+            status: AdapterStatus::Refused,
+            detail: "Discord user-account tokens are refused.".into(),
+        });
+        assert!(!discord_linked(&snapshot));
+        assert_eq!(snapshot.unread_for(ProtocolId::Discord), 0);
     }
 
     #[test]

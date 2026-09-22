@@ -54,6 +54,15 @@ impl AdapterHost {
         events
     }
 
+    /// Clone of the worker command channel.
+    ///
+    /// Keychain hydration uses this to reconnect Discord after `spawn_blocking`
+    /// finishes. Sending does not run adapter code on the caller.
+    #[must_use]
+    pub fn command_sender(&self) -> UnboundedSender<AdapterCommand> {
+        self.command_tx.clone()
+    }
+
     /// Enqueue a command for the worker. Never runs adapter code on the caller.
     pub fn send(&self, command: AdapterCommand) {
         if self.command_tx.send(command).is_err() {
