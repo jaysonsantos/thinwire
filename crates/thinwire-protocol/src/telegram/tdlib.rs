@@ -14,8 +14,8 @@ use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resol
 use super::inbox::{self, ChatDirectory, ChatEffect, InboxMessage, MessageParty, NameBook};
 use crate::adapter::{
     AdapterStatus, EventTx, ProtocolId, TelegramAuthPhase, TelegramAuthStep, emit_conversation,
-    emit_conversation_removed, emit_message, emit_message_body, emit_message_replaced, emit_status,
-    emit_telegram_auth,
+    emit_conversation_removed, emit_message, emit_message_body, emit_message_replaced,
+    emit_messages_removed, emit_status, emit_telegram_auth,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -482,6 +482,8 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
                 if emit {
                     emit_mapped_message(events, message, live, None);
                 }
+            } else {
+                publish(events, emit, live.directory.set_preview(update.chat_id, ""));
             }
         }
         tdlib_rs::enums::Update::NewMessage(update) => {
@@ -496,7 +498,45 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
             if emit {
                 let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
                 emit_mapped_message(events, &update.message, live, Some(old_id));
+                emit_status(
+                    events,
+                    ProtocolId::Telegram,
+                    AdapterStatus::Ready,
+                    "Message sent.",
+                );
             }
+        }
+        tdlib_rs::enums::Update::MessageSendFailed(update) => {
+            if emit {
+                let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
+                emit_mapped_message(events, &update.message, live, Some(old_id));
+                emit_status(
+                    events,
+                    ProtocolId::Telegram,
+                    AdapterStatus::Error,
+                    format!(
+                        "Telegram did not send the message (TDLib {}).",
+                        update.error.code
+                    ),
+                );
+            }
+        }
+        tdlib_rs::enums::Update::DeleteMessages(update) => {
+            // Cache eviction can be fetched again. Rows drop only when the chat lost them.
+            if !emit || update.from_cache {
+                return;
+            }
+            let message_ids = update
+                .message_ids
+                .iter()
+                .map(|message_id| inbox::message_id(update.chat_id, *message_id))
+                .collect();
+            emit_messages_removed(
+                events,
+                ProtocolId::Telegram,
+                inbox::conversation_id(update.chat_id),
+                message_ids,
+            );
         }
         tdlib_rs::enums::Update::MessageContent(update) => {
             if !emit {
@@ -664,8 +704,21 @@ async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, even
     {
         Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
             let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
+            let viewed: Vec<i64> = messages.iter().map(|message| message.id).collect();
             for message in inbox::chronological(messages) {
                 emit_mapped_message(events, &message, live, None);
+            }
+            if !viewed.is_empty()
+                && let Err(error) =
+                    tdlib_rs::functions::view_messages(chat_id, viewed, None, true, client_id).await
+            {
+                emit_status(
+                    events,
+                    ProtocolId::Telegram,
+                    AdapterStatus::Error,
+                    format!("Could not mark messages read (TDLib {}).", error.code),
+                );
+                return;
             }
             emit_status(
                 events,
@@ -724,12 +777,6 @@ async fn send_text(
     match tdlib_rs::functions::send_message(chat_id, None, None, None, content, client_id).await {
         Ok(tdlib_rs::enums::Message::Message(message)) => {
             emit_mapped_message(events, &message, live, None);
-            emit_status(
-                events,
-                ProtocolId::Telegram,
-                AdapterStatus::Ready,
-                "Message sent.",
-            );
         }
         Err(error) => emit_status(
             events,

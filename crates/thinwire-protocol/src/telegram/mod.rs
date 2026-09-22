@@ -498,6 +498,33 @@ mod tests {
         assert!(!src.contains("while let Some"));
         assert!(!src.contains(".phone_number"));
         assert!(src.contains("thinwire-tdlib-recv"));
+        let send = fn_body(src, "async fn send_text");
+        assert!(
+            !send.contains("Message sent."),
+            "send_message must not announce success before TDLib confirms it"
+        );
+        let updates = fn_body(src, "fn apply_chat_update");
+        assert!(updates.contains("Update::MessageSendSucceeded"));
+        assert!(updates.contains("Message sent."));
+        assert!(updates.contains("Update::MessageSendFailed"));
+        assert!(updates.contains("Update::DeleteMessages"));
+        assert!(updates.contains("update.from_cache"));
+        assert!(updates.contains("emit_messages_removed"));
+        assert!(updates.contains("set_preview(update.chat_id, \"\")"));
+        let open = fn_body(src, "async fn open_chat");
+        assert!(open.contains("functions::view_messages"));
+        assert!(open.contains("true,"));
+    }
+
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src.find(name).unwrap_or_else(|| panic!("{name} missing"));
+        let rest = &src[start..];
+        let end = rest[name.len()..]
+            .find("\nfn ")
+            .or_else(|| rest[name.len()..].find("\nasync fn "))
+            .map(|offset| offset + name.len())
+            .unwrap_or(rest.len());
+        &rest[..end]
     }
 
     #[test]

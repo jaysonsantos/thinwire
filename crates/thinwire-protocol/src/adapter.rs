@@ -239,6 +239,12 @@ pub enum AdapterEvent {
         message_id: String,
         body: String,
     },
+    /// Drop messages TDLib deleted. They stay gone for this session.
+    MessagesRemoved {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_ids: Vec<String>,
+    },
 }
 
 /// Conversation row shown in the inbox.
@@ -349,6 +355,20 @@ pub(crate) fn emit_message_replaced(
         conversation_id: message.conversation_id.clone(),
         old_id: old_id.into(),
         message,
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_messages_removed(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    message_ids: Vec<String>,
+) {
+    let _ = events.send(AdapterEvent::MessagesRemoved {
+        protocol,
+        conversation_id: conversation_id.into(),
+        message_ids,
     });
 }
 

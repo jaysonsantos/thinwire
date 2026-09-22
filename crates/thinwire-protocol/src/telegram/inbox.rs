@@ -367,6 +367,11 @@ mod tests {
         assert!(chat.preview.chars().count() <= PREVIEW_CHARS + 1);
         assert!(chat.preview.ends_with('…'));
         assert!(!chat.preview.contains('\n'));
+        let ChatEffect::Upsert(chat) = directory.set_preview(5, "").expect("cleared") else {
+            panic!("upsert");
+        };
+        assert_eq!(chat.preview, "");
+        assert_eq!(chat.title, "Saved");
     }
 
     #[test]

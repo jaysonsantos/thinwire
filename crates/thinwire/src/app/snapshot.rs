@@ -195,6 +195,11 @@ impl Snapshot {
                 message_id,
                 body,
             } => self.patch_message_body(protocol, &conversation_id, &message_id, body),
+            AdapterEvent::MessagesRemoved {
+                protocol,
+                conversation_id,
+                message_ids,
+            } => self.remove_messages(protocol, &conversation_id, &message_ids),
             AdapterEvent::TelegramAuth { phase } => self.apply_telegram_phase(phase),
             AdapterEvent::FlushSecrets => {
                 self.keychain_flush = true;
@@ -659,6 +664,21 @@ impl Snapshot {
             return;
         };
         list.retain(|row| row.id != message_id);
+    }
+
+    fn remove_messages(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_ids: &[String],
+    ) {
+        let Some(list) = self
+            .messages
+            .get_mut(&(protocol, conversation_id.to_string()))
+        else {
+            return;
+        };
+        list.retain(|row| !message_ids.contains(&row.id));
     }
 
     fn patch_message_body(
@@ -1278,6 +1298,36 @@ mod tests {
         assert_eq!(edited.body, "sent-edited");
         assert_eq!(edited.sender, "you");
         assert!(edited.outbound);
+    }
+
+    #[test]
+    fn deleted_message_ids_leave_the_thread() {
+        let mut snapshot = Snapshot::new();
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some("telegram:4".into());
+        for (id, body) in [("telegram:4:1", "keep"), ("telegram:4:2", "drop")] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: ChatMessage {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id: "telegram:4".into(),
+                    id: id.into(),
+                    sender: "Ada".into(),
+                    body: body.into(),
+                    outbound: false,
+                },
+            });
+        }
+        snapshot.apply(AdapterEvent::MessagesRemoved {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:4".into(),
+            message_ids: vec!["telegram:4:2".into()],
+        });
+        let bodies: Vec<_> = snapshot
+            .selected_messages()
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect();
+        assert_eq!(bodies, vec!["keep"]);
     }
 
     #[test]
