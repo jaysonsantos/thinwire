@@ -187,4 +187,53 @@ mod tests {
         assert!(!debug.contains("TELEGRAM_API"));
         assert!(!debug.to_ascii_lowercase().contains("api_hash"));
     }
+
+    /// Public CI and pull_request workflows must not receive publisher secrets.
+    /// Main-only `os-zips.yml` is the inject path and must fail closed.
+    #[test]
+    fn public_ci_workflows_do_not_receive_publisher_secrets() {
+        let ci = include_str!("../../../../.github/workflows/ci.yml");
+        let release = include_str!("../../../../.github/workflows/release-tag.yml");
+        let claude = include_str!("../../../../.github/workflows/claude.yml");
+        let review = include_str!("../../../../.github/workflows/claude-code-review.yml");
+        for (name, src) in [
+            ("ci.yml", ci),
+            ("release-tag.yml", release),
+            ("claude.yml", claude),
+            ("claude-code-review.yml", review),
+        ] {
+            assert!(
+                !src.contains("TELEGRAM_API"),
+                "{name} must not mention publisher Telegram credentials"
+            );
+            assert!(
+                !src.contains("secrets.TELEGRAM"),
+                "{name} must not pass Telegram repository secrets"
+            );
+        }
+
+        let os_zips = include_str!("../../../../.github/workflows/os-zips.yml");
+        assert!(
+            !os_zips.contains("pull_request:"),
+            "os-zips must not run on pull_request"
+        );
+        assert!(os_zips.contains("secrets.TELEGRAM_API_ID"));
+        assert!(os_zips.contains("secrets.TELEGRAM_API_HASH"));
+        assert!(os_zips.contains("--features telegram-tdlib"));
+        assert!(os_zips.contains(
+            "Official OS zip refused: set repository secrets TELEGRAM_API_ID and TELEGRAM_API_HASH."
+        ));
+        assert!(
+            !os_zips.contains("echo \"$TELEGRAM_API"),
+            "os-zips must not print publisher credentials"
+        );
+        assert!(
+            !os_zips.contains("echo ${TELEGRAM_API"),
+            "os-zips must not print publisher credentials"
+        );
+        assert!(
+            os_zips.contains("Never add these secrets"),
+            "os-zips must warn against copying secrets into public CI"
+        );
+    }
 }

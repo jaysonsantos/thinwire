@@ -1,5 +1,11 @@
 # Unsigned OS zips on main only. These are not releases.
 # pull_request never triggers this workflow, and the job also refuses non-main pushes.
+#
+# TELEGRAM_API_ID and TELEGRAM_API_HASH are publisher Telegram app credentials.
+# This main-only workflow reads them from GitHub Actions repository secrets and
+# passes them to cargo so option_env! can bake them in. Never add these secrets
+# to ci.yml or any pull_request workflow. Never log the values. Real values live
+# in GitHub repository secrets and SOPS (arcoiro), not in this MIT tree.
 name: OS zips
 
 on:
@@ -53,13 +59,37 @@ jobs:
             libxkbcommon-dev \
             libwayland-dev \
             libgl1-mesa-dev \
-            libegl1-mesa-dev
+            libegl1-mesa-dev \
+            libc++-dev \
+            libc++abi-dev \
+            patchelf
+          # libc++-dev pulls libunwind-18-dev. Do not also install libunwind-dev;
+          # those packages conflict.
 
       - name: Install Rust toolchain
         run: rustup show
 
+      - name: Require publisher Telegram credentials
+        shell: bash
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set +x
+          set -euo pipefail
+          # Do not echo TELEGRAM_API_ID or TELEGRAM_API_HASH.
+          id_compact=$(printf '%s' "$TELEGRAM_API_ID" | tr -d '[:space:]')
+          hash_compact=$(printf '%s' "$TELEGRAM_API_HASH" | tr -d '[:space:]')
+          if [[ -z "$id_compact" || -z "$hash_compact" || ! "$id_compact" =~ ^[0-9]+$ ]]; then
+            echo "::error::Official OS zip refused: set repository secrets TELEGRAM_API_ID and TELEGRAM_API_HASH. TELEGRAM_API_ID must be a number. This job will not upload a credentials-missing binary."
+            exit 1
+          fi
+
       - name: Build release binary
-        run: cargo build --release -p thinwire
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: cargo build --release -p thinwire --features telegram-tdlib
 
       - name: Zip unsigned binary
         shell: bash
@@ -70,8 +100,28 @@ jobs:
           mkdir -p dist
           if [[ -f target/release/thinwire.exe ]]; then
             cp target/release/thinwire.exe dist/
+            bin=dist/thinwire.exe
           else
             cp target/release/thinwire dist/
+            bin=dist/thinwire
+          fi
+          if [[ "$(uname -s)" == "Linux" ]]; then
+            # Static TDLib still loads the LLVM C++ runtime. Ship those sonames
+            # beside the binary. Do not copy libc or other system loaders.
+            copied=0
+            while IFS= read -r lib; do
+              if [[ -z "$lib" || ! -f "$lib" ]]; then
+                echo "::error::Linux zip is missing a TDLib C++ runtime library. Refusing to upload a binary that cannot load TDLib."
+                exit 1
+              fi
+              cp -L "$lib" "dist/$(basename "$lib")"
+              copied=$((copied + 1))
+            done < <(ldd "$bin" | awk '/libc\+\+\.so|libc\+\+abi\.so|libunwind\.so/ { print $3 }')
+            if [[ "$copied" -lt 1 ]]; then
+              echo "::error::Linux zip did not find the LLVM C++ runtime required by static TDLib. Refusing to upload."
+              exit 1
+            fi
+            patchelf --set-rpath '$ORIGIN' "$bin"
           fi
           if command -v python3 >/dev/null; then
             PY=python3
