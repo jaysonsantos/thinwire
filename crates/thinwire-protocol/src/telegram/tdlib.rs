@@ -11,18 +11,32 @@ use std::thread;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
+use super::inbox::{self, ChatDirectory, ChatEffect, InboxMessage, MessageParty, NameBook};
 use crate::adapter::{
-    AdapterStatus, ChatMessage, Conversation, EventTx, ProtocolId, TelegramAuthPhase,
-    TelegramAuthStep, emit_conversation, emit_message, emit_status, emit_telegram_auth,
+    AdapterStatus, EventTx, ProtocolId, TelegramAuthPhase, TelegramAuthStep, emit_conversation,
+    emit_conversation_removed, emit_message, emit_message_body, emit_message_replaced, emit_status,
+    emit_telegram_auth,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
 /// Marker written to the persistent session key after authorization.
 pub const TDLIB_SESSION_MARKER: &str = "tdlib-ready";
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum TdlibCommand {
     Step(TelegramAuthStep),
+    LoadChats,
+    OpenChat(String),
+    SendText {
+        conversation_id: String,
+        body: String,
+    },
+}
+
+struct LiveInbox {
+    authorized: bool,
+    directory: ChatDirectory,
+    names: NameBook,
 }
 
 /// Owns the TDLib client id and the command sink into the worker.
@@ -52,9 +66,62 @@ impl TdlibRuntime {
         source: TelegramApiSource,
         events: &EventTx,
     ) {
+        self.enqueue(TdlibCommand::Step(step), secrets, source, events);
+    }
+
+    pub fn load_chats(
+        &mut self,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(TdlibCommand::LoadChats, secrets, source, events);
+    }
+
+    pub fn open_chat(
+        &mut self,
+        conversation_id: String,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::OpenChat(conversation_id),
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    pub fn send_text(
+        &mut self,
+        conversation_id: String,
+        body: String,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::SendText {
+                conversation_id,
+                body,
+            },
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    fn enqueue(
+        &mut self,
+        command: TdlibCommand,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
         let born = self.generation.load(Ordering::SeqCst);
         let generation = Arc::clone(&self.generation);
-        let sent = super::send_or_respawn(&mut self.commands, TdlibCommand::Step(step), || {
+        let sent = super::send_or_respawn(&mut self.commands, command, || {
             spawn_tdlib_worker(
                 Arc::clone(&secrets),
                 source.clone(),
@@ -91,12 +158,24 @@ fn spawn_tdlib_worker(
     let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let client_id = tdlib_rs::create_client();
+    let receive_generation = Arc::clone(&generation);
     thread::Builder::new()
         .name("thinwire-tdlib-recv".into())
         .spawn(move || {
-            while let Some((update, id)) = tdlib_rs::receive() {
-                if id == client_id {
-                    let _ = update_tx.send(update);
+            // `receive` returns None on timeout and after it hands a response
+            // to the request observer. Keep looping so chat updates and
+            // in-flight calls are not dropped when the UI is idle.
+            loop {
+                if receive_generation.load(Ordering::SeqCst) != born {
+                    break;
+                }
+                match tdlib_rs::receive() {
+                    Some((update, id)) if id == client_id => {
+                        if update_tx.send(update).is_err() {
+                            break;
+                        }
+                    }
+                    Some(_) | None => {}
                 }
             }
         })
@@ -110,16 +189,35 @@ fn spawn_tdlib_worker(
             tracing::info!("tdlib log verbosity was not applied");
         }
 
+        let mut live = LiveInbox {
+            authorized: false,
+            directory: ChatDirectory::new(),
+            names: NameBook::new(),
+        };
+
         loop {
             tokio::select! {
                 command = cmd_rx.recv() => {
-                    let Some(TdlibCommand::Step(step)) = command else {
+                    let Some(command) = command else {
                         break;
                     };
                     if generation.load(Ordering::SeqCst) != born {
                         break;
                     }
-                    apply_step(client_id, step, secrets.as_ref(), &events).await;
+                    match command {
+                        TdlibCommand::Step(step) => {
+                            apply_step(client_id, step, secrets.as_ref(), &events).await;
+                        }
+                        TdlibCommand::LoadChats => {
+                            load_main_chats(client_id, live.authorized, &events).await;
+                        }
+                        TdlibCommand::OpenChat(conversation_id) => {
+                            open_chat(client_id, &conversation_id, &live, &events).await;
+                        }
+                        TdlibCommand::SendText { conversation_id, body } => {
+                            send_text(client_id, &conversation_id, &body, &live, &events).await;
+                        }
+                    }
                 }
                 update = update_rx.recv() => {
                     let Some(update) = update else {
@@ -128,7 +226,7 @@ fn spawn_tdlib_worker(
                     if generation.load(Ordering::SeqCst) != born {
                         break;
                     }
-                    apply_update(client_id, update, secrets.as_ref(), &source, &events).await;
+                    apply_update(client_id, update, secrets.as_ref(), &source, &events, &mut live).await;
                 }
             }
         }
@@ -229,11 +327,40 @@ async fn apply_update(
     secrets: &dyn TelegramSecretVault,
     source: &TelegramApiSource,
     events: &EventTx,
+    live: &mut LiveInbox,
 ) {
-    let tdlib_rs::enums::Update::AuthorizationState(state) = update else {
-        return;
-    };
-    match state.authorization_state {
+    match update {
+        tdlib_rs::enums::Update::AuthorizationState(state) => {
+            apply_authorization(
+                client_id,
+                state.authorization_state,
+                secrets,
+                source,
+                events,
+                live,
+            )
+            .await;
+        }
+        tdlib_rs::enums::Update::User(update) => {
+            live.names.remember_user(
+                update.user.id,
+                &update.user.first_name,
+                &update.user.last_name,
+            );
+        }
+        other => apply_chat_update(other, live, events),
+    }
+}
+
+async fn apply_authorization(
+    client_id: i32,
+    state: tdlib_rs::enums::AuthorizationState,
+    secrets: &dyn TelegramSecretVault,
+    source: &TelegramApiSource,
+    events: &EventTx,
+    live: &mut LiveInbox,
+) {
+    match state {
         tdlib_rs::enums::AuthorizationState::WaitTdlibParameters => {
             set_parameters(client_id, secrets, source, events).await;
         }
@@ -267,35 +394,18 @@ async fn apply_update(
         tdlib_rs::enums::AuthorizationState::Ready => {
             secrets.set_secret(TelegramSecretKey::Session, TDLIB_SESSION_MARKER);
             super::request_secret_flush(events);
+            live.authorized = true;
             emit_telegram_auth(events, TelegramAuthPhase::Ready);
             emit_status(
                 events,
                 ProtocolId::Telegram,
                 AdapterStatus::Ready,
-                "Telegram is ready. TDLib session is live.",
+                "Telegram is ready. Loading the chat list.",
             );
-            emit_conversation(
-                events,
-                Conversation {
-                    protocol: ProtocolId::Telegram,
-                    id: "telegram:ready".into(),
-                    title: "Telegram".into(),
-                    participant: "you".into(),
-                    preview: "Connected via TDLib.".into(),
-                    unread: 0,
-                },
-            );
-            emit_message(
-                events,
-                ChatMessage {
-                    protocol: ProtocolId::Telegram,
-                    conversation_id: "telegram:ready".into(),
-                    id: "telegram:ready:1".into(),
-                    sender: "thinwire".into(),
-                    body: "Telegram login finished on the official TDLib path.".into(),
-                    outbound: false,
-                },
-            );
+            for conversation in live.directory.listed() {
+                emit_conversation(events, conversation);
+            }
+            load_main_chats(client_id, true, events).await;
         }
         tdlib_rs::enums::AuthorizationState::WaitEmailAddress(_)
         | tdlib_rs::enums::AuthorizationState::WaitEmailCode(_)
@@ -312,6 +422,7 @@ async fn apply_update(
         tdlib_rs::enums::AuthorizationState::LoggingOut
         | tdlib_rs::enums::AuthorizationState::Closing
         | tdlib_rs::enums::AuthorizationState::Closed => {
+            live.authorized = false;
             emit_status(
                 events,
                 ProtocolId::Telegram,
@@ -319,6 +430,313 @@ async fn apply_update(
                 "Telegram session closed.",
             );
         }
+    }
+}
+
+fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, events: &EventTx) {
+    let emit = live.authorized;
+    match update {
+        tdlib_rs::enums::Update::NewChat(update) => {
+            publish(events, emit, note_chat(&mut live.directory, &update.chat));
+        }
+        tdlib_rs::enums::Update::ChatTitle(update) => {
+            publish(
+                events,
+                emit,
+                live.directory.set_title(update.chat_id, &update.title),
+            );
+        }
+        tdlib_rs::enums::Update::ChatPosition(update) => {
+            if matches!(update.position.list, tdlib_rs::enums::ChatList::Main) {
+                publish(
+                    events,
+                    emit,
+                    live.directory
+                        .set_main_order(update.chat_id, update.position.order),
+                );
+            }
+        }
+        tdlib_rs::enums::Update::ChatReadInbox(update) => {
+            publish(
+                events,
+                emit,
+                live.directory
+                    .set_unread(update.chat_id, update.unread_count),
+            );
+        }
+        tdlib_rs::enums::Update::ChatLastMessage(update) => {
+            if let Some(order) = main_order(&update.positions) {
+                publish(
+                    events,
+                    emit,
+                    live.directory.set_main_order(update.chat_id, order),
+                );
+            }
+            if let Some(message) = update.last_message.as_ref() {
+                let preview = message_body(&message.content);
+                publish(
+                    events,
+                    emit,
+                    live.directory.set_preview(update.chat_id, &preview),
+                );
+                if emit {
+                    emit_mapped_message(events, message, live, None);
+                }
+            }
+        }
+        tdlib_rs::enums::Update::NewMessage(update) => {
+            let preview = message_body(&update.message.content);
+            let chat_id = update.message.chat_id;
+            if emit {
+                emit_mapped_message(events, &update.message, live, None);
+            }
+            publish(events, emit, live.directory.set_preview(chat_id, &preview));
+        }
+        tdlib_rs::enums::Update::MessageSendSucceeded(update) => {
+            if emit {
+                let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
+                emit_mapped_message(events, &update.message, live, Some(old_id));
+            }
+        }
+        tdlib_rs::enums::Update::MessageContent(update) => {
+            if !emit {
+                return;
+            }
+            emit_message_body(
+                events,
+                ProtocolId::Telegram,
+                inbox::conversation_id(update.chat_id),
+                inbox::message_id(update.chat_id, update.message_id),
+                message_body(&update.new_content),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn publish(events: &EventTx, emit: bool, effect: Option<ChatEffect>) {
+    if emit {
+        emit_effect(events, effect);
+    }
+}
+
+fn emit_effect(events: &EventTx, effect: Option<ChatEffect>) {
+    match effect {
+        Some(ChatEffect::Upsert(conversation)) => emit_conversation(events, conversation),
+        Some(ChatEffect::Remove(id)) => {
+            emit_conversation_removed(events, ProtocolId::Telegram, id);
+        }
+        None => {}
+    }
+}
+
+fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Option<ChatEffect> {
+    let order = main_order(&chat.positions).unwrap_or(0);
+    let preview = chat
+        .last_message
+        .as_ref()
+        .map(|message| message_body(&message.content))
+        .unwrap_or_default();
+    directory.upsert(
+        chat.id,
+        &chat.title,
+        order,
+        chat.unread_count,
+        &preview,
+        &chat.title,
+    )
+}
+
+fn main_order(positions: &[tdlib_rs::types::ChatPosition]) -> Option<i64> {
+    positions
+        .iter()
+        .find(|position| matches!(position.list, tdlib_rs::enums::ChatList::Main))
+        .map(|position| position.order)
+}
+
+fn emit_mapped_message(
+    events: &EventTx,
+    message: &tdlib_rs::types::Message,
+    live: &LiveInbox,
+    replace_old: Option<String>,
+) {
+    let party = match &message.sender_id {
+        tdlib_rs::enums::MessageSender::User(user) => MessageParty::User(user.user_id),
+        tdlib_rs::enums::MessageSender::Chat(chat) => MessageParty::Chat(chat.chat_id),
+    };
+    let mapped = inbox::to_chat_message(
+        &InboxMessage {
+            chat_id: message.chat_id,
+            message_id: message.id,
+            outgoing: message.is_outgoing,
+            party,
+            body: message_body(&message.content),
+        },
+        &live.names,
+        live.directory.title(message.chat_id),
+    );
+    if let Some(old_id) = replace_old.filter(|old_id| *old_id != mapped.id) {
+        emit_message_replaced(events, old_id, mapped);
+        return;
+    }
+    emit_message(events, mapped);
+}
+
+fn message_body(content: &tdlib_rs::enums::MessageContent) -> String {
+    match content {
+        tdlib_rs::enums::MessageContent::MessageText(text) => text.text.text.clone(),
+        tdlib_rs::enums::MessageContent::MessagePhoto(_) => "Photo".into(),
+        tdlib_rs::enums::MessageContent::MessageSticker(_) => "Sticker".into(),
+        tdlib_rs::enums::MessageContent::MessageVideo(_) => "Video".into(),
+        tdlib_rs::enums::MessageContent::MessageAnimation(_) => "Animation".into(),
+        tdlib_rs::enums::MessageContent::MessageVoiceNote(_) => "Voice message".into(),
+        tdlib_rs::enums::MessageContent::MessageDocument(_) => "File".into(),
+        _ => "Message".into(),
+    }
+}
+
+async fn load_main_chats(client_id: i32, authorized: bool, events: &EventTx) {
+    if !authorized {
+        return;
+    }
+    match tdlib_rs::functions::load_chats(
+        Some(tdlib_rs::enums::ChatList::Main),
+        inbox::MAIN_CHAT_LIMIT,
+        client_id,
+    )
+    .await
+    {
+        Ok(()) => emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Ready,
+            "Telegram chat list loaded.",
+        ),
+        Err(error) if inbox::is_end_of_chat_list(error.code) => emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Ready,
+            "Telegram chat list is up to date.",
+        ),
+        Err(error) => emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            format!("Could not load Telegram chats (TDLib {}).", error.code),
+        ),
+    }
+}
+
+async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, events: &EventTx) {
+    if !live.authorized {
+        emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            "Telegram is not ready. Open a chat after authorization.",
+        );
+        return;
+    }
+    let Some(chat_id) = inbox::parse_telegram_chat_id(conversation_id) else {
+        emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            "That chat id is not a Telegram chat.",
+        );
+        return;
+    };
+    emit_status(
+        events,
+        ProtocolId::Telegram,
+        AdapterStatus::Ready,
+        "Loading recent messages.",
+    );
+    match tdlib_rs::functions::get_chat_history(
+        chat_id,
+        0,
+        0,
+        inbox::HISTORY_LIMIT,
+        false,
+        client_id,
+    )
+    .await
+    {
+        Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
+            let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
+            for message in inbox::chronological(messages) {
+                emit_mapped_message(events, &message, live, None);
+            }
+            emit_status(
+                events,
+                ProtocolId::Telegram,
+                AdapterStatus::Ready,
+                "Recent messages loaded.",
+            );
+        }
+        Err(error) => emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            format!("Could not load messages (TDLib {}).", error.code),
+        ),
+    }
+}
+
+async fn send_text(
+    client_id: i32,
+    conversation_id: &str,
+    body: &str,
+    live: &LiveInbox,
+    events: &EventTx,
+) {
+    if !live.authorized {
+        emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            "Telegram is not ready. Send after authorization.",
+        );
+        return;
+    }
+    let Some(chat_id) = inbox::parse_telegram_chat_id(conversation_id) else {
+        emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            "That chat id is not a Telegram chat.",
+        );
+        return;
+    };
+    let text = body.trim();
+    if text.is_empty() {
+        return;
+    }
+    let content =
+        tdlib_rs::enums::InputMessageContent::InputMessageText(tdlib_rs::types::InputMessageText {
+            text: tdlib_rs::types::FormattedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            },
+            link_preview_options: None,
+            clear_draft: true,
+        });
+    match tdlib_rs::functions::send_message(chat_id, None, None, None, content, client_id).await {
+        Ok(tdlib_rs::enums::Message::Message(message)) => {
+            emit_mapped_message(events, &message, live, None);
+            emit_status(
+                events,
+                ProtocolId::Telegram,
+                AdapterStatus::Ready,
+                "Message sent.",
+            );
+        }
+        Err(error) => emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            format!("Telegram did not send the message (TDLib {}).", error.code),
+        ),
     }
 }
 

@@ -51,6 +51,7 @@ impl DiscordAdapter {
                 participant: "Example guild".into(),
                 preview: "Bot/OAuth stub — no user-account session.".into(),
                 unread: 1,
+                order: 0,
             },
         );
         emit_message(

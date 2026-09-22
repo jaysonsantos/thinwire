@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use thinwire_protocol::{
     AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, ProtocolCapabilities,
     ProtocolId, TelegramApiSource, TelegramAuthPhase, TelegramAuthStep, TelegramSecretVault,
-    catalog, telegram_api_available,
+    catalog, parse_telegram_chat_id, telegram_api_available,
 };
 
 use super::secrets::{SecretKey, SecretStore};
@@ -163,18 +163,38 @@ impl Snapshot {
             }
             AdapterEvent::ConversationUpsert { conversation } => {
                 let protocol = conversation.protocol;
-                let list = self.conversations.entry(protocol).or_default();
-                if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
-                    *existing = conversation;
-                } else {
-                    list.push(conversation);
+                {
+                    let list = self.conversations.entry(protocol).or_default();
+                    if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
+                        *existing = conversation;
+                    } else {
+                        list.push(conversation);
+                    }
+                    sort_conversations(list);
                 }
                 self.ensure_conversation_selection();
             }
-            AdapterEvent::MessageReceived { message } => {
-                let key = (message.protocol, message.conversation_id.clone());
-                self.messages.entry(key).or_default().push(message);
+            AdapterEvent::ConversationRemoved { protocol, id } => {
+                self.remove_conversation(protocol, &id);
             }
+            AdapterEvent::MessageReceived { message } => self.upsert_message(message),
+            AdapterEvent::MessageReplaced {
+                protocol,
+                conversation_id,
+                old_id,
+                message,
+            } => {
+                if protocol == message.protocol {
+                    self.remove_message(protocol, &conversation_id, &old_id);
+                }
+                self.upsert_message(message);
+            }
+            AdapterEvent::MessageBody {
+                protocol,
+                conversation_id,
+                message_id,
+                body,
+            } => self.patch_message_body(protocol, &conversation_id, &message_id, body),
             AdapterEvent::TelegramAuth { phase } => self.apply_telegram_phase(phase),
             AdapterEvent::FlushSecrets => {
                 self.keychain_flush = true;
@@ -205,6 +225,7 @@ impl Snapshot {
 
     pub(crate) fn select_conversation(&mut self, id: String) {
         self.selected_conversation = Some(id);
+        self.queue_open_chat();
     }
 
     pub(crate) fn set_filter(&mut self, filter: InboxFilter) {
@@ -285,7 +306,11 @@ impl Snapshot {
             .filter(|id| self.filter.matches(*id))
             .collect();
         for protocol in protocols {
-            self.pending.push(AdapterCommand::Connect { protocol });
+            if protocol == ProtocolId::Telegram && self.telegram_authorized {
+                self.pending.push(AdapterCommand::LoadChats { protocol });
+            } else {
+                self.pending.push(AdapterCommand::Connect { protocol });
+            }
         }
         self.status_text = "Refresh queued on the tokio worker. The UI thread stays free.".into();
     }
@@ -372,7 +397,7 @@ impl Snapshot {
         }
     }
 
-    pub(crate) fn send_compose_stub(&mut self) {
+    pub(crate) fn send_compose(&mut self) {
         let Some(conversation_id) = self.selected_conversation.clone() else {
             self.set_error(
                 "Nothing was sent.",
@@ -386,26 +411,34 @@ impl Snapshot {
             self.set_error(
                 "Nothing was sent.",
                 "The compose field is empty.",
-                "Type a message for the selected thread. This stub does not open a live session.",
+                "Type a message for the selected Telegram chat.",
+            );
+            return;
+        }
+        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
+            self.set_error(
+                "Nothing was sent.",
+                "Telegram is not ready.",
+                "Sign in with Telegram, then pick a chat. Other protocols are not ready.",
+            );
+            return;
+        }
+        if parse_telegram_chat_id(&conversation_id).is_none() {
+            self.set_error(
+                "Nothing was sent.",
+                "That chat is not a Telegram chat id.",
+                "Pick a chat from the Telegram list.",
             );
             return;
         }
         self.compose.clear();
         self.error = None;
-        let id = format!("{conversation_id}:compose-stub");
-        self.messages
-            .entry((self.selected_protocol, conversation_id.clone()))
-            .or_default()
-            .push(ChatMessage {
-                protocol: self.selected_protocol,
-                conversation_id,
-                id,
-                sender: "you".into(),
-                body,
-                outbound: true,
-            });
-        self.status_text =
-            "Compose stub queued on the UI snapshot only. No protocol I/O ran.".into();
+        self.pending.push(AdapterCommand::SendText {
+            protocol: ProtocolId::Telegram,
+            conversation_id,
+            body,
+        });
+        self.status_text = "Message queued on the tokio worker. The UI thread stays free.".into();
     }
 
     pub(crate) fn open_telegram(&mut self, store: &SecretStore) {
@@ -483,12 +516,12 @@ impl Snapshot {
         {
             row.linked = true;
         }
+        self.telegram_authorized = true;
         self.select_protocol(ProtocolId::Telegram);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
-        self.telegram_authorized = true;
         self.error = None;
-        self.status_text = "Telegram is ready. TDLib session is live.".into();
+        self.status_text = "Telegram is ready. Loading the chat list.".into();
     }
 
     fn finish_telegram_unavailable(&mut self) {
@@ -566,8 +599,100 @@ impl Snapshot {
             .and_then(|rows| rows.first())
         {
             self.selected_conversation = Some(first.id.clone());
+            self.queue_open_chat();
         }
     }
+
+    fn queue_open_chat(&mut self) {
+        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
+            return;
+        }
+        let Some(id) = self.selected_conversation.clone() else {
+            return;
+        };
+        if parse_telegram_chat_id(&id).is_none() {
+            return;
+        }
+        let already = self.pending.iter().any(|command| {
+            matches!(
+                command,
+                AdapterCommand::OpenChat { conversation_id, .. } if conversation_id == &id
+            )
+        });
+        if already {
+            return;
+        }
+        self.pending.push(AdapterCommand::OpenChat {
+            protocol: ProtocolId::Telegram,
+            conversation_id: id,
+        });
+    }
+
+    fn remove_conversation(&mut self, protocol: ProtocolId, id: &str) {
+        if let Some(list) = self.conversations.get_mut(&protocol) {
+            list.retain(|row| row.id != id);
+        }
+        self.messages
+            .retain(|key, _| !(key.0 == protocol && key.1 == id));
+        if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
+            self.selected_conversation = None;
+            self.ensure_conversation_selection();
+        }
+    }
+
+    fn upsert_message(&mut self, message: ChatMessage) {
+        let key = (message.protocol, message.conversation_id.clone());
+        let list = self.messages.entry(key).or_default();
+        if let Some(existing) = list.iter_mut().find(|row| row.id == message.id) {
+            *existing = message;
+        } else {
+            list.push(message);
+        }
+        sort_messages(list);
+    }
+
+    fn remove_message(&mut self, protocol: ProtocolId, conversation_id: &str, message_id: &str) {
+        let Some(list) = self
+            .messages
+            .get_mut(&(protocol, conversation_id.to_string()))
+        else {
+            return;
+        };
+        list.retain(|row| row.id != message_id);
+    }
+
+    fn patch_message_body(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        body: String,
+    ) {
+        let Some(list) = self
+            .messages
+            .get_mut(&(protocol, conversation_id.to_string()))
+        else {
+            return;
+        };
+        if let Some(message) = list.iter_mut().find(|row| row.id == message_id) {
+            message.body = body;
+        }
+    }
+}
+
+fn sort_conversations(list: &mut [Conversation]) {
+    list.sort_by_key(|row| (std::cmp::Reverse(row.order), row.id.clone()));
+}
+
+fn sort_messages(list: &mut [ChatMessage]) {
+    list.sort_by_key(|row| message_rank(&row.id));
+}
+
+fn message_rank(id: &str) -> i64 {
+    id.rsplit(':')
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0)
 }
 
 fn persist_api(
@@ -667,6 +792,16 @@ mod tests {
         assert!(seven.contains("Primary login UI: phone/code"));
         assert!(seven.contains("not** the primary login path"));
         assert!(seven.contains("do **not** send every user to my.telegram.org"));
+        assert!(seven.contains("GitHub Actions repository secrets"));
+        assert!(seven.contains("TELEGRAM_API_ID"));
+        assert!(seven.contains("win."));
+        assert!(seven.contains("Encrypted inventory copy"));
+        assert!(seven.contains("Terraform/SOPS"));
+        let roadmap = include_str!("../../../../ROADMAP.md");
+        assert!(roadmap.contains("#19"));
+        assert!(roadmap.contains("5c46222"));
+        assert!(roadmap.contains("authorizationStateReady"));
+        assert!(roadmap.contains("Chat list + messages"));
     }
 
     #[test]
@@ -778,6 +913,7 @@ mod tests {
                 participant: "you".into(),
                 preview: "secret-preview-should-not-match-search".into(),
                 unread: 2,
+                order: 0,
             },
         });
         assert!(snapshot.visible_conversations().is_empty());
@@ -965,6 +1101,7 @@ mod tests {
                 participant: "you".into(),
                 preview: "secret-preview-should-not-match-search".into(),
                 unread: 0,
+                order: 0,
             },
         });
         snapshot
@@ -982,15 +1119,211 @@ mod tests {
     }
 
     #[test]
-    fn compose_stub_appends_outbound_without_protocol_command() {
+    fn send_compose_queues_text_on_the_worker_without_a_local_stub() {
         let mut snapshot = Snapshot::new();
-        snapshot.selected_conversation = Some("telegram:saved".into());
-        snapshot.compose = "hello".into();
-        snapshot.send_compose_stub();
+        snapshot.telegram_authorized = true;
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some("telegram:42".into());
+        snapshot.compose = " hello ".into();
+        snapshot.send_compose();
         assert!(snapshot.compose.is_empty());
+        assert!(snapshot.selected_messages().is_empty());
+        let commands = snapshot.take_commands();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                body,
+            } if conversation_id == "telegram:42" && body == "hello"
+        )));
+        let debug = format!("{commands:?}");
+        assert!(debug.contains("hello"));
+        assert!(!debug.contains("hash-value"));
+    }
+
+    #[test]
+    fn send_compose_refuses_before_telegram_is_ready() {
+        let mut snapshot = Snapshot::new();
+        snapshot.selected_conversation = Some("telegram:42".into());
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        assert_eq!(snapshot.compose, "hello");
         assert!(snapshot.take_commands().is_empty());
+        assert!(snapshot.error.is_some());
+        assert!(snapshot.selected_messages().is_empty());
+    }
+
+    #[test]
+    fn selecting_a_ready_chat_queues_history_and_sorts_by_order() {
+        let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
+        snapshot
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Telegram)
+            .expect("telegram")
+            .linked = true;
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:2".into(),
+                title: "Older".into(),
+                participant: "Older".into(),
+                preview: "a".into(),
+                unread: 0,
+                order: 10,
+            },
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:9".into(),
+                title: "Newer".into(),
+                participant: "Newer".into(),
+                preview: "b".into(),
+                unread: 1,
+                order: 90,
+            },
+        });
+        let ids: Vec<_> = snapshot
+            .visible_conversations()
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["telegram:9", "telegram:2"]);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:2")
+        );
+        let commands = snapshot.take_commands();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            AdapterCommand::OpenChat { conversation_id, .. } if conversation_id == "telegram:2"
+        )));
+        snapshot.select_conversation("telegram:9".into());
+        let commands = snapshot.take_commands();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            AdapterCommand::OpenChat { conversation_id, .. } if conversation_id == "telegram:9"
+        )));
+    }
+
+    #[test]
+    fn messages_upsert_replace_and_body_edits_keep_sender() {
+        let mut snapshot = Snapshot::new();
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some("telegram:4".into());
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:4".into(),
+                id: "telegram:4:2".into(),
+                sender: "Ada".into(),
+                body: "second".into(),
+                outbound: false,
+            },
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:4".into(),
+                id: "telegram:4:1".into(),
+                sender: "Ada".into(),
+                body: "first".into(),
+                outbound: false,
+            },
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:4".into(),
+                id: "telegram:4:2".into(),
+                sender: "Ada".into(),
+                body: "second-edited-via-upsert".into(),
+                outbound: false,
+            },
+        });
+        let bodies: Vec<_> = snapshot
+            .selected_messages()
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect();
+        assert_eq!(bodies, vec!["first", "second-edited-via-upsert"]);
+        snapshot.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:4".into(),
+            old_id: "telegram:4:1".into(),
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:4".into(),
+                id: "telegram:4:8".into(),
+                sender: "you".into(),
+                body: "sent".into(),
+                outbound: true,
+            },
+        });
+        snapshot.apply(AdapterEvent::MessageBody {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:4".into(),
+            message_id: "telegram:4:8".into(),
+            body: "sent-edited".into(),
+        });
         let messages = snapshot.selected_messages();
-        assert_eq!(messages.last().map(|m| m.body.as_str()), Some("hello"));
-        assert_eq!(messages.last().map(|m| m.outbound), Some(true));
+        assert!(messages.iter().all(|message| message.id != "telegram:4:1"));
+        let edited = messages
+            .iter()
+            .find(|message| message.id == "telegram:4:8")
+            .expect("replaced");
+        assert_eq!(edited.body, "sent-edited");
+        assert_eq!(edited.sender, "you");
+        assert!(edited.outbound);
+    }
+
+    #[test]
+    fn removed_chat_drops_messages_and_refresh_reloads_when_ready() {
+        let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
+        snapshot
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Telegram)
+            .expect("telegram")
+            .linked = true;
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:3".into(),
+                title: "Gone".into(),
+                participant: "Gone".into(),
+                preview: String::new(),
+                unread: 2,
+                order: 5,
+            },
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:3".into(),
+                id: "telegram:3:1".into(),
+                sender: "Ada".into(),
+                body: "hi".into(),
+                outbound: false,
+            },
+        });
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Telegram,
+            id: "telegram:3".into(),
+        });
+        assert!(snapshot.visible_conversations().is_empty());
+        assert!(snapshot.selected_messages().is_empty());
+        snapshot.refresh_visible();
+        assert!(snapshot.take_commands().iter().any(|command| matches!(
+            command,
+            AdapterCommand::LoadChats {
+                protocol: ProtocolId::Telegram,
+            }
+        )));
     }
 }

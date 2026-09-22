@@ -12,11 +12,11 @@ Rule: an ADR accepted is not Done until the matching change is on `main`.
 - System light/dark by default — `0005`
 - Live TDLib path + hard constraints — `0006` (on `main` via #15 / `eff31de`)
 - Official release inject for main OS zips — `0007` (on `main` via #19 / `5c46222`)
+- Chat list + messages after `authorizationStateReady`. The worker loads the main chat list, opens a chat for recent messages, and sends text. Auth alone is not the inbox. WhatsApp, Discord, and Slack stay not-ready.
 
 ## Next (locked order)
 
-1. **Chat list + messages** on TDLib after `authorizationStateReady` (auth alone is not enough).
-2. **Other protocols** (only after Telegram feels usable):
+1. **Other protocols** (only after Telegram feels usable):
   - WhatsApp — experimental, honest ToS labels (`0001`)
   - Discord — bot/OAuth inbox only, no self-bots (`0001`)
   - Slack — official OAuth (`0001`)
