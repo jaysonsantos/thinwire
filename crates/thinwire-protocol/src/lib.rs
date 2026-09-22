@@ -12,8 +12,8 @@ mod whatsapp;
 
 pub use adapter::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Conversation,
-    DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass,
-    TelegramAuthPhase, TelegramAuthStep,
+    DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
+    RedactedPairingSecret, SupportClass, TelegramAuthPhase, TelegramAuthStep,
 };
 pub use discord::DiscordAdapter;
 pub use fake::FakeAdapter;
@@ -39,7 +39,7 @@ pub use telegram::{
     TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,
     resolve_telegram_api, telegram_api_available,
 };
-pub use whatsapp::WhatsAppAdapter;
+pub use whatsapp::{WhatsAppAdapter, WhatsAppPhoneVault};
 
 /// v1 protocols in shell display order (S2: four protocols, no Signal).
 pub fn catalog() -> [ProtocolCapabilities; 4] {
@@ -53,10 +53,11 @@ pub fn catalog() -> [ProtocolCapabilities; 4] {
 
 pub(crate) fn registry(
     secrets: std::sync::Arc<dyn TelegramSecretVault>,
+    whatsapp_phone: std::sync::Arc<WhatsAppPhoneVault>,
 ) -> Vec<Box<dyn ProtocolAdapter>> {
     vec![
         Box::new(TelegramAdapter::new(secrets)),
-        Box::new(WhatsAppAdapter),
+        Box::new(WhatsAppAdapter::new(whatsapp_phone)),
         Box::new(DiscordAdapter),
         Box::new(SlackAdapter),
     ]
@@ -119,21 +120,61 @@ mod tests {
     }
 
     #[test]
-    fn v1_does_not_depend_on_libsignal_or_presage() {
-        let sources = [
+    fn v1_does_not_depend_on_agpl_signal_client_or_presage() {
+        // Signal the messenger stays out of v1. Reject Presage and the AGPL
+        // Signal client crates. `wacore-libsignal` is MIT code inside the
+        // optional whatsapp-rust linked-device stack, not a Signal account.
+        for manifest in [
             include_str!("../Cargo.toml"),
             include_str!("../../thinwire/Cargo.toml"),
             include_str!("../../../Cargo.toml"),
-            include_str!("../../../Cargo.lock"),
-        ];
-        for src in sources {
-            let lower = src.to_ascii_lowercase();
-            assert!(!lower.contains("presage"), "v1 must not depend on presage");
+        ] {
+            let lower = manifest.to_ascii_lowercase();
+            assert!(
+                !lower.contains("presage"),
+                "manifests must not name presage"
+            );
             assert!(
                 !lower.contains("libsignal"),
-                "v1 must not depend on libsignal"
+                "manifests must not name the Signal client crate"
             );
         }
+        let names = package_names_from_lock(include_str!("../../../Cargo.lock"));
+        for name in &names {
+            assert!(
+                !is_forbidden_signal_stack(name),
+                "v1 must not depend on {name}"
+            );
+        }
+        if names.contains(&"wacore-libsignal") {
+            assert!(
+                names.contains(&"whatsapp-rust"),
+                "bundled linked-device crypto is only allowed via whatsapp-rust"
+            );
+        }
+        assert!(is_forbidden_signal_stack("libsignal"));
+        assert!(is_forbidden_signal_stack("libsignal-protocol"));
+        assert!(is_forbidden_signal_stack("presage"));
+        assert!(is_forbidden_signal_stack("presage-store-sled"));
+        assert!(!is_forbidden_signal_stack("wacore-libsignal"));
+        assert!(!is_forbidden_signal_stack("whatsapp-rust"));
+    }
+
+    fn package_names_from_lock(lock: &str) -> Vec<&str> {
+        lock.lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("name = \"")?;
+                rest.strip_suffix('"')
+            })
+            .collect()
+    }
+
+    fn is_forbidden_signal_stack(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower == "presage"
+            || lower.starts_with("presage-")
+            || lower == "libsignal"
+            || lower.starts_with("libsignal-")
     }
 
     fn contains_word(hay: &str, word: &str) -> bool {

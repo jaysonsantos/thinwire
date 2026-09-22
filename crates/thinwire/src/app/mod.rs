@@ -5,12 +5,14 @@ mod secrets;
 mod settings;
 mod snapshot;
 mod ui;
+#[cfg(feature = "whatsapp-web")]
+mod whatsapp_gate;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
-use thinwire_protocol::{AdapterHost, TelegramSecretVault};
+use thinwire_protocol::{AdapterHost, TelegramSecretVault, WhatsAppPhoneVault};
 
 use secrets::SecretStore;
 use snapshot::Snapshot;
@@ -24,6 +26,7 @@ pub struct ThinwireApp {
     snapshot: Snapshot,
     settings: Settings,
     secrets: Arc<SecretStore>,
+    whatsapp_phone: Arc<WhatsAppPhoneVault>,
     last_os_theme: Option<egui::Theme>,
 }
 
@@ -32,9 +35,11 @@ impl ThinwireApp {
     pub fn new(settings: Settings) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime for protocol adapters");
         let secrets = SecretStore::for_ui(runtime.handle());
+        let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
         let host = AdapterHost::spawn(
             runtime.handle(),
             Arc::clone(&secrets) as Arc<dyn TelegramSecretVault>,
+            Arc::clone(&whatsapp_phone),
         );
         let mut snapshot = Snapshot::new();
         snapshot.status_text = secret_store_status_text(secrets.backend_name());
@@ -44,6 +49,7 @@ impl ThinwireApp {
             snapshot,
             settings,
             secrets,
+            whatsapp_phone,
             last_os_theme: None,
         }
     }
@@ -88,7 +94,13 @@ impl eframe::App for ThinwireApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        ui::draw(ui, &mut self.snapshot, &mut self.settings, &self.secrets);
+        ui::draw(
+            ui,
+            &mut self.snapshot,
+            &mut self.settings,
+            &self.secrets,
+            &self.whatsapp_phone,
+        );
         self.flush_commands();
     }
 }

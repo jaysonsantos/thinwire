@@ -12,3 +12,7 @@ result
 td.binlog
 **/td.binlog
 *.binlog
+
+# WhatsApp linked-device store (app-data only; never the repo)
+device.sqlite
+device.sqlite-*

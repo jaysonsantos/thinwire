@@ -17,9 +17,14 @@ Rule: an ADR accepted is not Done until the matching change is on `main`.
 ## Next (locked order)
 
 1. **Other protocols** (only after Telegram feels usable):
-  - WhatsApp — experimental, honest ToS labels (`0001`)
+  - WhatsApp — experimental, honest ToS labels (`0001`). Feature `whatsapp-web` is a scaffold spike, not the default UI, and not Done.
   - Discord — bot/OAuth inbox only, no self-bots (`0001`)
   - Slack — official OAuth (`0001`). Feature-off spike `slack-oauth` records the workspace-app shape (`0008`) and stays out of the default UI.
+
+## Spike (scaffold, not the default UI)
+
+- `whatsapp-web` — experimental linked-device scaffold on `whatsapp-rust` (oxidezap), git revision pinned the same way ZapFast pins it. Off unless that cargo feature is enabled. Default CI does not enable it. No ready WhatsApp account in the default build. Full-screen ToS/ban gate before QR or pair. Telegram chat list and messages are on `main`; this spike stays off by default.
+- `slack-oauth` — workspace-app OAuth v2 / Socket Mode scaffold on `slack-morphism` (`0008`). Off by default. No Slack auth UI in the default shell.
 
 ## Explicitly not next
 

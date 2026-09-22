@@ -53,6 +53,22 @@ mod tests {
     }
 
     #[test]
+    fn docs_record_whatsapp_spike_as_experimental_and_not_default_ui() {
+        let agents = include_str!("../../../AGENTS.md");
+        let roadmap = include_str!("../../../ROADMAP.md");
+        let readme = include_str!("../../../README.md");
+        for doc in [agents, roadmap, readme] {
+            assert!(doc.contains("whatsapp-web"));
+            assert!(
+                doc.to_ascii_lowercase().contains("not the default ui"),
+                "spike must stay off the default UI"
+            );
+        }
+        assert!(agents.contains("Full-screen ToS/ban gate"));
+        assert!(roadmap.contains("No ready WhatsApp account"));
+    }
+
+    #[test]
     fn readme_does_not_list_signal_as_v1_protocol() {
         let readme = include_str!("../../../README.md");
         assert!(

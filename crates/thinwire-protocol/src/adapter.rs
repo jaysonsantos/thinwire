@@ -182,6 +182,14 @@ pub enum AdapterCommand {
         conversation_id: String,
         body: String,
     },
+    /// Records that the full-screen WhatsApp ban gate was accepted.
+    /// Carries no secrets and does not open a network session.
+    WhatsAppAcknowledgeRisk,
+    /// Asks the worker to start experimental linked-device pairing.
+    /// Phone digits, if any, stay in the memory vault. This variant has no fields.
+    WhatsAppBeginLink,
+    /// Stops experimental pairing and clears the in-memory risk acknowledgement.
+    WhatsAppCancelLink,
 }
 
 impl AdapterCommand {
@@ -195,6 +203,9 @@ impl AdapterCommand {
             | Self::SendText { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
+            Self::WhatsAppAcknowledgeRisk | Self::WhatsAppBeginLink | Self::WhatsAppCancelLink => {
+                ProtocolId::WhatsApp
+            }
         }
     }
 }
@@ -245,6 +256,49 @@ pub enum AdapterEvent {
         conversation_id: String,
         message_ids: Vec<String>,
     },
+    /// Experimental WhatsApp QR payload. Debug output is redacted.
+    /// Never log [`RedactedPairingSecret::reveal`].
+    WhatsAppQr {
+        code: RedactedPairingSecret,
+        /// Link generation that produced this payload. Stale generations are dropped.
+        generation: u64,
+    },
+    /// Experimental WhatsApp pair code. Debug output is redacted.
+    /// Never log [`RedactedPairingSecret::reveal`].
+    WhatsAppPairCode {
+        code: RedactedPairingSecret,
+        /// Link generation that produced this payload. Stale generations are dropped.
+        generation: u64,
+    },
+}
+
+/// Pairing material shown only on the experimental WhatsApp screen.
+///
+/// `Debug` is redacted. Do not put this value on [`AdapterCommand`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedactedPairingSecret {
+    value: String,
+}
+
+impl RedactedPairingSecret {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+        }
+    }
+
+    /// UI-only access. Callers must not log or persist the returned string.
+    #[must_use]
+    pub fn reveal(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Debug for RedactedPairingSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RedactedPairingSecret(<redacted>)")
+    }
 }
 
 /// Conversation row shown in the inbox.
