@@ -125,14 +125,15 @@ fn bind_discord_after_hydrate(secrets: &SecretStore, host: &AdapterHost) {
     });
 }
 
-const SECRET_STORE_STATUS_PREFIX: &str = "Adapters are stubs. Secret store: ";
+const SECRET_STORE_STATUS_PREFIX: &str = "Sign in with Telegram to get started.";
 
 fn secret_store_status_text(backend: &str) -> String {
-    format!("{SECRET_STORE_STATUS_PREFIX}{backend}.")
+    let _ = backend;
+    SECRET_STORE_STATUS_PREFIX.to_string()
 }
 
 fn refreshed_secret_store_status(current: &str, backend: &str) -> Option<String> {
-    if !current.starts_with(SECRET_STORE_STATUS_PREFIX) {
+    if current != SECRET_STORE_STATUS_PREFIX {
         return None;
     }
     let next = secret_store_status_text(backend);
@@ -206,12 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn secret_store_status_updates_from_memory_to_os() {
+    fn secret_store_status_stays_calm_across_backend_attach() {
         let current = secret_store_status_text("memory");
-        assert_eq!(
-            refreshed_secret_store_status(&current, "os-keychain").as_deref(),
-            Some("Adapters are stubs. Secret store: os-keychain.")
-        );
+        assert_eq!(current, "Sign in with Telegram to get started.");
+        assert_eq!(refreshed_secret_store_status(&current, "os-keychain"), None);
     }
 
     #[test]
