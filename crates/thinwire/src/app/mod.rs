@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
-use thinwire_protocol::{AdapterHost, TelegramSecretVault, WhatsAppPhoneVault};
+use thinwire_protocol::{
+    AdapterHost, DiscordSecretVault, TelegramSecretVault, WhatsAppPhoneVault,
+};
 
 use secrets::SecretStore;
 use snapshot::Snapshot;
@@ -39,6 +41,7 @@ impl ThinwireApp {
         let host = AdapterHost::spawn(
             runtime.handle(),
             Arc::clone(&secrets) as Arc<dyn TelegramSecretVault>,
+            Arc::clone(&secrets) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&whatsapp_phone),
         );
         let mut snapshot = Snapshot::new();

@@ -26,6 +26,9 @@ slack-oauth = ["dep:slack-morphism"]
 # Git revision matches ZapFast 0.14 so the spike builds on stable Rust.
 # Default CI does not enable this feature. Not a supported messenger.
 whatsapp-web = ["dep:whatsapp-rust"]
+# Bot/OAuth guild inbox spike via twilight. Default CI stays feature-off.
+# No user-token client. Never put a Discord token in CI or the MIT tree.
+discord-bot = ["dep:twilight-http", "dep:twilight-model", "dep:rustls"]
 
 [dependencies]
 tdlib-rs = { version = "1.4", optional = true, default-features = false, features = [
@@ -39,6 +42,13 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "ae3c
   "tokio-runtime",
   "ureq-client",
   "tokio-native",
+] }
+twilight-http = { version = "0.17.1", optional = true }
+twilight-model = { version = "0.17.1", optional = true }
+# twilight-http 0.17 leaves rustls without a process crypto provider.
+# `ring` is the single provider for the bot HTTP client.
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+  "ring",
 ] }
 dirs.workspace = true
 getrandom = "0.2"

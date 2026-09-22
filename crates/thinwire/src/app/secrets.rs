@@ -15,7 +15,10 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use keyring::Entry;
-use thinwire_protocol::{TELEGRAM_SECRET_SERVICE, TelegramSecretKey, TelegramSecretVault};
+use thinwire_protocol::{
+    DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordSecretVault, TELEGRAM_SECRET_SERVICE,
+    TelegramSecretKey, TelegramSecretVault,
+};
 use tokio::runtime::Handle;
 
 /// Telegram secrets the login screens persist. Re-export keeps call sites short.
@@ -58,6 +61,8 @@ enum AttachPhase {
 struct Inner {
     values: HashMap<SecretKey, String>,
     dirty: HashSet<SecretKey>,
+    discord_bot_token: Option<String>,
+    discord_token_dirty: bool,
     flush_pending: bool,
     flush_in_flight: bool,
     phase: AttachPhase,
@@ -74,6 +79,8 @@ impl SecretStore {
             inner: Mutex::new(Inner {
                 values: HashMap::new(),
                 dirty: HashSet::new(),
+                discord_bot_token: None,
+                discord_token_dirty: false,
                 flush_pending: false,
                 flush_in_flight: false,
                 phase,
@@ -142,6 +149,24 @@ impl SecretStore {
         }
         inner.dirty.insert(key);
         Ok(())
+    }
+
+    /// UI thread: memory only. OS keychain I/O stays on the flush/attach worker.
+    pub fn set_discord_bot_token(&self, value: &str) -> Result<(), SecretError> {
+        let trimmed = value.trim();
+        let mut inner = self.lock()?;
+        if trimmed.is_empty() {
+            inner.discord_bot_token = None;
+        } else {
+            inner.discord_bot_token = Some(trimmed.to_string());
+        }
+        inner.discord_token_dirty = true;
+        Ok(())
+    }
+
+    /// UI thread: read the in-memory bot token only.
+    pub fn discord_bot_token(&self) -> Result<Option<String>, SecretError> {
+        Ok(self.lock()?.discord_bot_token.clone())
     }
 
     /// UI thread: read the in-memory map only.
@@ -218,7 +243,9 @@ impl SecretStore {
         match probe_os() {
             Ok(()) => {
                 let (os_values, hydrate_error) = read_os_snapshot();
+                let discord_token = read_discord_os_token();
                 let should_flush = self.finish_ready(os_values);
+                self.store_hydrated_discord_token(discord_token);
                 if let Some(error) = hydrate_error {
                     tracing::warn!(
                         error = %error,
@@ -270,7 +297,8 @@ impl SecretStore {
             }
         }
         inner.phase = AttachPhase::Ready;
-        let should_flush = inner.flush_pending || !inner.dirty.is_empty();
+        let should_flush =
+            inner.flush_pending || !inner.dirty.is_empty() || inner.discord_token_dirty;
         inner.flush_pending = false;
         inner.dirty.clear();
         if should_flush {
@@ -288,7 +316,53 @@ impl SecretStore {
                 }
             }
             Ok(())
-        })
+        })?;
+        self.flush_discord_token()
+    }
+
+    fn flush_discord_token(&self) -> Result<(), SecretError> {
+        let snapshot = {
+            let mut inner = self.lock()?;
+            if inner.phase != AttachPhase::Ready || !inner.discord_token_dirty {
+                return Ok(());
+            }
+            inner.discord_token_dirty = false;
+            inner.discord_bot_token.clone()
+        };
+        let write = match snapshot {
+            Some(value) => discord_os_set(&value),
+            None => discord_os_delete(),
+        };
+        if let Err(error) = write {
+            if let Ok(mut inner) = self.lock() {
+                inner.discord_token_dirty = true;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn store_hydrated_discord_token(&self, value: Result<Option<String>, SecretError>) {
+        let Ok(mut inner) = self.lock() else {
+            return;
+        };
+        if inner.discord_token_dirty {
+            return;
+        }
+        match value {
+            Ok(Some(raw)) => {
+                let trimmed = raw.trim();
+                inner.discord_bot_token = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "discord bot token hydrate failed");
+            }
+        }
     }
 
     fn flush_loop<F>(&self, mut commit: F) -> Result<(), SecretError>
@@ -336,6 +410,18 @@ impl SecretStore {
 }
 
 type FlushSnapshot = [(SecretKey, Option<String>); 4];
+
+impl DiscordSecretVault for SecretStore {
+    fn bot_token(&self) -> Option<String> {
+        self.discord_bot_token().ok().flatten()
+    }
+
+    fn set_bot_token(&self, value: &str) {
+        if let Err(error) = self.set_discord_bot_token(value) {
+            tracing::warn!(error = %error, "discord bot token memory write failed");
+        }
+    }
+}
 
 impl TelegramSecretVault for SecretStore {
     fn get_secret(&self, key: TelegramSecretKey) -> Option<String> {
@@ -405,6 +491,31 @@ fn os_get(key: SecretKey) -> Result<Option<String>, SecretError> {
     match os_entry(key)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(map_keyring_error(error)),
+    }
+}
+
+fn discord_os_entry() -> Result<Entry, SecretError> {
+    Entry::new(DISCORD_SECRET_SERVICE, DISCORD_SECRET_BOT_TOKEN).map_err(map_keyring_error)
+}
+
+fn read_discord_os_token() -> Result<Option<String>, SecretError> {
+    match discord_os_entry()?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(map_keyring_error(error)),
+    }
+}
+
+fn discord_os_set(value: &str) -> Result<(), SecretError> {
+    discord_os_entry()?
+        .set_password(value)
+        .map_err(map_keyring_error)
+}
+
+fn discord_os_delete() -> Result<(), SecretError> {
+    match discord_os_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
@@ -479,6 +590,28 @@ mod tests {
         assert!(!debug.contains("super-secret-session"));
         store.delete(SecretKey::ApiHash).expect("delete hash");
         assert_eq!(store.get(SecretKey::ApiHash).expect("get hash"), None);
+    }
+
+    #[test]
+    fn discord_bot_token_stays_in_memory_and_out_of_debug() {
+        let store = SecretStore::memory();
+        store
+            .set_discord_bot_token("  fixture-bot-token  ")
+            .expect("set");
+        assert_eq!(
+            store.discord_bot_token().expect("get").as_deref(),
+            Some("fixture-bot-token")
+        );
+        store.set_discord_bot_token(" ").expect("clear");
+        assert_eq!(store.discord_bot_token().expect("cleared"), None);
+        store
+            .set_discord_bot_token("fixture-bot-token")
+            .expect("set again");
+        let debug = format!("{store:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("fixture-bot-token"));
+        assert_eq!(DISCORD_SECRET_BOT_TOKEN, "discord.bot_token");
+        assert_eq!(store.request_flush(), FlushAction::Ignore);
     }
 
     #[test]

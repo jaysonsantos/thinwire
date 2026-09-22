@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
-    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, ProtocolCapabilities,
-    ProtocolId, TelegramApiSource, TelegramAuthPhase, TelegramAuthStep, TelegramSecretVault,
-    catalog, parse_telegram_chat_id, telegram_api_available,
+    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, DiscordAdapter,
+    ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthPhase, TelegramAuthStep,
+    TelegramSecretVault, catalog, parse_telegram_chat_id, telegram_api_available,
 };
 
 use super::secrets::{SecretKey, SecretStore};
@@ -105,6 +105,7 @@ pub(crate) struct Snapshot {
     pub compose: String,
     pub auth_busy: bool,
     pub telegram_authorized: bool,
+    telegram_messages_from_adapter: u32,
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
@@ -150,6 +151,7 @@ impl Snapshot {
             compose: String::new(),
             auth_busy: false,
             telegram_authorized: false,
+            telegram_messages_from_adapter: 0,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
@@ -194,6 +196,12 @@ impl Snapshot {
             }
             AdapterEvent::ConversationUpsert { conversation } => {
                 let protocol = conversation.protocol;
+                if protocol == ProtocolId::Discord
+                    && DiscordAdapter::bot_inbox_compiled()
+                    && let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol)
+                {
+                    row.linked = true;
+                }
                 {
                     let list = self.conversations.entry(protocol).or_default();
                     if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
@@ -208,7 +216,13 @@ impl Snapshot {
             AdapterEvent::ConversationRemoved { protocol, id } => {
                 self.remove_conversation(protocol, &id);
             }
-            AdapterEvent::MessageReceived { message } => self.upsert_message(message),
+            AdapterEvent::MessageReceived { message } => {
+                if message.protocol == ProtocolId::Telegram {
+                    self.telegram_messages_from_adapter =
+                        self.telegram_messages_from_adapter.saturating_add(1);
+                }
+                self.upsert_message(message);
+            }
             AdapterEvent::MessageReplaced {
                 protocol,
                 conversation_id,
@@ -280,6 +294,9 @@ impl Snapshot {
     }
 
     pub(crate) fn select_protocol(&mut self, protocol: ProtocolId) {
+        if !self.account_surface_visible(protocol) {
+            return;
+        }
         self.selected_protocol = protocol;
         self.selected_conversation = None;
         self.ensure_conversation_selection();
@@ -303,8 +320,23 @@ impl Snapshot {
         }
     }
 
+    /// Discord stays hidden until the bot feature is compiled and Telegram has messages.
+    #[must_use]
+    pub(crate) fn discord_inbox_visible(&self) -> bool {
+        DiscordAdapter::bot_inbox_compiled()
+            && self.telegram_authorized
+            && self.telegram_messages_from_adapter > 0
+    }
+
+    #[must_use]
+    pub(crate) fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
+        !matches!(protocol, ProtocolId::Discord) || self.discord_inbox_visible()
+    }
+
     pub(crate) fn visible_conversations(&self) -> Vec<&Conversation> {
-        if !self.protocol_linked(self.selected_protocol) {
+        if !self.account_surface_visible(self.selected_protocol)
+            || !self.protocol_linked(self.selected_protocol)
+        {
             return Vec::new();
         }
         let query = self.search.trim().to_ascii_lowercase();
@@ -365,7 +397,7 @@ impl Snapshot {
             .accounts
             .iter()
             .map(|row| row.caps.id)
-            .filter(|id| self.filter.matches(*id))
+            .filter(|id| self.filter.matches(*id) && self.account_surface_visible(*id))
             .collect();
         for protocol in protocols {
             if protocol == ProtocolId::Telegram && self.telegram_authorized {
@@ -1230,6 +1262,43 @@ mod tests {
         assert!(!InboxFilter::Experimental.matches(ProtocolId::Telegram));
         assert!(InboxFilter::Telegram.matches(ProtocolId::Telegram));
         assert!(InboxFilter::All.matches(ProtocolId::Discord));
+    }
+
+    #[test]
+    fn discord_stays_invisible_until_telegram_messages_exist() {
+        let mut snapshot = Snapshot::new();
+        assert!(!snapshot.discord_inbox_visible());
+        assert!(!snapshot.account_surface_visible(ProtocolId::Discord));
+        assert!(snapshot.account_surface_visible(ProtocolId::WhatsApp));
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        assert!(snapshot.telegram_ready());
+        assert!(!snapshot.discord_inbox_visible());
+        snapshot.selected_conversation = Some("telegram:1".into());
+        snapshot.compose = "local only".into();
+        snapshot.send_compose();
+        assert!(!snapshot.discord_inbox_visible());
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                id: "telegram:1:1".into(),
+                sender: "worker".into(),
+                body: "hello from telegram".into(),
+                outbound: false,
+            },
+        });
+        assert_eq!(
+            snapshot.discord_inbox_visible(),
+            DiscordAdapter::bot_inbox_compiled()
+        );
+        snapshot.select_protocol(ProtocolId::Discord);
+        if DiscordAdapter::bot_inbox_compiled() {
+            assert_eq!(snapshot.selected_protocol, ProtocolId::Discord);
+        } else {
+            assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
+        }
     }
 
     #[test]

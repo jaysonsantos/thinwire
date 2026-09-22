@@ -153,6 +153,9 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 .collect();
             let mut clicked: Option<ProtocolId> = None;
             for (account, unread) in snapshot.accounts.iter().zip(unread_by_protocol) {
+                if !snapshot.account_surface_visible(account.caps.id) {
+                    continue;
+                }
                 if !snapshot.filter.shows_in_switcher(account.caps.id) {
                     continue;
                 }

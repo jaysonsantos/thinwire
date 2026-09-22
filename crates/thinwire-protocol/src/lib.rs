@@ -15,7 +15,10 @@ pub use adapter::{
     DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
     RedactedPairingSecret, SupportClass, TelegramAuthPhase, TelegramAuthStep,
 };
-pub use discord::DiscordAdapter;
+pub use discord::{
+    DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
+    DiscordSecretVault, MemoryDiscordVault,
+};
 pub use fake::FakeAdapter;
 pub use host::AdapterHost;
 pub use risk::{
@@ -53,12 +56,13 @@ pub fn catalog() -> [ProtocolCapabilities; 4] {
 
 pub(crate) fn registry(
     secrets: std::sync::Arc<dyn TelegramSecretVault>,
+    discord: std::sync::Arc<dyn DiscordSecretVault>,
     whatsapp_phone: std::sync::Arc<WhatsAppPhoneVault>,
 ) -> Vec<Box<dyn ProtocolAdapter>> {
     vec![
         Box::new(TelegramAdapter::new(secrets)),
         Box::new(WhatsAppAdapter::new(whatsapp_phone)),
-        Box::new(DiscordAdapter),
+        Box::new(DiscordAdapter::new(discord)),
         Box::new(SlackAdapter),
     ]
 }
