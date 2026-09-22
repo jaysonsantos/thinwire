@@ -10,14 +10,18 @@ description = "Protocol adapters and capability metadata for thinwire"
 
 [features]
 default = []
-# Live official TDLib client via `tdlib-rs`. Default CI stays feature-off so
-# jobs do not download or link system TDLib. Local builds: install is handled
-# by the crate's `download-tdlib` feature. Never put api_id / api_hash in CI.
+# Live official TDLib client via `tdlib-rs`. Default CI and pull_request
+# workflows stay feature-off so they do not download or link TDLib.
+# `download-tdlib` fetches the prebuilt archive; `static` links it into the
+# binary. Linux link needs libc++-dev and libc++abi-dev. Publisher
+# api_id / api_hash stay compile-time env (credentials.rs). Public CI must
+# not set them. Main-only os-zips injects repository secrets.
 telegram-tdlib = ["dep:tdlib-rs"]
 
 [dependencies]
 tdlib-rs = { version = "1.4", optional = true, default-features = false, features = [
   "download-tdlib",
+  "static",
 ] }
 getrandom = "0.2"
 tokio.workspace = true

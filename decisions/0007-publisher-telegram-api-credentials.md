@@ -3,13 +3,15 @@
 **Status:** accepted
 
 ## Context
-User asked whether thinwire needs a Telegram app and how to store credentials. Researcher: Terms 2.1 require an app-owned `api_id` (my.telegram.org); tdesktop-style clients inject at build time. Critic: do not force every end user through my.telegram.org; do not commit credentials to MIT tree/CI. User locked (2026-09-21). Critic residual: primary login must not open on paste-api fields.
+User asked whether thinwire needs a Telegram app and how to store credentials. Researcher: Terms 2.1 require an app-owned `api_id` (my.telegram.org); tdesktop-style clients inject at build time. Critic: do not force every end user through my.telegram.org; do not commit credentials to MIT tree/CI. User locked (2026-09-21). Critic residual: primary login must not open on paste-api fields. Council lock (2026-09-22): publisher secret values live in arcoiro under the thinwire path.
 
 ## Decision
 Publisher (Jayson / official thinwire releases) creates one Telegram app and owns `api_id` / `api_hash`.
 
 - Official binaries: inject that pair at release/build time from a private secret store (or the publisher’s machine keychain for local official builds).
-- Never commit `api_id` / `api_hash` to the MIT source tree or public CI (including fork PRs).
+- Secret values and the SOPS + Terraform home for publisher `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` live in arcoiro under the thinwire path (not watchkeep). No separate secrets repo.
+- Placeholders in arcoiro must be obviously invalid. Official os-zips inject fails closed when the GitHub secrets are empty or missing.
+- Never commit real `api_id` / `api_hash` values to the MIT thinwire tree or public CI / fork PRs.
 - Optional advanced override: power users may supply their own pair via OS keychain — **not** the primary login path.
 - Primary login UI: phone/code (or QR) only. Never open with “paste api_id / api_hash.”
 - Dev / unofficial builds without inject: show credentials missing — do **not** send every user to my.telegram.org.

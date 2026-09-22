@@ -58,7 +58,7 @@ Live TDLib (local install; `tdlib-rs` downloads a prebuilt `tdjson`; never commi
 TELEGRAM_API_ID= TELEGRAM_API_HASH= cargo build -p thinwire --features telegram-tdlib
 ```
 
-Public CI and fork PRs must not set those env vars. A keychain override in Advanced wins over the publisher pair when both exist.
+Official main OS zips read `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` from GitHub repository secrets. Local builds export the same names before cargo (empty placeholders above). Public CI never sets them. A keychain override in Advanced wins over the publisher pair when both exist. Linux live builds need `libc++-dev` and `libc++abi-dev` because the feature statically links the prebuilt TDLib.
 
 Telegram `api_id`, `api_hash`, and session material go to the OS secret store (`keyring`):
 
@@ -75,7 +75,7 @@ Theme preference is `System` (follow the OS, including live `ThemeChanged` updat
 
 There is no distroless GUI container. This is a desktop egui app.
 
-Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows. Retention is 7 days. These zips are not a release. They are not signed.
+Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows (`telegram-tdlib` on, publisher credentials injected). Retention is 7 days. These zips are not a release. They are not signed. Each zip includes the MIT `LICENSE` and `THIRD_PARTY_NOTICES/tdlib-LICENSE_1_0.txt` (TDLib's Boost Software License). Linux zips also include the copyright files for the shipped `libc++`, `libc++abi`, and `libunwind`, plus the Apache-2.0 text those files cite. The workflow fails closed when `TELEGRAM_API_ID` or `TELEGRAM_API_HASH` is missing. Secret values live in GitHub repository secrets and in arcoiro under the thinwire path (SOPS + Terraform, not watchkeep), not in this tree. Public CI (`ci.yml`) and pull requests do not set them.
 
 ## Design rules
 
@@ -87,4 +87,4 @@ Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows.
 - Never commit or log Telegram `api_id` / `api_hash` / session strings
 - Default appearance is System theme (ADR 0005)
 - Live Telegram TDLib is feature-gated (`0006-live-tdlib`). Default CI stays `telegram-tdlib` off.
-- Official Telegram `api_id` / `api_hash` are publisher inject (`0007-publisher-telegram-api-credentials`). No embed in source. Optional Advanced keychain override is not the primary login path.
+- Official Telegram `api_id` / `api_hash` are publisher inject (`0007-publisher-telegram-api-credentials`). Main OS zips read `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` from repository secrets; local builds export them before cargo; public CI never sets them. No embed in source. Optional Advanced keychain override is not the primary login path.
