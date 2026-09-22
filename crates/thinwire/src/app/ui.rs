@@ -3,6 +3,8 @@
 use eframe::egui::{self, Color32, RichText};
 use thinwire_protocol::{ProtocolId, SupportClass};
 
+use thinwire_protocol::WhatsAppPhoneVault;
+
 use super::auth;
 use super::secrets::SecretStore;
 use super::settings::{Settings, ThemeMode};
@@ -18,8 +20,16 @@ pub(crate) fn draw(
     snapshot: &mut Snapshot,
     settings: &mut Settings,
     secrets: &SecretStore,
+    whatsapp_phone: &WhatsAppPhoneVault,
 ) {
     settings.apply(ui.ctx());
+    #[cfg(feature = "whatsapp-web")]
+    if snapshot.whatsapp_gate_open() {
+        super::whatsapp_gate::draw(ui, snapshot, whatsapp_phone);
+        return;
+    }
+    #[cfg(not(feature = "whatsapp-web"))]
+    let _ = whatsapp_phone;
     top_bar(ui, snapshot, settings, secrets);
     status_strip(ui, snapshot, secrets);
     left_panel(ui, snapshot);
@@ -160,6 +170,9 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 snapshot.select_protocol(protocol);
             }
 
+            #[cfg(feature = "whatsapp-web")]
+            super::whatsapp_gate::risk_entry(ui, snapshot);
+
             ui.add_space(8.0);
             ui.heading("Inbox");
             ui.separator();
@@ -183,7 +196,13 @@ fn account_chip(ui: &mut egui::Ui, account: &AccountRow, selected: bool, unread:
             .small()
             .color(MUTED),
     );
-    if !matches!(caps.id, ProtocolId::Telegram) {
+    if caps.id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web") {
+        ui.label(
+            RichText::new("experimental spike — ban risk")
+                .small()
+                .color(MUTED),
+        );
+    } else if !matches!(caps.id, ProtocolId::Telegram) {
         ui.label(
             RichText::new("not ready — no login UI this beat")
                 .small()

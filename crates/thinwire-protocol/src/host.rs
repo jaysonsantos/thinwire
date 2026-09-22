@@ -5,7 +5,10 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use super::{AdapterCommand, AdapterEvent, ProtocolAdapter, TelegramSecretVault, registry};
+use super::{
+    AdapterCommand, AdapterEvent, ProtocolAdapter, TelegramSecretVault, WhatsAppPhoneVault,
+    registry,
+};
 
 /// Bridge between the UI thread and protocol workers.
 pub struct AdapterHost {
@@ -16,12 +19,16 @@ pub struct AdapterHost {
 impl AdapterHost {
     /// Spawn the worker that owns every adapter. Safe to call off the UI thread.
     #[must_use]
-    pub fn spawn(handle: &Handle, secrets: Arc<dyn TelegramSecretVault>) -> Self {
+    pub fn spawn(
+        handle: &Handle,
+        secrets: Arc<dyn TelegramSecretVault>,
+        whatsapp_phone: Arc<WhatsAppPhoneVault>,
+    ) -> Self {
         let (event_tx, event_rx) = unbounded_channel();
         let (command_tx, mut command_rx) = unbounded_channel();
 
         handle.spawn(async move {
-            let mut adapters = registry(secrets);
+            let mut adapters = registry(secrets, whatsapp_phone);
             for adapter in &mut adapters {
                 adapter.start(event_tx.clone());
             }

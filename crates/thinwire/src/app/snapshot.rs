@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+#[cfg(feature = "whatsapp-web")]
+use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
     AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, ProtocolCapabilities,
     ProtocolId, TelegramApiSource, TelegramAuthPhase, TelegramAuthStep, TelegramSecretVault,
@@ -59,6 +61,15 @@ pub(crate) enum AuthScreen {
     Telegram2fa,
 }
 
+/// Experimental WhatsApp screens. Only the `whatsapp-web` build can enter them.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WhatsAppScreen {
+    Hidden,
+    RiskGate,
+    Pair,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UserError {
     pub happened: String,
@@ -97,6 +108,16 @@ pub(crate) struct Snapshot {
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) whatsapp_screen: WhatsAppScreen,
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) whatsapp_phone: String,
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) whatsapp_qr: Option<String>,
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) whatsapp_pair_code: Option<String>,
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) whatsapp_started: bool,
 }
 
 impl Snapshot {
@@ -132,6 +153,16 @@ impl Snapshot {
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
+            #[cfg(feature = "whatsapp-web")]
+            whatsapp_screen: WhatsAppScreen::Hidden,
+            #[cfg(feature = "whatsapp-web")]
+            whatsapp_phone: String::new(),
+            #[cfg(feature = "whatsapp-web")]
+            whatsapp_qr: None,
+            #[cfg(feature = "whatsapp-web")]
+            whatsapp_pair_code: None,
+            #[cfg(feature = "whatsapp-web")]
+            whatsapp_started: false,
         }
     }
 
@@ -203,6 +234,26 @@ impl Snapshot {
             AdapterEvent::TelegramAuth { phase } => self.apply_telegram_phase(phase),
             AdapterEvent::FlushSecrets => {
                 self.keychain_flush = true;
+            }
+            AdapterEvent::WhatsAppQr { code } => {
+                #[cfg(feature = "whatsapp-web")]
+                {
+                    self.whatsapp_qr = Some(code.reveal().to_string());
+                }
+                #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    let _ = code;
+                }
+            }
+            AdapterEvent::WhatsAppPairCode { code } => {
+                #[cfg(feature = "whatsapp-web")]
+                {
+                    self.whatsapp_pair_code = Some(code.reveal().to_string());
+                }
+                #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    let _ = code;
+                }
             }
         }
     }
@@ -698,6 +749,65 @@ impl Snapshot {
             message.body = body;
         }
     }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[must_use]
+    pub(crate) fn whatsapp_gate_open(&self) -> bool {
+        !matches!(self.whatsapp_screen, WhatsAppScreen::Hidden)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn open_whatsapp_risk_gate(&mut self) {
+        self.whatsapp_screen = WhatsAppScreen::RiskGate;
+        self.whatsapp_qr = None;
+        self.whatsapp_pair_code = None;
+        self.whatsapp_started = false;
+        self.whatsapp_phone.clear();
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn close_whatsapp_gate(&mut self) {
+        self.whatsapp_screen = WhatsAppScreen::Hidden;
+        self.whatsapp_phone.clear();
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn acknowledge_whatsapp_risk(&mut self) {
+        self.whatsapp_screen = WhatsAppScreen::Pair;
+        self.error = None;
+        self.status_text =
+            "WhatsApp ban gate accepted. Pairing has not started. This is not a supported messenger."
+                .into();
+        self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn begin_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
+        if self.whatsapp_started {
+            return;
+        }
+        phone.set_phone(&self.whatsapp_phone);
+        self.whatsapp_phone.clear();
+        self.whatsapp_started = true;
+        self.error = None;
+        self.status_text =
+            "Experimental WhatsApp pairing was requested on the worker. The command carries no phone number."
+                .into();
+        self.pending.push(AdapterCommand::WhatsAppBeginLink);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn cancel_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
+        phone.clear();
+        self.whatsapp_phone.clear();
+        self.whatsapp_qr = None;
+        self.whatsapp_pair_code = None;
+        self.whatsapp_started = false;
+        self.whatsapp_screen = WhatsAppScreen::Hidden;
+        self.status_text =
+            "WhatsApp pairing cancelled before a supported session could exist.".into();
+        self.pending.push(AdapterCommand::WhatsAppCancelLink);
+    }
 }
 
 fn sort_conversations(list: &mut [Conversation]) {
@@ -1136,6 +1246,94 @@ mod tests {
         assert_eq!(snapshot.visible_conversations().len(), 1);
         snapshot.search = "saved".into();
         assert_eq!(snapshot.visible_conversations().len(), 1);
+    }
+
+    #[test]
+    fn whatsapp_qr_event_does_not_mark_the_account_ready() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("qr-do-not-log"),
+        });
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::WhatsApp)
+            .expect("whatsapp");
+        assert_ne!(row.status, AdapterStatus::Ready);
+        assert!(!row.linked);
+        assert!(!snapshot.status_text.contains("qr-do-not-log"));
+        assert!(snapshot.take_commands().is_empty());
+        snapshot.select_protocol(ProtocolId::WhatsApp);
+        assert!(
+            !snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::WhatsAppBeginLink))
+        );
+    }
+
+    #[test]
+    fn whatsapp_spike_ui_is_feature_gated() {
+        let app = include_str!("mod.rs");
+        assert!(app.contains("#[cfg(feature = \"whatsapp-web\")]\nmod whatsapp_gate;"));
+        let ui = include_str!("ui.rs");
+        assert!(ui.contains("not ready"));
+        assert!(ui.contains("whatsapp_gate::risk_entry"));
+        let gate = include_str!("whatsapp_gate.rs");
+        assert!(gate.contains("CRITIC_RISK_BULLETS"));
+        assert!(gate.contains("Review WhatsApp ban risk"));
+        assert!(gate.contains("No QR code and no pair code are shown on this screen."));
+        assert!(
+            !gate
+                .split(|ch: char| !ch.is_ascii_alphabetic())
+                .any(|word| word.eq_ignore_ascii_case("reliable"))
+        );
+        let ci = include_str!("../../../../.github/workflows/ci.yml");
+        assert!(!ci.contains("whatsapp-web"));
+        let os_zips = include_str!("../../../../.github/workflows/os-zips.yml");
+        assert!(!os_zips.contains("whatsapp-web"));
+        let test_sh = include_str!("../../../../scripts/test.sh");
+        assert!(!test_sh.contains("whatsapp-web"));
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn whatsapp_pair_ui_keeps_phone_off_the_command() {
+        let phone = thinwire_protocol::WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        assert!(!snapshot.whatsapp_gate_open());
+        snapshot.select_protocol(ProtocolId::WhatsApp);
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        snapshot.open_whatsapp_risk_gate();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::RiskGate);
+        assert!(snapshot.whatsapp_qr.is_none());
+        snapshot.acknowledge_whatsapp_risk();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        snapshot.whatsapp_phone = "+15559876".into();
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(snapshot.whatsapp_phone.is_empty());
+        assert_eq!(phone.phone().as_deref(), Some("+15559876"));
+        let commands = snapshot.take_commands();
+        let debug = format!("{commands:?}");
+        assert!(!debug.contains("15559876"));
+        assert!(commands.contains(&AdapterCommand::WhatsAppAcknowledgeRisk));
+        assert!(commands.contains(&AdapterCommand::WhatsAppBeginLink));
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("second-secret"),
+        });
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("second-secret"));
+        assert!(!snapshot.status_text.contains("second-secret"));
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::WhatsApp)
+            .expect("whatsapp");
+        assert!(!row.linked);
+        assert_ne!(row.status, AdapterStatus::Ready);
+        snapshot.cancel_whatsapp_link(&phone);
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        assert!(phone.phone().is_none());
+        assert!(snapshot.whatsapp_qr.is_none());
     }
 
     #[test]

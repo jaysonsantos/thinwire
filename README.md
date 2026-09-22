@@ -12,13 +12,15 @@ v1 protocols are Telegram, WhatsApp (experimental), Discord (bot/OAuth inbox onl
 
 First-run and Add account offer Telegram (TDLib) only. Official binaries inject `api_id` / `api_hash` at compile time, so end users sign in with phone → code → optional 2FA. The primary login UI never opens on paste-api fields. Dev builds without inject show credentials missing (rebuild with `TELEGRAM_API_ID`, or Advanced keychain override) and do not send every user to my.telegram.org. Slack, WhatsApp, and Discord protocol stubs remain; their auth UI is not in this beat. Discord user-account / self-bot fields do not exist. Default CI builds keep `telegram-tdlib` off so they do not link or download TDLib; the unauthorized banner drops only after TDLib Ready. After Ready, the inbox loads the main chat list, opens a chat for recent messages, and sends text on the worker thread. Enable `--features telegram-tdlib` locally after a TDLib install for the live `tdlib-rs` client. Default CI also keeps `slack-oauth` off, so it does not compile `slack-morphism`. That feature is a workspace-app OAuth v2 and Socket Mode scaffold (`0008-slack-oauth-workspace-spike`). It adds no Slack auth screen. Publisher `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_APP_TOKEN` stay out of git and public CI. Appearance defaults to the OS light/dark theme (System).
 
+The WhatsApp linked-device spike is cargo feature `whatsapp-web` (pinned `whatsapp-rust` from oxidezap, same style of git revision ZapFast uses). It is experimental and not the default UI. Default builds and public CI leave the feature off, so there is no WhatsApp pairing screen and the WhatsApp account is not marked ready. With the feature on, a full-screen ban acknowledgement comes before any QR or phone-pair UI. The device store stays in the platform app-data directory, not in git. This spike is not a supported messenger.
+
 ## Protocol support (honest)
 
 | Protocol | Path | Support language |
 | --- | --- | --- |
 | Telegram | Official TDLib via Rust bindings (`tdlib-rs`) | Supported goal |
 | Slack | Official Slack OAuth v2 / Socket Mode (workspace app, `slack-morphism`, feature `slack-oauth`) | Supported goal |
-| WhatsApp | Unofficial Web / linked-device style (ZapFast / whatsapp-rust inspired) | **Experimental** |
+| WhatsApp | Unofficial Web / linked-device (`whatsapp-rust`, feature `whatsapp-web`, off by default) | **Experimental** |
 | Discord | Bot/OAuth inbox only — no Discord user self-bots / personal DMs | Constrained / experimental |
 
 ## Risk notice (required)
@@ -49,7 +51,7 @@ nix develop --command scripts/lint.sh
 nix develop --command scripts/test.sh
 ```
 
-CI feature matrix: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` run **without** `telegram-tdlib` and **without** `slack-oauth`. That is the merge-critical default.
+CI feature matrix: `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings` run **without** `telegram-tdlib`, **without** `slack-oauth`, and **without** `whatsapp-web`. That is the merge-critical default.
 
 Live TDLib (local install; `tdlib-rs` downloads a prebuilt `tdjson`; never commit `api_id` / `api_hash` / session strings):
 
@@ -64,6 +66,12 @@ Slack workspace-app spike (types only; this command does not call Slack). Regist
 
 ```bash
 SLACK_CLIENT_ID= SLACK_CLIENT_SECRET= SLACK_APP_TOKEN= cargo check -p thinwire --features slack-oauth
+```
+
+Local check of the experimental WhatsApp spike (not the default UI; public CI does not pass this feature):
+
+```bash
+cargo check -p thinwire --features whatsapp-web
 ```
 
 Telegram `api_id`, `api_hash`, and session material go to the OS secret store (`keyring`):
@@ -93,5 +101,6 @@ Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows 
 - Never commit or log Telegram `api_id` / `api_hash` / session strings
 - Default appearance is System theme (ADR 0005)
 - Live Telegram TDLib is feature-gated (`0006-live-tdlib`). Default CI stays `telegram-tdlib` off.
+- WhatsApp linked-device spike is feature `whatsapp-web` (pinned `whatsapp-rust`). Experimental and not the default UI. Default CI stays feature-off. Full-screen ToS/ban gate before QR or pair. Device store stays in app-data.
 - Official Telegram `api_id` / `api_hash` are publisher inject (`0007-publisher-telegram-api-credentials`). Main OS zips read `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` from repository secrets; local builds export them before cargo; public CI never sets them. No embed in source. Optional Advanced keychain override is not the primary login path.
 - Slack official OAuth is a feature-gated workspace-app spike (`slack-oauth`, `slack-morphism`, `0008-slack-oauth-workspace-spike`). Default CI stays off. No Slack auth UI in the default shell. Publisher `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_APP_TOKEN` and the workspace bot token stay in the OS keychain or compile-time inject, never in git or public CI.

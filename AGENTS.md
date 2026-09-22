@@ -16,7 +16,7 @@
 
 - Rust 2024 workspace, egui/eframe, tokio for async adapters
 - Telegram: TDLib / tdlib-rs preferred
-- WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk
+- WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk. Experimental spike is feature `whatsapp-web` (`whatsapp-rust`, git rev pinned). Not the default UI. Default CI stays feature-off. Full-screen ToS/ban gate before any QR or pair UI. Session file stays in app-data. Never call it reliable.
 - Discord: bot/OAuth inbox only — no self-bots / personal DMs
 - Slack: official OAuth only — workspace app, not a personal desktop clone
 - Signal: out of v1 (S2); no libsignal / Presage

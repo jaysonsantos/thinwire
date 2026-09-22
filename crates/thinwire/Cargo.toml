@@ -13,6 +13,8 @@ readme = "../../README.md"
 default = []
 telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
 slack-oauth = ["thinwire-protocol/slack-oauth"]
+# Experimental spike. Default CI and the default UI stay feature-off.
+whatsapp-web = ["thinwire-protocol/whatsapp-web"]
 
 [dependencies]
 dirs.workspace = true
