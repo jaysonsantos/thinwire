@@ -155,6 +155,10 @@ pub fn authorize_url(client_id: &str, state: &str) -> String {
 /// `raw_query` is the query string with or without a leading `?`. On success
 /// the code is returned to the caller, which should put it in
 /// [`SlackSecretKey::OAuthCode`] and exchange it off the UI thread.
+///
+/// `state` is checked before a decline is accepted. An `error` parameter
+/// whose `state` is missing or different from `expected_state` is not a
+/// decline of this install.
 pub fn parse_loopback_callback(
     raw_query: &str,
     expected_state: &str,
@@ -174,11 +178,17 @@ pub fn parse_loopback_callback(
         let name = decode_component(name)?;
         let value = decode_component(value)?;
         match name.as_str() {
-            "error" => declined = true,
+            "error" if !value.is_empty() => declined = true,
             "code" => code = Some(value),
             "state" => state = Some(value),
             _ => {}
         }
+    }
+    let Some(state) = state.filter(|value| !value.is_empty()) else {
+        return Err(SlackCallbackError::MissingState);
+    };
+    if state != expected_state {
+        return Err(SlackCallbackError::StateMismatch);
     }
     if declined {
         return Err(SlackCallbackError::Declined);
@@ -186,12 +196,6 @@ pub fn parse_loopback_callback(
     let Some(code) = code.filter(|value| !value.is_empty()) else {
         return Err(SlackCallbackError::MissingCode);
     };
-    let Some(state) = state.filter(|value| !value.is_empty()) else {
-        return Err(SlackCallbackError::MissingState);
-    };
-    if state != expected_state {
-        return Err(SlackCallbackError::StateMismatch);
-    }
     Ok(code)
 }
 
@@ -296,6 +300,23 @@ mod tests {
                 .expect_err("declined");
         assert_eq!(declined, SlackCallbackError::Declined);
         assert!(!declined.to_string().contains("access_denied"));
+    }
+
+    #[test]
+    fn forged_decline_without_matching_state_is_not_accepted() {
+        let missing = parse_loopback_callback("?error=access_denied", "state-test")
+            .expect_err("unbound decline");
+        assert_eq!(missing, SlackCallbackError::MissingState);
+        assert_ne!(missing, SlackCallbackError::Declined);
+
+        let forged = parse_loopback_callback("error=access_denied&state=other-state", "state-test")
+            .expect_err("forged decline");
+        assert_eq!(forged, SlackCallbackError::StateMismatch);
+        assert_ne!(forged, SlackCallbackError::Declined);
+        let shown = forged.to_string();
+        assert!(!shown.contains("access_denied"));
+        assert!(!shown.contains("other-state"));
+        assert!(!shown.contains("state-test"));
     }
 
     #[test]
