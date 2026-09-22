@@ -218,12 +218,17 @@ impl Snapshot {
                     }
                 }
                 // Crate / feature jargon stays on the account row and in logs.
-                // Chrome only surfaces Telegram errors the user can act on.
+                // Chrome surfaces Telegram errors and Ready operational copy only.
                 if protocol == ProtocolId::Telegram
-                    && matches!(status, AdapterStatus::Error | AdapterStatus::Refused)
+                    && matches!(
+                        status,
+                        AdapterStatus::Error | AdapterStatus::Refused | AdapterStatus::Ready
+                    )
                 {
                     self.status_text = detail;
-                    if self.auth != AuthScreen::Idle {
+                    if matches!(status, AdapterStatus::Error | AdapterStatus::Refused)
+                        && self.auth != AuthScreen::Idle
+                    {
                         self.auth_busy = false;
                     }
                 }
@@ -409,12 +414,6 @@ impl Snapshot {
         self.accounts
             .iter()
             .any(|row| row.caps.id == protocol && row.linked)
-    }
-
-    pub(crate) fn selected_account(&self) -> Option<&AccountRow> {
-        self.accounts
-            .iter()
-            .find(|row| row.caps.id == self.selected_protocol)
     }
 
     pub(crate) fn selected_conversation_row(&self) -> Option<&Conversation> {
@@ -987,6 +986,9 @@ mod tests {
         assert!(!ui.contains("Experimental chips stay visible"));
         assert!(!ui.contains("tokio worker"));
         assert!(!ui.contains("Supported goals:"));
+        assert!(!ui.contains("Telegram is live"));
+        assert!(!ui.contains("caps.detail"));
+        assert!(!ui.contains("account.caps.short_label"));
         assert!(!ui.contains("\"Experimental\""));
         assert!(!ui.contains("my.telegram.org"));
         assert!(src.contains(super::super::auth::TDLIB_UNAVAILABLE_BANNER));
@@ -1359,6 +1361,12 @@ mod tests {
         });
         assert_eq!(snapshot.status_text, before);
         assert!(!snapshot.status_text.contains("tdlib-rs"));
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Recent messages loaded.".into(),
+        });
+        assert_eq!(snapshot.status_text, "Recent messages loaded.");
         snapshot.apply(AdapterEvent::Status {
             protocol: ProtocolId::Telegram,
             status: AdapterStatus::Error,

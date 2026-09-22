@@ -277,9 +277,6 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     match snapshot.selected_conversation_row() {
         Some(conversation) => {
             ui.heading(&conversation.title);
-            if let Some(account) = snapshot.selected_account() {
-                ui.label(RichText::new(account.caps.short_label).small().color(MUTED));
-            }
         }
         None => {
             ui.heading("Thread");
