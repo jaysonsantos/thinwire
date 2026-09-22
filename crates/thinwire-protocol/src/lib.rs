@@ -29,8 +29,8 @@ pub use secrets::{
 };
 pub use slack::SlackAdapter;
 pub use telegram::{
-    TelegramAdapter, TelegramApiOrigin, TelegramApiSource, resolve_telegram_api,
-    telegram_api_available,
+    TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,
+    resolve_telegram_api, telegram_api_available,
 };
 pub use whatsapp::WhatsAppAdapter;
 

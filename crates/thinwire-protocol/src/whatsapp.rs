@@ -43,6 +43,7 @@ impl WhatsAppAdapter {
                 participant: "Placeholder contact".into(),
                 preview: "Experimental unofficial path — not connected.".into(),
                 unread: 1,
+                order: 0,
             },
         );
         emit_message(

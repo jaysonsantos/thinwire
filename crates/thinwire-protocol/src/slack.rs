@@ -41,6 +41,7 @@ impl SlackAdapter {
                 participant: "workspace".into(),
                 preview: "OAuth workspace stub — not connected.".into(),
                 unread: 1,
+                order: 0,
             },
         );
         emit_message(

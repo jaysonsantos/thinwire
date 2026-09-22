@@ -167,13 +167,32 @@ pub enum AdapterCommand {
     TelegramAuth {
         step: TelegramAuthStep,
     },
+    /// Load another page of the main chat list. No secrets.
+    LoadChats {
+        protocol: ProtocolId,
+    },
+    /// Open a chat and load recent messages. `conversation_id` is not a secret.
+    OpenChat {
+        protocol: ProtocolId,
+        conversation_id: String,
+    },
+    /// Send plain text. The body is the user's message, never a credential.
+    SendText {
+        protocol: ProtocolId,
+        conversation_id: String,
+        body: String,
+    },
 }
 
 impl AdapterCommand {
     #[must_use]
     pub const fn protocol(&self) -> ProtocolId {
         match *self {
-            Self::Connect { protocol } | Self::Disconnect { protocol } => protocol,
+            Self::Connect { protocol }
+            | Self::Disconnect { protocol }
+            | Self::LoadChats { protocol }
+            | Self::OpenChat { protocol, .. }
+            | Self::SendText { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
         }
@@ -201,6 +220,31 @@ pub enum AdapterEvent {
     /// Ask the UI to flush persistent vault keys to the OS keychain.
     /// Never carries secret values.
     FlushSecrets,
+    /// Drop a chat that left the main list (`order == 0`).
+    ConversationRemoved {
+        protocol: ProtocolId,
+        id: String,
+    },
+    /// A pending outgoing id was replaced by the sent message id.
+    MessageReplaced {
+        protocol: ProtocolId,
+        conversation_id: String,
+        old_id: String,
+        message: ChatMessage,
+    },
+    /// Edit the body of a message already in the thread. Does not change sender.
+    MessageBody {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        body: String,
+    },
+    /// Drop messages TDLib deleted. They stay gone for this session.
+    MessagesRemoved {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_ids: Vec<String>,
+    },
 }
 
 /// Conversation row shown in the inbox.
@@ -212,6 +256,8 @@ pub struct Conversation {
     pub participant: String,
     pub preview: String,
     pub unread: u32,
+    /// TDLib main-list order. Higher sorts first. Zero means unordered.
+    pub order: i64,
 }
 
 /// Message shown in the right pane.
@@ -284,6 +330,62 @@ pub(crate) fn emit_message(events: &EventTx, message: ChatMessage) {
 
 pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
     let _ = events.send(AdapterEvent::TelegramAuth { phase });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_conversation_removed(
+    events: &EventTx,
+    protocol: ProtocolId,
+    id: impl Into<String>,
+) {
+    let _ = events.send(AdapterEvent::ConversationRemoved {
+        protocol,
+        id: id.into(),
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_message_replaced(
+    events: &EventTx,
+    old_id: impl Into<String>,
+    message: ChatMessage,
+) {
+    let _ = events.send(AdapterEvent::MessageReplaced {
+        protocol: message.protocol,
+        conversation_id: message.conversation_id.clone(),
+        old_id: old_id.into(),
+        message,
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_messages_removed(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    message_ids: Vec<String>,
+) {
+    let _ = events.send(AdapterEvent::MessagesRemoved {
+        protocol,
+        conversation_id: conversation_id.into(),
+        message_ids,
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_message_body(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    message_id: impl Into<String>,
+    body: impl Into<String>,
+) {
+    let _ = events.send(AdapterEvent::MessageBody {
+        protocol,
+        conversation_id: conversation_id.into(),
+        message_id: message_id.into(),
+        body: body.into(),
+    });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]

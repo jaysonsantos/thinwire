@@ -8,6 +8,7 @@
 mod credentials;
 mod db_key;
 mod engine;
+mod inbox;
 
 #[cfg(feature = "telegram-tdlib")]
 mod tdlib;
@@ -22,6 +23,7 @@ use engine::TelegramAuthEngine;
 pub use credentials::{
     TelegramApiOrigin, TelegramApiSource, resolve_telegram_api, telegram_api_available,
 };
+pub use inbox::parse_telegram_chat_id;
 
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, EventTx, ProtocolAdapter, ProtocolCapabilities,
@@ -125,7 +127,7 @@ impl TelegramAdapter {
                 events,
             );
             let _ = phase;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(feature = "telegram-tdlib"))]
         {
@@ -212,6 +214,46 @@ impl ProtocolAdapter for TelegramAdapter {
                 );
                 Ok(())
             }
+            AdapterCommand::LoadChats {
+                protocol: ProtocolId::Telegram,
+            } => self.dispatch_live(events, LiveCall::LoadChats),
+            AdapterCommand::OpenChat {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+            } => {
+                if parse_telegram_chat_id(&conversation_id).is_none() {
+                    return Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason: "chat id is not a Telegram chat",
+                    });
+                }
+                self.dispatch_live(events, LiveCall::OpenChat(conversation_id))
+            }
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                body,
+            } => {
+                if body.trim().is_empty() {
+                    return Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason: "message text is empty",
+                    });
+                }
+                if parse_telegram_chat_id(&conversation_id).is_none() {
+                    return Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason: "chat id is not a Telegram chat",
+                    });
+                }
+                self.dispatch_live(
+                    events,
+                    LiveCall::SendText {
+                        conversation_id,
+                        body,
+                    },
+                )
+            }
             other => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Telegram,
                 reason: command_mismatch(other),
@@ -225,10 +267,11 @@ pub const fn uses_tdlib_hook() -> bool {
     cfg!(feature = "telegram-tdlib")
 }
 
-const fn command_mismatch(_command: AdapterCommand) -> &'static str {
+fn command_mismatch(_command: AdapterCommand) -> &'static str {
     "command is not handled by the Telegram adapter"
 }
 
+#[cfg(not(feature = "telegram-tdlib"))]
 const fn phase_status(phase: TelegramAuthPhase) -> AdapterStatus {
     match phase {
         TelegramAuthPhase::Ready => AdapterStatus::Ready,
@@ -240,11 +283,55 @@ const fn phase_status(phase: TelegramAuthPhase) -> AdapterStatus {
     }
 }
 
+#[cfg(not(feature = "telegram-tdlib"))]
 fn phase_detail(phase: TelegramAuthPhase, backend: &str) -> String {
     format!(
         "Telegram {phase} queued. Credentials stay in the secret store. {backend}",
         phase = phase.as_str()
     )
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+enum LiveCall {
+    LoadChats,
+    OpenChat(String),
+    SendText {
+        conversation_id: String,
+        body: String,
+    },
+}
+
+impl TelegramAdapter {
+    fn dispatch_live(&mut self, events: &EventTx, call: LiveCall) -> Result<(), AdapterError> {
+        #[cfg(feature = "telegram-tdlib")]
+        {
+            let secrets = Arc::clone(&self.secrets);
+            let source = self.api_source.clone();
+            match call {
+                LiveCall::LoadChats => self.tdlib.load_chats(secrets, source, events),
+                LiveCall::OpenChat(conversation_id) => {
+                    self.tdlib
+                        .open_chat(conversation_id, secrets, source, events);
+                }
+                LiveCall::SendText {
+                    conversation_id,
+                    body,
+                } => {
+                    self.tdlib
+                        .send_text(conversation_id, body, secrets, source, events);
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "telegram-tdlib"))]
+        {
+            let _ = (events, call);
+            Err(AdapterError::Unavailable {
+                protocol: ProtocolId::Telegram,
+                reason: "TDLib unavailable in this build",
+            })
+        }
+    }
 }
 
 /// Persist vault keys via the UI keychain-flush path. Never puts values on the event.
@@ -398,6 +485,49 @@ mod tests {
     }
 
     #[test]
+    fn live_tdlib_loads_chats_and_messages_after_ready() {
+        let src = include_str!("tdlib.rs");
+        let ready = src.find("AuthorizationState::Ready").expect("ready arm");
+        let after_ready = &src[ready..];
+        assert!(after_ready.contains("load_main_chats"));
+        assert!(src.contains("functions::load_chats"));
+        assert!(src.contains("functions::get_chat_history"));
+        assert!(src.contains("functions::send_message"));
+        assert!(src.contains("live.authorized = true"));
+        assert!(!src.contains("telegram:ready"));
+        assert!(!src.contains("while let Some"));
+        assert!(!src.contains(".phone_number"));
+        assert!(src.contains("thinwire-tdlib-recv"));
+        let send = fn_body(src, "async fn send_text");
+        assert!(
+            !send.contains("Message sent."),
+            "send_message must not announce success before TDLib confirms it"
+        );
+        let updates = fn_body(src, "fn apply_chat_update");
+        assert!(updates.contains("Update::MessageSendSucceeded"));
+        assert!(updates.contains("Message sent."));
+        assert!(updates.contains("Update::MessageSendFailed"));
+        assert!(updates.contains("Update::DeleteMessages"));
+        assert!(updates.contains("update.from_cache"));
+        assert!(updates.contains("emit_messages_removed"));
+        assert!(updates.contains("set_preview(update.chat_id, \"\")"));
+        let open = fn_body(src, "async fn open_chat");
+        assert!(open.contains("functions::view_messages"));
+        assert!(open.contains("true,"));
+    }
+
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src.find(name).unwrap_or_else(|| panic!("{name} missing"));
+        let rest = &src[start..];
+        let end = rest[name.len()..]
+            .find("\nfn ")
+            .or_else(|| rest[name.len()..].find("\nasync fn "))
+            .map(|offset| offset + name.len())
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
     fn tdlib_generate_db_key_does_not_use_weak_entropy() {
         let src = include_str!("tdlib.rs");
         let start = src
@@ -530,6 +660,79 @@ mod tests {
             assert!(!debug.contains("hash-value"));
         }
         assert!(!saw_ready);
+    }
+
+    #[test]
+    fn inbox_commands_stay_off_the_ui_and_do_not_carry_secrets() {
+        let vault = Arc::new(MemorySecretVault::new());
+        vault.set_secret(TelegramSecretKey::ApiId, "11111");
+        vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+        let mut adapter = TelegramAdapter::new(Arc::clone(&vault) as Arc<dyn TelegramSecretVault>);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let open = adapter.handle(
+            AdapterCommand::OpenChat {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:saved".into(),
+            },
+            &tx,
+        );
+        assert!(
+            open.expect_err("placeholder")
+                .to_string()
+                .contains("not a Telegram chat")
+        );
+        let empty = adapter.handle(
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:42".into(),
+                body: "   ".into(),
+            },
+            &tx,
+        );
+        assert!(empty.expect_err("blank").to_string().contains("empty"));
+        let send = adapter.handle(
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:42".into(),
+                body: "hello".into(),
+            },
+            &tx,
+        );
+        let load = adapter.handle(
+            AdapterCommand::LoadChats {
+                protocol: ProtocolId::Telegram,
+            },
+            &tx,
+        );
+        if uses_tdlib_hook() {
+            send.expect("live send queues on the worker");
+            load.expect("live load queues on the worker");
+        } else {
+            assert!(
+                send.expect_err("feature off")
+                    .to_string()
+                    .contains("TDLib unavailable")
+            );
+            assert!(
+                load.expect_err("feature off")
+                    .to_string()
+                    .contains("TDLib unavailable")
+            );
+        }
+        while let Ok(event) = rx.try_recv() {
+            let debug = format!("{event:?}");
+            assert!(!debug.contains("11111"), "{debug}");
+            assert!(!debug.contains("hash-value"), "{debug}");
+        }
+        let command = AdapterCommand::SendText {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:42".into(),
+            body: "hello".into(),
+        };
+        let debug = format!("{command:?}");
+        assert!(debug.contains("hello"));
+        assert!(!debug.contains("11111"));
+        assert!(!debug.contains("hash-value"));
     }
 
     #[test]

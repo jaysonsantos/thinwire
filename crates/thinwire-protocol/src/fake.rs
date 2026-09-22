@@ -66,6 +66,7 @@ impl ProtocolAdapter for FakeAdapter {
                         participant: "worker".into(),
                         preview: "Pushed from the worker.".into(),
                         unread: 0,
+                        order: 0,
                     },
                 );
                 emit_message(

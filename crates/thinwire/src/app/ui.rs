@@ -102,10 +102,16 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
             ui.label(format!("Why: {why}"));
             ui.label(format!("What to do: {next}"));
         }
-        ui.colored_label(
-            MUTED,
-            "Offline — no live protocol session. Linking and refresh stay on the tokio worker.",
-        );
+        if snapshot.telegram_ready() {
+            ui.label(
+                "Telegram is live. Chat list and messages update from the worker. The UI thread stays free.",
+            );
+        } else {
+            ui.colored_label(
+                MUTED,
+                "Offline — no live protocol session. Linking and refresh stay on the tokio worker.",
+            );
+        }
         ui.label(
             RichText::new(
                 "Supported goals: Telegram via TDLib and Slack via OAuth. Experimental modules are not marketed here.",
@@ -302,9 +308,11 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         .show(ui, |ui| {
             if messages.is_empty() {
                 ui.label(
-                    RichText::new("No messages yet. Adapters push placeholders over the channel.")
-                        .italics()
-                        .color(MUTED),
+                    RichText::new(
+                        "No messages yet. Select a Telegram chat to load recent messages.",
+                    )
+                    .italics()
+                    .color(MUTED),
                 );
             }
             for (outbound, sender, body) in messages {
@@ -325,7 +333,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 .hint_text("Message"),
         );
         if ui.button("Send").clicked() {
-            snapshot.send_compose_stub();
+            snapshot.send_compose();
         }
     });
 }
