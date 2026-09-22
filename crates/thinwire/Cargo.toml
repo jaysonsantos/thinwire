@@ -12,6 +12,7 @@ readme = "../../README.md"
 [features]
 default = []
 telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
+slack-oauth = ["thinwire-protocol/slack-oauth"]
 
 [dependencies]
 dirs.workspace = true

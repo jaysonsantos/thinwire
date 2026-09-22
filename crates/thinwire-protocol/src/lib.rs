@@ -27,7 +27,14 @@ pub use secrets::{
     TELEGRAM_SECRET_DB_KEY, TELEGRAM_SECRET_PASSWORD, TELEGRAM_SECRET_PHONE,
     TELEGRAM_SECRET_SERVICE, TELEGRAM_SECRET_SESSION, TelegramSecretKey, TelegramSecretVault,
 };
-pub use slack::SlackAdapter;
+pub use slack::{
+    MemorySlackVault, SLACK_OAUTH_CALLBACK_PATH, SLACK_OAUTH_LOOPBACK_PORT, SLACK_SECRET_SERVICE,
+    SlackAdapter, SlackApiOrigin, SlackApiSource, SlackCallbackError, SlackInstalledWorkspace,
+    SlackSecretKey, SlackSecretVault, WORKSPACE_BOT_SCOPES, authorize_url, loopback_redirect_uri,
+    new_oauth_state, parse_loopback_callback, resolve_slack_app_token, resolve_slack_client,
+};
+#[cfg(feature = "slack-oauth")]
+pub use slack::{oauth_v2_access_request, socket_mode_config, workspace_bot_token};
 pub use telegram::{
     TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,
     resolve_telegram_api, telegram_api_available,

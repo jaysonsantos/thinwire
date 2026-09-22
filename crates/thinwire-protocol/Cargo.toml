@@ -17,12 +17,18 @@ default = []
 # api_id / api_hash stay compile-time env (credentials.rs). Public CI must
 # not set them. Main-only os-zips injects repository secrets.
 telegram-tdlib = ["dep:tdlib-rs"]
+# Official Slack workspace-app OAuth via `slack-morphism` (OAuth v2 types and
+# Socket Mode config). Default CI stays feature-off. No HTTP client in this
+# spike (`hyper` stays off). Publisher client credentials stay compile-time
+# env in `slack/credentials.rs`. Public CI must not set them.
+slack-oauth = ["dep:slack-morphism"]
 
 [dependencies]
 tdlib-rs = { version = "1.4", optional = true, default-features = false, features = [
   "download-tdlib",
   "static",
 ] }
+slack-morphism = { version = "2.29", optional = true, default-features = false }
 getrandom = "0.2"
 tokio.workspace = true
 tracing.workspace = true
