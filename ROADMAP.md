@@ -11,7 +11,7 @@ Rule: an ADR accepted is not Done until the matching change is on `main`.
 - Main-only unsigned CI artifacts + caveat — `0003`
 - System light/dark by default — `0005`
 - Live TDLib path + hard constraints — `0006` (on `main` via #15 / `eff31de`)
-- Official release inject for main OS zips — `0007`. `.github/workflows/os-zips.yml` builds `--features telegram-tdlib` with `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` from GitHub repository secrets and fails closed when either secret is missing. Real values live in GitHub secrets and in arcoiro under the thinwire path (SOPS + Terraform, not watchkeep, no separate secrets repo), not in this MIT tree. Public `ci.yml` and pull requests do not set them. The job refuses to upload a credentials-missing binary until those repository secrets exist.
+- Official release inject for main OS zips — `0007` (on `main` via #19 / `5c46222`)
 
 ## Next (locked order)
 
