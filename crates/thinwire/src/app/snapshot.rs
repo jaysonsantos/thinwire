@@ -16,20 +16,34 @@ use super::secrets::{SecretKey, SecretStore};
 pub(crate) enum InboxFilter {
     All,
     Telegram,
+    #[cfg(feature = "slack-oauth")]
     Slack,
-    Experimental,
 }
 
 impl InboxFilter {
-    pub(crate) const ALL: [Self; 4] = [Self::All, Self::Telegram, Self::Slack, Self::Experimental];
+    /// Top-bar filters for this build. Spike tabs stay out until their feature is on.
+    #[must_use]
+    pub(crate) fn chrome_filters() -> &'static [Self] {
+        #[cfg(feature = "slack-oauth")]
+        {
+            const FILTERS: &[InboxFilter] =
+                &[InboxFilter::All, InboxFilter::Telegram, InboxFilter::Slack];
+            FILTERS
+        }
+        #[cfg(not(feature = "slack-oauth"))]
+        {
+            const FILTERS: &[InboxFilter] = &[InboxFilter::All, InboxFilter::Telegram];
+            FILTERS
+        }
+    }
 
     #[must_use]
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::All => "All",
             Self::Telegram => "Telegram",
+            #[cfg(feature = "slack-oauth")]
             Self::Slack => "Slack",
-            Self::Experimental => "Experimental",
         }
     }
 
@@ -38,15 +52,29 @@ impl InboxFilter {
         match self {
             Self::All => true,
             Self::Telegram => matches!(protocol, ProtocolId::Telegram),
+            #[cfg(feature = "slack-oauth")]
             Self::Slack => matches!(protocol, ProtocolId::Slack),
-            Self::Experimental => matches!(protocol, ProtocolId::WhatsApp | ProtocolId::Discord),
         }
     }
 
-    /// Inbox filters hide supported accounts; experimental chips stay in the switcher.
+    /// Account chip visibility for the current filter. Off-feature spikes stay out.
+    ///
+    /// Discord also needs live Telegram messages before it may appear — that gate
+    /// lives on [`Snapshot::account_surface_visible`], so callers must AND both.
     #[must_use]
     pub(crate) const fn shows_in_switcher(self, protocol: ProtocolId) -> bool {
-        self.matches(protocol) || matches!(protocol, ProtocolId::WhatsApp | ProtocolId::Discord)
+        self.matches(protocol)
+    }
+}
+
+/// Compile-time chrome gate: spikes stay invisible when their feature is off.
+#[must_use]
+pub(crate) const fn protocol_chrome_enabled(protocol: ProtocolId) -> bool {
+    match protocol {
+        ProtocolId::Telegram => true,
+        ProtocolId::Slack => cfg!(feature = "slack-oauth"),
+        ProtocolId::WhatsApp => cfg!(feature = "whatsapp-web"),
+        ProtocolId::Discord => cfg!(feature = "discord-bot"),
     }
 }
 
@@ -147,7 +175,7 @@ impl Snapshot {
             telegram_code: String::new(),
             telegram_2fa: String::new(),
             error: None,
-            status_text: "Adapters are stubs. No live network session.".into(),
+            status_text: "Sign in with Telegram to get started.".into(),
             compose: String::new(),
             auth_busy: false,
             telegram_authorized: false,
@@ -189,12 +217,20 @@ impl Snapshot {
                         row.linked = DiscordAdapter::inbox_account_linked(status, &detail);
                     }
                 }
-                self.status_text = detail;
+                // Crate / feature jargon stays on the account row and in logs.
+                // Chrome surfaces Telegram errors and Ready operational copy only.
                 if protocol == ProtocolId::Telegram
-                    && matches!(status, AdapterStatus::Error | AdapterStatus::Refused)
-                    && self.auth != AuthScreen::Idle
+                    && matches!(
+                        status,
+                        AdapterStatus::Error | AdapterStatus::Refused | AdapterStatus::Ready
+                    )
                 {
-                    self.auth_busy = false;
+                    self.status_text = detail;
+                    if matches!(status, AdapterStatus::Error | AdapterStatus::Refused)
+                        && self.auth != AuthScreen::Idle
+                    {
+                        self.auth_busy = false;
+                    }
                 }
             }
             AdapterEvent::ConversationUpsert { conversation } => {
@@ -310,7 +346,9 @@ impl Snapshot {
             && let Some(first) = self
                 .accounts
                 .iter()
-                .find(|row| filter.matches(row.caps.id))
+                .find(|row| {
+                    filter.matches(row.caps.id) && self.account_surface_visible(row.caps.id)
+                })
                 .map(|row| row.caps.id)
         {
             self.select_protocol(first);
@@ -325,9 +363,21 @@ impl Snapshot {
             && self.telegram_messages_from_adapter > 0
     }
 
+    /// Protocols that may appear in Accounts / filter chrome for this build.
+    ///
+    /// Telegram is always present. Slack and WhatsApp appear only when their
+    /// cargo features are on. Discord also waits for Telegram messages (0009).
     #[must_use]
     pub(crate) fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
-        !matches!(protocol, ProtocolId::Discord) || self.discord_inbox_visible()
+        match protocol {
+            ProtocolId::Discord => self.discord_inbox_visible(),
+            other => protocol_chrome_enabled(other),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn shows_in_switcher(&self, protocol: ProtocolId) -> bool {
+        self.filter.shows_in_switcher(protocol) && self.account_surface_visible(protocol)
     }
 
     pub(crate) fn visible_conversations(&self) -> Vec<&Conversation> {
@@ -366,12 +416,6 @@ impl Snapshot {
             .any(|row| row.caps.id == protocol && row.linked)
     }
 
-    pub(crate) fn selected_account(&self) -> Option<&AccountRow> {
-        self.accounts
-            .iter()
-            .find(|row| row.caps.id == self.selected_protocol)
-    }
-
     pub(crate) fn selected_conversation_row(&self) -> Option<&Conversation> {
         let id = self.selected_conversation.as_ref()?;
         self.conversations
@@ -403,7 +447,7 @@ impl Snapshot {
                 self.pending.push(AdapterCommand::Connect { protocol });
             }
         }
-        self.status_text = "Refresh queued on the tokio worker. The UI thread stays free.".into();
+        self.status_text = "Refreshing…".into();
     }
 
     #[must_use]
@@ -510,7 +554,7 @@ impl Snapshot {
             self.set_error(
                 "Nothing was sent.",
                 "Telegram is not ready.",
-                "Sign in with Telegram, then pick a chat. Other protocols are not ready.",
+                "Sign in with Telegram, then pick a chat.",
             );
             return;
         }
@@ -529,7 +573,7 @@ impl Snapshot {
             conversation_id,
             body,
         });
-        self.status_text = "Message queued on the tokio worker. The UI thread stays free.".into();
+        self.status_text = "Sending…".into();
     }
 
     pub(crate) fn open_telegram(&mut self, store: &SecretStore) {
@@ -826,9 +870,7 @@ impl Snapshot {
     pub(crate) fn acknowledge_whatsapp_risk(&mut self) {
         self.whatsapp_screen = WhatsAppScreen::Pair;
         self.error = None;
-        self.status_text =
-            "WhatsApp ban gate accepted. Pairing has not started. This is not a supported messenger."
-                .into();
+        self.status_text = "WhatsApp ban gate accepted. Pairing has not started.".into();
         self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
     }
 
@@ -841,9 +883,7 @@ impl Snapshot {
         self.whatsapp_phone.clear();
         self.whatsapp_started = true;
         self.error = None;
-        self.status_text =
-            "Experimental WhatsApp pairing was requested on the worker. The command carries no phone number."
-                .into();
+        self.status_text = "WhatsApp pairing requested.".into();
         self.pending.push(AdapterCommand::WhatsAppBeginLink);
     }
 
@@ -855,8 +895,7 @@ impl Snapshot {
         self.whatsapp_pair_code = None;
         self.whatsapp_started = false;
         self.whatsapp_screen = WhatsAppScreen::Hidden;
-        self.status_text =
-            "WhatsApp pairing cancelled before a supported session could exist.".into();
+        self.status_text = "WhatsApp pairing cancelled.".into();
         self.pending.push(AdapterCommand::WhatsAppCancelLink);
     }
 }
@@ -942,10 +981,58 @@ mod tests {
         assert!(!src.contains("user_token"));
         let ui = include_str!("ui.rs");
         assert!(ui.contains("not ready"));
-        assert!(ui.contains("not login peers"));
+        assert!(ui.contains("Start with Telegram"));
+        assert!(!ui.contains("not login peers"));
+        assert!(!ui.contains("Experimental chips stay visible"));
+        assert!(!ui.contains("tokio worker"));
+        assert!(!ui.contains("Supported goals:"));
+        assert!(!ui.contains("Telegram is live"));
+        assert!(!ui.contains("caps.detail"));
+        assert!(!ui.contains("account.caps.short_label"));
+        assert!(!ui.contains("\"Experimental\""));
         assert!(!ui.contains("my.telegram.org"));
         assert!(src.contains(super::super::auth::TDLIB_UNAVAILABLE_BANNER));
         assert!(ui.contains("stub_banner"));
+    }
+
+    #[test]
+    fn default_chrome_is_telegram_only_when_spikes_are_off() {
+        assert!(protocol_chrome_enabled(ProtocolId::Telegram));
+        assert_eq!(
+            protocol_chrome_enabled(ProtocolId::Slack),
+            cfg!(feature = "slack-oauth")
+        );
+        assert_eq!(
+            protocol_chrome_enabled(ProtocolId::WhatsApp),
+            cfg!(feature = "whatsapp-web")
+        );
+        assert_eq!(
+            protocol_chrome_enabled(ProtocolId::Discord),
+            cfg!(feature = "discord-bot")
+        );
+        let filters = InboxFilter::chrome_filters();
+        assert!(filters.contains(&InboxFilter::All));
+        assert!(filters.contains(&InboxFilter::Telegram));
+        #[cfg(feature = "slack-oauth")]
+        assert!(filters.contains(&InboxFilter::Slack));
+        #[cfg(not(feature = "slack-oauth"))]
+        assert_eq!(filters.len(), 2);
+        assert!(
+            !filters
+                .iter()
+                .any(|filter| filter.label() == "Experimental")
+        );
+        let snapshot = Snapshot::new();
+        assert!(snapshot.shows_in_switcher(ProtocolId::Telegram));
+        assert_eq!(
+            snapshot.shows_in_switcher(ProtocolId::WhatsApp),
+            cfg!(feature = "whatsapp-web")
+        );
+        assert!(!snapshot.shows_in_switcher(ProtocolId::Discord));
+        assert_eq!(
+            snapshot.shows_in_switcher(ProtocolId::Slack),
+            cfg!(feature = "slack-oauth")
+        );
     }
 
     #[test]
@@ -1254,11 +1341,53 @@ mod tests {
     }
 
     #[test]
-    fn experimental_filter_hides_supported_protocols() {
-        assert!(InboxFilter::Experimental.matches(ProtocolId::WhatsApp));
-        assert!(!InboxFilter::Experimental.matches(ProtocolId::Telegram));
+    fn adapter_status_jargon_does_not_clobber_chrome_status() {
+        let mut snapshot = Snapshot::new();
+        let before = snapshot.status_text.clone();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Slack,
+            status: AdapterStatus::Stubbed,
+            detail:
+                "Official Slack OAuth / workspace app (slack-morphism). Feature slack-oauth is off."
+                    .into(),
+        });
+        assert_eq!(snapshot.status_text, before);
+        assert!(!snapshot.status_text.contains("slack-morphism"));
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Connecting,
+            detail: "tdlib-rs live client compiled; FFI and network I/O stay off the UI thread"
+                .into(),
+        });
+        assert_eq!(snapshot.status_text, before);
+        assert!(!snapshot.status_text.contains("tdlib-rs"));
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Recent messages loaded.".into(),
+        });
+        assert_eq!(snapshot.status_text, "Recent messages loaded.");
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "telegram api_id must be a number".into(),
+        });
+        assert_eq!(snapshot.status_text, "telegram api_id must be a number");
+    }
+
+    #[test]
+    fn filter_matches_supported_protocols_without_an_experimental_tab() {
         assert!(InboxFilter::Telegram.matches(ProtocolId::Telegram));
+        assert!(!InboxFilter::Telegram.matches(ProtocolId::Slack));
+        #[cfg(feature = "slack-oauth")]
+        assert!(InboxFilter::Slack.matches(ProtocolId::Slack));
         assert!(InboxFilter::All.matches(ProtocolId::Discord));
+        assert!(InboxFilter::All.matches(ProtocolId::WhatsApp));
+        assert!(
+            !InboxFilter::chrome_filters()
+                .iter()
+                .any(|filter| filter.label() == "Experimental")
+        );
     }
 
     fn discord_guild_placeholder() -> Conversation {
@@ -1358,7 +1487,10 @@ mod tests {
         let mut snapshot = Snapshot::new();
         assert!(!snapshot.discord_inbox_visible());
         assert!(!snapshot.account_surface_visible(ProtocolId::Discord));
-        assert!(snapshot.account_surface_visible(ProtocolId::WhatsApp));
+        assert_eq!(
+            snapshot.account_surface_visible(ProtocolId::WhatsApp),
+            cfg!(feature = "whatsapp-web")
+        );
         snapshot.apply(AdapterEvent::TelegramAuth {
             phase: TelegramAuthPhase::Ready,
         });
@@ -1391,12 +1523,29 @@ mod tests {
     }
 
     #[test]
-    fn experimental_chips_stay_in_switcher_under_every_filter() {
-        for filter in InboxFilter::ALL {
-            assert!(filter.shows_in_switcher(ProtocolId::WhatsApp));
-            assert!(filter.shows_in_switcher(ProtocolId::Discord));
+    fn off_feature_spikes_stay_out_of_the_switcher() {
+        for filter in InboxFilter::chrome_filters() {
+            let mut view = Snapshot::new();
+            view.set_filter(*filter);
+            assert_eq!(
+                view.shows_in_switcher(ProtocolId::WhatsApp),
+                cfg!(feature = "whatsapp-web") && filter.matches(ProtocolId::WhatsApp)
+            );
+            assert!(
+                !view.shows_in_switcher(ProtocolId::Discord),
+                "discord needs telegram messages before chrome"
+            );
+            assert_eq!(
+                view.shows_in_switcher(ProtocolId::Slack),
+                cfg!(feature = "slack-oauth") && filter.matches(ProtocolId::Slack)
+            );
+            assert_eq!(
+                view.shows_in_switcher(ProtocolId::Telegram),
+                filter.matches(ProtocolId::Telegram)
+            );
         }
         assert!(!InboxFilter::Telegram.shows_in_switcher(ProtocolId::Slack));
+        #[cfg(feature = "slack-oauth")]
         assert!(!InboxFilter::Slack.shows_in_switcher(ProtocolId::Telegram));
     }
 

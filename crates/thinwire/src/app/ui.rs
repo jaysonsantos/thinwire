@@ -47,12 +47,12 @@ fn top_bar(
         ui.horizontal(|ui| {
             ui.heading("thinwire");
             ui.separator();
-            for filter in InboxFilter::ALL {
+            for filter in InboxFilter::chrome_filters() {
                 if ui
-                    .selectable_label(snapshot.filter == filter, filter.label())
+                    .selectable_label(snapshot.filter == *filter, filter.label())
                     .clicked()
                 {
-                    snapshot.set_filter(filter);
+                    snapshot.set_filter(*filter);
                 }
             }
             ui.separator();
@@ -112,23 +112,6 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
             ui.label(format!("Why: {why}"));
             ui.label(format!("What to do: {next}"));
         }
-        if snapshot.telegram_ready() {
-            ui.label(
-                "Telegram is live. Chat list and messages update from the worker. The UI thread stays free.",
-            );
-        } else {
-            ui.colored_label(
-                MUTED,
-                "Offline — no live protocol session. Linking and refresh stay on the tokio worker.",
-            );
-        }
-        ui.label(
-            RichText::new(
-                "Supported goals: Telegram via TDLib and Slack via OAuth. Experimental modules are not marketed here.",
-            )
-            .small()
-            .color(MUTED),
-        );
     });
 }
 
@@ -139,11 +122,6 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         .size_range(220.0..=400.0)
         .show(ui, |ui| {
             ui.heading("Accounts");
-            ui.label(
-                RichText::new("Experimental chips stay visible")
-                    .small()
-                    .color(MUTED),
-            );
             ui.separator();
 
             let unread_by_protocol: Vec<u32> = snapshot
@@ -153,10 +131,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 .collect();
             let mut clicked: Option<ProtocolId> = None;
             for (account, unread) in snapshot.accounts.iter().zip(unread_by_protocol) {
-                if !snapshot.account_surface_visible(account.caps.id) {
-                    continue;
-                }
-                if !snapshot.filter.shows_in_switcher(account.caps.id) {
+                if !snapshot.shows_in_switcher(account.caps.id) {
                     continue;
                 }
                 if account_chip(
@@ -233,7 +208,7 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
 
     if rows.is_empty() {
         ui.label(
-            RichText::new("No conversations in this filter.")
+            RichText::new("No conversations yet.")
                 .italics()
                 .color(MUTED),
         );
@@ -275,37 +250,33 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
 }
 
 fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    ui.heading("Start with Telegram");
-    if let Some(banner) = super::auth::stub_banner(snapshot) {
-        ui.colored_label(EXPERIMENTAL, banner);
-    }
-    if snapshot.has_api_credentials(secrets) {
-        ui.label("Sign in with your phone number, then the login code, then optional 2FA.");
-    } else {
-        ui.label(
-            "Credentials missing. Official binaries inject them at release time. Dev: rebuild with TELEGRAM_API_ID and TELEGRAM_API_HASH, or use Advanced to set a keychain override.",
-        );
-    }
-    ui.add_space(8.0);
-    if ui.button("Add Telegram").clicked() {
-        snapshot.open_telegram(secrets);
-    }
-    ui.add_space(12.0);
-    ui.label(
-        RichText::new(
-            "WhatsApp, Discord, and Slack are not ready. They are stubs, not login peers of Telegram this beat.",
-        )
-        .color(EXPERIMENTAL),
-    );
+    let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
+    ui.add_space(top);
+    ui.vertical_centered(|ui| {
+        ui.heading(RichText::new("Start with Telegram").size(22.0));
+        ui.add_space(12.0);
+        if let Some(banner) = super::auth::stub_banner(snapshot) {
+            ui.colored_label(EXPERIMENTAL, banner);
+            ui.add_space(10.0);
+        }
+        if snapshot.has_api_credentials(secrets) {
+            ui.label("Sign in with your phone number, then the login code, then optional 2FA.");
+        } else {
+            ui.label(
+                "Credentials missing. Official binaries inject them at release time. Dev: rebuild with TELEGRAM_API_ID and TELEGRAM_API_HASH, or use Advanced to set a keychain override.",
+            );
+        }
+        ui.add_space(16.0);
+        if ui.button("Add Telegram").clicked() {
+            snapshot.open_telegram(secrets);
+        }
+    });
 }
 
 fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     match snapshot.selected_conversation_row() {
         Some(conversation) => {
             ui.heading(&conversation.title);
-            if let Some(account) = snapshot.selected_account() {
-                ui.label(RichText::new(account.caps.detail).small().color(MUTED));
-            }
         }
         None => {
             ui.heading("Thread");
