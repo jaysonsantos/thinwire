@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui;
-use thinwire_protocol::{AdapterHost, TelegramSecretVault, WhatsAppPhoneVault};
+use thinwire_protocol::{
+    AdapterCommand, AdapterHost, DiscordAdapter, DiscordSecretVault, ProtocolId,
+    TelegramSecretVault, WhatsAppPhoneVault,
+};
 
 use secrets::SecretStore;
 use snapshot::Snapshot;
@@ -39,8 +42,13 @@ impl ThinwireApp {
         let host = AdapterHost::spawn(
             runtime.handle(),
             Arc::clone(&secrets) as Arc<dyn TelegramSecretVault>,
+            Arc::clone(&secrets) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&whatsapp_phone),
         );
+        // `for_ui` only schedules keychain attach. Discord's start can run
+        // before that blocking read finishes, so arm it again once a token
+        // is in memory. The hook sends a command; it does not touch the OS store.
+        bind_discord_after_hydrate(&secrets, &host);
         let mut snapshot = Snapshot::new();
         snapshot.status_text = secret_store_status_text(secrets.backend_name());
         Self {
@@ -105,6 +113,18 @@ impl eframe::App for ThinwireApp {
     }
 }
 
+fn bind_discord_after_hydrate(secrets: &SecretStore, host: &AdapterHost) {
+    if !DiscordAdapter::bot_inbox_compiled() {
+        return;
+    }
+    let commands = host.command_sender();
+    secrets.on_discord_token_hydrated(move || {
+        let _ = commands.send(AdapterCommand::Connect {
+            protocol: ProtocolId::Discord,
+        });
+    });
+}
+
 const SECRET_STORE_STATUS_PREFIX: &str = "Adapters are stubs. Secret store: ";
 
 fn secret_store_status_text(backend: &str) -> String {
@@ -121,7 +141,69 @@ fn refreshed_secret_store_status(current: &str, backend: &str) -> Option<String>
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use thinwire_protocol::{AdapterEvent, AdapterStatus, DiscordSecretVault, TelegramSecretVault};
+    use tokio::runtime::Handle;
+
     use super::*;
+
+    #[tokio::test]
+    async fn discord_arms_after_keychain_hydrate() {
+        if !DiscordAdapter::bot_inbox_compiled() {
+            return;
+        }
+        let store = SecretStore::detached_for_test();
+        let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
+        let mut host = AdapterHost::spawn(
+            &Handle::current(),
+            Arc::clone(&store) as Arc<dyn TelegramSecretVault>,
+            Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
+            Arc::clone(&whatsapp_phone),
+        );
+        bind_discord_after_hydrate(&store, &host);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_missing = false;
+        while !saw_missing {
+            for event in host.poll_events() {
+                if let AdapterEvent::Status { detail, .. } = &event {
+                    assert!(!detail.contains("fixture-bot-token"));
+                    if detail.contains("bot token is not in the OS keychain") {
+                        saw_missing = true;
+                    }
+                }
+            }
+            if saw_missing {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("discord started without reporting a missing token");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        store.complete_discord_hydrate_for_test(Some("fixture-bot-token"));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            for event in host.poll_events() {
+                if let AdapterEvent::Status { status, detail, .. } = &event {
+                    assert!(!detail.contains("fixture-bot-token"));
+                    if *status == AdapterStatus::Stubbed
+                        && detail.contains("bot token is in the OS keychain")
+                        && !detail.contains("not in the OS keychain")
+                    {
+                        return;
+                    }
+                }
+            }
+            if Instant::now() > deadline {
+                panic!("discord did not arm after keychain hydrate");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 
     #[test]
     fn secret_store_status_updates_from_memory_to_os() {

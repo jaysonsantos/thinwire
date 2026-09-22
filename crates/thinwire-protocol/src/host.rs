@@ -6,8 +6,8 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::{
-    AdapterCommand, AdapterEvent, ProtocolAdapter, TelegramSecretVault, WhatsAppPhoneVault,
-    registry,
+    AdapterCommand, AdapterEvent, DiscordSecretVault, ProtocolAdapter, TelegramSecretVault,
+    WhatsAppPhoneVault, registry,
 };
 
 /// Bridge between the UI thread and protocol workers.
@@ -22,13 +22,14 @@ impl AdapterHost {
     pub fn spawn(
         handle: &Handle,
         secrets: Arc<dyn TelegramSecretVault>,
+        discord: Arc<dyn DiscordSecretVault>,
         whatsapp_phone: Arc<WhatsAppPhoneVault>,
     ) -> Self {
         let (event_tx, event_rx) = unbounded_channel();
         let (command_tx, mut command_rx) = unbounded_channel();
 
         handle.spawn(async move {
-            let mut adapters = registry(secrets, whatsapp_phone);
+            let mut adapters = registry(secrets, discord, whatsapp_phone);
             for adapter in &mut adapters {
                 adapter.start(event_tx.clone());
             }
@@ -51,6 +52,15 @@ impl AdapterHost {
             events.push(event);
         }
         events
+    }
+
+    /// Clone of the worker command channel.
+    ///
+    /// Keychain hydration uses this to reconnect Discord after `spawn_blocking`
+    /// finishes. Sending does not run adapter code on the caller.
+    #[must_use]
+    pub fn command_sender(&self) -> UnboundedSender<AdapterCommand> {
+        self.command_tx.clone()
     }
 
     /// Enqueue a command for the worker. Never runs adapter code on the caller.

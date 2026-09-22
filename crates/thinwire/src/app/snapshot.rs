@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
-    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, ProtocolCapabilities,
-    ProtocolId, TelegramApiSource, TelegramAuthPhase, TelegramAuthStep, TelegramSecretVault,
-    catalog, parse_telegram_chat_id, telegram_api_available,
+    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, DiscordAdapter,
+    ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthPhase, TelegramAuthStep,
+    TelegramSecretVault, catalog, parse_telegram_chat_id, telegram_api_available,
 };
 
 use super::secrets::{SecretKey, SecretStore};
@@ -105,6 +105,7 @@ pub(crate) struct Snapshot {
     pub compose: String,
     pub auth_busy: bool,
     pub telegram_authorized: bool,
+    telegram_messages_from_adapter: u32,
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
@@ -150,6 +151,7 @@ impl Snapshot {
             compose: String::new(),
             auth_busy: false,
             telegram_authorized: false,
+            telegram_messages_from_adapter: 0,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
@@ -183,6 +185,9 @@ impl Snapshot {
                 if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
                     row.status = status;
                     row.detail = detail.clone();
+                    if protocol == ProtocolId::Discord {
+                        row.linked = DiscordAdapter::inbox_account_linked(status, &detail);
+                    }
                 }
                 self.status_text = detail;
                 if protocol == ProtocolId::Telegram
@@ -208,7 +213,13 @@ impl Snapshot {
             AdapterEvent::ConversationRemoved { protocol, id } => {
                 self.remove_conversation(protocol, &id);
             }
-            AdapterEvent::MessageReceived { message } => self.upsert_message(message),
+            AdapterEvent::MessageReceived { message } => {
+                if message.protocol == ProtocolId::Telegram {
+                    self.telegram_messages_from_adapter =
+                        self.telegram_messages_from_adapter.saturating_add(1);
+                }
+                self.upsert_message(message);
+            }
             AdapterEvent::MessageReplaced {
                 protocol,
                 conversation_id,
@@ -280,6 +291,9 @@ impl Snapshot {
     }
 
     pub(crate) fn select_protocol(&mut self, protocol: ProtocolId) {
+        if !self.account_surface_visible(protocol) {
+            return;
+        }
         self.selected_protocol = protocol;
         self.selected_conversation = None;
         self.ensure_conversation_selection();
@@ -303,8 +317,23 @@ impl Snapshot {
         }
     }
 
+    /// Discord stays hidden until the bot feature is compiled and Telegram has messages.
+    #[must_use]
+    pub(crate) fn discord_inbox_visible(&self) -> bool {
+        DiscordAdapter::bot_inbox_compiled()
+            && self.telegram_authorized
+            && self.telegram_messages_from_adapter > 0
+    }
+
+    #[must_use]
+    pub(crate) fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
+        !matches!(protocol, ProtocolId::Discord) || self.discord_inbox_visible()
+    }
+
     pub(crate) fn visible_conversations(&self) -> Vec<&Conversation> {
-        if !self.protocol_linked(self.selected_protocol) {
+        if !self.account_surface_visible(self.selected_protocol)
+            || !self.protocol_linked(self.selected_protocol)
+        {
             return Vec::new();
         }
         let query = self.search.trim().to_ascii_lowercase();
@@ -365,7 +394,7 @@ impl Snapshot {
             .accounts
             .iter()
             .map(|row| row.caps.id)
-            .filter(|id| self.filter.matches(*id))
+            .filter(|id| self.filter.matches(*id) && self.account_surface_visible(*id))
             .collect();
         for protocol in protocols {
             if protocol == ProtocolId::Telegram && self.telegram_authorized {
@@ -1230,6 +1259,135 @@ mod tests {
         assert!(!InboxFilter::Experimental.matches(ProtocolId::Telegram));
         assert!(InboxFilter::Telegram.matches(ProtocolId::Telegram));
         assert!(InboxFilter::All.matches(ProtocolId::Discord));
+    }
+
+    fn discord_guild_placeholder() -> Conversation {
+        Conversation {
+            protocol: ProtocolId::Discord,
+            id: "discord:guild-inbox:general".into(),
+            title: "Bot inbox #general".into(),
+            participant: "guild channel".into(),
+            preview: "placeholder".into(),
+            unread: 1,
+            order: 0,
+        }
+    }
+
+    fn discord_linked(snapshot: &Snapshot) -> bool {
+        snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Discord)
+            .expect("discord account")
+            .linked
+    }
+
+    fn unlock_telegram_messages(snapshot: &mut Snapshot) {
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:saved".into(),
+                id: "telegram:saved:1".into(),
+                sender: "worker".into(),
+                body: "hello from telegram".into(),
+                outbound: false,
+            },
+        });
+    }
+
+    #[test]
+    fn discord_missing_token_placeholder_stays_unlinked() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: discord_guild_placeholder(),
+        });
+        assert!(!discord_linked(&snapshot));
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Discord,
+            status: AdapterStatus::Stubbed,
+            detail: "Discord bot inbox placeholder. bot token is not in the OS keychain. Gateway is not started.".into(),
+        });
+        assert!(!discord_linked(&snapshot));
+        unlock_telegram_messages(&mut snapshot);
+        snapshot.select_protocol(ProtocolId::Discord);
+        assert!(snapshot.visible_conversations().is_empty());
+        assert_eq!(snapshot.unread_for(ProtocolId::Discord), 0);
+        assert!(!discord_linked(&snapshot));
+    }
+
+    #[test]
+    fn discord_links_only_when_a_bot_token_is_present() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Discord,
+            status: AdapterStatus::Stubbed,
+            detail: "Discord bot inbox placeholder. bot token is in the OS keychain. Gateway is not started.".into(),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: discord_guild_placeholder(),
+        });
+        assert_eq!(
+            discord_linked(&snapshot),
+            DiscordAdapter::bot_inbox_compiled()
+        );
+        unlock_telegram_messages(&mut snapshot);
+        snapshot.select_protocol(ProtocolId::Discord);
+        if DiscordAdapter::bot_inbox_compiled() {
+            assert_eq!(snapshot.selected_protocol, ProtocolId::Discord);
+            assert_eq!(snapshot.visible_conversations().len(), 1);
+            assert_eq!(snapshot.unread_for(ProtocolId::Discord), 1);
+        } else {
+            assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
+            assert!(snapshot.visible_conversations().is_empty());
+            assert!(!discord_linked(&snapshot));
+        }
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Discord,
+            status: AdapterStatus::Refused,
+            detail: "Discord user-account tokens are refused.".into(),
+        });
+        assert!(!discord_linked(&snapshot));
+        assert_eq!(snapshot.unread_for(ProtocolId::Discord), 0);
+    }
+
+    #[test]
+    fn discord_stays_invisible_until_telegram_messages_exist() {
+        let mut snapshot = Snapshot::new();
+        assert!(!snapshot.discord_inbox_visible());
+        assert!(!snapshot.account_surface_visible(ProtocolId::Discord));
+        assert!(snapshot.account_surface_visible(ProtocolId::WhatsApp));
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        assert!(snapshot.telegram_ready());
+        assert!(!snapshot.discord_inbox_visible());
+        snapshot.selected_conversation = Some("telegram:1".into());
+        snapshot.compose = "local only".into();
+        snapshot.send_compose();
+        assert!(!snapshot.discord_inbox_visible());
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                id: "telegram:1:1".into(),
+                sender: "worker".into(),
+                body: "hello from telegram".into(),
+                outbound: false,
+            },
+        });
+        assert_eq!(
+            snapshot.discord_inbox_visible(),
+            DiscordAdapter::bot_inbox_compiled()
+        );
+        snapshot.select_protocol(ProtocolId::Discord);
+        if DiscordAdapter::bot_inbox_compiled() {
+            assert_eq!(snapshot.selected_protocol, ProtocolId::Discord);
+        } else {
+            assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
+        }
     }
 
     #[test]
