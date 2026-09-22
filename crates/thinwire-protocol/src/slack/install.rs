@@ -124,7 +124,7 @@ pub fn loopback_redirect_uri() -> String {
 #[must_use]
 pub fn new_oauth_state() -> String {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).expect("slack oauth state requires OS CSPRNG");
+    getrandom::fill(&mut bytes).expect("slack oauth state requires OS CSPRNG");
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(32);
     for byte in bytes {

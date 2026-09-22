@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use keyring::Entry;
+use keyring_core::Entry;
 use thinwire_protocol::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordSecretVault, TELEGRAM_SECRET_SERVICE,
     TelegramSecretKey, TelegramSecretVault,
@@ -539,14 +539,46 @@ fn memory_requested() -> bool {
 }
 
 fn probe_os() -> Result<(), SecretError> {
+    ensure_default_store()?;
     let entry = os_entry(SecretKey::ApiId)?;
     match entry.get_password() {
-        Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+        Ok(_) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
 
+fn ensure_default_store() -> Result<(), SecretError> {
+    if keyring_core::get_default_store().is_some() {
+        return Ok(());
+    }
+    install_platform_store()
+}
+
+fn install_platform_store() -> Result<(), SecretError> {
+    let store = {
+        #[cfg(target_os = "linux")]
+        {
+            linux_keyutils_keyring_store::Store::new().map_err(map_keyring_error)?
+        }
+        #[cfg(target_os = "macos")]
+        {
+            apple_native_keyring_store::keychain::Store::new().map_err(map_keyring_error)?
+        }
+        #[cfg(windows)]
+        {
+            windows_native_keyring_store::Store::new().map_err(map_keyring_error)?
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            return Err(SecretError::new("OS keychain: unsupported platform"));
+        }
+    };
+    keyring_core::set_default_store(store);
+    Ok(())
+}
+
 fn os_entry(key: SecretKey) -> Result<Entry, SecretError> {
+    ensure_default_store()?;
     Entry::new(TELEGRAM_SECRET_SERVICE, key.account()).map_err(map_keyring_error)
 }
 
@@ -559,19 +591,20 @@ fn os_set(key: SecretKey, value: &str) -> Result<(), SecretError> {
 fn os_get(key: SecretKey) -> Result<Option<String>, SecretError> {
     match os_entry(key)?.get_password() {
         Ok(value) => Ok(Some(value)),
-        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
 
 fn discord_os_entry() -> Result<Entry, SecretError> {
+    ensure_default_store()?;
     Entry::new(DISCORD_SECRET_SERVICE, DISCORD_SECRET_BOT_TOKEN).map_err(map_keyring_error)
 }
 
 fn read_discord_os_token() -> Result<Option<String>, SecretError> {
     match discord_os_entry()?.get_password() {
         Ok(value) => Ok(Some(value)),
-        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
@@ -584,14 +617,14 @@ fn discord_os_set(value: &str) -> Result<(), SecretError> {
 
 fn discord_os_delete() -> Result<(), SecretError> {
     match discord_os_entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
 
 fn os_delete(key: SecretKey) -> Result<(), SecretError> {
     match os_entry(key)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
@@ -612,14 +645,16 @@ impl SecretStore {
     }
 }
 
-fn map_keyring_error(error: keyring::Error) -> SecretError {
+fn map_keyring_error(error: keyring_core::Error) -> SecretError {
     let kind = match error {
-        keyring::Error::NoEntry => "not found",
-        keyring::Error::NoStorageAccess(_) => "no storage access",
-        keyring::Error::PlatformFailure(_) => "platform failure",
-        keyring::Error::TooLong(_, _) => "value too long",
-        keyring::Error::Invalid(_, _) => "invalid attribute",
-        keyring::Error::Ambiguous(_) => "ambiguous entry",
+        keyring_core::Error::NoEntry => "not found",
+        keyring_core::Error::NoStorageAccess(_) => "no storage access",
+        keyring_core::Error::PlatformFailure(_) => "platform failure",
+        keyring_core::Error::TooLong(_, _) => "value too long",
+        keyring_core::Error::Invalid(_, _) => "invalid attribute",
+        keyring_core::Error::Ambiguous(_) => "ambiguous entry",
+        keyring_core::Error::NoDefaultStore => "no default store",
+        keyring_core::Error::NotSupportedByStore(_) => "unsupported by store",
         other => {
             let _ = other;
             "keychain error"
