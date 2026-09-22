@@ -5,7 +5,8 @@
 # This main-only workflow reads them from GitHub Actions repository secrets and
 # passes them to cargo so option_env! can bake them in. Never add these secrets
 # to ci.yml or any pull_request workflow. Never log the values. Real values live
-# in GitHub repository secrets and SOPS (arcoiro), not in this MIT tree.
+# in GitHub repository secrets and in arcoiro under the thinwire path
+# (SOPS + Terraform, not watchkeep), not in this MIT tree.
 name: OS zips
 
 on:
