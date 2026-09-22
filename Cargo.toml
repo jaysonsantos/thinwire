@@ -40,12 +40,15 @@ tokio = { version = "1", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dirs = "6"
-# No default features: pick OS stores explicitly. Linux uses kernel
-# keyutils so CI compiles without libdbus. Runtime falls back to memory
-# when the platform store is unavailable.
-keyring = { version = "3.6", default-features = false, features = [
-  "apple-native",
-  "windows-native",
-  "linux-native",
+dirs = "7"
+# keyring v4 is a rewrite CLI/sample crate — apps must use keyring-core
+# plus platform stores. Linux uses kernel keyutils so CI compiles without
+# libdbus. Runtime falls back to memory when the platform store is unavailable.
+keyring-core = "1"
+linux-keyutils-keyring-store = "1"
+# `keychain` matches keyring v3's apple-native path for unsigned desktop apps.
+apple-native-keyring-store = { version = "1", default-features = false, features = [
+  "keychain",
 ] }
+# No `search` (default) — sheds regex; Entry get/set/delete does not need it.
+windows-native-keyring-store = { version = "1", default-features = false }

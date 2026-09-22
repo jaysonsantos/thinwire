@@ -7,7 +7,7 @@
 #[must_use]
 pub(super) fn generate_db_key() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("telegram db encryption key requires OS CSPRNG");
+    getrandom::fill(&mut bytes).expect("telegram db encryption key requires OS CSPRNG");
     hex_encode(&bytes)
 }
 

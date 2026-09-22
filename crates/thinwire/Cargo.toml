@@ -21,12 +21,21 @@ discord-bot = ["thinwire-protocol/discord-bot"]
 dirs.workspace = true
 eframe.workspace = true
 egui.workspace = true
-keyring.workspace = true
+keyring-core.workspace = true
 thinwire-protocol.workspace = true
 winit.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store.workspace = true
 
 [lints]
 workspace = true
