@@ -51,7 +51,7 @@ rustls = { version = "0.23", optional = true, default-features = false, features
   "ring",
 ] }
 dirs.workspace = true
-getrandom = "0.2"
+getrandom = "0.4"
 tokio.workspace = true
 tracing.workspace = true
 
