@@ -1269,6 +1269,7 @@ mod tests {
             participant: "guild channel".into(),
             preview: "placeholder".into(),
             unread: 1,
+            order: 0,
         }
     }
 
