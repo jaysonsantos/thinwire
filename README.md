@@ -75,7 +75,7 @@ Theme preference is `System` (follow the OS, including live `ThemeChanged` updat
 
 There is no distroless GUI container. This is a desktop egui app.
 
-Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows (`telegram-tdlib` on, publisher credentials injected). Retention is 7 days. These zips are not a release. They are not signed. The workflow fails closed when `TELEGRAM_API_ID` or `TELEGRAM_API_HASH` is missing. Secret values live in GitHub repository secrets and in arcoiro under the thinwire path (SOPS + Terraform, not watchkeep), not in this tree. Public CI (`ci.yml`) and pull requests do not set them.
+Pushes to `main` upload unsigned OS zip artifacts for Linux, macOS, and Windows (`telegram-tdlib` on, publisher credentials injected). Retention is 7 days. These zips are not a release. They are not signed. Each zip includes the MIT `LICENSE` and `THIRD_PARTY_NOTICES/tdlib-LICENSE_1_0.txt` (TDLib's Boost Software License). Linux zips also include the copyright files for the shipped `libc++`, `libc++abi`, and `libunwind`. The workflow fails closed when `TELEGRAM_API_ID` or `TELEGRAM_API_HASH` is missing. Secret values live in GitHub repository secrets and in arcoiro under the thinwire path (SOPS + Terraform, not watchkeep), not in this tree. Public CI (`ci.yml`) and pull requests do not set them.
 
 ## Design rules
 

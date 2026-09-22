@@ -235,5 +235,41 @@ mod tests {
             os_zips.contains("Never add these secrets"),
             "os-zips must warn against copying secrets into public CI"
         );
+        assert!(
+            os_zips.contains("third_party/tdlib/LICENSE_1_0.txt"),
+            "os-zips must copy the vendored TDLib Boost license into the zip"
+        );
+        assert!(
+            os_zips.contains("dist/THIRD_PARTY_NOTICES"),
+            "os-zips must place third-party notices in the archive tree"
+        );
+        assert!(
+            os_zips.contains("/usr/share/doc/"),
+            "Linux zips must attach the LLVM runtime package copyright files"
+        );
+        assert!(
+            os_zips.contains("patchelf --set-rpath '$ORIGIN' \"$so\""),
+            "copied LLVM runtimes must get an ORIGIN rpath"
+        );
+        assert!(
+            !os_zips.contains("tr -d"),
+            "TELEGRAM_API_ID check must not strip embedded whitespace"
+        );
+        assert!(
+            os_zips.contains("^[0-9]+$"),
+            "TELEGRAM_API_ID must be validated as digits after edge trim"
+        );
+    }
+
+    #[test]
+    fn os_zip_vendored_tdlib_notice_is_boost_license() {
+        let notice = include_str!("../../../../third_party/tdlib/LICENSE_1_0.txt");
+        assert!(
+            notice.starts_with("Boost Software License - Version 1.0 - August 17th, 2003\n"),
+            "TDLib notice must be the upstream Boost license, not a summary"
+        );
+        assert!(notice.contains(
+            "must be included in all copies of the Software, in whole or in part"
+        ));
     }
 }

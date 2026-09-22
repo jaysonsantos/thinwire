@@ -79,9 +79,17 @@ jobs:
           set +x
           set -euo pipefail
           # Do not echo TELEGRAM_API_ID or TELEGRAM_API_HASH.
-          id_compact=$(printf '%s' "$TELEGRAM_API_ID" | tr -d '[:space:]')
-          hash_compact=$(printf '%s' "$TELEGRAM_API_HASH" | tr -d '[:space:]')
-          if [[ -z "$id_compact" || -z "$hash_compact" || ! "$id_compact" =~ ^[0-9]+$ ]]; then
+          # Trim leading and trailing whitespace only. Embedded spaces stay,
+          # so they fail ^[0-9]+$. Cargo still receives the original values.
+          trim_edges() {
+            local s="$1"
+            s="${s#"${s%%[![:space:]]*}"}"
+            s="${s%"${s##*[![:space:]]}"}"
+            printf '%s' "$s"
+          }
+          id_trimmed=$(trim_edges "$TELEGRAM_API_ID")
+          hash_trimmed=$(trim_edges "$TELEGRAM_API_HASH")
+          if [[ -z "$id_trimmed" || -z "$hash_trimmed" || ! "$id_trimmed" =~ ^[0-9]+$ ]]; then
             echo "::error::Official OS zip refused: set repository secrets TELEGRAM_API_ID and TELEGRAM_API_HASH. TELEGRAM_API_ID must be a number. This job will not upload a credentials-missing binary."
             exit 1
           fi
@@ -98,7 +106,43 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
         run: |
           set -euo pipefail
-          mkdir -p dist
+          # Notices land in dist before make_archive. The tdlib-rs prebuilt
+          # zip has no license file. This copy is the Boost Software License
+          # from tdlib/td 11e254af695060d8890024dd7faa1cc2d6685ef8 (1.8.61).
+          mkdir -p dist/THIRD_PARTY_NOTICES
+          cp LICENSE dist/LICENSE
+          tdlib_license=third_party/tdlib/LICENSE_1_0.txt
+          if [[ ! -f "$tdlib_license" ]]; then
+            echo "::error::Missing vendored TDLib Boost license at ${tdlib_license}."
+            exit 1
+          fi
+          cp "$tdlib_license" dist/THIRD_PARTY_NOTICES/tdlib-LICENSE_1_0.txt
+          copy_llvm_notice() {
+            local lib="$1"
+            local owner=""
+            local pkg=""
+            local doc=""
+            local real=""
+            owner=$(dpkg -S "$lib" 2>/dev/null || true)
+            owner=${owner%%$'\n'*}
+            if [[ -z "$owner" ]]; then
+              real=$(readlink -f "$lib")
+              owner=$(dpkg -S "$real" 2>/dev/null || true)
+              owner=${owner%%$'\n'*}
+            fi
+            if [[ -z "$owner" ]]; then
+              echo "::error::No package owns ${lib}; refusing to ship it without its redistribution notice."
+              exit 1
+            fi
+            pkg=${owner%%: /*}
+            pkg=${pkg%%:*}
+            doc="/usr/share/doc/${pkg}/copyright"
+            if [[ ! -f "$doc" ]]; then
+              echo "::error::Redistribution notice missing at ${doc} for ${lib}."
+              exit 1
+            fi
+            cp "$doc" "dist/THIRD_PARTY_NOTICES/${pkg}.copyright"
+          }
           if [[ -f target/release/thinwire.exe ]]; then
             cp target/release/thinwire.exe dist/
             bin=dist/thinwire.exe
@@ -115,7 +159,12 @@ jobs:
                 echo "::error::Linux zip is missing a TDLib C++ runtime library. Refusing to upload a binary that cannot load TDLib."
                 exit 1
               fi
-              cp -L "$lib" "dist/$(basename "$lib")"
+              so="dist/$(basename "$lib")"
+              cp -L "$lib" "$so"
+              # On the runtime itself, so libc++abi and libunwind resolve from
+              # $ORIGIN whether patchelf writes DT_RPATH or DT_RUNPATH.
+              patchelf --set-rpath '$ORIGIN' "$so"
+              copy_llvm_notice "$lib"
               copied=$((copied + 1))
             done < <(ldd "$bin" | awk '/libc\+\+\.so|libc\+\+abi\.so|libunwind\.so/ { print $3 }')
             if [[ "$copied" -lt 1 ]]; then
