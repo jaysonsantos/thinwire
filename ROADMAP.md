@@ -19,7 +19,7 @@ Rule: an ADR accepted is not Done until the matching change is on `main`.
 1. **Other protocols** (only after Telegram feels usable):
   - WhatsApp — experimental, honest ToS labels (`0001`)
   - Discord — bot/OAuth inbox only, no self-bots (`0001`)
-  - Slack — official OAuth (`0001`)
+  - Slack — official OAuth (`0001`). Feature-off spike `slack-oauth` records the workspace-app shape (`0008`) and stays out of the default UI.
 
 ## Explicitly not next
 
