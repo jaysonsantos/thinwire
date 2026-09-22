@@ -248,6 +248,10 @@ mod tests {
             "Linux zips must attach the LLVM runtime package copyright files"
         );
         assert!(
+            os_zips.contains("/usr/share/common-licenses/Apache-2.0"),
+            "Linux LLVM notices must include the Apache-2.0 text the copyright file cites"
+        );
+        assert!(
             os_zips.contains("patchelf --set-rpath '$ORIGIN' \"$so\""),
             "copied LLVM runtimes must get an ORIGIN rpath"
         );
@@ -268,8 +272,8 @@ mod tests {
             notice.starts_with("Boost Software License - Version 1.0 - August 17th, 2003\n"),
             "TDLib notice must be the upstream Boost license, not a summary"
         );
-        assert!(notice.contains(
-            "must be included in all copies of the Software, in whole or in part"
-        ));
+        assert!(
+            notice.contains("must be included in all copies of the Software, in whole or in part")
+        );
     }
 }
