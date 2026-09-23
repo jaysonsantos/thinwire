@@ -1,5 +1,7 @@
 //! Shell: account switcher + inbox on the left, thread in the center.
 
+use std::time::Instant;
+
 use chrono::Local;
 use eframe::egui::{self, Color32, RichText};
 use thinwire_protocol::{Delivery, ProtocolId, SupportClass};
@@ -312,21 +314,23 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
         }
         match snapshot.center_view() {
             CenterView::Auth => auth::draw(ui, snapshot, secrets),
-            CenterView::Resuming { connecting } => resuming(ui, connecting),
+            CenterView::Resuming { connecting } => resuming(ui, snapshot, connecting),
             CenterView::FirstRun => first_run(ui, snapshot, secrets),
             CenterView::Thread => thread(ui, snapshot),
         }
     });
 }
 
-fn resuming(ui: &mut egui::Ui, connecting: bool) {
+fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, connecting: bool) {
     let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
     ui.add_space(top);
     ui.vertical_centered(|ui| {
         ui.spinner();
+        ui.add_space(8.0);
         if connecting {
-            ui.add_space(8.0);
             ui.label(RESUME_CONNECTING);
+        } else {
+            ui.label(snapshot.keychain_wait_text(Instant::now()));
         }
     });
 }

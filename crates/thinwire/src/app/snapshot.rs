@@ -1,6 +1,7 @@
 //! UI-side snapshot. Mutated only on the UI thread from polled events and clicks.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault;
@@ -213,6 +214,16 @@ pub(crate) const SESSION_ENDED_NOTICE: &str = "Your Telegram session ended. Sign
 /// Status line while a new client starts, before the phone step.
 const CONNECTING_STATUS: &str = "Connecting to Telegram…";
 
+/// Center panel copy while the keychain read runs.
+pub(crate) const KEYCHAIN_OPENING: &str = "Opening the keychain…";
+
+/// Center panel copy when the keychain read takes long: a wallet can wait
+/// for an unlock prompt, which may be behind this window.
+pub(crate) const KEYCHAIN_WAITING: &str = "Waiting for the keychain. Unlock it to continue.";
+
+/// After this long, the keychain copy asks the user to unlock it.
+const KEYCHAIN_SLOW_AFTER: Duration = Duration::from_secs(1);
+
 /// Center panel copy while a saved session reconnects.
 pub(crate) const RESUME_CONNECTING: &str = "Connecting to Telegram…";
 
@@ -267,6 +278,8 @@ pub(crate) struct Snapshot {
     pub code_via: Option<TelegramCodeVia>,
     pub telegram_authorized: bool,
     resume: Resume,
+    /// When the UI first saw the keychain read still running.
+    keychain_wait_started: Option<Instant>,
     telegram_messages_from_adapter: u32,
     chat_list_loading: bool,
     history_loading: HashSet<String>,
@@ -326,6 +339,7 @@ impl Snapshot {
             code_via: None,
             telegram_authorized: false,
             resume: Resume::Waiting,
+            keychain_wait_started: None,
             telegram_messages_from_adapter: 0,
             chat_list_loading: false,
             history_loading: HashSet::new(),
@@ -531,7 +545,22 @@ impl Snapshot {
     /// Call once per frame. It acts only after the keychain read settles, and
     /// only once. The UI thread reads memory only; the command has no secret.
     pub(crate) fn poll_resume(&mut self, store: &SecretStore) {
+        if !store.attach_settled() {
+            self.keychain_wait_started.get_or_insert_with(Instant::now);
+        }
         self.try_resume(store, super::auth::tdlib_compiled());
+    }
+
+    /// Copy under the spinner while the keychain read runs. No bare spinner:
+    /// after [`KEYCHAIN_SLOW_AFTER`] it asks the user to unlock the keychain.
+    #[must_use]
+    pub(crate) fn keychain_wait_text(&self, now: Instant) -> &'static str {
+        match self.keychain_wait_started {
+            Some(started) if now.saturating_duration_since(started) >= KEYCHAIN_SLOW_AFTER => {
+                KEYCHAIN_WAITING
+            }
+            _ => KEYCHAIN_OPENING,
+        }
     }
 
     fn try_resume(&mut self, store: &SecretStore, live: bool) {
@@ -2401,6 +2430,32 @@ mod tests {
         store.complete_ready_attach_for_test(&[]);
         snapshot.open_telegram(&store);
         assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
+    }
+
+    #[test]
+    fn a_slow_keychain_read_asks_the_user_to_unlock() {
+        let store = SecretStore::detached_for_test();
+        let mut snapshot = Snapshot::new();
+        snapshot.poll_resume(&store);
+        let started = snapshot.keychain_wait_started.expect("started");
+        assert_eq!(snapshot.keychain_wait_text(started), KEYCHAIN_OPENING);
+        assert_eq!(
+            snapshot.keychain_wait_text(started + KEYCHAIN_SLOW_AFTER),
+            KEYCHAIN_WAITING
+        );
+        snapshot.poll_resume(&store);
+        assert_eq!(
+            snapshot.keychain_wait_started,
+            Some(started),
+            "the clock starts once"
+        );
+        let ui = include_str!("ui.rs");
+        let resuming = &ui[ui.find("fn resuming(").expect("resuming")..];
+        let resuming = &resuming[..resuming.find("\nfn ").expect("next")];
+        assert!(
+            resuming.contains("keychain_wait_text("),
+            "no bare spinner (qa R1)"
+        );
     }
 
     #[test]
