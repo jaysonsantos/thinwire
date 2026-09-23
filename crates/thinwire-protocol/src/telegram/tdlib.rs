@@ -4,10 +4,9 @@
 //! Credential values are read from the vault and never logged.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -15,6 +14,7 @@ use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resol
 use super::inbox::{
     self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook,
 };
+use super::lifecycle::{DoneFlag, WorkerSlots, all_done, mark_done};
 use super::router::Router;
 use crate::adapter::{
     AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthError, TelegramAuthPhase,
@@ -45,8 +45,12 @@ enum TdlibCommand {
     Close,
 }
 
-/// How often the shutdown task checks that every worker has exited.
-const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+/// How often a waiter checks that closing workers have exited.
+const WORKER_POLL: Duration = Duration::from_millis(50);
+
+/// Longest wait for an old client to release the database before a new one
+/// opens it.
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct LiveInbox {
     authorized: bool,
@@ -54,13 +58,13 @@ struct LiveInbox {
     names: NameBook,
 }
 
-/// Owns the command sink into the current worker and counts live workers.
+/// Owns the command sink into the current worker and the workers' done flags.
 ///
 /// A worker never drops its TDLib client without `close`: an unclean exit
 /// aborts the process at exit and can damage the TDLib database.
 pub struct TdlibRuntime {
     commands: Option<UnboundedSender<TdlibCommand>>,
-    live_workers: Arc<AtomicUsize>,
+    slots: WorkerSlots,
 }
 
 impl TdlibRuntime {
@@ -68,26 +72,28 @@ impl TdlibRuntime {
     pub fn new() -> Self {
         Self {
             commands: None,
-            live_workers: Arc::new(AtomicUsize::new(0)),
+            slots: WorkerSlots::new(),
         }
     }
 
-    /// Close the current worker's TDLib client. The next command starts a new one.
+    /// Close the current worker's TDLib client. The next command starts a new
+    /// worker, which waits until this one released the database.
     pub fn stop(&mut self) {
         if let Some(commands) = self.commands.take() {
             let _ = commands.send(TdlibCommand::Close);
         }
+        self.slots.retire_current();
     }
 
     /// Close every TDLib client, then emit `Stopped` once all workers exited.
     pub fn shutdown(&mut self, events: &EventTx) {
         self.stop();
-        let live_workers = Arc::clone(&self.live_workers);
+        let workers = self.slots.all();
         let events = events.clone();
         tokio::spawn(async move {
             // Exit only when no thread is inside TDLib any more.
-            while live_workers.load(Ordering::SeqCst) > 0 || !receiver_idle() {
-                tokio::time::sleep(SHUTDOWN_POLL).await;
+            while !all_done(&workers) || !receiver_idle() {
+                tokio::time::sleep(WORKER_POLL).await;
             }
             emit_stopped(&events, ProtocolId::Telegram);
         });
@@ -172,13 +178,15 @@ impl TdlibRuntime {
         source: TelegramApiSource,
         events: &EventTx,
     ) {
-        let live_workers = Arc::clone(&self.live_workers);
+        let slots = &mut self.slots;
         let sent = super::send_or_respawn(&mut self.commands, command, || {
+            let (done, wait_for) = slots.start();
             spawn_tdlib_worker(
                 Arc::clone(&secrets),
                 source.clone(),
                 events.clone(),
-                Arc::clone(&live_workers),
+                done,
+                wait_for,
             )
         });
         if !sent {
@@ -272,17 +280,28 @@ fn spawn_tdlib_worker(
     secrets: Arc<dyn TelegramSecretVault>,
     source: TelegramApiSource,
     events: EventTx,
-    live_workers: Arc<AtomicUsize>,
+    done: DoneFlag,
+    wait_for: Vec<DoneFlag>,
 ) -> UnboundedSender<TdlibCommand> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    live_workers.fetch_add(1, Ordering::SeqCst);
-    let dispatcher = Dispatcher::get();
-    let client_id = tdlib_rs::create_client();
-    // Register before the first request, so no update for this client is lost.
-    let mut update_rx = dispatcher.register(client_id);
-
     tokio::spawn(async move {
+        // Commands wait in the channel until the old client released the database.
+        if !wait_for_retired(&wait_for).await {
+            emit_status(
+                &events,
+                ProtocolId::Telegram,
+                AdapterStatus::Error,
+                "Telegram is still closing the last session. Cancel and try again.",
+            );
+            mark_done(&done);
+            return;
+        }
+        let dispatcher = Dispatcher::get();
+        let client_id = tdlib_rs::create_client();
+        // Register before the first request, so no update for this client is lost.
+        let mut update_rx = dispatcher.register(client_id);
+
         if tdlib_rs::functions::set_log_verbosity_level(1, client_id)
             .await
             .is_err()
@@ -345,10 +364,22 @@ fn spawn_tdlib_worker(
         }
 
         dispatcher.unregister(client_id);
-        live_workers.fetch_sub(1, Ordering::SeqCst);
+        mark_done(&done);
     });
 
     cmd_tx
+}
+
+/// Wait until every closing worker exited. `false` after [`RETIRE_TIMEOUT`].
+async fn wait_for_retired(workers: &[DoneFlag]) -> bool {
+    let deadline = Instant::now() + RETIRE_TIMEOUT;
+    while !all_done(workers) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(WORKER_POLL).await;
+    }
+    true
 }
 
 /// Next command, or `None` once the sender is gone. Never resolves after that.

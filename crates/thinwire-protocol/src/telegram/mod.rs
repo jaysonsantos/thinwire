@@ -10,6 +10,7 @@ mod credentials;
 mod db_key;
 mod engine;
 mod inbox;
+mod lifecycle;
 mod router;
 
 #[cfg(feature = "telegram-tdlib")]
@@ -640,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_reports_stopped_and_live_workers_close_tdlib_first() {
+    fn shutdown_reports_stopped_and_workers_close_tdlib_first() {
         let mut adapter = TelegramAdapter::memory();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         if !uses_tdlib_hook() {
@@ -667,7 +668,7 @@ mod tests {
             "stop closes, it does not drop"
         );
         let shutdown = fn_body(src, "pub fn shutdown(");
-        assert!(shutdown.contains("live_workers.load"));
+        assert!(shutdown.contains("all_done(&workers)"));
         assert!(shutdown.contains("emit_stopped"));
         assert!(
             shutdown.contains("receiver_idle()"),
@@ -689,13 +690,32 @@ mod tests {
         let unregister = worker
             .find("dispatcher.unregister(client_id)")
             .expect("unregister");
-        let done = worker.find("live_workers.fetch_sub").expect("done");
+        let done = worker.rfind("mark_done(&done)").expect("done");
         assert!(unregister < done);
         assert!(fn_body(src, "async fn request_close").contains("functions::close"));
         assert!(
             !src.contains("generation"),
             "no worker is dropped without close"
         );
+    }
+
+    #[test]
+    fn a_new_client_opens_only_after_the_old_one_released_the_database() {
+        let src = include_str!("tdlib.rs");
+        let stop = &src[src.find("pub fn stop(").expect("stop")
+            ..src.find("pub fn shutdown(").expect("shutdown")];
+        assert!(stop.contains("retire_current()"));
+        let enqueue = fn_body(src, "fn enqueue(");
+        assert!(enqueue.contains("slots.start()"));
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        let wait = worker.find("wait_for_retired(&wait_for)").expect("wait");
+        let create = worker.find("create_client()").expect("create");
+        assert!(
+            wait < create,
+            "wait before the new client opens the database"
+        );
+        let timeout = fn_body(src, "async fn wait_for_retired");
+        assert!(timeout.contains("RETIRE_TIMEOUT"));
     }
 
     #[test]
