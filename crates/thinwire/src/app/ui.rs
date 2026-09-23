@@ -18,6 +18,17 @@ const SUPPORTED: Color32 = Color32::from_rgb(96, 176, 128);
 const EXPERIMENTAL: Color32 = Color32::from_rgb(214, 160, 64);
 const CONSTRAINED: Color32 = Color32::from_rgb(196, 148, 88);
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
+const WARN: Color32 = Color32::from_rgb(214, 160, 64);
+
+/// Shown while the OS keychain is not available. Secrets stay in memory.
+pub(crate) const KEYCHAIN_UNAVAILABLE_NOTICE: &str =
+    "Sign-in is not saved on this device: keychain unavailable.";
+
+/// One notice for the whole window. `None` while the keychain works or loads.
+#[must_use]
+pub(crate) fn keychain_notice(secrets: &SecretStore) -> Option<&'static str> {
+    secrets.memory_only().then_some(KEYCHAIN_UNAVAILABLE_NOTICE)
+}
 const FAILED: Color32 = Color32::from_rgb(200, 80, 80);
 const COMPOSE_MAX_ROWS: usize = 5;
 /// A message bubble uses at most this share of the thread width.
@@ -39,7 +50,7 @@ pub(crate) fn draw(
     #[cfg(not(feature = "whatsapp-web"))]
     let _ = whatsapp_phone;
     top_bar(ui, snapshot, settings, secrets);
-    status_strip(ui, snapshot);
+    status_strip(ui, snapshot, secrets);
     left_panel(ui, snapshot);
     center_panel(ui, snapshot, secrets);
 }
@@ -97,15 +108,18 @@ fn theme_control(ui: &mut egui::Ui, settings: &mut Settings) {
     }
 }
 
-fn status_strip(ui: &mut egui::Ui, snapshot: &Snapshot) {
+fn status_strip(ui: &mut egui::Ui, snapshot: &Snapshot, secrets: &SecretStore) {
     egui::Panel::top("status").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Status").strong());
             // The login form has its own Cancel. One Cancel on screen only.
             ui.label(&snapshot.status_text);
         });
+        if let Some(notice) = keychain_notice(secrets) {
+            ui.colored_label(WARN, notice);
+        }
         if let Some(banner) = super::auth::stub_banner(snapshot) {
-            ui.colored_label(Color32::from_rgb(214, 160, 64), banner);
+            ui.colored_label(WARN, banner);
         }
         if let Some(error) = &snapshot.error {
             let happened = &error.happened;

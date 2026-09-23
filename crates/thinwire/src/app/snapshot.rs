@@ -2147,6 +2147,28 @@ mod tests {
     }
 
     #[test]
+    fn keychain_notice_shows_only_when_secrets_stay_in_memory() {
+        use super::super::ui::{KEYCHAIN_UNAVAILABLE_NOTICE, keychain_notice};
+        assert_eq!(
+            keychain_notice(&SecretStore::memory()),
+            Some(KEYCHAIN_UNAVAILABLE_NOTICE)
+        );
+        let attaching = SecretStore::detached_for_test();
+        assert_eq!(keychain_notice(&attaching), None, "no notice while loading");
+        attaching.complete_ready_attach_for_test(&[]);
+        assert_eq!(keychain_notice(&attaching), None);
+        let ui = include_str!("ui.rs");
+        let strip = &ui[ui.find("fn status_strip(").expect("strip")..];
+        let strip = &strip[..strip.find("\nfn ").expect("next")];
+        assert!(strip.contains("keychain_notice(secrets)"));
+        assert_eq!(
+            ui.matches("keychain_notice(secrets)").count(),
+            1,
+            "one notice only"
+        );
+    }
+
+    #[test]
     fn auth_ui_is_telegram_only_this_beat() {
         let src = include_str!("auth.rs");
         assert!(src.contains("TELEGRAM_API_ID"));

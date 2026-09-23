@@ -148,6 +148,13 @@ impl SecretStore {
         matches!(self.phase(), AttachPhase::Ready | AttachPhase::MemoryOnly)
     }
 
+    /// UI thread: `true` once attach settled without the OS keychain.
+    /// Secrets then live for this session only, so resume cannot work.
+    #[must_use]
+    pub fn memory_only(&self) -> bool {
+        self.phase() == AttachPhase::MemoryOnly
+    }
+
     fn phase(&self) -> AttachPhase {
         self.lock()
             .map(|inner| inner.phase)
