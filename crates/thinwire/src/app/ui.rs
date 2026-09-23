@@ -35,7 +35,7 @@ pub(crate) fn draw(
     #[cfg(not(feature = "whatsapp-web"))]
     let _ = whatsapp_phone;
     top_bar(ui, snapshot, settings, secrets);
-    status_strip(ui, snapshot, secrets);
+    status_strip(ui, snapshot);
     left_panel(ui, snapshot);
     center_panel(ui, snapshot, secrets);
 }
@@ -93,14 +93,12 @@ fn theme_control(ui: &mut egui::Ui, settings: &mut Settings) {
     }
 }
 
-fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+fn status_strip(ui: &mut egui::Ui, snapshot: &Snapshot) {
     egui::Panel::top("status").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Status").strong());
+            // The login form has its own Cancel. One Cancel on screen only.
             ui.label(&snapshot.status_text);
-            if snapshot.auth != super::snapshot::AuthScreen::Idle && ui.button("Cancel").clicked() {
-                snapshot.cancel_auth(secrets);
-            }
         });
         if let Some(banner) = super::auth::stub_banner(snapshot) {
             ui.colored_label(Color32::from_rgb(214, 160, 64), banner);

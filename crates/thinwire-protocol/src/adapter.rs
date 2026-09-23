@@ -125,6 +125,33 @@ impl TelegramAuthStep {
     }
 }
 
+/// Why Telegram refused a login step. Holds an error name or number only,
+/// never a value the user typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramAuthError {
+    PhoneInvalid,
+    CodeInvalid,
+    CodeExpired,
+    PasswordInvalid,
+    /// Too many tries. Telegram asks the client to wait this long.
+    FloodWait {
+        seconds: u32,
+    },
+    /// Any other error. Only the numeric code crosses the channel.
+    Other {
+        code: i32,
+    },
+}
+
+/// How Telegram delivered the login code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramCodeVia {
+    TelegramApp,
+    Sms,
+    Call,
+    Other,
+}
+
 /// Telegram login phase reported to the UI. Never carries credential values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelegramAuthPhase {
@@ -234,6 +261,14 @@ pub enum AdapterEvent {
     /// Telegram login state machine. The UI applies this on the next poll.
     TelegramAuth {
         phase: TelegramAuthPhase,
+    },
+    /// Telegram refused the last login step. Sent just before the `Failed` phase.
+    TelegramAuthRejected {
+        error: TelegramAuthError,
+    },
+    /// Telegram sent a login code. Sent just before the `NeedCode` phase.
+    TelegramCodeSent {
+        via: TelegramCodeVia,
     },
     /// Ask the UI to flush persistent vault keys to the OS keychain.
     /// Never carries secret values.
@@ -420,6 +455,16 @@ pub(crate) fn emit_message(events: &EventTx, message: ChatMessage) {
 
 pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
     let _ = events.send(AdapterEvent::TelegramAuth { phase });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_telegram_auth_rejected(events: &EventTx, error: TelegramAuthError) {
+    let _ = events.send(AdapterEvent::TelegramAuthRejected { error });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_telegram_code_sent(events: &EventTx, via: TelegramCodeVia) {
+    let _ = events.send(AdapterEvent::TelegramCodeSent { via });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]

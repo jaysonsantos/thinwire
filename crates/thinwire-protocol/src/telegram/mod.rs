@@ -5,6 +5,7 @@
 //! credentials from [`TelegramSecretVault`] — never put them on commands, never
 //! log them, never commit them.
 
+mod auth_error;
 mod credentials;
 mod db_key;
 mod engine;
@@ -596,6 +597,21 @@ mod tests {
         let mapped = fn_body(src, "fn emit_mapped_message");
         assert!(mapped.contains("MessageSendingState::Pending"));
         assert!(mapped.contains("MessageSendingState::Failed"));
+    }
+
+    #[test]
+    fn live_tdlib_reports_why_a_login_step_failed_and_where_the_code_went() {
+        let src = include_str!("tdlib.rs");
+        let steps = fn_body(src, "async fn apply_step");
+        assert_eq!(steps.matches("reject_step(events, &error)").count(), 3);
+        let reject = fn_body(src, "fn reject_step");
+        assert!(reject.contains("auth_error_from_tdlib(error.code, &error.message)"));
+        assert!(reject.contains("emit_telegram_auth_rejected"));
+        assert!(reject.contains("TelegramAuthPhase::Failed"));
+        let auth = fn_body(src, "async fn apply_authorization");
+        assert!(auth.contains("emit_telegram_code_sent(events, code_via("));
+        assert!(!auth.contains("optional 2FA"));
+        assert!(!src.contains("TDLib worker is not running"));
     }
 
     #[test]

@@ -6,8 +6,9 @@ use std::collections::{HashMap, HashSet};
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
     AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery,
-    DiscordAdapter, ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthPhase,
-    TelegramAuthStep, TelegramSecretVault, catalog, parse_telegram_chat_id, telegram_api_available,
+    DiscordAdapter, ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthError,
+    TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, TelegramSecretVault, catalog,
+    parse_telegram_chat_id, telegram_api_available,
 };
 
 use super::secrets::{SecretKey, SecretStore};
@@ -131,6 +132,64 @@ pub(crate) enum ThreadState {
     Empty,
 }
 
+/// Keys the login form reacts to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthKey {
+    Enter,
+    Escape,
+}
+
+/// Error block for a refused login step. Only the error kind is shown.
+#[must_use]
+pub(crate) fn auth_user_error(reason: Option<TelegramAuthError>) -> UserError {
+    let (happened, why, next) = match reason {
+        Some(TelegramAuthError::PhoneInvalid) => (
+            "Telegram did not accept the phone number.",
+            "The number format is not valid.".to_string(),
+            "Check the number. Use + and the country code.".to_string(),
+        ),
+        Some(TelegramAuthError::CodeInvalid) => (
+            "Telegram did not accept the code.",
+            "The code is wrong.".to_string(),
+            "Type it again.".to_string(),
+        ),
+        Some(TelegramAuthError::CodeExpired) => (
+            "Telegram did not accept the code.",
+            "The code expired.".to_string(),
+            "Press Send a new code.".to_string(),
+        ),
+        Some(TelegramAuthError::PasswordInvalid) => (
+            "Telegram did not accept the password.",
+            "The password is wrong.".to_string(),
+            "Type it again.".to_string(),
+        ),
+        Some(TelegramAuthError::FloodWait { seconds }) => {
+            let minutes = seconds.div_ceil(60).max(1);
+            let unit = if minutes == 1 { "minute" } else { "minutes" };
+            (
+                "Telegram paused the login.",
+                "Too many tries.".to_string(),
+                format!("Wait {minutes} {unit}, then try again."),
+            )
+        }
+        Some(TelegramAuthError::Other { code }) => (
+            "Telegram login did not advance.",
+            format!("Telegram did not accept this step (error {code})."),
+            "Correct the field, or press Cancel.".to_string(),
+        ),
+        None => (
+            "Telegram login did not advance.",
+            "Telegram did not accept this step.".to_string(),
+            "Correct the field, or press Cancel.".to_string(),
+        ),
+    };
+    UserError {
+        happened: happened.into(),
+        why,
+        next,
+    }
+}
+
 /// Copy on the phone step when a saved session no longer works.
 pub(crate) const SESSION_ENDED_NOTICE: &str = "Your Telegram session ended. Sign in again.";
 
@@ -182,6 +241,10 @@ pub(crate) struct Snapshot {
     pub auth_busy: bool,
     /// One line above the active login form. Never holds a secret.
     pub auth_notice: Option<&'static str>,
+    /// Why Telegram refused the last login step, if it said.
+    pub auth_rejection: Option<TelegramAuthError>,
+    /// Where Telegram sent the login code, if it said.
+    pub code_via: Option<TelegramCodeVia>,
     pub telegram_authorized: bool,
     resume: Resume,
     telegram_messages_from_adapter: u32,
@@ -236,6 +299,8 @@ impl Snapshot {
             compose: String::new(),
             auth_busy: false,
             auth_notice: None,
+            auth_rejection: None,
+            code_via: None,
             telegram_authorized: false,
             resume: Resume::Waiting,
             telegram_messages_from_adapter: 0,
@@ -381,6 +446,12 @@ impl Snapshot {
                 message_ids,
             } => self.remove_messages(protocol, &conversation_id, &message_ids),
             AdapterEvent::TelegramAuth { phase } => self.apply_telegram_phase(phase),
+            AdapterEvent::TelegramAuthRejected { error } => {
+                self.auth_rejection = Some(error);
+            }
+            AdapterEvent::TelegramCodeSent { via } => {
+                self.code_via = Some(via);
+            }
             AdapterEvent::FlushSecrets => {
                 self.keychain_flush = true;
             }
@@ -791,12 +862,58 @@ impl Snapshot {
                 self.mark_auth_busy("Telegram: login code stored. Waiting for the next step.");
             }
             AuthScreen::Telegram2fa => {
+                // TDLib asks for a password only when the account has one.
+                if self.telegram_2fa.is_empty() {
+                    return;
+                }
                 store.set_secret(SecretKey::Password, &self.telegram_2fa);
                 self.queue_telegram_step(TelegramAuthStep::TwoFactor);
-                self.mark_auth_busy("Telegram: optional 2FA submitted. Waiting for authorization.");
+                self.mark_auth_busy("Telegram: password sent. Waiting for Telegram.");
             }
             AuthScreen::NeedCredentials | AuthScreen::Idle => {}
         }
+    }
+
+    /// Enter submits the current login step. Escape cancels the login.
+    pub(crate) fn auth_key(&mut self, key: AuthKey, store: &SecretStore) {
+        if self.auth == AuthScreen::Idle {
+            return;
+        }
+        match key {
+            AuthKey::Enter => self.advance_telegram(store),
+            AuthKey::Escape => self.cancel_auth(store),
+        }
+    }
+
+    /// The submit button is enabled. The 2FA step needs a password.
+    #[must_use]
+    pub(crate) fn can_submit_auth(&self) -> bool {
+        !self.auth_busy && !(self.auth == AuthScreen::Telegram2fa && self.telegram_2fa.is_empty())
+    }
+
+    /// Back from the code step to the phone step. No command: the next phone
+    /// submit asks Telegram for a new code.
+    pub(crate) fn change_number(&mut self) {
+        if self.auth != AuthScreen::TelegramCode {
+            return;
+        }
+        self.auth = AuthScreen::TelegramPhone;
+        self.auth_busy = false;
+        self.telegram_code.clear();
+        self.code_via = None;
+        self.auth_rejection = None;
+        self.error = None;
+        self.status_text = "Telegram: enter a phone number.".into();
+    }
+
+    /// Ask for a new code: submit the same phone number again.
+    pub(crate) fn resend_code(&mut self, store: &SecretStore) {
+        if self.auth != AuthScreen::TelegramCode || self.auth_busy {
+            return;
+        }
+        self.telegram_code.clear();
+        self.auth = AuthScreen::TelegramPhone;
+        self.advance_telegram(store);
     }
 
     /// Queue the compose text. Does nothing when [`Self::can_send`] is false;
@@ -857,6 +974,7 @@ impl Snapshot {
         self.auth_busy = false;
         if phase != TelegramAuthPhase::Failed {
             self.error = None;
+            self.auth_rejection = None;
         }
         let resuming = std::mem::replace(&mut self.resume, Resume::Settled) == Resume::Connecting;
         self.auth_notice = None;
@@ -879,17 +997,12 @@ impl Snapshot {
             }
             TelegramAuthPhase::NeedTwoFactor => {
                 self.auth = AuthScreen::Telegram2fa;
-                self.status_text =
-                    "Telegram: optional 2FA. Leave blank to skip if this account has none.".into();
+                self.status_text = "Telegram: enter your Telegram password.".into();
             }
             TelegramAuthPhase::Ready => self.finish_telegram_ready(),
             TelegramAuthPhase::Unavailable => self.finish_telegram_unavailable(),
             TelegramAuthPhase::Failed => {
-                self.set_error(
-                    "Telegram login did not advance.",
-                    "The adapter rejected this step.",
-                    "Correct the field, or press Cancel. Values are not logged.",
-                );
+                self.error = Some(auth_user_error(self.auth_rejection));
             }
         }
     }
@@ -946,6 +1059,7 @@ impl Snapshot {
 
     fn mark_auth_busy(&mut self, status: &str) {
         self.auth_busy = true;
+        self.auth_rejection = None;
         self.error = None;
         self.status_text = status.into();
     }
@@ -964,6 +1078,8 @@ impl Snapshot {
 
     fn clear_secrets(&mut self) {
         self.auth_notice = None;
+        self.auth_rejection = None;
+        self.code_via = None;
         self.telegram_api_id.clear();
         self.telegram_api_hash.clear();
         self.telegram_phone.clear();
@@ -1275,6 +1391,7 @@ mod tests {
         snapshot.telegram_code = "12345".into();
         submit_and_apply(snapshot, store, TelegramAuthPhase::NeedTwoFactor);
         assert_eq!(snapshot.auth, AuthScreen::Telegram2fa);
+        snapshot.telegram_2fa = "2fa-secret".into();
         submit_and_apply(snapshot, store, TelegramAuthPhase::Ready);
         assert_eq!(snapshot.auth, AuthScreen::Idle);
         assert!(snapshot.telegram_ready());
@@ -1756,6 +1873,242 @@ mod tests {
         assert!(ui.contains("\"Retry\""));
     }
 
+    fn auth_steps(snapshot: &mut Snapshot) -> Vec<TelegramAuthStep> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::TelegramAuth { step } => Some(step),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn at_phone_step(store: &SecretStore) -> Snapshot {
+        seed_override(store);
+        let mut snapshot = Snapshot::new();
+        snapshot.open_telegram(store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        snapshot.take_commands();
+        snapshot
+    }
+
+    #[test]
+    fn auth_error_table_gives_each_refusal_its_own_copy() {
+        let cases = [
+            (
+                Some(TelegramAuthError::PhoneInvalid),
+                "Check the number. Use + and the country code.",
+            ),
+            (Some(TelegramAuthError::CodeInvalid), "Type it again."),
+            (
+                Some(TelegramAuthError::CodeExpired),
+                "Press Send a new code.",
+            ),
+            (Some(TelegramAuthError::PasswordInvalid), "Type it again."),
+            (
+                Some(TelegramAuthError::FloodWait { seconds: 30 }),
+                "Wait 1 minute, then try again.",
+            ),
+            (
+                Some(TelegramAuthError::FloodWait { seconds: 125 }),
+                "Wait 3 minutes, then try again.",
+            ),
+            (
+                Some(TelegramAuthError::Other { code: 406 }),
+                "Correct the field, or press Cancel.",
+            ),
+            (None, "Correct the field, or press Cancel."),
+        ];
+        for (reason, next) in cases {
+            let error = auth_user_error(reason);
+            assert_eq!(error.next, next, "{reason:?}");
+            for text in [&error.happened, &error.why, &error.next] {
+                assert!(!text.contains("adapter"), "{text}");
+                assert!(!text.contains("TDLib"), "{text}");
+            }
+        }
+        assert_eq!(
+            auth_user_error(Some(TelegramAuthError::CodeInvalid)).why,
+            "The code is wrong."
+        );
+        assert_eq!(
+            auth_user_error(Some(TelegramAuthError::CodeExpired)).why,
+            "The code expired."
+        );
+        assert_eq!(
+            auth_user_error(Some(TelegramAuthError::PasswordInvalid)).why,
+            "The password is wrong."
+        );
+        assert!(
+            auth_user_error(Some(TelegramAuthError::Other { code: 406 }))
+                .why
+                .contains("406")
+        );
+    }
+
+    #[test]
+    fn rejected_step_shows_the_specific_error_then_clears() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        snapshot.telegram_phone = "12".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.apply(AdapterEvent::TelegramAuthRejected {
+            error: TelegramAuthError::PhoneInvalid,
+        });
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Failed,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert!(!snapshot.auth_busy);
+        let error = snapshot.error.clone().expect("error");
+        assert_eq!(error.next, "Check the number. Use + and the country code.");
+
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.apply(AdapterEvent::TelegramCodeSent {
+            via: TelegramCodeVia::Sms,
+        });
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedCode,
+        });
+        assert!(snapshot.error.is_none());
+        assert_eq!(snapshot.auth_rejection, None);
+        assert_eq!(snapshot.code_via, Some(TelegramCodeVia::Sms));
+
+        snapshot.telegram_code = "11111".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Failed,
+        });
+        assert_eq!(
+            snapshot.error.clone().expect("generic").why,
+            "Telegram did not accept this step."
+        );
+    }
+
+    #[test]
+    fn enter_on_each_step_queues_exactly_one_auth_step() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.auth_key(AuthKey::Enter, &store);
+        assert_eq!(auth_steps(&mut snapshot), vec![TelegramAuthStep::Phone]);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedCode,
+        });
+        snapshot.telegram_code = "12345".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.auth_key(AuthKey::Enter, &store);
+        assert_eq!(auth_steps(&mut snapshot), vec![TelegramAuthStep::Code]);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedTwoFactor,
+        });
+        snapshot.telegram_2fa = "2fa-secret".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.auth_key(AuthKey::Enter, &store);
+        assert_eq!(auth_steps(&mut snapshot), vec![TelegramAuthStep::TwoFactor]);
+    }
+
+    #[test]
+    fn empty_two_step_password_cannot_submit() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedTwoFactor,
+        });
+        assert!(!snapshot.can_submit_auth());
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.advance_telegram(&store);
+        assert!(auth_steps(&mut snapshot).is_empty());
+        assert!(!snapshot.auth_busy, "the screen does not hang in busy");
+        snapshot.telegram_2fa = "x".into();
+        assert!(snapshot.can_submit_auth());
+    }
+
+    #[test]
+    fn escape_cancels_and_change_number_goes_back_without_a_command() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedCode,
+        });
+        snapshot.take_commands();
+        snapshot.telegram_code = "123".into();
+        snapshot.change_number();
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert!(snapshot.telegram_code.is_empty());
+        assert!(snapshot.take_commands().is_empty());
+
+        snapshot.auth_key(AuthKey::Escape, &store);
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(snapshot.telegram_phone.is_empty());
+    }
+
+    #[test]
+    fn send_a_new_code_submits_the_phone_again() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedCode,
+        });
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::TelegramAuthRejected {
+            error: TelegramAuthError::CodeExpired,
+        });
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Failed,
+        });
+        snapshot.resend_code(&store);
+        snapshot.resend_code(&store);
+        assert_eq!(auth_steps(&mut snapshot), vec![TelegramAuthStep::Phone]);
+        assert!(snapshot.auth_busy);
+    }
+
+    #[test]
+    fn login_copy_has_no_developer_words_and_one_cancel() {
+        let auth = include_str!("auth.rs");
+        let draw = &auth[auth.find("pub(crate) fn draw(").expect("draw")..];
+        let draw = &draw[..draw.find("fn need_credentials(").expect("next")];
+        for word in ["adapter", "UI thread", "TDLib", "tdlib-rs", "secret store"] {
+            assert!(!draw.contains(word), "{word}");
+        }
+        let steps = &auth[auth.find("fn telegram_phone(").expect("phone")..];
+        for word in [
+            "adapter",
+            "UI thread",
+            "TDLib",
+            "secret store",
+            "Optional",
+            "optional",
+        ] {
+            assert!(!steps.contains(word), "{word}");
+        }
+        assert!(!super::super::auth::TELEGRAM_STUB_UNTIL_READY.contains("TDLib"));
+        assert!(auth.contains("\"Two-step verification\""));
+        assert!(auth.contains("\"Enter your Telegram password.\""));
+        assert!(auth.contains("hint_text(\"12345\")"));
+        assert!(auth.contains("\"Change number\""));
+        assert!(auth.contains("\"Send a new code\""));
+        let code = &auth[auth.find("fn telegram_code(").expect("code")..];
+        let code = &code[..code.find("\nfn ").expect("next")];
+        assert!(
+            !code.contains("password(true)"),
+            "the code field shows digits"
+        );
+        let ui = include_str!("ui.rs");
+        let strip = &ui[ui.find("fn status_strip(").expect("strip")..];
+        let strip = &strip[..strip.find("\nfn ").expect("next")];
+        assert!(!strip.contains("\"Cancel\""));
+    }
+
     #[test]
     fn auth_ui_is_telegram_only_this_beat() {
         let src = include_str!("auth.rs");
@@ -2025,6 +2378,7 @@ mod tests {
         assert!(!debug.contains("hash-value"));
         assert!(!debug.contains("+15551234567"));
         assert!(!debug.contains("12345"));
+        assert!(!debug.contains("2fa-secret"));
         assert!(!snapshot.take_keychain_flush());
     }
 

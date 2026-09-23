@@ -13,7 +13,8 @@ mod whatsapp;
 pub use adapter::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery,
     DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    RedactedPairingSecret, SupportClass, TelegramAuthPhase, TelegramAuthStep,
+    RedactedPairingSecret, SupportClass, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
+    TelegramCodeVia,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,

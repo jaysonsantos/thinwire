@@ -13,10 +13,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
 use super::inbox::{self, ChatDirectory, ChatEffect, InboxMessage, MessageParty, NameBook};
 use crate::adapter::{
-    AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthPhase, TelegramAuthStep,
-    emit_chat_list_loaded, emit_conversation, emit_conversation_removed, emit_history_loaded,
-    emit_message, emit_message_body, emit_message_delivery, emit_message_replaced,
-    emit_messages_removed, emit_status, emit_telegram_auth,
+    AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthError, TelegramAuthPhase,
+    TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
+    emit_conversation_removed, emit_history_loaded, emit_message, emit_message_body,
+    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_status,
+    emit_telegram_auth, emit_telegram_auth_rejected, emit_telegram_code_sent,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -159,7 +160,7 @@ impl TdlibRuntime {
                 events,
                 ProtocolId::Telegram,
                 AdapterStatus::Error,
-                "TDLib worker is not running. Cancel and try again.",
+                "Telegram stopped. Cancel and try again.",
             );
         }
     }
@@ -288,11 +289,10 @@ async fn apply_step(
                 );
                 return;
             };
-            if tdlib_rs::functions::set_authentication_phone_number(phone, None, client_id)
-                .await
-                .is_err()
+            if let Err(error) =
+                tdlib_rs::functions::set_authentication_phone_number(phone, None, client_id).await
             {
-                emit_telegram_auth(events, TelegramAuthPhase::Failed);
+                reject_step(events, &error);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -312,11 +312,10 @@ async fn apply_step(
                 );
                 return;
             };
-            if tdlib_rs::functions::check_authentication_code(code, client_id)
-                .await
-                .is_err()
+            if let Err(error) =
+                tdlib_rs::functions::check_authentication_code(code, client_id).await
             {
-                emit_telegram_auth(events, TelegramAuthPhase::Failed);
+                reject_step(events, &error);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -332,11 +331,10 @@ async fn apply_step(
             if password.is_empty() {
                 return;
             }
-            if tdlib_rs::functions::check_authentication_password(password, client_id)
-                .await
-                .is_err()
+            if let Err(error) =
+                tdlib_rs::functions::check_authentication_password(password, client_id).await
             {
-                emit_telegram_auth(events, TelegramAuthPhase::Failed);
+                reject_step(events, &error);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -345,6 +343,25 @@ async fn apply_step(
                 );
             }
         }
+    }
+}
+
+/// Report why TDLib refused a login step, then the `Failed` phase.
+/// Only the error name and code are read; the typed value is never echoed.
+fn reject_step(events: &EventTx, error: &tdlib_rs::types::Error) {
+    let reason: TelegramAuthError =
+        super::auth_error::auth_error_from_tdlib(error.code, &error.message);
+    emit_telegram_auth_rejected(events, reason);
+    emit_telegram_auth(events, TelegramAuthPhase::Failed);
+}
+
+fn code_via(kind: &tdlib_rs::enums::AuthenticationCodeType) -> TelegramCodeVia {
+    use tdlib_rs::enums::AuthenticationCodeType as Kind;
+    match kind {
+        Kind::TelegramMessage(_) => TelegramCodeVia::TelegramApp,
+        Kind::Sms(_) | Kind::SmsWord(_) | Kind::SmsPhrase(_) => TelegramCodeVia::Sms,
+        Kind::Call(_) | Kind::FlashCall(_) | Kind::MissedCall(_) => TelegramCodeVia::Call,
+        _ => TelegramCodeVia::Other,
     }
 }
 
@@ -406,7 +423,8 @@ async fn apply_authorization(
                 "Telegram needs a phone number. Values stay in the secret store.",
             );
         }
-        tdlib_rs::enums::AuthorizationState::WaitCode(_) => {
+        tdlib_rs::enums::AuthorizationState::WaitCode(state) => {
+            emit_telegram_code_sent(events, code_via(&state.code_info.r#type));
             emit_telegram_auth(events, TelegramAuthPhase::NeedCode);
             emit_status(
                 events,
@@ -421,7 +439,7 @@ async fn apply_authorization(
                 events,
                 ProtocolId::Telegram,
                 AdapterStatus::Connecting,
-                "Telegram needs the optional 2FA password. Leave blank only if this account has none.",
+                "Telegram needs the account password (two-step verification).",
             );
         }
         tdlib_rs::enums::AuthorizationState::Ready => {
