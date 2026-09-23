@@ -26,4 +26,6 @@ Hard constraints:
 ## Consequences
 A later beat can attach a gateway on the tokio worker without revisiting the crate choice or the user-token refusal. Until Telegram messages work, the shell does not show this inbox.
 
+**Amendment (2026-09-23):** The product lock changed. Discord work runs in parallel with Telegram and does not wait for Telegram messages. Issue #35 removes the Telegram-messages visibility gate. The bot/OAuth-only rule, the user-token refusal, and feature-off default CI do not change.
+
 Rejected: serenity; a user-token or self-bot client; compiling twilight in default CI; a Discord login screen in this beat.

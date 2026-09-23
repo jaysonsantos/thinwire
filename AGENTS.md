@@ -8,7 +8,8 @@
 - Never claim WhatsApp or Discord personal clients are “reliable”
 - Discord: no self-bots / user-account automation
 - UI: egui + eframe; protocol work off the UI thread
-- First-run / Add account this beat: Telegram only (no WA / Discord / Slack auth UI)
+- WhatsApp, Discord, and Slack work runs in parallel with Telegram (lock change 2026-09-23). It does not wait for "Telegram feels usable"
+- Default build: First-run / Add account offer Telegram only. WA / Discord / Slack auth UI exists only when its cargo feature is on. Default and public CI stay feature-off
 - Theme default is System (follow OS light/dark live via egui `system_theme`; persist System \| Light \| Dark)
 - Ordered next work: see `ROADMAP.md`
 
@@ -17,7 +18,7 @@
 - Rust 2024 workspace, egui/eframe, tokio for async adapters
 - Telegram: TDLib / tdlib-rs preferred
 - WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk. Experimental spike is feature `whatsapp-web` (`whatsapp-rust`, git rev pinned). Not the default UI. Default CI stays feature-off. Full-screen ToS/ban gate before any QR or pair UI. Session file stays in app-data. Never call it reliable.
-- Discord: bot/OAuth guild inbox only — no self-bots / personal DMs / user tokens. Feature `discord-bot` (twilight) is a hidden spike until Telegram messages work. ADR `0009-discord-bot-inbox-spike`. Default CI stays feature-off.
+- Discord: bot/OAuth guild inbox only — no self-bots / personal DMs / user tokens. Feature `discord-bot` (twilight) is off by default. The inbox must not wait for Telegram messages (lock change 2026-09-23); the code gate that waits is removed in #35. ADR `0009-discord-bot-inbox-spike`. Default CI stays feature-off.
 - Slack: official OAuth only — workspace app, not a personal desktop clone
 - Signal: out of v1 (S2); no libsignal / Presage
 - Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session and the Discord bot token (`discord.bot_token`). Phone / code / 2FA stay in the memory vault only. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets. Never put secrets on `AdapterCommand`. Never commit a Discord token.
@@ -30,13 +31,14 @@
 | Path | Purpose |
 | --- | --- |
 | `crates/thinwire/` | Desktop binary: egui shell, Telegram login, keychain, system theme, inbox |
-| `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings |
-| `decisions/` | ADRs (0002 glow, 0004 Signal out, 0005 system theme, `0006-live-tdlib`, `0007-publisher-telegram-api-credentials`, `0008-slack-oauth-workspace-spike`, `0009-discord-bot-inbox-spike`) |
+| `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings, and the Telegram / Slack / WhatsApp / Discord adapters (`telegram/`, `slack/`, `whatsapp/`, `discord/`) |
+| `decisions/` | ADRs (0001 option B, 0002 glow, 0003 main-only artifacts, 0004 Signal out, 0005 system theme, `0006-live-tdlib`, `0007-publisher-telegram-api-credentials`, `0008-slack-oauth-workspace-spike`, `0009-discord-bot-inbox-spike`) |
 | `ROADMAP.md` | Ordered product-council todo list (ADRs stay in `decisions/`) |
 | `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |
 | `.github/workflows/ci.yml` | Parallel lint/test/build plus the `check` guard |
+| `.github/workflows/os-zips.yml` | Main-only unsigned OS zips with `telegram-tdlib` and publisher secrets (ADR 0003, 0007) |
 | `.github/workflows/release-tag.yml` | Manual tag. No distroless GUI image |
 
 ## Commands

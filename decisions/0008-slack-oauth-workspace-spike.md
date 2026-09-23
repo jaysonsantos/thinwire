@@ -1,6 +1,6 @@
 # Slack official OAuth workspace spike
 
-**Status:** spike (scaffold). Chat list + messages on TDLib are Done on `main`. Slack auth UI stays out of the default shell; feature `slack-oauth` stays off until other-protocol work is Next.
+**Status:** spike (scaffold). Chat list + messages on TDLib are Done on `main`. Slack auth UI stays out of the default shell; feature `slack-oauth` stays off in the default build and public CI. Amendment (2026-09-23): Slack work runs in parallel with Telegram (#36); official OAuth only.
 
 ## Context
 Product lock (`0001`) names Slack as official OAuth, a workspace app, not a personal desktop clone. This beat only scaffolds that path. It does not install an app, open a socket, or show a Slack login screen.
