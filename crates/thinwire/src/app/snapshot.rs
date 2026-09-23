@@ -87,6 +87,9 @@ pub(crate) enum AuthScreen {
     Idle,
     NeedCredentials,
     TelegramApi,
+    /// The client is starting. The phone step shows only after the adapter
+    /// reports `NeedPhone` (TDLib `authorizationStateWaitPhoneNumber`).
+    TelegramConnecting,
     TelegramPhone,
     TelegramCode,
     Telegram2fa,
@@ -199,6 +202,9 @@ pub(crate) fn auth_user_error(reason: Option<TelegramAuthError>) -> UserError {
 
 /// Copy on the phone step when a saved session no longer works.
 pub(crate) const SESSION_ENDED_NOTICE: &str = "Your Telegram session ended. Sign in again.";
+
+/// Status line while a new client starts, before the phone step.
+const CONNECTING_STATUS: &str = "Connecting to Telegram…";
 
 /// Center panel copy while a saved session reconnects.
 pub(crate) const RESUME_CONNECTING: &str = "Connecting to Telegram…";
@@ -863,6 +869,11 @@ impl Snapshot {
                     "Telegram: api credentials stored. Waiting for the next login step.",
                 );
             }
+            AuthScreen::TelegramConnecting => {
+                // Try again after a failed start. The adapter reports NeedPhone.
+                self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
+                self.mark_auth_busy(CONNECTING_STATUS);
+            }
             AuthScreen::TelegramPhone => {
                 let phone = self.telegram_phone.clone();
                 if !self.require_field("phone number", &phone) {
@@ -998,9 +1009,9 @@ impl Snapshot {
     }
 
     fn start_phone_login(&mut self) {
-        self.auth = AuthScreen::TelegramPhone;
+        self.auth = AuthScreen::TelegramConnecting;
         self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
-        self.mark_auth_busy("Telegram: using stored or publisher API credentials. Enter a phone number when the next step is ready.");
+        self.mark_auth_busy(CONNECTING_STATUS);
     }
 
     fn apply_telegram_phase(&mut self, phase: TelegramAuthPhase) {
@@ -2218,7 +2229,7 @@ mod tests {
         snapshot.center_key(AuthKey::Enter, &store);
         assert_eq!(
             snapshot.auth,
-            AuthScreen::TelegramPhone,
+            AuthScreen::TelegramConnecting,
             "Enter = Add Telegram"
         );
         assert_eq!(
@@ -2290,6 +2301,44 @@ mod tests {
             }
         )));
         assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+    }
+
+    #[test]
+    fn phone_step_shows_only_after_the_adapter_asks_for_it() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        let mut snapshot = Snapshot::new();
+        snapshot.open_telegram(&store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ApiCredentials]
+        );
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.center_key(AuthKey::Enter, &store);
+        assert!(
+            auth_steps(&mut snapshot).is_empty(),
+            "no phone before NeedPhone"
+        );
+
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Failed,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
+        assert!(snapshot.can_submit_auth(), "Try again is enabled");
+        snapshot.center_key(AuthKey::Enter, &store);
+        snapshot.center_key(AuthKey::Enter, &store);
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ApiCredentials],
+            "Try again starts the client once"
+        );
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        let auth = include_str!("auth.rs");
+        assert!(auth.contains("\"Try again\""));
     }
 
     #[test]
@@ -2408,7 +2457,7 @@ mod tests {
         let mut snapshot =
             Snapshot::with_api_source(TelegramApiSource::with_publisher("11111", "publisher-hash"));
         snapshot.open_telegram(&store);
-        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
         assert!(snapshot.auth_busy);
         assert!(!snapshot.telegram_ready());
         let commands = snapshot.take_commands();
@@ -2427,7 +2476,7 @@ mod tests {
         seed_override(&store);
         let mut snapshot = Snapshot::new();
         snapshot.open_telegram(&store);
-        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
         assert!(snapshot.has_api_credentials(&store));
     }
 
@@ -2437,7 +2486,7 @@ mod tests {
         seed_override(&store);
         let mut snapshot = Snapshot::new();
         snapshot.open_telegram(&store);
-        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
         assert!(snapshot.auth_busy);
         snapshot.apply(AdapterEvent::TelegramAuth {
             phase: TelegramAuthPhase::NeedPhone,
@@ -2655,7 +2704,7 @@ mod tests {
             detail: "telegram api_id must be a number".into(),
         });
         assert!(!snapshot.auth_busy);
-        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
         assert!(!snapshot.status_text.contains("11111"));
     }
 

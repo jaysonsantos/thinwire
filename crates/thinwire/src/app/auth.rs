@@ -65,6 +65,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
         AuthScreen::Idle => {}
         AuthScreen::NeedCredentials => need_credentials(ui, snapshot, secrets),
         AuthScreen::TelegramApi => telegram_api(ui, snapshot, secrets, focus),
+        AuthScreen::TelegramConnecting => telegram_connecting(ui, snapshot, secrets),
         AuthScreen::TelegramPhone => telegram_phone(ui, snapshot, secrets, focus),
         AuthScreen::TelegramCode => telegram_code(ui, snapshot, secrets, focus),
         AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot, secrets, focus),
@@ -100,7 +101,9 @@ fn auth_heading(auth: AuthScreen) -> &'static str {
     match auth {
         AuthScreen::NeedCredentials => "Telegram API credentials missing",
         AuthScreen::TelegramApi => "Advanced: custom Telegram API credentials",
-        AuthScreen::TelegramPhone | AuthScreen::TelegramCode => "Add Telegram account",
+        AuthScreen::TelegramConnecting | AuthScreen::TelegramPhone | AuthScreen::TelegramCode => {
+            "Add Telegram account"
+        }
         AuthScreen::Telegram2fa => "Two-step verification",
         AuthScreen::Idle => "",
     }
@@ -149,6 +152,14 @@ fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
         );
     });
     continue_button(ui, snapshot, secrets, "Save override");
+}
+
+/// Between Add Telegram and the phone step. Busy shows the spinner above;
+/// after a failed start, the error block explains and Try again retries.
+fn telegram_connecting(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+    if !snapshot.auth_busy {
+        continue_button(ui, snapshot, secrets, "Try again");
+    }
 }
 
 fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
