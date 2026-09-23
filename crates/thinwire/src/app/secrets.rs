@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use keyring_core::Entry;
 use thinwire_protocol::{
@@ -50,6 +50,44 @@ impl fmt::Display for SecretError {
 
 impl std::error::Error for SecretError {}
 
+/// OS store in use after attach. Linux tries them in [`LINUX_BACKENDS`] order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsBackend {
+    /// D-Bus Secret Service: KDE Wallet or GNOME Keyring. Kept across restarts.
+    SecretService,
+    /// Kernel keyutils. The keyring is lost when the computer restarts.
+    KernelKeyring,
+    /// macOS Keychain or Windows Credential Manager.
+    Native,
+}
+
+impl OsBackend {
+    #[must_use]
+    pub const fn survives_restart(self) -> bool {
+        !matches!(self, Self::KernelKeyring)
+    }
+}
+
+/// Secret Service first, keyutils second. Memory is the last fallback.
+#[cfg(target_os = "linux")]
+const LINUX_BACKENDS: [OsBackend; 2] = [OsBackend::SecretService, OsBackend::KernelKeyring];
+
+/// Set once, by the first successful store install.
+static OS_BACKEND: OnceLock<OsBackend> = OnceLock::new();
+
+/// How long a sign-in lasts with the current store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Persistence {
+    /// Attach has not finished.
+    Loading,
+    /// Kept across restarts.
+    Saved,
+    /// Kept until the computer restarts (kernel keyutils).
+    UntilRestart,
+    /// Kept for this app session only (memory).
+    ThisSession,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachPhase {
     Detached,
@@ -76,6 +114,7 @@ struct Inner {
     flush_pending: bool,
     flush_in_flight: bool,
     phase: AttachPhase,
+    os_backend: Option<OsBackend>,
     discord_hydrate: DiscordHydrate,
 }
 
@@ -95,6 +134,7 @@ impl SecretStore {
                 flush_pending: false,
                 flush_in_flight: false,
                 phase,
+                os_backend: None,
                 discord_hydrate: if phase == AttachPhase::MemoryOnly {
                     DiscordHydrate::Settled { notify: false }
                 } else {
@@ -148,11 +188,20 @@ impl SecretStore {
         matches!(self.phase(), AttachPhase::Ready | AttachPhase::MemoryOnly)
     }
 
-    /// UI thread: `true` once attach settled without the OS keychain.
-    /// Secrets then live for this session only, so resume cannot work.
+    /// UI thread: how long a sign-in lasts with the store in use.
     #[must_use]
-    pub fn memory_only(&self) -> bool {
-        self.phase() == AttachPhase::MemoryOnly
+    pub fn persistence(&self) -> Persistence {
+        let Ok(inner) = self.lock() else {
+            return Persistence::ThisSession;
+        };
+        match (inner.phase, inner.os_backend) {
+            (AttachPhase::Detached | AttachPhase::Attaching, _) => Persistence::Loading,
+            (AttachPhase::MemoryOnly, _) => Persistence::ThisSession,
+            (AttachPhase::Ready, Some(backend)) if !backend.survives_restart() => {
+                Persistence::UntilRestart
+            }
+            (AttachPhase::Ready, _) => Persistence::Saved,
+        }
     }
 
     fn phase(&self) -> AttachPhase {
@@ -298,10 +347,13 @@ impl SecretStore {
             return;
         }
         match probe_os() {
-            Ok(()) => {
+            Ok(backend) => {
                 let (os_values, hydrate_error) = read_os_snapshot();
                 let discord_token = read_discord_os_token();
                 let should_flush = self.finish_ready(os_values);
+                if let Ok(mut inner) = self.lock() {
+                    inner.os_backend = Some(backend);
+                }
                 self.store_hydrated_discord_token(discord_token);
                 if let Some(error) = hydrate_error {
                     tracing::warn!(
@@ -309,7 +361,7 @@ impl SecretStore {
                         "OS keychain attached but hydrate failed; dirty UI writes are kept"
                     );
                 } else {
-                    tracing::info!("using the OS keychain for Telegram secrets");
+                    tracing::info!(?backend, "using the OS keychain for Telegram secrets");
                 }
                 if should_flush && let Err(error) = self.flush_os() {
                     tracing::warn!(
@@ -552,9 +604,16 @@ fn memory_requested() -> bool {
     std::env::var_os(KEYRING_ENV).is_some_and(|value| value == KEYRING_MEMORY)
 }
 
-fn probe_os() -> Result<(), SecretError> {
+fn probe_os() -> Result<OsBackend, SecretError> {
     ensure_default_store()?;
-    let entry = os_entry(SecretKey::ApiId)?;
+    probe_entry()?;
+    Ok(OS_BACKEND.get().copied().unwrap_or(OsBackend::Native))
+}
+
+/// Read one entry. A missing entry proves the store works.
+fn probe_entry() -> Result<(), SecretError> {
+    let entry = Entry::new(TELEGRAM_SECRET_SERVICE, SecretKey::ApiId.account())
+        .map_err(map_keyring_error)?;
     match entry.get_password() {
         Ok(_) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(error) => Err(map_keyring_error(error)),
@@ -565,15 +624,43 @@ fn ensure_default_store() -> Result<(), SecretError> {
     if keyring_core::get_default_store().is_some() {
         return Ok(());
     }
-    install_platform_store()
+    let backend = install_platform_store()?;
+    let _ = OS_BACKEND.set(backend);
+    Ok(())
 }
 
-fn install_platform_store() -> Result<(), SecretError> {
-    let store = {
-        #[cfg(target_os = "linux")]
-        {
-            linux_keyutils_keyring_store::Store::new().map_err(map_keyring_error)?
+#[cfg(target_os = "linux")]
+fn install_platform_store() -> Result<OsBackend, SecretError> {
+    let mut last_error = SecretError::new("OS keychain: no Linux backend");
+    for backend in LINUX_BACKENDS {
+        match install_linux_store(backend).and_then(|()| probe_entry()) {
+            Ok(()) => return Ok(backend),
+            Err(error) => {
+                tracing::info!(?backend, error = %error, "keychain backend not usable; trying the next one");
+                keyring_core::unset_default_store();
+                last_error = error;
+            }
         }
+    }
+    Err(last_error)
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_store(backend: OsBackend) -> Result<(), SecretError> {
+    match backend {
+        OsBackend::SecretService => keyring_core::set_default_store(
+            zbus_secret_service_keyring_store::Store::new().map_err(map_keyring_error)?,
+        ),
+        OsBackend::KernelKeyring | OsBackend::Native => keyring_core::set_default_store(
+            linux_keyutils_keyring_store::Store::new().map_err(map_keyring_error)?,
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_platform_store() -> Result<OsBackend, SecretError> {
+    let store = {
         #[cfg(target_os = "macos")]
         {
             apple_native_keyring_store::keychain::Store::new().map_err(map_keyring_error)?
@@ -582,13 +669,13 @@ fn install_platform_store() -> Result<(), SecretError> {
         {
             windows_native_keyring_store::Store::new().map_err(map_keyring_error)?
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             return Err(SecretError::new("OS keychain: unsupported platform"));
         }
     };
     keyring_core::set_default_store(store);
-    Ok(())
+    Ok(OsBackend::Native)
 }
 
 fn os_entry(key: SecretKey) -> Result<Entry, SecretError> {
@@ -655,6 +742,12 @@ impl SecretStore {
             .map(|(key, value)| (*key, (*value).to_string()))
             .collect();
         let _ = self.finish_ready(values);
+    }
+
+    pub(crate) fn set_backend_for_test(&self, backend: OsBackend) {
+        if let Ok(mut inner) = self.lock() {
+            inner.os_backend = Some(backend);
+        }
     }
 
     pub(crate) fn complete_discord_hydrate_for_test(&self, token: Option<&str>) {
@@ -831,6 +924,26 @@ mod tests {
         store.set(SecretKey::Session, "keep").expect("set");
         store.set(SecretKey::Session, "  ").expect("clear");
         assert_eq!(store.get(SecretKey::Session).expect("get"), None);
+    }
+
+    #[test]
+    fn linux_tries_secret_service_before_keyutils_and_only_keyutils_expires() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            LINUX_BACKENDS,
+            [OsBackend::SecretService, OsBackend::KernelKeyring]
+        );
+        assert!(OsBackend::SecretService.survives_restart());
+        assert!(OsBackend::Native.survives_restart());
+        assert!(!OsBackend::KernelKeyring.survives_restart());
+        assert_eq!(
+            SecretStore::memory().persistence(),
+            Persistence::ThisSession
+        );
+        assert_eq!(
+            SecretStore::blank(AttachPhase::Detached).persistence(),
+            Persistence::Loading
+        );
     }
 
     #[test]

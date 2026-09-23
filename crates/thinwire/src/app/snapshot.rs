@@ -11,6 +11,8 @@ use thinwire_protocol::{
     parse_telegram_chat_id, telegram_api_available,
 };
 
+#[cfg(test)]
+use super::secrets::OsBackend;
 use super::secrets::{SecretKey, SecretStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2169,7 +2171,16 @@ mod tests {
         let attaching = SecretStore::detached_for_test();
         assert_eq!(keychain_notice(&attaching), None, "no notice while loading");
         attaching.complete_ready_attach_for_test(&[]);
+        attaching.set_backend_for_test(OsBackend::SecretService);
+        assert_eq!(keychain_notice(&attaching), None, "Secret Service keeps it");
+        attaching.set_backend_for_test(OsBackend::Native);
         assert_eq!(keychain_notice(&attaching), None);
+        attaching.set_backend_for_test(OsBackend::KernelKeyring);
+        assert_eq!(
+            keychain_notice(&attaching),
+            Some(super::super::ui::KEYCHAIN_UNTIL_RESTART_NOTICE),
+            "keyutils is lost at restart"
+        );
         let ui = include_str!("ui.rs");
         let strip = &ui[ui.find("fn status_strip(").expect("strip")..];
         let strip = &strip[..strip.find("\nfn ").expect("next")];

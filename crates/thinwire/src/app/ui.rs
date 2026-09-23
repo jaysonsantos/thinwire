@@ -7,7 +7,7 @@ use thinwire_protocol::{Delivery, ProtocolId, SupportClass};
 use thinwire_protocol::WhatsAppPhoneVault;
 
 use super::auth;
-use super::secrets::SecretStore;
+use super::secrets::{Persistence, SecretStore};
 use super::settings::{Settings, ThemeMode};
 use super::snapshot::{
     AccountRow, AuthKey, CenterView, InboxFilter, InboxState, RESUME_CONNECTING, Snapshot,
@@ -25,10 +25,19 @@ const WARN: Color32 = Color32::from_rgb(214, 160, 64);
 pub(crate) const KEYCHAIN_UNAVAILABLE_NOTICE: &str =
     "Sign-in is not saved on this device: keychain unavailable.";
 
-/// One notice for the whole window. `None` while the keychain works or loads.
+/// Shown when only the kernel keyring works. It is lost at restart.
+pub(crate) const KEYCHAIN_UNTIL_RESTART_NOTICE: &str =
+    "Sign-in is kept until you restart the computer.";
+
+/// One notice for the whole window. `None` while the keychain loads or keeps
+/// the sign-in across restarts.
 #[must_use]
 pub(crate) fn keychain_notice(secrets: &SecretStore) -> Option<&'static str> {
-    secrets.memory_only().then_some(KEYCHAIN_UNAVAILABLE_NOTICE)
+    match secrets.persistence() {
+        Persistence::ThisSession => Some(KEYCHAIN_UNAVAILABLE_NOTICE),
+        Persistence::UntilRestart => Some(KEYCHAIN_UNTIL_RESTART_NOTICE),
+        Persistence::Loading | Persistence::Saved => None,
+    }
 }
 const FAILED: Color32 = Color32::from_rgb(200, 80, 80);
 const COMPOSE_MAX_ROWS: usize = 5;

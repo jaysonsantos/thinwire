@@ -51,6 +51,11 @@ dirs = "7"
 # libdbus. Runtime falls back to memory when the platform store is unavailable.
 keyring-core = "1"
 linux-keyutils-keyring-store = "1"
+# Secret Service (KDE Wallet / GNOME Keyring) over pure-Rust zbus: no libdbus
+# at build time. async-io keeps its executor off the tokio blocking pool.
+zbus-secret-service-keyring-store = { version = "1", features = [
+  "rt-async-io-crypto-rust",
+] }
 # `keychain` matches keyring v3's apple-native path for unsigned desktop apps.
 apple-native-keyring-store = { version = "1", default-features = false, features = [
   "keychain",
