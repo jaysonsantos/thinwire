@@ -2311,7 +2311,8 @@ mod tests {
     #[test]
     fn first_run_without_credentials_does_not_open_api_screens() {
         let store = SecretStore::memory();
-        let mut snapshot = Snapshot::new();
+        // A local shell can inject TELEGRAM_API_ID at build time; this case has none.
+        let mut snapshot = Snapshot::with_api_source(TelegramApiSource::empty());
         snapshot.open_add_account(&store);
         assert_eq!(snapshot.auth, AuthScreen::NeedCredentials);
         assert!(snapshot.status_text.contains("Credentials missing"));
