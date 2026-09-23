@@ -275,6 +275,9 @@ pub enum AdapterEvent {
     TelegramAuthRejected {
         error: TelegramAuthError,
     },
+    /// The old Telegram data folder could not open (its key was lost). It was
+    /// moved aside, and a fresh login follows. Carries no path or value.
+    TelegramDataReset,
     /// Telegram sent a login code. Sent just before the `NeedCode` phase.
     TelegramCodeSent {
         via: TelegramCodeVia,
@@ -479,6 +482,11 @@ pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 pub(crate) fn emit_telegram_auth_rejected(events: &EventTx, error: TelegramAuthError) {
     let _ = events.send(AdapterEvent::TelegramAuthRejected { error });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_telegram_data_reset(events: &EventTx) {
+    let _ = events.send(AdapterEvent::TelegramDataReset);
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]

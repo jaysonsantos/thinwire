@@ -200,6 +200,13 @@ pub(crate) fn auth_user_error(reason: Option<TelegramAuthError>) -> UserError {
     }
 }
 
+/// Copy on the phone step after the old Telegram data folder was moved aside.
+pub(crate) const DATA_RESET_NOTICE: &str =
+    "Telegram data on this device could not be opened. It was moved aside. Sign in again.";
+
+/// Status line when Add Telegram is pressed before the keychain read ends.
+const KEYCHAIN_LOADING_STATUS: &str = "Reading the keychain. Try again in a moment.";
+
 /// Copy on the phone step when a saved session no longer works.
 pub(crate) const SESSION_ENDED_NOTICE: &str = "Your Telegram session ended. Sign in again.";
 
@@ -268,6 +275,8 @@ pub(crate) struct Snapshot {
     drafts: HashMap<String, String>,
     focus_compose: bool,
     telegram_stopped: bool,
+    /// The worker moved the old data folder aside. Shown on the next phone step.
+    data_reset: bool,
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
@@ -324,6 +333,7 @@ impl Snapshot {
             drafts: HashMap::new(),
             focus_compose: false,
             telegram_stopped: false,
+            data_reset: false,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
@@ -468,6 +478,9 @@ impl Snapshot {
             AdapterEvent::TelegramAuth { phase } => self.apply_telegram_phase(phase),
             AdapterEvent::TelegramAuthRejected { error } => {
                 self.auth_rejection = Some(error);
+            }
+            AdapterEvent::TelegramDataReset => {
+                self.data_reset = true;
             }
             AdapterEvent::TelegramCodeSent { via } => {
                 self.code_via = Some(via);
@@ -981,6 +994,12 @@ impl Snapshot {
     }
 
     pub(crate) fn open_telegram(&mut self, store: &SecretStore) {
+        // Until the keychain read ends, a saved DB key looks missing, and the
+        // worker would move a good data folder aside.
+        if !store.attach_settled() {
+            self.status_text = KEYCHAIN_LOADING_STATUS.into();
+            return;
+        }
         self.clear_secrets();
         self.resume = Resume::Settled;
         clear_ephemeral(store);
@@ -1023,6 +1042,11 @@ impl Snapshot {
         let resuming = std::mem::replace(&mut self.resume, Resume::Settled) == Resume::Connecting;
         self.auth_notice = None;
         match phase {
+            TelegramAuthPhase::NeedPhone if std::mem::take(&mut self.data_reset) => {
+                self.auth = AuthScreen::TelegramPhone;
+                self.auth_notice = Some(DATA_RESET_NOTICE);
+                self.status_text = DATA_RESET_NOTICE.into();
+            }
             TelegramAuthPhase::NeedPhone if resuming => {
                 // The worker drops the stale session marker on this path.
                 self.auth = AuthScreen::TelegramPhone;
@@ -2339,6 +2363,44 @@ mod tests {
         assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
         let auth = include_str!("auth.rs");
         assert!(auth.contains("\"Try again\""));
+    }
+
+    #[test]
+    fn data_reset_shows_its_notice_on_the_next_phone_step() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        store
+            .set(SecretKey::Session, "tdlib-ready")
+            .expect("marker");
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&store, true);
+        snapshot.apply(AdapterEvent::TelegramDataReset);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert_eq!(snapshot.auth_notice, Some(DATA_RESET_NOTICE));
+        snapshot.telegram_phone = "+15551234567".into();
+        submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::NeedCode);
+        assert_eq!(snapshot.auth_notice, None, "shown once");
+        let debug = format!("{:?}", AdapterEvent::TelegramDataReset);
+        assert!(!debug.contains('/'), "no path on the event");
+    }
+
+    #[test]
+    fn add_telegram_waits_for_the_keychain_read() {
+        let store = SecretStore::detached_for_test();
+        let mut snapshot =
+            Snapshot::with_api_source(TelegramApiSource::with_publisher("11111", "publisher-hash"));
+        snapshot.open_telegram(&store);
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "no client before the key is known"
+        );
+        store.complete_ready_attach_for_test(&[]);
+        snapshot.open_telegram(&store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
     }
 
     #[test]

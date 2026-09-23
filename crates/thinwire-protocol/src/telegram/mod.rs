@@ -7,6 +7,7 @@
 
 mod auth_error;
 mod credentials;
+mod data_dir;
 mod db_key;
 mod engine;
 mod inbox;
@@ -722,12 +723,31 @@ mod tests {
     fn failed_tdlib_parameters_stop_the_login_and_log_safely() {
         let src = include_str!("tdlib.rs");
         let params = fn_body(src, "async fn set_parameters");
-        assert!(params.contains("if let Err(error) = tdlib_rs::functions::set_tdlib_parameters("));
+        assert!(params.contains("if let Err(error) = result"));
+        assert!(fn_body(src, "async fn send_parameters").contains("set_tdlib_parameters("));
         assert!(params.contains("TelegramAuthError::ClientSetup"));
         assert!(params.contains("TelegramAuthPhase::Failed"));
         assert!(params.contains("log_tdlib_error(\"setTdlibParameters\""));
         let log = fn_body(src, "fn log_tdlib_error");
         assert!(log.contains("loggable_tdlib_message"));
+    }
+
+    #[test]
+    fn live_tdlib_moves_a_keyless_data_folder_aside_before_it_opens() {
+        let src = include_str!("tdlib.rs");
+        let params = fn_body(src, "async fn set_parameters");
+        let check = params
+            .find("move_aside_if_keyless(&dir, has_key)")
+            .expect("check");
+        let key = params.find("ensure_db_key(").expect("key");
+        assert!(check < key, "check the vault before a new key is made");
+        assert!(params.contains("data_dir::is_database_error(&error.message)"));
+        assert!(params.contains("&& !reset"), "retry once only");
+        assert!(params.contains("emit_telegram_data_reset(events)"));
+        assert!(
+            !src.contains("remove_dir_all"),
+            "old data is moved, never deleted"
+        );
     }
 
     #[test]

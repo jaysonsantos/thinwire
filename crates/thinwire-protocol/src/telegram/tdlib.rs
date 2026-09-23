@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
+use super::data_dir;
 use super::inbox::{
     self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook,
 };
@@ -22,6 +23,7 @@ use crate::adapter::{
     emit_conversation_removed, emit_history_loaded, emit_message, emit_message_body,
     emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_status, emit_stopped,
     emit_telegram_auth, emit_telegram_auth_rejected, emit_telegram_code_sent,
+    emit_telegram_data_reset,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -1105,27 +1107,47 @@ async fn set_parameters(
         );
         return;
     };
-    let database_directory = tdlib_data_dir().display().to_string();
-    let encryption_key = ensure_db_key(secrets, events);
-    if let Err(error) = tdlib_rs::functions::set_tdlib_parameters(
-        false,
-        database_directory,
-        String::new(),
-        encryption_key,
-        true,
-        true,
-        true,
-        false,
-        api_id,
-        api_hash,
-        "en".into(),
-        "thinwire".into(),
-        String::new(),
-        env!("CARGO_PKG_VERSION").into(),
+    let dir = tdlib_data_dir();
+    // A folder whose key the vault lost can never open again. Move it aside
+    // before the first try. This checks the vault before a new key is made.
+    let has_key = secrets
+        .get_secret(TelegramSecretKey::DbEncryption)
+        .is_some_and(|key| !key.is_empty());
+    let mut reset = move_aside(data_dir::move_aside_if_keyless(&dir, has_key));
+    ensure_dir(&dir);
+    let mut result = send_parameters(
         client_id,
+        &dir,
+        ensure_db_key(secrets, events),
+        api_id,
+        &api_hash,
     )
-    .await
+    .await;
+    if let Err(error) = &result
+        && !reset
+        && data_dir::is_database_error(&error.message)
     {
+        // The key in the vault does not open this folder. Keep the old folder,
+        // start a fresh one with a new key, and try once more.
+        log_tdlib_error("setTdlibParameters", error);
+        reset = move_aside(data_dir::move_aside(&dir).map(Some));
+        if reset {
+            secrets.set_secret(TelegramSecretKey::DbEncryption, "");
+            ensure_dir(&dir);
+            result = send_parameters(
+                client_id,
+                &dir,
+                ensure_db_key(secrets, events),
+                api_id,
+                &api_hash,
+            )
+            .await;
+        }
+    }
+    if reset {
+        emit_telegram_data_reset(events);
+    }
+    if let Err(error) = result {
         // No login step can run now. Stop the flow; the UI must not show
         // the phone step (TDLib would answer "call setTdlibParameters first").
         log_tdlib_error("setTdlibParameters", &error);
@@ -1137,6 +1159,54 @@ async fn set_parameters(
             AdapterStatus::Error,
             format!("Telegram could not start (error {}).", error.code),
         );
+    }
+}
+
+async fn send_parameters(
+    client_id: i32,
+    dir: &std::path::Path,
+    encryption_key: String,
+    api_id: i32,
+    api_hash: &str,
+) -> Result<(), tdlib_rs::types::Error> {
+    tdlib_rs::functions::set_tdlib_parameters(
+        false,
+        dir.display().to_string(),
+        String::new(),
+        encryption_key,
+        true,
+        true,
+        true,
+        false,
+        api_id,
+        api_hash.to_string(),
+        "en".into(),
+        "thinwire".into(),
+        String::new(),
+        env!("CARGO_PKG_VERSION").into(),
+        client_id,
+    )
+    .await
+}
+
+/// Log the result of a move-aside. `true` when the folder moved.
+fn move_aside(result: std::io::Result<Option<PathBuf>>) -> bool {
+    match result {
+        Ok(Some(moved)) => {
+            let name = moved
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            tracing::warn!(
+                moved_to = name.as_deref().unwrap_or("?"),
+                "telegram data folder could not open with the saved key; moved aside"
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(%error, "telegram data folder could not be moved aside");
+            false
+        }
     }
 }
 
@@ -1166,7 +1236,7 @@ fn generate_db_key() -> String {
 }
 
 fn tdlib_data_dir() -> PathBuf {
-    let path = if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
+    if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
         PathBuf::from(dir)
     } else {
         let mut base = std::env::var_os("XDG_DATA_HOME")
@@ -1179,12 +1249,15 @@ fn tdlib_data_dir() -> PathBuf {
         base.push("thinwire");
         base.push("tdlib");
         base
-    };
-    let _ = std::fs::create_dir_all(&path);
+    }
+}
+
+/// Create the folder, readable by this user only.
+fn ensure_dir(path: &std::path::Path) {
+    let _ = std::fs::create_dir_all(path);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
     }
-    path
 }
