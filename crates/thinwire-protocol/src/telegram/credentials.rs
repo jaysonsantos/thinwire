@@ -240,17 +240,33 @@ mod tests {
             "os-zips must stage the payload with scripts/stage-os-artifact.sh"
         );
         assert!(
-            os_zips.contains("path: dist/"),
-            "upload-artifact must upload the payload directory"
+            os_zips.contains("path: thinwire-${{ matrix.artifact }}.tar.gz"),
+            "upload-artifact must upload one mode-preserving tar.gz"
+        );
+        assert!(
+            os_zips.contains("ARTIFACT: ${{ matrix.artifact }}"),
+            "the stage script needs the artifact name for the tar.gz"
+        );
+        assert!(
+            !os_zips.contains("path: dist/"),
+            "uploading the raw directory drops executable bits"
         );
         assert!(
             !os_zips.contains("make_archive"),
-            "upload-artifact is the only zip layer"
+            "do not pre-build a zip for upload-artifact to wrap"
         );
         let stage = include_str!("../../../../scripts/stage-os-artifact.sh");
         assert!(
             !stage.contains("make_archive"),
             "the stage script must not pre-zip the payload"
+        );
+        assert!(
+            stage.contains("tar -czf"),
+            "the stage script must build a mode-preserving tar.gz"
+        );
+        assert!(
+            stage.contains("executable bit missing"),
+            "the stage script must refuse a tar.gz whose binary is not executable"
         );
         assert!(
             stage.contains("third_party/tdlib/LICENSE_1_0.txt"),

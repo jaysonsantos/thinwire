@@ -1,6 +1,6 @@
 # Unsigned OS artifacts on main only. These are not releases.
-# actions/upload-artifact is the only zip layer. Do not archive the payload first.
-# macOS uploads an unsigned Thinwire.app. Linux and Windows upload a flat payload.
+# GitHub wraps every artifact download in an outer zip. The uploaded file is
+# one mode-preserving .tar.gz so executable bits and the macOS .app survive.
 # pull_request never triggers this workflow, and the job also refuses non-main pushes.
 #
 # TELEGRAM_API_ID and TELEGRAM_API_HASH are publisher Telegram app credentials.
@@ -9,7 +9,7 @@
 # to ci.yml or any pull_request workflow. Never log the values. Real values live
 # in GitHub repository secrets and in arcoiro under the thinwire path
 # (SOPS + Terraform, not watchkeep), not in this MIT tree.
-name: OS zips
+name: OS artifacts
 
 on:
   push:
@@ -27,7 +27,7 @@ env:
 
 jobs:
   os-zips:
-    name: zip-${{ matrix.artifact }}
+    name: artifact-${{ matrix.artifact }}
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -102,13 +102,15 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: cargo build --release -p thinwire --features telegram-tdlib
 
-      - name: Stage unsigned payload
+      - name: Stage and archive unsigned payload
         shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
         run: scripts/stage-os-artifact.sh
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: thinwire-${{ matrix.artifact }}
-          path: dist/
+          path: thinwire-${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
           retention-days: 7

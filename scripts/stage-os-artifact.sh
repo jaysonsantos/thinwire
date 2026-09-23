@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
-# Stage dist/ for actions/upload-artifact.
-# That action is the only zip layer. Do not archive this directory first.
+# Stage dist/, then write one mode-preserving thinwire-$ARTIFACT.tar.gz.
+# actions/upload-artifact wraps downloads in an outer zip and stores loose
+# files as 644. The tar.gz is what keeps executable bits and the .app tree.
 # macOS: unsigned Thinwire.app. Linux and Windows: flat binary plus notices.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(dirname "$script_dir")" || exit 1
+
+if [[ -z "${ARTIFACT:-}" ]]; then
+  echo "::error::ARTIFACT is required to name the OS archive."
+  exit 1
+fi
+if [[ ! "$ARTIFACT" =~ ^[a-z0-9_-]+$ ]]; then
+  echo "::error::ARTIFACT must be a safe archive name. Got: ${ARTIFACT}"
+  exit 1
+fi
 
 # Notices land in dist before upload. The tdlib-rs prebuilt
 # zip has no license file. This copy is the Boost Software License
@@ -158,5 +168,96 @@ EOF
   fi
 fi
 
+if [[ -f dist/thinwire.exe ]]; then
+  leftover="$(find dist -mindepth 1 -maxdepth 1 \
+    ! -name 'thinwire.exe' ! -name 'LICENSE' ! -name 'THIRD_PARTY_NOTICES' -print)"
+  if [[ -n "$leftover" ]]; then
+    echo "::error::Windows payload must be only thinwire.exe, LICENSE, and THIRD_PARTY_NOTICES."
+    printf '%s\n' "$leftover"
+    exit 1
+  fi
+fi
+
+if [[ -f dist/thinwire ]]; then
+  chmod 755 dist/thinwire
+fi
+if [[ -f dist/thinwire.exe ]]; then
+  chmod 755 dist/thinwire.exe
+fi
+if [[ -f dist/Thinwire.app/Contents/MacOS/thinwire ]]; then
+  chmod 755 dist/Thinwire.app/Contents/MacOS/thinwire
+fi
+for so in dist/*.so dist/*.so.*; do
+  if [[ -f "$so" ]]; then
+    chmod 755 "$so"
+  fi
+done
+
+archive="thinwire-${ARTIFACT}.tar.gz"
+rm -f "$archive"
+# macOS tar adds AppleDouble files unless this is set. Other tar ignores it.
+COPYFILE_DISABLE=1 tar -czf "$archive" -C dist .
+if [[ ! -s "$archive" ]]; then
+  echo "::error::Failed to build ${archive}."
+  exit 1
+fi
+if command -v python3 >/dev/null 2>&1; then
+  py=python3
+elif command -v python >/dev/null 2>&1; then
+  py=python
+else
+  echo "::error::Need python3 or python to verify ${archive} keeps executable bits."
+  exit 1
+fi
+"$py" - "$archive" <<'PY'
+import sys
+import tarfile
+
+archive = sys.argv[1]
+with tarfile.open(archive, "r:gz") as tf:
+    members = [m for m in tf.getmembers() if m.name not in {".", "./"}]
+    if not members:
+        raise SystemExit(f"{archive} is empty")
+
+    def norm(name: str) -> str:
+        return name[2:] if name.startswith("./") else name
+
+    names = [norm(m.name) for m in members]
+    if any(name == "dist" or name.startswith("dist/") for name in names):
+        raise SystemExit(f"{archive} nests dist/; upload the payload itself")
+
+    binaries = []
+    for member in members:
+        name = norm(member.name)
+        base = name.rsplit("/", 1)[-1]
+        if member.isfile() and base in {"thinwire", "thinwire.exe"}:
+            binaries.append(member)
+    if len(binaries) != 1:
+        found = [norm(m.name) for m in binaries]
+        raise SystemExit(f"{archive} expected one thinwire binary, found {found}")
+
+    binary = binaries[0]
+    mode = binary.mode & 0o777
+    if mode != 0o755:
+        raise SystemExit(
+            f"{norm(binary.name)} mode is {oct(mode)}; executable bit missing"
+        )
+
+    for member in members:
+        name = norm(member.name)
+        base = name.rsplit("/", 1)[-1]
+        if member.isfile() and ".so" in base and (member.mode & 0o777) != 0o755:
+            got = oct(member.mode & 0o777)
+            raise SystemExit(f"{name} mode is {got}; executable bit missing")
+
+    has_license = any(name == "LICENSE" or name.endswith("/LICENSE") for name in names)
+    has_notice = any(name.endswith("tdlib-LICENSE_1_0.txt") for name in names)
+    if not has_license or not has_notice:
+        raise SystemExit(f"{archive} is missing LICENSE or the TDLib notice")
+
+print(f"archive ok: {norm(binary.name)} mode {oct(mode)}")
+PY
+
 echo "Staged payload:"
 find dist -print | sort
+echo "Archive: ${archive}"
