@@ -23,7 +23,7 @@ use crate::adapter::{
     emit_conversation_removed, emit_history_loaded, emit_message, emit_message_body,
     emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_status, emit_stopped,
     emit_telegram_auth, emit_telegram_auth_rejected, emit_telegram_code_sent,
-    emit_telegram_data_reset,
+    emit_telegram_data_reset, emit_telegram_session_ended,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -56,6 +56,9 @@ const RETIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct LiveInbox {
     authorized: bool,
+    /// This app asked TDLib to close (shutdown, Cancel, Try again). A close
+    /// without this flag came from elsewhere, for example a remote logout.
+    closing: bool,
     directory: ChatDirectory,
     names: NameBook,
 }
@@ -319,11 +322,11 @@ fn spawn_tdlib_worker(
 
         let mut live = LiveInbox {
             authorized: false,
+            closing: false,
             directory: ChatDirectory::new(),
             names: NameBook::new(),
         };
         let mut commands = Some(cmd_rx);
-        let mut closing = false;
 
         loop {
             tokio::select! {
@@ -334,12 +337,12 @@ fn spawn_tdlib_worker(
                         commands = None;
                         TdlibCommand::Close
                     });
-                    if closing {
+                    if live.closing {
                         continue;
                     }
                     match command {
                         TdlibCommand::Close => {
-                            closing = true;
+                            live.closing = true;
                             request_close(client_id).await;
                         }
                         TdlibCommand::Step(step) => {
@@ -625,7 +628,12 @@ async fn apply_authorization(
         tdlib_rs::enums::AuthorizationState::LoggingOut
         | tdlib_rs::enums::AuthorizationState::Closing
         | tdlib_rs::enums::AuthorizationState::Closed => {
-            live.authorized = false;
+            let was_authorized = std::mem::replace(&mut live.authorized, false);
+            // A live session that closes without our request ended elsewhere,
+            // for example Settings → Devices on another client (qa R73).
+            if was_authorized && !live.closing {
+                emit_telegram_session_ended(events);
+            }
             emit_status(
                 events,
                 ProtocolId::Telegram,

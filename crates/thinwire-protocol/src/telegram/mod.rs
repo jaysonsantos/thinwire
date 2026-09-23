@@ -832,6 +832,20 @@ mod tests {
     }
 
     #[test]
+    fn live_tdlib_reports_a_remote_logout_but_not_its_own_close() {
+        let src = include_str!("tdlib.rs");
+        let auth = fn_body(src, "async fn apply_authorization");
+        let arm = &auth[auth.find("AuthorizationState::LoggingOut").expect("arm")..];
+        assert!(arm.contains("was_authorized && !live.closing"));
+        assert!(arm.contains("emit_telegram_session_ended(events)"));
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        assert!(
+            worker.contains("live.closing = true;"),
+            "our Close is not a logout"
+        );
+    }
+
+    #[test]
     fn live_tdlib_has_one_receive_thread_for_the_process() {
         let src = include_str!("tdlib.rs");
         assert_eq!(src.matches("tdlib_rs::receive()").count(), 1);

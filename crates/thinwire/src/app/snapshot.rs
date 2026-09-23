@@ -498,6 +498,7 @@ impl Snapshot {
             AdapterEvent::TelegramAuthRejected { error } => {
                 self.auth_rejection = Some(error);
             }
+            AdapterEvent::TelegramSessionEnded => self.end_telegram_session(),
             AdapterEvent::TelegramDataReset { moved_to } => {
                 self.data_reset = Some(moved_to);
             }
@@ -1158,6 +1159,39 @@ impl Snapshot {
         self.auth_busy = false;
         self.error = None;
         self.status_text = "Telegram is ready. Loading the chat list.".into();
+    }
+
+    /// The live session ended elsewhere. Drop the old inbox, then start a new
+    /// client: the next phone step says the session ended (qa R73).
+    fn end_telegram_session(&mut self) {
+        if !self.telegram_authorized {
+            return;
+        }
+        self.telegram_authorized = false;
+        if let Some(row) = self
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Telegram)
+        {
+            row.linked = false;
+        }
+        self.conversations.remove(&ProtocolId::Telegram);
+        self.messages
+            .retain(|(protocol, _), _| *protocol != ProtocolId::Telegram);
+        self.history_loading.clear();
+        self.chat_list_loading = false;
+        self.drafts.clear();
+        self.compose.clear();
+        if self.selected_protocol == ProtocolId::Telegram {
+            self.selected_conversation = None;
+        }
+        self.auth = AuthScreen::Idle;
+        self.auth_busy = false;
+        self.error = None;
+        // Reuse the resume path: spinner, then the phone step with the notice.
+        self.resume = Resume::Connecting;
+        self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
+        self.status_text = SESSION_ENDED_NOTICE.into();
     }
 
     fn finish_telegram_unavailable(&mut self) {
@@ -2564,6 +2598,49 @@ mod tests {
                 protocol: ProtocolId::Telegram
             }
         )));
+    }
+
+    #[test]
+    fn a_remote_logout_clears_the_inbox_and_asks_to_sign_in_again() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: telegram_text(1, 7, "hi"),
+        });
+        snapshot.compose = "draft".into();
+        assert!(!snapshot.can_add_account());
+
+        snapshot.apply(AdapterEvent::TelegramSessionEnded);
+        assert!(!snapshot.telegram_ready());
+        assert!(!snapshot.has_primary_account());
+        assert!(
+            snapshot.visible_conversations().is_empty(),
+            "the old inbox is gone"
+        );
+        assert!(snapshot.selected_messages().is_empty());
+        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.can_add_account(), "Add account is back");
+        assert_eq!(snapshot.status_text, SESSION_ENDED_NOTICE);
+        assert_eq!(
+            snapshot.center_view(),
+            CenterView::Resuming { connecting: true }
+        );
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ApiCredentials]
+        );
+
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert_eq!(snapshot.auth_notice.as_deref(), Some(SESSION_ENDED_NOTICE));
+
+        snapshot.apply(AdapterEvent::TelegramSessionEnded);
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "a second end does nothing"
+        );
     }
 
     #[test]

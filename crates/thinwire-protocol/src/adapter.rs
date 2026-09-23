@@ -292,6 +292,9 @@ pub enum AdapterEvent {
         /// A file name only, never a path.
         moved_to: String,
     },
+    /// A live session ended without a request from this app (remote logout,
+    /// or the session was revoked). The client closes; a new login follows.
+    TelegramSessionEnded,
     /// Telegram sent a login code. Sent just before the `NeedCode` phase.
     TelegramCodeSent {
         via: TelegramCodeVia,
@@ -496,6 +499,11 @@ pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 pub(crate) fn emit_telegram_auth_rejected(events: &EventTx, error: TelegramAuthError) {
     let _ = events.send(AdapterEvent::TelegramAuthRejected { error });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_telegram_session_ended(events: &EventTx) {
+    let _ = events.send(AdapterEvent::TelegramSessionEnded);
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
