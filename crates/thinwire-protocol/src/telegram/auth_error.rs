@@ -38,18 +38,20 @@ pub(super) fn auth_error_from_tdlib(code: i32, message: &str) -> TelegramAuthErr
     TelegramAuthError::Other { code }
 }
 
-/// TDLib error text that is safe to log: a bare error name (`A-Z0-9_`, for
-/// example `PHONE_CODE_INVALID`) or text with no digits. Any other text can
-/// hold a phone number or a login code, so it is never logged.
+/// TDLib error text that is safe to log: a bare error name that starts with
+/// a letter (`A-Z0-9_`, for example `PHONE_CODE_INVALID` or `FLOOD_WAIT_120`),
+/// or text with no digits. Any other text, including a bare run of digits,
+/// can hold a phone number or a login code, so it is never logged.
 #[must_use]
 pub(super) fn loggable_tdlib_message(message: &str) -> Option<&str> {
     let message = message.trim();
     if message.is_empty() {
         return None;
     }
-    let bare_name = message
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    let bare_name = message.starts_with(|c: char| c.is_ascii_uppercase())
+        && message
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
     let no_digits = !message.chars().any(|c| c.is_ascii_digit());
     (bare_name || no_digits).then_some(message)
 }
@@ -116,6 +118,13 @@ mod tests {
             None
         );
         assert_eq!(loggable_tdlib_message("  "), None);
+        assert_eq!(
+            loggable_tdlib_message("15551234567"),
+            None,
+            "a phone number"
+        );
+        assert_eq!(loggable_tdlib_message("12345"), None, "a login code");
+        assert_eq!(loggable_tdlib_message("_12345"), None);
     }
 
     #[test]
