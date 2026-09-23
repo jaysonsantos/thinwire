@@ -93,6 +93,7 @@ impl eframe::App for ThinwireApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.refresh_secret_store_status();
+        self.snapshot.poll_resume(&self.secrets);
         if self.settings.follow_os_live(ctx, &mut self.last_os_theme) {
             ctx.request_repaint();
         }

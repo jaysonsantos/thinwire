@@ -141,6 +141,13 @@ impl SecretStore {
         }
     }
 
+    /// UI thread: true once OS attach finished or the store is memory-only.
+    /// Values read after this point include what the keychain held at launch.
+    #[must_use]
+    pub fn attach_settled(&self) -> bool {
+        matches!(self.phase(), AttachPhase::Ready | AttachPhase::MemoryOnly)
+    }
+
     fn phase(&self) -> AttachPhase {
         self.lock()
             .map(|inner| inner.phase)
@@ -633,6 +640,14 @@ fn os_delete(key: SecretKey) -> Result<(), SecretError> {
 impl SecretStore {
     pub(crate) fn detached_for_test() -> Arc<Self> {
         Arc::new(Self::blank(AttachPhase::Detached))
+    }
+
+    pub(crate) fn complete_ready_attach_for_test(&self, os: &[(SecretKey, &str)]) {
+        let values = os
+            .iter()
+            .map(|(key, value)| (*key, (*value).to_string()))
+            .collect();
+        let _ = self.finish_ready(values);
     }
 
     pub(crate) fn complete_discord_hydrate_for_test(&self, token: Option<&str>) {

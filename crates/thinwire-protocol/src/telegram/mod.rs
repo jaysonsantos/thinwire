@@ -516,6 +516,22 @@ mod tests {
         assert!(open.contains("true,"));
     }
 
+    #[test]
+    fn live_tdlib_drops_a_stale_session_marker_on_phone_prompt() {
+        let src = include_str!("tdlib.rs");
+        let auth = fn_body(src, "async fn apply_authorization");
+        let start = auth
+            .find("AuthorizationState::WaitPhoneNumber")
+            .expect("phone arm");
+        let end = auth[start..]
+            .find("AuthorizationState::WaitCode")
+            .expect("code arm");
+        let phone = &auth[start..start + end];
+        assert!(phone.contains("set_secret(TelegramSecretKey::Session, \"\")"));
+        assert!(phone.contains("request_secret_flush"));
+        assert!(phone.contains("TelegramAuthPhase::NeedPhone"));
+    }
+
     fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
         let start = src.find(name).unwrap_or_else(|| panic!("{name} missing"));
         let rest = &src[start..];

@@ -8,7 +8,7 @@ use thinwire_protocol::WhatsAppPhoneVault;
 use super::auth;
 use super::secrets::SecretStore;
 use super::settings::{Settings, ThemeMode};
-use super::snapshot::{AccountRow, InboxFilter, Snapshot};
+use super::snapshot::{AccountRow, CenterView, InboxFilter, RESUME_CONNECTING, Snapshot};
 
 const SUPPORTED: Color32 = Color32::from_rgb(96, 176, 128);
 const EXPERIMENTAL: Color32 = Color32::from_rgb(214, 160, 64);
@@ -234,18 +234,23 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
 }
 
 fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    egui::CentralPanel::default().show(ui, |ui| {
-        if snapshot.auth != super::snapshot::AuthScreen::Idle {
-            auth::draw(ui, snapshot, secrets);
-            return;
-        }
+    egui::CentralPanel::default().show(ui, |ui| match snapshot.center_view() {
+        CenterView::Auth => auth::draw(ui, snapshot, secrets),
+        CenterView::Resuming { connecting } => resuming(ui, connecting),
+        CenterView::FirstRun => first_run(ui, snapshot, secrets),
+        CenterView::Thread => thread(ui, snapshot),
+    });
+}
 
-        if !snapshot.has_primary_account() {
-            first_run(ui, snapshot, secrets);
-            return;
+fn resuming(ui: &mut egui::Ui, connecting: bool) {
+    let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
+    ui.add_space(top);
+    ui.vertical_centered(|ui| {
+        ui.spinner();
+        if connecting {
+            ui.add_space(8.0);
+            ui.label(RESUME_CONNECTING);
         }
-
-        thread(ui, snapshot);
     });
 }
 

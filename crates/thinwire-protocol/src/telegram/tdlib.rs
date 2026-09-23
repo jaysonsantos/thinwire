@@ -365,6 +365,12 @@ async fn apply_authorization(
             set_parameters(client_id, secrets, source, events).await;
         }
         tdlib_rs::enums::AuthorizationState::WaitPhoneNumber => {
+            // A saved session that lands here expired or was revoked. Drop the
+            // marker so the next launch does not try to resume it again.
+            if secrets.get_secret(TelegramSecretKey::Session).is_some() {
+                secrets.set_secret(TelegramSecretKey::Session, "");
+                super::request_secret_flush(events);
+            }
             emit_telegram_auth(events, TelegramAuthPhase::NeedPhone);
             emit_status(
                 events,

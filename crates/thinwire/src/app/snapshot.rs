@@ -89,6 +89,35 @@ pub(crate) enum AuthScreen {
     Telegram2fa,
 }
 
+/// Start-up resume of a saved Telegram session. Runs once per launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resume {
+    /// The OS keychain has not finished its first read.
+    Waiting,
+    /// A saved session exists. TDLib is starting with no click.
+    Connecting,
+    /// Resume finished, failed, or did not apply.
+    Settled,
+}
+
+/// What the center panel shows. Pure state, so tests do not need egui.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CenterView {
+    Auth,
+    /// Spinner. `true` adds the "Connecting to Telegram…" text.
+    Resuming {
+        connecting: bool,
+    },
+    FirstRun,
+    Thread,
+}
+
+/// Copy on the phone step when a saved session no longer works.
+pub(crate) const SESSION_ENDED_NOTICE: &str = "Your Telegram session ended. Sign in again.";
+
+/// Center panel copy while a saved session reconnects.
+pub(crate) const RESUME_CONNECTING: &str = "Connecting to Telegram…";
+
 /// Experimental WhatsApp screens. Only the `whatsapp-web` build can enter them.
 #[cfg(feature = "whatsapp-web")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +161,10 @@ pub(crate) struct Snapshot {
     pub status_text: String,
     pub compose: String,
     pub auth_busy: bool,
+    /// One line above the active login form. Never holds a secret.
+    pub auth_notice: Option<&'static str>,
     pub telegram_authorized: bool,
+    resume: Resume,
     telegram_messages_from_adapter: u32,
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
@@ -178,7 +210,9 @@ impl Snapshot {
             status_text: "Sign in with Telegram to get started.".into(),
             compose: String::new(),
             auth_busy: false,
+            auth_notice: None,
             telegram_authorized: false,
+            resume: Resume::Waiting,
             telegram_messages_from_adapter: 0,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
@@ -226,10 +260,11 @@ impl Snapshot {
                     )
                 {
                     self.status_text = detail;
-                    if matches!(status, AdapterStatus::Error | AdapterStatus::Refused)
-                        && self.auth != AuthScreen::Idle
-                    {
-                        self.auth_busy = false;
+                    if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
+                        if self.auth != AuthScreen::Idle {
+                            self.auth_busy = false;
+                        }
+                        self.resume = Resume::Settled;
                     }
                 }
             }
@@ -318,6 +353,50 @@ impl Snapshot {
     #[must_use]
     pub(crate) fn take_keychain_flush(&mut self) -> bool {
         std::mem::take(&mut self.keychain_flush)
+    }
+
+    /// Start TDLib with no click when the keychain holds a saved session.
+    ///
+    /// Call once per frame. It acts only after the keychain read settles, and
+    /// only once. The UI thread reads memory only; the command has no secret.
+    pub(crate) fn poll_resume(&mut self, store: &SecretStore) {
+        self.try_resume(store, super::auth::tdlib_compiled());
+    }
+
+    fn try_resume(&mut self, store: &SecretStore, live: bool) {
+        if self.resume != Resume::Waiting || !store.attach_settled() {
+            return;
+        }
+        let saved_session = store.get(SecretKey::Session).ok().flatten().is_some();
+        if !live
+            || !saved_session
+            || self.auth != AuthScreen::Idle
+            || self.telegram_authorized
+            || !self.has_api_credentials(store)
+        {
+            self.resume = Resume::Settled;
+            return;
+        }
+        self.resume = Resume::Connecting;
+        self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
+        self.status_text = RESUME_CONNECTING.into();
+    }
+
+    #[must_use]
+    pub(crate) fn center_view(&self) -> CenterView {
+        if self.auth != AuthScreen::Idle {
+            return CenterView::Auth;
+        }
+        if self.has_primary_account() {
+            return CenterView::Thread;
+        }
+        match self.resume {
+            Resume::Waiting if super::auth::tdlib_compiled() => {
+                CenterView::Resuming { connecting: false }
+            }
+            Resume::Connecting => CenterView::Resuming { connecting: true },
+            Resume::Waiting | Resume::Settled => CenterView::FirstRun,
+        }
     }
 
     pub(crate) fn has_primary_account(&self) -> bool {
@@ -466,6 +545,7 @@ impl Snapshot {
 
     pub(crate) fn cancel_auth(&mut self, store: &SecretStore) {
         self.clear_secrets();
+        self.resume = Resume::Settled;
         clear_ephemeral(store);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
@@ -578,6 +658,7 @@ impl Snapshot {
 
     pub(crate) fn open_telegram(&mut self, store: &SecretStore) {
         self.clear_secrets();
+        self.resume = Resume::Settled;
         clear_ephemeral(store);
         self.error = None;
         self.auth_busy = false;
@@ -614,7 +695,15 @@ impl Snapshot {
         if phase != TelegramAuthPhase::Failed {
             self.error = None;
         }
+        let resuming = std::mem::replace(&mut self.resume, Resume::Settled) == Resume::Connecting;
+        self.auth_notice = None;
         match phase {
+            TelegramAuthPhase::NeedPhone if resuming => {
+                // The worker drops the stale session marker on this path.
+                self.auth = AuthScreen::TelegramPhone;
+                self.auth_notice = Some(SESSION_ENDED_NOTICE);
+                self.status_text = SESSION_ENDED_NOTICE.into();
+            }
             TelegramAuthPhase::NeedPhone => {
                 self.auth = AuthScreen::TelegramPhone;
                 self.status_text =
@@ -709,6 +798,7 @@ impl Snapshot {
     }
 
     fn clear_secrets(&mut self) {
+        self.auth_notice = None;
         self.telegram_api_id.clear();
         self.telegram_api_hash.clear();
         self.telegram_phone.clear();
@@ -961,6 +1051,148 @@ mod tests {
         submit_and_apply(snapshot, store, TelegramAuthPhase::Ready);
         assert_eq!(snapshot.auth, AuthScreen::Idle);
         assert!(snapshot.telegram_ready());
+    }
+
+    fn resume_commands(snapshot: &mut Snapshot) -> usize {
+        snapshot
+            .take_commands()
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    AdapterCommand::TelegramAuth {
+                        step: TelegramAuthStep::ApiCredentials
+                    }
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn saved_session_resumes_once_without_first_run() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        store
+            .set(SecretKey::Session, "tdlib-ready")
+            .expect("marker");
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&store, true);
+        snapshot.try_resume(&store, true);
+        assert_eq!(
+            snapshot.center_view(),
+            CenterView::Resuming { connecting: true }
+        );
+        assert_eq!(snapshot.status_text, RESUME_CONNECTING);
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        let commands = snapshot.take_commands();
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(
+            commands[0],
+            AdapterCommand::TelegramAuth {
+                step: TelegramAuthStep::ApiCredentials
+            }
+        ));
+        let debug = format!("{commands:?}");
+        assert!(!debug.contains("11111"));
+        assert!(!debug.contains("hash-value"));
+        assert!(!debug.contains("tdlib-ready"));
+
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        assert_eq!(snapshot.center_view(), CenterView::Thread);
+        assert!(snapshot.has_primary_account());
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert_eq!(snapshot.auth_notice, None);
+    }
+
+    #[test]
+    fn no_saved_session_keeps_first_run() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&store, true);
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+        assert_eq!(resume_commands(&mut snapshot), 0);
+    }
+
+    #[test]
+    fn saved_session_without_api_credentials_or_tdlib_keeps_first_run() {
+        let store = SecretStore::memory();
+        store
+            .set(SecretKey::Session, "tdlib-ready")
+            .expect("marker");
+        let mut snapshot = Snapshot::with_api_source(TelegramApiSource::empty());
+        snapshot.try_resume(&store, true);
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+        assert_eq!(resume_commands(&mut snapshot), 0);
+
+        seed_override(&store);
+        let mut feature_off = Snapshot::new();
+        feature_off.try_resume(&store, false);
+        assert_eq!(feature_off.center_view(), CenterView::FirstRun);
+        assert_eq!(resume_commands(&mut feature_off), 0);
+    }
+
+    #[test]
+    fn resume_waits_for_the_keychain_read_then_arms() {
+        let store = SecretStore::detached_for_test();
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&store, true);
+        assert_eq!(resume_commands(&mut snapshot), 0);
+        assert_ne!(snapshot.center_view(), CenterView::Thread);
+        store.complete_ready_attach_for_test(&[
+            (SecretKey::ApiId, "11111"),
+            (SecretKey::ApiHash, "hash-value"),
+            (SecretKey::Session, "tdlib-ready"),
+        ]);
+        snapshot.try_resume(&store, true);
+        assert_eq!(resume_commands(&mut snapshot), 1);
+        assert_eq!(
+            snapshot.center_view(),
+            CenterView::Resuming { connecting: true }
+        );
+    }
+
+    #[test]
+    fn ended_session_shows_the_phone_step_with_a_notice() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        store
+            .set(SecretKey::Session, "tdlib-ready")
+            .expect("marker");
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&store, true);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert_eq!(snapshot.center_view(), CenterView::Auth);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert_eq!(snapshot.auth_notice, Some(SESSION_ENDED_NOTICE));
+        assert_eq!(snapshot.status_text, SESSION_ENDED_NOTICE);
+
+        snapshot.telegram_phone = "+15551234567".into();
+        submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::NeedCode);
+        assert_eq!(snapshot.auth_notice, None);
+    }
+
+    #[test]
+    fn resume_error_falls_back_to_first_run() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        store
+            .set(SecretKey::Session, "tdlib-ready")
+            .expect("marker");
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&store, true);
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "TDLib worker is not running. Cancel and try again.".into(),
+        });
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+        snapshot.try_resume(&store, true);
+        assert_eq!(resume_commands(&mut snapshot), 1, "only the first try");
     }
 
     #[test]

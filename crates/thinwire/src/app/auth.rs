@@ -58,6 +58,10 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
         );
     }
 
+    if let Some(notice) = snapshot.auth_notice {
+        ui.colored_label(WARN, notice);
+    }
+
     match snapshot.auth {
         AuthScreen::Idle => {}
         AuthScreen::NeedCredentials => need_credentials(ui, snapshot, secrets),
