@@ -152,8 +152,18 @@ pub enum TelegramAuthError {
 pub enum TelegramCodeVia {
     TelegramApp,
     Sms,
+    /// SMS with a word or a phrase, not digits.
+    SmsWord,
     Call,
     Other,
+}
+
+impl TelegramCodeVia {
+    /// `false` for a word or phrase code: the code field must keep letters.
+    #[must_use]
+    pub const fn digits_only(self) -> bool {
+        !matches!(self, Self::SmsWord)
+    }
 }
 
 /// Telegram login phase reported to the UI. Never carries credential values.

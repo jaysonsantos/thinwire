@@ -29,6 +29,8 @@ pub use credentials::{
 };
 pub use inbox::parse_telegram_chat_id;
 
+#[cfg(test)]
+use super::adapter::TelegramCodeVia;
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, EventTx, ProtocolAdapter, ProtocolCapabilities,
     ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep, emit_flush_secrets, emit_status,
@@ -623,6 +625,10 @@ mod tests {
         assert!(reject.contains("TelegramAuthPhase::Failed"));
         let auth = fn_body(src, "async fn apply_authorization");
         assert!(auth.contains("emit_telegram_code_sent(events, code_via("));
+        let via = fn_body(src, "fn code_via");
+        assert!(via.contains("Kind::SmsWord(_) | Kind::SmsPhrase(_) => TelegramCodeVia::SmsWord"));
+        assert!(TelegramCodeVia::Sms.digits_only());
+        assert!(!TelegramCodeVia::SmsWord.digits_only(), "qa R14");
         assert!(!auth.contains("optional 2FA"));
         assert!(!src.contains("TDLib worker is not running"));
     }

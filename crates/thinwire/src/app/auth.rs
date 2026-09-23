@@ -175,13 +175,21 @@ fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretSt
 
 fn telegram_code(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
     ui.label(code_hint(snapshot.code_via));
+    let digits_only = code_is_digits(snapshot.code_via);
+    let hint = if digits_only {
+        "12345"
+    } else {
+        "word or phrase"
+    };
     field(
         ui,
-        egui::TextEdit::singleline(&mut snapshot.telegram_code).hint_text("12345"),
+        egui::TextEdit::singleline(&mut snapshot.telegram_code).hint_text(hint),
         "code",
         focus,
     );
-    snapshot.telegram_code.retain(|c| c.is_ascii_digit());
+    if digits_only {
+        snapshot.telegram_code.retain(|c| c.is_ascii_digit());
+    }
     continue_button(ui, snapshot, secrets, "Continue");
     ui.horizontal(|ui| {
         if ui.link("Change number").clicked() {
@@ -195,12 +203,19 @@ fn telegram_code(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretSto
     });
 }
 
+/// Digits only, unless Telegram sent a word or phrase (qa R14).
+#[must_use]
+pub(crate) fn code_is_digits(via: Option<TelegramCodeVia>) -> bool {
+    via.is_none_or(TelegramCodeVia::digits_only)
+}
+
 fn code_hint(via: Option<TelegramCodeVia>) -> &'static str {
     match via {
         Some(TelegramCodeVia::TelegramApp) => {
             "Telegram sent the code to your Telegram app on another device."
         }
         Some(TelegramCodeVia::Sms) => "Telegram sent the code by SMS.",
+        Some(TelegramCodeVia::SmsWord) => "Telegram sent a word or a phrase by SMS. Type it here.",
         Some(TelegramCodeVia::Call) => "Telegram will call you with the code.",
         Some(TelegramCodeVia::Other) | None => "Enter the code Telegram sent you.",
     }

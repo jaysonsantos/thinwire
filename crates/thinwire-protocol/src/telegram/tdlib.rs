@@ -503,7 +503,8 @@ fn code_via(kind: &tdlib_rs::enums::AuthenticationCodeType) -> TelegramCodeVia {
     use tdlib_rs::enums::AuthenticationCodeType as Kind;
     match kind {
         Kind::TelegramMessage(_) => TelegramCodeVia::TelegramApp,
-        Kind::Sms(_) | Kind::SmsWord(_) | Kind::SmsPhrase(_) => TelegramCodeVia::Sms,
+        Kind::Sms(_) => TelegramCodeVia::Sms,
+        Kind::SmsWord(_) | Kind::SmsPhrase(_) => TelegramCodeVia::SmsWord,
         Kind::Call(_) | Kind::FlashCall(_) | Kind::MissedCall(_) => TelegramCodeVia::Call,
         _ => TelegramCodeVia::Other,
     }

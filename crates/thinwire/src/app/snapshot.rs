@@ -2207,7 +2207,7 @@ mod tests {
         assert!(!super::super::auth::TELEGRAM_STUB_UNTIL_READY.contains("TDLib"));
         assert!(auth.contains("\"Two-step verification\""));
         assert!(auth.contains("\"Enter your Telegram password.\""));
-        assert!(auth.contains("hint_text(\"12345\")"));
+        assert!(auth.contains("\"12345\"") && auth.contains("\"word or phrase\""));
         assert!(auth.contains("\"Change number\""));
         assert!(auth.contains("\"Send a new code\""));
         let code = &auth[auth.find("fn telegram_code(").expect("code")..];
@@ -2456,6 +2456,21 @@ mod tests {
             resuming.contains("keychain_wait_text("),
             "no bare spinner (qa R1)"
         );
+    }
+
+    #[test]
+    fn word_and_phrase_codes_keep_their_letters() {
+        use super::super::auth::code_is_digits;
+        assert!(code_is_digits(None));
+        assert!(code_is_digits(Some(TelegramCodeVia::Sms)));
+        assert!(code_is_digits(Some(TelegramCodeVia::TelegramApp)));
+        assert!(!code_is_digits(Some(TelegramCodeVia::SmsWord)));
+        let auth = include_str!("auth.rs");
+        let code = &auth[auth.find("fn telegram_code(").expect("code")..];
+        let code = &code[..code.find("\nfn ").expect("next")];
+        let guard = code.find("if digits_only").expect("guard");
+        let filter = code.find("retain(|c| c.is_ascii_digit())").expect("filter");
+        assert!(guard < filter, "the digit filter runs only for digit codes");
     }
 
     #[test]
