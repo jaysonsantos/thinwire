@@ -100,7 +100,8 @@ fn top_bar(
             if snapshot.can_add_account() && ui.button("Add account").clicked() {
                 snapshot.open_add_account(secrets);
             }
-            if ui.button("Advanced").clicked() {
+            // The override applies to a new client only: hidden while signed in.
+            if snapshot.can_add_account() && ui.button("Advanced").clicked() {
                 snapshot.open_api_override(secrets);
             }
             ui.separator();

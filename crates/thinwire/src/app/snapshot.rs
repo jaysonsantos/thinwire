@@ -1071,7 +1071,12 @@ impl Snapshot {
         };
     }
 
+    /// The API override applies to a new client only, so it is offered only
+    /// while Telegram is not signed in (qa note on F8).
     pub(crate) fn open_api_override(&mut self, store: &SecretStore) {
+        if !self.can_add_account() {
+            return;
+        }
         self.clear_secrets();
         self.error = None;
         self.auth_busy = false;
@@ -2560,7 +2565,14 @@ mod tests {
         assert!(snapshot.take_commands().is_empty());
 
         snapshot.open_api_override(&store);
-        assert_eq!(snapshot.auth, AuthScreen::TelegramApi);
+        assert_eq!(
+            snapshot.auth,
+            AuthScreen::Idle,
+            "no Advanced while signed in"
+        );
+        // A form can still be over a live session (for example one opened just
+        // before Ready). Cancel then closes the form only.
+        snapshot.auth = AuthScreen::TelegramApi;
         snapshot.center_key(AuthKey::Escape, &store);
         assert_eq!(snapshot.auth, AuthScreen::Idle);
         assert!(snapshot.telegram_ready(), "Cancel does not sign out");
@@ -2584,6 +2596,11 @@ mod tests {
         let guard = bar.find("can_add_account()").expect("guard");
         let button = bar.find("\"Add account\"").expect("button");
         assert!(guard < button, "Add account hides when Telegram is ready");
+        let advanced = bar.find("\"Advanced\"").expect("advanced");
+        let advanced_guard = bar[..advanced]
+            .rfind("can_add_account()")
+            .expect("advanced guard");
+        assert!(advanced_guard > button, "Advanced has its own guard");
     }
 
     #[test]
