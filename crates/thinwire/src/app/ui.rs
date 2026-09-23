@@ -1,7 +1,7 @@
 //! Shell: account switcher + inbox on the left, thread in the center.
 
 use eframe::egui::{self, Color32, RichText};
-use thinwire_protocol::{ProtocolId, SupportClass};
+use thinwire_protocol::{Delivery, ProtocolId, SupportClass};
 
 use thinwire_protocol::WhatsAppPhoneVault;
 
@@ -16,6 +16,8 @@ const SUPPORTED: Color32 = Color32::from_rgb(96, 176, 128);
 const EXPERIMENTAL: Color32 = Color32::from_rgb(214, 160, 64);
 const CONSTRAINED: Color32 = Color32::from_rgb(196, 148, 88);
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
+const FAILED: Color32 = Color32::from_rgb(200, 80, 80);
+const COMPOSE_MAX_ROWS: usize = 5;
 
 pub(crate) fn draw(
     ui: &mut egui::Ui,
@@ -315,26 +317,35 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     }
     ui.separator();
 
-    let messages: Vec<(bool, String, String)> = snapshot
+    let messages: Vec<(String, bool, String, String, Delivery)> = snapshot
         .selected_messages()
         .iter()
         .map(|message| {
             (
+                message.id.clone(),
                 message.outbound,
                 message.sender.clone(),
                 message.body.clone(),
+                message.delivery,
             )
         })
         .collect();
 
+    // Compose grows to COMPOSE_MAX_ROWS lines, then scrolls. Reserve its height.
+    let row_height = ui.text_style_height(&egui::TextStyle::Body);
+    let compose_rows = snapshot.compose.lines().count().clamp(1, COMPOSE_MAX_ROWS);
+    let compose_height = row_height * COMPOSE_MAX_ROWS as f32;
+    let reserve = row_height * compose_rows as f32 + 32.0;
+
     let state = snapshot.thread_state();
+    let mut retry: Option<String> = None;
     // One scroll state per chat, so each chat opens at its newest message.
     let salt = snapshot.selected_conversation.clone().unwrap_or_default();
     egui::ScrollArea::vertical()
         .id_salt(("thread", salt))
         .auto_shrink([false, true])
         .stick_to_bottom(true)
-        .max_height(ui.available_height() - 48.0)
+        .max_height(ui.available_height() - reserve)
         .show(ui, |ui| {
             match state {
                 ThreadState::Loading => {
@@ -352,24 +363,77 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 }
                 ThreadState::NoSelection | ThreadState::Rows => {}
             }
-            for (outbound, sender, body) in messages {
+            for (id, outbound, sender, body, delivery) in messages {
                 ui.group(|ui| {
                     let who = if outbound { "you" } else { sender.as_str() };
                     ui.strong(who);
                     ui.label(body);
+                    match delivery {
+                        Delivery::Sent => {}
+                        Delivery::Pending => {
+                            ui.label(RichText::new("Sending…").small().color(MUTED));
+                        }
+                        Delivery::Failed => {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(FAILED, RichText::new("Not sent").small());
+                                if ui.small_button("Retry").clicked() {
+                                    retry = Some(id.clone());
+                                }
+                            });
+                        }
+                    }
                 });
                 ui.add_space(4.0);
             }
         });
+    if let Some(id) = retry {
+        snapshot.retry_send(&id);
+    }
 
     ui.separator();
+    compose(ui, snapshot, compose_height);
+}
+
+/// Multiline compose. Enter sends; Shift+Enter adds a line.
+fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
+    let compose_id = egui::Id::new("thread-compose");
+    if snapshot.take_focus_compose() {
+        ui.memory_mut(|memory| memory.request_focus(compose_id));
+    }
+    if ui.memory(|memory| memory.has_focus(compose_id)) {
+        let (enter, shift, other) = ui.input(|input| {
+            let modifiers = input.modifiers;
+            (
+                input.key_pressed(egui::Key::Enter),
+                modifiers.shift,
+                modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd,
+            )
+        });
+        // Eat plain Enter before the text field sees it, so it does not add a line.
+        if enter && !other && snapshot.compose_enter(shift) {
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        }
+    }
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut snapshot.compose)
-                .desired_width(ui.available_width() - 72.0)
-                .hint_text("Message"),
-        );
-        if ui.button("Send").clicked() {
+        let width = ui.available_width() - 72.0;
+        egui::ScrollArea::vertical()
+            .id_salt("thread-compose-scroll")
+            .max_height(max_height)
+            .max_width(width)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut snapshot.compose)
+                        .id(compose_id)
+                        .desired_rows(1)
+                        .desired_width(width)
+                        .hint_text("Message"),
+                );
+            });
+        if ui
+            .add_enabled(snapshot.can_send(), egui::Button::new("Send"))
+            .clicked()
+        {
             snapshot.send_compose();
         }
     });

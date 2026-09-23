@@ -176,6 +176,12 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         conversation_id: String,
     },
+    /// Send a failed outgoing message again. Ids are not secrets.
+    ResendMessage {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+    },
     /// Send plain text. The body is the user's message, never a credential.
     SendText {
         protocol: ProtocolId,
@@ -200,7 +206,8 @@ impl AdapterCommand {
             | Self::Disconnect { protocol }
             | Self::LoadChats { protocol }
             | Self::OpenChat { protocol, .. }
-            | Self::SendText { protocol, .. } => protocol,
+            | Self::SendText { protocol, .. }
+            | Self::ResendMessage { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
             Self::WhatsAppAcknowledgeRisk | Self::WhatsAppBeginLink | Self::WhatsAppCancelLink => {
@@ -255,6 +262,13 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         conversation_id: String,
         message_ids: Vec<String>,
+    },
+    /// New delivery state for a message already in the thread.
+    MessageDelivery {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        delivery: Delivery,
     },
     /// A chat-list page load ended (loaded, already complete, or failed).
     /// The UI stops its "Loading chats…" state.
@@ -324,6 +338,17 @@ pub struct Conversation {
     pub order: i64,
 }
 
+/// Delivery of an outgoing message. Incoming messages are always `Sent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Delivery {
+    #[default]
+    Sent,
+    /// Queued on the client. The server has not confirmed it yet.
+    Pending,
+    /// The server did not accept it. The user can retry.
+    Failed,
+}
+
 /// Message shown in the right pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -333,6 +358,7 @@ pub struct ChatMessage {
     pub sender: String,
     pub body: String,
     pub outbound: bool,
+    pub delivery: Delivery,
 }
 
 /// Recoverable adapter failure. Never includes secrets.
@@ -449,6 +475,22 @@ pub(crate) fn emit_message_body(
         conversation_id: conversation_id.into(),
         message_id: message_id.into(),
         body: body.into(),
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_message_delivery(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    message_id: impl Into<String>,
+    delivery: Delivery,
+) {
+    let _ = events.send(AdapterEvent::MessageDelivery {
+        protocol,
+        conversation_id: conversation_id.into(),
+        message_id: message_id.into(),
+        delivery,
     });
 }
 

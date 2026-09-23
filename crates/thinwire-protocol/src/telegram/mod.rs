@@ -229,6 +229,27 @@ impl ProtocolAdapter for TelegramAdapter {
                 }
                 self.dispatch_live(events, LiveCall::OpenChat(conversation_id))
             }
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                message_id,
+            } => {
+                let owned = inbox::parse_message_id(&message_id)
+                    .is_some_and(|(chat_id, _)| inbox::conversation_id(chat_id) == conversation_id);
+                if !owned {
+                    return Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason: "message id is not in this Telegram chat",
+                    });
+                }
+                self.dispatch_live(
+                    events,
+                    LiveCall::Resend {
+                        conversation_id,
+                        message_id,
+                    },
+                )
+            }
             AdapterCommand::SendText {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -299,6 +320,10 @@ enum LiveCall {
         conversation_id: String,
         body: String,
     },
+    Resend {
+        conversation_id: String,
+        message_id: String,
+    },
 }
 
 impl TelegramAdapter {
@@ -319,6 +344,13 @@ impl TelegramAdapter {
                 } => {
                     self.tdlib
                         .send_text(conversation_id, body, secrets, source, events);
+                }
+                LiveCall::Resend {
+                    conversation_id,
+                    message_id,
+                } => {
+                    self.tdlib
+                        .resend(conversation_id, message_id, secrets, source, events);
                 }
             }
             Ok(())
@@ -519,6 +551,51 @@ mod tests {
         assert!(history.contains("true,"));
         let chats = fn_body(src, "async fn load_main_chats");
         assert!(chats.contains("emit_chat_list_loaded"));
+    }
+
+    #[test]
+    fn resend_checks_the_chat_and_uses_tdlib_resend() {
+        let mut adapter = TelegramAdapter::memory();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let foreign = adapter.handle(
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                message_id: "telegram:2:5".into(),
+            },
+            &tx,
+        );
+        assert!(
+            foreign
+                .expect_err("other chat")
+                .to_string()
+                .contains("not in this Telegram chat")
+        );
+        let resend = adapter.handle(
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                message_id: "telegram:1:5".into(),
+            },
+            &tx,
+        );
+        if uses_tdlib_hook() {
+            resend.expect("live resend queues on the worker");
+        } else {
+            assert!(
+                resend
+                    .expect_err("feature off")
+                    .to_string()
+                    .contains("TDLib unavailable")
+            );
+        }
+        let src = include_str!("tdlib.rs");
+        let body = fn_body(src, "async fn resend");
+        assert!(body.contains("functions::resend_messages"));
+        assert!(body.contains("Delivery::Failed"));
+        let mapped = fn_body(src, "fn emit_mapped_message");
+        assert!(mapped.contains("MessageSendingState::Pending"));
+        assert!(mapped.contains("MessageSendingState::Failed"));
     }
 
     #[test]

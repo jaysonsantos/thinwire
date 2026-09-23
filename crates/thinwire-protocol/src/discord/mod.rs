@@ -16,7 +16,7 @@ use super::adapter::{
     ProtocolCapabilities, ProtocolId, SupportClass, emit_status,
 };
 #[cfg(feature = "discord-bot")]
-use super::adapter::{ChatMessage, Conversation, emit_conversation, emit_message};
+use super::adapter::{ChatMessage, Conversation, Delivery, emit_conversation, emit_message};
 use token::authorization_token;
 
 pub use install::DiscordOAuthInstall;
@@ -227,6 +227,7 @@ impl DiscordAdapter {
                 sender: "thinwire".into(),
                 body: "Guild bot inbox placeholder. The gateway is not started. User-account and self-bot paths are refused.".into(),
                 outbound: false,
+                delivery: Delivery::Sent,
             },
         );
     }

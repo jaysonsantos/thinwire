@@ -12,7 +12,7 @@ mod live;
 use std::sync::Arc;
 
 use super::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
     ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
     emit_message, emit_status,
 };
@@ -140,6 +140,7 @@ impl WhatsAppAdapter {
                 sender: "thinwire".into(),
                 body: "WhatsApp is experimental. Unofficial linked-device code can get a personal account banned. This is not a live session.".into(),
                 outbound: false,
+                delivery: Delivery::Sent,
             },
         );
     }

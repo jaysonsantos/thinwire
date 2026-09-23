@@ -1,7 +1,7 @@
 //! Test double used to prove workers push events without calling UI APIs.
 
 use super::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
     ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
     emit_message, emit_status,
 };
@@ -78,6 +78,7 @@ impl ProtocolAdapter for FakeAdapter {
                         sender: "worker".into(),
                         body: "event from tokio worker".into(),
                         outbound: false,
+                        delivery: Delivery::Sent,
                     },
                 );
                 Ok(())

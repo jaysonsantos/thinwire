@@ -24,7 +24,7 @@ pub use morphism::{oauth_v2_access_request, socket_mode_config, workspace_bot_to
 pub use secrets::{MemorySlackVault, SLACK_SECRET_SERVICE, SlackSecretKey, SlackSecretVault};
 
 use super::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
     ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
     emit_message, emit_status,
 };
@@ -100,6 +100,7 @@ impl SlackAdapter {
                 sender: "thinwire".into(),
                 body: "Slack is a supported OAuth / workspace-app goal. This pane is placeholder data; no workspace token is stored.".into(),
                 outbound: false,
+                delivery: Delivery::Sent,
             },
         );
     }

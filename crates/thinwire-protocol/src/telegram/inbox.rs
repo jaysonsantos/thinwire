@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::adapter::{ChatMessage, Conversation, ProtocolId};
+use crate::adapter::{ChatMessage, Conversation, Delivery, ProtocolId};
 
 /// Page size passed to TDLib `loadChats` for the main list.
 pub(super) const MAIN_CHAT_LIMIT: i32 = 30;
@@ -36,6 +36,7 @@ pub(super) struct InboxMessage {
     pub outgoing: bool,
     pub party: MessageParty,
     pub body: String,
+    pub delivery: Delivery,
 }
 
 /// What the shell should do after a chat-list mutation.
@@ -216,6 +217,17 @@ pub(super) fn message_id(chat_id: i64, message_id: i64) -> String {
     format!("telegram:{chat_id}:{message_id}")
 }
 
+/// Split `telegram:<chat>:<message>` back into TDLib ids.
+#[must_use]
+pub(super) fn parse_message_id(message_id: &str) -> Option<(i64, i64)> {
+    let rest = message_id.strip_prefix("telegram:")?;
+    let (chat, message) = rest.split_once(':')?;
+    if chat.starts_with('+') || message.starts_with('+') {
+        return None;
+    }
+    Some((chat.parse().ok()?, message.parse().ok()?))
+}
+
 #[must_use]
 pub(super) fn is_end_of_chat_list(code: i32) -> bool {
     code == END_OF_CHAT_LIST
@@ -253,6 +265,11 @@ pub(super) fn to_chat_message(
         sender,
         body: message.body.clone(),
         outbound: message.outgoing,
+        delivery: if message.outgoing {
+            message.delivery
+        } else {
+            Delivery::Sent
+        },
     }
 }
 
@@ -387,6 +404,7 @@ mod tests {
             outgoing: false,
             party: MessageParty::User(7),
             body: "hello".into(),
+            delivery: Delivery::Sent,
         };
         let mapped = to_chat_message(&message, &names, Some("Ada"));
         assert_eq!(mapped.sender, "Ada Lovelace");
@@ -399,6 +417,37 @@ mod tests {
         };
         assert_eq!(to_chat_message(&mine, &names, None).sender, "you");
         assert!(to_chat_message(&mine, &names, None).outbound);
+    }
+
+    #[test]
+    fn delivery_maps_only_for_outgoing_and_message_ids_parse_back() {
+        let names = NameBook::new();
+        let failed = InboxMessage {
+            chat_id: 9,
+            message_id: 4,
+            outgoing: true,
+            party: MessageParty::User(1),
+            body: "ping".into(),
+            delivery: Delivery::Failed,
+        };
+        assert_eq!(
+            to_chat_message(&failed, &names, None).delivery,
+            Delivery::Failed
+        );
+        let inbound = InboxMessage {
+            outgoing: false,
+            delivery: Delivery::Pending,
+            ..failed
+        };
+        assert_eq!(
+            to_chat_message(&inbound, &names, None).delivery,
+            Delivery::Sent
+        );
+        assert_eq!(parse_message_id("telegram:9:4"), Some((9, 4)));
+        assert_eq!(parse_message_id("telegram:-100:7"), Some((-100, 7)));
+        assert_eq!(parse_message_id("telegram:9"), None);
+        assert_eq!(parse_message_id("telegram:+9:4"), None);
+        assert_eq!(parse_message_id("slack:9:4"), None);
     }
 
     #[test]

@@ -13,10 +13,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
 use super::inbox::{self, ChatDirectory, ChatEffect, InboxMessage, MessageParty, NameBook};
 use crate::adapter::{
-    AdapterStatus, EventTx, ProtocolId, TelegramAuthPhase, TelegramAuthStep, emit_chat_list_loaded,
-    emit_conversation, emit_conversation_removed, emit_history_loaded, emit_message,
-    emit_message_body, emit_message_replaced, emit_messages_removed, emit_status,
-    emit_telegram_auth,
+    AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthPhase, TelegramAuthStep,
+    emit_chat_list_loaded, emit_conversation, emit_conversation_removed, emit_history_loaded,
+    emit_message, emit_message_body, emit_message_delivery, emit_message_replaced,
+    emit_messages_removed, emit_status, emit_telegram_auth,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -31,6 +31,10 @@ enum TdlibCommand {
     SendText {
         conversation_id: String,
         body: String,
+    },
+    Resend {
+        conversation_id: String,
+        message_id: String,
     },
 }
 
@@ -106,6 +110,25 @@ impl TdlibRuntime {
             TdlibCommand::SendText {
                 conversation_id,
                 body,
+            },
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    pub fn resend(
+        &mut self,
+        conversation_id: String,
+        message_id: String,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::Resend {
+                conversation_id,
+                message_id,
             },
             secrets,
             source,
@@ -217,6 +240,9 @@ fn spawn_tdlib_worker(
                         }
                         TdlibCommand::SendText { conversation_id, body } => {
                             send_text(client_id, &conversation_id, &body, &live, &events).await;
+                        }
+                        TdlibCommand::Resend { conversation_id, message_id } => {
+                            resend(client_id, &conversation_id, &message_id, &live, &events).await;
                         }
                     }
                 }
@@ -618,6 +644,11 @@ fn emit_mapped_message(
             outgoing: message.is_outgoing,
             party,
             body: message_body(&message.content),
+            delivery: match &message.sending_state {
+                None => Delivery::Sent,
+                Some(tdlib_rs::enums::MessageSendingState::Pending(_)) => Delivery::Pending,
+                Some(tdlib_rs::enums::MessageSendingState::Failed(_)) => Delivery::Failed,
+            },
         },
         &live.names,
         live.directory.title(message.chat_id),
@@ -797,6 +828,67 @@ async fn send_text(
             AdapterStatus::Error,
             format!("Telegram did not send the message (TDLib {}).", error.code),
         ),
+    }
+}
+
+async fn resend(
+    client_id: i32,
+    conversation_id: &str,
+    message_id: &str,
+    live: &LiveInbox,
+    events: &EventTx,
+) {
+    let failed = || {
+        emit_message_delivery(
+            events,
+            ProtocolId::Telegram,
+            conversation_id,
+            message_id,
+            Delivery::Failed,
+        );
+    };
+    if !live.authorized {
+        failed();
+        emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            "Telegram is not ready. Retry after authorization.",
+        );
+        return;
+    }
+    let Some((chat_id, id)) = inbox::parse_message_id(message_id) else {
+        failed();
+        return;
+    };
+    // TDLib deletes the failed row and returns a new pending message, or null
+    // when the message cannot be sent again.
+    match tdlib_rs::functions::resend_messages(chat_id, vec![id], None, 0, client_id).await {
+        Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
+            match batch.messages.into_iter().flatten().next() {
+                Some(message) => {
+                    emit_mapped_message(events, &message, live, Some(message_id.to_string()));
+                }
+                None => {
+                    failed();
+                    emit_status(
+                        events,
+                        ProtocolId::Telegram,
+                        AdapterStatus::Error,
+                        "Telegram cannot send this message again.",
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            failed();
+            emit_status(
+                events,
+                ProtocolId::Telegram,
+                AdapterStatus::Error,
+                format!("Telegram did not send the message (TDLib {}).", error.code),
+            );
+        }
     }
 }
 

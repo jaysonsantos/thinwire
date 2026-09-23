@@ -5,9 +5,9 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
-    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, DiscordAdapter,
-    ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthPhase, TelegramAuthStep,
-    TelegramSecretVault, catalog, parse_telegram_chat_id, telegram_api_available,
+    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery,
+    DiscordAdapter, ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthPhase,
+    TelegramAuthStep, TelegramSecretVault, catalog, parse_telegram_chat_id, telegram_api_available,
 };
 
 use super::secrets::{SecretKey, SecretStore};
@@ -188,6 +188,9 @@ pub(crate) struct Snapshot {
     chat_list_loading: bool,
     history_loading: HashSet<String>,
     scroll_to_selected: bool,
+    /// Unsent compose text per chat. `compose` holds the selected chat's draft.
+    drafts: HashMap<String, String>,
+    focus_compose: bool,
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
@@ -239,6 +242,8 @@ impl Snapshot {
             chat_list_loading: false,
             history_loading: HashSet::new(),
             scroll_to_selected: false,
+            drafts: HashMap::new(),
+            focus_compose: false,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
@@ -319,6 +324,12 @@ impl Snapshot {
                 }
                 self.ensure_conversation_selection();
             }
+            AdapterEvent::MessageDelivery {
+                protocol,
+                conversation_id,
+                message_id,
+                delivery,
+            } => self.set_delivery(protocol, &conversation_id, &message_id, delivery),
             AdapterEvent::ChatListLoaded { protocol } => {
                 if protocol == ProtocolId::Telegram {
                     self.chat_list_loading = false;
@@ -340,6 +351,9 @@ impl Snapshot {
                     self.telegram_messages_from_adapter =
                         self.telegram_messages_from_adapter.saturating_add(1);
                 }
+                let before =
+                    self.delivery_of(message.protocol, &message.conversation_id, &message.id);
+                self.note_delivery(before, &message);
                 self.upsert_message(message);
             }
             AdapterEvent::MessageReplaced {
@@ -348,6 +362,8 @@ impl Snapshot {
                 old_id,
                 message,
             } => {
+                let before = self.delivery_of(protocol, &conversation_id, &old_id);
+                self.note_delivery(before, &message);
                 if protocol == message.protocol {
                     self.remove_message(protocol, &conversation_id, &old_id);
                 }
@@ -461,13 +477,91 @@ impl Snapshot {
             return;
         }
         self.selected_protocol = protocol;
-        self.selected_conversation = None;
+        self.set_selected_conversation(None);
         self.ensure_conversation_selection();
     }
 
     pub(crate) fn select_conversation(&mut self, id: String) {
-        self.selected_conversation = Some(id);
+        self.set_selected_conversation(Some(id));
+        self.focus_compose = true;
         self.queue_open_chat();
+    }
+
+    /// Change the selected chat. The compose text stays with the chat it was typed in.
+    fn set_selected_conversation(&mut self, id: Option<String>) {
+        if self.selected_conversation == id {
+            return;
+        }
+        let draft = std::mem::take(&mut self.compose);
+        if let Some(old) = self.selected_conversation.take()
+            && !draft.is_empty()
+        {
+            self.drafts.insert(old, draft);
+        }
+        if let Some(new) = id.as_ref() {
+            self.compose = self.drafts.remove(new).unwrap_or_default();
+        }
+        self.selected_conversation = id;
+    }
+
+    /// True once after the user picked a chat. The UI then focuses compose.
+    pub(crate) fn take_focus_compose(&mut self) -> bool {
+        std::mem::take(&mut self.focus_compose)
+    }
+
+    /// Send is possible: a Telegram chat is selected, Telegram is ready, text exists.
+    #[must_use]
+    pub(crate) fn can_send(&self) -> bool {
+        self.selected_protocol == ProtocolId::Telegram
+            && self.telegram_authorized
+            && !self.compose.trim().is_empty()
+            && self
+                .selected_conversation
+                .as_deref()
+                .and_then(parse_telegram_chat_id)
+                .is_some()
+    }
+
+    /// Enter in compose. Plain Enter sends and returns `true`, so the UI eats
+    /// the key. Shift+Enter returns `false`, so the text field adds a line.
+    pub(crate) fn compose_enter(&mut self, shift: bool) -> bool {
+        if shift {
+            return false;
+        }
+        self.send_compose();
+        true
+    }
+
+    /// Send a failed outgoing message again. Only a `Failed` row queues a command.
+    pub(crate) fn retry_send(&mut self, message_id: &str) {
+        let Some(conversation_id) = self.selected_conversation.clone() else {
+            return;
+        };
+        let protocol = self.selected_protocol;
+        if protocol != ProtocolId::Telegram || !self.telegram_authorized {
+            return;
+        }
+        let Some(message) = self
+            .messages
+            .get_mut(&(protocol, conversation_id.clone()))
+            .and_then(|list| list.iter_mut().find(|row| row.id == message_id))
+        else {
+            return;
+        };
+        if !message.outbound || message.delivery != Delivery::Failed {
+            return;
+        }
+        message.delivery = Delivery::Pending;
+        if self.compose == message.body {
+            self.compose.clear();
+        }
+        self.error = None;
+        self.status_text = "Sending…".into();
+        self.pending.push(AdapterCommand::ResendMessage {
+            protocol,
+            conversation_id,
+            message_id: message_id.to_string(),
+        });
     }
 
     pub(crate) fn set_filter(&mut self, filter: InboxFilter) {
@@ -705,40 +799,16 @@ impl Snapshot {
         }
     }
 
+    /// Queue the compose text. Does nothing when [`Self::can_send`] is false;
+    /// the Send button is disabled in that case, so no error block shows.
     pub(crate) fn send_compose(&mut self) {
+        if !self.can_send() {
+            return;
+        }
         let Some(conversation_id) = self.selected_conversation.clone() else {
-            self.set_error(
-                "Nothing was sent.",
-                "No conversation is selected.",
-                "Pick a thread in the inbox, then type in the compose field.",
-            );
             return;
         };
         let body = self.compose.trim().to_string();
-        if body.is_empty() {
-            self.set_error(
-                "Nothing was sent.",
-                "The compose field is empty.",
-                "Type a message for the selected Telegram chat.",
-            );
-            return;
-        }
-        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
-            self.set_error(
-                "Nothing was sent.",
-                "Telegram is not ready.",
-                "Sign in with Telegram, then pick a chat.",
-            );
-            return;
-        }
-        if parse_telegram_chat_id(&conversation_id).is_none() {
-            self.set_error(
-                "Nothing was sent.",
-                "That chat is not a Telegram chat id.",
-                "Pick a chat from the Telegram list.",
-            );
-            return;
-        }
         self.compose.clear();
         self.error = None;
         self.pending.push(AdapterCommand::SendText {
@@ -918,7 +988,7 @@ impl Snapshot {
             .get(&self.selected_protocol)
             .and_then(|rows| rows.first())
         {
-            self.selected_conversation = Some(first.id.clone());
+            self.set_selected_conversation(Some(first.id.clone()));
             self.queue_open_chat();
         }
     }
@@ -956,9 +1026,70 @@ impl Snapshot {
         self.messages
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
         if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
+            self.drafts.remove(id);
+            self.compose.clear();
             self.selected_conversation = None;
             self.ensure_conversation_selection();
         }
+    }
+
+    fn delivery_of(
+        &self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        id: &str,
+    ) -> Option<Delivery> {
+        self.messages
+            .get(&(protocol, conversation_id.to_string()))?
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.delivery)
+    }
+
+    fn set_delivery(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        delivery: Delivery,
+    ) {
+        let before = self.delivery_of(protocol, conversation_id, message_id);
+        let Some(message) = self
+            .messages
+            .get_mut(&(protocol, conversation_id.to_string()))
+            .and_then(|list| list.iter_mut().find(|row| row.id == message_id))
+        else {
+            return;
+        };
+        message.delivery = delivery;
+        let message = message.clone();
+        self.note_delivery(before, &message);
+    }
+
+    /// A send that was pending and now failed: show the error block and keep the text.
+    fn note_delivery(&mut self, before: Option<Delivery>, message: &ChatMessage) {
+        if !message.outbound
+            || message.delivery != Delivery::Failed
+            || before != Some(Delivery::Pending)
+        {
+            return;
+        }
+        let selected = self.selected_protocol == message.protocol
+            && self.selected_conversation.as_deref() == Some(message.conversation_id.as_str());
+        if selected {
+            if self.compose.trim().is_empty() {
+                self.compose.clone_from(&message.body);
+            }
+        } else {
+            self.drafts
+                .entry(message.conversation_id.clone())
+                .or_insert_with(|| message.body.clone());
+        }
+        self.set_error(
+            "Message not sent.",
+            "Telegram did not accept the message.",
+            "Press Retry on the message, or edit the text and send it again.",
+        );
     }
 
     fn upsert_message(&mut self, message: ChatMessage) {
@@ -1311,6 +1442,7 @@ mod tests {
             sender: "Ada".into(),
             body: body.into(),
             outbound: false,
+            delivery: Delivery::Sent,
         }
     }
 
@@ -1421,6 +1553,207 @@ mod tests {
         assert!(ui.contains("Loading messages…"));
         assert!(ui.contains("No messages in this chat."));
         assert!(!ui.contains("No conversations yet."));
+    }
+
+    fn outgoing(chat: i64, id: i64, body: &str, delivery: Delivery) -> ChatMessage {
+        ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: format!("telegram:{chat}"),
+            id: format!("telegram:{chat}:{id}"),
+            sender: "you".into(),
+            body: body.into(),
+            outbound: true,
+            delivery,
+        }
+    }
+
+    fn ready_with_chats(store: &SecretStore) -> Snapshot {
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 10),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 5),
+        });
+        snapshot.take_commands();
+        snapshot
+    }
+
+    fn send_texts(snapshot: &mut Snapshot) -> Vec<String> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::SendText { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn enter_sends_and_shift_enter_keeps_the_line() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "line one".into();
+        assert!(
+            !snapshot.compose_enter(true),
+            "Shift+Enter goes to the text field"
+        );
+        assert_eq!(snapshot.compose, "line one");
+        assert!(send_texts(&mut snapshot).is_empty());
+
+        snapshot.compose = "line one\nline two".into();
+        assert!(snapshot.compose_enter(false));
+        assert!(snapshot.compose.is_empty());
+        assert_eq!(send_texts(&mut snapshot), vec!["line one\nline two"]);
+
+        snapshot.compose = "   ".into();
+        assert!(!snapshot.can_send());
+        assert!(
+            snapshot.compose_enter(false),
+            "plain Enter never adds a line"
+        );
+        assert!(send_texts(&mut snapshot).is_empty());
+        assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn picking_a_chat_focuses_compose_and_keeps_drafts_per_chat() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        assert!(
+            !snapshot.take_focus_compose(),
+            "auto-select does not steal focus"
+        );
+        snapshot.compose = "draft for Ada".into();
+        snapshot.select_conversation("telegram:2".into());
+        assert!(snapshot.take_focus_compose());
+        assert!(!snapshot.take_focus_compose());
+        assert_eq!(snapshot.compose, "");
+        snapshot.compose = "draft for Bob".into();
+        snapshot.select_conversation("telegram:1".into());
+        assert_eq!(snapshot.compose, "draft for Ada");
+        snapshot.select_conversation("telegram:2".into());
+        assert_eq!(snapshot.compose, "draft for Bob");
+        assert!(
+            send_texts(&mut snapshot).is_empty(),
+            "switching never sends"
+        );
+    }
+
+    #[test]
+    fn pending_send_turns_sent_on_success() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 100, "hi", Delivery::Pending),
+        });
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+        snapshot.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing(1, 200, "hi", Delivery::Sent),
+        });
+        let messages = snapshot.selected_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "telegram:1:200");
+        assert_eq!(messages[0].delivery, Delivery::Sent);
+        assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn failed_send_keeps_the_text_and_retry_queues_one_resend() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hi".into();
+        snapshot.send_compose();
+        assert_eq!(send_texts(&mut snapshot), vec!["hi"]);
+        assert!(snapshot.compose.is_empty());
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 100, "hi", Delivery::Pending),
+        });
+        snapshot.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing(1, 101, "hi", Delivery::Failed),
+        });
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+        assert_eq!(snapshot.compose, "hi", "failed text goes back to compose");
+        let error = snapshot.error.clone().expect("error block");
+        assert_eq!(error.happened, "Message not sent.");
+
+        snapshot.retry_send("telegram:1:101");
+        snapshot.retry_send("telegram:1:101");
+        let commands = snapshot.take_commands();
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(
+            &commands[0],
+            AdapterCommand::ResendMessage { protocol: ProtocolId::Telegram, conversation_id, message_id }
+                if conversation_id == "telegram:1" && message_id == "telegram:1:101"
+        ));
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+        assert!(
+            snapshot.compose.is_empty(),
+            "retry does not leave a copy to send twice"
+        );
+
+        snapshot.apply(AdapterEvent::MessageDelivery {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:101".into(),
+            delivery: Delivery::Failed,
+        });
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+        assert_eq!(snapshot.compose, "hi");
+    }
+
+    #[test]
+    fn old_failed_rows_from_history_do_not_raise_an_error() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 5, "old", Delivery::Failed),
+        });
+        assert!(snapshot.error.is_none());
+        assert!(snapshot.compose.is_empty());
+        snapshot.retry_send("telegram:1:5");
+        assert_eq!(snapshot.take_commands().len(), 1);
+    }
+
+    #[test]
+    fn failure_in_another_chat_goes_to_that_chat_draft() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(2, 100, "for Bob", Delivery::Pending),
+        });
+        snapshot.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+            old_id: "telegram:2:100".into(),
+            message: outgoing(2, 101, "for Bob", Delivery::Failed),
+        });
+        assert!(snapshot.compose.is_empty());
+        snapshot.select_conversation("telegram:2".into());
+        assert_eq!(snapshot.compose, "for Bob");
+    }
+
+    #[test]
+    fn compose_ui_uses_enter_multiline_and_disabled_send() {
+        let ui = include_str!("ui.rs");
+        assert!(ui.contains("TextEdit::multiline(&mut snapshot.compose)"));
+        assert!(ui.contains("compose_enter(shift)"));
+        assert!(ui.contains("add_enabled(snapshot.can_send()"));
+        assert!(ui.contains("request_focus(compose_id)"));
+        assert!(ui.contains("\"Not sent\""));
+        assert!(ui.contains("\"Retry\""));
     }
 
     #[test]
@@ -1883,6 +2216,7 @@ mod tests {
                 sender: "worker".into(),
                 body: "hello from telegram".into(),
                 outbound: false,
+                delivery: Delivery::Sent,
             },
         });
     }
@@ -1968,6 +2302,7 @@ mod tests {
                 sender: "worker".into(),
                 body: "hello from telegram".into(),
                 outbound: false,
+                delivery: Delivery::Sent,
             },
         });
         assert_eq!(
@@ -2208,10 +2543,14 @@ mod tests {
         let mut snapshot = Snapshot::new();
         snapshot.selected_conversation = Some("telegram:42".into());
         snapshot.compose = "hello".into();
+        assert!(!snapshot.can_send());
         snapshot.send_compose();
         assert_eq!(snapshot.compose, "hello");
         assert!(snapshot.take_commands().is_empty());
-        assert!(snapshot.error.is_some());
+        assert!(
+            snapshot.error.is_none(),
+            "Send is disabled, so no error block"
+        );
         assert!(snapshot.selected_messages().is_empty());
     }
 
@@ -2283,6 +2622,7 @@ mod tests {
                 sender: "Ada".into(),
                 body: "second".into(),
                 outbound: false,
+                delivery: Delivery::Sent,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -2293,6 +2633,7 @@ mod tests {
                 sender: "Ada".into(),
                 body: "first".into(),
                 outbound: false,
+                delivery: Delivery::Sent,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -2303,6 +2644,7 @@ mod tests {
                 sender: "Ada".into(),
                 body: "second-edited-via-upsert".into(),
                 outbound: false,
+                delivery: Delivery::Sent,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -2322,6 +2664,7 @@ mod tests {
                 sender: "you".into(),
                 body: "sent".into(),
                 outbound: true,
+                delivery: Delivery::Sent,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -2355,6 +2698,7 @@ mod tests {
                     sender: "Ada".into(),
                     body: body.into(),
                     outbound: false,
+                    delivery: Delivery::Sent,
                 },
             });
         }
@@ -2400,6 +2744,7 @@ mod tests {
                 sender: "Ada".into(),
                 body: "hi".into(),
                 outbound: false,
+                delivery: Delivery::Sent,
             },
         });
         let _ = snapshot.take_commands();
