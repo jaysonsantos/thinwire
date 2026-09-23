@@ -747,6 +747,78 @@ mod tests {
         assert_eq!(conversations(&events).len(), 1);
     }
 
+    /// Channel list fails with `error`. No conversations. The token stays out of the detail.
+    async fn channel_list_fails(error: api::DiscordApiError, fragment: &str) {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        api.state().next_error = Some(error);
+        let (mut adapter, _vault) = fake_adapter(api, Some(FIXTURE_TOKEN));
+        let (tx, mut rx) = unbounded_channel();
+        adapter.start(tx);
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Error,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(conversations(&events).is_empty());
+        assert!(!format!("{events:?}").contains(FIXTURE_TOKEN));
+        let Some(AdapterEvent::Status { status, detail, .. }) = events.last() else {
+            panic!("error status");
+        };
+        assert_eq!(*status, AdapterStatus::Error);
+        assert!(detail.contains("did not load"));
+        assert!(detail.contains(fragment));
+        assert!(!DiscordAdapter::inbox_account_linked(*status, detail));
+    }
+
+    #[tokio::test]
+    async fn network_error_stops_the_channel_list() {
+        channel_list_fails(api::DiscordApiError::Transport, "network error").await;
+    }
+
+    #[tokio::test]
+    async fn rate_limit_stops_the_channel_list() {
+        channel_list_fails(api::DiscordApiError::RateLimited, "rate limit").await;
+    }
+
+    #[tokio::test]
+    async fn revoked_token_stops_a_later_channel_list() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, events) = connected(Arc::clone(&api)).await;
+        assert_eq!(conversations(&events).len(), 2);
+        api.state().unauthorized = true;
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Error,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(conversations(&events).is_empty());
+        assert!(!format!("{events:?}").contains(FIXTURE_TOKEN));
+        let Some(AdapterEvent::Status { status, detail, .. }) = events.last() else {
+            panic!("error status");
+        };
+        assert!(detail.contains("did not load"));
+        assert!(detail.contains("Replace discord.bot_token"));
+        assert!(!DiscordAdapter::inbox_account_linked(*status, detail));
+    }
+
     #[tokio::test]
     async fn rejected_token_reports_an_error_without_conversations() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());

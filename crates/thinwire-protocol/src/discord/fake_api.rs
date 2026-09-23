@@ -27,8 +27,11 @@ pub(crate) struct FakeState {
     pub channels: HashMap<u64, Vec<ChannelSummary>>,
     pub history: HashMap<u64, Vec<MessageSummary>>,
     pub sent: Vec<(u64, String)>,
+    /// Every call returns 401 until this is cleared. A revoked bot token.
     pub unauthorized: bool,
     pub send_error: Option<DiscordApiError>,
+    /// The next call returns this error once, then clears it.
+    pub next_error: Option<DiscordApiError>,
     pub next_id: u64,
 }
 
@@ -131,11 +134,14 @@ impl FakeDiscordApi {
     }
 
     fn check_token(&self) -> Result<(), DiscordApiError> {
-        if self.state().unauthorized {
-            Err(DiscordApiError::Unauthorized)
-        } else {
-            Ok(())
+        let mut state = self.state();
+        if state.unauthorized {
+            return Err(DiscordApiError::Unauthorized);
         }
+        if let Some(error) = state.next_error.take() {
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
