@@ -112,6 +112,25 @@ pub(crate) enum CenterView {
     Thread,
 }
 
+/// What the inbox list shows for the selected protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboxState {
+    Rows,
+    Loading,
+    Empty,
+    /// Chats exist, but the search hides all of them.
+    NoMatch,
+}
+
+/// What the thread shows for the selected chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadState {
+    NoSelection,
+    Rows,
+    Loading,
+    Empty,
+}
+
 /// Copy on the phone step when a saved session no longer works.
 pub(crate) const SESSION_ENDED_NOTICE: &str = "Your Telegram session ended. Sign in again.";
 
@@ -166,6 +185,9 @@ pub(crate) struct Snapshot {
     pub telegram_authorized: bool,
     resume: Resume,
     telegram_messages_from_adapter: u32,
+    chat_list_loading: bool,
+    history_loading: HashSet<String>,
+    scroll_to_selected: bool,
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
@@ -214,6 +236,9 @@ impl Snapshot {
             telegram_authorized: false,
             resume: Resume::Waiting,
             telegram_messages_from_adapter: 0,
+            chat_list_loading: false,
+            history_loading: HashSet::new(),
+            scroll_to_selected: false,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
@@ -265,21 +290,47 @@ impl Snapshot {
                             self.auth_busy = false;
                         }
                         self.resume = Resume::Settled;
+                        // A failed load does not send its end event. Stop the spinners.
+                        self.chat_list_loading = false;
+                        self.history_loading.clear();
                     }
                 }
             }
             AdapterEvent::ConversationUpsert { conversation } => {
                 let protocol = conversation.protocol;
-                {
-                    let list = self.conversations.entry(protocol).or_default();
-                    if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
-                        *existing = conversation;
-                    } else {
-                        list.push(conversation);
-                    }
-                    sort_conversations(list);
+                let selected = (self.selected_protocol == protocol)
+                    .then(|| self.selected_conversation.clone())
+                    .flatten();
+                let list = self.conversations.entry(protocol).or_default();
+                let before = selected
+                    .as_ref()
+                    .and_then(|id| list.iter().position(|row| row.id == *id));
+                if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
+                    *existing = conversation;
+                } else {
+                    list.push(conversation);
+                }
+                sort_conversations(list);
+                let after = selected
+                    .as_ref()
+                    .and_then(|id| list.iter().position(|row| row.id == *id));
+                if before.is_some() && before != after {
+                    self.scroll_to_selected = true;
                 }
                 self.ensure_conversation_selection();
+            }
+            AdapterEvent::ChatListLoaded { protocol } => {
+                if protocol == ProtocolId::Telegram {
+                    self.chat_list_loading = false;
+                }
+            }
+            AdapterEvent::HistoryLoaded {
+                protocol,
+                conversation_id,
+            } => {
+                if protocol == ProtocolId::Telegram {
+                    self.history_loading.remove(&conversation_id);
+                }
             }
             AdapterEvent::ConversationRemoved { protocol, id } => {
                 self.remove_conversation(protocol, &id);
@@ -503,6 +554,47 @@ impl Snapshot {
             .find(|row| row.id == *id)
     }
 
+    #[must_use]
+    pub(crate) fn inbox_state(&self) -> InboxState {
+        if !self.visible_conversations().is_empty() {
+            return InboxState::Rows;
+        }
+        let has_rows = self.protocol_linked(self.selected_protocol)
+            && self
+                .conversations
+                .get(&self.selected_protocol)
+                .is_some_and(|rows| !rows.is_empty());
+        if has_rows {
+            return InboxState::NoMatch;
+        }
+        if self.chat_list_loading
+            && self.selected_protocol == ProtocolId::Telegram
+            && self.protocol_linked(ProtocolId::Telegram)
+        {
+            return InboxState::Loading;
+        }
+        InboxState::Empty
+    }
+
+    #[must_use]
+    pub(crate) fn thread_state(&self) -> ThreadState {
+        let Some(id) = self.selected_conversation.as_ref() else {
+            return ThreadState::NoSelection;
+        };
+        if !self.selected_messages().is_empty() {
+            return ThreadState::Rows;
+        }
+        if self.selected_protocol == ProtocolId::Telegram && self.history_loading.contains(id) {
+            return ThreadState::Loading;
+        }
+        ThreadState::Empty
+    }
+
+    /// True once after the selected row moved in the sorted list.
+    pub(crate) fn take_scroll_to_selected(&mut self) -> bool {
+        std::mem::take(&mut self.scroll_to_selected)
+    }
+
     pub(crate) fn selected_messages(&self) -> &[ChatMessage] {
         let Some(id) = self.selected_conversation.as_ref() else {
             return &[];
@@ -521,6 +613,7 @@ impl Snapshot {
             .collect();
         for protocol in protocols {
             if protocol == ProtocolId::Telegram && self.telegram_authorized {
+                self.chat_list_loading = true;
                 self.pending.push(AdapterCommand::LoadChats { protocol });
             } else {
                 self.pending.push(AdapterCommand::Connect { protocol });
@@ -741,6 +834,8 @@ impl Snapshot {
             row.linked = true;
         }
         self.telegram_authorized = true;
+        // The worker loads the main list right after Ready.
+        self.chat_list_loading = true;
         self.select_protocol(ProtocolId::Telegram);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
@@ -847,6 +942,7 @@ impl Snapshot {
         if already {
             return;
         }
+        self.history_loading.insert(id.clone());
         self.pending.push(AdapterCommand::OpenChat {
             protocol: ProtocolId::Telegram,
             conversation_id: id,
@@ -1193,6 +1289,138 @@ mod tests {
         assert_eq!(snapshot.center_view(), CenterView::FirstRun);
         snapshot.try_resume(&store, true);
         assert_eq!(resume_commands(&mut snapshot), 1, "only the first try");
+    }
+
+    fn telegram_chat(id: i64, title: &str, order: i64) -> Conversation {
+        Conversation {
+            protocol: ProtocolId::Telegram,
+            id: format!("telegram:{id}"),
+            title: title.into(),
+            participant: title.into(),
+            preview: String::new(),
+            unread: 0,
+            order,
+        }
+    }
+
+    fn telegram_text(chat: i64, id: i64, body: &str) -> ChatMessage {
+        ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: format!("telegram:{chat}"),
+            id: format!("telegram:{chat}:{id}"),
+            sender: "Ada".into(),
+            body: body.into(),
+            outbound: false,
+        }
+    }
+
+    #[test]
+    fn inbox_state_covers_loading_rows_empty_and_no_match() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        assert_eq!(snapshot.inbox_state(), InboxState::Empty);
+        complete_telegram(&mut snapshot, &store);
+        assert_eq!(snapshot.inbox_state(), InboxState::Loading);
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        assert_eq!(snapshot.inbox_state(), InboxState::Empty);
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 10),
+        });
+        assert_eq!(snapshot.inbox_state(), InboxState::Rows);
+        snapshot.search = "zzz".into();
+        assert_eq!(snapshot.inbox_state(), InboxState::NoMatch);
+        snapshot.search = "ad".into();
+        assert_eq!(snapshot.inbox_state(), InboxState::Rows);
+
+        snapshot.refresh_visible();
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Telegram,
+            id: "telegram:1".into(),
+        });
+        assert_eq!(snapshot.inbox_state(), InboxState::Loading);
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "Could not load Telegram chats (TDLib 500).".into(),
+        });
+        assert_eq!(snapshot.inbox_state(), InboxState::Empty);
+    }
+
+    #[test]
+    fn thread_state_covers_loading_rows_and_empty() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, &store);
+        assert_eq!(snapshot.thread_state(), ThreadState::NoSelection);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 10),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 5),
+        });
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        assert_eq!(snapshot.thread_state(), ThreadState::Loading);
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+        });
+        assert_eq!(snapshot.thread_state(), ThreadState::Empty);
+
+        snapshot.select_conversation("telegram:2".into());
+        assert_eq!(snapshot.thread_state(), ThreadState::Loading);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: telegram_text(2, 7, "hi"),
+        });
+        assert_eq!(snapshot.thread_state(), ThreadState::Rows);
+    }
+
+    #[test]
+    fn selected_row_requests_scroll_only_when_it_moves() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, &store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 10),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 5),
+        });
+        snapshot.select_conversation("telegram:2".into());
+        assert!(!snapshot.take_scroll_to_selected());
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 11),
+        });
+        assert!(
+            !snapshot.take_scroll_to_selected(),
+            "selected row did not move"
+        );
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(3, "Cy", 99),
+        });
+        assert!(snapshot.take_scroll_to_selected());
+        assert!(!snapshot.take_scroll_to_selected(), "one request per move");
+    }
+
+    #[test]
+    fn inbox_and_thread_scroll_and_show_load_states() {
+        let ui = include_str!("ui.rs");
+        let left = &ui[ui.find("fn left_panel").expect("left panel")..];
+        let left = &left[..left.find("\nfn ").expect("next fn")];
+        assert!(left.contains("ScrollArea::vertical()"));
+        assert!(ui.contains(".stick_to_bottom(true)"));
+        assert!(ui.contains("scroll_to_me"));
+        assert!(ui.contains("Loading chats…"));
+        assert!(ui.contains("Loading messages…"));
+        assert!(ui.contains("No messages in this chat."));
+        assert!(!ui.contains("No conversations yet."));
     }
 
     #[test]

@@ -512,8 +512,13 @@ mod tests {
         assert!(updates.contains("emit_messages_removed"));
         assert!(updates.contains("set_preview(update.chat_id, \"\")"));
         let open = fn_body(src, "async fn open_chat");
-        assert!(open.contains("functions::view_messages"));
-        assert!(open.contains("true,"));
+        assert!(open.contains("load_history"));
+        assert!(open.contains("emit_history_loaded"));
+        let history = fn_body(src, "async fn load_history");
+        assert!(history.contains("functions::view_messages"));
+        assert!(history.contains("true,"));
+        let chats = fn_body(src, "async fn load_main_chats");
+        assert!(chats.contains("emit_chat_list_loaded"));
     }
 
     #[test]

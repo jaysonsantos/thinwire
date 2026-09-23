@@ -256,6 +256,16 @@ pub enum AdapterEvent {
         conversation_id: String,
         message_ids: Vec<String>,
     },
+    /// A chat-list page load ended (loaded, already complete, or failed).
+    /// The UI stops its "Loading chats…" state.
+    ChatListLoaded {
+        protocol: ProtocolId,
+    },
+    /// A history load for one chat ended. The UI stops "Loading messages…".
+    HistoryLoaded {
+        protocol: ProtocolId,
+        conversation_id: String,
+    },
     /// Experimental WhatsApp QR payload. Debug output is redacted.
     /// Never log [`RedactedPairingSecret::reveal`].
     WhatsAppQr {
@@ -439,6 +449,23 @@ pub(crate) fn emit_message_body(
         conversation_id: conversation_id.into(),
         message_id: message_id.into(),
         body: body.into(),
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_chat_list_loaded(events: &EventTx, protocol: ProtocolId) {
+    let _ = events.send(AdapterEvent::ChatListLoaded { protocol });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_history_loaded(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+) {
+    let _ = events.send(AdapterEvent::HistoryLoaded {
+        protocol,
+        conversation_id: conversation_id.into(),
     });
 }
 

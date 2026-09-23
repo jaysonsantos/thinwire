@@ -8,7 +8,9 @@ use thinwire_protocol::WhatsAppPhoneVault;
 use super::auth;
 use super::secrets::SecretStore;
 use super::settings::{Settings, ThemeMode};
-use super::snapshot::{AccountRow, CenterView, InboxFilter, RESUME_CONNECTING, Snapshot};
+use super::snapshot::{
+    AccountRow, CenterView, InboxFilter, InboxState, RESUME_CONNECTING, Snapshot, ThreadState,
+};
 
 const SUPPORTED: Color32 = Color32::from_rgb(96, 176, 128);
 const EXPERIMENTAL: Color32 = Color32::from_rgb(214, 160, 64);
@@ -156,7 +158,10 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
             ui.add_space(8.0);
             ui.heading("Inbox");
             ui.separator();
-            inbox(ui, snapshot);
+            egui::ScrollArea::vertical()
+                .id_salt("inbox")
+                .auto_shrink([false, false])
+                .show(ui, |ui| inbox(ui, snapshot));
         });
 }
 
@@ -206,15 +211,31 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         })
         .collect();
 
-    if rows.is_empty() {
-        ui.label(
-            RichText::new("No conversations yet.")
-                .italics()
-                .color(MUTED),
-        );
-        return;
+    match snapshot.inbox_state() {
+        InboxState::Rows => {}
+        InboxState::Loading => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Loading chats…").color(MUTED));
+            });
+            return;
+        }
+        InboxState::Empty => {
+            ui.label(RichText::new("No chats.").italics().color(MUTED));
+            return;
+        }
+        InboxState::NoMatch => {
+            let query = snapshot.search.trim();
+            ui.label(
+                RichText::new(format!("No chats match '{query}'."))
+                    .italics()
+                    .color(MUTED),
+            );
+            return;
+        }
     }
 
+    let scroll_to_selected = snapshot.take_scroll_to_selected();
     let mut clicked: Option<String> = None;
     for (id, title, preview, unread) in rows {
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
@@ -223,7 +244,11 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         } else {
             format!("{title}  ({unread})")
         };
-        if ui.selectable_label(selected, label).clicked() {
+        let response = ui.selectable_label(selected, label);
+        if selected && scroll_to_selected {
+            response.scroll_to_me(None);
+        }
+        if response.clicked() {
             clicked = Some(id);
         }
         ui.label(RichText::new(preview).small().weak());
@@ -302,18 +327,30 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         })
         .collect();
 
+    let state = snapshot.thread_state();
+    // One scroll state per chat, so each chat opens at its newest message.
+    let salt = snapshot.selected_conversation.clone().unwrap_or_default();
     egui::ScrollArea::vertical()
+        .id_salt(("thread", salt))
         .auto_shrink([false, true])
+        .stick_to_bottom(true)
         .max_height(ui.available_height() - 48.0)
         .show(ui, |ui| {
-            if messages.is_empty() {
-                ui.label(
-                    RichText::new(
-                        "No messages yet. Select a Telegram chat to load recent messages.",
-                    )
-                    .italics()
-                    .color(MUTED),
-                );
+            match state {
+                ThreadState::Loading => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Loading messages…").color(MUTED));
+                    });
+                }
+                ThreadState::Empty => {
+                    ui.label(
+                        RichText::new("No messages in this chat.")
+                            .italics()
+                            .color(MUTED),
+                    );
+                }
+                ThreadState::NoSelection | ThreadState::Rows => {}
             }
             for (outbound, sender, body) in messages {
                 ui.group(|ui| {

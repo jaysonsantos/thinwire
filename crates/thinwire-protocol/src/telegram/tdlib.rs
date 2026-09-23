@@ -13,9 +13,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
 use super::inbox::{self, ChatDirectory, ChatEffect, InboxMessage, MessageParty, NameBook};
 use crate::adapter::{
-    AdapterStatus, EventTx, ProtocolId, TelegramAuthPhase, TelegramAuthStep, emit_conversation,
-    emit_conversation_removed, emit_message, emit_message_body, emit_message_replaced,
-    emit_messages_removed, emit_status, emit_telegram_auth,
+    AdapterStatus, EventTx, ProtocolId, TelegramAuthPhase, TelegramAuthStep, emit_chat_list_loaded,
+    emit_conversation, emit_conversation_removed, emit_history_loaded, emit_message,
+    emit_message_body, emit_message_replaced, emit_messages_removed, emit_status,
+    emit_telegram_auth,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -671,6 +672,7 @@ async fn load_main_chats(client_id: i32, authorized: bool, events: &EventTx) {
             format!("Could not load Telegram chats (TDLib {}).", error.code),
         ),
     }
+    emit_chat_list_loaded(events, ProtocolId::Telegram);
 }
 
 async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, events: &EventTx) {
@@ -698,6 +700,11 @@ async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, even
         AdapterStatus::Ready,
         "Loading recent messages.",
     );
+    load_history(client_id, chat_id, live, events).await;
+    emit_history_loaded(events, ProtocolId::Telegram, conversation_id);
+}
+
+async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &EventTx) {
     match tdlib_rs::functions::get_chat_history(
         chat_id,
         0,
