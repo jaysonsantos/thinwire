@@ -7,7 +7,6 @@ use eframe::egui::{self, RichText};
 use thinwire_protocol::{AdapterStatus, Delivery, ProtocolId, WhatsAppPhoneVault};
 
 use super::auth;
-use super::secrets::{Persistence, SecretStore};
 use super::settings::{Settings, ThemeMode, ThemeModeEgui};
 use super::snapshot::{
     AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
@@ -15,6 +14,7 @@ use super::snapshot::{
 };
 use super::theme::{self, radius, size, space};
 use super::thread_layout::{RowLayout, list_time, thread_rows};
+use thinwire_core::secrets::{Persistence, SecretStore};
 
 /// Shown while the OS keychain is not available. Secrets stay in memory.
 pub(crate) const KEYCHAIN_UNAVAILABLE_NOTICE: &str =

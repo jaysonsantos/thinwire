@@ -22,7 +22,6 @@ chrono.workspace = true
 dirs.workspace = true
 eframe.workspace = true
 egui.workspace = true
-keyring-core.workspace = true
 thinwire-core.workspace = true
 thinwire-protocol.workspace = true
 winit.workspace = true
@@ -30,16 +29,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-linux-keyutils-keyring-store.workspace = true
-zbus-secret-service-keyring-store.workspace = true
-secret-service.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-native-keyring-store.workspace = true
+[dev-dependencies]
+thinwire-core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

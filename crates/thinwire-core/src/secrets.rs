@@ -1,7 +1,7 @@
 //! OS secret store for Telegram `api_id`, `api_hash`, and session material.
 //!
 //! The UI thread only touches an in-memory map. OS keychain I/O runs on a
-//! tokio `spawn_blocking` worker so egui never waits on keyutils / Keychain /
+//! tokio `spawn_blocking` worker so a frontend never waits on keyutils / Keychain /
 //! Credential Manager. Never log or persist these values in the git repo.
 //!
 //! Attach is an ordered state machine (`Detached` → `Attaching` → `Ready` or
@@ -881,19 +881,21 @@ fn os_delete(key: SecretKey) -> Result<(), SecretError> {
     }
 }
 
-#[cfg(test)]
+/// Test hooks. Other workspace crates reach them through feature `test-support`.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 impl SecretStore {
-    pub(crate) fn detached_for_test() -> Arc<Self> {
+    pub fn detached_for_test() -> Arc<Self> {
         Arc::new(Self::blank(AttachPhase::Detached))
     }
 
-    pub(crate) fn fail_attach_for_test(&self) {
+    pub fn fail_attach_for_test(&self) {
         if let Ok(mut inner) = self.lock() {
             inner.phase = AttachPhase::ReadFailed;
         }
     }
 
-    pub(crate) fn complete_ready_attach_for_test(&self, os: &[(SecretKey, &str)]) {
+    pub fn complete_ready_attach_for_test(&self, os: &[(SecretKey, &str)]) {
         let values = os
             .iter()
             .map(|(key, value)| (*key, (*value).to_string()))
@@ -901,13 +903,13 @@ impl SecretStore {
         let _ = self.finish_ready(values);
     }
 
-    pub(crate) fn set_backend_for_test(&self, backend: OsBackend) {
+    pub fn set_backend_for_test(&self, backend: OsBackend) {
         if let Ok(mut inner) = self.lock() {
             inner.os_backend = Some(backend);
         }
     }
 
-    pub(crate) fn complete_discord_hydrate_for_test(&self, token: Option<&str>) {
+    pub fn complete_discord_hydrate_for_test(&self, token: Option<&str>) {
         let value = match token {
             Some(token) => Ok(Some(token.to_string())),
             None => Ok(None),

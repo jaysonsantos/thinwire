@@ -7,6 +7,7 @@
 
 mod intent;
 mod secret_text;
+pub mod secrets;
 mod signal;
 mod theme;
 

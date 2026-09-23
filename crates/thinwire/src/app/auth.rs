@@ -5,9 +5,9 @@ use eframe::egui::{self, RichText};
 
 use thinwire_protocol::{TelegramAuthError, TelegramCodeVia};
 
-use super::secrets::SecretStore;
 use super::snapshot::{AuthScreen, Snapshot};
 use super::theme::{self, space};
+use thinwire_core::secrets::SecretStore;
 
 /// Shown until TDLib reports Ready. Feature-off builds stay on this copy.
 pub(crate) const TDLIB_UNAVAILABLE_BANNER: &str = "TDLib unavailable in this build. Enable feature telegram-tdlib after a local TDLib install. These screens do not open a live Telegram session.";

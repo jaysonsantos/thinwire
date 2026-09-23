@@ -13,8 +13,8 @@ use thinwire_protocol::{
 };
 
 #[cfg(test)]
-use super::secrets::OsBackend;
-use super::secrets::{SecretKey, SecretStore};
+use thinwire_core::secrets::OsBackend;
+use thinwire_core::secrets::{SecretKey, SecretStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InboxFilter {
@@ -1657,7 +1657,7 @@ fn persist_api(
     store: &SecretStore,
     api_id: &str,
     api_hash: &str,
-) -> Result<(), super::secrets::SecretError> {
+) -> Result<(), thinwire_core::secrets::SecretError> {
     store.set(SecretKey::ApiId, api_id)?;
     store.set(SecretKey::ApiHash, api_hash)?;
     Ok(())

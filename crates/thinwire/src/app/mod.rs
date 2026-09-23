@@ -1,7 +1,6 @@
 //! eframe application: polls adapter events and draws the shell.
 
 mod auth;
-mod secrets;
 mod settings;
 mod snapshot;
 mod theme;
@@ -19,8 +18,8 @@ use thinwire_protocol::{
     TelegramSecretVault, WhatsAppPhoneVault, catalog,
 };
 
-use secrets::SecretStore;
 use snapshot::Snapshot;
+use thinwire_core::secrets::SecretStore;
 
 pub use settings::Settings;
 pub use theme::install as install_theme;
