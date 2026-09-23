@@ -96,7 +96,8 @@ fn top_bar(
             if ui.button("Refresh").clicked() {
                 snapshot.refresh_visible();
             }
-            if ui.button("Add account").clicked() {
+            // One Telegram account per build: no Add account once signed in (ux F8).
+            if snapshot.can_add_account() && ui.button("Add account").clicked() {
                 snapshot.open_add_account(secrets);
             }
             if ui.button("Advanced").clicked() {

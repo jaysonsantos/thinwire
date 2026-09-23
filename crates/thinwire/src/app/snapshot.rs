@@ -870,7 +870,17 @@ impl Snapshot {
         self.telegram_authorized
     }
 
+    /// Add account is offered only while Telegram is not signed in: this
+    /// build supports one Telegram account (ux F8).
+    #[must_use]
+    pub(crate) fn can_add_account(&self) -> bool {
+        !self.telegram_authorized
+    }
+
     pub(crate) fn open_add_account(&mut self, store: &SecretStore) {
+        if !self.can_add_account() {
+            return;
+        }
         self.open_telegram(store);
     }
 
@@ -880,8 +890,13 @@ impl Snapshot {
         clear_ephemeral(store);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
-        self.telegram_authorized = false;
         self.error = None;
+        if self.telegram_authorized {
+            // A form over a live session (for example Advanced): close the
+            // form only. The session and the chat list stay (ux F8).
+            self.status_text = "Telegram is ready.".into();
+            return;
+        }
         self.status_text = "Account linking cancelled.".into();
         self.pending.push(AdapterCommand::Disconnect {
             protocol: ProtocolId::Telegram,
@@ -2498,6 +2513,57 @@ mod tests {
         let guard = code.find("if digits_only").expect("guard");
         let filter = code.find("retain(|c| c.is_ascii_digit())").expect("filter");
         assert!(guard < filter, "the digit filter runs only for digit codes");
+    }
+
+    #[test]
+    fn a_live_session_hides_add_account_and_cancel_keeps_it() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        assert!(snapshot.telegram_ready());
+        assert!(!snapshot.can_add_account(), "one Telegram account (ux F8)");
+        snapshot.open_add_account(&store);
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(snapshot.take_commands().is_empty());
+
+        snapshot.open_api_override(&store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramApi);
+        snapshot.center_key(AuthKey::Escape, &store);
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(snapshot.telegram_ready(), "Cancel does not sign out");
+        assert!(
+            !snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::Disconnect { .. })),
+            "no Disconnect on a live session"
+        );
+        assert_eq!(
+            snapshot.visible_conversations().len(),
+            2,
+            "the chat list stays"
+        );
+        assert_eq!(snapshot.center_view(), CenterView::Thread);
+
+        let ui = include_str!("ui.rs");
+        let bar = &ui[ui.find("fn top_bar(").expect("top bar")..];
+        let bar = &bar[..bar.find("\nfn ").expect("next")];
+        let guard = bar.find("can_add_account()").expect("guard");
+        let button = bar.find("\"Add account\"").expect("button");
+        assert!(guard < button, "Add account hides when Telegram is ready");
+    }
+
+    #[test]
+    fn cancel_before_sign_in_still_closes_the_client() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        assert!(snapshot.can_add_account());
+        snapshot.cancel_auth(&store);
+        assert!(snapshot.take_commands().iter().any(|command| matches!(
+            command,
+            AdapterCommand::Disconnect {
+                protocol: ProtocolId::Telegram
+            }
+        )));
     }
 
     #[test]
