@@ -10,6 +10,7 @@ mod credentials;
 mod db_key;
 mod engine;
 mod inbox;
+mod router;
 
 #[cfg(feature = "telegram-tdlib")]
 mod tdlib;
@@ -668,21 +669,49 @@ mod tests {
         let shutdown = fn_body(src, "pub fn shutdown(");
         assert!(shutdown.contains("live_workers.load"));
         assert!(shutdown.contains("emit_stopped"));
+        assert!(
+            shutdown.contains("receiver_idle()"),
+            "exit waits until no thread is in TDLib"
+        );
         let worker = fn_body(src, "fn spawn_tdlib_worker");
         assert!(worker.contains("request_close(client_id)"));
         assert!(worker.contains("if closed"));
-        assert!(worker.contains("receiver.join()"));
-        assert!(worker.contains("live_workers.fetch_sub"));
-        let join = worker.find("receiver.join()").expect("join");
-        let done = worker.find("live_workers.fetch_sub").expect("done");
+        let register = worker
+            .find("dispatcher.register(client_id)")
+            .expect("register");
+        let first_request = worker
+            .find("set_log_verbosity_level")
+            .expect("first request");
         assert!(
-            join < done,
-            "a worker counts as gone only after its receive thread"
+            register < first_request,
+            "register before the first request"
         );
+        let unregister = worker
+            .find("dispatcher.unregister(client_id)")
+            .expect("unregister");
+        let done = worker.find("live_workers.fetch_sub").expect("done");
+        assert!(unregister < done);
         assert!(fn_body(src, "async fn request_close").contains("functions::close"));
         assert!(
             !src.contains("generation"),
             "no worker is dropped without close"
+        );
+    }
+
+    #[test]
+    fn live_tdlib_has_one_receive_thread_for_the_process() {
+        let src = include_str!("tdlib.rs");
+        assert_eq!(src.matches("tdlib_rs::receive()").count(), 1);
+        assert_eq!(src.matches(".name(\"thinwire-tdlib-recv\"").count(), 1);
+        assert!(src.contains("static DISPATCHER: OnceLock"));
+        let receive = fn_body(src, "fn receive_loop");
+        assert!(receive.contains("begin_receive()"));
+        assert!(receive.contains("end_receive()"));
+        assert!(receive.contains("route(client_id, update)"));
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        assert!(
+            !worker.contains("thread::Builder"),
+            "workers do not start receive threads"
         );
     }
 

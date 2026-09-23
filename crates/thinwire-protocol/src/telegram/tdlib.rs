@@ -4,8 +4,8 @@
 //! Credential values are read from the vault and never logged.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resol
 use super::inbox::{
     self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook,
 };
+use super::router::Router;
 use crate::adapter::{
     AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
@@ -84,7 +85,8 @@ impl TdlibRuntime {
         let live_workers = Arc::clone(&self.live_workers);
         let events = events.clone();
         tokio::spawn(async move {
-            while live_workers.load(Ordering::SeqCst) > 0 {
+            // Exit only when no thread is inside TDLib any more.
+            while live_workers.load(Ordering::SeqCst) > 0 || !receiver_idle() {
                 tokio::time::sleep(SHUTDOWN_POLL).await;
             }
             emit_stopped(&events, ProtocolId::Telegram);
@@ -196,6 +198,76 @@ impl Default for TdlibRuntime {
     }
 }
 
+/// The one process-wide receive thread and its router.
+struct Dispatcher {
+    router: Mutex<Router<tdlib_rs::enums::Update>>,
+    wake: Condvar,
+}
+
+static DISPATCHER: OnceLock<Arc<Dispatcher>> = OnceLock::new();
+
+impl Dispatcher {
+    fn get() -> Arc<Self> {
+        Arc::clone(DISPATCHER.get_or_init(|| {
+            let dispatcher = Arc::new(Self {
+                router: Mutex::new(Router::new()),
+                wake: Condvar::new(),
+            });
+            let receiving = Arc::clone(&dispatcher);
+            let spawned = thread::Builder::new()
+                .name("thinwire-tdlib-recv".into())
+                .spawn(move || receiving.receive_loop());
+            if let Err(error) = spawned {
+                tracing::warn!(%error, "tdlib receive thread did not start");
+            }
+            dispatcher
+        }))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Router<tdlib_rs::enums::Update>> {
+        self.router.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Call `td_receive` only while a client exists. `receive` returns None on
+    /// timeout and after it hands a response to the request observer.
+    fn receive_loop(&self) {
+        loop {
+            {
+                let mut router = self.lock();
+                while !router.begin_receive() {
+                    router = self
+                        .wake
+                        .wait(router)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+            let received = tdlib_rs::receive();
+            let mut router = self.lock();
+            router.end_receive();
+            if let Some((update, client_id)) = received {
+                router.route(client_id, update);
+            }
+        }
+    }
+
+    fn register(&self, client_id: i32) -> UnboundedReceiver<tdlib_rs::enums::Update> {
+        let receiver = self.lock().register(client_id);
+        self.wake.notify_all();
+        receiver
+    }
+
+    fn unregister(&self, client_id: i32) {
+        self.lock().unregister(client_id);
+    }
+}
+
+/// True when no thread is inside TDLib: no client and no receive in flight.
+fn receiver_idle() -> bool {
+    DISPATCHER
+        .get()
+        .is_none_or(|dispatcher| dispatcher.lock().idle())
+}
+
 fn spawn_tdlib_worker(
     secrets: Arc<dyn TelegramSecretVault>,
     source: TelegramApiSource,
@@ -203,33 +275,12 @@ fn spawn_tdlib_worker(
     live_workers: Arc<AtomicUsize>,
 ) -> UnboundedSender<TdlibCommand> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel();
 
     live_workers.fetch_add(1, Ordering::SeqCst);
+    let dispatcher = Dispatcher::get();
     let client_id = tdlib_rs::create_client();
-    let receive_stop = Arc::new(AtomicBool::new(false));
-    let stop_receiving = Arc::clone(&receive_stop);
-    let receiver = thread::Builder::new()
-        .name("thinwire-tdlib-recv".into())
-        .spawn(move || {
-            // `receive` returns None on timeout and after it hands a response
-            // to the request observer. Keep looping so chat updates and
-            // in-flight calls are not dropped when the UI is idle.
-            loop {
-                if stop_receiving.load(Ordering::SeqCst) {
-                    break;
-                }
-                match tdlib_rs::receive() {
-                    Some((update, id)) if id == client_id => {
-                        if update_tx.send(update).is_err() {
-                            break;
-                        }
-                    }
-                    Some(_) | None => {}
-                }
-            }
-        })
-        .ok();
+    // Register before the first request, so no update for this client is lost.
+    let mut update_rx = dispatcher.register(client_id);
 
     tokio::spawn(async move {
         if tdlib_rs::functions::set_log_verbosity_level(1, client_id)
@@ -293,12 +344,7 @@ fn spawn_tdlib_worker(
             }
         }
 
-        // Stop and join the receive thread, so no thread is inside TDLib when
-        // the process exits.
-        receive_stop.store(true, Ordering::SeqCst);
-        if let Some(receiver) = receiver {
-            let _ = tokio::task::spawn_blocking(move || receiver.join()).await;
-        }
+        dispatcher.unregister(client_id);
         live_workers.fetch_sub(1, Ordering::SeqCst);
     });
 
