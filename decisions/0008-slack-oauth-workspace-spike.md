@@ -41,3 +41,19 @@ Keychain override wins when both client id and client secret are present. The ap
 Default builds keep the existing Slack stub in the shell (not ready, no login). Enabling `slack-oauth` compiles types into the binary and still shows no Slack auth UI.
 
 Rejected: reverse-engineered Slack Desktop; a personal user-token client; Slack secrets in the MIT tree or public CI; network I/O on the UI thread; enabling this feature in default CI.
+
+## Amendment: live workspace-app inbox (issue #36)
+
+**Status:** accepted. WhatsApp, Discord, and Slack no longer wait for Telegram. They run in parallel.
+
+With `slack-oauth` on, the registry uses `SlackInbox` instead of the stub:
+
+- `Connect { Slack }` with no stored bot token starts the install. The worker binds `127.0.0.1:8976`, opens the authorize URL in the system browser, checks `state`, and exchanges `code` with `oauth.v2.access`. A wrong `state` gets HTTP 400 and does not end the install. The install stops after 10 minutes.
+- With a bot token, the worker calls `auth.test`, lists the channels the app is a member of (`conversations.list`, public, private, DM, group DM), loads history (`conversations.history`), and sends as the app (`chat.postMessage`).
+- Socket Mode starts only when an app-level token resolves. `app_uninstalled`, `invalid_auth`, and `token_revoked` clear the bot token.
+- `slack-morphism` enables its `hyper` feature. `axum` stays off, so there is no inbound HTTP server.
+- `slack-morphism` logs the one-time Socket Mode URL. The binary sets the log directive `slack_morphism=off`.
+- `AdapterCommand` has no new variants. `Disconnect { Slack }` cancels an install or stops the session and keeps the bot token.
+- The Slack vault is memory-only in this change. The OS keychain entry waits for the core crate (issue #33).
+
+Tests use fakes for the Web API, Socket Mode, and the browser. The fake tests run in default CI with the feature off. Default CI does not enable the feature and does not set Slack secrets.

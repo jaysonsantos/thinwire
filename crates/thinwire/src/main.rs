@@ -4,7 +4,12 @@ use eframe::egui;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            // `slack_morphism` logs the one-time Socket Mode URL. Keep it off
+            // even when RUST_LOG asks for more.
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("slack_morphism=off".parse().expect("static directive")),
+        )
         .init();
 
     let options = eframe::NativeOptions {

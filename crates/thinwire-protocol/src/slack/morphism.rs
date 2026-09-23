@@ -1,7 +1,7 @@
 //! `slack-morphism` OAuth v2 request and Socket Mode config.
 //!
 //! Compiled only with `--features slack-oauth`. Constructs values. Does not
-//! open a socket and does not call Slack. The `hyper` feature stays off.
+//! open a socket and does not call Slack; `live.rs` does that.
 
 use slack_morphism::prelude::*;
 
@@ -36,7 +36,7 @@ pub fn workspace_bot_token(bot_token: &str, team_id: &str) -> SlackApiToken {
     token
 }
 
-/// Socket Mode client settings. A later worker passes the app-level token.
+/// Socket Mode client settings. `live.rs` passes the app-level token.
 #[must_use]
 pub fn socket_mode_config() -> SlackClientSocketModeConfig {
     SlackClientSocketModeConfig::new()

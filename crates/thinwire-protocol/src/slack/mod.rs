@@ -1,16 +1,32 @@
-//! Slack official OAuth / workspace-app stub. Not a personal desktop clone.
+//! Slack official OAuth workspace app. Not a personal desktop clone.
 //!
-//! Feature `slack-oauth` compiles `slack-morphism` types. Default builds keep
-//! the feature off. This adapter does not open a network session.
+//! Default builds keep feature `slack-oauth` off and register the
+//! [`SlackAdapter`] stub, which opens no network session. With the feature on,
+//! the registry uses [`SlackInbox`] with the `slack-morphism` client
+//! (`live.rs`): OAuth v2 install on a loopback redirect, Socket Mode events,
+//! channel list, history, and send as the app. The inbox logic is compiled in
+//! every build so default CI runs its tests against fakes.
 
+mod api;
 mod credentials;
+#[cfg(test)]
+mod fake;
 mod install;
+#[cfg(feature = "slack-oauth")]
+mod live;
+mod loopback;
 #[cfg(feature = "slack-oauth")]
 mod morphism;
 mod secrets;
+mod session;
 
 use credentials::require_slack_client;
 
+pub use api::{
+    SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
+    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound,
+    SlackInstallGrant, SlackPost, SlackWebApi,
+};
 pub use credentials::{
     SlackApiOrigin, SlackApiSource, resolve_slack_app_token, resolve_slack_client,
 };
@@ -19,9 +35,35 @@ pub use install::{
     SlackInstalledWorkspace, WORKSPACE_BOT_SCOPES, authorize_url, loopback_redirect_uri,
     new_oauth_state, parse_loopback_callback,
 };
+pub use loopback::SlackLoopback;
 #[cfg(feature = "slack-oauth")]
 pub use morphism::{oauth_v2_access_request, socket_mode_config, workspace_bot_token};
 pub use secrets::{MemorySlackVault, SLACK_SECRET_SERVICE, SlackSecretKey, SlackSecretVault};
+pub use session::{SlackDeps, SlackInbox};
+
+/// Adapter the host registers. Feature on: the live workspace-app inbox.
+/// The Slack vault is memory-only until the core owns a Slack keychain entry.
+pub(crate) fn registry_adapter() -> Box<dyn ProtocolAdapter> {
+    #[cfg(feature = "slack-oauth")]
+    {
+        match live::hyper_client() {
+            Ok(client) => {
+                return Box::new(SlackInbox::new(SlackDeps::new(
+                    live::MorphismWebApi::new(std::sync::Arc::clone(&client)),
+                    live::MorphismSocket::new(client),
+                    live::SystemBrowser,
+                    std::sync::Arc::new(MemorySlackVault::new()),
+                    SlackApiSource::from_build(),
+                )));
+            }
+            Err(error) => tracing::warn!(%error, "slack https client did not start"),
+        }
+    }
+    Box::new(SlackAdapter)
+}
+
+/// Conversation ids are `slack:<channel id>`. Message ids add `:<ts>`.
+pub const SLACK_CONVERSATION_PREFIX: &str = "slack:";
 
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
@@ -210,12 +252,12 @@ mod tests {
             assert!(!src.contains("SLACK_APP_TOKEN"));
         }
         let protocol = include_str!("../../Cargo.toml");
-        let feature = protocol
-            .lines()
-            .find(|line| line.contains("slack-oauth ="))
-            .expect("feature");
-        assert!(!feature.contains("hyper"));
+        assert!(protocol.contains("slack-oauth = ["));
+        // Socket Mode only: no inbound HTTP server (`axum`) for Slack events.
+        assert!(!protocol.contains("slack-morphism/axum"));
         assert!(protocol.contains("default = []"));
+        // The library logs the one-time Socket Mode URL; the binary turns it off.
+        assert!(include_str!("../../../thinwire/src/main.rs").contains("slack_morphism=off"));
     }
 
     #[test]
