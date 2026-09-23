@@ -236,25 +236,70 @@ mod tests {
             "os-zips must warn against copying secrets into public CI"
         );
         assert!(
-            os_zips.contains("third_party/tdlib/LICENSE_1_0.txt"),
-            "os-zips must copy the vendored TDLib Boost license into the zip"
+            os_zips.contains("scripts/stage-os-artifact.sh"),
+            "os-zips must stage the payload with scripts/stage-os-artifact.sh"
         );
         assert!(
-            os_zips.contains("dist/THIRD_PARTY_NOTICES"),
-            "os-zips must place third-party notices in the archive tree"
+            os_zips.contains("path: thinwire-${{ matrix.artifact }}.tar.gz"),
+            "upload-artifact must upload one mode-preserving tar.gz"
         );
         assert!(
-            os_zips.contains("/usr/share/doc/"),
-            "Linux zips must attach the LLVM runtime package copyright files"
+            os_zips.contains("ARTIFACT: ${{ matrix.artifact }}"),
+            "the stage script needs the artifact name for the tar.gz"
         );
         assert!(
-            os_zips.contains("/usr/share/common-licenses/Apache-2.0"),
+            !os_zips.contains("path: dist/"),
+            "uploading the raw directory drops executable bits"
+        );
+        assert!(
+            !os_zips.contains("make_archive"),
+            "do not pre-build a zip for upload-artifact to wrap"
+        );
+        let stage = include_str!("../../../../scripts/stage-os-artifact.sh");
+        assert!(
+            !stage.contains("make_archive"),
+            "the stage script must not pre-zip the payload"
+        );
+        assert!(
+            stage.contains("tar -czf"),
+            "the stage script must build a mode-preserving tar.gz"
+        );
+        assert!(
+            stage.contains("executable bit missing"),
+            "the stage script must refuse a tar.gz whose binary is not executable"
+        );
+        assert!(
+            stage.contains("third_party/tdlib/LICENSE_1_0.txt"),
+            "os-zips must copy the vendored TDLib Boost license into the payload"
+        );
+        assert!(
+            stage.contains("dist/THIRD_PARTY_NOTICES"),
+            "os-zips must place third-party notices in the payload tree"
+        );
+        assert!(
+            stage.contains("/usr/share/doc/"),
+            "Linux payloads must attach the LLVM runtime package copyright files"
+        );
+        assert!(
+            stage.contains("/usr/share/common-licenses/Apache-2.0"),
             "Linux LLVM notices must include the Apache-2.0 text the copyright file cites"
         );
         assert!(
-            os_zips.contains("patchelf --set-rpath '$ORIGIN' \"$so\""),
+            stage.contains("patchelf --set-rpath '$ORIGIN' \"$so\""),
             "copied LLVM runtimes must get an ORIGIN rpath"
         );
+        assert!(
+            stage.contains("Thinwire.app"),
+            "macOS payload must be an app bundle"
+        );
+        assert!(stage.contains("Contents/MacOS/thinwire"));
+        assert!(stage.contains("dev.jaysonsantos.thinwire"));
+        assert!(stage.contains("CFBundleExecutable"));
+        assert!(stage.contains("CFBundlePackageType"));
+        assert!(stage.contains("<string>APPL</string>"));
+        assert!(stage.contains("NSHighResolutionCapable"));
+        assert!(stage.contains("<string>11.0</string>"));
+        assert!(stage.contains("Contents/Resources"));
         assert!(
             !os_zips.contains("tr -d"),
             "TELEGRAM_API_ID check must not strip embedded whitespace"
