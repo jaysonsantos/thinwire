@@ -757,6 +757,13 @@ mod tests {
         assert!(params.contains("tdlib_data_dir(secrets.persists())"));
         let dir = fn_body(src, "fn tdlib_data_dir");
         assert!(dir.contains("data_dir::this_process_session_dir()"));
+        let shutdown = &src[src.find("pub fn shutdown(").expect("shutdown")..];
+        let shutdown = &shutdown[..shutdown.find("\n    }\n").expect("end")];
+        let idle = shutdown.find("receiver_idle()").expect("idle");
+        let remove = shutdown
+            .find("data_dir::remove_this_process_session_dir()")
+            .expect("throwaway folder is removed at a clean exit");
+        assert!(idle < remove, "remove only after no thread is in TDLib");
         assert!(TelegramSecretVault::persists(&MemorySecretVault::new()));
     }
 

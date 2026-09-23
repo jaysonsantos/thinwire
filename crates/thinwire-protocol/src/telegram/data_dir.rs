@@ -7,8 +7,10 @@
 
 #![cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Name part for a moved-aside folder: `tdlib.stale-<unix seconds>`.
@@ -17,17 +19,88 @@ const STALE_MARK: &str = "stale";
 /// Most tries to find a free stale name in one second.
 const STALE_NAME_TRIES: u32 = 100;
 
-/// Throwaway folder for one process when the keychain cannot save the key.
+/// Name start of a throwaway session folder.
+const SESSION_PREFIX: &str = "thinwire-tdlib-session-";
+
+/// Random bytes in a session folder name, so another user cannot guess it.
+const SESSION_SUFFIX_BYTES: usize = 8;
+
+/// The throwaway folder of this process, once made.
+static SESSION_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Throwaway folder for this process when the keychain cannot save the key.
 /// Its key lives in memory only, so the data cannot open after exit.
-#[must_use]
-pub(super) fn session_dir(temp: &Path, pid: u32) -> PathBuf {
-    temp.join(format!("thinwire-tdlib-session-{pid}"))
+///
+/// It is a new folder with a random name under `$XDG_RUNTIME_DIR` (per user)
+/// or the temp folder. It must not exist before, must not be a symlink, and
+/// must be private to this user; else it is refused.
+pub(super) fn this_process_session_dir() -> io::Result<PathBuf> {
+    if let Some(dir) = SESSION_DIR.get() {
+        verify_private(dir)?;
+        return Ok(dir.clone());
+    }
+    let dir = session_base().join(format!("{SESSION_PREFIX}{}", random_suffix()?));
+    create_private_dir(&dir)?;
+    Ok(SESSION_DIR.get_or_init(|| dir).clone())
 }
 
-/// [`session_dir`] for this process, in the OS temp folder.
-#[must_use]
-pub(super) fn this_process_session_dir() -> PathBuf {
-    session_dir(&std::env::temp_dir(), std::process::id())
+/// Remove this process's throwaway folder at a clean exit. It can never
+/// open again, and it holds TDLib's unencrypted media cache.
+pub(super) fn remove_this_process_session_dir() {
+    let Some(dir) = SESSION_DIR.get() else {
+        return;
+    };
+    if verify_private(dir).is_ok()
+        && let Err(error) = fs::remove_dir_all(dir)
+    {
+        tracing::warn!(%error, "throwaway telegram folder was not removed");
+    }
+}
+
+fn session_base() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute() && verify_private(dir).is_ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn random_suffix() -> io::Result<String> {
+    let mut bytes = [0u8; SESSION_SUFFIX_BYTES];
+    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Create a new folder, mode 0700. Fails when anything (a folder, a file,
+/// or a symlink) is already at the path.
+pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    verify_private(path)
+}
+
+/// A real folder (not a symlink) with no access for other users.
+///
+/// No owner check is needed: `create_private_dir` fails when anything is
+/// already at the path, so a folder it made is always this user's. A base
+/// folder that another user owns with mode 0700 cannot be written into.
+fn verify_private(path: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(io::Error::other("not a private folder"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 {
+            return Err(io::Error::other("folder is open to other users"));
+        }
+    }
+    Ok(())
 }
 
 /// True when the folder exists and holds any entry.
@@ -152,11 +225,46 @@ mod tests {
     }
 
     #[test]
-    fn a_memory_only_session_gets_its_own_temp_folder() {
-        let temp = Path::new("/tmp");
-        let first = session_dir(temp, 41);
-        assert_eq!(first, Path::new("/tmp/thinwire-tdlib-session-41"));
-        assert_ne!(first, session_dir(temp, 42), "one folder per process");
+    fn a_session_folder_is_new_private_and_hard_to_guess() {
+        let root = scratch("session");
+        let dir = root.join("thinwire-tdlib-session-x");
+        create_private_dir(&dir).expect("new folder");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = fs::metadata(&dir).expect("meta").mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        assert!(
+            create_private_dir(&dir).is_err(),
+            "an existing folder is never reused"
+        );
+        let a = random_suffix().expect("suffix");
+        let b = random_suffix().expect("suffix");
+        assert_eq!(a.len(), SESSION_SUFFIX_BYTES * 2);
+        assert_ne!(a, b);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_or_open_folder_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("symlink");
+        let target = root.join("elsewhere");
+        fs::create_dir(&target).expect("target");
+        let link = root.join("thinwire-tdlib-session-link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(create_private_dir(&link).is_err(), "a symlink is refused");
+        assert!(verify_private(&link).is_err());
+        let open = root.join("open");
+        fs::create_dir(&open).expect("open");
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(
+            verify_private(&open).is_err(),
+            "a folder others can use is refused"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

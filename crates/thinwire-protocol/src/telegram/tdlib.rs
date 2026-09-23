@@ -97,6 +97,7 @@ impl TdlibRuntime {
             while !all_done(&workers) || !receiver_idle() {
                 tokio::time::sleep(WORKER_POLL).await;
             }
+            data_dir::remove_this_process_session_dir();
             emit_stopped(&events, ProtocolId::Telegram);
         });
     }
@@ -1120,7 +1121,21 @@ async fn set_parameters(
         );
         return;
     };
-    let dir = tdlib_data_dir(secrets.persists());
+    let dir = match tdlib_data_dir(secrets.persists()) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(%error, "no private folder for the Telegram session");
+            emit_telegram_auth_rejected(events, TelegramAuthError::ClientSetup { code: 0 });
+            emit_telegram_auth(events, TelegramAuthPhase::Failed);
+            emit_status(
+                events,
+                ProtocolId::Telegram,
+                AdapterStatus::Error,
+                "Telegram could not start (no private data folder).",
+            );
+            return;
+        }
+    };
     // A folder whose key the vault lost can never open again. Move it aside
     // before the first try. This checks the vault before a new key is made.
     let has_key = secrets
@@ -1249,12 +1264,13 @@ fn generate_db_key() -> String {
 }
 
 /// The TDLib folder. `THINWIRE_TDLIB_DIR` wins. Without a keychain that
-/// persists, each process uses its own temp folder (see [`data_dir::session_dir`]).
-fn tdlib_data_dir(persists: bool) -> PathBuf {
-    if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
+/// persists, each process uses its own private throwaway folder
+/// (see [`data_dir::this_process_session_dir`]).
+fn tdlib_data_dir(persists: bool) -> std::io::Result<PathBuf> {
+    Ok(if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
         PathBuf::from(dir)
     } else if !persists {
-        data_dir::this_process_session_dir()
+        data_dir::this_process_session_dir()?
     } else {
         let mut base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -1266,7 +1282,7 @@ fn tdlib_data_dir(persists: bool) -> PathBuf {
         base.push("thinwire");
         base.push("tdlib");
         base
-    }
+    })
 }
 
 /// Create the folder, readable by this user only.
