@@ -40,6 +40,7 @@ const SECRET_STORE_STATUS_PREFIX: &str = "Sign in with Telegram to get started."
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
     settings: Settings,
+    memory_secrets: bool,
 }
 
 impl CoreConfig {
@@ -52,7 +53,18 @@ impl CoreConfig {
     /// Use settings the caller loaded, for example from a test path.
     #[must_use]
     pub const fn new(settings: Settings) -> Self {
-        Self { settings }
+        Self {
+            settings,
+            memory_secrets: false,
+        }
+    }
+
+    /// Keep every secret in memory, as `THINWIRE_KEYRING=memory` does.
+    /// For headless runs and tests. Nothing reaches the OS keychain.
+    #[must_use]
+    pub const fn with_memory_secrets(mut self) -> Self {
+        self.memory_secrets = true;
+        self
     }
 }
 
@@ -75,15 +87,15 @@ impl Core {
     /// `THINWIRE_KEYRING=memory` keeps every secret in memory.
     #[must_use]
     pub fn new(runtime: &Handle, config: CoreConfig) -> Self {
-        let secrets = SecretStore::for_ui(runtime);
+        let secrets = if config.memory_secrets {
+            Arc::new(SecretStore::memory())
+        } else {
+            SecretStore::for_ui(runtime)
+        };
         Self::with_store(runtime, config, secrets)
     }
 
-    pub(crate) fn with_store(
-        runtime: &Handle,
-        config: CoreConfig,
-        secrets: Arc<SecretStore>,
-    ) -> Self {
+    fn with_store(runtime: &Handle, config: CoreConfig, secrets: Arc<SecretStore>) -> Self {
         let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
         let host = AdapterHost::spawn(
             runtime,
@@ -385,10 +397,9 @@ mod tests {
     }
 
     fn memory_core() -> Core {
-        Core::with_store(
+        Core::new(
             &Handle::current(),
-            CoreConfig::new(temp_settings()),
-            Arc::new(SecretStore::memory()),
+            CoreConfig::new(temp_settings()).with_memory_secrets(),
         )
     }
 

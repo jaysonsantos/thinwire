@@ -50,6 +50,7 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p thinwire
+cargo run -p thinwire-core --example headless
 nix develop --command scripts/lint.sh
 nix develop --command scripts/test.sh
 ```
