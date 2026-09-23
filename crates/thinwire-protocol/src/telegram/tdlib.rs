@@ -5,10 +5,11 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
 use super::inbox::{
@@ -18,7 +19,7 @@ use crate::adapter::{
     AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
     emit_conversation_removed, emit_history_loaded, emit_message, emit_message_body,
-    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_status,
+    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_status, emit_stopped,
     emit_telegram_auth, emit_telegram_auth_rejected, emit_telegram_code_sent,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
@@ -39,7 +40,12 @@ enum TdlibCommand {
         conversation_id: String,
         message_id: String,
     },
+    /// Ask TDLib to close. The worker exits after `authorizationStateClosed`.
+    Close,
 }
+
+/// How often the shutdown task checks that every worker has exited.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
 struct LiveInbox {
     authorized: bool,
@@ -47,10 +53,13 @@ struct LiveInbox {
     names: NameBook,
 }
 
-/// Owns the TDLib client id and the command sink into the worker.
+/// Owns the command sink into the current worker and counts live workers.
+///
+/// A worker never drops its TDLib client without `close`: an unclean exit
+/// aborts the process at exit and can damage the TDLib database.
 pub struct TdlibRuntime {
     commands: Option<UnboundedSender<TdlibCommand>>,
-    generation: Arc<AtomicU64>,
+    live_workers: Arc<AtomicUsize>,
 }
 
 impl TdlibRuntime {
@@ -58,13 +67,28 @@ impl TdlibRuntime {
     pub fn new() -> Self {
         Self {
             commands: None,
-            generation: Arc::new(AtomicU64::new(0)),
+            live_workers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    /// Close the current worker's TDLib client. The next command starts a new one.
     pub fn stop(&mut self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        self.commands = None;
+        if let Some(commands) = self.commands.take() {
+            let _ = commands.send(TdlibCommand::Close);
+        }
+    }
+
+    /// Close every TDLib client, then emit `Stopped` once all workers exited.
+    pub fn shutdown(&mut self, events: &EventTx) {
+        self.stop();
+        let live_workers = Arc::clone(&self.live_workers);
+        let events = events.clone();
+        tokio::spawn(async move {
+            while live_workers.load(Ordering::SeqCst) > 0 {
+                tokio::time::sleep(SHUTDOWN_POLL).await;
+            }
+            emit_stopped(&events, ProtocolId::Telegram);
+        });
     }
 
     pub fn submit(
@@ -146,15 +170,13 @@ impl TdlibRuntime {
         source: TelegramApiSource,
         events: &EventTx,
     ) {
-        let born = self.generation.load(Ordering::SeqCst);
-        let generation = Arc::clone(&self.generation);
+        let live_workers = Arc::clone(&self.live_workers);
         let sent = super::send_or_respawn(&mut self.commands, command, || {
             spawn_tdlib_worker(
                 Arc::clone(&secrets),
                 source.clone(),
                 events.clone(),
-                Arc::clone(&generation),
-                born,
+                Arc::clone(&live_workers),
             )
         });
         if !sent {
@@ -178,22 +200,23 @@ fn spawn_tdlib_worker(
     secrets: Arc<dyn TelegramSecretVault>,
     source: TelegramApiSource,
     events: EventTx,
-    generation: Arc<AtomicU64>,
-    born: u64,
+    live_workers: Arc<AtomicUsize>,
 ) -> UnboundedSender<TdlibCommand> {
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    live_workers.fetch_add(1, Ordering::SeqCst);
     let client_id = tdlib_rs::create_client();
-    let receive_generation = Arc::clone(&generation);
-    thread::Builder::new()
+    let receive_stop = Arc::new(AtomicBool::new(false));
+    let stop_receiving = Arc::clone(&receive_stop);
+    let receiver = thread::Builder::new()
         .name("thinwire-tdlib-recv".into())
         .spawn(move || {
             // `receive` returns None on timeout and after it hands a response
             // to the request observer. Keep looping so chat updates and
             // in-flight calls are not dropped when the UI is idle.
             loop {
-                if receive_generation.load(Ordering::SeqCst) != born {
+                if stop_receiving.load(Ordering::SeqCst) {
                     break;
                 }
                 match tdlib_rs::receive() {
@@ -221,17 +244,26 @@ fn spawn_tdlib_worker(
             directory: ChatDirectory::new(),
             names: NameBook::new(),
         };
+        let mut commands = Some(cmd_rx);
+        let mut closing = false;
 
         loop {
             tokio::select! {
-                command = cmd_rx.recv() => {
-                    let Some(command) = command else {
-                        break;
-                    };
-                    if generation.load(Ordering::SeqCst) != born {
-                        break;
+                command = next_command(&mut commands) => {
+                    // A dropped sender means the runtime let go of this worker.
+                    // Close TDLib in both cases; keep reading updates until Closed.
+                    let command = command.unwrap_or_else(|| {
+                        commands = None;
+                        TdlibCommand::Close
+                    });
+                    if closing {
+                        continue;
                     }
                     match command {
+                        TdlibCommand::Close => {
+                            closing = true;
+                            request_close(client_id).await;
+                        }
                         TdlibCommand::Step(step) => {
                             apply_step(client_id, step, secrets.as_ref(), &events).await;
                         }
@@ -253,16 +285,40 @@ fn spawn_tdlib_worker(
                     let Some(update) = update else {
                         break;
                     };
-                    if generation.load(Ordering::SeqCst) != born {
+                    let closed = apply_update(client_id, update, secrets.as_ref(), &source, &events, &mut live).await;
+                    if closed {
                         break;
                     }
-                    apply_update(client_id, update, secrets.as_ref(), &source, &events, &mut live).await;
                 }
             }
         }
+
+        // Stop and join the receive thread, so no thread is inside TDLib when
+        // the process exits.
+        receive_stop.store(true, Ordering::SeqCst);
+        if let Some(receiver) = receiver {
+            let _ = tokio::task::spawn_blocking(move || receiver.join()).await;
+        }
+        live_workers.fetch_sub(1, Ordering::SeqCst);
     });
 
     cmd_tx
+}
+
+/// Next command, or `None` once the sender is gone. Never resolves after that.
+async fn next_command(
+    commands: &mut Option<UnboundedReceiver<TdlibCommand>>,
+) -> Option<TdlibCommand> {
+    match commands.as_mut() {
+        Some(commands) => commands.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn request_close(client_id: i32) {
+    if let Err(error) = tdlib_rs::functions::close(client_id).await {
+        tracing::warn!(code = error.code, "tdlib close request failed");
+    }
 }
 
 async fn apply_step(
@@ -367,6 +423,7 @@ fn code_via(kind: &tdlib_rs::enums::AuthenticationCodeType) -> TelegramCodeVia {
     }
 }
 
+/// Returns `true` once TDLib reports `authorizationStateClosed`.
 async fn apply_update(
     client_id: i32,
     update: tdlib_rs::enums::Update,
@@ -374,9 +431,13 @@ async fn apply_update(
     source: &TelegramApiSource,
     events: &EventTx,
     live: &mut LiveInbox,
-) {
+) -> bool {
     match update {
         tdlib_rs::enums::Update::AuthorizationState(state) => {
+            let closed = matches!(
+                state.authorization_state,
+                tdlib_rs::enums::AuthorizationState::Closed
+            );
             apply_authorization(
                 client_id,
                 state.authorization_state,
@@ -386,6 +447,7 @@ async fn apply_update(
                 live,
             )
             .await;
+            return closed;
         }
         tdlib_rs::enums::Update::User(update) => {
             live.names.remember_user(
@@ -396,6 +458,7 @@ async fn apply_update(
         }
         other => apply_chat_update(other, live, events),
     }
+    false
 }
 
 async fn apply_authorization(

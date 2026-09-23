@@ -10,7 +10,7 @@ mod ui;
 mod whatsapp_gate;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use thinwire_protocol::{
@@ -23,6 +23,59 @@ use snapshot::Snapshot;
 
 pub use settings::Settings;
 
+/// Longest wait for TDLib to close before the window closes anyway.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll step while `on_exit` waits for a late shutdown.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+
+/// What to do with a window close request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    Allow,
+    /// Keep the window open and send `Shutdown` once.
+    HoldAndShutdown,
+    Hold,
+}
+
+/// Holds the window open until TDLib closed cleanly, or until a deadline.
+///
+/// An exit while TDLib runs aborts the process and can damage its database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseGate {
+    Open,
+    Waiting { deadline: Instant },
+    Done,
+}
+
+impl CloseGate {
+    fn on_close_requested(&mut self, now: Instant) -> CloseAction {
+        match *self {
+            Self::Open => {
+                *self = Self::Waiting {
+                    deadline: now + SHUTDOWN_TIMEOUT,
+                };
+                CloseAction::HoldAndShutdown
+            }
+            Self::Waiting { .. } => CloseAction::Hold,
+            Self::Done => CloseAction::Allow,
+        }
+    }
+
+    /// `true` once: the window may close now.
+    fn poll(&mut self, now: Instant, stopped: bool) -> bool {
+        match *self {
+            Self::Waiting { deadline } if stopped || now >= deadline => {
+                if !stopped {
+                    tracing::warn!("telegram did not close in time; closing the window anyway");
+                }
+                *self = Self::Done;
+                true
+            }
+            Self::Open | Self::Waiting { .. } | Self::Done => false,
+        }
+    }
+}
+
 /// Native thinwire window. Protocol and keychain work stay off the UI thread.
 pub struct ThinwireApp {
     runtime: tokio::runtime::Runtime,
@@ -32,6 +85,7 @@ pub struct ThinwireApp {
     secrets: Arc<SecretStore>,
     whatsapp_phone: Arc<WhatsAppPhoneVault>,
     last_os_theme: Option<egui::Theme>,
+    close_gate: CloseGate,
 }
 
 impl ThinwireApp {
@@ -60,6 +114,30 @@ impl ThinwireApp {
             secrets,
             whatsapp_phone,
             last_os_theme: None,
+            close_gate: CloseGate::Open,
+        }
+    }
+
+    /// Hold a close request until Telegram stopped, then close the window.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().close_requested()) {
+            match self.close_gate.on_close_requested(Instant::now()) {
+                CloseAction::Allow => {}
+                CloseAction::HoldAndShutdown => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.host.send(AdapterCommand::Shutdown {
+                        protocol: ProtocolId::Telegram,
+                    });
+                    self.snapshot.status_text = "Closing Telegram…".into();
+                }
+                CloseAction::Hold => ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose),
+            }
+        }
+        if self
+            .close_gate
+            .poll(Instant::now(), self.snapshot.telegram_stopped())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -95,6 +173,7 @@ impl eframe::App for ThinwireApp {
         self.drain_events();
         self.refresh_secret_store_status();
         self.snapshot.poll_resume(&self.secrets);
+        self.handle_close(ctx);
         if self.settings.follow_os_live(ctx, &mut self.last_os_theme) {
             ctx.request_repaint();
         }
@@ -112,6 +191,26 @@ impl eframe::App for ThinwireApp {
             &self.whatsapp_phone,
         );
         self.flush_commands();
+    }
+
+    /// Safety net for an exit that skipped the close gate. The window is gone,
+    /// so a short block here does not freeze the UI.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.close_gate == CloseGate::Done || self.snapshot.telegram_stopped() {
+            return;
+        }
+        self.host.send(AdapterCommand::Shutdown {
+            protocol: ProtocolId::Telegram,
+        });
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        while Instant::now() < deadline {
+            self.drain_events();
+            if self.snapshot.telegram_stopped() {
+                return;
+            }
+            std::thread::sleep(SHUTDOWN_POLL);
+        }
+        tracing::warn!("telegram did not close before exit");
     }
 }
 
@@ -204,6 +303,63 @@ mod tests {
             if Instant::now() > deadline {
                 panic!("discord did not arm after keychain hydrate");
             }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[test]
+    fn close_waits_for_stopped_then_allows_the_next_request() {
+        let start = Instant::now();
+        let mut gate = CloseGate::Open;
+        assert_eq!(gate.on_close_requested(start), CloseAction::HoldAndShutdown);
+        assert_eq!(
+            gate.on_close_requested(start),
+            CloseAction::Hold,
+            "one Shutdown only"
+        );
+        assert!(!gate.poll(start, false));
+        assert!(gate.poll(start, true));
+        assert!(!gate.poll(start, true), "close fires once");
+        assert_eq!(gate.on_close_requested(start), CloseAction::Allow);
+    }
+
+    #[test]
+    fn close_gives_up_after_the_deadline() {
+        let start = Instant::now();
+        let mut gate = CloseGate::Open;
+        gate.on_close_requested(start);
+        assert!(!gate.poll(start + SHUTDOWN_TIMEOUT / 2, false));
+        assert!(gate.poll(start + SHUTDOWN_TIMEOUT, false));
+        assert_eq!(gate, CloseGate::Done);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reaches_the_telegram_adapter_and_reports_stopped() {
+        let store = SecretStore::memory();
+        let store = Arc::new(store);
+        let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
+        let mut host = AdapterHost::spawn(
+            &Handle::current(),
+            Arc::clone(&store) as Arc<dyn TelegramSecretVault>,
+            Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
+            whatsapp_phone,
+        );
+        host.send(AdapterCommand::Shutdown {
+            protocol: ProtocolId::Telegram,
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if host.poll_events().iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Stopped {
+                        protocol: ProtocolId::Telegram
+                    }
+                )
+            }) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "no Stopped event");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }

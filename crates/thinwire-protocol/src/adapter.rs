@@ -203,6 +203,10 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         conversation_id: String,
     },
+    /// The app is closing. Close every client cleanly, then send `Stopped`.
+    Shutdown {
+        protocol: ProtocolId,
+    },
     /// Send a failed outgoing message again. Ids are not secrets.
     ResendMessage {
         protocol: ProtocolId,
@@ -233,6 +237,7 @@ impl AdapterCommand {
             | Self::Disconnect { protocol }
             | Self::LoadChats { protocol }
             | Self::OpenChat { protocol, .. }
+            | Self::Shutdown { protocol }
             | Self::SendText { protocol, .. }
             | Self::ResendMessage { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
@@ -297,6 +302,10 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         conversation_id: String,
         message_ids: Vec<String>,
+    },
+    /// Every client of this protocol closed after `Shutdown`. The app may exit.
+    Stopped {
+        protocol: ProtocolId,
     },
     /// New delivery state for a message already in the thread.
     MessageDelivery {
@@ -543,6 +552,10 @@ pub(crate) fn emit_message_delivery(
         message_id: message_id.into(),
         delivery,
     });
+}
+
+pub(crate) fn emit_stopped(events: &EventTx, protocol: ProtocolId) {
+    let _ = events.send(AdapterEvent::Stopped { protocol });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]

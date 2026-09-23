@@ -254,6 +254,7 @@ pub(crate) struct Snapshot {
     /// Unsent compose text per chat. `compose` holds the selected chat's draft.
     drafts: HashMap<String, String>,
     focus_compose: bool,
+    telegram_stopped: bool,
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
@@ -309,6 +310,7 @@ impl Snapshot {
             scroll_to_selected: false,
             drafts: HashMap::new(),
             focus_compose: false,
+            telegram_stopped: false,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
@@ -395,6 +397,11 @@ impl Snapshot {
                 message_id,
                 delivery,
             } => self.set_delivery(protocol, &conversation_id, &message_id, delivery),
+            AdapterEvent::Stopped { protocol } => {
+                if protocol == ProtocolId::Telegram {
+                    self.telegram_stopped = true;
+                }
+            }
             AdapterEvent::ChatListLoaded { protocol } => {
                 if protocol == ProtocolId::Telegram {
                     self.chat_list_loading = false;
@@ -573,6 +580,12 @@ impl Snapshot {
             self.compose = self.drafts.remove(new).unwrap_or_default();
         }
         self.selected_conversation = id;
+    }
+
+    /// Telegram closed every client after `Shutdown`. The app may exit.
+    #[must_use]
+    pub(crate) fn telegram_stopped(&self) -> bool {
+        self.telegram_stopped
     }
 
     /// True once after the user picked a chat. The UI then focuses compose.

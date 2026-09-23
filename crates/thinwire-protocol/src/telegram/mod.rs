@@ -215,6 +215,16 @@ impl ProtocolAdapter for TelegramAdapter {
                 );
                 Ok(())
             }
+            AdapterCommand::Shutdown {
+                protocol: ProtocolId::Telegram,
+            } => {
+                self.engine.reset();
+                #[cfg(feature = "telegram-tdlib")]
+                self.tdlib.shutdown(events);
+                #[cfg(not(feature = "telegram-tdlib"))]
+                super::adapter::emit_stopped(events, ProtocolId::Telegram);
+                Ok(())
+            }
             AdapterCommand::LoadChats {
                 protocol: ProtocolId::Telegram,
             } => self.dispatch_live(events, LiveCall::LoadChats),
@@ -626,6 +636,54 @@ mod tests {
         let updates = fn_body(src, "fn apply_chat_update");
         assert!(updates.contains("i64::from(message.date)"));
         assert!(updates.contains("i64::from(update.message.date)"));
+    }
+
+    #[test]
+    fn shutdown_reports_stopped_and_live_workers_close_tdlib_first() {
+        let mut adapter = TelegramAdapter::memory();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        if !uses_tdlib_hook() {
+            adapter
+                .handle(
+                    AdapterCommand::Shutdown {
+                        protocol: ProtocolId::Telegram,
+                    },
+                    &tx,
+                )
+                .expect("shutdown");
+            assert_eq!(
+                rx.try_recv().expect("stopped"),
+                AdapterEvent::Stopped {
+                    protocol: ProtocolId::Telegram
+                }
+            );
+        }
+        let src = include_str!("tdlib.rs");
+        let stop = &src[src.find("pub fn stop(").expect("stop")
+            ..src.find("pub fn shutdown(").expect("shutdown")];
+        assert!(
+            stop.contains("TdlibCommand::Close"),
+            "stop closes, it does not drop"
+        );
+        let shutdown = fn_body(src, "pub fn shutdown(");
+        assert!(shutdown.contains("live_workers.load"));
+        assert!(shutdown.contains("emit_stopped"));
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        assert!(worker.contains("request_close(client_id)"));
+        assert!(worker.contains("if closed"));
+        assert!(worker.contains("receiver.join()"));
+        assert!(worker.contains("live_workers.fetch_sub"));
+        let join = worker.find("receiver.join()").expect("join");
+        let done = worker.find("live_workers.fetch_sub").expect("done");
+        assert!(
+            join < done,
+            "a worker counts as gone only after its receive thread"
+        );
+        assert!(fn_body(src, "async fn request_close").contains("functions::close"));
+        assert!(
+            !src.contains("generation"),
+            "no worker is dropped without close"
+        );
     }
 
     #[test]
