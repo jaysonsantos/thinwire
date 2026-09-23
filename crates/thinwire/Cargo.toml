@@ -23,6 +23,7 @@ dirs.workspace = true
 eframe.workspace = true
 egui.workspace = true
 keyring-core.workspace = true
+thinwire-core.workspace = true
 thinwire-protocol.workspace = true
 winit.workspace = true
 tokio.workspace = true

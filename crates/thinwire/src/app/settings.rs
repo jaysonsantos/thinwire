@@ -6,7 +6,6 @@
 //! re-check the persist epoch under that lock so `settings.toml` always matches
 //! the latest theme.
 
-use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,37 +13,16 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-/// User override for light/dark. Default and missing config are System.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThemeMode {
-    #[default]
-    System,
-    Light,
-    Dark,
+pub use thinwire_core::ThemeMode;
+
+/// egui mapping for the core [`ThemeMode`]. The core does not know egui.
+pub trait ThemeModeEgui: Sized {
+    fn to_egui(self) -> egui::ThemePreference;
+    fn from_egui(preference: egui::ThemePreference) -> Self;
 }
 
-impl ThemeMode {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Light => "light",
-            Self::Dark => "dark",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().trim_matches('"').to_ascii_lowercase().as_str() {
-            "system" => Some(Self::System),
-            "light" => Some(Self::Light),
-            "dark" => Some(Self::Dark),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn to_egui(self) -> egui::ThemePreference {
+impl ThemeModeEgui for ThemeMode {
+    fn to_egui(self) -> egui::ThemePreference {
         match self {
             Self::System => egui::ThemePreference::System,
             Self::Light => egui::ThemePreference::Light,
@@ -52,19 +30,12 @@ impl ThemeMode {
         }
     }
 
-    #[must_use]
-    pub const fn from_egui(preference: egui::ThemePreference) -> Self {
+    fn from_egui(preference: egui::ThemePreference) -> Self {
         match preference {
             egui::ThemePreference::System => Self::System,
             egui::ThemePreference::Light => Self::Light,
             egui::ThemePreference::Dark => Self::Dark,
         }
-    }
-}
-
-impl fmt::Display for ThemeMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -342,14 +313,6 @@ mod tests {
             scope.spawn(|| latest.run_after_naive_pre_io_check());
         });
         assert_eq!(Settings::load_from(path).theme(), ThemeMode::Light);
-    }
-
-    #[test]
-    fn parse_accepts_quoted_and_mixed_case() {
-        assert_eq!(ThemeMode::parse(" System "), Some(ThemeMode::System));
-        assert_eq!(ThemeMode::parse("\"DARK\""), Some(ThemeMode::Dark));
-        assert_eq!(ThemeMode::parse("light"), Some(ThemeMode::Light));
-        assert_eq!(ThemeMode::parse("nope"), None);
     }
 
     #[test]

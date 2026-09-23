@@ -31,11 +31,12 @@
 
 | Path | Purpose |
 | --- | --- |
-| `crates/thinwire/` | Desktop binary: egui shell, Telegram login, keychain, system theme, inbox |
+| `crates/thinwire/` | Desktop binary: egui frontend. Draws the core view and sends intents |
+| `crates/thinwire-core/` | Frontend-independent core: state, `Intent`, view, change signal, secret store, settings, host wiring. No egui / eframe / winit (ADR `0010`) |
 | `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings, and the Telegram / Slack / WhatsApp / Discord adapters (`telegram/`, `slack/`, `whatsapp/`, `discord/`) |
-| `decisions/` | ADRs (0001 option B, 0002 glow, 0003 main-only artifacts, 0004 Signal out, 0005 system theme, `0006-live-tdlib`, `0007-publisher-telegram-api-credentials`, `0008-slack-oauth-workspace-spike`, `0009-discord-bot-inbox-spike`, `0011-agpl-protocols-local-only`) |
+| `decisions/` | ADRs (0001 option B, 0002 glow, 0003 main-only artifacts, 0004 Signal out, 0005 system theme, `0006-live-tdlib`, `0007-publisher-telegram-api-credentials`, `0008-slack-oauth-workspace-spike`, `0009-discord-bot-inbox-spike`, `0010-frontend-independent-core`, `0011-agpl-protocols-local-only`) |
 | `ROADMAP.md` | Ordered product-council todo list (ADRs stay in `decisions/`) |
-| `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh` — CI calls the same scripts |
+| `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh`, `check-core-deps.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |
 | `.github/workflows/ci.yml` | Parallel lint/test/build plus the `check` guard |

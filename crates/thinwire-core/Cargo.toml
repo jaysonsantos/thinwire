@@ -1,0 +1,21 @@
+[package]
+name = "thinwire-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Frontend-independent thinwire state, intents, and change signal"
+
+# ADR 0010: no egui, eframe, or winit here. `scripts/check-core-deps.sh`
+# fails the test run if one of them shows up in `cargo tree`.
+[dependencies]
+thinwire-protocol.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true

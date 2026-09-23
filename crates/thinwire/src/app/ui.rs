@@ -8,7 +8,7 @@ use thinwire_protocol::{AdapterStatus, Delivery, ProtocolId, WhatsAppPhoneVault}
 
 use super::auth;
 use super::secrets::{Persistence, SecretStore};
-use super::settings::{Settings, ThemeMode};
+use super::settings::{Settings, ThemeMode, ThemeModeEgui};
 use super::snapshot::{
     AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
     RESUME_CONNECTING, Snapshot, ThreadState,

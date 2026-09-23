@@ -4610,6 +4610,7 @@ dependencies = [
  "keyring-core",
  "linux-keyutils-keyring-store",
  "secret-service",
+ "thinwire-core",
  "thinwire-protocol",
  "tokio",
  "tracing",
@@ -4617,6 +4618,14 @@ dependencies = [
  "windows-native-keyring-store",
  "winit",
  "zbus-secret-service-keyring-store",
+]
+
+[[package]]
+name = "thinwire-core"
+version = "0.1.0"
+dependencies = [
+ "thinwire-protocol",
+ "tokio",
 ]
 
 [[package]]
