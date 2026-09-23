@@ -137,6 +137,10 @@ pub enum TelegramAuthError {
     FloodWait {
         seconds: u32,
     },
+    /// TDLib refused `setTdlibParameters`, so no login step can run.
+    ClientSetup {
+        code: i32,
+    },
     /// Any other error. Only the numeric code crosses the channel.
     Other {
         code: i32,

@@ -38,6 +38,22 @@ pub(super) fn auth_error_from_tdlib(code: i32, message: &str) -> TelegramAuthErr
     TelegramAuthError::Other { code }
 }
 
+/// TDLib error text that is safe to log: a bare error name (`A-Z0-9_`, for
+/// example `PHONE_CODE_INVALID`) or text with no digits. Any other text can
+/// hold a phone number or a login code, so it is never logged.
+#[must_use]
+pub(super) fn loggable_tdlib_message(message: &str) -> Option<&str> {
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let bare_name = message
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    let no_digits = !message.chars().any(|c| c.is_ascii_digit());
+    (bare_name || no_digits).then_some(message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,6 +91,31 @@ mod tests {
         for (code, message, expected) in cases {
             assert_eq!(auth_error_from_tdlib(code, message), expected, "{message}");
         }
+    }
+
+    #[test]
+    fn only_names_and_digit_free_text_may_be_logged() {
+        assert_eq!(
+            loggable_tdlib_message("PHONE_CODE_INVALID"),
+            Some("PHONE_CODE_INVALID")
+        );
+        assert_eq!(
+            loggable_tdlib_message("FLOOD_WAIT_120"),
+            Some("FLOOD_WAIT_120")
+        );
+        assert_eq!(
+            loggable_tdlib_message(
+                "Initialization parameters are needed: call setTdlibParameters first"
+            ),
+            Some("Initialization parameters are needed: call setTdlibParameters first")
+        );
+        assert_eq!(loggable_tdlib_message("+15551234567 is not valid"), None);
+        assert_eq!(loggable_tdlib_message("code 12345 expired"), None);
+        assert_eq!(
+            loggable_tdlib_message("Too Many Requests: retry after 30"),
+            None
+        );
+        assert_eq!(loggable_tdlib_message("  "), None);
     }
 
     #[test]

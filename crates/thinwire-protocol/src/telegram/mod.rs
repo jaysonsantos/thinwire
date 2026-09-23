@@ -719,6 +719,18 @@ mod tests {
     }
 
     #[test]
+    fn failed_tdlib_parameters_stop_the_login_and_log_safely() {
+        let src = include_str!("tdlib.rs");
+        let params = fn_body(src, "async fn set_parameters");
+        assert!(params.contains("if let Err(error) = tdlib_rs::functions::set_tdlib_parameters("));
+        assert!(params.contains("TelegramAuthError::ClientSetup"));
+        assert!(params.contains("TelegramAuthPhase::Failed"));
+        assert!(params.contains("log_tdlib_error(\"setTdlibParameters\""));
+        let log = fn_body(src, "fn log_tdlib_error");
+        assert!(log.contains("loggable_tdlib_message"));
+    }
+
+    #[test]
     fn live_tdlib_has_one_receive_thread_for_the_process() {
         let src = include_str!("tdlib.rs");
         assert_eq!(src.matches("tdlib_rs::receive()").count(), 1);

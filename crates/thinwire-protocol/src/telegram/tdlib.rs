@@ -1107,7 +1107,7 @@ async fn set_parameters(
     };
     let database_directory = tdlib_data_dir().display().to_string();
     let encryption_key = ensure_db_key(secrets, events);
-    if tdlib_rs::functions::set_tdlib_parameters(
+    if let Err(error) = tdlib_rs::functions::set_tdlib_parameters(
         false,
         database_directory,
         String::new(),
@@ -1125,14 +1125,27 @@ async fn set_parameters(
         client_id,
     )
     .await
-    .is_err()
     {
+        // No login step can run now. Stop the flow; the UI must not show
+        // the phone step (TDLib would answer "call setTdlibParameters first").
+        log_tdlib_error("setTdlibParameters", &error);
+        emit_telegram_auth_rejected(events, TelegramAuthError::ClientSetup { code: error.code });
+        emit_telegram_auth(events, TelegramAuthPhase::Failed);
         emit_status(
             events,
             ProtocolId::Telegram,
             AdapterStatus::Error,
-            "TDLib rejected the client parameters. Check api_id and api_hash.",
+            format!("Telegram could not start (error {}).", error.code),
         );
+    }
+}
+
+/// Log a TDLib error. The text goes to the log only when it cannot hold a
+/// phone number or a code.
+fn log_tdlib_error(request: &str, error: &tdlib_rs::types::Error) {
+    match super::auth_error::loggable_tdlib_message(&error.message) {
+        Some(message) => tracing::warn!(request, code = error.code, message, "tdlib error"),
+        None => tracing::warn!(request, code = error.code, "tdlib error (text not logged)"),
     }
 }
 

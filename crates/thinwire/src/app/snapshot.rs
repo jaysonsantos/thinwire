@@ -174,6 +174,11 @@ pub(crate) fn auth_user_error(reason: Option<TelegramAuthError>) -> UserError {
                 format!("Wait {minutes} {unit}, then try again."),
             )
         }
+        Some(TelegramAuthError::ClientSetup { code }) => (
+            "Telegram could not start.",
+            format!("The local Telegram data could not be opened (error {code})."),
+            "Press Add Telegram to try again. If it fails again, restart thinwire.".to_string(),
+        ),
         Some(TelegramAuthError::Other { code }) => (
             "Telegram login did not advance.",
             format!("Telegram did not accept this step (error {code})."),
@@ -1031,6 +1036,18 @@ impl Snapshot {
             TelegramAuthPhase::Unavailable => self.finish_telegram_unavailable(),
             TelegramAuthPhase::Failed => {
                 self.error = Some(auth_user_error(self.auth_rejection));
+                if matches!(
+                    self.auth_rejection,
+                    Some(TelegramAuthError::ClientSetup { .. })
+                ) {
+                    // No step can run on this client. Leave the form, close the
+                    // client, and let Add Telegram start a fresh one.
+                    self.auth = AuthScreen::Idle;
+                    self.clear_secrets();
+                    self.pending.push(AdapterCommand::Disconnect {
+                        protocol: ProtocolId::Telegram,
+                    });
+                }
             }
         }
     }
@@ -2245,6 +2262,34 @@ mod tests {
         let center = &center[..center.find("\nfn ").expect("next")];
         assert!(center.contains("center_key(AuthKey::Enter"));
         assert!(center.contains("center_key(AuthKey::Escape"));
+    }
+
+    #[test]
+    fn failed_client_setup_leaves_the_login_and_closes_the_client() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        snapshot.apply(AdapterEvent::TelegramAuthRejected {
+            error: TelegramAuthError::ClientSetup { code: 400 },
+        });
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Failed,
+        });
+        assert_eq!(
+            snapshot.auth,
+            AuthScreen::Idle,
+            "no phone step on a dead client"
+        );
+        assert!(!snapshot.auth_busy);
+        let error = snapshot.error.clone().expect("error");
+        assert_eq!(error.happened, "Telegram could not start.");
+        assert!(error.why.contains("400"));
+        assert!(snapshot.take_commands().iter().any(|command| matches!(
+            command,
+            AdapterCommand::Disconnect {
+                protocol: ProtocolId::Telegram
+            }
+        )));
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
     }
 
     #[test]
