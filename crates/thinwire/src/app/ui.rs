@@ -7,16 +7,16 @@ use eframe::egui::{self, RichText};
 use thinwire_protocol::{AdapterStatus, Delivery, ProtocolId, WhatsAppPhoneVault};
 
 use super::auth;
-use super::snapshot::{
-    AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
-    RESUME_CONNECTING, Snapshot, ThreadState,
-};
 use super::theme::{self, radius, size, space};
 use super::theme_mode::{SettingsEgui, ThemeModeEgui};
 use super::thread_layout::{RowLayout, list_time, thread_rows};
 use thinwire_core::ThemeMode;
 use thinwire_core::secrets::{Persistence, SecretStore};
 use thinwire_core::settings::Settings;
+use thinwire_core::state::{
+    AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
+    RESUME_CONNECTING, Snapshot, ThreadState,
+};
 
 /// Shown while the OS keychain is not available. Secrets stay in memory.
 pub(crate) const KEYCHAIN_UNAVAILABLE_NOTICE: &str =
@@ -1140,8 +1140,8 @@ mod tests {
             COMPOSE_MAX_ROWS, FIELD_STROKE_MAX, SEND_MIN_HEIGHT, compose, compose_line_count,
             compose_reserve, compose_row_height,
         };
-        use crate::app::snapshot::Snapshot;
         use crate::app::theme::{self, space};
+        use thinwire_core::state::Snapshot;
 
         let ctx = egui::Context::default();
         theme::install(&ctx);
@@ -1317,7 +1317,7 @@ mod tests {
     #[test]
     fn chip_says_not_signed_in_before_login_starts() {
         use super::chip_label;
-        use crate::app::snapshot::{AuthScreen, Snapshot};
+        use thinwire_core::state::{AuthScreen, Snapshot};
         use thinwire_protocol::ProtocolId;
 
         let mut snapshot = Snapshot::new();
@@ -1345,7 +1345,7 @@ mod tests {
     #[test]
     fn inbox_stays_blank_before_sign_in() {
         use super::show_no_chats;
-        use crate::app::snapshot::Snapshot;
+        use thinwire_core::state::Snapshot;
 
         let mut snapshot = Snapshot::new();
         assert!(!show_no_chats(&snapshot));
@@ -1355,7 +1355,7 @@ mod tests {
 
     #[test]
     fn add_account_hides_when_telegram_is_linked() {
-        use crate::app::snapshot::{InboxFilter, Snapshot};
+        use thinwire_core::state::{InboxFilter, Snapshot};
 
         let mut snapshot = Snapshot::new();
         assert!(snapshot.can_add_account());
@@ -1367,7 +1367,7 @@ mod tests {
     #[test]
     fn idle_status_and_tdlib_lines_hide_the_strip() {
         use super::{is_idle_status, public_status, status_strip_visible};
-        use crate::app::snapshot::Snapshot;
+        use thinwire_core::state::Snapshot;
 
         assert!(is_idle_status(""));
         assert!(is_idle_status("Sign in with Telegram to get started."));
@@ -1394,7 +1394,7 @@ mod tests {
     #[test]
     fn load_failures_stay_on_the_status_strip() {
         use super::{load_failure_text, public_status, status_strip_visible};
-        use crate::app::snapshot::Snapshot;
+        use thinwire_core::state::Snapshot;
 
         let cases = [
             (

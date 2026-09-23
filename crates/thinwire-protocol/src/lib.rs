@@ -140,6 +140,7 @@ mod tests {
         for manifest in [
             include_str!("../Cargo.toml"),
             include_str!("../../thinwire/Cargo.toml"),
+            include_str!("../../thinwire-core/Cargo.toml"),
             include_str!("../../../Cargo.toml"),
         ] {
             let lower = manifest.to_ascii_lowercase();

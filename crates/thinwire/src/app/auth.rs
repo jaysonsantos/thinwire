@@ -5,33 +5,10 @@ use eframe::egui::{self, RichText};
 
 use thinwire_protocol::{TelegramAuthError, TelegramCodeVia};
 
-use super::snapshot::{AuthScreen, Snapshot};
 use super::theme::{self, space};
 use thinwire_core::secrets::SecretStore;
-
-/// Shown until TDLib reports Ready. Feature-off builds stay on this copy.
-pub(crate) const TDLIB_UNAVAILABLE_BANNER: &str = "TDLib unavailable in this build. Enable feature telegram-tdlib after a local TDLib install. These screens do not open a live Telegram session.";
-
-/// Shown when TDLib is compiled but authorizationStateReady has not arrived.
-/// It drops only on Ready (ADR 0006). End-user copy: no library names.
-pub(crate) const TELEGRAM_STUB_UNTIL_READY: &str = "Telegram is not signed in yet.";
-
-#[must_use]
-pub(crate) const fn tdlib_compiled() -> bool {
-    cfg!(feature = "telegram-tdlib")
-}
-
-#[must_use]
-pub(crate) fn stub_banner(snapshot: &Snapshot) -> Option<&'static str> {
-    if snapshot.telegram_ready() {
-        return None;
-    }
-    if tdlib_compiled() {
-        Some(TELEGRAM_STUB_UNTIL_READY)
-    } else {
-        Some(TDLIB_UNAVAILABLE_BANNER)
-    }
-}
+pub(crate) use thinwire_core::state::stub_banner;
+use thinwire_core::state::{AuthScreen, Snapshot};
 
 /// Step caption for the three login fields. Other screens have none.
 #[must_use]

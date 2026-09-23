@@ -6,8 +6,8 @@
 use eframe::egui::{self, RichText};
 use thinwire_protocol::{CRITIC_RISK_BULLETS, WhatsAppPhoneVault};
 
-use super::snapshot::{Snapshot, WhatsAppScreen};
 use super::theme;
+use thinwire_core::state::{Snapshot, WhatsAppScreen};
 
 pub(crate) fn risk_entry(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     ui.add_space(8.0);

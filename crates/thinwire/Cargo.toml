@@ -11,15 +11,17 @@ readme = "../../README.md"
 
 [features]
 default = []
-telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
-slack-oauth = ["thinwire-protocol/slack-oauth"]
+telegram-tdlib = [
+  "thinwire-core/telegram-tdlib",
+  "thinwire-protocol/telegram-tdlib",
+]
+slack-oauth = ["thinwire-core/slack-oauth", "thinwire-protocol/slack-oauth"]
 # Experimental spike. Default CI and the default UI stay feature-off.
-whatsapp-web = ["thinwire-protocol/whatsapp-web"]
-discord-bot = ["thinwire-protocol/discord-bot"]
+whatsapp-web = ["thinwire-core/whatsapp-web", "thinwire-protocol/whatsapp-web"]
+discord-bot = ["thinwire-core/discord-bot", "thinwire-protocol/discord-bot"]
 
 [dependencies]
 chrono.workspace = true
-dirs.workspace = true
 eframe.workspace = true
 egui.workspace = true
 thinwire-core.workspace = true

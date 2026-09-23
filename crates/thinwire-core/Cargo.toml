@@ -12,6 +12,12 @@ description = "Frontend-independent thinwire state, intents, and change signal"
 # fails the test run if one of them shows up in `cargo tree`.
 [features]
 default = []
+# Protocol features live here. The frontend crate forwards them.
+telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
+slack-oauth = ["thinwire-protocol/slack-oauth"]
+# Experimental spike. Default CI and the default UI stay feature-off.
+whatsapp-web = ["thinwire-protocol/whatsapp-web"]
+discord-bot = ["thinwire-protocol/discord-bot"]
 # Test hooks on `SecretStore` for other workspace crates. Never in a release.
 test-support = []
 

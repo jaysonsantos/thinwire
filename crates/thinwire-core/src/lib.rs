@@ -10,6 +10,7 @@ mod secret_text;
 pub mod secrets;
 pub mod settings;
 mod signal;
+pub mod state;
 mod theme;
 
 pub use intent::{AuthField, DiscordIntent, Intent, SlackIntent, TelegramIntent, WhatsAppIntent};

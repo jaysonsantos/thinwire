@@ -1,11 +1,12 @@
 //! eframe application: polls adapter events and draws the shell.
 
 mod auth;
-mod snapshot;
 mod theme;
 mod theme_mode;
 mod thread_layout;
 mod ui;
+#[cfg(test)]
+mod ui_tests;
 #[cfg(feature = "whatsapp-web")]
 mod whatsapp_gate;
 
@@ -18,8 +19,8 @@ use thinwire_protocol::{
     TelegramSecretVault, WhatsAppPhoneVault, catalog,
 };
 
-use snapshot::Snapshot;
 use thinwire_core::secrets::SecretStore;
+use thinwire_core::state::Snapshot;
 
 pub use theme::install as install_theme;
 pub use theme_mode::SettingsEgui;

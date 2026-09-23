@@ -1,4 +1,4 @@
-//! UI-side snapshot. Mutated only on the UI thread from polled events and clicks.
+//! App state. Mutated only on the frontend thread from adapter events and user actions.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -12,12 +12,34 @@ use thinwire_protocol::{
     parse_telegram_chat_id, telegram_api_available,
 };
 
-#[cfg(test)]
-use thinwire_core::secrets::OsBackend;
-use thinwire_core::secrets::{SecretKey, SecretStore};
+use crate::secrets::{SecretKey, SecretStore};
+
+/// Shown until TDLib reports Ready. Feature-off builds stay on this copy.
+pub const TDLIB_UNAVAILABLE_BANNER: &str = "TDLib unavailable in this build. Enable feature telegram-tdlib after a local TDLib install. These screens do not open a live Telegram session.";
+
+/// Shown when TDLib is compiled but authorizationStateReady has not arrived.
+/// It drops only on Ready (ADR 0006). End-user copy: no library names.
+pub const TELEGRAM_STUB_UNTIL_READY: &str = "Telegram is not signed in yet.";
+
+#[must_use]
+pub const fn tdlib_compiled() -> bool {
+    cfg!(feature = "telegram-tdlib")
+}
+
+#[must_use]
+pub fn stub_banner(snapshot: &Snapshot) -> Option<&'static str> {
+    if snapshot.telegram_ready() {
+        return None;
+    }
+    if tdlib_compiled() {
+        Some(TELEGRAM_STUB_UNTIL_READY)
+    } else {
+        Some(TDLIB_UNAVAILABLE_BANNER)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InboxFilter {
+pub enum InboxFilter {
     All,
     Telegram,
     #[cfg(feature = "slack-oauth")]
@@ -27,7 +49,7 @@ pub(crate) enum InboxFilter {
 impl InboxFilter {
     /// Top-bar filters for this build. Spike tabs stay out until their feature is on.
     #[must_use]
-    pub(crate) fn chrome_filters() -> &'static [Self] {
+    pub fn chrome_filters() -> &'static [Self] {
         #[cfg(feature = "slack-oauth")]
         {
             const FILTERS: &[InboxFilter] =
@@ -42,7 +64,7 @@ impl InboxFilter {
     }
 
     #[must_use]
-    pub(crate) const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::All => "All",
             Self::Telegram => "Telegram",
@@ -52,7 +74,7 @@ impl InboxFilter {
     }
 
     #[must_use]
-    pub(crate) const fn matches(self, protocol: ProtocolId) -> bool {
+    pub const fn matches(self, protocol: ProtocolId) -> bool {
         match self {
             Self::All => true,
             Self::Telegram => matches!(protocol, ProtocolId::Telegram),
@@ -66,14 +88,14 @@ impl InboxFilter {
     /// Cargo features decide which protocols exist. Callers still AND
     /// [`Snapshot::account_surface_visible`].
     #[must_use]
-    pub(crate) const fn shows_in_switcher(self, protocol: ProtocolId) -> bool {
+    pub const fn shows_in_switcher(self, protocol: ProtocolId) -> bool {
         self.matches(protocol)
     }
 }
 
 /// Compile-time chrome gate: spikes stay invisible when their feature is off.
 #[must_use]
-pub(crate) const fn protocol_chrome_enabled(protocol: ProtocolId) -> bool {
+pub const fn protocol_chrome_enabled(protocol: ProtocolId) -> bool {
     match protocol {
         ProtocolId::Telegram => true,
         ProtocolId::Slack => cfg!(feature = "slack-oauth"),
@@ -84,7 +106,7 @@ pub(crate) const fn protocol_chrome_enabled(protocol: ProtocolId) -> bool {
 
 /// Non-modal Telegram login steps. Credential field values never leave this snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthScreen {
+pub enum AuthScreen {
     Idle,
     NeedCredentials,
     TelegramApi,
@@ -98,7 +120,7 @@ pub(crate) enum AuthScreen {
 
 /// Start-up resume of a saved Telegram session. Runs once per launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Resume {
+pub enum Resume {
     /// The OS keychain has not finished its first read.
     Waiting,
     /// A saved session exists. TDLib is starting with no click.
@@ -109,7 +131,7 @@ pub(crate) enum Resume {
 
 /// What the center panel shows. Pure state, so tests do not need egui.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CenterView {
+pub enum CenterView {
     Auth,
     /// Spinner. `true` adds the "Connecting to Telegram…" text.
     Resuming {
@@ -123,7 +145,7 @@ pub(crate) enum CenterView {
 
 /// What the inbox list shows for the selected protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InboxState {
+pub enum InboxState {
     Rows,
     Loading,
     Empty,
@@ -133,7 +155,7 @@ pub(crate) enum InboxState {
 
 /// What the thread shows for the selected chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThreadState {
+pub enum ThreadState {
     NoSelection,
     Rows,
     Loading,
@@ -142,14 +164,14 @@ pub(crate) enum ThreadState {
 
 /// Keys the login form reacts to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthKey {
+pub enum AuthKey {
     Enter,
     Escape,
 }
 
 /// Error block for a refused login step. Only the error kind is shown.
 #[must_use]
-pub(crate) fn auth_user_error(reason: Option<TelegramAuthError>) -> UserError {
+pub fn auth_user_error(reason: Option<TelegramAuthError>) -> UserError {
     let (happened, why, next) = match reason {
         Some(TelegramAuthError::PhoneInvalid) => (
             "Telegram did not accept the phone number.",
@@ -206,7 +228,7 @@ pub(crate) fn auth_user_error(reason: Option<TelegramAuthError>) -> UserError {
 /// Copy on the phone step after the old Telegram data folder was moved aside.
 /// Names the folder once; old folders are kept, never deleted.
 #[must_use]
-pub(crate) fn data_reset_notice(moved_to: &str) -> String {
+pub fn data_reset_notice(moved_to: &str) -> String {
     format!(
         "Telegram data on this device could not be opened. It was moved to \"{moved_to}\" in the thinwire data folder and kept. Sign in again."
     )
@@ -216,45 +238,45 @@ pub(crate) fn data_reset_notice(moved_to: &str) -> String {
 const KEYCHAIN_LOADING_STATUS: &str = "Reading the keychain. Try again in a moment.";
 
 /// Copy on the phone step when a saved session no longer works.
-pub(crate) const SESSION_ENDED_NOTICE: &str = "Your Telegram session ended. Sign in again.";
+pub const SESSION_ENDED_NOTICE: &str = "Your Telegram session ended. Sign in again.";
 
 /// Status line while a new client starts, before the phone step.
 const CONNECTING_STATUS: &str = "Connecting to Telegram…";
 
 /// Center panel copy when a keychain read failed (the values are unknown).
-pub(crate) const KEYCHAIN_READ_FAILED: &str = "The keychain could not be read. Your saved sign-in did not load. Unlock the keychain, then press Try again.";
+pub const KEYCHAIN_READ_FAILED: &str = "The keychain could not be read. Your saved sign-in did not load. Unlock the keychain, then press Try again.";
 
 /// Center panel copy while the keychain read runs.
-pub(crate) const KEYCHAIN_OPENING: &str = "Opening the keychain…";
+pub const KEYCHAIN_OPENING: &str = "Opening the keychain…";
 
 /// Center panel copy when the keychain read takes long: a wallet can wait
 /// for an unlock prompt, which may be behind this window.
-pub(crate) const KEYCHAIN_WAITING: &str = "Waiting for the keychain. Unlock it to continue.";
+pub const KEYCHAIN_WAITING: &str = "Waiting for the keychain. Unlock it to continue.";
 
 /// After this long, the keychain copy asks the user to unlock it.
 const KEYCHAIN_SLOW_AFTER: Duration = Duration::from_secs(1);
 
 /// Center panel copy while a saved session reconnects.
-pub(crate) const RESUME_CONNECTING: &str = "Connecting to Telegram…";
+pub const RESUME_CONNECTING: &str = "Connecting to Telegram…";
 
 /// Experimental WhatsApp screens. Only the `whatsapp-web` build can enter them.
 #[cfg(feature = "whatsapp-web")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WhatsAppScreen {
+pub enum WhatsAppScreen {
     Hidden,
     RiskGate,
     Pair,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UserError {
+pub struct UserError {
     pub happened: String,
     pub why: String,
     pub next: String,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AccountRow {
+pub struct AccountRow {
     pub caps: ProtocolCapabilities,
     pub status: AdapterStatus,
     pub detail: String,
@@ -262,7 +284,7 @@ pub(crate) struct AccountRow {
 }
 
 #[derive(Debug)]
-pub(crate) struct Snapshot {
+pub struct Snapshot {
     pub accounts: Vec<AccountRow>,
     conversations: HashMap<ProtocolId, Vec<Conversation>>,
     messages: HashMap<(ProtocolId, String), Vec<ChatMessage>>,
@@ -315,19 +337,25 @@ pub(crate) struct Snapshot {
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) whatsapp_screen: WhatsAppScreen,
+    pub whatsapp_screen: WhatsAppScreen,
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) whatsapp_phone: String,
+    pub whatsapp_phone: String,
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) whatsapp_qr: Option<String>,
+    pub whatsapp_qr: Option<String>,
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) whatsapp_pair_code: Option<String>,
+    pub whatsapp_pair_code: Option<String>,
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) whatsapp_started: bool,
+    pub whatsapp_started: bool,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Snapshot {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let accounts = catalog()
             .into_iter()
             .map(|caps| AccountRow {
@@ -389,13 +417,13 @@ impl Snapshot {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_api_source(source: TelegramApiSource) -> Self {
+    pub fn with_api_source(source: TelegramApiSource) -> Self {
         let mut snapshot = Self::new();
         snapshot.api_source = source;
         snapshot
     }
 
-    pub(crate) fn apply(&mut self, event: AdapterEvent) {
+    pub fn apply(&mut self, event: AdapterEvent) {
         // Telegram inbox events come only after Ready. One that arrives while
         // Telegram is not linked is from a cancelled or ended client, for
         // example queued before Cancel: drop it (PR #49 review).
@@ -579,12 +607,12 @@ impl Snapshot {
         }
     }
 
-    pub(crate) fn take_commands(&mut self) -> Vec<AdapterCommand> {
+    pub fn take_commands(&mut self) -> Vec<AdapterCommand> {
         std::mem::take(&mut self.pending)
     }
 
     #[must_use]
-    pub(crate) fn take_keychain_flush(&mut self) -> bool {
+    pub fn take_keychain_flush(&mut self) -> bool {
         std::mem::take(&mut self.keychain_flush)
     }
 
@@ -592,18 +620,18 @@ impl Snapshot {
     ///
     /// Call once per frame. It acts only after the keychain read settles, and
     /// only once. The UI thread reads memory only; the command has no secret.
-    pub(crate) fn poll_resume(&mut self, store: &SecretStore) {
+    pub fn poll_resume(&mut self, store: &SecretStore) {
         self.keychain_failed = store.read_failed();
         if !store.attach_settled() {
             self.keychain_wait_started.get_or_insert_with(Instant::now);
         }
-        self.try_resume(store, super::auth::tdlib_compiled());
+        self.try_resume(store, tdlib_compiled());
     }
 
     /// Copy under the spinner while the keychain read runs. No bare spinner:
     /// after [`KEYCHAIN_SLOW_AFTER`] it asks the user to unlock the keychain.
     #[must_use]
-    pub(crate) fn keychain_wait_text(&self, now: Instant) -> &'static str {
+    pub fn keychain_wait_text(&self, now: Instant) -> &'static str {
         match self.keychain_wait_started {
             Some(started) if now.saturating_duration_since(started) >= KEYCHAIN_SLOW_AFTER => {
                 KEYCHAIN_WAITING
@@ -632,7 +660,7 @@ impl Snapshot {
     }
 
     #[must_use]
-    pub(crate) fn center_view(&self) -> CenterView {
+    pub fn center_view(&self) -> CenterView {
         if self.auth != AuthScreen::Idle {
             return CenterView::Auth;
         }
@@ -643,21 +671,19 @@ impl Snapshot {
             return CenterView::KeychainFailed;
         }
         match self.resume {
-            Resume::Waiting if super::auth::tdlib_compiled() => {
-                CenterView::Resuming { connecting: false }
-            }
+            Resume::Waiting if tdlib_compiled() => CenterView::Resuming { connecting: false },
             Resume::Connecting => CenterView::Resuming { connecting: true },
             Resume::Waiting | Resume::Settled => CenterView::FirstRun,
         }
     }
 
-    pub(crate) fn has_primary_account(&self) -> bool {
+    pub fn has_primary_account(&self) -> bool {
         self.accounts
             .iter()
             .any(|row| row.linked && matches!(row.caps.id, ProtocolId::Telegram))
     }
 
-    pub(crate) fn select_protocol(&mut self, protocol: ProtocolId) {
+    pub fn select_protocol(&mut self, protocol: ProtocolId) {
         if !self.account_surface_visible(protocol) {
             return;
         }
@@ -666,7 +692,7 @@ impl Snapshot {
         self.ensure_conversation_selection();
     }
 
-    pub(crate) fn select_conversation(&mut self, id: String) {
+    pub fn select_conversation(&mut self, id: String) {
         self.set_selected_conversation(Some(id));
         self.focus_compose = true;
         self.queue_open_chat();
@@ -692,20 +718,20 @@ impl Snapshot {
     /// Every adapter answered `Shutdown` with `Stopped`: no session of any
     /// protocol (TDLib, the WhatsApp bot and its SQLite session) still runs.
     #[must_use]
-    pub(crate) fn all_stopped(&self) -> bool {
+    pub fn all_stopped(&self) -> bool {
         self.accounts
             .iter()
             .all(|row| self.stopped.contains(&row.caps.id))
     }
 
     /// True once after the user picked a chat. The UI then focuses compose.
-    pub(crate) fn take_focus_compose(&mut self) -> bool {
+    pub fn take_focus_compose(&mut self) -> bool {
         std::mem::take(&mut self.focus_compose)
     }
 
     /// Send is possible: a Telegram chat is selected, Telegram is ready, text exists.
     #[must_use]
-    pub(crate) fn can_send(&self) -> bool {
+    pub fn can_send(&self) -> bool {
         self.selected_protocol == ProtocolId::Telegram
             && self.telegram_authorized
             && !self.compose.trim().is_empty()
@@ -722,7 +748,7 @@ impl Snapshot {
 
     /// Enter in compose. Plain Enter sends and returns `true`, so the UI eats
     /// the key. Shift+Enter returns `false`, so the text field adds a line.
-    pub(crate) fn compose_enter(&mut self, shift: bool) -> bool {
+    pub fn compose_enter(&mut self, shift: bool) -> bool {
         if shift {
             return false;
         }
@@ -731,7 +757,7 @@ impl Snapshot {
     }
 
     /// Send a failed outgoing message again. Only a `Failed` row queues a command.
-    pub(crate) fn retry_send(&mut self, message_id: &str) {
+    pub fn retry_send(&mut self, message_id: &str) {
         let Some(conversation_id) = self.selected_conversation.clone() else {
             return;
         };
@@ -762,7 +788,7 @@ impl Snapshot {
         });
     }
 
-    pub(crate) fn set_filter(&mut self, filter: InboxFilter) {
+    pub fn set_filter(&mut self, filter: InboxFilter) {
         self.filter = filter;
         if !filter.matches(self.selected_protocol)
             && let Some(first) = self
@@ -782,7 +808,7 @@ impl Snapshot {
     /// Visibility follows that compile-time check alone. It does not wait for
     /// a Telegram session or for Telegram messages.
     #[must_use]
-    pub(crate) fn discord_inbox_visible(&self) -> bool {
+    pub fn discord_inbox_visible(&self) -> bool {
         DiscordAdapter::bot_inbox_compiled()
     }
 
@@ -791,7 +817,7 @@ impl Snapshot {
     /// Telegram is always present. Slack, WhatsApp, and Discord appear only
     /// when their cargo features are on.
     #[must_use]
-    pub(crate) fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
+    pub fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
         match protocol {
             ProtocolId::Discord => self.discord_inbox_visible(),
             other => protocol_chrome_enabled(other),
@@ -799,11 +825,11 @@ impl Snapshot {
     }
 
     #[must_use]
-    pub(crate) fn shows_in_switcher(&self, protocol: ProtocolId) -> bool {
+    pub fn shows_in_switcher(&self, protocol: ProtocolId) -> bool {
         self.filter.shows_in_switcher(protocol) && self.account_surface_visible(protocol)
     }
 
-    pub(crate) fn visible_conversations(&self) -> Vec<&Conversation> {
+    pub fn visible_conversations(&self) -> Vec<&Conversation> {
         if !self.account_surface_visible(self.selected_protocol)
             || !self.protocol_linked(self.selected_protocol)
         {
@@ -823,7 +849,7 @@ impl Snapshot {
     }
 
     #[must_use]
-    pub(crate) fn unread_for(&self, protocol: ProtocolId) -> u32 {
+    pub fn unread_for(&self, protocol: ProtocolId) -> u32 {
         if !self.protocol_linked(protocol) {
             return 0;
         }
@@ -839,7 +865,7 @@ impl Snapshot {
             .any(|row| row.caps.id == protocol && row.linked)
     }
 
-    pub(crate) fn selected_conversation_row(&self) -> Option<&Conversation> {
+    pub fn selected_conversation_row(&self) -> Option<&Conversation> {
         let id = self.selected_conversation.as_ref()?;
         self.conversations
             .get(&self.selected_protocol)?
@@ -848,7 +874,7 @@ impl Snapshot {
     }
 
     #[must_use]
-    pub(crate) fn inbox_state(&self) -> InboxState {
+    pub fn inbox_state(&self) -> InboxState {
         if !self.visible_conversations().is_empty() {
             return InboxState::Rows;
         }
@@ -870,7 +896,7 @@ impl Snapshot {
     }
 
     #[must_use]
-    pub(crate) fn thread_state(&self) -> ThreadState {
+    pub fn thread_state(&self) -> ThreadState {
         let Some(id) = self.selected_conversation.as_ref() else {
             return ThreadState::NoSelection;
         };
@@ -884,11 +910,11 @@ impl Snapshot {
     }
 
     /// True once after the selected row moved in the sorted list.
-    pub(crate) fn take_scroll_to_selected(&mut self) -> bool {
+    pub fn take_scroll_to_selected(&mut self) -> bool {
         std::mem::take(&mut self.scroll_to_selected)
     }
 
-    pub(crate) fn selected_messages(&self) -> &[ChatMessage] {
+    pub fn selected_messages(&self) -> &[ChatMessage] {
         let Some(id) = self.selected_conversation.as_ref() else {
             return &[];
         };
@@ -897,7 +923,7 @@ impl Snapshot {
             .map_or(&[], Vec::as_slice)
     }
 
-    pub(crate) fn refresh_visible(&mut self) {
+    pub fn refresh_visible(&mut self) {
         let protocols: HashSet<ProtocolId> = self
             .accounts
             .iter()
@@ -916,30 +942,30 @@ impl Snapshot {
     }
 
     #[must_use]
-    pub(crate) fn has_api_credentials(&self, store: &SecretStore) -> bool {
+    pub fn has_api_credentials(&self, store: &SecretStore) -> bool {
         telegram_api_available(store, &self.api_source)
     }
 
     #[must_use]
-    pub(crate) fn telegram_ready(&self) -> bool {
+    pub fn telegram_ready(&self) -> bool {
         self.telegram_authorized
     }
 
     /// Add account is offered only while Telegram is not signed in: this
     /// build supports one Telegram account (ux F8).
     #[must_use]
-    pub(crate) fn can_add_account(&self) -> bool {
+    pub fn can_add_account(&self) -> bool {
         !self.telegram_authorized
     }
 
-    pub(crate) fn open_add_account(&mut self, store: &SecretStore) {
+    pub fn open_add_account(&mut self, store: &SecretStore) {
         if !self.can_add_account() {
             return;
         }
         self.open_telegram(store);
     }
 
-    pub(crate) fn cancel_auth(&mut self, store: &SecretStore) {
+    pub fn cancel_auth(&mut self, store: &SecretStore) {
         self.clear_secrets();
         self.resume = Resume::Settled;
         clear_ephemeral(store);
@@ -958,7 +984,7 @@ impl Snapshot {
         });
     }
 
-    pub(crate) fn advance_telegram(&mut self, store: &SecretStore) {
+    pub fn advance_telegram(&mut self, store: &SecretStore) {
         if self.auth_busy {
             return;
         }
@@ -1028,7 +1054,7 @@ impl Snapshot {
 
     /// Enter runs the main button of the center screen. Escape cancels a login.
     /// Compose handles its own Enter, so the thread view ignores keys here.
-    pub(crate) fn center_key(&mut self, key: AuthKey, store: &SecretStore) {
+    pub fn center_key(&mut self, key: AuthKey, store: &SecretStore) {
         match self.center_view() {
             CenterView::FirstRun => {
                 if key == AuthKey::Enter {
@@ -1046,14 +1072,14 @@ impl Snapshot {
     }
 
     /// Try again after a failed keychain read. The app starts the read.
-    pub(crate) fn retry_keychain(&mut self) {
+    pub fn retry_keychain(&mut self) {
         self.keychain_retry = true;
         self.keychain_wait_started = None;
         self.error = None;
     }
 
     /// True once after Try again: read the keychain again off the UI thread.
-    pub(crate) fn take_keychain_retry(&mut self) -> bool {
+    pub fn take_keychain_retry(&mut self) -> bool {
         std::mem::take(&mut self.keychain_retry)
     }
 
@@ -1095,7 +1121,7 @@ impl Snapshot {
     }
 
     /// Enter submits the current login step. Escape cancels the login.
-    pub(crate) fn auth_key(&mut self, key: AuthKey, store: &SecretStore) {
+    pub fn auth_key(&mut self, key: AuthKey, store: &SecretStore) {
         match (key, self.auth) {
             (_, AuthScreen::Idle) => {}
             (AuthKey::Escape, _) => self.cancel_auth(store),
@@ -1106,7 +1132,7 @@ impl Snapshot {
 
     /// The submit button is enabled. The 2FA step needs a password.
     #[must_use]
-    pub(crate) fn can_submit_auth(&self) -> bool {
+    pub fn can_submit_auth(&self) -> bool {
         !self.auth_busy && !(self.auth == AuthScreen::Telegram2fa && self.telegram_2fa.is_empty())
     }
 
@@ -1114,7 +1140,7 @@ impl Snapshot {
     /// 1.8.61 accepts `setAuthenticationPhoneNumber` in `authorizationStateWaitCode`
     /// (when no auth query is pending), so the next phone submit moves the live
     /// TDLib state to the new number and sends a new code.
-    pub(crate) fn change_number(&mut self) {
+    pub fn change_number(&mut self) {
         if self.auth != AuthScreen::TelegramCode {
             return;
         }
@@ -1129,7 +1155,7 @@ impl Snapshot {
 
     /// Ask Telegram for a new code with TDLib `resendAuthenticationCode`
     /// (the `ResendCode` step). The code step stays on screen.
-    pub(crate) fn resend_code(&mut self) {
+    pub fn resend_code(&mut self) {
         if self.auth != AuthScreen::TelegramCode || self.auth_busy {
             return;
         }
@@ -1140,7 +1166,7 @@ impl Snapshot {
 
     /// Queue the compose text. Does nothing when [`Self::can_send`] is false;
     /// the Send button is disabled in that case, so no error block shows.
-    pub(crate) fn send_compose(&mut self) {
+    pub fn send_compose(&mut self) {
         if !self.can_send() {
             return;
         }
@@ -1163,7 +1189,7 @@ impl Snapshot {
         self.status_text = "Sending…".into();
     }
 
-    pub(crate) fn open_telegram(&mut self, store: &SecretStore) {
+    pub fn open_telegram(&mut self, store: &SecretStore) {
         // Until the keychain read ends, a saved DB key looks missing, and the
         // worker would move a good data folder aside.
         if store.read_failed() {
@@ -1197,7 +1223,7 @@ impl Snapshot {
 
     /// The API override applies to a new client only, so it is offered only
     /// while Telegram is not signed in (qa note on F8).
-    pub(crate) fn open_api_override(&mut self, store: &SecretStore) {
+    pub fn open_api_override(&mut self, store: &SecretStore) {
         if !self.can_add_account() {
             return;
         }
@@ -1573,18 +1599,18 @@ impl Snapshot {
     /// build leaves the feature off, so first-run chrome stays Telegram-only.
     #[cfg(feature = "whatsapp-web")]
     #[must_use]
-    pub(crate) fn whatsapp_pairing_available(&self) -> bool {
+    pub fn whatsapp_pairing_available(&self) -> bool {
         protocol_chrome_enabled(ProtocolId::WhatsApp)
     }
 
     #[cfg(feature = "whatsapp-web")]
     #[must_use]
-    pub(crate) fn whatsapp_gate_open(&self) -> bool {
+    pub fn whatsapp_gate_open(&self) -> bool {
         self.whatsapp_pairing_available() && !matches!(self.whatsapp_screen, WhatsAppScreen::Hidden)
     }
 
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) fn open_whatsapp_risk_gate(&mut self) {
+    pub fn open_whatsapp_risk_gate(&mut self) {
         if !self.whatsapp_pairing_available() {
             return;
         }
@@ -1599,13 +1625,13 @@ impl Snapshot {
     }
 
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) fn close_whatsapp_gate(&mut self) {
+    pub fn close_whatsapp_gate(&mut self) {
         self.whatsapp_screen = WhatsAppScreen::Hidden;
         self.whatsapp_phone.clear();
     }
 
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) fn acknowledge_whatsapp_risk(&mut self) {
+    pub fn acknowledge_whatsapp_risk(&mut self) {
         self.whatsapp_screen = WhatsAppScreen::Pair;
         self.error = None;
         self.status_text = "WhatsApp ban gate accepted. Pairing has not started.".into();
@@ -1613,7 +1639,7 @@ impl Snapshot {
     }
 
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) fn begin_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
+    pub fn begin_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
         if self.whatsapp_started {
             return;
         }
@@ -1626,7 +1652,7 @@ impl Snapshot {
     }
 
     #[cfg(feature = "whatsapp-web")]
-    pub(crate) fn cancel_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
+    pub fn cancel_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
         phone.clear();
         self.whatsapp_phone.clear();
         self.whatsapp_qr = None;
@@ -1657,7 +1683,7 @@ fn persist_api(
     store: &SecretStore,
     api_id: &str,
     api_hash: &str,
-) -> Result<(), thinwire_core::secrets::SecretError> {
+) -> Result<(), crate::secrets::SecretError> {
     store.set(SecretKey::ApiId, api_id)?;
     store.set(SecretKey::ApiHash, api_hash)?;
     Ok(())
@@ -1669,21 +1695,28 @@ fn clear_ephemeral(store: &SecretStore) {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
+    //! Fixtures shared by the core tests and the egui source-text tests.
+
     use super::*;
 
-    fn submit_and_apply(snapshot: &mut Snapshot, store: &SecretStore, phase: TelegramAuthPhase) {
+    pub fn submit_and_apply(
+        snapshot: &mut Snapshot,
+        store: &SecretStore,
+        phase: TelegramAuthPhase,
+    ) {
         snapshot.advance_telegram(store);
         snapshot.apply(AdapterEvent::TelegramAuth { phase });
     }
 
-    fn seed_override(store: &SecretStore) {
+    pub fn seed_override(store: &SecretStore) {
         store.set(SecretKey::ApiId, "11111").expect("id");
         store.set(SecretKey::ApiHash, "hash-value").expect("hash");
     }
 
-    fn complete_telegram(snapshot: &mut Snapshot, store: &SecretStore) {
+    pub fn complete_telegram(snapshot: &mut Snapshot, store: &SecretStore) {
         seed_override(store);
         snapshot.open_telegram(store);
         snapshot.apply(AdapterEvent::TelegramAuth {
@@ -1701,6 +1734,51 @@ mod tests {
         assert_eq!(snapshot.auth, AuthScreen::Idle);
         assert!(snapshot.telegram_ready());
     }
+
+    pub fn telegram_chat(id: i64, title: &str, order: i64) -> Conversation {
+        Conversation {
+            protocol: ProtocolId::Telegram,
+            id: format!("telegram:{id}"),
+            title: title.into(),
+            participant: title.into(),
+            preview: String::new(),
+            unread: 0,
+            order,
+            last_at: 0,
+            is_group: false,
+        }
+    }
+
+    pub fn ready_with_chats(store: &SecretStore) -> Snapshot {
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 10),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 5),
+        });
+        snapshot.take_commands();
+        snapshot
+    }
+
+    pub fn auth_steps(snapshot: &mut Snapshot) -> Vec<TelegramAuthStep> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                // Any epoch: the host stamps the real one later (PR #49 review).
+                AdapterCommand::TelegramAuth { step, epoch: _ } => Some(step),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
 
     fn resume_commands(snapshot: &mut Snapshot) -> usize {
         snapshot
@@ -1846,20 +1924,6 @@ mod tests {
         assert_eq!(resume_commands(&mut snapshot), 1, "only the first try");
     }
 
-    fn telegram_chat(id: i64, title: &str, order: i64) -> Conversation {
-        Conversation {
-            protocol: ProtocolId::Telegram,
-            id: format!("telegram:{id}"),
-            title: title.into(),
-            participant: title.into(),
-            preview: String::new(),
-            unread: 0,
-            order,
-            last_at: 0,
-            is_group: false,
-        }
-    }
-
     fn telegram_text(chat: i64, id: i64, body: &str) -> ChatMessage {
         ChatMessage {
             protocol: ProtocolId::Telegram,
@@ -1968,20 +2032,6 @@ mod tests {
         assert!(!snapshot.take_scroll_to_selected(), "one request per move");
     }
 
-    #[test]
-    fn inbox_and_thread_scroll_and_show_load_states() {
-        let ui = include_str!("ui.rs");
-        let left = &ui[ui.find("fn left_panel").expect("left panel")..];
-        let left = &left[..left.find("\nfn ").expect("next fn")];
-        assert!(left.contains("ScrollArea::vertical()"));
-        assert!(ui.contains(".stick_to_bottom(true)"));
-        assert!(ui.contains("scroll_to_me"));
-        assert!(ui.contains("Loading chats…"));
-        assert!(ui.contains("Loading messages…"));
-        assert!(ui.contains("No messages in this chat."));
-        assert!(!ui.contains("No conversations yet."));
-    }
-
     fn outgoing(chat: i64, id: i64, body: &str, delivery: Delivery) -> ChatMessage {
         ChatMessage {
             protocol: ProtocolId::Telegram,
@@ -1993,19 +2043,6 @@ mod tests {
             delivery,
             sent_at: 0,
         }
-    }
-
-    fn ready_with_chats(store: &SecretStore) -> Snapshot {
-        let mut snapshot = Snapshot::new();
-        complete_telegram(&mut snapshot, store);
-        snapshot.apply(AdapterEvent::ConversationUpsert {
-            conversation: telegram_chat(1, "Ada", 10),
-        });
-        snapshot.apply(AdapterEvent::ConversationUpsert {
-            conversation: telegram_chat(2, "Bob", 5),
-        });
-        snapshot.take_commands();
-        snapshot
     }
 
     fn send_texts(snapshot: &mut Snapshot) -> Vec<String> {
@@ -2179,54 +2216,6 @@ mod tests {
         assert!(snapshot.compose.is_empty());
         snapshot.select_conversation("telegram:2".into());
         assert_eq!(snapshot.compose, "for Bob");
-    }
-
-    #[test]
-    fn compose_ui_uses_enter_multiline_and_disabled_send() {
-        let ui = include_str!("ui.rs");
-        assert!(ui.contains("TextEdit::multiline(&mut snapshot.compose)"));
-        assert!(ui.contains("compose_enter(shift)"));
-        assert!(ui.contains("add_enabled(snapshot.can_send()"));
-        assert!(ui.contains("request_focus(compose_id)"));
-        assert!(ui.contains("\"Not sent\""));
-        assert!(ui.contains("\"Retry\""));
-    }
-
-    fn auth_steps(snapshot: &mut Snapshot) -> Vec<TelegramAuthStep> {
-        snapshot
-            .take_commands()
-            .into_iter()
-            .filter_map(|command| match command {
-                // Any epoch: the host stamps the real one later (PR #49 review).
-                AdapterCommand::TelegramAuth { step, epoch: _ } => Some(step),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn auth_steps_sees_a_step_with_any_epoch() {
-        let mut snapshot = Snapshot::new();
-        snapshot.pending.push(AdapterCommand::TelegramAuth {
-            step: TelegramAuthStep::Phone,
-            epoch: 3,
-        });
-        assert_eq!(
-            auth_steps(&mut snapshot),
-            vec![TelegramAuthStep::Phone],
-            "a non-zero epoch must not vanish from the helper"
-        );
-        // The snapshot itself queues epoch 0; AdapterHost::send stamps the real one.
-        let store = SecretStore::memory();
-        seed_override(&store);
-        snapshot.open_telegram(&store);
-        assert!(snapshot.take_commands().iter().any(|command| matches!(
-            command,
-            AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::ApiCredentials,
-                epoch: 0
-            }
-        )));
     }
 
     fn at_phone_step(store: &SecretStore) -> Snapshot {
@@ -2462,96 +2451,6 @@ mod tests {
     }
 
     #[test]
-    fn login_copy_has_no_developer_words_and_one_cancel() {
-        let auth = include_str!("auth.rs");
-        let draw = &auth[auth.find("pub(crate) fn draw(").expect("draw")..];
-        let draw = &draw[..draw.find("fn need_credentials(").expect("next")];
-        for word in ["adapter", "UI thread", "TDLib", "tdlib-rs", "secret store"] {
-            assert!(!draw.contains(word), "{word}");
-        }
-        let steps = &auth[auth.find("fn telegram_phone(").expect("phone")..];
-        for word in [
-            "adapter",
-            "UI thread",
-            "TDLib",
-            "secret store",
-            "Optional",
-            "optional",
-        ] {
-            assert!(!steps.contains(word), "{word}");
-        }
-        assert!(!super::super::auth::TELEGRAM_STUB_UNTIL_READY.contains("TDLib"));
-        assert!(auth.contains("\"Two-step verification\""));
-        assert!(auth.contains("\"Enter your Telegram password.\""));
-        assert!(auth.contains("\"12345\"") && auth.contains("\"word or phrase\""));
-        assert!(auth.contains("\"Change number\""));
-        assert!(auth.contains("\"Send a new code\""));
-        let code = &auth[auth.find("fn telegram_code(").expect("code")..];
-        let code = &code[..code.find("\nfn ").expect("next")];
-        assert!(
-            !code.contains("password(true)"),
-            "the code field shows digits"
-        );
-        let ui = include_str!("ui.rs");
-        let strip = &ui[ui.find("fn status_strip(").expect("strip")..];
-        let strip = &strip[..strip.find("\nfn ").expect("next")];
-        assert!(!strip.contains("\"Cancel\""));
-    }
-
-    #[test]
-    fn thread_draws_bubbles_by_side_with_times_and_day_breaks() {
-        let ui = include_str!("ui.rs");
-        let bubble = &ui[ui.find("fn bubble(").expect("bubble")..];
-        let bubble = &bubble[..bubble.find("\nfn ").expect("next")];
-        assert!(bubble.contains("palette.out"));
-        assert!(bubble.contains("palette.surface"));
-        assert!(bubble.contains("egui::Align::Max"));
-        assert!(bubble.contains("egui::Align::Min"));
-        assert!(bubble.contains("layout.day_break"));
-        assert!(bubble.contains("layout.show_sender"));
-        assert!(bubble.contains("layout.time"));
-        assert!(bubble.contains(".selectable(true)"));
-        assert!(bubble.contains(".wrap()"));
-        assert!(
-            !bubble.contains("Color32::from_rgb"),
-            "colors come from the theme"
-        );
-        assert!(ui.contains("thread_rows(snapshot.selected_messages(), is_group"));
-        assert!(ui.contains("list_time(row.last_at, &now)"));
-    }
-
-    #[test]
-    fn keychain_notice_shows_only_when_secrets_stay_in_memory() {
-        use super::super::ui::{KEYCHAIN_UNAVAILABLE_NOTICE, keychain_notice};
-        assert_eq!(
-            keychain_notice(&SecretStore::memory()),
-            Some(KEYCHAIN_UNAVAILABLE_NOTICE)
-        );
-        let attaching = SecretStore::detached_for_test();
-        assert_eq!(keychain_notice(&attaching), None, "no notice while loading");
-        attaching.complete_ready_attach_for_test(&[]);
-        attaching.set_backend_for_test(OsBackend::SecretService);
-        assert_eq!(keychain_notice(&attaching), None, "Secret Service keeps it");
-        attaching.set_backend_for_test(OsBackend::Native);
-        assert_eq!(keychain_notice(&attaching), None);
-        attaching.set_backend_for_test(OsBackend::KernelKeyring);
-        assert_eq!(
-            keychain_notice(&attaching),
-            Some(super::super::ui::KEYCHAIN_UNTIL_RESTART_NOTICE),
-            "keyutils is lost at restart"
-        );
-        let ui = include_str!("ui.rs");
-        let strip = &ui[ui.find("fn status_strip(").expect("strip")..];
-        let strip = &strip[..strip.find("\nfn ").expect("next")];
-        assert!(strip.contains("keychain_notice(secrets)"));
-        assert_eq!(
-            ui.matches("keychain_notice(secrets)").count(),
-            1,
-            "one notice only"
-        );
-    }
-
-    #[test]
     fn enter_runs_the_main_button_on_each_center_screen() {
         let store = SecretStore::memory();
         seed_override(&store);
@@ -2593,20 +2492,6 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_read_once_in_the_center_panel() {
-        let auth = include_str!("auth.rs");
-        assert!(
-            !auth.contains("key_pressed"),
-            "auth.rs does not read keys again"
-        );
-        let ui = include_str!("ui.rs");
-        let center = &ui[ui.find("fn center_panel(").expect("center")..];
-        let center = &center[..center.find("\nfn ").expect("next")];
-        assert!(center.contains("center_key(AuthKey::Enter"));
-        assert!(center.contains("center_key(AuthKey::Escape"));
-    }
-
-    #[test]
     fn failed_client_setup_leaves_the_login_and_closes_the_client() {
         let store = SecretStore::memory();
         let mut snapshot = at_phone_step(&store);
@@ -2632,55 +2517,6 @@ mod tests {
             }
         )));
         assert_eq!(snapshot.center_view(), CenterView::FirstRun);
-    }
-
-    #[test]
-    fn phone_step_shows_only_after_the_adapter_asks_for_it() {
-        let store = SecretStore::memory();
-        seed_override(&store);
-        let mut snapshot = Snapshot::new();
-        snapshot.open_telegram(&store);
-        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
-        assert_eq!(
-            auth_steps(&mut snapshot),
-            vec![TelegramAuthStep::ApiCredentials]
-        );
-        snapshot.telegram_phone = "+15551234567".into();
-        snapshot.center_key(AuthKey::Enter, &store);
-        assert!(
-            auth_steps(&mut snapshot).is_empty(),
-            "no phone before NeedPhone"
-        );
-
-        snapshot.apply(AdapterEvent::TelegramAuth {
-            phase: TelegramAuthPhase::Failed,
-        });
-        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
-        assert!(snapshot.can_submit_auth(), "Try again is enabled");
-        snapshot.center_key(AuthKey::Enter, &store);
-        snapshot.center_key(AuthKey::Enter, &store);
-        let commands = snapshot.take_commands();
-        assert!(
-            matches!(
-                commands.as_slice(),
-                [
-                    AdapterCommand::Disconnect {
-                        protocol: ProtocolId::Telegram
-                    },
-                    AdapterCommand::TelegramAuth {
-                        step: TelegramAuthStep::ApiCredentials,
-                        epoch: 0
-                    }
-                ]
-            ),
-            "Try again restarts the client once (qa R59): {commands:?}"
-        );
-        snapshot.apply(AdapterEvent::TelegramAuth {
-            phase: TelegramAuthPhase::NeedPhone,
-        });
-        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
-        let auth = include_str!("auth.rs");
-        assert!(auth.contains("\"Try again\""));
     }
 
     #[test]
@@ -2729,102 +2565,6 @@ mod tests {
     }
 
     #[test]
-    fn a_slow_keychain_read_asks_the_user_to_unlock() {
-        let store = SecretStore::detached_for_test();
-        let mut snapshot = Snapshot::new();
-        snapshot.poll_resume(&store);
-        let started = snapshot.keychain_wait_started.expect("started");
-        assert_eq!(snapshot.keychain_wait_text(started), KEYCHAIN_OPENING);
-        assert_eq!(
-            snapshot.keychain_wait_text(started + KEYCHAIN_SLOW_AFTER),
-            KEYCHAIN_WAITING
-        );
-        snapshot.poll_resume(&store);
-        assert_eq!(
-            snapshot.keychain_wait_started,
-            Some(started),
-            "the clock starts once"
-        );
-        let ui = include_str!("ui.rs");
-        let resuming = &ui[ui.find("fn resuming(").expect("resuming")..];
-        let resuming = &resuming[..resuming.find("\nfn ").expect("next")];
-        assert!(
-            resuming.contains("keychain_wait_text("),
-            "no bare spinner (qa R1)"
-        );
-    }
-
-    #[test]
-    fn word_and_phrase_codes_keep_their_letters() {
-        use super::super::auth::code_is_digits;
-        assert!(code_is_digits(None));
-        assert!(code_is_digits(Some(TelegramCodeVia::Sms)));
-        assert!(code_is_digits(Some(TelegramCodeVia::TelegramApp)));
-        assert!(!code_is_digits(Some(TelegramCodeVia::SmsWord)));
-        let auth = include_str!("auth.rs");
-        let code = &auth[auth.find("fn telegram_code(").expect("code")..];
-        let code = &code[..code.find("\nfn ").expect("next")];
-        let guard = code.find("if digits_only").expect("guard");
-        let filter = code.find("retain(|c| c.is_ascii_digit())").expect("filter");
-        assert!(guard < filter, "the digit filter runs only for digit codes");
-    }
-
-    #[test]
-    fn a_live_session_hides_add_account_and_cancel_keeps_it() {
-        let store = SecretStore::memory();
-        let mut snapshot = ready_with_chats(&store);
-        store.set_secret(SecretKey::Session, "live-session");
-        assert!(snapshot.telegram_ready());
-        assert!(!snapshot.can_add_account(), "one Telegram account (ux F8)");
-        snapshot.open_add_account(&store);
-        assert_eq!(snapshot.auth, AuthScreen::Idle);
-        assert!(snapshot.take_commands().is_empty());
-
-        snapshot.open_api_override(&store);
-        assert_eq!(
-            snapshot.auth,
-            AuthScreen::Idle,
-            "no Advanced while signed in"
-        );
-        // A form can still be over a live session (for example one opened just
-        // before Ready). Cancel then closes the form only.
-        snapshot.auth = AuthScreen::TelegramApi;
-        snapshot.center_key(AuthKey::Escape, &store);
-        assert_eq!(snapshot.auth, AuthScreen::Idle);
-        assert!(snapshot.telegram_ready(), "Cancel does not sign out");
-        assert!(
-            !snapshot
-                .take_commands()
-                .iter()
-                .any(|command| matches!(command, AdapterCommand::Disconnect { .. })),
-            "no Disconnect on a live session, so the worker never logs out"
-        );
-        assert_eq!(
-            store.get(SecretKey::Session).expect("read").as_deref(),
-            Some("live-session"),
-            "the session marker stays"
-        );
-        assert_eq!(
-            snapshot.visible_conversations().len(),
-            2,
-            "the chat list stays"
-        );
-        assert_eq!(snapshot.center_view(), CenterView::Thread);
-
-        let ui = include_str!("ui.rs");
-        let bar = &ui[ui.find("fn top_bar(").expect("top bar")..];
-        let bar = &bar[..bar.find("\nfn ").expect("next")];
-        let guard = bar.find("can_add_account()").expect("guard");
-        let button = bar.find("\"Add account\"").expect("button");
-        assert!(guard < button, "Add account hides when Telegram is ready");
-        let advanced = bar.find("\"Advanced\"").expect("advanced");
-        let advanced_guard = bar[..advanced]
-            .rfind("can_add_account()")
-            .expect("advanced guard");
-        assert!(advanced_guard > button, "Advanced has its own guard");
-    }
-
-    #[test]
     fn cancel_before_sign_in_still_closes_the_client() {
         let store = SecretStore::memory();
         let mut snapshot = at_phone_step(&store);
@@ -2836,317 +2576,6 @@ mod tests {
                 protocol: ProtocolId::Telegram
             }
         )));
-    }
-
-    #[test]
-    fn a_remote_logout_clears_the_inbox_and_asks_to_sign_in_again() {
-        let store = SecretStore::memory();
-        let mut snapshot = ready_with_chats(&store);
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: telegram_text(1, 7, "hi"),
-        });
-        snapshot.compose = "draft".into();
-        assert!(!snapshot.can_add_account());
-
-        snapshot.apply(AdapterEvent::TelegramSessionEnded);
-        assert!(!snapshot.telegram_ready());
-        assert!(!snapshot.has_primary_account());
-        assert!(
-            snapshot.visible_conversations().is_empty(),
-            "the old inbox is gone"
-        );
-        assert!(snapshot.selected_messages().is_empty());
-        assert!(snapshot.compose.is_empty());
-        assert!(snapshot.can_add_account(), "Add account is back");
-        assert_eq!(snapshot.status_text, SESSION_ENDED_NOTICE);
-        assert_eq!(
-            snapshot.center_view(),
-            CenterView::Resuming { connecting: true }
-        );
-        assert_eq!(
-            auth_steps(&mut snapshot),
-            vec![TelegramAuthStep::ApiCredentials]
-        );
-
-        snapshot.apply(AdapterEvent::TelegramAuth {
-            phase: TelegramAuthPhase::NeedPhone,
-        });
-        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
-        assert_eq!(snapshot.auth_notice.as_deref(), Some(SESSION_ENDED_NOTICE));
-
-        snapshot.apply(AdapterEvent::TelegramSessionEnded);
-        assert!(
-            snapshot.take_commands().is_empty(),
-            "a second end does nothing"
-        );
-    }
-
-    #[test]
-    fn a_failed_keychain_read_blocks_sign_in_and_offers_try_again() {
-        let store = SecretStore::detached_for_test();
-        store.fail_attach_for_test();
-        let mut snapshot =
-            Snapshot::with_api_source(TelegramApiSource::with_publisher("11111", "publisher-hash"));
-        snapshot.poll_resume(&store);
-        assert_eq!(snapshot.center_view(), CenterView::KeychainFailed);
-
-        // No client can start, so no data folder can move (Codex 4091044706).
-        snapshot.open_telegram(&store);
-        snapshot.open_add_account(&store);
-        assert_eq!(snapshot.auth, AuthScreen::Idle);
-        assert!(snapshot.take_commands().is_empty());
-        assert!(snapshot.error.is_some());
-
-        snapshot.center_key(AuthKey::Enter, &store);
-        assert!(snapshot.take_keychain_retry(), "Enter = Try again");
-        assert!(!snapshot.take_keychain_retry(), "one retry per press");
-
-        // The retry reads every entry, including a saved session.
-        store.complete_ready_attach_for_test(&[
-            (SecretKey::ApiId, "11111"),
-            (SecretKey::ApiHash, "hash-value"),
-            (SecretKey::Session, "tdlib-ready"),
-        ]);
-        snapshot.try_resume(&store, true);
-        snapshot.keychain_failed = store.read_failed();
-        assert_eq!(
-            snapshot.center_view(),
-            CenterView::Resuming { connecting: true }
-        );
-        assert_eq!(
-            auth_steps(&mut snapshot),
-            vec![TelegramAuthStep::ApiCredentials]
-        );
-    }
-
-    #[test]
-    fn a_confirmed_missing_key_still_lets_sign_in_start() {
-        let store = SecretStore::detached_for_test();
-        store.complete_ready_attach_for_test(&[]);
-        let mut snapshot =
-            Snapshot::with_api_source(TelegramApiSource::with_publisher("11111", "publisher-hash"));
-        snapshot.poll_resume(&store);
-        assert_ne!(snapshot.center_view(), CenterView::KeychainFailed);
-        snapshot.open_telegram(&store);
-        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
-        assert_eq!(
-            auth_steps(&mut snapshot),
-            vec![TelegramAuthStep::ApiCredentials]
-        );
-    }
-
-    #[test]
-    fn compose_text_stays_until_the_adapter_accepts_the_send() {
-        let store = SecretStore::memory();
-        let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "hello".into();
-        snapshot.send_compose();
-        assert_eq!(send_texts(&mut snapshot), vec!["hello"]);
-        assert_eq!(
-            snapshot.compose, "hello",
-            "not cleared before the pending row"
-        );
-        assert!(
-            !snapshot.can_send(),
-            "no second send while one is in flight"
-        );
-        snapshot.send_compose();
-        assert!(send_texts(&mut snapshot).is_empty());
-
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: outgoing(1, 100, "hello", Delivery::Pending),
-        });
-        accept(&mut snapshot, "telegram:1");
-        assert!(
-            snapshot.compose.is_empty(),
-            "the pending row means accepted"
-        );
-        assert!(snapshot.error.is_none());
-    }
-
-    #[test]
-    fn a_send_in_one_chat_does_not_block_send_in_another() {
-        let store = SecretStore::memory();
-        let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "for Ada".into();
-        snapshot.send_compose();
-        assert!(!snapshot.can_send(), "chat 1 waits for its pending row");
-        snapshot.select_conversation("telegram:2".into());
-        snapshot.compose = "for Bob".into();
-        assert!(snapshot.can_send(), "chat 2 is free (PR #40 re-review)");
-        snapshot.send_compose();
-        assert_eq!(send_texts(&mut snapshot), vec!["for Ada", "for Bob"]);
-
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: outgoing(1, 100, "for Ada", Delivery::Pending),
-        });
-        accept(&mut snapshot, "telegram:1");
-        snapshot.select_conversation("telegram:1".into());
-        assert!(
-            snapshot.compose.is_empty(),
-            "chat 1's draft cleared on accept"
-        );
-        snapshot.select_conversation("telegram:2".into());
-        assert_eq!(snapshot.compose, "for Bob", "chat 2 still waits");
-    }
-
-    #[test]
-    fn an_immediate_send_error_keeps_the_text_and_shows_the_error() {
-        let store = SecretStore::memory();
-        let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "hello".into();
-        snapshot.send_compose();
-        let request = sent_request(&mut snapshot);
-        // A stale or other request id does not fail this send.
-        snapshot.apply(AdapterEvent::SendRejected {
-            protocol: ProtocolId::Telegram,
-            conversation_id: "telegram:1".into(),
-            request: request + 100,
-        });
-        assert!(!snapshot.can_send(), "still pending");
-        snapshot.apply(AdapterEvent::SendRejected {
-            protocol: ProtocolId::Telegram,
-            conversation_id: "telegram:1".into(),
-            request,
-        });
-        assert_eq!(snapshot.compose, "hello", "no pending row: the text stays");
-        let error = snapshot.error.clone().expect("error block");
-        assert_eq!(error.happened, "Message not sent.");
-        assert!(snapshot.can_send(), "the user can send it again");
-    }
-
-    #[test]
-    fn an_unrelated_telegram_error_keeps_the_send_pending() {
-        let store = SecretStore::memory();
-        let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "hello".into();
-        snapshot.send_compose();
-        snapshot.take_commands();
-        snapshot.apply(AdapterEvent::Status {
-            protocol: ProtocolId::Telegram,
-            status: AdapterStatus::Error,
-            detail: "Could not load messages (TDLib 500).".into(),
-        });
-        assert!(
-            snapshot.error.is_none(),
-            "no \"Message not sent\" for a history error"
-        );
-        assert!(!snapshot.can_send(), "the send is still pending");
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: outgoing(1, 100, "hello", Delivery::Pending),
-        });
-        accept(&mut snapshot, "telegram:1");
-        assert!(snapshot.compose.is_empty(), "then accepted as usual");
-    }
-
-    /// The adapter accepts the in-flight send of `chat` (its own request id).
-    fn accept(snapshot: &mut Snapshot, chat: &str) {
-        let request = snapshot.sending.get(chat).expect("a send in flight").0;
-        snapshot.apply(AdapterEvent::SendAccepted {
-            protocol: ProtocolId::Telegram,
-            conversation_id: chat.into(),
-            request,
-        });
-    }
-
-    #[test]
-    fn a_history_message_with_the_same_text_is_not_an_acceptance() {
-        let store = SecretStore::memory();
-        let mut snapshot = ready_with_chats(&store);
-        snapshot.compose = "ok".into();
-        snapshot.send_compose();
-        let request = sent_request(&mut snapshot);
-        // History (still loading) has an older outgoing "ok" in this chat.
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: outgoing(1, 5, "ok", Delivery::Sent),
-        });
-        assert_eq!(snapshot.compose, "ok", "history does not accept the send");
-        assert!(!snapshot.can_send(), "the real send is still in flight");
-        // The real send then fails at once: the draft is still there.
-        snapshot.apply(AdapterEvent::SendRejected {
-            protocol: ProtocolId::Telegram,
-            conversation_id: "telegram:1".into(),
-            request,
-        });
-        assert_eq!(snapshot.compose, "ok");
-        assert_eq!(
-            snapshot.error.clone().expect("error").happened,
-            "Message not sent."
-        );
-    }
-
-    fn sent_request(snapshot: &mut Snapshot) -> u64 {
-        snapshot
-            .take_commands()
-            .into_iter()
-            .find_map(|command| match command {
-                AdapterCommand::SendText { request, .. } => Some(request),
-                _ => None,
-            })
-            .expect("a SendText")
-    }
-
-    #[test]
-    fn a_new_phone_step_drops_a_stale_code_and_password() {
-        let store = SecretStore::memory();
-        let mut snapshot = at_phone_step(&store);
-        snapshot.telegram_code = "12345".into();
-        snapshot.telegram_2fa = "old-password".into();
-        snapshot.apply(AdapterEvent::TelegramAuth {
-            phase: TelegramAuthPhase::NeedPhone,
-        });
-        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
-        assert!(snapshot.telegram_code.is_empty(), "no stale code");
-        assert!(snapshot.telegram_2fa.is_empty(), "no stale password");
-    }
-
-    #[test]
-    fn exit_waits_until_every_adapter_stopped() {
-        let mut snapshot = Snapshot::new();
-        assert!(!snapshot.all_stopped());
-        snapshot.apply(AdapterEvent::Stopped {
-            protocol: ProtocolId::Telegram,
-        });
-        assert!(
-            !snapshot.all_stopped(),
-            "Telegram alone is not enough (Codex 4091477244)"
-        );
-        for protocol in [ProtocolId::WhatsApp, ProtocolId::Discord, ProtocolId::Slack] {
-            snapshot.apply(AdapterEvent::Stopped { protocol });
-        }
-        assert!(snapshot.all_stopped());
-    }
-
-    #[test]
-    fn auth_ui_is_telegram_only_this_beat() {
-        let src = include_str!("auth.rs");
-        assert!(src.contains("TELEGRAM_API_ID"));
-        assert!(src.contains("credentials missing") || src.contains("Credentials missing"));
-        assert!(src.contains("my.telegram.org"));
-        assert!(src.contains("Cancel"));
-        assert!(src.contains("Send code"));
-        assert!(!src.contains("Continue (stub)"));
-        assert!(!src.contains("Send code (stub)"));
-        assert!(!src.contains("Finish (stub)"));
-        assert!(!src.contains("WhatsApp"));
-        assert!(!src.contains("Discord"));
-        assert!(!src.contains("Slack"));
-        assert!(!src.contains("UserAccount"));
-        assert!(!src.contains("user_token"));
-        let ui = include_str!("ui.rs");
-        assert!(ui.contains("not ready"));
-        assert!(ui.contains("Start with Telegram"));
-        assert!(!ui.contains("not login peers"));
-        assert!(!ui.contains("Experimental chips stay visible"));
-        assert!(!ui.contains("tokio worker"));
-        assert!(!ui.contains("Supported goals:"));
-        assert!(!ui.contains("Telegram is live"));
-        assert!(!ui.contains("caps.detail"));
-        assert!(!ui.contains("account.caps.short_label"));
-        assert!(!ui.contains("\"Experimental\""));
-        assert!(!ui.contains("my.telegram.org"));
-        assert!(src.contains(super::super::auth::TDLIB_UNAVAILABLE_BANNER));
-        assert!(ui.contains("stub_banner"));
     }
 
     #[test]
@@ -3208,12 +2637,11 @@ mod tests {
 
     #[test]
     fn council_adrs_use_locked_filenames() {
-        let six = include_str!("../../../../decisions/0006-live-tdlib.md");
+        let six = include_str!("../../../decisions/0006-live-tdlib.md");
         assert!(six.contains("# Live TDLib replaces the Telegram stub"));
         assert!(six.contains("authorizationStateReady"));
         assert!(six.contains("0007-publisher-telegram-api-credentials"));
-        let seven =
-            include_str!("../../../../decisions/0007-publisher-telegram-api-credentials.md");
+        let seven = include_str!("../../../decisions/0007-publisher-telegram-api-credentials.md");
         assert!(seven.contains("# Publisher-owned Telegram api_id / api_hash"));
         assert!(seven.contains("Primary login UI: phone/code"));
         assert!(seven.contains("not** the primary login path"));
@@ -3223,7 +2651,7 @@ mod tests {
         assert!(seven.contains("win."));
         assert!(seven.contains("Encrypted inventory copy"));
         assert!(seven.contains("Terraform/SOPS"));
-        let roadmap = include_str!("../../../../ROADMAP.md");
+        let roadmap = include_str!("../../../ROADMAP.md");
         assert!(roadmap.contains("#19"));
         assert!(roadmap.contains("5c46222"));
         assert!(roadmap.contains("authorizationStateReady"));
@@ -3458,6 +2886,242 @@ mod tests {
         assert!(debug.contains("FlushSecrets"));
         assert!(!debug.to_ascii_lowercase().contains("hash"));
         assert!(!debug.contains("db_key"));
+    }
+
+    #[test]
+    fn a_failed_keychain_read_blocks_sign_in_and_offers_try_again() {
+        let store = SecretStore::detached_for_test();
+        store.fail_attach_for_test();
+        let mut snapshot =
+            Snapshot::with_api_source(TelegramApiSource::with_publisher("11111", "publisher-hash"));
+        snapshot.poll_resume(&store);
+        assert_eq!(snapshot.center_view(), CenterView::KeychainFailed);
+
+        // No client can start, so no data folder can move (Codex 4091044706).
+        snapshot.open_telegram(&store);
+        snapshot.open_add_account(&store);
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(snapshot.take_commands().is_empty());
+        assert!(snapshot.error.is_some());
+
+        snapshot.center_key(AuthKey::Enter, &store);
+        assert!(snapshot.take_keychain_retry(), "Enter = Try again");
+        assert!(!snapshot.take_keychain_retry(), "one retry per press");
+
+        // The retry reads every entry, including a saved session.
+        store.complete_ready_attach_for_test(&[
+            (SecretKey::ApiId, "11111"),
+            (SecretKey::ApiHash, "hash-value"),
+            (SecretKey::Session, "tdlib-ready"),
+        ]);
+        snapshot.try_resume(&store, true);
+        snapshot.keychain_failed = store.read_failed();
+        assert_eq!(
+            snapshot.center_view(),
+            CenterView::Resuming { connecting: true }
+        );
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ApiCredentials]
+        );
+    }
+
+    #[test]
+    fn compose_text_stays_until_the_adapter_accepts_the_send() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        assert_eq!(send_texts(&mut snapshot), vec!["hello"]);
+        assert_eq!(
+            snapshot.compose, "hello",
+            "not cleared before the pending row"
+        );
+        assert!(
+            !snapshot.can_send(),
+            "no second send while one is in flight"
+        );
+        snapshot.send_compose();
+        assert!(send_texts(&mut snapshot).is_empty());
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 100, "hello", Delivery::Pending),
+        });
+        accept(&mut snapshot, "telegram:1");
+        assert!(
+            snapshot.compose.is_empty(),
+            "the pending row means accepted"
+        );
+        assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn a_send_in_one_chat_does_not_block_send_in_another() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "for Ada".into();
+        snapshot.send_compose();
+        assert!(!snapshot.can_send(), "chat 1 waits for its pending row");
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.compose = "for Bob".into();
+        assert!(snapshot.can_send(), "chat 2 is free (PR #40 re-review)");
+        snapshot.send_compose();
+        assert_eq!(send_texts(&mut snapshot), vec!["for Ada", "for Bob"]);
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 100, "for Ada", Delivery::Pending),
+        });
+        accept(&mut snapshot, "telegram:1");
+        snapshot.select_conversation("telegram:1".into());
+        assert!(
+            snapshot.compose.is_empty(),
+            "chat 1's draft cleared on accept"
+        );
+        snapshot.select_conversation("telegram:2".into());
+        assert_eq!(snapshot.compose, "for Bob", "chat 2 still waits");
+    }
+
+    #[test]
+    fn an_immediate_send_error_keeps_the_text_and_shows_the_error() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        let request = sent_request(&mut snapshot);
+        // A stale or other request id does not fail this send.
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request: request + 100,
+        });
+        assert!(!snapshot.can_send(), "still pending");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(snapshot.compose, "hello", "no pending row: the text stays");
+        let error = snapshot.error.clone().expect("error block");
+        assert_eq!(error.happened, "Message not sent.");
+        assert!(snapshot.can_send(), "the user can send it again");
+    }
+
+    #[test]
+    fn an_unrelated_telegram_error_keeps_the_send_pending() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "Could not load messages (TDLib 500).".into(),
+        });
+        assert!(
+            snapshot.error.is_none(),
+            "no \"Message not sent\" for a history error"
+        );
+        assert!(!snapshot.can_send(), "the send is still pending");
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 100, "hello", Delivery::Pending),
+        });
+        accept(&mut snapshot, "telegram:1");
+        assert!(snapshot.compose.is_empty(), "then accepted as usual");
+    }
+
+    /// The adapter accepts the in-flight send of `chat` (its own request id).
+    fn accept(snapshot: &mut Snapshot, chat: &str) {
+        let request = snapshot.sending.get(chat).expect("a send in flight").0;
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: chat.into(),
+            request,
+        });
+    }
+
+    #[test]
+    fn a_history_message_with_the_same_text_is_not_an_acceptance() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "ok".into();
+        snapshot.send_compose();
+        let request = sent_request(&mut snapshot);
+        // History (still loading) has an older outgoing "ok" in this chat.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 5, "ok", Delivery::Sent),
+        });
+        assert_eq!(snapshot.compose, "ok", "history does not accept the send");
+        assert!(!snapshot.can_send(), "the real send is still in flight");
+        // The real send then fails at once: the draft is still there.
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(snapshot.compose, "ok");
+        assert_eq!(
+            snapshot.error.clone().expect("error").happened,
+            "Message not sent."
+        );
+    }
+
+    fn sent_request(snapshot: &mut Snapshot) -> u64 {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("a SendText")
+    }
+
+    #[test]
+    fn a_new_phone_step_drops_a_stale_code_and_password() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        snapshot.telegram_code = "12345".into();
+        snapshot.telegram_2fa = "old-password".into();
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert!(snapshot.telegram_code.is_empty(), "no stale code");
+        assert!(snapshot.telegram_2fa.is_empty(), "no stale password");
+    }
+
+    #[test]
+    fn exit_waits_until_every_adapter_stopped() {
+        let mut snapshot = Snapshot::new();
+        assert!(!snapshot.all_stopped());
+        snapshot.apply(AdapterEvent::Stopped {
+            protocol: ProtocolId::Telegram,
+        });
+        assert!(
+            !snapshot.all_stopped(),
+            "Telegram alone is not enough (Codex 4091477244)"
+        );
+        for protocol in [ProtocolId::WhatsApp, ProtocolId::Discord, ProtocolId::Slack] {
+            snapshot.apply(AdapterEvent::Stopped { protocol });
+        }
+        assert!(snapshot.all_stopped());
+    }
+
+    #[test]
+    fn a_confirmed_missing_key_still_lets_sign_in_start() {
+        let store = SecretStore::detached_for_test();
+        store.complete_ready_attach_for_test(&[]);
+        let mut snapshot =
+            Snapshot::with_api_source(TelegramApiSource::with_publisher("11111", "publisher-hash"));
+        snapshot.poll_resume(&store);
+        assert_ne!(snapshot.center_view(), CenterView::KeychainFailed);
+        snapshot.open_telegram(&store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ApiCredentials]
+        );
     }
 
     #[test]
@@ -3765,31 +3429,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn whatsapp_spike_ui_is_feature_gated() {
-        let app = include_str!("mod.rs");
-        assert!(app.contains("#[cfg(feature = \"whatsapp-web\")]\nmod whatsapp_gate;"));
-        let ui = include_str!("ui.rs");
-        assert!(ui.contains("not ready"));
-        assert!(ui.contains("whatsapp_pairing_available"));
-        assert!(ui.contains("whatsapp_gate::risk_entry"));
-        let gate = include_str!("whatsapp_gate.rs");
-        assert!(gate.contains("CRITIC_RISK_BULLETS"));
-        assert!(gate.contains("Review WhatsApp ban risk"));
-        assert!(gate.contains("No QR code and no pair code are shown on this screen."));
-        assert!(
-            !gate
-                .split(|ch: char| !ch.is_ascii_alphabetic())
-                .any(|word| word.eq_ignore_ascii_case("reliable"))
-        );
-        let ci = include_str!("../../../../.github/workflows/ci.yml");
-        assert!(!ci.contains("whatsapp-web"));
-        let os_zips = include_str!("../../../../.github/workflows/os-zips.yml");
-        assert!(!os_zips.contains("whatsapp-web"));
-        let test_sh = include_str!("../../../../scripts/test.sh");
-        assert!(!test_sh.contains("whatsapp-web"));
-    }
-
     #[cfg(feature = "whatsapp-web")]
     #[test]
     fn whatsapp_pairing_does_not_require_a_linked_telegram() {
@@ -4055,49 +3694,6 @@ mod tests {
     }
 
     #[test]
-    fn inbox_events_queued_before_cancel_leave_no_rows() {
-        // The worker linked, then the user pressed Cancel before the UI polled
-        // Ready. The host drops the stamped Ready. The chat rows and messages
-        // queued after it arrive unstamped: the snapshot drops them.
-        let store = SecretStore::memory();
-        let mut snapshot = Snapshot::new();
-        seed_override(&store);
-        snapshot.open_telegram(&store);
-        snapshot.apply(AdapterEvent::TelegramAuth {
-            phase: TelegramAuthPhase::NeedPhone,
-        });
-        snapshot.cancel_auth(&store);
-        snapshot.apply(AdapterEvent::ConversationUpsert {
-            conversation: telegram_chat(4, "Ada", 9),
-        });
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: ChatMessage {
-                protocol: ProtocolId::Telegram,
-                conversation_id: "telegram:4".into(),
-                id: "telegram:4:1".into(),
-                sender: "Ada".into(),
-                body: "from the cancelled account".into(),
-                outbound: false,
-                delivery: Delivery::Sent,
-                sent_at: 0,
-            },
-        });
-        snapshot.apply(AdapterEvent::ChatListLoaded {
-            protocol: ProtocolId::Telegram,
-        });
-        assert!(snapshot.conversations.is_empty());
-        assert!(snapshot.messages.is_empty());
-
-        // A different account that links later starts with no old rows.
-        complete_telegram(&mut snapshot, &store);
-        assert!(snapshot.visible_conversations().is_empty());
-        snapshot.apply(AdapterEvent::ConversationUpsert {
-            conversation: telegram_chat(5, "Bob", 3),
-        });
-        assert_eq!(snapshot.visible_conversations().len(), 1);
-    }
-
-    #[test]
     fn deleted_message_ids_leave_the_thread() {
         let mut snapshot = Snapshot::new();
         snapshot.telegram_authorized = true;
@@ -4179,5 +3775,135 @@ mod tests {
                 protocol: ProtocolId::Telegram,
             }
         )));
+    }
+
+    #[test]
+    fn a_slow_keychain_read_asks_the_user_to_unlock() {
+        let store = SecretStore::detached_for_test();
+        let mut snapshot = Snapshot::new();
+        snapshot.poll_resume(&store);
+        let started = snapshot.keychain_wait_started.expect("started");
+        assert_eq!(snapshot.keychain_wait_text(started), KEYCHAIN_OPENING);
+        assert_eq!(
+            snapshot.keychain_wait_text(started + KEYCHAIN_SLOW_AFTER),
+            KEYCHAIN_WAITING
+        );
+        snapshot.poll_resume(&store);
+        assert_eq!(
+            snapshot.keychain_wait_started,
+            Some(started),
+            "the clock starts once"
+        );
+    }
+
+    #[test]
+    fn a_remote_logout_clears_the_inbox_and_asks_to_sign_in_again() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: telegram_text(1, 7, "hi"),
+        });
+        snapshot.compose = "draft".into();
+        assert!(!snapshot.can_add_account());
+
+        snapshot.apply(AdapterEvent::TelegramSessionEnded);
+        assert!(!snapshot.telegram_ready());
+        assert!(!snapshot.has_primary_account());
+        assert!(
+            snapshot.visible_conversations().is_empty(),
+            "the old inbox is gone"
+        );
+        assert!(snapshot.selected_messages().is_empty());
+        assert!(snapshot.compose.is_empty());
+        assert!(snapshot.can_add_account(), "Add account is back");
+        assert_eq!(snapshot.status_text, SESSION_ENDED_NOTICE);
+        assert_eq!(
+            snapshot.center_view(),
+            CenterView::Resuming { connecting: true }
+        );
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ApiCredentials]
+        );
+
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert_eq!(snapshot.auth_notice.as_deref(), Some(SESSION_ENDED_NOTICE));
+
+        snapshot.apply(AdapterEvent::TelegramSessionEnded);
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "a second end does nothing"
+        );
+    }
+
+    #[test]
+    fn auth_steps_sees_a_step_with_any_epoch() {
+        let mut snapshot = Snapshot::new();
+        snapshot.pending.push(AdapterCommand::TelegramAuth {
+            step: TelegramAuthStep::Phone,
+            epoch: 3,
+        });
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::Phone],
+            "a non-zero epoch must not vanish from the helper"
+        );
+        // The snapshot itself queues epoch 0; the host stamps the real one.
+        let store = SecretStore::memory();
+        seed_override(&store);
+        snapshot.open_telegram(&store);
+        assert!(snapshot.take_commands().iter().any(|command| matches!(
+            command,
+            AdapterCommand::TelegramAuth {
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
+            }
+        )));
+    }
+
+    #[test]
+    fn inbox_events_queued_before_cancel_leave_no_rows() {
+        // The worker linked, then the user pressed Cancel before the UI polled
+        // Ready. The host drops the stamped Ready. The chat rows and messages
+        // queued after it arrive unstamped: the snapshot drops them.
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        seed_override(&store);
+        snapshot.open_telegram(&store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        snapshot.cancel_auth(&store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(4, "Ada", 9),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:4".into(),
+                id: "telegram:4:1".into(),
+                sender: "Ada".into(),
+                body: "from the cancelled account".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 0,
+            },
+        });
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        assert!(snapshot.conversations.is_empty());
+        assert!(snapshot.messages.is_empty());
+
+        // A different account that links later starts with no old rows.
+        complete_telegram(&mut snapshot, &store);
+        assert!(snapshot.visible_conversations().is_empty());
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(5, "Bob", 3),
+        });
+        assert_eq!(snapshot.visible_conversations().len(), 1);
     }
 }
