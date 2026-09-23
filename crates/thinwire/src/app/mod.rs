@@ -147,6 +147,11 @@ impl CloseGate {
         }
     }
 
+    /// UI commands flow only before a close request.
+    const fn accepts_commands(self) -> bool {
+        matches!(self, Self::Open)
+    }
+
     /// `true` once: the window may close now.
     fn poll(&mut self, now: Instant, stopped: bool) -> bool {
         match *self {
@@ -243,8 +248,12 @@ impl ThinwireApp {
     }
 
     fn flush_commands(&mut self) {
-        for command in self.snapshot.take_commands() {
-            self.host.send(command);
+        let commands = self.snapshot.take_commands();
+        // While the window closes, a click must not reach a protocol worker.
+        if self.close_gate.accepts_commands() {
+            for command in commands {
+                self.host.send(command);
+            }
         }
         if self.snapshot.take_keychain_flush() {
             self.secrets.spawn_os_flush(self.runtime.handle());
@@ -398,7 +407,12 @@ mod tests {
     fn close_waits_for_stopped_then_allows_the_next_request() {
         let start = Instant::now();
         let mut gate = CloseGate::Open;
+        assert!(gate.accepts_commands());
         assert_eq!(gate.on_close_requested(start), CloseAction::HoldAndShutdown);
+        assert!(
+            !gate.accepts_commands(),
+            "no clicks reach a worker while closing"
+        );
         assert_eq!(
             gate.on_close_requested(start),
             CloseAction::Hold,

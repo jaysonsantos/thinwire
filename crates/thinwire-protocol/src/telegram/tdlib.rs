@@ -90,6 +90,7 @@ impl TdlibRuntime {
     /// Close every TDLib client, then emit `Stopped` once all workers exited.
     pub fn shutdown(&mut self, events: &EventTx) {
         self.stop();
+        self.slots.shut_down();
         let workers = self.slots.all();
         let events = events.clone();
         tokio::spawn(async move {
@@ -181,9 +182,13 @@ impl TdlibRuntime {
         source: TelegramApiSource,
         events: &EventTx,
     ) {
+        // The app is closing: a late UI command must not open a new client.
+        if self.slots.is_shut() {
+            return;
+        }
         let slots = &mut self.slots;
         let sent = super::send_or_respawn(&mut self.commands, command, || {
-            let (done, wait_for) = slots.start();
+            let (done, wait_for) = slots.start().unwrap_or_default();
             spawn_tdlib_worker(
                 Arc::clone(&secrets),
                 source.clone(),

@@ -708,6 +708,11 @@ mod tests {
         assert!(stop.contains("retire_current()"));
         let enqueue = fn_body(src, "fn enqueue(");
         assert!(enqueue.contains("slots.start()"));
+        let guard = enqueue
+            .find("self.slots.is_shut()")
+            .expect("shutdown guard");
+        let spawn = enqueue.find("send_or_respawn").expect("spawn");
+        assert!(guard < spawn, "no new client after Shutdown (qa R50)");
         let worker = fn_body(src, "fn spawn_tdlib_worker");
         let wait = worker.find("wait_for_retired(&wait_for)").expect("wait");
         let create = worker.find("create_client()").expect("create");
