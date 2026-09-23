@@ -912,7 +912,11 @@ impl Snapshot {
                 );
             }
             AuthScreen::TelegramConnecting => {
-                // Try again after a failed start. The adapter reports NeedPhone.
+                // Try again after a failed start: close the old client, then
+                // start a new one. The new one waits for the old one to close.
+                self.pending.push(AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Telegram,
+                });
                 self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
                 self.mark_auth_busy(CONNECTING_STATUS);
             }
@@ -2381,10 +2385,20 @@ mod tests {
         assert!(snapshot.can_submit_auth(), "Try again is enabled");
         snapshot.center_key(AuthKey::Enter, &store);
         snapshot.center_key(AuthKey::Enter, &store);
-        assert_eq!(
-            auth_steps(&mut snapshot),
-            vec![TelegramAuthStep::ApiCredentials],
-            "Try again starts the client once"
+        let commands = snapshot.take_commands();
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [
+                    AdapterCommand::Disconnect {
+                        protocol: ProtocolId::Telegram
+                    },
+                    AdapterCommand::TelegramAuth {
+                        step: TelegramAuthStep::ApiCredentials
+                    }
+                ]
+            ),
+            "Try again restarts the client once (qa R59): {commands:?}"
         );
         snapshot.apply(AdapterEvent::TelegramAuth {
             phase: TelegramAuthPhase::NeedPhone,
