@@ -18,6 +18,7 @@ whatsapp-web = ["thinwire-protocol/whatsapp-web"]
 discord-bot = ["thinwire-protocol/discord-bot"]
 
 [dependencies]
+chrono.workspace = true
 dirs.workspace = true
 eframe.workspace = true
 egui.workspace = true

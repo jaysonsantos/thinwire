@@ -371,6 +371,10 @@ pub struct Conversation {
     pub unread: u32,
     /// TDLib main-list order. Higher sorts first. Zero means unordered.
     pub order: i64,
+    /// Unix seconds of the last message. Zero when unknown.
+    pub last_at: i64,
+    /// Group chat: the thread names each run of senders.
+    pub is_group: bool,
 }
 
 /// Delivery of an outgoing message. Incoming messages are always `Sent`.
@@ -394,6 +398,8 @@ pub struct ChatMessage {
     pub body: String,
     pub outbound: bool,
     pub delivery: Delivery,
+    /// Unix seconds when the message was sent. Zero when unknown.
+    pub sent_at: i64,
 }
 
 /// Recoverable adapter failure. Never includes secrets.

@@ -1,5 +1,6 @@
 //! Shell: account switcher + inbox on the left, thread in the center.
 
+use chrono::Local;
 use eframe::egui::{self, Color32, RichText};
 use thinwire_protocol::{Delivery, ProtocolId, SupportClass};
 
@@ -11,6 +12,7 @@ use super::settings::{Settings, ThemeMode};
 use super::snapshot::{
     AccountRow, CenterView, InboxFilter, InboxState, RESUME_CONNECTING, Snapshot, ThreadState,
 };
+use super::thread_layout::{RowLayout, list_time, thread_rows};
 
 const SUPPORTED: Color32 = Color32::from_rgb(96, 176, 128);
 const EXPERIMENTAL: Color32 = Color32::from_rgb(214, 160, 64);
@@ -18,6 +20,8 @@ const CONSTRAINED: Color32 = Color32::from_rgb(196, 148, 88);
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
 const FAILED: Color32 = Color32::from_rgb(200, 80, 80);
 const COMPOSE_MAX_ROWS: usize = 5;
+/// A message bubble uses at most this share of the thread width.
+const BUBBLE_WIDTH: f32 = 0.75;
 
 pub(crate) fn draw(
     ui: &mut egui::Ui,
@@ -198,7 +202,8 @@ fn account_chip(ui: &mut egui::Ui, account: &AccountRow, selected: bool, unread:
 }
 
 fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    let rows: Vec<(String, String, String, u32)> = snapshot
+    let now = Local::now();
+    let rows: Vec<(String, String, String, u32, String)> = snapshot
         .visible_conversations()
         .iter()
         .map(|row| {
@@ -207,6 +212,7 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 row.title.clone(),
                 row.preview.clone(),
                 row.unread,
+                list_time(row.last_at, &now),
             )
         })
         .collect();
@@ -237,14 +243,22 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
 
     let scroll_to_selected = snapshot.take_scroll_to_selected();
     let mut clicked: Option<String> = None;
-    for (id, title, preview, unread) in rows {
+    for (id, title, preview, unread, time) in rows {
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
         let label = if unread == 0 {
             title
         } else {
             format!("{title}  ({unread})")
         };
-        let response = ui.selectable_label(selected, label);
+        let response = ui
+            .horizontal(|ui| {
+                let response = ui.selectable_label(selected, label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(time).small().color(MUTED));
+                });
+                response
+            })
+            .inner;
         if selected && scroll_to_selected {
             response.scroll_to_me(None);
         }
@@ -315,17 +329,21 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     }
     ui.separator();
 
-    let messages: Vec<(String, bool, String, String, Delivery)> = snapshot
+    let is_group = snapshot
+        .selected_conversation_row()
+        .is_some_and(|row| row.is_group);
+    let layout = thread_rows(snapshot.selected_messages(), is_group, &Local::now());
+    let messages: Vec<Bubble> = snapshot
         .selected_messages()
         .iter()
-        .map(|message| {
-            (
-                message.id.clone(),
-                message.outbound,
-                message.sender.clone(),
-                message.body.clone(),
-                message.delivery,
-            )
+        .zip(layout)
+        .map(|(message, layout)| Bubble {
+            id: message.id.clone(),
+            outbound: message.outbound,
+            sender: message.sender.clone(),
+            body: message.body.clone(),
+            delivery: message.delivery,
+            layout,
         })
         .collect();
 
@@ -361,27 +379,8 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 }
                 ThreadState::NoSelection | ThreadState::Rows => {}
             }
-            for (id, outbound, sender, body, delivery) in messages {
-                ui.group(|ui| {
-                    let who = if outbound { "you" } else { sender.as_str() };
-                    ui.strong(who);
-                    ui.label(body);
-                    match delivery {
-                        Delivery::Sent => {}
-                        Delivery::Pending => {
-                            ui.label(RichText::new("Sending…").small().color(MUTED));
-                        }
-                        Delivery::Failed => {
-                            ui.horizontal(|ui| {
-                                ui.colored_label(FAILED, RichText::new("Not sent").small());
-                                if ui.small_button("Retry").clicked() {
-                                    retry = Some(id.clone());
-                                }
-                            });
-                        }
-                    }
-                });
-                ui.add_space(4.0);
+            for message in &messages {
+                bubble(ui, message, &mut retry);
             }
         });
     if let Some(id) = retry {
@@ -390,6 +389,65 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
 
     ui.separator();
     compose(ui, snapshot, compose_height);
+}
+
+/// One message row, ready to draw.
+struct Bubble {
+    id: String,
+    outbound: bool,
+    sender: String,
+    body: String,
+    delivery: Delivery,
+    layout: RowLayout,
+}
+
+/// Own messages sit on the right in the theme selection color. Others sit
+/// on the left. Both follow the light or dark theme.
+fn bubble(ui: &mut egui::Ui, message: &Bubble, retry: &mut Option<String>) {
+    if let Some(day) = &message.layout.day_break {
+        ui.add_space(6.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(day).small().color(MUTED));
+        });
+        ui.add_space(2.0);
+    }
+    let max_width = ui.available_width() * BUBBLE_WIDTH;
+    let (align, fill) = if message.outbound {
+        (egui::Align::Max, ui.visuals().selection.bg_fill)
+    } else {
+        (egui::Align::Min, ui.visuals().widgets.inactive.weak_bg_fill)
+    };
+    ui.with_layout(egui::Layout::top_down(align), |ui| {
+        egui::Frame::new()
+            .fill(fill)
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_max_width(max_width);
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    if message.layout.show_sender {
+                        ui.label(RichText::new(&message.sender).small().strong());
+                    }
+                    ui.add(egui::Label::new(&message.body).selectable(true).wrap());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&message.layout.time).small().color(MUTED));
+                        match message.delivery {
+                            Delivery::Sent => {}
+                            Delivery::Pending => {
+                                ui.label(RichText::new("Sending…").small().color(MUTED));
+                            }
+                            Delivery::Failed => {
+                                ui.colored_label(FAILED, RichText::new("Not sent").small());
+                                if ui.small_button("Retry").clicked() {
+                                    *retry = Some(message.id.clone());
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+    });
+    ui.add_space(4.0);
 }
 
 /// Multiline compose. Enter sends; Shift+Enter adds a line.

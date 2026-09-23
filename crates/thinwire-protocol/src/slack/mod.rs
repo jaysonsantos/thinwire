@@ -89,6 +89,8 @@ impl SlackAdapter {
                 preview: "OAuth workspace stub — not connected.".into(),
                 unread: 1,
                 order: 0,
+                last_at: 0,
+                is_group: false,
             },
         );
         emit_message(
@@ -101,6 +103,7 @@ impl SlackAdapter {
                 body: "Slack is a supported OAuth / workspace-app goal. This pane is placeholder data; no workspace token is stored.".into(),
                 outbound: false,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         );
     }

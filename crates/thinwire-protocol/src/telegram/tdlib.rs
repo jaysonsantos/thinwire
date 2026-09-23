@@ -11,7 +11,9 @@ use std::thread;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
-use super::inbox::{self, ChatDirectory, ChatEffect, InboxMessage, MessageParty, NameBook};
+use super::inbox::{
+    self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook,
+};
 use crate::adapter::{
     AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
@@ -528,22 +530,32 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
                 publish(
                     events,
                     emit,
-                    live.directory.set_preview(update.chat_id, &preview),
+                    live.directory
+                        .set_preview(update.chat_id, &preview, i64::from(message.date)),
                 );
                 if emit {
                     emit_mapped_message(events, message, live, None);
                 }
             } else {
-                publish(events, emit, live.directory.set_preview(update.chat_id, ""));
+                publish(
+                    events,
+                    emit,
+                    live.directory.set_preview(update.chat_id, "", 0),
+                );
             }
         }
         tdlib_rs::enums::Update::NewMessage(update) => {
             let preview = message_body(&update.message.content);
             let chat_id = update.message.chat_id;
+            let at = i64::from(update.message.date);
             if emit {
                 emit_mapped_message(events, &update.message, live, None);
             }
-            publish(events, emit, live.directory.set_preview(chat_id, &preview));
+            publish(
+                events,
+                emit,
+                live.directory.set_preview(chat_id, &preview, at),
+            );
         }
         tdlib_rs::enums::Update::MessageSendSucceeded(update) => {
             if emit {
@@ -628,13 +640,26 @@ fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Opt
         .as_ref()
         .map(|message| message_body(&message.content))
         .unwrap_or_default();
+    let last_at = chat
+        .last_message
+        .as_ref()
+        .map_or(0, |message| i64::from(message.date));
+    let is_group = match &chat.r#type {
+        tdlib_rs::enums::ChatType::BasicGroup(_) => true,
+        tdlib_rs::enums::ChatType::Supergroup(group) => !group.is_channel,
+        tdlib_rs::enums::ChatType::Private(_) | tdlib_rs::enums::ChatType::Secret(_) => false,
+    };
     directory.upsert(
         chat.id,
-        &chat.title,
-        order,
-        chat.unread_count,
-        &preview,
-        &chat.title,
+        ChatSeed {
+            title: &chat.title,
+            order,
+            unread: chat.unread_count,
+            preview: &preview,
+            participant: &chat.title,
+            last_at,
+            is_group,
+        },
     )
 }
 
@@ -662,6 +687,7 @@ fn emit_mapped_message(
             outgoing: message.is_outgoing,
             party,
             body: message_body(&message.content),
+            sent_at: i64::from(message.date),
             delivery: match &message.sending_state {
                 None => Delivery::Sent,
                 Some(tdlib_rs::enums::MessageSendingState::Pending(_)) => Delivery::Pending,

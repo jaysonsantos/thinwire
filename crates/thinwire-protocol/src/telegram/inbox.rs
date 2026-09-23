@@ -37,6 +37,7 @@ pub(super) struct InboxMessage {
     pub party: MessageParty,
     pub body: String,
     pub delivery: Delivery,
+    pub sent_at: i64,
 }
 
 /// What the shell should do after a chat-list mutation.
@@ -46,6 +47,18 @@ pub(super) enum ChatEffect {
     Remove(String),
 }
 
+/// Fields TDLib gives for a new chat.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ChatSeed<'a> {
+    pub title: &'a str,
+    pub order: i64,
+    pub unread: i32,
+    pub preview: &'a str,
+    pub participant: &'a str,
+    pub last_at: i64,
+    pub is_group: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChatRecord {
     title: String,
@@ -53,6 +66,8 @@ struct ChatRecord {
     unread: u32,
     preview: String,
     participant: String,
+    last_at: i64,
+    is_group: bool,
 }
 
 /// Main-list chats keyed by TDLib chat id. `order == 0` is not listed.
@@ -86,24 +101,18 @@ impl ChatDirectory {
     }
 
     /// Insert or replace a chat. Listed only when `order` is positive.
-    pub(super) fn upsert(
-        &mut self,
-        chat_id: i64,
-        title: &str,
-        order: i64,
-        unread: i32,
-        preview: &str,
-        participant: &str,
-    ) -> Option<ChatEffect> {
+    pub(super) fn upsert(&mut self, chat_id: i64, seed: ChatSeed<'_>) -> Option<ChatEffect> {
         let previous = self.chats.get(&chat_id).map(|chat| chat.order);
         self.chats.insert(
             chat_id,
             ChatRecord {
-                title: fallback_title(title),
-                order,
-                unread: unread_count(unread),
-                preview: one_line_preview(preview),
-                participant: fallback_title(participant),
+                title: fallback_title(seed.title),
+                order: seed.order,
+                unread: unread_count(seed.unread),
+                preview: one_line_preview(seed.preview),
+                participant: fallback_title(seed.participant),
+                last_at: seed.last_at,
+                is_group: seed.is_group,
             },
         );
         self.effect(chat_id, previous)
@@ -137,10 +146,17 @@ impl ChatDirectory {
         self.effect(chat_id, Some(previous))
     }
 
-    pub(super) fn set_preview(&mut self, chat_id: i64, preview: &str) -> Option<ChatEffect> {
+    /// New last message. `at` is Unix seconds; zero clears the time.
+    pub(super) fn set_preview(
+        &mut self,
+        chat_id: i64,
+        preview: &str,
+        at: i64,
+    ) -> Option<ChatEffect> {
         let previous = self.ensure(chat_id).order;
         if let Some(chat) = self.chats.get_mut(&chat_id) {
             chat.preview = one_line_preview(preview);
+            chat.last_at = at;
         }
         self.effect(chat_id, Some(previous))
     }
@@ -152,6 +168,8 @@ impl ChatDirectory {
             unread: 0,
             preview: String::new(),
             participant: "Chat".into(),
+            last_at: 0,
+            is_group: false,
         })
     }
 
@@ -264,6 +282,7 @@ pub(super) fn to_chat_message(
         id: message_id(message.chat_id, message.message_id),
         sender,
         body: message.body.clone(),
+        sent_at: message.sent_at,
         outbound: message.outgoing,
         delivery: if message.outgoing {
             message.delivery
@@ -282,6 +301,8 @@ fn conversation_from(chat_id: i64, chat: &ChatRecord) -> Conversation {
         preview: chat.preview.clone(),
         unread: chat.unread,
         order: chat.order,
+        last_at: chat.last_at,
+        is_group: chat.is_group,
     }
 }
 
@@ -313,6 +334,18 @@ fn one_line_preview(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn seed<'a>(title: &'a str, order: i64, unread: i32, preview: &'a str) -> ChatSeed<'a> {
+        ChatSeed {
+            title,
+            order,
+            unread,
+            preview,
+            participant: title,
+            last_at: 0,
+            is_group: false,
+        }
+    }
+
     #[test]
     fn chat_ids_round_trip_and_reject_placeholders() {
         assert_eq!(conversation_id(42), "telegram:42");
@@ -329,19 +362,15 @@ mod tests {
     #[test]
     fn main_list_hides_zero_order_and_sorts_by_order_field() {
         let mut directory = ChatDirectory::new();
-        assert!(
-            directory
-                .upsert(1, "Hidden", 0, 3, "nope", "Hidden")
-                .is_none()
-        );
+        assert!(directory.upsert(1, seed("Hidden", 0, 3, "nope")).is_none());
         let ChatEffect::Upsert(low) = directory
-            .upsert(2, "Low", 10, 1, "older", "Low")
+            .upsert(2, seed("Low", 10, 1, "older"))
             .expect("listed")
         else {
             panic!("expected upsert");
         };
         let ChatEffect::Upsert(high) = directory
-            .upsert(3, "High", 90, 4, "newer\nline", "High")
+            .upsert(3, seed("High", 90, 4, "newer\nline"))
             .expect("listed")
         else {
             panic!("expected upsert");
@@ -363,6 +392,34 @@ mod tests {
     }
 
     #[test]
+    fn upsert_keeps_the_last_message_time_and_the_group_flag() {
+        let mut directory = ChatDirectory::new();
+        let ChatEffect::Upsert(chat) = directory
+            .upsert(
+                7,
+                ChatSeed {
+                    last_at: 1_700_000_000,
+                    is_group: true,
+                    ..seed("Team", 5, 0, "hi")
+                },
+            )
+            .expect("listed")
+        else {
+            panic!("expected upsert");
+        };
+        assert_eq!(chat.last_at, 1_700_000_000);
+        assert!(chat.is_group);
+        let ChatEffect::Upsert(chat) = directory
+            .set_preview(7, "later", 1_700_000_600)
+            .expect("preview")
+        else {
+            panic!("expected upsert");
+        };
+        assert_eq!(chat.last_at, 1_700_000_600);
+        assert!(chat.is_group, "a preview update keeps the chat kind");
+    }
+
+    #[test]
     fn title_unread_and_preview_updates_emit_only_while_listed() {
         let mut directory = ChatDirectory::new();
         assert!(directory.set_title(5, "Later").is_none());
@@ -376,7 +433,7 @@ mod tests {
         };
         assert_eq!(chat.unread, 0);
         let ChatEffect::Upsert(chat) = directory
-            .set_preview(5, &"word ".repeat(40))
+            .set_preview(5, &"word ".repeat(40), 1_700_000_000)
             .expect("preview")
         else {
             panic!("upsert");
@@ -384,7 +441,8 @@ mod tests {
         assert!(chat.preview.chars().count() <= PREVIEW_CHARS + 1);
         assert!(chat.preview.ends_with('…'));
         assert!(!chat.preview.contains('\n'));
-        let ChatEffect::Upsert(chat) = directory.set_preview(5, "").expect("cleared") else {
+        assert_eq!(chat.last_at, 1_700_000_000);
+        let ChatEffect::Upsert(chat) = directory.set_preview(5, "", 0).expect("cleared") else {
             panic!("upsert");
         };
         assert_eq!(chat.preview, "");
@@ -405,9 +463,11 @@ mod tests {
             party: MessageParty::User(7),
             body: "hello".into(),
             delivery: Delivery::Sent,
+            sent_at: 1_700_000_000,
         };
         let mapped = to_chat_message(&message, &names, Some("Ada"));
         assert_eq!(mapped.sender, "Ada Lovelace");
+        assert_eq!(mapped.sent_at, 1_700_000_000);
         assert!(!mapped.outbound);
         assert_eq!(mapped.id, "telegram:9:3");
         let mine = InboxMessage {
@@ -429,6 +489,7 @@ mod tests {
             party: MessageParty::User(1),
             body: "ping".into(),
             delivery: Delivery::Failed,
+            sent_at: 0,
         };
         assert_eq!(
             to_chat_message(&failed, &names, None).delivery,

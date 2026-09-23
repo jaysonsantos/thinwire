@@ -4521,6 +4521,7 @@ name = "thinwire"
 version = "0.1.0"
 dependencies = [
  "apple-native-keyring-store",
+ "chrono",
  "dirs 7.0.0",
  "eframe",
  "egui",

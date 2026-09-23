@@ -4,6 +4,7 @@ mod auth;
 mod secrets;
 mod settings;
 mod snapshot;
+mod thread_layout;
 mod ui;
 #[cfg(feature = "whatsapp-web")]
 mod whatsapp_gate;

@@ -216,6 +216,8 @@ impl DiscordAdapter {
                 preview: "Bot/OAuth guild inbox placeholder. Not a personal Discord client.".into(),
                 unread: 1,
                 order: 0,
+                last_at: 0,
+                is_group: false,
             },
         );
         emit_message(
@@ -228,6 +230,7 @@ impl DiscordAdapter {
                 body: "Guild bot inbox placeholder. The gateway is not started. User-account and self-bot paths are refused.".into(),
                 outbound: false,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         );
     }

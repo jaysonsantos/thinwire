@@ -129,6 +129,8 @@ impl WhatsAppAdapter {
                 preview: "Experimental unofficial path — not connected.".into(),
                 unread: 1,
                 order: 0,
+                last_at: 0,
+                is_group: false,
             },
         );
         emit_message(
@@ -141,6 +143,7 @@ impl WhatsAppAdapter {
                 body: "WhatsApp is experimental. Unofficial linked-device code can get a personal account banned. This is not a live session.".into(),
                 outbound: false,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         );
     }

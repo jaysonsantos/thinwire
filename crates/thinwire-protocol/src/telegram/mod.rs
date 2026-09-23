@@ -543,7 +543,7 @@ mod tests {
         assert!(updates.contains("Update::DeleteMessages"));
         assert!(updates.contains("update.from_cache"));
         assert!(updates.contains("emit_messages_removed"));
-        assert!(updates.contains("set_preview(update.chat_id, \"\")"));
+        assert!(updates.contains("set_preview(update.chat_id, \"\", 0)"));
         let open = fn_body(src, "async fn open_chat");
         assert!(open.contains("load_history"));
         assert!(open.contains("emit_history_loaded"));
@@ -612,6 +612,20 @@ mod tests {
         assert!(auth.contains("emit_telegram_code_sent(events, code_via("));
         assert!(!auth.contains("optional 2FA"));
         assert!(!src.contains("TDLib worker is not running"));
+    }
+
+    #[test]
+    fn live_tdlib_maps_message_dates_and_group_chats() {
+        let src = include_str!("tdlib.rs");
+        let mapped = fn_body(src, "fn emit_mapped_message");
+        assert!(mapped.contains("sent_at: i64::from(message.date)"));
+        let chat = fn_body(src, "fn note_chat");
+        assert!(chat.contains("i64::from(message.date)"));
+        assert!(chat.contains("ChatType::BasicGroup(_) => true"));
+        assert!(chat.contains("!group.is_channel"));
+        let updates = fn_body(src, "fn apply_chat_update");
+        assert!(updates.contains("i64::from(message.date)"));
+        assert!(updates.contains("i64::from(update.message.date)"));
     }
 
     #[test]

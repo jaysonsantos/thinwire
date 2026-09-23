@@ -1548,6 +1548,8 @@ mod tests {
             preview: String::new(),
             unread: 0,
             order,
+            last_at: 0,
+            is_group: false,
         }
     }
 
@@ -1560,6 +1562,7 @@ mod tests {
             body: body.into(),
             outbound: false,
             delivery: Delivery::Sent,
+            sent_at: 0,
         }
     }
 
@@ -1681,6 +1684,7 @@ mod tests {
             body: body.into(),
             outbound: true,
             delivery,
+            sent_at: 0,
         }
     }
 
@@ -2110,6 +2114,26 @@ mod tests {
     }
 
     #[test]
+    fn thread_draws_bubbles_by_side_with_times_and_day_breaks() {
+        let ui = include_str!("ui.rs");
+        let bubble = &ui[ui.find("fn bubble(").expect("bubble")..];
+        let bubble = &bubble[..bubble.find("\nfn ").expect("next")];
+        assert!(bubble.contains("selection.bg_fill"));
+        assert!(bubble.contains("egui::Align::Max"));
+        assert!(bubble.contains("egui::Align::Min"));
+        assert!(bubble.contains("layout.day_break"));
+        assert!(bubble.contains("layout.show_sender"));
+        assert!(bubble.contains("layout.time"));
+        assert!(bubble.contains(".selectable(true).wrap()"));
+        assert!(
+            !bubble.contains("Color32::from_rgb"),
+            "colors come from the theme"
+        );
+        assert!(ui.contains("thread_rows(snapshot.selected_messages(), is_group"));
+        assert!(ui.contains("list_time(row.last_at, &now)"));
+    }
+
+    #[test]
     fn auth_ui_is_telegram_only_this_beat() {
         let src = include_str!("auth.rs");
         assert!(src.contains("TELEGRAM_API_ID"));
@@ -2328,6 +2352,8 @@ mod tests {
                 preview: "secret-preview-should-not-match-search".into(),
                 unread: 2,
                 order: 0,
+                last_at: 0,
+                is_group: false,
             },
         });
         assert!(snapshot.visible_conversations().is_empty());
@@ -2546,6 +2572,8 @@ mod tests {
             preview: "placeholder".into(),
             unread: 1,
             order: 0,
+            last_at: 0,
+            is_group: false,
         }
     }
 
@@ -2571,6 +2599,7 @@ mod tests {
                 body: "hello from telegram".into(),
                 outbound: false,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         });
     }
@@ -2657,6 +2686,7 @@ mod tests {
                 body: "hello from telegram".into(),
                 outbound: false,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         });
         assert_eq!(
@@ -2710,6 +2740,8 @@ mod tests {
                 preview: "secret-preview-should-not-match-search".into(),
                 unread: 0,
                 order: 0,
+                last_at: 0,
+                is_group: false,
             },
         });
         snapshot
@@ -2927,6 +2959,8 @@ mod tests {
                 preview: "a".into(),
                 unread: 0,
                 order: 10,
+                last_at: 0,
+                is_group: false,
             },
         });
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -2938,6 +2972,8 @@ mod tests {
                 preview: "b".into(),
                 unread: 1,
                 order: 90,
+                last_at: 0,
+                is_group: false,
             },
         });
         let ids: Vec<_> = snapshot
@@ -2977,6 +3013,7 @@ mod tests {
                 body: "second".into(),
                 outbound: false,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -2988,6 +3025,7 @@ mod tests {
                 body: "first".into(),
                 outbound: false,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -2999,6 +3037,7 @@ mod tests {
                 body: "second-edited-via-upsert".into(),
                 outbound: false,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -3019,6 +3058,7 @@ mod tests {
                 body: "sent".into(),
                 outbound: true,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -3053,6 +3093,7 @@ mod tests {
                     body: body.into(),
                     outbound: false,
                     delivery: Delivery::Sent,
+                    sent_at: 0,
                 },
             });
         }
@@ -3088,6 +3129,8 @@ mod tests {
                 preview: String::new(),
                 unread: 2,
                 order: 5,
+                last_at: 0,
+                is_group: false,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -3099,6 +3142,7 @@ mod tests {
                 body: "hi".into(),
                 outbound: false,
                 delivery: Delivery::Sent,
+                sent_at: 0,
             },
         });
         let _ = snapshot.take_commands();

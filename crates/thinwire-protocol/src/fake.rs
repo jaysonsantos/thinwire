@@ -6,6 +6,9 @@ use super::adapter::{
     emit_message, emit_status,
 };
 
+/// Fixed send time for fake messages: 2026-01-02 03:04:05 UTC.
+const FAKE_SENT_AT: i64 = 1_767_323_045;
+
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Telegram,
     support: SupportClass::Supported,
@@ -67,6 +70,8 @@ impl ProtocolAdapter for FakeAdapter {
                         preview: "Pushed from the worker.".into(),
                         unread: 0,
                         order: 0,
+                        last_at: FAKE_SENT_AT,
+                        is_group: false,
                     },
                 );
                 emit_message(
@@ -79,6 +84,7 @@ impl ProtocolAdapter for FakeAdapter {
                         body: "event from tokio worker".into(),
                         outbound: false,
                         delivery: Delivery::Sent,
+                        sent_at: FAKE_SENT_AT,
                     },
                 );
                 Ok(())
