@@ -757,8 +757,8 @@ mod tests {
         let key = params.find("ensure_db_key(").expect("key");
         assert!(check < key, "check the vault before a new key is made");
         assert!(params.contains("data_dir::is_wrong_key_error(&error.message)"));
-        assert!(params.contains("&& !reset"), "retry once only");
-        assert!(params.contains("emit_telegram_data_reset(events)"));
+        assert!(params.contains("&& moved_to.is_none()"), "retry once only");
+        assert!(params.contains("emit_telegram_data_reset(events, name)"));
         assert!(
             !src.contains("remove_dir_all"),
             "old data is moved, never deleted"
@@ -814,6 +814,21 @@ mod tests {
         let log = fn_body(src, "fn log_tdlib_error");
         assert!(log.contains("loggable_tdlib_message(&error.message)"));
         assert!(!log.contains("error.message,"), "raw text is never logged");
+    }
+
+    #[test]
+    fn data_reset_event_names_the_folder_never_a_path() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::adapter::emit_telegram_data_reset(
+            &tx,
+            "/home/user/.local/share/thinwire/tdlib.stale-1790000000",
+        );
+        assert_eq!(
+            rx.try_recv().expect("event"),
+            AdapterEvent::TelegramDataReset {
+                moved_to: "tdlib.stale-1790000000".into()
+            }
+        );
     }
 
     #[test]

@@ -202,8 +202,13 @@ pub(crate) fn auth_user_error(reason: Option<TelegramAuthError>) -> UserError {
 }
 
 /// Copy on the phone step after the old Telegram data folder was moved aside.
-pub(crate) const DATA_RESET_NOTICE: &str =
-    "Telegram data on this device could not be opened. It was moved aside. Sign in again.";
+/// Names the folder once; old folders are kept, never deleted.
+#[must_use]
+pub(crate) fn data_reset_notice(moved_to: &str) -> String {
+    format!(
+        "Telegram data on this device could not be opened. It was moved to \"{moved_to}\" in the thinwire data folder and kept. Sign in again."
+    )
+}
 
 /// Status line when Add Telegram is pressed before the keychain read ends.
 const KEYCHAIN_LOADING_STATUS: &str = "Reading the keychain. Try again in a moment.";
@@ -271,7 +276,7 @@ pub(crate) struct Snapshot {
     pub compose: String,
     pub auth_busy: bool,
     /// One line above the active login form. Never holds a secret.
-    pub auth_notice: Option<&'static str>,
+    pub auth_notice: Option<String>,
     /// Why Telegram refused the last login step, if it said.
     pub auth_rejection: Option<TelegramAuthError>,
     /// Where Telegram sent the login code, if it said.
@@ -288,8 +293,8 @@ pub(crate) struct Snapshot {
     drafts: HashMap<String, String>,
     focus_compose: bool,
     telegram_stopped: bool,
-    /// The worker moved the old data folder aside. Shown on the next phone step.
-    data_reset: bool,
+    /// Name of the folder the worker moved aside. Shown on the next phone step.
+    data_reset: Option<String>,
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
@@ -347,7 +352,7 @@ impl Snapshot {
             drafts: HashMap::new(),
             focus_compose: false,
             telegram_stopped: false,
-            data_reset: false,
+            data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
@@ -493,8 +498,8 @@ impl Snapshot {
             AdapterEvent::TelegramAuthRejected { error } => {
                 self.auth_rejection = Some(error);
             }
-            AdapterEvent::TelegramDataReset => {
-                self.data_reset = true;
+            AdapterEvent::TelegramDataReset { moved_to } => {
+                self.data_reset = Some(moved_to);
             }
             AdapterEvent::TelegramCodeSent { via } => {
                 self.code_via = Some(via);
@@ -1075,15 +1080,16 @@ impl Snapshot {
         let resuming = std::mem::replace(&mut self.resume, Resume::Settled) == Resume::Connecting;
         self.auth_notice = None;
         match phase {
-            TelegramAuthPhase::NeedPhone if std::mem::take(&mut self.data_reset) => {
+            TelegramAuthPhase::NeedPhone if self.data_reset.is_some() => {
+                let notice = data_reset_notice(&self.data_reset.take().unwrap_or_default());
                 self.auth = AuthScreen::TelegramPhone;
-                self.auth_notice = Some(DATA_RESET_NOTICE);
-                self.status_text = DATA_RESET_NOTICE.into();
+                self.status_text.clone_from(&notice);
+                self.auth_notice = Some(notice);
             }
             TelegramAuthPhase::NeedPhone if resuming => {
                 // The worker drops the stale session marker on this path.
                 self.auth = AuthScreen::TelegramPhone;
-                self.auth_notice = Some(SESSION_ENDED_NOTICE);
+                self.auth_notice = Some(SESSION_ENDED_NOTICE.into());
                 self.status_text = SESSION_ENDED_NOTICE.into();
             }
             TelegramAuthPhase::NeedPhone => {
@@ -1625,7 +1631,7 @@ mod tests {
         });
         assert_eq!(snapshot.center_view(), CenterView::Auth);
         assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
-        assert_eq!(snapshot.auth_notice, Some(SESSION_ENDED_NOTICE));
+        assert_eq!(snapshot.auth_notice.as_deref(), Some(SESSION_ENDED_NOTICE));
         assert_eq!(snapshot.status_text, SESSION_ENDED_NOTICE);
 
         snapshot.telegram_phone = "+15551234567".into();
@@ -2417,17 +2423,24 @@ mod tests {
             .expect("marker");
         let mut snapshot = Snapshot::new();
         snapshot.try_resume(&store, true);
-        snapshot.apply(AdapterEvent::TelegramDataReset);
+        snapshot.apply(AdapterEvent::TelegramDataReset {
+            moved_to: "tdlib.stale-1790000000".into(),
+        });
         snapshot.apply(AdapterEvent::TelegramAuth {
             phase: TelegramAuthPhase::NeedPhone,
         });
         assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
-        assert_eq!(snapshot.auth_notice, Some(DATA_RESET_NOTICE));
+        let notice = snapshot.auth_notice.clone().expect("notice");
+        assert!(notice.contains("\"tdlib.stale-1790000000\""), "{notice}");
+        assert!(notice.contains("kept"), "never deleted (R62)");
+        assert!(!notice.contains('/'), "a name, not a path");
         snapshot.telegram_phone = "+15551234567".into();
         submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::NeedCode);
         assert_eq!(snapshot.auth_notice, None, "shown once");
-        let debug = format!("{:?}", AdapterEvent::TelegramDataReset);
-        assert!(!debug.contains('/'), "no path on the event");
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert_eq!(snapshot.auth_notice, None, "the folder name shows once");
     }
 
     #[test]

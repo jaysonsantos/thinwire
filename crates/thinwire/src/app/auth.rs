@@ -56,7 +56,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
         });
     }
 
-    if let Some(notice) = snapshot.auth_notice {
+    if let Some(notice) = &snapshot.auth_notice {
         ui.colored_label(WARN, notice);
     }
 

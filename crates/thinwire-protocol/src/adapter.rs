@@ -287,7 +287,11 @@ pub enum AdapterEvent {
     },
     /// The old Telegram data folder could not open (its key was lost). It was
     /// moved aside, and a fresh login follows. Carries no path or value.
-    TelegramDataReset,
+    TelegramDataReset {
+        /// Name of the moved-aside folder, for example `tdlib.stale-1790000000`.
+        /// A file name only, never a path.
+        moved_to: String,
+    },
     /// Telegram sent a login code. Sent just before the `NeedCode` phase.
     TelegramCodeSent {
         via: TelegramCodeVia,
@@ -495,8 +499,12 @@ pub(crate) fn emit_telegram_auth_rejected(events: &EventTx, error: TelegramAuthE
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_telegram_data_reset(events: &EventTx) {
-    let _ = events.send(AdapterEvent::TelegramDataReset);
+pub(crate) fn emit_telegram_data_reset(events: &EventTx, moved_to: &str) {
+    // A file name only: drop anything up to the last path separator.
+    let name = moved_to.rsplit(['/', '\\']).next().unwrap_or_default();
+    let _ = events.send(AdapterEvent::TelegramDataReset {
+        moved_to: name.to_string(),
+    });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]

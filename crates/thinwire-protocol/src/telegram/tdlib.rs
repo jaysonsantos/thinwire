@@ -1147,7 +1147,7 @@ async fn set_parameters(
     let has_key = secrets
         .get_secret(TelegramSecretKey::DbEncryption)
         .is_some_and(|key| !key.is_empty());
-    let mut reset = move_aside(data_dir::move_aside_if_keyless(&dir, has_key));
+    let mut moved_to = move_aside(data_dir::move_aside_if_keyless(&dir, has_key));
     ensure_dir(&dir);
     let mut result = send_parameters(
         client_id,
@@ -1158,14 +1158,14 @@ async fn set_parameters(
     )
     .await;
     if let Err(error) = &result
-        && !reset
+        && moved_to.is_none()
         && data_dir::is_wrong_key_error(&error.message)
     {
         // The key in the vault does not open this folder. Keep the old folder,
         // start a fresh one with a new key, and try once more.
         log_tdlib_error("setTdlibParameters", error);
-        reset = move_aside(data_dir::move_aside(&dir).map(Some));
-        if reset {
+        moved_to = move_aside(data_dir::move_aside(&dir).map(Some));
+        if moved_to.is_some() {
             secrets.set_secret(TelegramSecretKey::DbEncryption, "");
             ensure_dir(&dir);
             result = send_parameters(
@@ -1178,8 +1178,9 @@ async fn set_parameters(
             .await;
         }
     }
-    if reset {
-        emit_telegram_data_reset(events);
+    // All old folders are kept (never deleted). The notice names the new one once.
+    if let Some(name) = &moved_to {
+        emit_telegram_data_reset(events, name);
     }
     if let Err(error) = result {
         // No login step can run now. Stop the flow; the UI must not show
@@ -1224,22 +1225,24 @@ async fn send_parameters(
 }
 
 /// Log the result of a move-aside. `true` when the folder moved.
-fn move_aside(result: std::io::Result<Option<PathBuf>>) -> bool {
+/// Log the result of a move-aside. Returns the new folder name when it moved.
+fn move_aside(result: std::io::Result<Option<PathBuf>>) -> Option<String> {
     match result {
         Ok(Some(moved)) => {
-            let name = moved
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned());
+            let name = moved.file_name().map_or_else(
+                || "tdlib.stale".to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
             tracing::warn!(
-                moved_to = name.as_deref().unwrap_or("?"),
+                moved_to = %name,
                 "telegram data folder could not open with the saved key; moved aside"
             );
-            true
+            Some(name)
         }
-        Ok(None) => false,
+        Ok(None) => None,
         Err(error) => {
             tracing::warn!(%error, "telegram data folder could not be moved aside");
-            false
+            None
         }
     }
 }
