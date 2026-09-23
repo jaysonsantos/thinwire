@@ -741,7 +741,7 @@ mod tests {
             .expect("check");
         let key = params.find("ensure_db_key(").expect("key");
         assert!(check < key, "check the vault before a new key is made");
-        assert!(params.contains("data_dir::is_database_error(&error.message)"));
+        assert!(params.contains("data_dir::is_wrong_key_error(&error.message)"));
         assert!(params.contains("&& !reset"), "retry once only");
         assert!(params.contains("emit_telegram_data_reset(events)"));
         assert!(

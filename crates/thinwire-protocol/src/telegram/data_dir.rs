@@ -76,12 +76,20 @@ fn free_stale_path(dir: &Path, unix_secs: u64) -> io::Result<PathBuf> {
     ))
 }
 
-/// TDLib text that points at the database or its key. Such an error can be
-/// fixed by a fresh folder; other errors (for example a bad api_id) cannot.
+/// TDLib's text when the key does not open the database.
+const WRONG_KEY_ERROR: &str = "wrong database encryption key";
+
+/// Text of a lock error: another client (for example a second thinwire)
+/// uses the folder. Such a folder is alive and must never move.
+const LOCK_MARKERS: [&str; 2] = ["already in use", "lock"];
+
+/// Only TDLib's wrong-key error can be fixed by a fresh folder. Any other
+/// error (a bad api_id, or a folder another instance holds) cannot, and a
+/// wrong match would move a live folder aside and clear its key.
 #[must_use]
-pub(super) fn is_database_error(message: &str) -> bool {
+pub(super) fn is_wrong_key_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("database") || message.contains("encryption")
+    message.contains(WRONG_KEY_ERROR) && !LOCK_MARKERS.iter().any(|lock| message.contains(lock))
 }
 
 #[cfg(test)]
@@ -152,10 +160,17 @@ mod tests {
     }
 
     #[test]
-    fn only_database_errors_trigger_a_fresh_folder() {
-        assert!(is_database_error("Wrong database encryption key"));
-        assert!(is_database_error("Can't open database"));
-        assert!(!is_database_error("Valid api_id must be provided"));
-        assert!(!is_database_error("PHONE_NUMBER_INVALID"));
+    fn only_the_wrong_key_error_triggers_a_fresh_folder() {
+        assert!(is_wrong_key_error("Wrong database encryption key"));
+        assert!(!is_wrong_key_error("Can't open database"));
+        assert!(!is_wrong_key_error("database /x is already in use"));
+        assert!(!is_wrong_key_error(
+            "Can't lock file \"/a/database/td.binlog\", because it is already in use; check for another program instance running"
+        ));
+        assert!(!is_wrong_key_error(
+            "Wrong database encryption key, and the file lock is held"
+        ));
+        assert!(!is_wrong_key_error("Valid api_id must be provided"));
+        assert!(!is_wrong_key_error("PHONE_NUMBER_INVALID"));
     }
 }
