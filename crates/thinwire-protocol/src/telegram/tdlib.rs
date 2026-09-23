@@ -1107,7 +1107,7 @@ async fn set_parameters(
         );
         return;
     };
-    let dir = tdlib_data_dir();
+    let dir = tdlib_data_dir(secrets.persists());
     // A folder whose key the vault lost can never open again. Move it aside
     // before the first try. This checks the vault before a new key is made.
     let has_key = secrets
@@ -1235,9 +1235,13 @@ fn generate_db_key() -> String {
     super::db_key::generate_db_key()
 }
 
-fn tdlib_data_dir() -> PathBuf {
+/// The TDLib folder. `THINWIRE_TDLIB_DIR` wins. Without a keychain that
+/// persists, each process uses its own temp folder (see [`data_dir::session_dir`]).
+fn tdlib_data_dir(persists: bool) -> PathBuf {
     if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
         PathBuf::from(dir)
+    } else if !persists {
+        data_dir::this_process_session_dir()
     } else {
         let mut base = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)

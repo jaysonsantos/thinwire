@@ -17,6 +17,19 @@ const STALE_MARK: &str = "stale";
 /// Most tries to find a free stale name in one second.
 const STALE_NAME_TRIES: u32 = 100;
 
+/// Throwaway folder for one process when the keychain cannot save the key.
+/// Its key lives in memory only, so the data cannot open after exit.
+#[must_use]
+pub(super) fn session_dir(temp: &Path, pid: u32) -> PathBuf {
+    temp.join(format!("thinwire-tdlib-session-{pid}"))
+}
+
+/// [`session_dir`] for this process, in the OS temp folder.
+#[must_use]
+pub(super) fn this_process_session_dir() -> PathBuf {
+    session_dir(&std::env::temp_dir(), std::process::id())
+}
+
 /// True when the folder exists and holds any entry.
 #[must_use]
 pub(super) fn has_data(dir: &Path) -> bool {
@@ -128,6 +141,14 @@ mod tests {
         assert_ne!(first, second);
         assert!(second.to_string_lossy().ends_with("tdlib.stale-7-1"));
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_memory_only_session_gets_its_own_temp_folder() {
+        let temp = Path::new("/tmp");
+        let first = session_dir(temp, 41);
+        assert_eq!(first, Path::new("/tmp/thinwire-tdlib-session-41"));
+        assert_ne!(first, session_dir(temp, 42), "one folder per process");
     }
 
     #[test]

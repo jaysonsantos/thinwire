@@ -568,6 +568,10 @@ impl TelegramSecretVault for SecretStore {
             tracing::warn!(error = %error, "memory secret write failed");
         }
     }
+
+    fn persists(&self) -> bool {
+        self.persistence() != Persistence::ThisSession
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,6 +928,22 @@ mod tests {
         store.set(SecretKey::Session, "keep").expect("set");
         store.set(SecretKey::Session, "  ").expect("clear");
         assert_eq!(store.get(SecretKey::Session).expect("get"), None);
+    }
+
+    #[test]
+    fn only_a_memory_only_store_asks_for_a_throwaway_tdlib_folder() {
+        assert!(!TelegramSecretVault::persists(&SecretStore::memory()));
+        let ready = SecretStore::blank(AttachPhase::Detached);
+        assert!(
+            TelegramSecretVault::persists(&ready),
+            "loading counts as saved"
+        );
+        ready.complete_ready_attach_for_test(&[]);
+        ready.set_backend_for_test(OsBackend::KernelKeyring);
+        assert!(
+            TelegramSecretVault::persists(&ready),
+            "keyutils keeps the key until restart; the stale-folder move covers that"
+        );
     }
 
     #[test]

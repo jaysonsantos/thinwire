@@ -99,6 +99,13 @@ impl fmt::Debug for TelegramSecretKey {
 pub trait TelegramSecretVault: Send + Sync {
     fn get_secret(&self, key: TelegramSecretKey) -> Option<String>;
     fn set_secret(&self, key: TelegramSecretKey, value: &str);
+
+    /// `false` when values live in memory only and are lost at exit. The
+    /// TDLib database then uses a throwaway folder, so a key that cannot be
+    /// saved never protects the folder on disk.
+    fn persists(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory vault used by tests and as the UI-side map.

@@ -751,6 +751,16 @@ mod tests {
     }
 
     #[test]
+    fn live_tdlib_uses_a_throwaway_folder_without_a_saving_keychain() {
+        let src = include_str!("tdlib.rs");
+        let params = fn_body(src, "async fn set_parameters");
+        assert!(params.contains("tdlib_data_dir(secrets.persists())"));
+        let dir = fn_body(src, "fn tdlib_data_dir");
+        assert!(dir.contains("data_dir::this_process_session_dir()"));
+        assert!(TelegramSecretVault::persists(&MemorySecretVault::new()));
+    }
+
+    #[test]
     fn live_tdlib_has_one_receive_thread_for_the_process() {
         let src = include_str!("tdlib.rs");
         assert_eq!(src.matches("tdlib_rs::receive()").count(), 1);
