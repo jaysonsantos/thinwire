@@ -38,8 +38,10 @@ struct ApiState {
     exchanged: Vec<SlackCodeExchange>,
     identify_error: Option<SlackApiError>,
     pages: Vec<SlackChannelPage>,
+    list_error: Option<SlackApiError>,
     history: HashMap<String, Vec<SlackPost>>,
     history_error: Option<SlackApiError>,
+    post_error: Option<SlackApiError>,
     users: HashMap<String, String>,
     posted: Vec<(String, String)>,
     next_ts: u64,
@@ -156,6 +158,9 @@ impl SlackWebApi for FakeApi {
                 "conversations.list {}",
                 cursor.as_deref().unwrap_or("-")
             ));
+            if let Some(error) = state.list_error.clone() {
+                return Err(error);
+            }
             let index = usize::from(cursor.is_some());
             Ok(state.pages.get(index).cloned().unwrap_or_default())
         })
@@ -187,6 +192,9 @@ impl SlackWebApi for FakeApi {
         Self::check_token(token);
         self.with(|state| {
             state.calls.push(format!("chat.postMessage {channel}"));
+            if let Some(error) = state.post_error.clone() {
+                return Err(error);
+            }
             state.posted.push((channel.into(), text.into()));
             state.next_ts += 1;
             Ok(post(
@@ -659,6 +667,98 @@ async fn app_uninstall_event_clears_the_install() {
     );
     assert!(h.socket.stopped.load(Ordering::SeqCst));
     assert_eq!(h.vault.get_secret(SlackSecretKey::BotToken), None);
+}
+
+#[tokio::test]
+async fn network_error_on_channel_list_keeps_the_install() {
+    let api = FakeApi::workspace();
+    api.with(|state| state.list_error = Some(SlackApiError::Network));
+    let mut h = Harness::new(api, installed_vault(), true);
+    h.start();
+    let detail = h.status(AdapterStatus::Error).await;
+    assert!(detail.contains("could not reach Slack"));
+    assert_eq!(
+        h.vault.get_secret(SlackSecretKey::BotToken).as_deref(),
+        Some(BOT_TOKEN)
+    );
+    assert_eq!(
+        h.vault.get_secret(SlackSecretKey::TeamId).as_deref(),
+        Some("T1")
+    );
+    assert!(
+        !h.seen
+            .iter()
+            .any(|event| matches!(event, AdapterEvent::ConversationUpsert { .. }))
+    );
+
+    h.api.with(|state| state.list_error = None);
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    h.conversation("slack:C1").await;
+}
+
+#[tokio::test]
+async fn rate_limit_on_send_keeps_the_install() {
+    let mut h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.api
+        .with(|state| state.post_error = Some(SlackApiError::RateLimited));
+    h.send(AdapterCommand::SendText {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        body: "not sent".into(),
+    });
+    let detail = h.status(AdapterStatus::Error).await;
+    assert!(detail.contains("rate limit"));
+    assert!(h.api.with(|state| state.posted.is_empty()));
+    assert!(!h.seen.iter().any(|event| {
+        matches!(event, AdapterEvent::MessageReceived { message } if message.body == "not sent")
+    }));
+    assert_eq!(
+        h.vault.get_secret(SlackSecretKey::BotToken).as_deref(),
+        Some(BOT_TOKEN)
+    );
+
+    h.api.with(|state| state.post_error = None);
+    h.send(AdapterCommand::SendText {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        body: "sent after the limit".into(),
+    });
+    h.message("sent after the limit").await;
+}
+
+#[tokio::test]
+async fn revoked_token_on_history_stops_the_session() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let api = FakeApi::workspace();
+    let mut h = Harness::new(api, vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    assert!(h.socket.connected());
+    h.api.with(|state| {
+        state.history_error = Some(SlackApiError::api("token_revoked"));
+    });
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    assert!(
+        h.status(AdapterStatus::Error)
+            .await
+            .contains("access ended")
+    );
+    assert_eq!(h.vault.get_secret(SlackSecretKey::BotToken), None);
+    assert_eq!(h.vault.get_secret(SlackSecretKey::TeamId), None);
+    assert!(h.socket.stopped.load(Ordering::SeqCst));
+    assert!(
+        !h.seen
+            .iter()
+            .any(|event| matches!(event, AdapterEvent::MessageReceived { .. }))
+    );
 }
 
 #[tokio::test]

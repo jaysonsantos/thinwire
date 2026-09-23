@@ -414,7 +414,7 @@ where
         let identity = match self.deps.api.identify(&token).await {
             Ok(identity) => identity,
             Err(error) => {
-                self.api_failed(&error);
+                self.api_failed(&error).await;
                 return;
             }
         };
@@ -486,21 +486,22 @@ where
         if self.live.is_none() {
             return;
         }
+        self.end_access().await;
+    }
+
+    /// The bot token no longer works. Stop Socket Mode and drop the install.
+    async fn end_access(&mut self) {
         self.stop_live().await;
         self.deps.vault.set_secret(SlackSecretKey::BotToken, "");
         self.deps.vault.set_secret(SlackSecretKey::TeamId, "");
         self.status(AdapterStatus::Error, DETAIL_ENDED);
     }
 
-    fn api_failed(&mut self, error: &SlackApiError) {
+    async fn api_failed(&mut self, error: &SlackApiError) {
         if let SlackApiError::Api(code) = error
             && TOKEN_ENDED.contains(&code.as_str())
         {
-            self.live = None;
-            self.channels.clear();
-            self.deps.vault.set_secret(SlackSecretKey::BotToken, "");
-            self.deps.vault.set_secret(SlackSecretKey::TeamId, "");
-            self.status(AdapterStatus::Error, DETAIL_ENDED);
+            self.end_access().await;
             return;
         }
         if matches!(error, SlackApiError::Api(code) if code == "not_in_channel") {
@@ -523,7 +524,7 @@ where
         let page = match self.deps.api.list_channels(&token, cursor).await {
             Ok(page) => page,
             Err(error) => {
-                self.api_failed(&error);
+                self.api_failed(&error).await;
                 return;
             }
         };
@@ -603,7 +604,7 @@ where
         let posts = match self.deps.api.history(&token, channel, HISTORY_LIMIT).await {
             Ok(posts) => posts,
             Err(error) => {
-                self.api_failed(&error);
+                self.api_failed(&error).await;
                 return;
             }
         };
@@ -634,7 +635,7 @@ where
                 let message = self.chat_message(&token, post).await;
                 emit_message(&self.events, message);
             }
-            Err(error) => self.api_failed(&error),
+            Err(error) => self.api_failed(&error).await,
         }
     }
 
