@@ -22,7 +22,7 @@ fn main() -> eframe::Result<()> {
             let settings = app::Settings::load();
             // First paint follows the stored mode. Missing file → System (ADR 0005).
             settings.apply(&cc.egui_ctx);
-            Ok(Box::new(app::ThinwireApp::new(settings)))
+            Ok(Box::new(app::ThinwireApp::new(settings, &cc.egui_ctx)))
         }),
     )
 }

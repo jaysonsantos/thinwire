@@ -28,6 +28,92 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll step while `on_exit` waits for a late shutdown.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
+/// What to do on a stop signal (SIGTERM, SIGINT, or Ctrl+C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalAction {
+    /// First signal: close the window through the close gate, as the button does.
+    CloseWindow,
+    /// A later signal: the user insists. Exit now, without the TDLib close.
+    ExitNow,
+}
+
+const fn on_stop_signal(seen_before: u32) -> SignalAction {
+    if seen_before == 0 {
+        SignalAction::CloseWindow
+    } else {
+        SignalAction::ExitNow
+    }
+}
+
+/// Exit code for a forced exit after a second stop signal (128 + SIGINT).
+const FORCED_EXIT_CODE: i32 = 130;
+
+/// Turn stop signals into a window close, so the close gate closes TDLib.
+/// Without this, a desktop logout or `kill` ends the process with TDLib open.
+fn close_on_stop_signal(runtime: &tokio::runtime::Handle, ctx: egui::Context) {
+    runtime.spawn(async move {
+        let Some(mut signals) = StopSignals::install() else {
+            tracing::warn!("stop signal handlers were not installed");
+            return;
+        };
+        let mut seen = 0;
+        while signals.recv().await {
+            match on_stop_signal(seen) {
+                SignalAction::CloseWindow => {
+                    tracing::info!("stop signal; closing the window");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ctx.request_repaint();
+                }
+                SignalAction::ExitNow => {
+                    tracing::warn!("second stop signal; exiting without closing Telegram");
+                    std::process::exit(FORCED_EXIT_CODE);
+                }
+            }
+            seen += 1;
+        }
+    });
+}
+
+/// SIGTERM and SIGINT on Unix. Ctrl+C elsewhere.
+#[cfg(unix)]
+struct StopSignals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl StopSignals {
+    fn install() -> Option<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Some(Self {
+            terminate: signal(SignalKind::terminate()).ok()?,
+            interrupt: signal(SignalKind::interrupt()).ok()?,
+        })
+    }
+
+    /// `false` when the signal stream ended.
+    async fn recv(&mut self) -> bool {
+        tokio::select! {
+            got = self.terminate.recv() => got.is_some(),
+            got = self.interrupt.recv() => got.is_some(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct StopSignals;
+
+#[cfg(not(unix))]
+impl StopSignals {
+    fn install() -> Option<Self> {
+        Some(Self)
+    }
+
+    async fn recv(&mut self) -> bool {
+        tokio::signal::ctrl_c().await.is_ok()
+    }
+}
+
 /// What to do with a window close request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseAction {
@@ -90,7 +176,7 @@ pub struct ThinwireApp {
 
 impl ThinwireApp {
     #[must_use]
-    pub fn new(settings: Settings) -> Self {
+    pub fn new(settings: Settings, ctx: &egui::Context) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime for protocol adapters");
         let secrets = SecretStore::for_ui(runtime.handle());
         let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
@@ -104,6 +190,7 @@ impl ThinwireApp {
         // before that blocking read finishes, so arm it again once a token
         // is in memory. The hook sends a command; it does not touch the OS store.
         bind_discord_after_hydrate(&secrets, &host);
+        close_on_stop_signal(runtime.handle(), ctx.clone());
         let mut snapshot = Snapshot::new();
         snapshot.status_text = secret_store_status_text(secrets.backend_name());
         Self {
@@ -321,6 +408,22 @@ mod tests {
         assert!(gate.poll(start, true));
         assert!(!gate.poll(start, true), "close fires once");
         assert_eq!(gate.on_close_requested(start), CloseAction::Allow);
+    }
+
+    #[test]
+    fn first_stop_signal_closes_the_window_and_a_second_one_exits() {
+        assert_eq!(on_stop_signal(0), SignalAction::CloseWindow);
+        assert_eq!(on_stop_signal(1), SignalAction::ExitNow);
+        assert_eq!(on_stop_signal(5), SignalAction::ExitNow);
+        let src = include_str!("mod.rs");
+        let spawn = &src[src.find("fn close_on_stop_signal").expect("fn")..];
+        let spawn = &spawn[..spawn.find("\n}\n").expect("end")];
+        assert!(
+            spawn.contains("ViewportCommand::Close"),
+            "a signal goes through the same close gate as the button"
+        );
+        assert!(src.contains("SignalKind::terminate()"));
+        assert!(src.contains("SignalKind::interrupt()"));
     }
 
     #[test]
