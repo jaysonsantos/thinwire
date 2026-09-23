@@ -1,4 +1,6 @@
-# Unsigned OS zips on main only. These are not releases.
+# Unsigned OS artifacts on main only. These are not releases.
+# actions/upload-artifact is the only zip layer. Do not archive the payload first.
+# macOS uploads an unsigned Thinwire.app. Linux and Windows upload a flat payload.
 # pull_request never triggers this workflow, and the job also refuses non-main pushes.
 #
 # TELEGRAM_API_ID and TELEGRAM_API_HASH are publisher Telegram app credentials.
@@ -100,105 +102,13 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: cargo build --release -p thinwire --features telegram-tdlib
 
-      - name: Zip unsigned binary
+      - name: Stage unsigned payload
         shell: bash
-        env:
-          ARTIFACT: ${{ matrix.artifact }}
-        run: |
-          set -euo pipefail
-          # Notices land in dist before make_archive. The tdlib-rs prebuilt
-          # zip has no license file. This copy is the Boost Software License
-          # from tdlib/td 11e254af695060d8890024dd7faa1cc2d6685ef8 (1.8.61).
-          mkdir -p dist/THIRD_PARTY_NOTICES
-          cp LICENSE dist/LICENSE
-          tdlib_license=third_party/tdlib/LICENSE_1_0.txt
-          if [[ ! -f "$tdlib_license" ]]; then
-            echo "::error::Missing vendored TDLib Boost license at ${tdlib_license}."
-            exit 1
-          fi
-          cp "$tdlib_license" dist/THIRD_PARTY_NOTICES/tdlib-LICENSE_1_0.txt
-          copy_llvm_notice() {
-            local lib="$1"
-            local owner=""
-            local pkg=""
-            local doc=""
-            local real=""
-            owner=$(dpkg -S "$lib" 2>/dev/null || true)
-            owner=${owner%%$'\n'*}
-            if [[ -z "$owner" ]]; then
-              real=$(readlink -f "$lib")
-              owner=$(dpkg -S "$real" 2>/dev/null || true)
-              owner=${owner%%$'\n'*}
-            fi
-            if [[ -z "$owner" ]]; then
-              echo "::error::No package owns ${lib}; refusing to ship it without its redistribution notice."
-              exit 1
-            fi
-            pkg=${owner%%: /*}
-            pkg=${pkg%%:*}
-            doc="/usr/share/doc/${pkg}/copyright"
-            if [[ ! -f "$doc" ]]; then
-              echo "::error::Redistribution notice missing at ${doc} for ${lib}."
-              exit 1
-            fi
-            cp "$doc" "dist/THIRD_PARTY_NOTICES/${pkg}.copyright"
-            # Debian copyright defers the Apache 2.0 text to this path.
-            # The zip is not a Debian system, so ship the license itself.
-            if grep -q "/usr/share/common-licenses/Apache-2.0" "$doc"; then
-              apache=/usr/share/common-licenses/Apache-2.0
-              if [[ ! -f "$apache" ]]; then
-                echo "::error::LLVM copyright at ${doc} points at ${apache}, which is missing."
-                exit 1
-              fi
-              cp "$apache" dist/THIRD_PARTY_NOTICES/Apache-2.0
-            fi
-          }
-          if [[ -f target/release/thinwire.exe ]]; then
-            cp target/release/thinwire.exe dist/
-            bin=dist/thinwire.exe
-          else
-            cp target/release/thinwire dist/
-            bin=dist/thinwire
-          fi
-          if [[ "$(uname -s)" == "Linux" ]]; then
-            # Static TDLib still loads the LLVM C++ runtime. Ship those sonames
-            # beside the binary. Do not copy libc or other system loaders.
-            copied=0
-            while IFS= read -r lib; do
-              if [[ -z "$lib" || ! -f "$lib" ]]; then
-                echo "::error::Linux zip is missing a TDLib C++ runtime library. Refusing to upload a binary that cannot load TDLib."
-                exit 1
-              fi
-              so="dist/$(basename "$lib")"
-              cp -L "$lib" "$so"
-              # On the runtime itself, so libc++abi and libunwind resolve from
-              # $ORIGIN whether patchelf writes DT_RPATH or DT_RUNPATH.
-              patchelf --set-rpath '$ORIGIN' "$so"
-              copy_llvm_notice "$lib"
-              copied=$((copied + 1))
-            done < <(ldd "$bin" | awk '/libc\+\+\.so|libc\+\+abi\.so|libunwind\.so/ { print $3 }')
-            if [[ "$copied" -lt 1 ]]; then
-              echo "::error::Linux zip did not find the LLVM C++ runtime required by static TDLib. Refusing to upload."
-              exit 1
-            fi
-            patchelf --set-rpath '$ORIGIN' "$bin"
-          fi
-          if command -v python3 >/dev/null; then
-            PY=python3
-          else
-            PY=python
-          fi
-          "$PY" - <<'PY'
-          import os
-          import shutil
-
-          name = os.environ["ARTIFACT"]
-          shutil.make_archive(f"thinwire-{name}", "zip", "dist")
-          PY
+        run: scripts/stage-os-artifact.sh
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: thinwire-${{ matrix.artifact }}
-          path: thinwire-${{ matrix.artifact }}.zip
+          path: dist/
           if-no-files-found: error
           retention-days: 7
