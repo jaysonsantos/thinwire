@@ -396,7 +396,7 @@ async fn next_command(
 
 async fn request_close(client_id: i32) {
     if let Err(error) = tdlib_rs::functions::close(client_id).await {
-        tracing::warn!(code = error.code, "tdlib close request failed");
+        log_tdlib_error("close", &error);
     }
 }
 
@@ -486,6 +486,7 @@ async fn apply_step(
 /// Report why TDLib refused a login step, then the `Failed` phase.
 /// Only the error name and code are read; the typed value is never echoed.
 fn reject_step(events: &EventTx, error: &tdlib_rs::types::Error) {
+    log_tdlib_error("login step", error);
     let reason: TelegramAuthError =
         super::auth_error::auth_error_from_tdlib(error.code, &error.message);
     emit_telegram_auth_rejected(events, reason);
@@ -713,6 +714,7 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
         }
         tdlib_rs::enums::Update::MessageSendFailed(update) => {
             if emit {
+                log_tdlib_error("sendMessage (update)", &update.error);
                 let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
                 emit_mapped_message(events, &update.message, live, Some(old_id));
                 emit_status(
@@ -882,12 +884,15 @@ async fn load_main_chats(client_id: i32, authorized: bool, events: &EventTx) {
             AdapterStatus::Ready,
             "Telegram chat list is up to date.",
         ),
-        Err(error) => emit_status(
-            events,
-            ProtocolId::Telegram,
-            AdapterStatus::Error,
-            format!("Could not load Telegram chats (TDLib {}).", error.code),
-        ),
+        Err(error) => {
+            log_tdlib_error("loadChats", &error);
+            emit_status(
+                events,
+                ProtocolId::Telegram,
+                AdapterStatus::Error,
+                format!("Could not load Telegram chats (TDLib {}).", error.code),
+            );
+        }
     }
     emit_chat_list_loaded(events, ProtocolId::Telegram);
 }
@@ -942,6 +947,7 @@ async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &E
                 && let Err(error) =
                     tdlib_rs::functions::view_messages(chat_id, viewed, None, true, client_id).await
             {
+                log_tdlib_error("viewMessages", &error);
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -957,12 +963,15 @@ async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &E
                 "Recent messages loaded.",
             );
         }
-        Err(error) => emit_status(
-            events,
-            ProtocolId::Telegram,
-            AdapterStatus::Error,
-            format!("Could not load messages (TDLib {}).", error.code),
-        ),
+        Err(error) => {
+            log_tdlib_error("getChatHistory", &error);
+            emit_status(
+                events,
+                ProtocolId::Telegram,
+                AdapterStatus::Error,
+                format!("Could not load messages (TDLib {}).", error.code),
+            );
+        }
     }
 }
 
@@ -1008,12 +1017,15 @@ async fn send_text(
         Ok(tdlib_rs::enums::Message::Message(message)) => {
             emit_mapped_message(events, &message, live, None);
         }
-        Err(error) => emit_status(
-            events,
-            ProtocolId::Telegram,
-            AdapterStatus::Error,
-            format!("Telegram did not send the message (TDLib {}).", error.code),
-        ),
+        Err(error) => {
+            log_tdlib_error("sendMessage", &error);
+            emit_status(
+                events,
+                ProtocolId::Telegram,
+                AdapterStatus::Error,
+                format!("Telegram did not send the message (TDLib {}).", error.code),
+            );
+        }
     }
 }
 
@@ -1067,6 +1079,7 @@ async fn resend(
             }
         }
         Err(error) => {
+            log_tdlib_error("resendMessages", &error);
             failed();
             emit_status(
                 events,

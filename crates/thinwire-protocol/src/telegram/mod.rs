@@ -761,6 +761,37 @@ mod tests {
     }
 
     #[test]
+    fn every_tdlib_error_goes_through_the_safe_log() {
+        let src = include_str!("tdlib.rs");
+        for request in [
+            "\"sendMessage (update)\"",
+            "\"close\"",
+            "\"login step\"",
+            "\"loadChats\"",
+            "\"viewMessages\"",
+            "\"getChatHistory\"",
+            "\"sendMessage\"",
+            "\"resendMessages\"",
+            "\"setTdlibParameters\"",
+        ] {
+            assert!(
+                src.contains(&format!("log_tdlib_error({request}")),
+                "{request}"
+            );
+        }
+        assert_eq!(
+            fn_body(src, "fn reject_step")
+                .matches("log_tdlib_error(")
+                .count(),
+            1,
+            "the three login arms log through reject_step"
+        );
+        let log = fn_body(src, "fn log_tdlib_error");
+        assert!(log.contains("loggable_tdlib_message(&error.message)"));
+        assert!(!log.contains("error.message,"), "raw text is never logged");
+    }
+
+    #[test]
     fn live_tdlib_has_one_receive_thread_for_the_process() {
         let src = include_str!("tdlib.rs");
         assert_eq!(src.matches("tdlib_rs::receive()").count(), 1);
