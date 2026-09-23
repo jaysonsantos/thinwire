@@ -887,14 +887,27 @@ impl Snapshot {
         }
     }
 
+    /// Enter runs the main button of the center screen. Escape cancels a login.
+    /// Compose handles its own Enter, so the thread view ignores keys here.
+    pub(crate) fn center_key(&mut self, key: AuthKey, store: &SecretStore) {
+        match self.center_view() {
+            CenterView::FirstRun => {
+                if key == AuthKey::Enter {
+                    self.open_telegram(store);
+                }
+            }
+            CenterView::Auth => self.auth_key(key, store),
+            CenterView::Resuming { .. } | CenterView::Thread => {}
+        }
+    }
+
     /// Enter submits the current login step. Escape cancels the login.
     pub(crate) fn auth_key(&mut self, key: AuthKey, store: &SecretStore) {
-        if self.auth == AuthScreen::Idle {
-            return;
-        }
-        match key {
-            AuthKey::Enter => self.advance_telegram(store),
-            AuthKey::Escape => self.cancel_auth(store),
+        match (key, self.auth) {
+            (_, AuthScreen::Idle) => {}
+            (AuthKey::Escape, _) => self.cancel_auth(store),
+            (AuthKey::Enter, AuthScreen::NeedCredentials) => self.open_api_override(store),
+            (AuthKey::Enter, _) => self.advance_telegram(store),
         }
     }
 
@@ -2166,6 +2179,61 @@ mod tests {
             1,
             "one notice only"
         );
+    }
+
+    #[test]
+    fn enter_runs_the_main_button_on_each_center_screen() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        let mut snapshot = Snapshot::new();
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+        snapshot.center_key(AuthKey::Enter, &store);
+        assert_eq!(
+            snapshot.auth,
+            AuthScreen::TelegramPhone,
+            "Enter = Add Telegram"
+        );
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ApiCredentials]
+        );
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.center_key(AuthKey::Enter, &store);
+        assert_eq!(auth_steps(&mut snapshot), vec![TelegramAuthStep::Phone]);
+        snapshot.center_key(AuthKey::Escape, &store);
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+
+        let missing = SecretStore::memory();
+        let mut no_api = Snapshot::with_api_source(TelegramApiSource::empty());
+        no_api.center_key(AuthKey::Enter, &missing);
+        assert_eq!(no_api.auth, AuthScreen::NeedCredentials);
+        no_api.center_key(AuthKey::Enter, &missing);
+        assert_eq!(no_api.auth, AuthScreen::TelegramApi, "Enter = Advanced");
+
+        let mut ready = ready_with_chats(&store);
+        ready.compose = "hi".into();
+        ready.center_key(AuthKey::Enter, &store);
+        assert!(
+            ready.take_commands().is_empty(),
+            "compose owns Enter in the thread"
+        );
+    }
+
+    #[test]
+    fn keys_are_read_once_in_the_center_panel() {
+        let auth = include_str!("auth.rs");
+        assert!(
+            !auth.contains("key_pressed"),
+            "auth.rs does not read keys again"
+        );
+        let ui = include_str!("ui.rs");
+        let center = &ui[ui.find("fn center_panel(").expect("center")..];
+        let center = &center[..center.find("\nfn ").expect("next")];
+        assert!(center.contains("center_key(AuthKey::Enter"));
+        assert!(center.contains("center_key(AuthKey::Escape"));
     }
 
     #[test]

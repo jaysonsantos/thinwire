@@ -6,7 +6,7 @@ use eframe::egui::{self, Color32, RichText};
 use thinwire_protocol::{TelegramAuthError, TelegramCodeVia};
 
 use super::secrets::SecretStore;
-use super::snapshot::{AuthKey, AuthScreen, Snapshot};
+use super::snapshot::{AuthScreen, Snapshot};
 
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
 const WARN: Color32 = Color32::from_rgb(214, 160, 64);
@@ -39,12 +39,6 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
     if snapshot.auth == AuthScreen::Idle {
         return;
     }
-    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-        snapshot.auth_key(AuthKey::Escape, secrets);
-        return;
-    }
-    let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
-
     ui.separator();
     ui.heading(auth_heading(snapshot.auth));
     if let Some(banner) = stub_banner(snapshot) {
@@ -79,10 +73,6 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
     ui.add_space(8.0);
     if ui.button("Cancel").clicked() {
         snapshot.cancel_auth(secrets);
-        return;
-    }
-    if enter {
-        snapshot.auth_key(AuthKey::Enter, secrets);
     }
 }
 

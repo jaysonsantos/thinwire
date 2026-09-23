@@ -10,7 +10,8 @@ use super::auth;
 use super::secrets::SecretStore;
 use super::settings::{Settings, ThemeMode};
 use super::snapshot::{
-    AccountRow, CenterView, InboxFilter, InboxState, RESUME_CONNECTING, Snapshot, ThreadState,
+    AccountRow, AuthKey, CenterView, InboxFilter, InboxState, RESUME_CONNECTING, Snapshot,
+    ThreadState,
 };
 use super::thread_layout::{RowLayout, list_time, thread_rows};
 
@@ -287,11 +288,25 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
 }
 
 fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    egui::CentralPanel::default().show(ui, |ui| match snapshot.center_view() {
-        CenterView::Auth => auth::draw(ui, snapshot, secrets),
-        CenterView::Resuming { connecting } => resuming(ui, connecting),
-        CenterView::FirstRun => first_run(ui, snapshot, secrets),
-        CenterView::Thread => thread(ui, snapshot),
+    egui::CentralPanel::default().show(ui, |ui| {
+        // Keys first, before a text field can take Enter. One press, one action.
+        let (enter, escape) = ui.input(|input| {
+            (
+                input.key_pressed(egui::Key::Enter),
+                input.key_pressed(egui::Key::Escape),
+            )
+        });
+        if escape {
+            snapshot.center_key(AuthKey::Escape, secrets);
+        } else if enter {
+            snapshot.center_key(AuthKey::Enter, secrets);
+        }
+        match snapshot.center_view() {
+            CenterView::Auth => auth::draw(ui, snapshot, secrets),
+            CenterView::Resuming { connecting } => resuming(ui, connecting),
+            CenterView::FirstRun => first_run(ui, snapshot, secrets),
+            CenterView::Thread => thread(ui, snapshot),
+        }
     });
 }
 
