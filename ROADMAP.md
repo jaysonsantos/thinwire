@@ -46,7 +46,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 
 - [ ] #34 — WhatsApp experimental linked-device inbox (feature `whatsapp-web`, `0001`). Local-only AGPL (`0011`). Release builds and OS zips never enable it. Honest ToS labels. Full-screen ToS/ban gate before QR or pair. Never call it reliable.
 - [ ] #44 — close during WhatsApp startup reports Stopped before the bot handle exists.
-- [ ] #35 — Discord bot/OAuth guild inbox (feature `discord-bot`, `0009`). No self-bots, no user tokens, no personal DMs. Not a personal client. The Telegram wait is gone on `main` (#40).
+- [ ] #35 — Discord bot/OAuth guild inbox (feature `discord-bot`, `0009`). Lists readable guild channels, loads history, and sends as the bot. No gateway yet. No self-bots, no user tokens, no personal DMs. Not a personal client. The Telegram wait is gone on `main` (#40).
 - [ ] #36 — Slack workspace-app OAuth inbox (feature `slack-oauth`, `0008`). Official OAuth v2 only. Not a personal desktop clone.
 
 ### Local-only AGPL
@@ -60,7 +60,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 ## Spike (scaffold, not the default UI)
 
 - `whatsapp-web` — experimental linked-device scaffold on `whatsapp-rust` (oxidezap), git revision pinned the same way ZapFast pins it. Local-only AGPL (`wacore-libsignal`, `0011`). Off unless that cargo feature is enabled. Default CI does not enable it. Release builds and OS zips never enable it. No ready WhatsApp account in the default build. Full-screen ToS/ban gate before QR or pair. Work continues in #34.
-- `discord-bot` — bot/OAuth guild inbox scaffold on twilight (`0009`). Off by default. Not a personal Discord client. Work continues in #35.
+- `discord-bot` — bot/OAuth guild inbox on twilight HTTP (`0009`). Off by default. Shows when the feature is compiled. Not a personal Discord client. Work continues in #35.
 - `slack-oauth` — workspace-app OAuth v2 / Socket Mode scaffold on `slack-morphism` (`0008`). Off by default. No Slack auth UI in the default shell. Work continues in #36.
 
 ## Explicitly not next

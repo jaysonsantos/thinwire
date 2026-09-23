@@ -1,22 +1,35 @@
-//! Discord bot/OAuth inbox spike. User-account self-bots are refused.
+//! Discord bot/OAuth guild inbox. User-account self-bots are refused.
 //!
-//! Feature `discord-bot` compiles the twilight bot HTTP client and a guild
-//! inbox placeholder. Default builds stay "not ready" and do not emit that
-//! placeholder. The HTTP client is constructed on the adapter worker only.
-//! `Client::new` does not send a request or open a gateway.
+//! Feature `discord-bot` compiles the twilight bot HTTP backend. With a bot
+//! token in the vault, the adapter lists guild channels that the bot can read,
+//! loads recent history, and sends as the bot. Every HTTP call runs in a tokio
+//! task on the adapter worker. No gateway is opened yet. Default builds stay
+//! "not ready" and do not compile an HTTP client.
 
+#[cfg(any(test, feature = "discord-bot"))]
+mod api;
+#[cfg(test)]
+mod fake_api;
+#[cfg(any(test, feature = "discord-bot"))]
+mod inbox;
 mod install;
+#[cfg(any(test, feature = "discord-bot"))]
+mod permissions;
+#[cfg(any(test, feature = "discord-bot"))]
+mod session;
 mod token;
+#[cfg(feature = "discord-bot")]
+mod twilight;
 
 use std::fmt;
 use std::sync::Arc;
+#[cfg(any(test, feature = "discord-bot"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::adapter::{
     AccountState, AdapterCommand, AdapterError, AdapterStatus, DiscordAuthMode, EventTx,
     ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_account, emit_status,
 };
-#[cfg(feature = "discord-bot")]
-use super::adapter::{ChatMessage, Conversation, Delivery, emit_conversation, emit_message};
 use token::authorization_token;
 
 pub use install::DiscordOAuthInstall;
@@ -28,13 +41,23 @@ pub use token::{
 const CAPABILITY_DETAIL: &str = "Bot/OAuth inbox only. Not ready in this build. Enable feature discord-bot. No user-account self-bots or personal DMs.";
 
 #[cfg(feature = "discord-bot")]
-const CAPABILITY_DETAIL: &str = "Bot/OAuth guild inbox placeholder (twilight). Gateway is not started. No user-account self-bots or personal DMs.";
+const CAPABILITY_DETAIL: &str = "Bot/OAuth guild inbox (twilight HTTP). Lists guild channels the bot can read, loads recent history, and sends as the bot. No gateway yet. No user-account self-bots or personal DMs.";
 
 const NOT_READY_DETAIL: &str = "Discord bot inbox is not ready in this build. Enable feature discord-bot. No user-account client is compiled.";
+
+const NOT_READY_REASON: &str = "Discord bot inbox is not ready in this build";
+
+#[cfg(any(test, feature = "discord-bot"))]
+const NOT_CONNECTED_REASON: &str =
+    "Discord bot inbox is not connected. Store a bot token, then connect";
 
 const SELF_BOT_REFUSAL: &str = "Discord user-account / self-bot automation is refused. Bot/OAuth only. License-clean crates do not grant Discord permission to automate a personal account.";
 
 const USER_TOKEN_REFUSAL: &str = "Discord user-account tokens are refused. A Bearer prefix does not prove application or bot provenance or the bot scope, so it is not sent. The keychain slot accepts a bot token.";
+
+/// Refusal for a conversation id that is not in the last guild channel list.
+#[cfg(any(test, feature = "discord-bot"))]
+const UNKNOWN_CHANNEL_REFUSAL: &str = "That Discord conversation is not a guild channel the bot can read. Direct messages are out of scope.";
 
 /// Detail fragment present only after a bot token was accepted.
 const BOT_TOKEN_PRESENT: &str = "bot token is in the OS keychain";
@@ -52,33 +75,20 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: false,
 };
 
-#[cfg(feature = "discord-bot")]
-const PLACEHOLDER_CONVERSATION: &str = "discord:guild-inbox:general";
-
-#[cfg(feature = "discord-bot")]
-struct BotHttp {
-    client: twilight_http::Client,
-}
-
-#[cfg(feature = "discord-bot")]
-impl fmt::Debug for BotHttp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = &self.client;
-        f.write_str("BotHttp { token: <redacted>, gateway: not started }")
-    }
-}
-
-#[cfg(feature = "discord-bot")]
-enum TokenGate {
-    Missing,
-    Accepted,
-}
+/// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.
+#[cfg(any(test, feature = "discord-bot"))]
+type BackendFactory = Box<dyn Fn(String) -> Arc<dyn api::DiscordApi> + Send>;
 
 /// Constrained Discord adapter. Never starts a user-account client.
 pub struct DiscordAdapter {
     secrets: Arc<dyn DiscordSecretVault>,
-    #[cfg(feature = "discord-bot")]
-    http: Option<BotHttp>,
+    #[cfg(any(test, feature = "discord-bot"))]
+    backend: Option<BackendFactory>,
+    #[cfg(any(test, feature = "discord-bot"))]
+    session: Option<session::Session>,
+    /// Session generation. A bump makes running tasks drop their results.
+    #[cfg(any(test, feature = "discord-bot"))]
+    live: Arc<AtomicU64>,
 }
 
 impl DiscordAdapter {
@@ -87,8 +97,24 @@ impl DiscordAdapter {
         Self {
             secrets,
             #[cfg(feature = "discord-bot")]
-            http: None,
+            backend: Some(Box::new(|token| {
+                Arc::new(twilight::TwilightApi::new(token)) as Arc<dyn api::DiscordApi>
+            })),
+            #[cfg(all(test, not(feature = "discord-bot")))]
+            backend: None,
+            #[cfg(any(test, feature = "discord-bot"))]
+            session: None,
+            #[cfg(any(test, feature = "discord-bot"))]
+            live: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Adapter with an injected backend. Tests pass a fake here.
+    #[cfg(test)]
+    fn with_backend(secrets: Arc<dyn DiscordSecretVault>, backend: BackendFactory) -> Self {
+        let mut adapter = Self::new(secrets);
+        adapter.backend = Some(backend);
+        adapter
     }
 
     #[must_use]
@@ -108,8 +134,8 @@ impl DiscordAdapter {
 
     /// Linked-account marker for a guild inbox.
     ///
-    /// A missing-token placeholder is not linked. The bot token must be present
-    /// and the adapter must not be refused. Gateway `Ready` is not required.
+    /// A missing-token status is not linked. The bot token must be present
+    /// and the adapter must not be refused or in error.
     #[must_use]
     pub fn inbox_account_linked(status: AdapterStatus, detail: &str) -> bool {
         Self::bot_inbox_compiled()
@@ -138,18 +164,27 @@ impl DiscordAdapter {
     }
 
     fn connect_bot_inbox(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        self.stop_session();
         let prepared = self.prepared_token()?;
-        self.finish_connect(events, prepared)
-    }
-
-    #[cfg(not(feature = "discord-bot"))]
-    fn finish_connect(
-        &mut self,
-        events: &EventTx,
-        prepared: Option<String>,
-    ) -> Result<(), AdapterError> {
+        #[cfg(any(test, feature = "discord-bot"))]
+        if let Some(factory) = &self.backend {
+            match prepared {
+                None => emit_status(
+                    events,
+                    ProtocolId::Discord,
+                    AdapterStatus::Stubbed,
+                    format!(
+                        "Discord bot inbox. {BOT_TOKEN_MISSING}. Store a bot token to load guild channels. Not a personal Discord client."
+                    ),
+                ),
+                Some(token) => {
+                    let api = factory(token);
+                    self.session = Some(session::Session::start(api, &self.live, events));
+                }
+            }
+            return Ok(());
+        }
         drop(prepared);
-        self.clear_http();
         emit_status(
             events,
             ProtocolId::Discord,
@@ -159,90 +194,75 @@ impl DiscordAdapter {
         Ok(())
     }
 
-    #[cfg(feature = "discord-bot")]
-    fn finish_connect(
-        &mut self,
-        events: &EventTx,
-        prepared: Option<String>,
-    ) -> Result<(), AdapterError> {
-        let gate = match &prepared {
-            None => TokenGate::Missing,
-            Some(_) => TokenGate::Accepted,
-        };
-        self.arm_http(prepared);
-        self.emit_placeholder(events, &gate);
-        Ok(())
-    }
-
-    fn clear_http(&mut self) {
-        #[cfg(feature = "discord-bot")]
+    fn stop_session(&mut self) {
+        #[cfg(any(test, feature = "discord-bot"))]
         {
-            self.http = None;
+            self.live.fetch_add(1, Ordering::SeqCst);
+            self.session = None;
         }
     }
 
-    #[cfg(feature = "discord-bot")]
-    fn arm_http(&mut self, prepared: Option<String>) {
-        let _ = install::inbox_intents();
-        let _ = install::inbox_permissions();
-        let Some(token) = prepared else {
-            self.http = None;
-            return;
-        };
-        // Stores the token on the tokio worker. Does not send HTTP or open a gateway.
-        // The ratelimiter inside `Client::new` requires that worker's runtime.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        self.http = Some(BotHttp {
-            client: twilight_http::Client::new(token),
-        });
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn session_mut(&mut self) -> Result<&mut session::Session, AdapterError> {
+        if self.backend.is_none() {
+            return Err(not_ready());
+        }
+        self.session.as_mut().ok_or(AdapterError::Unavailable {
+            protocol: ProtocolId::Discord,
+            reason: NOT_CONNECTED_REASON,
+        })
     }
 
-    #[cfg(feature = "discord-bot")]
-    fn emit_placeholder(&self, events: &EventTx, gate: &TokenGate) {
-        let token_state = match gate {
-            TokenGate::Missing => BOT_TOKEN_MISSING,
-            TokenGate::Accepted => BOT_TOKEN_PRESENT,
-        };
-        let detail = format!(
-            "Discord bot inbox placeholder. {token_state}. Gateway is not started. Not a personal Discord client."
-        );
-        emit_status(events, ProtocolId::Discord, AdapterStatus::Stubbed, detail);
-        // Only this event links the account (the shell no longer reads the
-        // detail text). A missing token keeps it unlinked.
-        let state = match gate {
-            TokenGate::Missing => AccountState::Unlinked,
-            TokenGate::Accepted => AccountState::Linked,
-        };
-        emit_account(events, ProtocolId::Discord, state);
-        emit_conversation(
-            events,
-            Conversation {
-                protocol: ProtocolId::Discord,
-                id: PLACEHOLDER_CONVERSATION.into(),
-                title: "Bot inbox #general".into(),
-                participant: "guild channel".into(),
-                preview: "Bot/OAuth guild inbox placeholder. Not a personal Discord client.".into(),
-                unread: 1,
-                order: 0,
-                last_at: 0,
-                is_group: false,
-                writable: false,
-                placeholder: true,
-            },
-        );
-        emit_message(
-            events,
-            ChatMessage {
-                protocol: ProtocolId::Discord,
-                conversation_id: PLACEHOLDER_CONVERSATION.into(),
-                id: "discord:guild-inbox:general:1".into(),
-                sender: "thinwire".into(),
-                body: "Guild bot inbox placeholder. The gateway is not started. User-account and self-bot paths are refused.".into(),
-                outbound: false,
-                delivery: Delivery::Sent,
-                sent_at: 0,
-            },
-        );
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn load_chats(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        self.session_mut()?.reload(events);
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn open_chat(&mut self, conversation_id: String, events: &EventTx) -> Result<(), AdapterError> {
+        self.session_mut()?.open(conversation_id, events)
+    }
+
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn send_text(
+        &mut self,
+        conversation_id: String,
+        body: String,
+        events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        self.session_mut()?.send(conversation_id, body, events)
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn load_chats(&mut self, _events: &EventTx) -> Result<(), AdapterError> {
+        Err(not_ready())
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn open_chat(
+        &mut self,
+        _conversation_id: String,
+        _events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        Err(not_ready())
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn send_text(
+        &mut self,
+        _conversation_id: String,
+        _body: String,
+        _events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        Err(not_ready())
+    }
+}
+
+const fn not_ready() -> AdapterError {
+    AdapterError::Unavailable {
+        protocol: ProtocolId::Discord,
+        reason: NOT_READY_REASON,
     }
 }
 
@@ -251,7 +271,7 @@ impl fmt::Debug for DiscordAdapter {
         f.debug_struct("DiscordAdapter")
             .field("bot_inbox", &Self::bot_inbox_compiled())
             .field("token", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -280,6 +300,12 @@ impl ProtocolAdapter for DiscordAdapter {
         }
     }
 
+    /// Drop the bot session, then `Stopped`. Nothing is running until connect.
+    fn shutdown(&mut self, events: &EventTx) {
+        self.stop_session();
+        super::adapter::emit_stopped(events, ProtocolId::Discord);
+    }
+
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         match command {
             AdapterCommand::ConnectDiscord {
@@ -294,9 +320,9 @@ impl ProtocolAdapter for DiscordAdapter {
             AdapterCommand::Disconnect {
                 protocol: ProtocolId::Discord,
             } => {
-                self.clear_http();
+                self.stop_session();
                 let detail = if Self::bot_inbox_compiled() {
-                    "Discord bot inbox disconnected. Gateway was not started."
+                    "Discord bot inbox disconnected."
                 } else {
                     NOT_READY_DETAIL
                 };
@@ -304,6 +330,19 @@ impl ProtocolAdapter for DiscordAdapter {
                 emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
                 Ok(())
             }
+            AdapterCommand::LoadChats {
+                protocol: ProtocolId::Discord,
+            } => self.load_chats(events),
+            AdapterCommand::OpenChat {
+                protocol: ProtocolId::Discord,
+                conversation_id,
+            } => self.open_chat(conversation_id, events),
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Discord,
+                conversation_id,
+                body,
+                request: _,
+            } => self.send_text(conversation_id, body, events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Discord,
                 reason: "command is not handled by the Discord adapter",
@@ -314,17 +353,115 @@ impl ProtocolAdapter for DiscordAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tokio::sync::mpsc::unbounded_channel;
+    use std::time::Duration;
 
-    fn drain(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::AdapterEvent>,
-    ) -> Vec<crate::AdapterEvent> {
+    use super::fake_api::{
+        BOT_ID, FakeDiscordApi, GENERAL, GUILD, LOCKED_GUILD, NEWS, SECRET, VOICE,
+    };
+    use super::inbox::conversation_id;
+    use super::*;
+    use crate::AdapterEvent;
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    const FIXTURE_TOKEN: &str = "fixture-bot-token";
+
+    fn drain(rx: &mut UnboundedReceiver<AdapterEvent>) -> Vec<AdapterEvent> {
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
         }
         events
+    }
+
+    /// Collect events until `done` matches one. Fails after two seconds.
+    async fn until(
+        rx: &mut UnboundedReceiver<AdapterEvent>,
+        done: impl Fn(&AdapterEvent) -> bool,
+    ) -> Vec<AdapterEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("adapter event in time")
+                .expect("event channel open");
+            let stop = done(&event);
+            events.push(event);
+            if stop {
+                return events;
+            }
+        }
+    }
+
+    fn is_ready(event: &AdapterEvent) -> bool {
+        matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Ready,
+                ..
+            }
+        )
+    }
+
+    fn fake_adapter(
+        api: Arc<FakeDiscordApi>,
+        token: Option<&str>,
+    ) -> (DiscordAdapter, Arc<MemoryDiscordVault>) {
+        let vault = Arc::new(MemoryDiscordVault::new());
+        if let Some(token) = token {
+            vault.set_bot_token(token);
+        }
+        let adapter = DiscordAdapter::with_backend(
+            Arc::clone(&vault) as Arc<dyn DiscordSecretVault>,
+            Box::new(move |token| {
+                assert_eq!(token, FIXTURE_TOKEN, "backend gets the vault token");
+                Arc::clone(&api) as Arc<dyn api::DiscordApi>
+            }),
+        );
+        (adapter, vault)
+    }
+
+    /// Connect with the guild fixture and wait for the channel list.
+    async fn connected(
+        api: Arc<FakeDiscordApi>,
+    ) -> (
+        DiscordAdapter,
+        EventTx,
+        UnboundedReceiver<AdapterEvent>,
+        Vec<AdapterEvent>,
+    ) {
+        let (mut adapter, _vault) = fake_adapter(api, Some(FIXTURE_TOKEN));
+        let (tx, mut rx) = unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::ConnectDiscord {
+                    mode: DiscordAuthMode::Bot,
+                },
+                &tx,
+            )
+            .expect("connect");
+        let events = until(&mut rx, is_ready).await;
+        (adapter, tx, rx, events)
+    }
+
+    fn conversations(events: &[AdapterEvent]) -> Vec<&crate::Conversation> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ConversationUpsert { conversation } => Some(conversation),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn messages(events: &[AdapterEvent]) -> Vec<&crate::ChatMessage> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessageReceived { message } => Some(message),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -334,9 +471,9 @@ mod tests {
         assert!(!caps.allows_user_account_automation);
         assert!(caps.short_label.contains("bot/OAuth"));
         assert!(!caps.detail.to_ascii_lowercase().contains("reliable"));
-        assert!(!caps.detail.contains("personal Discord client is"));
+        assert!(caps.detail.contains("No user-account self-bots"));
         if DiscordAdapter::bot_inbox_compiled() {
-            assert!(caps.detail.contains("placeholder"));
+            assert!(caps.detail.contains("guild channels the bot can read"));
             assert!(!caps.detail.to_ascii_lowercase().contains("not ready"));
         } else {
             assert!(caps.detail.to_ascii_lowercase().contains("not ready"));
@@ -344,144 +481,347 @@ mod tests {
     }
 
     #[test]
-    fn feature_off_connect_is_not_ready_without_a_placeholder() {
-        let mut adapter = DiscordAdapter::memory();
-        let (tx, mut rx) = unbounded_channel();
-        adapter.start(tx.clone());
+    fn feature_off_connect_is_not_ready_without_conversations() {
         if DiscordAdapter::bot_inbox_compiled() {
             return;
         }
-        let events = drain(&mut rx);
-        assert!(events.iter().any(|event| match event {
-            crate::AdapterEvent::Status { detail, status, .. } => {
-                *status == AdapterStatus::Stubbed && detail.contains("not ready")
-            }
-            _ => false,
-        }));
-        assert!(events.iter().all(|event| {
-            !matches!(
-                event,
-                crate::AdapterEvent::ConversationUpsert { .. }
-                    | crate::AdapterEvent::MessageReceived { .. }
-            )
-        }));
-    }
-
-    #[test]
-    fn feature_on_emits_guild_inbox_placeholder_without_ready() {
-        if !DiscordAdapter::bot_inbox_compiled() {
-            return;
-        }
-        let mut adapter = DiscordAdapter::memory();
+        let vault = Arc::new(MemoryDiscordVault::new());
+        vault.set_bot_token(FIXTURE_TOKEN);
+        let mut adapter = DiscordAdapter::new(vault);
         let (tx, mut rx) = unbounded_channel();
-        adapter
-            .handle(
-                AdapterCommand::ConnectDiscord {
-                    mode: DiscordAuthMode::Bot,
-                },
-                &tx,
-            )
-            .expect("placeholder");
+        adapter.start(tx.clone());
         let events = drain(&mut rx);
-        let mut saw_guild = false;
-        for event in &events {
-            let rendered = format!("{event:?}");
-            assert!(!rendered.contains("fixture"));
-            match event {
-                crate::AdapterEvent::Status { status, detail, .. } => {
-                    assert_ne!(*status, AdapterStatus::Ready);
-                    assert!(detail.contains("placeholder"));
-                    assert!(detail.contains("not in the OS keychain"));
-                }
-                crate::AdapterEvent::ConversationUpsert { conversation } => {
-                    assert!(conversation.id.contains("guild-inbox"));
-                    assert!(!conversation.id.contains("dm"));
-                    assert!(conversation.participant.contains("guild"));
-                    saw_guild = true;
-                }
-                crate::AdapterEvent::MessageReceived { message } => {
-                    assert!(message.body.contains("self-bot"));
-                    assert!(!message.body.to_ascii_lowercase().contains("reliable"));
-                }
-                _ => {}
-            }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { detail, status, .. }
+                if *status == AdapterStatus::Stubbed && detail.contains("not ready")
+        )));
+        assert!(conversations(&events).is_empty());
+        assert!(messages(&events).is_empty());
+        for command in [
+            AdapterCommand::LoadChats {
+                protocol: ProtocolId::Discord,
+            },
+            AdapterCommand::OpenChat {
+                protocol: ProtocolId::Discord,
+                conversation_id: conversation_id(GUILD, GENERAL),
+            },
+        ] {
+            assert!(matches!(
+                adapter.handle(command, &tx),
+                Err(AdapterError::Unavailable { .. })
+            ));
         }
-        assert!(saw_guild);
     }
 
     #[tokio::test]
-    async fn stored_bot_token_is_not_logged_and_does_not_mark_ready() {
-        if !DiscordAdapter::bot_inbox_compiled() {
-            return;
-        }
-        let vault = Arc::new(MemoryDiscordVault::new());
-        vault.set_bot_token("fixture-bot-token");
-        let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
+    async fn missing_token_is_stubbed_and_not_linked() {
+        let (mut adapter, _vault) = fake_adapter(Arc::new(FakeDiscordApi::guild_fixture()), None);
         let (tx, mut rx) = unbounded_channel();
+        adapter.start(tx.clone());
+        let events = drain(&mut rx);
+        assert!(conversations(&events).is_empty());
+        let Some(AdapterEvent::Status { status, detail, .. }) = events.first() else {
+            panic!("missing-token status");
+        };
+        assert_eq!(*status, AdapterStatus::Stubbed);
+        assert!(detail.contains(BOT_TOKEN_MISSING));
+        assert!(!DiscordAdapter::inbox_account_linked(*status, detail));
+        assert!(matches!(
+            adapter.handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord
+                },
+                &tx
+            ),
+            Err(AdapterError::Unavailable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn channel_list_shows_only_readable_guild_text_channels() {
+        let (_adapter, _tx, _rx, events) =
+            connected(Arc::new(FakeDiscordApi::guild_fixture())).await;
+        let rendered = format!("{events:?}");
+        assert!(!rendered.contains(FIXTURE_TOKEN));
+
+        let rows = conversations(&events);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                conversation_id(GUILD, GENERAL).as_str(),
+                conversation_id(GUILD, NEWS).as_str(),
+            ]
+        );
+        assert!(!rendered.contains(&conversation_id(GUILD, SECRET)));
+        assert!(!rendered.contains(&conversation_id(GUILD, VOICE)));
+        assert!(!rendered.contains(&LOCKED_GUILD.to_string()));
+        let general = rows[0];
+        assert_eq!(general.protocol, ProtocolId::Discord);
+        assert_eq!(general.title, "#general");
+        assert_eq!(general.participant, "Test guild");
+        assert!(general.preview.contains("read and send"));
+        assert!(rows[1].preview.contains("read only"));
+
+        let Some(AdapterEvent::Status { status, detail, .. }) = events.last() else {
+            panic!("ready status");
+        };
+        assert!(detail.contains("2 guild channels"));
+        assert!(
+            DiscordAdapter::inbox_account_linked(*status, detail)
+                == DiscordAdapter::bot_inbox_compiled()
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Connecting,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn open_chat_loads_history_oldest_first() {
+        let (mut adapter, tx, mut rx, _) =
+            connected(Arc::new(FakeDiscordApi::guild_fixture())).await;
+        let id = conversation_id(GUILD, GENERAL);
         adapter
             .handle(
-                AdapterCommand::ConnectDiscord {
-                    mode: DiscordAuthMode::OAuth,
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
                 },
                 &tx,
             )
-            .expect("armed placeholder");
-        let events = drain(&mut rx);
-        let rendered = format!("{events:?} {adapter:?}");
-        assert!(!rendered.contains("fixture-bot-token"));
+            .expect("open");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReceived { message } if message.id == "discord:3")
+        })
+        .await;
+        let rows = messages(&events);
+        let bodies: Vec<&str> = rows.iter().map(|row| row.body.as_str()).collect();
+        assert_eq!(
+            bodies,
+            vec!["hello guild", "[no text]", "reply from the bot"]
+        );
+        assert!(rows.iter().all(|row| row.conversation_id == id));
+        assert_eq!(rows[0].sender, "alice");
+        assert!(!rows[0].outbound);
+        assert!(rows[2].outbound, "bot {BOT_ID} messages are outbound");
+    }
+
+    #[tokio::test]
+    async fn send_text_shows_pending_then_the_sent_message() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "hi from thinwire".into(),
+                    request: 0,
+                },
+                &tx,
+            )
+            .expect("send");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReplaced { .. })
+        })
+        .await;
+        let pending = messages(&events);
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].outbound);
+        assert!(pending[0].id.starts_with("discord:pending:"));
+        let Some(AdapterEvent::MessageReplaced {
+            protocol,
+            conversation_id,
+            old_id,
+            message,
+        }) = events.last()
+        else {
+            panic!("replace event");
+        };
+        assert_eq!(*protocol, ProtocolId::Discord);
+        assert_eq!(conversation_id, &id);
+        assert_eq!(old_id, &pending[0].id);
+        assert_eq!(message.body, "hi from thinwire");
+        assert!(message.outbound);
+        assert_eq!(
+            api.state().sent,
+            vec![(GENERAL, "hi from thinwire".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_send_removes_the_pending_row() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        api.state().send_error = Some(api::DiscordApiError::Forbidden);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "blocked".into(),
+                    request: 0,
+                },
+                &tx,
+            )
+            .expect("queued");
+        let events = until(&mut rx, is_ready).await;
+        let pending = messages(&events)[0].id.clone();
         assert!(events.iter().any(|event| matches!(
             event,
-            crate::AdapterEvent::Status { status, detail, .. }
-                if *status == AdapterStatus::Stubbed && detail.contains("in the OS keychain")
+            AdapterEvent::MessagesRemoved { message_ids, .. } if message_ids == &vec![pending.clone()]
         )));
-        assert!(events.iter().all(|event| {
-            !matches!(
+        assert!(matches!(
+            events.last(),
+            Some(AdapterEvent::Status { detail, .. }) if detail.contains("Send failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_and_unknown_channels_refuse_send() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        for id in [
+            conversation_id(GUILD, NEWS),
+            conversation_id(GUILD, SECRET),
+            // Looks like a DM channel id. It is not in the guild list.
+            "discord:0:777".to_string(),
+        ] {
+            let err = adapter
+                .handle(
+                    AdapterCommand::SendText {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: id,
+                        body: "nope".into(),
+                        request: 0,
+                    },
+                    &tx,
+                )
+                .unwrap_err();
+            assert!(matches!(err, AdapterError::Refused { .. }));
+        }
+        let err = adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, SECRET),
+                },
+                &tx,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::Refused { reason, .. } if reason.contains("Direct messages are out of scope"))
+        );
+        assert!(drain(&mut rx).is_empty());
+        assert!(api.state().sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_removes_channels_that_left_the_list() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state()
+            .channels
+            .get_mut(&GUILD)
+            .expect("guild")
+            .retain(|channel| channel.id != NEWS);
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        let events = until(&mut rx, is_ready).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if *id == conversation_id(GUILD, NEWS)
+        )));
+        assert_eq!(conversations(&events).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_token_reports_an_error_without_conversations() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        api.state().unauthorized = true;
+        let (mut adapter, _vault) = fake_adapter(api, Some(FIXTURE_TOKEN));
+        let (tx, mut rx) = unbounded_channel();
+        adapter.start(tx);
+        let events = until(&mut rx, |event| {
+            matches!(
                 event,
-                crate::AdapterEvent::Status {
-                    status: AdapterStatus::Ready,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Error,
                     ..
                 }
             )
-        }));
+        })
+        .await;
+        assert!(conversations(&events).is_empty());
+        let Some(AdapterEvent::Status { status, detail, .. }) = events.last() else {
+            panic!("error status");
+        };
+        assert!(detail.contains("Replace discord.bot_token"));
+        assert!(!detail.contains(FIXTURE_TOKEN));
+        assert!(!DiscordAdapter::inbox_account_linked(*status, detail));
     }
 
-    #[test]
-    fn missing_token_detail_does_not_mark_the_account_linked() {
-        assert!(
-            !BOT_TOKEN_MISSING.contains(BOT_TOKEN_PRESENT),
-            "the missing-token sentence must not satisfy the armed check"
-        );
-        let missing = format!("Discord bot inbox placeholder. {BOT_TOKEN_MISSING}.");
-        assert!(!DiscordAdapter::inbox_account_linked(
-            AdapterStatus::Stubbed,
-            &missing
-        ));
-        let armed = format!("Discord bot inbox placeholder. {BOT_TOKEN_PRESENT}.");
-        assert_eq!(
-            DiscordAdapter::inbox_account_linked(AdapterStatus::Stubbed, &armed),
-            DiscordAdapter::bot_inbox_compiled()
-        );
-        assert!(!DiscordAdapter::inbox_account_linked(
-            AdapterStatus::Refused,
-            &armed
+    #[tokio::test]
+    async fn disconnect_drops_history_from_the_old_session() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_history = Some(Arc::clone(&hold));
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                },
+                &tx,
+            )
+            .expect("open");
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = drain(&mut rx);
+        assert!(messages(&events).is_empty());
+        assert!(matches!(
+            adapter.handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                },
+                &tx
+            ),
+            Err(AdapterError::Unavailable { .. })
         ));
     }
 
     #[tokio::test]
-    async fn connect_after_hydrate_arms_a_token_that_start_missed() {
-        if !DiscordAdapter::bot_inbox_compiled() {
-            return;
-        }
-        let vault = Arc::new(MemoryDiscordVault::new());
-        let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
+    async fn connect_after_hydrate_loads_channels_that_start_missed() {
+        let (mut adapter, vault) = fake_adapter(Arc::new(FakeDiscordApi::guild_fixture()), None);
         let (tx, mut rx) = unbounded_channel();
         adapter.start(tx.clone());
-        let first = drain(&mut rx);
-        assert!(first.iter().any(|event| matches!(
+        assert!(drain(&mut rx).iter().any(|event| matches!(
             event,
-            crate::AdapterEvent::Status { detail, .. } if detail.contains(BOT_TOKEN_MISSING)
+            AdapterEvent::Status { detail, .. } if detail.contains(BOT_TOKEN_MISSING)
         )));
-        vault.set_bot_token("fixture-bot-token");
+        vault.set_bot_token(FIXTURE_TOKEN);
         adapter
             .handle(
                 AdapterCommand::Connect {
@@ -490,18 +830,36 @@ mod tests {
                 &tx,
             )
             .expect("reconnect");
-        let second = drain(&mut rx);
-        let rendered = format!("{second:?} {adapter:?}");
-        assert!(!rendered.contains("fixture-bot-token"));
-        assert!(second.iter().any(|event| matches!(
-            event,
-            crate::AdapterEvent::Status { status, detail, .. }
-                if *status == AdapterStatus::Stubbed && detail.contains(BOT_TOKEN_PRESENT)
-        )));
+        let events = until(&mut rx, is_ready).await;
+        assert_eq!(conversations(&events).len(), 2);
+        let rendered = format!("{events:?} {adapter:?}");
+        assert!(!rendered.contains(FIXTURE_TOKEN));
     }
 
     #[test]
-    fn unverified_bearer_in_the_vault_is_refused_without_a_placeholder() {
+    fn missing_token_detail_does_not_mark_the_account_linked() {
+        assert!(
+            !BOT_TOKEN_MISSING.contains(BOT_TOKEN_PRESENT),
+            "the missing-token sentence must not satisfy the armed check"
+        );
+        let missing = format!("Discord bot inbox. {BOT_TOKEN_MISSING}.");
+        assert!(!DiscordAdapter::inbox_account_linked(
+            AdapterStatus::Stubbed,
+            &missing
+        ));
+        let armed = format!("Discord bot inbox. {BOT_TOKEN_PRESENT}.");
+        assert_eq!(
+            DiscordAdapter::inbox_account_linked(AdapterStatus::Ready, &armed),
+            DiscordAdapter::bot_inbox_compiled()
+        );
+        assert!(!DiscordAdapter::inbox_account_linked(
+            AdapterStatus::Refused,
+            &armed
+        ));
+    }
+
+    #[test]
+    fn unverified_bearer_in_the_vault_is_refused_without_events() {
         let vault = Arc::new(MemoryDiscordVault::new());
         vault.set_bot_token("Bearer oauth-fixture");
         let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
@@ -528,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn user_token_in_the_vault_is_refused_without_a_placeholder() {
+    fn user_token_in_the_vault_is_refused_without_events() {
         let vault = Arc::new(MemoryDiscordVault::new());
         vault.set_bot_token("User personal-token");
         let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
@@ -589,11 +947,20 @@ mod tests {
 
     #[test]
     fn sources_do_not_automate_a_user_account() {
-        let src = include_str!("mod.rs");
-        assert!(!src.contains(concat!("Token::", "User")));
-        assert!(!src.contains(concat!("self", "bot")));
-        assert!(!src.contains(concat!("/users/", "@me")));
-        assert!(!src.contains(concat!("seren", "ity")));
+        for src in [
+            include_str!("mod.rs"),
+            include_str!("api.rs"),
+            include_str!("inbox.rs"),
+            include_str!("session.rs"),
+            include_str!("twilight.rs"),
+        ] {
+            assert!(!src.contains(concat!("Token::", "User")));
+            assert!(!src.contains(concat!("self", "bot")));
+            assert!(!src.contains(concat!("/users/", "@me")));
+            assert!(!src.contains(concat!("seren", "ity")));
+            assert!(!src.contains(concat!("private_", "channels")));
+            assert!(!src.contains(concat!("create_", "private_channel")));
+        }
         let toml = include_str!("../../Cargo.toml");
         assert!(toml.contains("discord-bot"));
         assert!(toml.contains("default = []"));
