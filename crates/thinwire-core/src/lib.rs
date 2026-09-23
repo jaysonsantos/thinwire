@@ -5,6 +5,7 @@
 //! secret store, the settings, and the adapter host. Protocol work stays on
 //! the tokio worker. This crate never depends on egui, eframe, or winit.
 
+mod core;
 mod intent;
 mod secret_text;
 pub mod secrets;
@@ -12,11 +13,15 @@ pub mod settings;
 mod signal;
 pub mod state;
 mod theme;
+mod view;
 
+pub use crate::core::{Core, CoreConfig};
 pub use intent::{AuthField, DiscordIntent, Intent, SlackIntent, TelegramIntent, WhatsAppIntent};
 pub use secret_text::SecretText;
 pub use signal::{ChangeNotifier, ChangeSignal, change_channel};
+pub use state::{AuthKey, InboxFilter};
 pub use theme::ThemeMode;
+pub use view::View;
 // Frontends name protocols through the core, not through a second dependency.
 pub use thinwire_protocol::ProtocolId;
 

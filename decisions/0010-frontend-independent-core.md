@@ -1,6 +1,6 @@
 # Frontend-independent core library
 
-**Status:** accepted (skeleton landed; state move follows the Telegram usable merge)
+**Status:** accepted
 
 ## Context
 The app state lives in the egui binary. `crates/thinwire/src/app/snapshot.rs` holds the inbox, the login flow, the drafts, and the command queue. `secrets.rs` holds the secret store. `settings.rs` holds the theme. `mod.rs` wires the adapter host. A TUI or a second GUI cannot use this code.
@@ -14,10 +14,10 @@ Add the library crate `crates/thinwire-core`. The crate holds the state, the int
 
 The public API has four parts:
 
-1. `Core`: the handle that a frontend owns. `Core::new(runtime, config)` starts the adapter host on the tokio runtime. `Core::dispatch(Intent)` applies one user action. `Core::pump()` applies the adapter events that arrived. `Core::view()` returns the view model.
-2. `View<'_>`: a read-only borrow of the state. Accessors return lists, the selection, the login step, the error block, and the status line. The frontend does not clone the message list on each frame.
+1. `Core`: the handle that a frontend owns. `Core::new(runtime, CoreConfig)` starts the adapter host and the keychain attach on the tokio runtime. `Core::dispatch(Intent)` applies one user action. `Core::pump()` applies the adapter events that arrived. `Core::view()` returns the view model. `Core::block_until_stopped(timeout)` closes the clients at exit.
+2. `View<'_>`: a read-only borrow of the state. It derefs to the state type `Snapshot`, so a frontend reads fields and `&self` methods. It cannot call a mutating method. It adds the reads that need the secret store or the settings. The frontend does not clone the message list on each frame.
 3. `Intent`: one enum for user actions. Protocol actions are in sub-enums: `TelegramIntent`, `WhatsAppIntent`, `DiscordIntent`, and `SlackIntent`. Typed secrets use `SecretText`. Its `Debug` output is redacted.
-4. `ChangeSignal`: a `tokio::sync::watch` revision. The core bumps it when an adapter event arrives, when the keychain attach ends, and after each `dispatch`. A frontend waits with `changed().await` or checks `has_changed()`.
+4. `ChangeSignal`: a `tokio::sync::watch` revision. The core bumps it when an adapter event arrives, while the keychain attach runs, and after each `dispatch`. A frontend waits with `changed().await` or checks `has_changed()`. The core gets the events through `AdapterHost::into_parts`.
 
 Rules for the boundary:
 
@@ -34,9 +34,9 @@ A TUI or a headless test can drive thinwire with no egui code. `crates/thinwire-
 
 The snapshot tests move to the core with the code. They keep their assertions. The egui crate keeps only drawing and toolkit tests.
 
-Protocol agents add a variant to their own intent sub-enum and a field to the state. They do not change `Core`, `View`, or `ChangeSignal`.
+Protocol agents add a variant to their own intent sub-enum and a field to the state. They add one match arm in `Core::dispatch`. They do not change `View` or `ChangeSignal`.
 
-The state move waits for the Telegram usable branch to merge. That branch changes `snapshot.rs`. This beat lands the crate, `Intent`, `SecretText`, `ChangeSignal`, `ThemeMode`, and the dependency guard.
+Protocol agents also add their state fields to `Snapshot`. `View` shows them with no extra code.
 
 Rejected:
 

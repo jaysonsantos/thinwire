@@ -607,6 +607,11 @@ impl Snapshot {
         }
     }
 
+    /// Queue one command for the worker. The core sends it on the next flush.
+    pub(crate) fn queue(&mut self, command: AdapterCommand) {
+        self.pending.push(command);
+    }
+
     pub fn take_commands(&mut self) -> Vec<AdapterCommand> {
         std::mem::take(&mut self.pending)
     }

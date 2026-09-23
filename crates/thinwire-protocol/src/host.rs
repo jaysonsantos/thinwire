@@ -73,6 +73,20 @@ impl AdapterHost {
         self.command_tx.clone()
     }
 
+    /// Split into the command sender and the event receiver.
+    ///
+    /// A caller that wants to wait on events (a frontend core) owns the
+    /// receiver on its own task. `poll_events` is not available after this.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        UnboundedSender<AdapterCommand>,
+        UnboundedReceiver<AdapterEvent>,
+    ) {
+        (self.command_tx, self.event_rx)
+    }
+
     /// Enqueue a command for the worker. Never runs adapter code on the caller.
     pub fn send(&self, mut command: AdapterCommand) {
         // Stamp first, then bump. A step sent before Cancel keeps the old

@@ -7,6 +7,7 @@
 
 use thinwire_protocol::ProtocolId;
 
+use crate::state::{AuthKey, InboxFilter};
 use crate::{SecretText, ThemeMode};
 
 /// One user action. Frontends map clicks and keys to these values.
@@ -17,12 +18,14 @@ pub enum Intent {
     SelectProtocol(ProtocolId),
     /// Open a chat of the selected protocol and load its recent messages.
     SelectConversation { id: String },
-    /// Limit the inbox to one protocol. `None` shows every protocol.
-    SetFilter(Option<ProtocolId>),
+    /// Limit the inbox to one protocol tab, or show All.
+    SetFilter(InboxFilter),
     /// Inbox search text. Matches chat title and participant only.
     SetSearch(String),
-    /// Load the next page of the chat list for the selected protocol.
-    LoadMoreChats,
+    /// Reload the chat lists of the visible protocols.
+    Refresh,
+    /// Enter or Escape on the center screen: first run or the login form.
+    Key(AuthKey),
     /// Unsent text for the selected chat. The core keeps one draft per chat.
     SetDraft(String),
     /// Send the draft of the selected chat.
@@ -83,8 +86,10 @@ pub enum WhatsAppIntent {
     CloseGate,
     /// The user accepted the risk gate.
     AcknowledgeRisk,
-    /// Start linked-device pairing. The phone stays in the memory vault.
-    BeginLink { phone: SecretText },
+    /// New text in the optional phone field of the pair screen.
+    SetPhone(SecretText),
+    /// Start linked-device pairing. The phone goes to the memory vault only.
+    BeginLink,
     /// Stop pairing and drop the risk acknowledgement.
     CancelLink,
 }
@@ -120,9 +125,7 @@ mod tests {
                 AuthField::Password,
                 SecretText::new("hunter2-fixture"),
             )),
-            Intent::WhatsApp(WhatsAppIntent::BeginLink {
-                phone: SecretText::new("+15550100"),
-            }),
+            Intent::WhatsApp(WhatsAppIntent::SetPhone(SecretText::new("+15550100"))),
         ];
         for intent in intents {
             let shown = format!("{intent:?}");
