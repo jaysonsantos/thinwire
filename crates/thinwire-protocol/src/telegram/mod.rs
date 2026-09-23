@@ -442,8 +442,10 @@ mod tests {
         assert!(!caps.detail.to_ascii_lowercase().contains("reliable"));
     }
 
-    #[test]
-    fn telegram_auth_step_does_not_echo_secrets() {
+    // A runtime for the live build's `tokio::spawn` (qa R44). The body never
+    // awaits, so the worker is never polled and no TDLib client starts.
+    #[tokio::test]
+    async fn telegram_auth_step_does_not_echo_secrets() {
         let vault = Arc::new(MemorySecretVault::new());
         vault.set_secret(TelegramSecretKey::ApiId, "11111");
         vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
@@ -569,8 +571,10 @@ mod tests {
         assert!(chats.contains("emit_chat_list_loaded"));
     }
 
-    #[test]
-    fn resend_checks_the_chat_and_uses_tdlib_resend() {
+    // A runtime for the live build's `tokio::spawn` (qa R44). The body never
+    // awaits, so the worker is never polled and no TDLib client starts.
+    #[tokio::test]
+    async fn resend_checks_the_chat_and_uses_tdlib_resend() {
         let mut adapter = TelegramAdapter::memory();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let foreign = adapter.handle(
@@ -775,7 +779,10 @@ mod tests {
             .find("data_dir::remove_this_process_session_dir()")
             .expect("throwaway folder is removed at a clean exit");
         assert!(idle < remove, "remove only after no thread is in TDLib");
-        assert!(TelegramSecretVault::persists(&MemorySecretVault::new()));
+        assert!(
+            !TelegramSecretVault::persists(&MemorySecretVault::new()),
+            "tests never open the real TDLib folder (qa R45)"
+        );
     }
 
     #[test]
@@ -949,8 +956,10 @@ mod tests {
         assert!(!debug.contains("db_key"));
     }
 
-    #[test]
-    fn disconnect_resets_engine_and_does_not_emit_ready() {
+    // A runtime for the live build's `tokio::spawn` (qa R44). The body never
+    // awaits, so the worker is never polled and no TDLib client starts.
+    #[tokio::test]
+    async fn disconnect_resets_engine_and_does_not_emit_ready() {
         let vault = Arc::new(MemorySecretVault::new());
         vault.set_secret(TelegramSecretKey::ApiId, "11111");
         vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
@@ -988,8 +997,10 @@ mod tests {
         assert!(!saw_ready);
     }
 
-    #[test]
-    fn inbox_commands_stay_off_the_ui_and_do_not_carry_secrets() {
+    // A runtime for the live build's `tokio::spawn` (qa R44). The body never
+    // awaits, so the worker is never polled and no TDLib client starts.
+    #[tokio::test]
+    async fn inbox_commands_stay_off_the_ui_and_do_not_carry_secrets() {
         let vault = Arc::new(MemorySecretVault::new());
         vault.set_secret(TelegramSecretKey::ApiId, "11111");
         vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");

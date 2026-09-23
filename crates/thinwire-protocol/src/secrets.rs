@@ -147,6 +147,12 @@ impl TelegramSecretVault for MemorySecretVault {
             values.insert(key, trimmed.to_string());
         }
     }
+
+    /// Memory never persists. A worker on this vault (every test) therefore
+    /// uses a throwaway TDLib folder and never opens the user's real one.
+    fn persists(&self) -> bool {
+        false
+    }
 }
 
 impl fmt::Debug for MemorySecretVault {
