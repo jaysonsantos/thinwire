@@ -27,6 +27,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
     - [x] Login steps: keyboard flow and clear errors (ux #4). On branch `feat/telegram-usable`, not yet on `main`.
     - [x] Message time, sender, and date separators (ux #5). On branch `feat/telegram-usable`, not yet on `main`.
     - [x] Fixes from live tests: TDLib closes cleanly at exit, a keychain-missing notice, and libc++ / mesa in the Nix dev shell. On branch `feat/telegram-usable`, not yet on `main`.
+    - [x] The phone step names the kept data folder once (qa R62). On branch `feat/telegram-usable`, not yet on `main`.
     - [ ] Follow-up (below the ux cut): remove jargon from the account row ("status: stubbed", "Supported · TDLib") and from worker status text ("TDLib <code>").
 2. **Telegram UX follow-ups**
     - [ ] #30 — load older messages when you scroll up in a chat.
