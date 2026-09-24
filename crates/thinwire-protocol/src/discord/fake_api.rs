@@ -32,6 +32,8 @@ pub(crate) struct FakeState {
     pub send_error: Option<DiscordApiError>,
     /// The next call returns this error once, then clears it.
     pub next_error: Option<DiscordApiError>,
+    /// Pauses the next bot-id read until notified. A reconnect stays without a bot id.
+    pub hold_load: Option<Arc<Notify>>,
     pub next_id: u64,
 }
 
@@ -151,6 +153,10 @@ impl DiscordApi for FakeDiscordApi {
     fn bot_user_id(&self) -> ApiFuture<'_, u64> {
         Box::pin(async move {
             self.check_token()?;
+            let hold = self.state().hold_load.clone();
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
             Ok(BOT_ID)
         })
     }

@@ -284,6 +284,10 @@ impl Session {
         };
         match (shared.channels.get(conversation_id), shared.bot_id) {
             (Some(access), Some(bot_id)) => Ok((*access, bot_id)),
+            (Some(_), None) => Err(AdapterError::Unavailable {
+                protocol: ProtocolId::Discord,
+                reason: "Discord bot inbox is still loading guild channels.",
+            }),
             _ => Err(refused),
         }
     }

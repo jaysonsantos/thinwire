@@ -940,6 +940,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_blocks_open_until_the_bot_id_returns() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let hold = Arc::new(Notify::new());
+        api.state().hold_load = Some(Arc::clone(&hold));
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let opened = adapter.handle(
+            AdapterCommand::OpenChat {
+                protocol: ProtocolId::Discord,
+                conversation_id: conversation_id(GUILD, GENERAL),
+            },
+            &tx,
+        );
+        assert!(matches!(
+            opened,
+            Err(AdapterError::Unavailable { reason, .. }) if reason.contains("still loading")
+        ));
+        let events = drain(&mut rx);
+        assert!(messages(&events).is_empty());
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Notice { .. }
+        )));
+        hold.notify_waiters();
+    }
+
+    #[tokio::test]
     async fn connect_removes_channels_that_left_the_list() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
