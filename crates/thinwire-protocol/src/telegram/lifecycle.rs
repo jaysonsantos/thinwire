@@ -131,6 +131,30 @@ pub(super) const fn close_kind(authorized: bool, new_login: bool, cancel: bool) 
     }
 }
 
+/// What a worker does with a Ready that its closing flag or a moved epoch
+/// told it to skip. TDLib is signed in even though the UI never links it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LateReady {
+    /// The worker has not read `Close` yet. Remember the Ready; `close_kind`
+    /// then decides on `Close`.
+    Wait,
+    /// Cancel already closed this new login: log out now (PR #49 review).
+    LogOut,
+    /// Shutdown, or a resumed session: keep it (ux F8).
+    Keep,
+}
+
+/// `close_cancel` is `None` before the worker reads `Close`, else the
+/// `cancel` value of that `Close`.
+#[must_use]
+pub(super) const fn late_ready(new_login: bool, close_cancel: Option<bool>) -> LateReady {
+    match close_cancel {
+        None => LateReady::Wait,
+        Some(true) if new_login => LateReady::LogOut,
+        Some(_) => LateReady::Keep,
+    }
+}
+
 /// Set by a worker when it has exited and released its client.
 pub(super) type DoneFlag = Arc<AtomicBool>;
 
@@ -330,6 +354,23 @@ mod tests {
             "nothing to roll back"
         );
         assert_eq!(close_kind(false, false, false), CloseKind::Close);
+    }
+
+    #[test]
+    fn cancel_then_a_late_ready_logs_out_only_a_new_login() {
+        // Cancel marks the flag first, so Ready is skipped before the worker
+        // reads Close. The skipped Ready counts as signed in for close_kind.
+        assert_eq!(late_ready(true, None), LateReady::Wait);
+        assert_eq!(close_kind(true, true, true), CloseKind::LogOut);
+        // The worker read Close first, then Ready came.
+        assert_eq!(late_ready(true, Some(true)), LateReady::LogOut);
+        // A resumed session: no logout on either path.
+        assert_eq!(late_ready(false, None), LateReady::Wait);
+        assert_eq!(close_kind(true, false, true), CloseKind::Close);
+        assert_eq!(late_ready(false, Some(true)), LateReady::Keep);
+        // Shutdown keeps a new login too.
+        assert_eq!(late_ready(true, Some(false)), LateReady::Keep);
+        assert_eq!(close_kind(true, true, false), CloseKind::Close);
     }
 
     #[test]

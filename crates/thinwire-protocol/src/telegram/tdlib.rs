@@ -17,8 +17,8 @@ use super::inbox::{
     self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook,
 };
 use super::lifecycle::{
-    CloseKind, ClosingFlag, DoneFlag, LoginEvents, WorkerSlots, all_done, close_kind, mark_done,
-    wait_until,
+    CloseKind, ClosingFlag, DoneFlag, LateReady, LoginEvents, WorkerSlots, all_done, close_kind,
+    late_ready, mark_done, wait_until,
 };
 use super::router::{self, Router};
 use crate::adapter::{
@@ -71,6 +71,11 @@ struct LiveInbox {
     /// This worker asked for a phone, code, or password step. Only such a
     /// login is rolled back on Cancel; a resumed session never is (ux F8).
     new_login: bool,
+    /// TDLib became Ready, but the worker skipped it (Cancel or shutdown).
+    /// `close_kind` treats it as signed in (PR #49 review).
+    late_ready: bool,
+    /// `cancel` of the `Close` the worker read. `None` before that.
+    close_cancel: Option<bool>,
     /// This app asked TDLib to close (shutdown, Cancel, Try again). The runtime
     /// sets it before the worker reads `Close`. A close without it came from
     /// elsewhere, for example a remote logout.
@@ -391,6 +396,8 @@ fn spawn_tdlib_worker(
             new_login: false,
             closing: closing.clone(),
             close_requested: false,
+            late_ready: false,
+            close_cancel: None,
             ended_elsewhere: false,
             directory: ChatDirectory::new(),
             names: NameBook::new(),
@@ -415,8 +422,10 @@ fn spawn_tdlib_worker(
                                 continue;
                             }
                             live.close_requested = true;
+                            live.close_cancel = Some(cancel);
                             live.closing.mark();
-                            match close_kind(live.authorized, live.new_login, cancel) {
+                            let signed_in = live.authorized || live.late_ready;
+                            match close_kind(signed_in, live.new_login, cancel) {
                                 CloseKind::LogOut => {
                                     // Ready ran before Cancel, but the UI dropped
                                     // it: do not keep that session (PR #49 review).
@@ -714,6 +723,13 @@ async fn apply_authorization(
             // A client that is closing, or whose epoch Cancel moved, does not
             // link: no marker, no inbox. Checked before each side effect.
             if !login.open() {
+                // TDLib is signed in, but the UI never links it. A cancelled
+                // new login must not stay signed in (PR #49 review).
+                match late_ready(live.new_login, live.close_cancel) {
+                    LateReady::Wait => live.late_ready = true,
+                    LateReady::LogOut => request_log_out(client_id).await,
+                    LateReady::Keep => {}
+                }
                 return;
             }
             secrets.set_secret(TelegramSecretKey::Session, TDLIB_SESSION_MARKER);

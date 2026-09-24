@@ -1120,7 +1120,12 @@ mod tests {
         let close = &worker[worker
             .find("TdlibCommand::Close { cancel }")
             .expect("close")..];
-        assert!(close.contains("close_kind(live.authorized, live.new_login, cancel)"));
+        assert!(close.contains("let signed_in = live.authorized || live.late_ready;"));
+        assert!(close.contains("close_kind(signed_in, live.new_login, cancel)"));
+        let skip = &ready[..marker];
+        assert!(skip.contains("late_ready(live.new_login, live.close_cancel)"));
+        assert!(skip.contains("LateReady::Wait => live.late_ready = true"));
+        assert!(skip.contains("LateReady::LogOut => request_log_out(client_id).await"));
         let auth_states = &auth[..auth.find("AuthorizationState::Ready").expect("ready")];
         for state in [
             "WaitPhoneNumber =>",
