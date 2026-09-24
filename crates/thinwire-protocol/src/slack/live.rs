@@ -17,7 +17,10 @@ use super::api::{
     SlackInstallGrant, SlackPost, SlackWebApi,
 };
 use super::install::SlackInstalledWorkspace;
-use super::morphism::oauth_v2_access_request;
+use super::morphism::{oauth_v2_access_request, workspace_bot_token};
+
+/// Retries after Slack sends `Retry-After`. The library retries only when this is set.
+const RATE_LIMIT_RETRIES: usize = 3;
 
 /// Page size for `conversations.list`. Slack allows up to 1000.
 const CHANNEL_PAGE: u16 = 200;
@@ -37,13 +40,29 @@ fn api_token(value: &str) -> SlackApiToken {
     SlackApiToken::new(value.into())
 }
 
+/// Bot token for Web API calls. A known team id turns on per-team method tiers.
+fn session_token(value: &str, team_id: Option<&str>) -> SlackApiToken {
+    match team_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(team) => workspace_bot_token(value, team),
+        None => {
+            let mut token = SlackApiToken::new(value.into());
+            token.token_type = Some(SlackApiTokenType::Bot);
+            token
+        }
+    }
+}
+
+fn rate_control_config() -> SlackApiRateControlConfig {
+    SlackApiRateControlConfig::new().with_max_retries(RATE_LIMIT_RETRIES)
+}
+
 /// Shared hyper client. Build once on the worker.
 pub fn hyper_client() -> std::io::Result<Arc<SlackHyperClient>> {
     // twilight (discord-bot) and hyper-rustls both use `ring`. Install it once.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    Ok(Arc::new(
-        SlackClient::new(SlackClientHyperConnector::new()?),
-    ))
+    Ok(Arc::new(SlackClient::new(
+        SlackClientHyperConnector::new()?.with_rate_control(rate_control_config()),
+    )))
 }
 
 /// Web API on the official Slack endpoints with a workspace bot token.
@@ -51,6 +70,8 @@ pub struct MorphismWebApi {
     client: Arc<SlackHyperClient>,
     /// Bot user id from `auth.test` or the install. Used to find a DM peer.
     bot_user: Mutex<Option<String>>,
+    /// Workspace id from `auth.test` or the install. Enables per-team rate tiers.
+    team_id: Mutex<Option<String>>,
 }
 
 impl MorphismWebApi {
@@ -59,7 +80,25 @@ impl MorphismWebApi {
         Self {
             client,
             bot_user: Mutex::new(None),
+            team_id: Mutex::new(None),
         }
+    }
+
+    fn remember_team(&self, team: &str) {
+        if team.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = self.team_id.lock() {
+            *slot = Some(team.to_string());
+        }
+    }
+
+    fn team_id(&self) -> Option<String> {
+        self.team_id.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn bot_session_token(&self, value: &str) -> SlackApiToken {
+        session_token(value, self.team_id().as_deref())
     }
 
     fn remember_bot_user(&self, user: &str) {
@@ -96,7 +135,7 @@ impl SlackWebApi for MorphismWebApi {
         &self,
         token: &SlackBotToken,
     ) -> Result<SlackInstalledWorkspace, SlackApiError> {
-        let token = api_token(token.reveal());
+        let token = self.bot_session_token(token.reveal());
         let response = self
             .client
             .open_session(&token)
@@ -107,6 +146,7 @@ impl SlackWebApi for MorphismWebApi {
             return Err(SlackApiError::api("not_a_bot_token"));
         }
         self.remember_bot_user(response.user_id.value());
+        self.remember_team(response.team_id.value());
         Ok(SlackInstalledWorkspace::new(
             response.team_id.value(),
             &response.team,
@@ -135,6 +175,7 @@ impl SlackWebApi for MorphismWebApi {
             .map(|id| id.value().clone())
             .unwrap_or_default();
         self.remember_bot_user(&bot_user);
+        self.remember_team(response.team.id.value());
         let team_name = response.team.name.clone().unwrap_or_default();
         Ok(SlackInstallGrant {
             workspace: SlackInstalledWorkspace::new(
@@ -152,7 +193,7 @@ impl SlackWebApi for MorphismWebApi {
         token: &SlackBotToken,
         cursor: Option<String>,
     ) -> Result<SlackChannelPage, SlackApiError> {
-        let token = api_token(token.reveal());
+        let token = self.bot_session_token(token.reveal());
         let request = SlackApiConversationsListRequest::new()
             .with_types(vec![
                 SlackConversationType::Public,
@@ -216,7 +257,7 @@ impl SlackWebApi for MorphismWebApi {
         channel: &str,
         limit: u16,
     ) -> Result<Vec<SlackPost>, SlackApiError> {
-        let token = api_token(token.reveal());
+        let token = self.bot_session_token(token.reveal());
         let request = SlackApiConversationsHistoryRequest::new()
             .with_channel(SlackChannelId::new(channel.into()))
             .with_limit(limit);
@@ -247,7 +288,7 @@ impl SlackWebApi for MorphismWebApi {
         channel: &str,
         text: &str,
     ) -> Result<SlackPost, SlackApiError> {
-        let token = api_token(token.reveal());
+        let token = self.bot_session_token(token.reveal());
         let request = SlackApiChatPostMessageRequest::new(
             SlackChannelId::new(channel.into()),
             SlackMessageContent::new().with_text(text.into()),
@@ -273,7 +314,7 @@ impl SlackWebApi for MorphismWebApi {
     }
 
     async fn user_name(&self, token: &SlackBotToken, user: &str) -> Result<String, SlackApiError> {
-        let token = api_token(token.reveal());
+        let token = self.bot_session_token(token.reveal());
         let request = SlackApiUsersInfoRequest::new(SlackUserId::new(user.into()));
         let response = self
             .client
@@ -420,4 +461,34 @@ async fn on_push(
         let _ = sink.send(inbound);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_control_retries_after_slack_says_wait() {
+        let config = rate_control_config();
+        assert_eq!(config.max_retries, Some(RATE_LIMIT_RETRIES));
+        assert!(
+            config
+                .tiers_limits
+                .contains_key(&SlackApiMethodRateTier::Tier4)
+        );
+    }
+
+    #[test]
+    fn session_token_carries_the_team_when_known() {
+        let known = session_token("xoxb-test", Some("T1"));
+        assert_eq!(known.token_type, Some(SlackApiTokenType::Bot));
+        assert_eq!(
+            known.team_id.as_ref().map(|id| id.value().as_str()),
+            Some("T1")
+        );
+        let unknown = session_token("xoxb-test", None);
+        assert!(unknown.team_id.is_none());
+        let blank = session_token("xoxb-test", Some("  "));
+        assert!(blank.team_id.is_none());
+    }
 }

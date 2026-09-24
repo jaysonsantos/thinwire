@@ -762,6 +762,47 @@ async fn revoked_token_on_history_stops_the_session() {
 }
 
 #[tokio::test]
+async fn failed_user_lookup_is_not_cached() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.users.remove("U1");
+        state.pages = vec![SlackChannelPage {
+            channels: vec![SlackChannel {
+                dm_user: Some("U1".into()),
+                ..channel("D1", "", SlackChannelKind::DirectMessage, true)
+            }],
+            next_cursor: None,
+        }];
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    h.start();
+    let row = h.conversation("slack:D1").await;
+    assert_eq!(row.title, "U1");
+
+    h.api.with(|state| {
+        state.users.insert("U1".into(), "Ana".into());
+        state.history.insert(
+            "D1".into(),
+            vec![post("D1", "1700000003.000100", "U1", "dm hello")],
+        );
+    });
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:D1".into(),
+    });
+    let message = h.message("dm hello").await;
+    assert_eq!(message.sender, "Ana");
+    let lookups = h.api.with(|state| {
+        state
+            .calls
+            .iter()
+            .filter(|call| call.as_str() == "users.info U1")
+            .count()
+    });
+    assert_eq!(lookups, 2);
+}
+
+#[tokio::test]
 async fn not_in_channel_asks_to_add_the_app() {
     let api = FakeApi::workspace();
     api.with(|state| state.history_error = Some(SlackApiError::api("not_in_channel")));

@@ -579,14 +579,12 @@ where
         if let Some(name) = self.names.get(user) {
             return name.clone();
         }
-        let name = self
-            .deps
-            .api
-            .user_name(token, user)
-            .await
-            .ok()
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| user.to_string());
+        let Ok(name) = self.deps.api.user_name(token, user).await else {
+            return user.to_string();
+        };
+        if name.trim().is_empty() {
+            return user.to_string();
+        }
         self.names.insert(user.to_string(), name.clone());
         name
     }
