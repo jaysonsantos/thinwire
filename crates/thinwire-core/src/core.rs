@@ -23,7 +23,7 @@ use crate::intent::{
 use crate::secrets::SecretStore;
 use crate::settings::Settings;
 use crate::signal::{ChangeNotifier, ChangeSignal, change_channel};
-use crate::state::Snapshot;
+use crate::state::{AuthScreen, Snapshot};
 use crate::view::View;
 
 /// How often the keychain watch wakes frontends while attach runs. The
@@ -254,6 +254,11 @@ impl Core {
             TelegramIntent::AddAccount => self.state.open_add_account(store),
             TelegramIntent::OpenApiOverride => self.state.open_api_override(store),
             TelegramIntent::SetField(field, value) => {
+                // Intents apply after the frame. A key typed in the same frame
+                // as Escape must not refill a cleared form (qa L2).
+                if self.state.auth == AuthScreen::Idle {
+                    return;
+                }
                 let value = value.expose().to_owned();
                 match field {
                     AuthField::ApiId => self.state.telegram_api_id = value,
@@ -459,6 +464,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn typed_login_fields_stay_in_the_state_and_off_debug() {
         let mut core = memory_core();
+        core.state.auth = AuthScreen::TelegramPhone;
         core.dispatch(Intent::Telegram(TelegramIntent::SetField(
             AuthField::Phone,
             "+15550100".into(),
@@ -643,5 +649,25 @@ mod tests {
             store.persistence(),
             crate::secrets::Persistence::UntilRestart
         );
+    }
+
+    /// qa L2: Escape and a typed key in one frame. `Cancel` applies first, so
+    /// the late `SetField` must not refill the cleared field.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_field_edit_after_cancel_is_dropped() {
+        let mut core = memory_core();
+        core.state.auth = AuthScreen::TelegramPhone;
+        core.dispatch(Intent::Telegram(TelegramIntent::SetField(
+            AuthField::Phone,
+            "+1555".into(),
+        )));
+        assert_eq!(core.view().telegram_phone, "+1555");
+        core.dispatch(Intent::Telegram(TelegramIntent::Cancel));
+        core.dispatch(Intent::Telegram(TelegramIntent::SetField(
+            AuthField::Phone,
+            "+15550".into(),
+        )));
+        assert_eq!(core.view().auth, AuthScreen::Idle);
+        assert!(core.view().telegram_phone.is_empty());
     }
 }
