@@ -50,17 +50,56 @@ const SAME_RUN_GAP: f32 = 2.0;
 /// Gap before the first bubble of the next sender run.
 const NEXT_RUN_GAP: f32 = 10.0;
 
-/// One-shot hints the core hands out once per change.
+/// One-shot hints from the core. A hint counts as used only where its widget
+/// draws, so a hidden widget does not lose it (qa L1).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Hints {
-    /// Put the cursor in the compose field.
-    pub focus_compose: bool,
-    /// Scroll the selected inbox row into view.
-    pub scroll_to_selected: bool,
+    focus_compose: bool,
+    scroll_to_selected: bool,
+    used_focus_compose: bool,
+    used_scroll_to_selected: bool,
+}
+
+impl Hints {
+    /// Hints that wait in the core this frame.
+    pub(crate) fn from_view(view: &View<'_>) -> Self {
+        Self {
+            focus_compose: view.wants_focus_compose(),
+            scroll_to_selected: view.wants_scroll_to_selected(),
+            ..Self::default()
+        }
+    }
+
+    /// Call only where the compose field draws.
+    pub(crate) fn take_focus_compose(&mut self) -> bool {
+        self.used_focus_compose = self.focus_compose;
+        self.focus_compose
+    }
+
+    /// Call only where the inbox rows draw.
+    pub(crate) fn take_scroll_to_selected(&mut self) -> bool {
+        self.used_scroll_to_selected = self.scroll_to_selected;
+        self.scroll_to_selected
+    }
+
+    /// The focus hint was used this frame. The app clears it in the core.
+    pub(crate) const fn used_focus_compose(self) -> bool {
+        self.used_focus_compose
+    }
+
+    /// The scroll hint was used this frame. The app clears it in the core.
+    pub(crate) const fn used_scroll_to_selected(self) -> bool {
+        self.used_scroll_to_selected
+    }
 }
 
 /// Draw one frame. User actions go to `out`; the app dispatches them after.
-pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
+pub(crate) fn draw(
+    ui: &mut egui::Ui,
+    snapshot: &View<'_>,
+    hints: &mut Hints,
+    out: &mut Vec<Intent>,
+) {
     super::theme_mode::apply(ui.ctx(), snapshot.theme());
     #[cfg(feature = "whatsapp-web")]
     if snapshot.whatsapp_pairing_available() && snapshot.whatsapp_gate_open() {
@@ -289,7 +328,7 @@ fn status_strip_visible(snapshot: &Snapshot, notice: Option<&str>) -> bool {
     notice.is_some() || show_error || show_status
 }
 
-fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
+fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     egui::Panel::left("switcher")
         .resizable(true)
         .default_size(280.0)
@@ -437,7 +476,7 @@ fn show_no_chats(snapshot: &Snapshot) -> bool {
     snapshot.telegram_ready() || snapshot.selected_protocol != ProtocolId::Telegram
 }
 
-fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
+fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     let now = Local::now();
     let rows: Vec<(String, String, String, u32, String)> = snapshot
         .visible_conversations()
@@ -479,7 +518,7 @@ fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Int
         }
     }
 
-    let scroll_to_selected = hints.scroll_to_selected;
+    let scroll_to_selected = hints.take_scroll_to_selected();
     let mut clicked: Option<String> = None;
     for (id, title, preview, unread, time) in rows {
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
@@ -625,7 +664,7 @@ fn account_label(status: AdapterStatus) -> &'static str {
     }
 }
 
-fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
+fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     let fill = theme::palette(ui).bg;
     let frame = egui::Frame::central_panel(ui.style())
         .fill(fill)
@@ -732,7 +771,7 @@ fn first_run(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     ui.data_mut(|data| data.insert_temp(id, response.rect.height()));
 }
 
-fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
+fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     thread_header(ui, snapshot);
 
     let is_group = snapshot
@@ -984,12 +1023,12 @@ fn compose_reserve(row_height: f32, rows: usize, item_spacing_y: f32) -> f32 {
 fn compose(
     ui: &mut egui::Ui,
     snapshot: &View<'_>,
-    hints: Hints,
+    hints: &mut Hints,
     max_height: f32,
     out: &mut Vec<Intent>,
 ) {
     let compose_id = egui::Id::new("thread-compose");
-    if hints.focus_compose {
+    if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
     }
     if ui.memory(|memory| memory.has_focus(compose_id)) {
@@ -1192,7 +1231,7 @@ mod tests {
                     compose(
                         ui,
                         &thinwire_core::View::from_parts(&snapshot, &store, &settings),
-                        super::Hints::default(),
+                        &mut super::Hints::default(),
                         compose_row_height(row_height, COMPOSE_MAX_ROWS),
                         &mut Vec::new(),
                     );
@@ -1274,7 +1313,7 @@ mod tests {
                             compose(
                                 ui,
                                 &thinwire_core::View::from_parts(&snapshot, &store, &settings),
-                                super::Hints::default(),
+                                &mut super::Hints::default(),
                                 compose_row_height(row_height, COMPOSE_MAX_ROWS),
                                 &mut Vec::new(),
                             );

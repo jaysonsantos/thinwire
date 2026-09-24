@@ -249,11 +249,16 @@ impl eframe::App for ThinwireApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let hints = ui::Hints {
-            focus_compose: self.core.take_focus_compose(),
-            scroll_to_selected: self.core.take_scroll_to_selected(),
-        };
-        ui::draw(ui, &self.core.view(), hints, &mut self.intents);
+        let view = self.core.view();
+        let mut hints = ui::Hints::from_view(&view);
+        ui::draw(ui, &view, &mut hints, &mut self.intents);
+        // Clear a hint only after its widget used it (qa L1).
+        if hints.used_focus_compose() {
+            self.core.take_focus_compose();
+        }
+        if hints.used_scroll_to_selected() {
+            self.core.take_scroll_to_selected();
+        }
         for intent in self.intents.drain(..) {
             self.core.dispatch(intent);
         }

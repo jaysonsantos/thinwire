@@ -730,6 +730,12 @@ impl Snapshot {
     }
 
     /// True once after the user picked a chat. The UI then focuses compose.
+    /// A focus request waits for the compose field. Read-only; see `take_focus_compose`.
+    #[must_use]
+    pub const fn wants_focus_compose(&self) -> bool {
+        self.focus_compose
+    }
+
     pub fn take_focus_compose(&mut self) -> bool {
         std::mem::take(&mut self.focus_compose)
     }
@@ -915,6 +921,12 @@ impl Snapshot {
     }
 
     /// True once after the selected row moved in the sorted list.
+    /// A scroll request waits for the inbox rows. Read-only; see `take_scroll_to_selected`.
+    #[must_use]
+    pub const fn wants_scroll_to_selected(&self) -> bool {
+        self.scroll_to_selected
+    }
+
     pub fn take_scroll_to_selected(&mut self) -> bool {
         std::mem::take(&mut self.scroll_to_selected)
     }

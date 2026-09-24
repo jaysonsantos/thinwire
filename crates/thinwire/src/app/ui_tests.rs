@@ -364,3 +364,37 @@ fn keychain_try_again_reaches_the_core_attach() {
     let retry = &retry[..retry.find('}').expect("end")];
     assert!(retry.contains("spawn_os_attach("));
 }
+
+/// qa L1: a hint the frame did not draw stays in the core for a later frame.
+#[test]
+fn hints_count_as_used_only_where_their_widget_draws() {
+    let store = SecretStore::memory();
+    let mut snapshot = ready_with_chats(&store);
+    snapshot.select_conversation(telegram_chat(1, "Alice", 1).id);
+    assert!(snapshot.wants_focus_compose());
+    assert!(
+        snapshot.wants_focus_compose(),
+        "reading the hint does not clear it"
+    );
+
+    let src = include_str!("mod.rs");
+    let ui_fn = &src[src.find("fn ui(").expect("ui")..];
+    let ui_fn = &ui_fn[..ui_fn.find("\n    fn ").expect("next fn")];
+    let draw = ui_fn.find("ui::draw(").expect("draw");
+    let take = ui_fn
+        .find("self.core.take_focus_compose()")
+        .expect("take focus");
+    assert!(draw < take, "the core hint clears after the draw");
+    assert!(ui_fn.contains("if hints.used_focus_compose()"));
+    assert!(ui_fn.contains("if hints.used_scroll_to_selected()"));
+
+    let ui = include_str!("ui.rs");
+    assert_eq!(ui.matches("hints.take_focus_compose()").count(), 1);
+    let compose = &ui[ui.find("fn compose(").expect("compose")..];
+    assert!(compose.contains("hints.take_focus_compose()"));
+    assert_eq!(ui.matches("hints.take_scroll_to_selected()").count(), 1);
+    let inbox = &ui[ui.find("fn inbox(").expect("inbox")..];
+    let inbox = &inbox[..inbox.find("\nfn ").expect("next")];
+    let rows_only = inbox.find("InboxState::Rows").expect("rows");
+    assert!(inbox.find("hints.take_scroll_to_selected()").expect("take") > rows_only);
+}
