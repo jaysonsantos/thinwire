@@ -148,6 +148,7 @@ impl Session {
                     for message in messages.iter().rev() {
                         emit_message(&events, chat_message(&conversation_id, bot_id, message));
                     }
+                    emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord history failed");

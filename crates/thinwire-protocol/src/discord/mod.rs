@@ -639,7 +639,10 @@ mod tests {
             )
             .expect("open");
         let events = until(&mut rx, |event| {
-            matches!(event, AdapterEvent::MessageReceived { message } if message.id == "discord:3")
+            matches!(
+                event,
+                AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+            )
         })
         .await;
         let rows = messages(&events);
