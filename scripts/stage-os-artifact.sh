@@ -28,6 +28,13 @@ if [[ ! -f "$tdlib_license" ]]; then
   exit 1
 fi
 cp "$tdlib_license" dist/THIRD_PARTY_NOTICES/tdlib-LICENSE_1_0.txt
+# The binary embeds Inter (SIL OFL 1.1). The OFL must ship with it.
+inter_license=crates/thinwire/assets/fonts/OFL.txt
+if [[ ! -f "$inter_license" ]]; then
+  echo "::error::Missing Inter OFL license at ${inter_license}."
+  exit 1
+fi
+cp "$inter_license" dist/THIRD_PARTY_NOTICES/Inter-OFL.txt
 
 copy_llvm_notice() {
   local lib="$1"
@@ -156,8 +163,8 @@ EOF
     echo "::error::Thinwire.app is missing an executable Contents/MacOS/thinwire."
     exit 1
   fi
-  if [[ ! -f "$app/Contents/Resources/LICENSE" || ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/tdlib-LICENSE_1_0.txt" ]]; then
-    echo "::error::Thinwire.app Resources are missing LICENSE or the TDLib notice."
+  if [[ ! -f "$app/Contents/Resources/LICENSE" || ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/tdlib-LICENSE_1_0.txt" || ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/Inter-OFL.txt" ]]; then
+    echo "::error::Thinwire.app Resources are missing LICENSE, the TDLib notice, or the Inter OFL."
     exit 1
   fi
   leftover="$(find dist -mindepth 1 -maxdepth 1 ! -name 'Thinwire.app' -print)"
@@ -252,8 +259,9 @@ with tarfile.open(archive, "r:gz") as tf:
 
     has_license = any(name == "LICENSE" or name.endswith("/LICENSE") for name in names)
     has_notice = any(name.endswith("tdlib-LICENSE_1_0.txt") for name in names)
-    if not has_license or not has_notice:
-        raise SystemExit(f"{archive} is missing LICENSE or the TDLib notice")
+    has_font_notice = any(name.endswith("Inter-OFL.txt") for name in names)
+    if not has_license or not has_notice or not has_font_notice:
+        raise SystemExit(f"{archive} is missing LICENSE, the TDLib notice, or the Inter OFL")
 
 print(f"archive ok: {norm(binary.name)} mode {oct(mode)}")
 PY

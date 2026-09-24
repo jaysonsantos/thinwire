@@ -33,7 +33,7 @@ WhatsApp (`whatsapp-web`) is a local-only AGPL feature. Signal (`signal-local`) 
 
 ## License
 
-MIT. Keep third-party notices (including Boost for TDLib if bundled).
+MIT. Keep third-party notices (including Boost for TDLib if bundled). The binary embeds the Inter font (SIL OFL 1.1). See `crates/thinwire/assets/fonts/`. Release archives ship its license as `THIRD_PARTY_NOTICES/Inter-OFL.txt`.
 
 ## Build
 

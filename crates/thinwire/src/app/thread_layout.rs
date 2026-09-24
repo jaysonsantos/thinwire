@@ -16,6 +16,9 @@ pub(crate) struct RowLayout {
     pub show_sender: bool,
     /// Local "HH:MM". Empty when the time is unknown.
     pub time: String,
+    /// Last bubble of a sender run. The next row is another sender, the
+    /// other side, a new day, or the end of the thread.
+    pub run_end: bool,
 }
 
 /// Day breaks, sender runs, and times for `messages` (oldest first).
@@ -55,8 +58,19 @@ where
                 .map(|local| local.format("%H:%M").to_string())
                 .unwrap_or_default(),
             day_break,
+            run_end: false,
         });
         previous = Some(message);
+    }
+    for index in 0..rows.len() {
+        rows[index].run_end = match messages.get(index + 1) {
+            None => true,
+            Some(next) => {
+                rows[index + 1].day_break.is_some()
+                    || next.outbound != messages[index].outbound
+                    || next.sender != messages[index].sender
+            }
+        };
     }
     rows
 }
@@ -188,6 +202,22 @@ mod tests {
         assert_eq!(group, vec![true, false, true, false, true, true]);
         let private = thread_rows(&messages, false, &now(0));
         assert!(private.iter().all(|row| !row.show_sender));
+    }
+
+    #[test]
+    fn run_end_marks_the_last_bubble_of_a_sender_run() {
+        let messages = [
+            message("Ada", false, NOON),
+            message("Ada", false, NOON + 60),
+            message("you", true, NOON + 120),
+            message("you", true, NOON + 180),
+            message("Ada", false, NOON + DAY),
+        ];
+        let ends: Vec<bool> = thread_rows(&messages, true, &now(0))
+            .iter()
+            .map(|row| row.run_end)
+            .collect();
+        assert_eq!(ends, vec![false, true, false, true, true]);
     }
 
     #[test]
