@@ -301,6 +301,9 @@ pub(crate) struct Snapshot {
     drafts: HashMap<String, String>,
     focus_compose: bool,
     telegram_stopped: bool,
+    /// A send the adapter has not accepted yet: (chat id, text). The compose
+    /// text stays until the pending row arrives (PR #40 review).
+    sending: Option<(String, String)>,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
     api_source: TelegramApiSource,
@@ -361,6 +364,7 @@ impl Snapshot {
             drafts: HashMap::new(),
             focus_compose: false,
             telegram_stopped: false,
+            sending: None,
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
@@ -412,6 +416,7 @@ impl Snapshot {
                         if self.auth != AuthScreen::Idle {
                             self.auth_busy = false;
                         }
+                        self.fail_unaccepted_send();
                         self.resume = Resume::Settled;
                         // A failed load does not send its end event. Stop the spinners.
                         self.chat_list_loading = false;
@@ -470,6 +475,7 @@ impl Snapshot {
                 self.remove_conversation(protocol, &id);
             }
             AdapterEvent::MessageReceived { message } => {
+                self.note_send_accepted(&message);
                 let before =
                     self.delivery_of(message.protocol, &message.conversation_id, &message.id);
                 self.note_delivery(before, &message);
@@ -669,6 +675,7 @@ impl Snapshot {
         self.selected_protocol == ProtocolId::Telegram
             && self.telegram_authorized
             && !self.compose.trim().is_empty()
+            && self.sending.is_none()
             && self
                 .selected_conversation
                 .as_deref()
@@ -1013,6 +1020,41 @@ impl Snapshot {
         std::mem::take(&mut self.keychain_retry)
     }
 
+    /// The pending (or sent) row of the unaccepted send arrived: the adapter
+    /// accepted it. Only now does the compose text (or the chat's draft) clear.
+    fn note_send_accepted(&mut self, message: &ChatMessage) {
+        let Some((chat, body)) = self.sending.as_ref() else {
+            return;
+        };
+        if !message.outbound || message.conversation_id != *chat || message.body.trim() != body {
+            return;
+        }
+        let selected = self.selected_conversation.as_deref() == Some(chat.as_str());
+        if selected && self.compose.trim() == body {
+            self.compose.clear();
+        } else if self
+            .drafts
+            .get(chat)
+            .is_some_and(|draft| draft.trim() == body)
+        {
+            self.drafts.remove(chat);
+        }
+        self.sending = None;
+    }
+
+    /// A Telegram error came before the pending row: the send was not
+    /// accepted. The text is still in compose; say what happened.
+    fn fail_unaccepted_send(&mut self) {
+        if self.sending.take().is_none() {
+            return;
+        }
+        self.set_error(
+            "Message not sent.",
+            "Telegram did not accept the message.",
+            "The text is still in the compose field. Send it again.",
+        );
+    }
+
     /// Enter submits the current login step. Escape cancels the login.
     pub(crate) fn auth_key(&mut self, key: AuthKey, store: &SecretStore) {
         match (key, self.auth) {
@@ -1064,7 +1106,8 @@ impl Snapshot {
             return;
         };
         let body = self.compose.trim().to_string();
-        self.compose.clear();
+        // Keep the text until the adapter accepts the send; see note_send_accepted.
+        self.sending = Some((conversation_id.clone(), body.clone()));
         self.error = None;
         self.pending.push(AdapterCommand::SendText {
             protocol: ProtocolId::Telegram,
@@ -1222,6 +1265,7 @@ impl Snapshot {
         self.chat_list_loading = false;
         self.drafts.clear();
         self.compose.clear();
+        self.sending = None;
         if self.selected_protocol == ProtocolId::Telegram {
             self.selected_conversation = None;
         }
@@ -1934,8 +1978,14 @@ mod tests {
 
         snapshot.compose = "line one\nline two".into();
         assert!(snapshot.compose_enter(false));
-        assert!(snapshot.compose.is_empty());
         assert_eq!(send_texts(&mut snapshot), vec!["line one\nline two"]);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 100, "line one\nline two", Delivery::Pending),
+        });
+        assert!(
+            snapshot.compose.is_empty(),
+            "cleared once the send is accepted"
+        );
 
         snapshot.compose = "   ".into();
         assert!(!snapshot.can_send());
@@ -2003,10 +2053,10 @@ mod tests {
         snapshot.compose = "hi".into();
         snapshot.send_compose();
         assert_eq!(send_texts(&mut snapshot), vec!["hi"]);
-        assert!(snapshot.compose.is_empty());
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 100, "hi", Delivery::Pending),
         });
+        assert!(snapshot.compose.is_empty());
         snapshot.apply(AdapterEvent::MessageReplaced {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
@@ -2747,6 +2797,52 @@ mod tests {
             auth_steps(&mut snapshot),
             vec![TelegramAuthStep::ApiCredentials]
         );
+    }
+
+    #[test]
+    fn compose_text_stays_until_the_adapter_accepts_the_send() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        assert_eq!(send_texts(&mut snapshot), vec!["hello"]);
+        assert_eq!(
+            snapshot.compose, "hello",
+            "not cleared before the pending row"
+        );
+        assert!(
+            !snapshot.can_send(),
+            "no second send while one is in flight"
+        );
+        snapshot.send_compose();
+        assert!(send_texts(&mut snapshot).is_empty());
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 100, "hello", Delivery::Pending),
+        });
+        assert!(
+            snapshot.compose.is_empty(),
+            "the pending row means accepted"
+        );
+        assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn an_immediate_send_error_keeps_the_text_and_shows_the_error() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "Telegram did not send the message (TDLib 400).".into(),
+        });
+        assert_eq!(snapshot.compose, "hello", "no pending row: the text stays");
+        let error = snapshot.error.clone().expect("error block");
+        assert_eq!(error.happened, "Message not sent.");
+        assert!(snapshot.can_send(), "the user can send it again");
     }
 
     #[test]
@@ -3499,7 +3595,10 @@ mod tests {
         snapshot.selected_conversation = Some("telegram:42".into());
         snapshot.compose = " hello ".into();
         snapshot.send_compose();
-        assert!(snapshot.compose.is_empty());
+        assert_eq!(
+            snapshot.compose, " hello ",
+            "kept until the adapter accepts it"
+        );
         assert!(snapshot.selected_messages().is_empty());
         let commands = snapshot.take_commands();
         assert!(commands.iter().any(|command| matches!(
