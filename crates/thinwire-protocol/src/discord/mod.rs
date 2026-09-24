@@ -427,6 +427,15 @@ mod tests {
         (adapter, vault)
     }
 
+    async fn inbox_loaded(rx: &mut UnboundedReceiver<AdapterEvent>) -> Vec<AdapterEvent> {
+        let mut events = until(rx, is_ready).await;
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+        {
+            events.push(event);
+        }
+        events
+    }
+
     /// Connect with the guild fixture and wait for the channel list.
     async fn connected(
         api: Arc<FakeDiscordApi>,
@@ -446,7 +455,7 @@ mod tests {
                 &tx,
             )
             .expect("connect");
-        let events = until(&mut rx, is_ready).await;
+        let events = inbox_loaded(&mut rx).await;
         (adapter, tx, rx, events)
     }
 
@@ -570,10 +579,27 @@ mod tests {
         assert!(general.preview.contains("read and send"));
         assert!(rows[1].preview.contains("read only"));
 
-        let Some(AdapterEvent::Status { status, detail, .. }) = events.last() else {
+        let ready_at = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Status {
+                        status: AdapterStatus::Ready,
+                        detail,
+                        ..
+                    } if detail.contains("2 guild channels")
+                )
+            })
+            .expect("ready status");
+        let first_row = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::ConversationUpsert { .. }))
+            .expect("channel row");
+        assert!(ready_at < first_row, "ready before the inbox");
+        let AdapterEvent::Status { status, detail, .. } = &events[ready_at] else {
             panic!("ready status");
         };
-        assert!(detail.contains("2 guild channels"));
         assert!(
             DiscordAdapter::inbox_account_linked(*status, detail)
                 == DiscordAdapter::bot_inbox_compiled()
@@ -756,7 +782,7 @@ mod tests {
                 &tx,
             )
             .expect("reload");
-        let events = until(&mut rx, is_ready).await;
+        let events = inbox_loaded(&mut rx).await;
         assert!(events.iter().any(|event| matches!(
             event,
             AdapterEvent::ConversationRemoved { id, .. } if *id == conversation_id(GUILD, NEWS)
@@ -781,7 +807,7 @@ mod tests {
                 &tx,
             )
             .expect("reconnect");
-        let events = until(&mut rx, is_ready).await;
+        let events = inbox_loaded(&mut rx).await;
         assert!(events.iter().any(|event| matches!(
             event,
             AdapterEvent::ConversationRemoved { id, .. } if *id == conversation_id(GUILD, NEWS)
@@ -944,7 +970,7 @@ mod tests {
                 &tx,
             )
             .expect("reconnect");
-        let events = until(&mut rx, is_ready).await;
+        let events = inbox_loaded(&mut rx).await;
         assert_eq!(conversations(&events).len(), 2);
         let rendered = format!("{events:?} {adapter:?}");
         assert!(!rendered.contains(FIXTURE_TOKEN));

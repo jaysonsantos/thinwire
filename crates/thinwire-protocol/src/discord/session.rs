@@ -273,13 +273,13 @@ fn publish_channels(
     for id in gone {
         emit_conversation_removed(events, ProtocolId::Discord, id);
     }
-    for channel in channels {
-        emit_conversation(events, channel.conversation());
-    }
     emit_ready(
         events,
         &format!("{} guild channels the bot can read.", channels.len()),
     );
+    for channel in channels {
+        emit_conversation(events, channel.conversation());
+    }
 }
 
 fn emit_ready(events: &EventTx, note: &str) {
