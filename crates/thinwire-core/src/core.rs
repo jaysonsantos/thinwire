@@ -339,15 +339,26 @@ fn forward_events(
 
 /// Wake the frontends while the keychain attach runs, and once when it ends.
 fn watch_keychain(runtime: &Handle, secrets: Arc<SecretStore>, notifier: ChangeNotifier) {
-    runtime.spawn(async move {
-        loop {
-            notifier.notify();
-            if secrets.attach_settled() {
-                return;
-            }
-            tokio::time::sleep(KEYCHAIN_WATCH_STEP).await;
+    runtime.spawn(watch_until(
+        move || secrets.attach_settled(),
+        notifier,
+        KEYCHAIN_WATCH_STEP,
+    ));
+}
+
+/// Notify every `step` until `settled` is true, then once more.
+///
+/// Check first, then notify: the last wake comes after the watch saw the
+/// attach end. So the frame for it sees the end too (qa M2).
+async fn watch_until(settled: impl Fn() -> bool, notifier: ChangeNotifier, step: Duration) {
+    loop {
+        let done = settled();
+        notifier.notify();
+        if done {
+            return;
         }
-    });
+        tokio::time::sleep(step).await;
+    }
 }
 
 fn bind_discord_after_hydrate(secrets: &SecretStore, host: &AdapterHost) {
@@ -585,6 +596,52 @@ mod tests {
         assert_eq!(
             refreshed_secret_store_status("Telegram: enter a phone number.", "os-keychain"),
             None
+        );
+    }
+
+    /// qa M2: the attach ends right after a wake. One more wake must come
+    /// after the watch saw the end, or the resume frame never runs.
+    #[tokio::test]
+    async fn keychain_watch_wakes_again_after_the_attach_ends() {
+        let (notifier, mut signal) = change_channel();
+        let probe = notifier.subscribe();
+        let seen_at = Arc::new(std::sync::Mutex::new(None));
+        let record = Arc::clone(&seen_at);
+        let checks = std::sync::atomic::AtomicU32::new(0);
+        let settled = move || {
+            // Not settled at the first check; the attach ends before the second.
+            let done = checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+            if done {
+                let mut probe = probe.clone();
+                *record.lock().expect("lock") = Some(probe.mark_seen());
+            }
+            done
+        };
+        tokio::time::timeout(
+            WAIT,
+            watch_until(settled, notifier, Duration::from_millis(1)),
+        )
+        .await
+        .expect("watch ends");
+        let seen = seen_at.lock().expect("lock").expect("saw the end");
+        let last = signal.mark_seen();
+        assert!(
+            last > seen,
+            "no wake after the end: seen {seen}, last {last}"
+        );
+    }
+
+    #[test]
+    fn ready_attach_sets_the_backend_under_the_same_lock() {
+        let store = SecretStore::detached_for_test();
+        let _ = store.finish_ready(
+            std::collections::HashMap::new(),
+            Some(crate::secrets::OsBackend::KernelKeyring),
+        );
+        assert!(store.attach_settled());
+        assert_eq!(
+            store.persistence(),
+            crate::secrets::Persistence::UntilRestart
         );
     }
 }

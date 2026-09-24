@@ -446,19 +446,24 @@ impl SecretStore {
             self.finish_read_failed();
             return false;
         }
-        let should_flush = self.finish_ready(os_values);
-        if let Ok(mut inner) = self.lock() {
-            inner.os_backend = Some(backend);
-        }
-        should_flush
+        self.finish_ready(os_values, Some(backend))
     }
 
     /// Merge OS values under the store lock. Dirty UI keys win. Returns
     /// whether a deferred flush (or any dirty write) must hit the keychain.
-    fn finish_ready(&self, os_values: HashMap<SecretKey, String>) -> bool {
+    /// Ready and the backend change under one lock, so a reader that sees
+    /// `Ready` also sees the backend (qa M2).
+    pub(crate) fn finish_ready(
+        &self,
+        os_values: HashMap<SecretKey, String>,
+        backend: Option<OsBackend>,
+    ) -> bool {
         let Ok(mut inner) = self.lock() else {
             return false;
         };
+        if backend.is_some() {
+            inner.os_backend = backend;
+        }
         for (key, value) in os_values {
             if inner.dirty.contains(&key) {
                 continue;
@@ -900,7 +905,7 @@ impl SecretStore {
             .iter()
             .map(|(key, value)| (*key, (*value).to_string()))
             .collect();
-        let _ = self.finish_ready(values);
+        let _ = self.finish_ready(values, None);
     }
 
     pub fn set_backend_for_test(&self, backend: OsBackend) {
@@ -954,7 +959,7 @@ mod tests {
                 .iter()
                 .map(|(key, value)| (*key, (*value).to_string()))
                 .collect();
-            self.finish_ready(os_values)
+            self.finish_ready(os_values, None)
         }
 
         fn finish_in_flight_flush_for_test(&self) {
