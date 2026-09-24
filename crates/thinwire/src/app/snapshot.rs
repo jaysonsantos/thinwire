@@ -301,9 +301,10 @@ pub(crate) struct Snapshot {
     drafts: HashMap<String, String>,
     focus_compose: bool,
     telegram_stopped: bool,
-    /// A send the adapter has not accepted yet: (chat id, text). The compose
-    /// text stays until the pending row arrives (PR #40 review).
-    sending: Option<(String, String)>,
+    /// Sends the adapter has not accepted yet: chat id → text. One per chat,
+    /// so a send in one chat does not block Send in another. The text stays
+    /// until the pending row arrives (PR #40 review).
+    sending: HashMap<String, String>,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
     api_source: TelegramApiSource,
@@ -364,7 +365,7 @@ impl Snapshot {
             drafts: HashMap::new(),
             focus_compose: false,
             telegram_stopped: false,
-            sending: None,
+            sending: HashMap::new(),
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
@@ -675,7 +676,10 @@ impl Snapshot {
         self.selected_protocol == ProtocolId::Telegram
             && self.telegram_authorized
             && !self.compose.trim().is_empty()
-            && self.sending.is_none()
+            && self
+                .selected_conversation
+                .as_ref()
+                .is_none_or(|chat| !self.sending.contains_key(chat))
             && self
                 .selected_conversation
                 .as_deref()
@@ -1023,12 +1027,16 @@ impl Snapshot {
     /// The pending (or sent) row of the unaccepted send arrived: the adapter
     /// accepted it. Only now does the compose text (or the chat's draft) clear.
     fn note_send_accepted(&mut self, message: &ChatMessage) {
-        let Some((chat, body)) = self.sending.as_ref() else {
-            return;
-        };
-        if !message.outbound || message.conversation_id != *chat || message.body.trim() != body {
+        if !message.outbound {
             return;
         }
+        let chat = &message.conversation_id;
+        if self.sending.get(chat).map(String::as_str) != Some(message.body.trim()) {
+            return;
+        }
+        let Some(body) = self.sending.remove(chat) else {
+            return;
+        };
         let selected = self.selected_conversation.as_deref() == Some(chat.as_str());
         if selected && self.compose.trim() == body {
             self.compose.clear();
@@ -1039,15 +1047,16 @@ impl Snapshot {
         {
             self.drafts.remove(chat);
         }
-        self.sending = None;
     }
 
     /// A Telegram error came before the pending row: the send was not
-    /// accepted. The text is still in compose; say what happened.
+    /// accepted. The error does not name a chat, so every unaccepted send
+    /// ends. Each text is still in its compose field or draft.
     fn fail_unaccepted_send(&mut self) {
-        if self.sending.take().is_none() {
+        if self.sending.is_empty() {
             return;
         }
+        self.sending.clear();
         self.set_error(
             "Message not sent.",
             "Telegram did not accept the message.",
@@ -1110,7 +1119,7 @@ impl Snapshot {
         };
         let body = self.compose.trim().to_string();
         // Keep the text until the adapter accepts the send; see note_send_accepted.
-        self.sending = Some((conversation_id.clone(), body.clone()));
+        self.sending.insert(conversation_id.clone(), body.clone());
         self.error = None;
         self.pending.push(AdapterCommand::SendText {
             protocol: ProtocolId::Telegram,
@@ -1273,7 +1282,7 @@ impl Snapshot {
         self.chat_list_loading = false;
         self.drafts.clear();
         self.compose.clear();
-        self.sending = None;
+        self.sending.clear();
         if self.selected_protocol == ProtocolId::Telegram {
             self.selected_conversation = None;
         }
@@ -2877,6 +2886,31 @@ mod tests {
             "the pending row means accepted"
         );
         assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn a_send_in_one_chat_does_not_block_send_in_another() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "for Ada".into();
+        snapshot.send_compose();
+        assert!(!snapshot.can_send(), "chat 1 waits for its pending row");
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.compose = "for Bob".into();
+        assert!(snapshot.can_send(), "chat 2 is free (PR #40 re-review)");
+        snapshot.send_compose();
+        assert_eq!(send_texts(&mut snapshot), vec!["for Ada", "for Bob"]);
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 100, "for Ada", Delivery::Pending),
+        });
+        snapshot.select_conversation("telegram:1".into());
+        assert!(
+            snapshot.compose.is_empty(),
+            "chat 1's draft cleared on accept"
+        );
+        snapshot.select_conversation("telegram:2".into());
+        assert_eq!(snapshot.compose, "for Bob", "chat 2 still waits");
     }
 
     #[test]
