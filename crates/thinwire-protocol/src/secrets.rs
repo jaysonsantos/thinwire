@@ -106,6 +106,16 @@ pub trait TelegramSecretVault: Send + Sync {
     fn persists(&self) -> bool {
         true
     }
+
+    /// `false` while an OS keychain read is unfinished or failed.
+    ///
+    /// A missing database key is confirmed only when this is true and
+    /// [`Self::get_secret`] returns `None` (`Ok(None)` from the keychain).
+    /// A read error must leave this false so it does not look like a missing
+    /// key. Vaults that never talk to an OS keychain stay hydrated.
+    fn secrets_hydrated(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory vault used by tests and as the UI-side map.

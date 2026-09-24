@@ -751,10 +751,17 @@ mod tests {
     fn live_tdlib_moves_a_keyless_data_folder_aside_before_it_opens() {
         let src = include_str!("tdlib.rs");
         let params = fn_body(src, "async fn set_parameters");
+        let settled = params
+            .find("secrets.secrets_hydrated()")
+            .expect("settled read");
         let check = params
             .find("move_aside_if_keyless(&dir, has_key)")
             .expect("check");
         let key = params.find("ensure_db_key(").expect("key");
+        assert!(
+            settled < check,
+            "a failed hydrate must not look like a missing key"
+        );
         assert!(check < key, "check the vault before a new key is made");
         assert!(params.contains("data_dir::is_wrong_key_error(&error.message)"));
         assert!(params.contains("&& moved_to.is_none()"), "retry once only");

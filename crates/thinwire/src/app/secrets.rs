@@ -5,8 +5,11 @@
 //! Credential Manager. Never log or persist these values in the git repo.
 //!
 //! Attach is an ordered state machine (`Detached` → `Attaching` → `Ready` or
-//! `MemoryOnly`). UI writes mark keys dirty so a late hydrate cannot overwrite
-//! them. A flush requested before `Ready` is deferred and runs after attach.
+//! `MemoryOnly`). A failed key read stays `Attaching`: the partial snapshot is
+//! not applied and the phase does not become `Ready`, so a missing database
+//! key is not assumed. UI writes mark keys dirty so a late hydrate cannot
+//! overwrite them. A flush requested before `Ready` is deferred and runs after
+//! attach.
 //! Concurrent Ready flushes coalesce onto one worker so an older OS write
 //! cannot clobber newer credentials.
 
@@ -348,19 +351,13 @@ impl SecretStore {
         }
         match probe_os() {
             Ok(backend) => {
-                let (os_values, hydrate_error) = read_os_snapshot();
                 let discord_token = read_discord_os_token();
-                let should_flush = self.finish_ready(os_values);
-                if let Ok(mut inner) = self.lock() {
-                    inner.os_backend = Some(backend);
-                }
+                let should_flush = match read_os_snapshot() {
+                    Ok(os_values) => self.settle_after_probe(backend, os_values, None),
+                    Err(error) => self.settle_after_probe(backend, HashMap::new(), Some(error)),
+                };
                 self.store_hydrated_discord_token(discord_token);
-                if let Some(error) = hydrate_error {
-                    tracing::warn!(
-                        error = %error,
-                        "OS keychain attached but hydrate failed; dirty UI writes are kept"
-                    );
-                } else {
+                if self.phase() == AttachPhase::Ready {
                     tracing::info!(?backend, "using the OS keychain for Telegram secrets");
                 }
                 if should_flush && let Err(error) = self.flush_os() {
@@ -388,6 +385,33 @@ impl SecretStore {
             inner.flush_pending = false;
             inner.flush_in_flight = false;
         }
+    }
+
+    /// Apply one probe result.
+    ///
+    /// `Ok(None)` entries are simply absent from `os_values`. That clean map
+    /// may settle `Ready` with no database key, which is the keyless recovery
+    /// signal. A hydrate error keeps `Attaching` and drops `os_values`, even
+    /// when the map already holds a session. A partial snapshot must not
+    /// become `Ready` with `DbEncryption` missing.
+    fn settle_after_probe(
+        &self,
+        backend: OsBackend,
+        os_values: HashMap<SecretKey, String>,
+        hydrate_error: Option<SecretError>,
+    ) -> bool {
+        if let Some(error) = hydrate_error {
+            tracing::warn!(
+                error = %error,
+                "OS keychain hydrate failed; attach stays unsettled so a missing database key is not assumed"
+            );
+            return false;
+        }
+        let should_flush = self.finish_ready(os_values);
+        if let Ok(mut inner) = self.lock() {
+            inner.os_backend = Some(backend);
+        }
+        should_flush
     }
 
     /// Merge OS values under the store lock. Dirty UI keys win. Returns
@@ -563,6 +587,10 @@ impl TelegramSecretVault for SecretStore {
         self.get(key).ok().flatten()
     }
 
+    fn secrets_hydrated(&self) -> bool {
+        self.attach_settled()
+    }
+
     fn set_secret(&self, key: TelegramSecretKey, value: &str) {
         if let Err(error) = self.set(key, value) {
             tracing::warn!(error = %error, "memory secret write failed");
@@ -581,7 +609,12 @@ enum FlushAction {
     Ignore,
 }
 
-fn read_os_snapshot() -> (HashMap<SecretKey, String>, Option<SecretError>) {
+/// Read every persistent key.
+///
+/// `Ok(None)` omits the key. That is a confirmed missing entry. `Err` drops
+/// keys already read and returns the error, so a later key failure cannot be
+/// applied as a partial `Ready` snapshot.
+fn read_os_snapshot() -> Result<HashMap<SecretKey, String>, SecretError> {
     let mut os_values = HashMap::new();
     for key in SecretKey::PERSISTENT {
         match os_get(key) {
@@ -589,10 +622,10 @@ fn read_os_snapshot() -> (HashMap<SecretKey, String>, Option<SecretError>) {
                 os_values.insert(key, value);
             }
             Ok(None) => {}
-            Err(error) => return (os_values, Some(error)),
+            Err(error) => return Err(error),
         }
     }
-    (os_values, None)
+    Ok(os_values)
 }
 
 impl fmt::Debug for SecretStore {
@@ -784,6 +817,8 @@ fn map_keyring_error(error: keyring_core::Error) -> SecretError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     impl SecretStore {
@@ -990,6 +1025,60 @@ mod tests {
         let err = SecretError::new("OS keychain: no storage access");
         assert!(!err.to_string().contains("api_hash"));
         assert!(!format!("{err:?}").contains("password"));
+    }
+
+    /// Mirrors the TDLib keyless check: a settled, persisting vault with no
+    /// database key. A hydrate error must not satisfy it.
+    fn keyless_recovery_allowed(store: &SecretStore) -> bool {
+        TelegramSecretVault::secrets_hydrated(store)
+            && TelegramSecretVault::persists(store)
+            && TelegramSecretVault::get_secret(store, SecretKey::DbEncryption).is_none()
+    }
+
+    #[test]
+    fn hydrate_error_does_not_finish_ready_with_a_missing_db_key() {
+        let store = SecretStore::blank(AttachPhase::Attaching);
+        let mut partial = HashMap::new();
+        partial.insert(SecretKey::Session, "saved-session".to_string());
+        partial.insert(SecretKey::ApiId, "12345".to_string());
+        let should_flush = store.settle_after_probe(
+            OsBackend::SecretService,
+            partial,
+            Some(SecretError::new("OS keychain: platform failure")),
+        );
+        assert!(!should_flush);
+        assert_eq!(store.phase(), AttachPhase::Attaching);
+        assert!(!store.attach_settled());
+        assert!(!TelegramSecretVault::secrets_hydrated(&store));
+        assert_eq!(store.get(SecretKey::Session).expect("session"), None);
+        assert_eq!(store.get(SecretKey::DbEncryption).expect("db key"), None);
+        assert!(
+            !keyless_recovery_allowed(&store),
+            "a read error must not move a valid TDLib folder aside"
+        );
+    }
+
+    #[test]
+    fn confirmed_missing_db_key_allows_keyless_recovery() {
+        let store = SecretStore::blank(AttachPhase::Attaching);
+        let mut os_values = HashMap::new();
+        os_values.insert(SecretKey::Session, "saved-session".to_string());
+        let should_flush = store.settle_after_probe(OsBackend::SecretService, os_values, None);
+        assert!(!should_flush);
+        assert_eq!(store.phase(), AttachPhase::Ready);
+        assert!(store.attach_settled());
+        assert!(TelegramSecretVault::secrets_hydrated(&store));
+        assert!(TelegramSecretVault::persists(&store));
+        assert_eq!(
+            store.get(SecretKey::Session).expect("session").as_deref(),
+            Some("saved-session")
+        );
+        assert_eq!(
+            TelegramSecretVault::get_secret(&store, SecretKey::DbEncryption),
+            None,
+            "Ok(None) stays a confirmed missing entry"
+        );
+        assert!(keyless_recovery_allowed(&store));
     }
 
     #[test]

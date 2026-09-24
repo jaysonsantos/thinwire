@@ -1146,6 +1146,21 @@ async fn set_parameters(
         );
         return;
     };
+    // A keychain read error is not a missing key. Refuse to open the folder
+    // until a clean hydrate has settled. Only Ok(None) on a settled vault is
+    // keyless; an unsettled vault must not reach move-aside or a new key.
+    if !secrets.secrets_hydrated() {
+        tracing::warn!("telegram secrets are not hydrated; not opening the data folder");
+        emit_telegram_auth_rejected(events, TelegramAuthError::ClientSetup { code: 0 });
+        emit_telegram_auth(events, TelegramAuthPhase::Failed);
+        emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            "Telegram could not start (keychain still opening).",
+        );
+        return;
+    }
     let dir = match tdlib_data_dir(secrets.persists()) {
         Ok(dir) => dir,
         Err(error) => {
