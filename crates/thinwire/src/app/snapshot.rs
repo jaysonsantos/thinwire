@@ -63,8 +63,8 @@ impl InboxFilter {
 
     /// Account chip visibility for the current filter. Off-feature spikes stay out.
     ///
-    /// Discord also needs live Telegram messages before it may appear — that gate
-    /// lives on [`Snapshot::account_surface_visible`], so callers must AND both.
+    /// Cargo features decide which protocols exist. Callers still AND
+    /// [`Snapshot::account_surface_visible`].
     #[must_use]
     pub(crate) const fn shows_in_switcher(self, protocol: ProtocolId) -> bool {
         self.matches(protocol)
@@ -285,7 +285,6 @@ pub(crate) struct Snapshot {
     resume: Resume,
     /// When the UI first saw the keychain read still running.
     keychain_wait_started: Option<Instant>,
-    telegram_messages_from_adapter: u32,
     chat_list_loading: bool,
     history_loading: HashSet<String>,
     scroll_to_selected: bool,
@@ -345,7 +344,6 @@ impl Snapshot {
             telegram_authorized: false,
             resume: Resume::Waiting,
             keychain_wait_started: None,
-            telegram_messages_from_adapter: 0,
             chat_list_loading: false,
             history_loading: HashSet::new(),
             scroll_to_selected: false,
@@ -461,10 +459,6 @@ impl Snapshot {
                 self.remove_conversation(protocol, &id);
             }
             AdapterEvent::MessageReceived { message } => {
-                if message.protocol == ProtocolId::Telegram {
-                    self.telegram_messages_from_adapter =
-                        self.telegram_messages_from_adapter.saturating_add(1);
-                }
                 let before =
                     self.delivery_of(message.protocol, &message.conversation_id, &message.id);
                 self.note_delivery(before, &message);
@@ -724,18 +718,19 @@ impl Snapshot {
         }
     }
 
-    /// Discord stays hidden until the bot feature is compiled and Telegram has messages.
+    /// Discord inbox chrome when feature `discord-bot` is compiled.
+    ///
+    /// Visibility follows that compile-time check alone. It does not wait for
+    /// a Telegram session or for Telegram messages.
     #[must_use]
     pub(crate) fn discord_inbox_visible(&self) -> bool {
         DiscordAdapter::bot_inbox_compiled()
-            && self.telegram_authorized
-            && self.telegram_messages_from_adapter > 0
     }
 
     /// Protocols that may appear in Accounts / filter chrome for this build.
     ///
-    /// Telegram is always present. Slack and WhatsApp appear only when their
-    /// cargo features are on. Discord also waits for Telegram messages (0009).
+    /// Telegram is always present. Slack, WhatsApp, and Discord appear only
+    /// when their cargo features are on.
     #[must_use]
     pub(crate) fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
         match protocol {
@@ -1435,14 +1430,14 @@ impl Snapshot {
         }
     }
 
-    /// Same predicate as the Telegram-only first-run screen.
+    /// WhatsApp pairing chrome when feature `whatsapp-web` is compiled.
     ///
-    /// Discord has no pairing control on that screen. The WhatsApp entry stays
-    /// unavailable until Telegram is linked, which happens on the Ready path.
+    /// The entry does not wait for a linked Telegram account. The default
+    /// build leaves the feature off, so first-run chrome stays Telegram-only.
     #[cfg(feature = "whatsapp-web")]
     #[must_use]
     pub(crate) fn whatsapp_pairing_available(&self) -> bool {
-        self.has_primary_account()
+        protocol_chrome_enabled(ProtocolId::WhatsApp)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -2725,7 +2720,10 @@ mod tests {
             snapshot.shows_in_switcher(ProtocolId::WhatsApp),
             cfg!(feature = "whatsapp-web")
         );
-        assert!(!snapshot.shows_in_switcher(ProtocolId::Discord));
+        assert_eq!(
+            snapshot.shows_in_switcher(ProtocolId::Discord),
+            DiscordAdapter::bot_inbox_compiled()
+        );
         assert_eq!(
             snapshot.shows_in_switcher(ProtocolId::Slack),
             cfg!(feature = "slack-oauth")
@@ -3114,24 +3112,6 @@ mod tests {
             .linked
     }
 
-    fn unlock_telegram_messages(snapshot: &mut Snapshot) {
-        snapshot.apply(AdapterEvent::TelegramAuth {
-            phase: TelegramAuthPhase::Ready,
-        });
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: ChatMessage {
-                protocol: ProtocolId::Telegram,
-                conversation_id: "telegram:saved".into(),
-                id: "telegram:saved:1".into(),
-                sender: "worker".into(),
-                body: "hello from telegram".into(),
-                outbound: false,
-                delivery: Delivery::Sent,
-                sent_at: 0,
-            },
-        });
-    }
-
     #[test]
     fn discord_missing_token_placeholder_stays_unlinked() {
         let mut snapshot = Snapshot::new();
@@ -3145,7 +3125,6 @@ mod tests {
             detail: "Discord bot inbox placeholder. bot token is not in the OS keychain. Gateway is not started.".into(),
         });
         assert!(!discord_linked(&snapshot));
-        unlock_telegram_messages(&mut snapshot);
         snapshot.select_protocol(ProtocolId::Discord);
         assert!(snapshot.visible_conversations().is_empty());
         assert_eq!(snapshot.unread_for(ProtocolId::Discord), 0);
@@ -3167,7 +3146,6 @@ mod tests {
             discord_linked(&snapshot),
             DiscordAdapter::bot_inbox_compiled()
         );
-        unlock_telegram_messages(&mut snapshot);
         snapshot.select_protocol(ProtocolId::Discord);
         if DiscordAdapter::bot_inbox_compiled() {
             assert_eq!(snapshot.selected_protocol, ProtocolId::Discord);
@@ -3188,10 +3166,18 @@ mod tests {
     }
 
     #[test]
-    fn discord_stays_invisible_until_telegram_messages_exist() {
+    fn discord_visibility_follows_the_compiled_bot_inbox() {
         let mut snapshot = Snapshot::new();
-        assert!(!snapshot.discord_inbox_visible());
-        assert!(!snapshot.account_surface_visible(ProtocolId::Discord));
+        assert!(!snapshot.telegram_authorized);
+        assert!(!snapshot.telegram_ready());
+        assert_eq!(
+            snapshot.discord_inbox_visible(),
+            DiscordAdapter::bot_inbox_compiled()
+        );
+        assert_eq!(
+            snapshot.account_surface_visible(ProtocolId::Discord),
+            DiscordAdapter::bot_inbox_compiled()
+        );
         assert_eq!(
             snapshot.account_surface_visible(ProtocolId::WhatsApp),
             cfg!(feature = "whatsapp-web")
@@ -3199,12 +3185,6 @@ mod tests {
         snapshot.apply(AdapterEvent::TelegramAuth {
             phase: TelegramAuthPhase::Ready,
         });
-        assert!(snapshot.telegram_ready());
-        assert!(!snapshot.discord_inbox_visible());
-        snapshot.selected_conversation = Some("telegram:1".into());
-        snapshot.compose = "local only".into();
-        snapshot.send_compose();
-        assert!(!snapshot.discord_inbox_visible());
         snapshot.apply(AdapterEvent::MessageReceived {
             message: ChatMessage {
                 protocol: ProtocolId::Telegram,
@@ -3238,9 +3218,9 @@ mod tests {
                 view.shows_in_switcher(ProtocolId::WhatsApp),
                 cfg!(feature = "whatsapp-web") && filter.matches(ProtocolId::WhatsApp)
             );
-            assert!(
-                !view.shows_in_switcher(ProtocolId::Discord),
-                "discord needs telegram messages before chrome"
+            assert_eq!(
+                view.shows_in_switcher(ProtocolId::Discord),
+                DiscordAdapter::bot_inbox_compiled() && filter.matches(ProtocolId::Discord)
             );
             assert_eq!(
                 view.shows_in_switcher(ProtocolId::Slack),
@@ -3338,21 +3318,10 @@ mod tests {
 
     #[cfg(feature = "whatsapp-web")]
     #[test]
-    fn whatsapp_pairing_entry_hidden_until_telegram_first_run() {
+    fn whatsapp_pairing_does_not_require_a_linked_telegram() {
         let mut snapshot = Snapshot::new();
         assert!(!snapshot.has_primary_account());
         assert!(!snapshot.telegram_ready());
-        assert!(!snapshot.whatsapp_pairing_available());
-        snapshot.open_whatsapp_risk_gate();
-        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
-        assert!(!snapshot.whatsapp_gate_open());
-        assert!(snapshot.take_commands().is_empty());
-
-        snapshot.apply(AdapterEvent::TelegramAuth {
-            phase: TelegramAuthPhase::Ready,
-        });
-        assert!(snapshot.has_primary_account());
-        assert!(snapshot.telegram_ready());
         assert!(snapshot.whatsapp_pairing_available());
         snapshot.open_whatsapp_risk_gate();
         assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::RiskGate);
