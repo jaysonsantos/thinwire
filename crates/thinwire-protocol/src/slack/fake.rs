@@ -827,6 +827,94 @@ async fn load_chats_names_a_channel_first_seen_by_id() {
     assert_eq!(conversation.preview, "new channel");
 }
 
+#[tokio::test]
+async fn deleting_the_latest_message_updates_the_preview() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000100.000100",
+        "U1",
+        "older",
+    )));
+    h.message("older").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000150.000100",
+        "U1",
+        "middle",
+    )));
+    h.message("middle").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000200.000100",
+        "U1",
+        "newest",
+    )));
+    h.message("newest").await;
+
+    h.socket.push(SlackInbound::Deleted {
+        channel: "C1".into(),
+        ts: "1700000150.000100".into(),
+    });
+    h.until("middle removed", |event| {
+        matches!(event, AdapterEvent::MessagesRemoved { .. })
+    })
+    .await;
+    if let Ok(event) = h.rx.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                AdapterEvent::ConversationUpsert { ref conversation }
+                    if conversation.id == "slack:C1" && conversation.preview != "newest"
+            ),
+            "deleting an older message must leave the preview"
+        );
+        h.seen.push(event);
+    }
+
+    h.socket.push(SlackInbound::Deleted {
+        channel: "C1".into(),
+        ts: "1700000200.000100".into(),
+    });
+    let stepped = h
+        .until("preview steps back", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C1" && conversation.preview == "older"
+            )
+        })
+        .await;
+    let AdapterEvent::ConversationUpsert { conversation } = stepped else {
+        unreachable!();
+    };
+    assert_eq!(conversation.order, 1_700_000_100_000_100);
+    assert_eq!(conversation.last_at, 1_700_000_100);
+
+    h.socket.push(SlackInbound::Deleted {
+        channel: "C1".into(),
+        ts: "1700000100.000100".into(),
+    });
+    let cleared = h
+        .until("preview cleared", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C1" && conversation.preview.is_empty()
+            )
+        })
+        .await;
+    let AdapterEvent::ConversationUpsert { conversation } = cleared else {
+        unreachable!();
+    };
+    assert_eq!(conversation.order, 0);
+    assert_eq!(conversation.last_at, 0);
+}
+
 fn shell_rank(id: &str) -> i64 {
     id.rsplit(':')
         .next()

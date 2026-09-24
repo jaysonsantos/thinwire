@@ -252,6 +252,8 @@ where
     attempts: u64,
     channels: HashMap<String, Conversation>,
     names: HashMap<String, String>,
+    /// Texts this session has shown, newest kept, so a delete can move the preview.
+    shown: HashMap<String, Vec<(String, String)>>,
 }
 
 impl<A, S, B> Session<A, S, B>
@@ -270,6 +272,7 @@ where
             attempts: 0,
             channels: HashMap::new(),
             names: HashMap::new(),
+            shown: HashMap::new(),
         }
     }
 
@@ -788,6 +791,11 @@ where
             message_id(channel, ts),
             text,
         );
+        if let Some(rows) = self.shown.get_mut(channel)
+            && let Some(row) = rows.iter_mut().find(|(seen, _)| seen == ts)
+        {
+            row.1 = text.to_string();
+        }
         let Some(row) = self.channels.get(channel) else {
             return;
         };
@@ -799,13 +807,41 @@ where
         self.upsert(channel.to_string(), row);
     }
 
-    fn delete_message(&self, channel: &str, ts: &str) {
+    fn delete_message(&mut self, channel: &str, ts: &str) {
         emit_messages_removed(
             &self.events,
             ProtocolId::Slack,
             conversation_id(channel),
             vec![message_id(channel, ts)],
         );
+        if let Some(rows) = self.shown.get_mut(channel) {
+            rows.retain(|(seen, _)| seen != ts);
+        }
+        let Some(row) = self.channels.get(channel) else {
+            return;
+        };
+        if ts_rank(ts) != row.order || row.order == 0 {
+            return;
+        }
+        let next = self.shown.get(channel).and_then(|rows| {
+            rows.iter()
+                .max_by_key(|(seen, _)| ts_rank(seen))
+                .map(|(seen, text)| (seen.clone(), text.clone()))
+        });
+        let mut row = row.clone();
+        match next {
+            Some((next_ts, text)) => {
+                row.preview = text;
+                row.order = ts_rank(&next_ts);
+                row.last_at = ts_order(&next_ts);
+            }
+            None => {
+                row.preview.clear();
+                row.order = 0;
+                row.last_at = 0;
+            }
+        }
+        self.upsert(channel.to_string(), row);
     }
 
     async fn inbound(&mut self, post: SlackPost) {
@@ -859,7 +895,22 @@ where
         self.upsert(channel, row);
     }
 
+    fn remember(&mut self, post: &SlackPost) {
+        let rows = self.shown.entry(post.channel.clone()).or_default();
+        if let Some(row) = rows.iter_mut().find(|(ts, _)| ts == &post.ts) {
+            row.1.clone_from(&post.text);
+            return;
+        }
+        rows.push((post.ts.clone(), post.text.clone()));
+        let cap = usize::from(HISTORY_LIMIT);
+        if rows.len() > cap {
+            let extra = rows.len() - cap;
+            rows.drain(0..extra);
+        }
+    }
+
     async fn chat_message(&mut self, token: &SlackBotToken, post: SlackPost) -> ChatMessage {
+        self.remember(&post);
         let outbound = self
             .live
             .as_ref()
