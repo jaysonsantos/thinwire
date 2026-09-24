@@ -841,7 +841,8 @@ async fn socket_mode_messages_update_preview_and_unread_and_stop_on_disconnect()
         unreachable!();
     };
     assert_eq!(conversation.unread, 1);
-    assert_eq!(conversation.order, 1_700_000_200);
+    assert_eq!(conversation.order, 1_700_000_200_000_100);
+    assert_eq!(conversation.last_at, 1_700_000_200);
 
     h.send(AdapterCommand::OpenChat {
         protocol: ProtocolId::Slack,
@@ -868,6 +869,45 @@ async fn socket_mode_messages_update_preview_and_unread_and_stop_on_disconnect()
         Some(BOT_TOKEN),
         "disconnect keeps the install"
     );
+}
+
+#[tokio::test]
+async fn same_second_messages_order_by_microseconds() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000200.000100",
+        "U1",
+        "early",
+    )));
+    let early = h
+        .until("early row", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C1" && conversation.preview == "early"
+            )
+        })
+        .await;
+    h.socket.push(SlackInbound::Message(post(
+        "C9",
+        "1700000200.000200",
+        "U1",
+        "later",
+    )));
+    let later = h.conversation("slack:C9").await;
+    let AdapterEvent::ConversationUpsert {
+        conversation: early,
+    } = early
+    else {
+        unreachable!();
+    };
+    assert!(later.order > early.order);
+    assert_eq!(early.last_at, later.last_at);
 }
 
 #[tokio::test]

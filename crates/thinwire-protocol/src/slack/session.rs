@@ -739,7 +739,7 @@ where
         let Some(row) = self.channels.get(channel) else {
             return;
         };
-        if ts_order(ts) != row.last_at || row.last_at == 0 {
+        if ts_rank(ts) != row.order || row.order == 0 {
             return;
         }
         let mut row = row.clone();
@@ -762,7 +762,8 @@ where
         };
         let token = live.token.clone();
         let channel = post.channel.clone();
-        let order = ts_order(&post.ts);
+        let order = ts_rank(&post.ts);
+        let sent_at = ts_order(&post.ts);
         let message = self.chat_message(&token, post).await;
         let preview = message.body.clone();
         let outbound = message.outbound;
@@ -784,7 +785,7 @@ where
                 preview,
                 unread: u32::from(!outbound),
                 order,
-                last_at: order,
+                last_at: sent_at,
                 is_group: !channel.starts_with('D'),
             };
             // The title is only the id. A later LoadChats walks the list again
@@ -799,7 +800,7 @@ where
         let mut row = row.clone();
         row.preview = preview;
         row.order = row.order.max(order);
-        row.last_at = row.last_at.max(order);
+        row.last_at = row.last_at.max(sent_at);
         if !outbound {
             row.unread = row.unread.saturating_add(1);
         }
