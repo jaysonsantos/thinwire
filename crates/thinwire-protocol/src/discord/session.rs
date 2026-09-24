@@ -12,7 +12,8 @@ use super::inbox::{HISTORY_LIMIT, InboxChannel, chat_message, load_channels};
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
 use crate::adapter::{
     AdapterError, AdapterEvent, AdapterStatus, ChatMessage, EventTx, ProtocolId, emit_conversation,
-    emit_conversation_removed, emit_message, emit_message_replaced, emit_notice, emit_status,
+    emit_conversation_removed, emit_message, emit_message_replaced, emit_notice,
+    emit_send_accepted, emit_send_rejected, emit_status,
 };
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
@@ -149,16 +150,27 @@ impl Session {
     }
 
     /// Sends as the bot. A pending row shows at once and is replaced on success.
+    ///
+    /// `request` is the UI's send id. Acceptance is the HTTP success, not the
+    /// optimistic row. A failure names that id in `SendRejected` so the draft stays.
     pub(crate) fn send(
         &mut self,
         conversation_id: String,
         body: String,
+        request: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
         let Some((access, bot_id)) = self.noted_access(&conversation_id, events)? else {
+            emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
             return Ok(());
         };
         if !access.can_send {
+            emit_send_rejected(
+                events,
+                ProtocolId::Discord,
+                conversation_id.as_str(),
+                request,
+            );
             emit_notice(events, ProtocolId::Discord, READ_ONLY_REFUSAL);
             return Ok(());
         }
@@ -183,10 +195,17 @@ impl Session {
         tokio::spawn(async move {
             let result = api.send(access.channel_id, body).await;
             if !gate.current() {
+                emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
                 return;
             }
             match result {
                 Ok(sent) => {
+                    emit_send_accepted(
+                        &events,
+                        ProtocolId::Discord,
+                        conversation_id.as_str(),
+                        request,
+                    );
                     emit_message_replaced(
                         &events,
                         pending_id,
@@ -197,9 +216,10 @@ impl Session {
                     tracing::info!(%error, "discord send failed");
                     let _ = events.send(AdapterEvent::MessagesRemoved {
                         protocol: ProtocolId::Discord,
-                        conversation_id,
+                        conversation_id: conversation_id.clone(),
                         message_ids: vec![pending_id],
                     });
+                    emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
                     emit_ready(&events, &format!("Send failed: {error}."));
                 }
             }
@@ -273,6 +293,8 @@ fn publish_channels(
     for id in gone {
         emit_conversation_removed(events, ProtocolId::Discord, id);
     }
+    // Ready before the rows. The shell auto-selects the first channel on
+    // upsert and opens it only once Discord is linked.
     emit_ready(
         events,
         &format!("{} guild channels the bot can read.", channels.len()),

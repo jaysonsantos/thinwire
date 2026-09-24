@@ -235,9 +235,11 @@ impl DiscordAdapter {
         &mut self,
         conversation_id: String,
         body: String,
+        request: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
-        self.session_mut()?.send(conversation_id, body, events)
+        self.session_mut()?
+            .send(conversation_id, body, request, events)
     }
 
     #[cfg(not(any(test, feature = "discord-bot")))]
@@ -259,6 +261,7 @@ impl DiscordAdapter {
         &mut self,
         _conversation_id: String,
         _body: String,
+        _request: u64,
         _events: &EventTx,
     ) -> Result<(), AdapterError> {
         Err(not_ready())
@@ -347,8 +350,8 @@ impl ProtocolAdapter for DiscordAdapter {
                 protocol: ProtocolId::Discord,
                 conversation_id,
                 body,
-                request: _,
-            } => self.send_text(conversation_id, body, events),
+                request,
+            } => self.send_text(conversation_id, body, request, events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Discord,
                 reason: "command is not handled by the Discord adapter",
@@ -663,6 +666,11 @@ mod tests {
             matches!(event, AdapterEvent::MessageReplaced { .. })
         })
         .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::SendAccepted { request: 0, conversation_id, .. }
+                if conversation_id == &id
+        )));
         let pending = messages(&events);
         assert_eq!(pending.len(), 1);
         assert!(pending[0].outbound);
@@ -709,6 +717,11 @@ mod tests {
             event,
             AdapterEvent::MessagesRemoved { message_ids, .. } if message_ids == &vec![pending.clone()]
         )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 0, .. }))
+        );
         assert!(matches!(
             events.last(),
             Some(AdapterEvent::Status { detail, .. }) if detail.contains("Send failed")
@@ -747,6 +760,14 @@ mod tests {
             )
             .expect("unknown channel is a note");
         let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AdapterEvent::SendRejected { .. }))
+                .count(),
+            3,
+            "each refused send names itself so the draft can stay"
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AdapterEvent::Notice { text, .. } if text.contains("Send Messages")
@@ -788,6 +809,12 @@ mod tests {
             AdapterEvent::ConversationRemoved { id, .. } if *id == conversation_id(GUILD, NEWS)
         )));
         assert_eq!(conversations(&events).len(), 1);
+        let ready_at = events.iter().position(is_ready).expect("ready");
+        let row_at = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::ConversationUpsert { .. }))
+            .expect("remaining channel");
+        assert!(ready_at < row_at);
     }
 
     #[tokio::test]
