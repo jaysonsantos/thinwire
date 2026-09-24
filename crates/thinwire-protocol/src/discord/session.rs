@@ -28,6 +28,7 @@ pub(crate) struct ChannelAccess {
 struct Inflight {
     conversation_id: String,
     request: u64,
+    pending_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -193,6 +194,7 @@ impl Session {
             state.inflight.push(Inflight {
                 conversation_id: conversation_id.clone(),
                 request,
+                pending_id: pending_id.clone(),
             });
         }
         emit_message(
@@ -262,6 +264,11 @@ impl Session {
             .map(|mut state| std::mem::take(&mut state.inflight))
             .unwrap_or_default();
         for row in inflight {
+            let _ = events.send(AdapterEvent::MessagesRemoved {
+                protocol: ProtocolId::Discord,
+                conversation_id: row.conversation_id.clone(),
+                message_ids: vec![row.pending_id],
+            });
             emit_send_rejected(
                 events,
                 ProtocolId::Discord,

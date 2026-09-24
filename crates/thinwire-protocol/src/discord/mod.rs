@@ -779,6 +779,27 @@ mod tests {
             })
             .collect();
         assert_eq!(rejected, vec![4, 9]);
+        let pending: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessageReceived { message } if message.id.contains(":pending:") => {
+                    Some(message.id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let removed: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessagesRemoved { message_ids, .. } => {
+                    Some(message_ids.iter().map(String::as_str))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(removed, pending);
+        assert_eq!(pending, vec!["discord:pending:1", "discord:pending:2"]);
         hold.notify_waiters();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let later = drain(&mut rx);
