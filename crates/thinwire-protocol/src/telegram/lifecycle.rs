@@ -9,6 +9,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 /// Set by a worker when it has exited and released its client.
 pub(super) type DoneFlag = Arc<AtomicBool>;
@@ -77,6 +80,21 @@ pub(super) fn mark_done(flag: &DoneFlag) {
     flag.store(true, Ordering::SeqCst);
 }
 
+/// Poll `done` until it is true or `limit` passes. `true` when it finished in
+/// time. Shutdown uses this, so a stuck worker cannot hold the exit forever.
+pub(super) async fn wait_until(done: impl Fn() -> bool, limit: Duration, poll: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if done() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +128,30 @@ mod tests {
         assert!(wait.is_empty(), "a done worker is not waited for");
         slots.retire_current();
         assert_eq!(slots.all().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_until_returns_when_done_and_gives_up_at_the_limit() {
+        use std::sync::atomic::AtomicUsize;
+        let polls = AtomicUsize::new(0);
+        let finished = wait_until(
+            || polls.fetch_add(1, Ordering::SeqCst) >= 2,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(finished);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+
+        let started = Instant::now();
+        let stuck = wait_until(
+            || false,
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(!stuck, "a fake that never finishes hits the limit");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

@@ -682,6 +682,18 @@ mod tests {
         assert!(shutdown.contains("all_done(&workers)"));
         assert!(shutdown.contains("emit_stopped"));
         assert!(
+            shutdown.contains("SHUTDOWN_LIMIT"),
+            "shutdown has its own bound"
+        );
+        assert!(
+            src.contains("const SHUTDOWN_LIMIT: Duration = Duration::from_secs(4);"),
+            "below the app's 5 s close limit"
+        );
+        assert!(
+            fn_body(src, "fn receiver_idle").contains("dispatcher.running.load"),
+            "a thread that never started counts as idle"
+        );
+        assert!(
             shutdown.contains("receiver_idle()"),
             "exit waits until no thread is in TDLib"
         );

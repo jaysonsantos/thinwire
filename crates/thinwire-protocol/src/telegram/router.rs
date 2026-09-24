@@ -69,6 +69,13 @@ impl<U> Router<U> {
     }
 }
 
+/// Shutdown's idle check. A receive thread that never started cannot be
+/// inside TDLib, so it counts as idle; shutdown must not wait for it.
+#[must_use]
+pub(super) fn receiver_idle<U>(thread_running: bool, router: &Router<U>) -> bool {
+    !thread_running || router.idle()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +108,21 @@ mod tests {
         let _kept = router.register(2);
         router.unregister(2);
         assert!(!router.route(2, 0));
+    }
+
+    #[test]
+    fn a_receive_thread_that_never_started_counts_as_idle() {
+        let mut router: Router<u8> = Router::new();
+        let _worker = router.register(1);
+        assert!(!router.idle());
+        assert!(
+            !receiver_idle(true, &router),
+            "a running thread with a client is busy"
+        );
+        assert!(
+            receiver_idle(false, &router),
+            "no thread: nothing to wait for"
+        );
     }
 
     #[test]

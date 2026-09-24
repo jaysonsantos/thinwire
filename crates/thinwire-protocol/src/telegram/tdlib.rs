@@ -4,6 +4,7 @@
 //! Credential values are read from the vault and never logged.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,8 +16,8 @@ use super::data_dir;
 use super::inbox::{
     self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook,
 };
-use super::lifecycle::{DoneFlag, WorkerSlots, all_done, mark_done};
-use super::router::Router;
+use super::lifecycle::{DoneFlag, WorkerSlots, all_done, mark_done, wait_until};
+use super::router::{self, Router};
 use crate::adapter::{
     AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
@@ -53,6 +54,10 @@ const WORKER_POLL: Duration = Duration::from_millis(50);
 /// Longest wait for an old client to release the database before a new one
 /// opens it.
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest wait in `shutdown`. It is below the app's 5 s close limit, so
+/// `Stopped` always reaches the UI before the window gives up.
+const SHUTDOWN_LIMIT: Duration = Duration::from_secs(4);
 
 struct LiveInbox {
     authorized: bool,
@@ -100,11 +105,18 @@ impl TdlibRuntime {
         let workers = self.slots.all();
         let events = events.clone();
         tokio::spawn(async move {
-            // Exit only when no thread is inside TDLib any more.
-            while !all_done(&workers) || !receiver_idle() {
-                tokio::time::sleep(WORKER_POLL).await;
+            // Exit only when no thread is inside TDLib any more, or at the limit.
+            let clean = wait_until(
+                || all_done(&workers) && receiver_idle(),
+                SHUTDOWN_LIMIT,
+                WORKER_POLL,
+            )
+            .await;
+            if clean {
+                data_dir::remove_this_process_session_dir();
+            } else {
+                tracing::warn!("telegram did not close within the shutdown limit");
             }
-            data_dir::remove_this_process_session_dir();
             emit_stopped(&events, ProtocolId::Telegram);
         });
     }
@@ -224,6 +236,8 @@ impl Default for TdlibRuntime {
 struct Dispatcher {
     router: Mutex<Router<tdlib_rs::enums::Update>>,
     wake: Condvar,
+    /// The receive thread started. If it did not, nothing is inside TDLib.
+    running: AtomicBool,
 }
 
 static DISPATCHER: OnceLock<Arc<Dispatcher>> = OnceLock::new();
@@ -234,13 +248,15 @@ impl Dispatcher {
             let dispatcher = Arc::new(Self {
                 router: Mutex::new(Router::new()),
                 wake: Condvar::new(),
+                running: AtomicBool::new(false),
             });
             let receiving = Arc::clone(&dispatcher);
             let spawned = thread::Builder::new()
                 .name("thinwire-tdlib-recv".into())
                 .spawn(move || receiving.receive_loop());
-            if let Err(error) = spawned {
-                tracing::warn!(%error, "tdlib receive thread did not start");
+            match spawned {
+                Ok(_) => dispatcher.running.store(true, Ordering::SeqCst),
+                Err(error) => tracing::warn!(%error, "tdlib receive thread did not start"),
             }
             dispatcher
         }))
@@ -285,9 +301,12 @@ impl Dispatcher {
 
 /// True when no thread is inside TDLib: no client and no receive in flight.
 fn receiver_idle() -> bool {
-    DISPATCHER
-        .get()
-        .is_none_or(|dispatcher| dispatcher.lock().idle())
+    DISPATCHER.get().is_none_or(|dispatcher| {
+        router::receiver_idle(
+            dispatcher.running.load(Ordering::SeqCst),
+            &dispatcher.lock(),
+        )
+    })
 }
 
 fn spawn_tdlib_worker(
