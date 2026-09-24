@@ -532,11 +532,6 @@ pub(crate) fn emit_conversation(events: &EventTx, conversation: Conversation) {
 pub(crate) fn emit_message(events: &EventTx, message: ChatMessage) {
     let _ = events.send(AdapterEvent::MessageReceived { message });
 }
-
-pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
-    let _ = events.send(AdapterEvent::TelegramAuth { phase });
-}
-
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 pub(crate) fn emit_telegram_session_ended(events: &EventTx) {
     let _ = events.send(AdapterEvent::TelegramSessionEnded);

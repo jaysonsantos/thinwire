@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::adapter::{
-    AdapterEvent, EventTx, TelegramAuthError, TelegramAuthPhase, TelegramCodeVia,
+    AdapterEvent, EventTx, LoginEpoch, TelegramAuthError, TelegramAuthPhase, TelegramCodeVia,
     emit_telegram_data_reset,
 };
 
@@ -25,15 +25,26 @@ use crate::adapter::{
 pub(super) struct ClosingFlag {
     closing: Arc<AtomicBool>,
     epoch: u64,
+    /// The host's login epoch. The UI thread bumps it at Cancel, before the
+    /// worker reads `Close`, so the worker can stop at once.
+    shared: LoginEpoch,
 }
 
 impl ClosingFlag {
-    /// A new client started under login epoch `epoch`.
-    pub(super) fn new(epoch: u64) -> Self {
+    /// A new client started under the host's current login epoch.
+    pub(super) fn new(shared: LoginEpoch) -> Self {
         Self {
             closing: Arc::new(AtomicBool::new(false)),
-            epoch,
+            epoch: shared.load(Ordering::SeqCst),
+            shared,
         }
+    }
+
+    /// `true` while this client may still act on login results: it is not
+    /// closing, and Cancel has not moved the host's epoch past it.
+    #[must_use]
+    pub(super) fn current(&self) -> bool {
+        !self.is_set() && self.shared.load(Ordering::SeqCst) == self.epoch
     }
 
     pub(super) fn mark(&self) {
@@ -59,10 +70,11 @@ impl<'a> LoginEvents<'a> {
         Self { events, closing }
     }
 
-    /// `false` once the client is closing.
+    /// `false` once the client is closing or Cancel moved the epoch. The
+    /// worker checks it after each TDLib call returns (PR #49 review).
     #[must_use]
     pub(super) fn open(&self) -> bool {
-        !self.closing.is_set()
+        self.closing.current()
     }
 
     /// Send `event` stamped with this client's epoch, while it is not closing.
@@ -93,6 +105,25 @@ impl<'a> LoginEvents<'a> {
     /// the kept folder (PR #49 review).
     pub(super) fn data_reset(&self, moved_to: &str) {
         emit_telegram_data_reset(self.events, moved_to);
+    }
+}
+
+/// How a worker ends its TDLib client on `Close`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CloseKind {
+    /// Keep the session (app shutdown, or not signed in).
+    Close,
+    /// Cancel reached a client that already became Ready, but the UI dropped
+    /// that Ready: roll back. Clear the session marker and log out.
+    LogOut,
+}
+
+#[must_use]
+pub(super) const fn close_kind(authorized: bool, cancel: bool) -> CloseKind {
+    if authorized && cancel {
+        CloseKind::LogOut
+    } else {
+        CloseKind::Close
     }
 }
 
@@ -216,7 +247,8 @@ mod tests {
     #[test]
     fn a_closing_client_sends_no_login_events() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let closing = ClosingFlag::new(7);
+        let shared: LoginEpoch = Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let closing = ClosingFlag::new(Arc::clone(&shared));
         // The runtime keeps a clone; Cancel marks it before `Close` is read.
         let runtime_side = closing.clone();
         let login = LoginEvents::new(&tx, &closing);
@@ -255,9 +287,45 @@ mod tests {
         );
 
         // A new client has its own flag: a clean login state.
-        let fresh = ClosingFlag::new(8);
+        let fresh = ClosingFlag::new(Arc::new(std::sync::atomic::AtomicU64::new(8)));
         LoginEvents::new(&tx, &fresh).phase(TelegramAuthPhase::NeedPhone);
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn cancel_stops_a_client_before_its_ready_side_effects() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared: LoginEpoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let closing = ClosingFlag::new(Arc::clone(&shared));
+        let login = LoginEvents::new(&tx, &closing);
+        assert!(login.open());
+        // Cancel: the UI thread bumps the epoch. The worker has not read
+        // `Close` yet, so the closing flag is still clear.
+        shared.fetch_add(1, Ordering::SeqCst);
+        assert!(!closing.is_set());
+        assert!(!login.open(), "the worker skips Ready side effects at once");
+        login.phase(TelegramAuthPhase::Ready);
+        login.phase(TelegramAuthPhase::Failed);
+        assert!(
+            rx.try_recv().is_err(),
+            "a result after Cancel is dropped at the source"
+        );
+    }
+
+    #[test]
+    fn only_a_cancelled_signed_in_client_is_rolled_back() {
+        assert_eq!(close_kind(true, true), CloseKind::LogOut);
+        assert_eq!(
+            close_kind(true, false),
+            CloseKind::Close,
+            "shutdown keeps the session"
+        );
+        assert_eq!(
+            close_kind(false, true),
+            CloseKind::Close,
+            "nothing to roll back"
+        );
+        assert_eq!(close_kind(false, false), CloseKind::Close);
     }
 
     #[tokio::test]

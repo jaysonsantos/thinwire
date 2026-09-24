@@ -91,6 +91,18 @@ impl AdapterHost {
     }
 }
 
+/// The error status of a failed login step carries the step's epoch, so a
+/// Cancel that happens after the step started still drops it (PR #49 review).
+fn stamp_login_failure(auth_epoch: Option<u64>, status: AdapterEvent) -> AdapterEvent {
+    match auth_epoch {
+        Some(epoch) => AdapterEvent::Login {
+            epoch,
+            event: Box::new(status),
+        },
+        None => status,
+    }
+}
+
 /// Record the login epoch a Telegram step was sent under.
 fn stamp_auth_epoch(command: &mut AdapterCommand, epoch: u64) {
     if let AdapterCommand::TelegramAuth { epoch: slot, .. } = command {
@@ -134,16 +146,21 @@ fn dispatch(
         adapter.shutdown(events);
         return;
     }
+    let auth_epoch = match command {
+        AdapterCommand::TelegramAuth { epoch, .. } => Some(epoch),
+        _ => None,
+    };
     if let Err(error) = adapter.handle(command, events) {
         tracing::info!(%error, "adapter refused or failed a command");
-        let _ = events.send(AdapterEvent::Status {
+        let status = AdapterEvent::Status {
             protocol: error_protocol(&error),
             status: match &error {
                 super::AdapterError::Refused { .. } => super::AdapterStatus::Refused,
                 super::AdapterError::Unavailable { .. } => super::AdapterStatus::Error,
             },
             detail: error.to_string(),
-        });
+        };
+        let _ = events.send(stamp_login_failure(auth_epoch, status));
     }
 }
 
@@ -215,6 +232,32 @@ mod tests {
         assert!(!ends_telegram_login(&AdapterCommand::Disconnect {
             protocol: ProtocolId::WhatsApp
         }));
+    }
+
+    #[test]
+    fn a_failed_step_status_is_stamped_and_dropped_after_cancel() {
+        let status = AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: crate::AdapterStatus::Error,
+            detail: "telegram phone is missing from the secret store".into(),
+        };
+        let stamped = stamp_login_failure(Some(0), status.clone());
+        // Cancel bumped the epoch to 1 before the UI polled.
+        assert_eq!(
+            deliver(stamped.clone(), 1),
+            None,
+            "no failure on a cancelled flow"
+        );
+        assert_eq!(
+            deliver(stamped, 0),
+            Some(status.clone()),
+            "shown when still current"
+        );
+        assert_eq!(
+            stamp_login_failure(None, status.clone()),
+            status,
+            "other commands unchanged"
+        );
     }
 
     #[tokio::test]

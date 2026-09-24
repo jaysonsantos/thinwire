@@ -17,7 +17,8 @@ use super::inbox::{
     self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook,
 };
 use super::lifecycle::{
-    ClosingFlag, DoneFlag, LoginEvents, WorkerSlots, all_done, mark_done, wait_until,
+    CloseKind, ClosingFlag, DoneFlag, LoginEvents, WorkerSlots, all_done, close_kind, mark_done,
+    wait_until,
 };
 use super::router::{self, Router};
 use crate::adapter::{
@@ -47,7 +48,11 @@ enum TdlibCommand {
         message_id: String,
     },
     /// Ask TDLib to close. The worker exits after `authorizationStateClosed`.
-    Close,
+    /// `cancel` is true for a Cancel (Disconnect): a client that already became
+    /// Ready is then rolled back (see [`close_kind`]).
+    Close {
+        cancel: bool,
+    },
 }
 
 /// How often a waiter checks that closing workers have exited.
@@ -109,20 +114,26 @@ impl TdlibRuntime {
     /// Close the current worker's TDLib client. The next command starts a new
     /// worker, which waits until this one released the database.
     pub fn stop(&mut self) {
+        self.stop_client(true);
+    }
+
+    /// `cancel`: a Cancel rolls back a client that already became Ready; app
+    /// shutdown keeps the session.
+    fn stop_client(&mut self, cancel: bool) {
         // Mark first: from now on the old client sends no login events, even
         // before its worker reads `Close` (issue #42).
         if let Some(closing) = self.current_closing.take() {
             closing.mark();
         }
         if let Some(commands) = self.commands.take() {
-            let _ = commands.send(TdlibCommand::Close);
+            let _ = commands.send(TdlibCommand::Close { cancel });
         }
         self.slots.retire_current();
     }
 
     /// Close every TDLib client, then emit `Stopped` once all workers exited.
     pub fn shutdown(&mut self, events: &EventTx) {
-        self.stop();
+        self.stop_client(false);
         self.slots.shut_down();
         let workers = self.slots.all();
         let events = events.clone();
@@ -233,7 +244,7 @@ impl TdlibRuntime {
         let login_epoch = Arc::clone(&self.login_epoch);
         let sent = super::send_or_respawn(&mut self.commands, command, || {
             let (done, wait_for) = slots.start().unwrap_or_default();
-            let closing = ClosingFlag::new(login_epoch.load(Ordering::SeqCst));
+            let closing = ClosingFlag::new(Arc::clone(&login_epoch));
             *current_closing = Some(closing.clone());
             spawn_tdlib_worker(
                 Arc::clone(&secrets),
@@ -389,19 +400,28 @@ fn spawn_tdlib_worker(
                     // Close TDLib in both cases; keep reading updates until Closed.
                     let command = command.unwrap_or_else(|| {
                         commands = None;
-                        TdlibCommand::Close
+                        TdlibCommand::Close { cancel: false }
                     });
-                    if live.closing.is_set() && !matches!(command, TdlibCommand::Close) {
+                    if live.closing.is_set() && !matches!(command, TdlibCommand::Close { .. }) {
                         continue;
                     }
                     match command {
-                        TdlibCommand::Close => {
+                        TdlibCommand::Close { cancel } => {
                             if live.close_requested {
                                 continue;
                             }
                             live.close_requested = true;
                             live.closing.mark();
-                            request_close(client_id).await;
+                            match close_kind(live.authorized, cancel) {
+                                CloseKind::LogOut => {
+                                    // Ready ran before Cancel, but the UI dropped
+                                    // it: do not keep that session (PR #49 review).
+                                    secrets.set_secret(TelegramSecretKey::Session, "");
+                                    super::request_secret_flush(&events);
+                                    request_log_out(client_id).await;
+                                }
+                                CloseKind::Close => request_close(client_id).await,
+                            }
                         }
                         TdlibCommand::Step(step) => {
                             apply_step(client_id, step, secrets.as_ref(), &events, &live.closing).await;
@@ -464,6 +484,13 @@ async fn next_command(
     match commands.as_mut() {
         Some(commands) => commands.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+async fn request_log_out(client_id: i32) {
+    if let Err(error) = tdlib_rs::functions::log_out(client_id).await {
+        log_tdlib_error("logOut", &error);
+        request_close(client_id).await;
     }
 }
 
@@ -677,7 +704,8 @@ async fn apply_authorization(
             );
         }
         tdlib_rs::enums::AuthorizationState::Ready => {
-            // A client that is closing does not link: no marker, no inbox.
+            // A client that is closing, or whose epoch Cancel moved, does not
+            // link: no marker, no inbox. Checked before each side effect.
             if !login.open() {
                 return;
             }
@@ -691,8 +719,14 @@ async fn apply_authorization(
                 AdapterStatus::Ready,
                 "Telegram is ready. Loading the chat list.",
             );
+            if !login.open() {
+                return;
+            }
             for conversation in live.directory.listed() {
                 emit_conversation(events, conversation);
+            }
+            if !login.open() {
+                return;
             }
             load_main_chats(client_id, true, events).await;
         }
