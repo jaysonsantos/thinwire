@@ -689,6 +689,79 @@ async fn socket_mode_messages_update_preview_and_unread_and_stop_on_disconnect()
 }
 
 #[tokio::test]
+async fn disconnect_removes_every_listed_channel() {
+    let mut h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.conversation("slack:D1").await;
+    h.conversation("slack:G1").await;
+
+    h.send(AdapterCommand::Disconnect {
+        protocol: ProtocolId::Slack,
+    });
+    let mut removed = Vec::new();
+    while removed.len() < 3 {
+        let event = h
+            .until("channel removal", |event| {
+                matches!(
+                    event,
+                    AdapterEvent::ConversationRemoved {
+                        protocol: ProtocolId::Slack,
+                        ..
+                    }
+                )
+            })
+            .await;
+        let AdapterEvent::ConversationRemoved { id, .. } = event else {
+            unreachable!();
+        };
+        removed.push(id);
+    }
+    removed.sort();
+    assert_eq!(removed, ["slack:C1", "slack:D1", "slack:G1"]);
+}
+
+#[tokio::test]
+async fn revoked_token_removes_every_listed_channel() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.conversation("slack:D1").await;
+    h.conversation("slack:G1").await;
+    h.socket.push(SlackInbound::Revoked);
+
+    let mut removed = Vec::new();
+    while removed.len() < 3 {
+        let event = h
+            .until("channel removal after revoke", |event| {
+                matches!(
+                    event,
+                    AdapterEvent::ConversationRemoved {
+                        protocol: ProtocolId::Slack,
+                        ..
+                    }
+                )
+            })
+            .await;
+        let AdapterEvent::ConversationRemoved { id, .. } = event else {
+            unreachable!();
+        };
+        removed.push(id);
+    }
+    removed.sort();
+    assert_eq!(removed, ["slack:C1", "slack:D1", "slack:G1"]);
+    assert!(
+        h.status(AdapterStatus::Error)
+            .await
+            .contains("access ended")
+    );
+}
+
+#[tokio::test]
 async fn revoked_token_clears_the_install() {
     let api = FakeApi::workspace();
     api.with(|state| state.identify_error = Some(SlackApiError::api("token_revoked")));

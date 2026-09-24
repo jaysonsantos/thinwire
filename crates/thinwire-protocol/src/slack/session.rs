@@ -28,8 +28,9 @@ use super::secrets::{SlackSecretKey, SlackSecretVault};
 use super::{CAPABILITIES, SLACK_CONVERSATION_PREFIX};
 use crate::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolAdapter, ProtocolCapabilities, ProtocolId, emit_conversation, emit_message,
-    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, emit_conversation,
+    emit_conversation_removed, emit_message, emit_send_accepted, emit_send_rejected, emit_status,
+    emit_stopped,
 };
 
 /// Messages loaded when a channel opens.
@@ -506,6 +507,16 @@ where
         }
         if let Some(stream) = live.stream.take() {
             stream.stop().await;
+        }
+        self.retract_channels();
+    }
+
+    /// The shell drops a row only after `ConversationRemoved`. Emit one for
+    /// every listed channel before the map is discarded.
+    fn retract_channels(&mut self) {
+        let ids: Vec<String> = self.channels.values().map(|row| row.id.clone()).collect();
+        for id in ids {
+            emit_conversation_removed(&self.events, ProtocolId::Slack, id);
         }
         self.channels.clear();
     }
