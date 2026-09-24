@@ -38,22 +38,37 @@ pub(super) fn auth_error_from_tdlib(code: i32, message: &str) -> TelegramAuthErr
     TelegramAuthError::Other { code }
 }
 
-/// TDLib error text that is safe to log: a bare error name that starts with
-/// a letter (`A-Z0-9_`, for example `PHONE_CODE_INVALID` or `FLOOD_WAIT_120`),
-/// or text with no digits. Any other text, including a bare run of digits,
-/// can hold a phone number or a login code, so it is never logged.
+/// Known symbolic TDLib / Telegram error names. Only these names are ever
+/// logged. Any other text is redacted: free text can hold a phone number, a
+/// login code (digits, or an SMS word or phrase), or a 2FA password.
+const LOGGABLE_ERROR_NAMES: &[&str] = &[
+    "API_ID_INVALID",
+    "API_ID_PUBLISHED_FLOOD",
+    "AUTH_KEY_UNREGISTERED",
+    "PASSWORD_HASH_INVALID",
+    "PHONE_CODE_EMPTY",
+    "PHONE_CODE_EXPIRED",
+    "PHONE_CODE_INVALID",
+    "PHONE_NUMBER_BANNED",
+    "PHONE_NUMBER_FLOOD",
+    "PHONE_NUMBER_INVALID",
+    "PHONE_PASSWORD_FLOOD",
+    "SESSION_PASSWORD_NEEDED",
+];
+
+/// TDLib error text that is safe to log: an exact name from
+/// [`LOGGABLE_ERROR_NAMES`], or `FLOOD_WAIT_` followed by digits only.
+/// Everything else is redacted, with or without digits.
 #[must_use]
 pub(super) fn loggable_tdlib_message(message: &str) -> Option<&str> {
     let message = message.trim();
-    if message.is_empty() {
-        return None;
+    if LOGGABLE_ERROR_NAMES.contains(&message) {
+        return Some(message);
     }
-    let bare_name = message.starts_with(|c: char| c.is_ascii_uppercase())
-        && message
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    let no_digits = !message.chars().any(|c| c.is_ascii_digit());
-    (bare_name || no_digits).then_some(message)
+    let flood_wait = message
+        .strip_prefix(FLOOD_WAIT_PREFIX)
+        .is_some_and(|seconds| !seconds.is_empty() && seconds.chars().all(|c| c.is_ascii_digit()));
+    flood_wait.then_some(message)
 }
 
 #[cfg(test)]
@@ -96,35 +111,41 @@ mod tests {
     }
 
     #[test]
-    fn only_names_and_digit_free_text_may_be_logged() {
+    fn only_known_error_names_may_be_logged() {
         assert_eq!(
             loggable_tdlib_message("PHONE_CODE_INVALID"),
             Some("PHONE_CODE_INVALID")
         );
         assert_eq!(
-            loggable_tdlib_message("FLOOD_WAIT_120"),
+            loggable_tdlib_message(" FLOOD_WAIT_120 "),
             Some("FLOOD_WAIT_120")
         );
-        assert_eq!(
-            loggable_tdlib_message(
-                "Initialization parameters are needed: call setTdlibParameters first"
-            ),
-            Some("Initialization parameters are needed: call setTdlibParameters first")
-        );
-        assert_eq!(loggable_tdlib_message("+15551234567 is not valid"), None);
-        assert_eq!(loggable_tdlib_message("code 12345 expired"), None);
-        assert_eq!(
-            loggable_tdlib_message("Too Many Requests: retry after 30"),
-            None
-        );
-        assert_eq!(loggable_tdlib_message("  "), None);
-        assert_eq!(
-            loggable_tdlib_message("15551234567"),
-            None,
-            "a phone number"
-        );
-        assert_eq!(loggable_tdlib_message("12345"), None, "a login code");
-        assert_eq!(loggable_tdlib_message("_12345"), None);
+        for secret_or_free_text in [
+            // Free text, with or without digits (Codex 4091477235).
+            "Initialization parameters are needed: call setTdlibParameters first",
+            "Wrong database encryption key",
+            "+15551234567 is not valid",
+            "code 12345 expired",
+            "Too Many Requests: retry after 30",
+            // Values a user types: none of them may reach a log.
+            "15551234567",
+            "12345",
+            "_12345",
+            "apple banana",
+            "correcthorsebattery",
+            "CORRECTHORSE",
+            "MY_SECRET_PASSWORD",
+            "FLOOD_WAIT_",
+            "FLOOD_WAIT_12a",
+            "phone_code_invalid",
+            "",
+        ] {
+            assert_eq!(
+                loggable_tdlib_message(secret_or_free_text),
+                None,
+                "{secret_or_free_text:?} must be redacted"
+            );
+        }
     }
 
     #[test]
