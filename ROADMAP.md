@@ -41,7 +41,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 ### Other protocols (parallel with Telegram)
 
 - [ ] #34 — WhatsApp experimental linked-device inbox (feature `whatsapp-web`, `0001`). Honest ToS labels. Full-screen ToS/ban gate before QR or pair. Never call it reliable.
-- [ ] #35 — Discord bot/OAuth guild inbox (feature `discord-bot`, `0009`). No self-bots, no user tokens, no personal DMs. Not a personal client. Remove the "wait for Telegram messages" visibility gate in the code.
+- [ ] #35 — Discord bot/OAuth guild inbox (feature `discord-bot`, `0009`). No self-bots, no user tokens, no personal DMs. Not a personal client. The "wait for Telegram messages" visibility gate is removed on branch `feat/telegram-usable` (`adfbb8c`, PR #40).
 - [ ] #36 — Slack workspace-app OAuth inbox (feature `slack-oauth`, `0008`). Official OAuth v2 only. Not a personal desktop clone.
 
 ## Spike (scaffold, not the default UI)

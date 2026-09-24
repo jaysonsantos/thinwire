@@ -18,7 +18,7 @@
 - Rust 2024 workspace, egui/eframe, tokio for async adapters
 - Telegram: TDLib / tdlib-rs preferred
 - WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk. Experimental spike is feature `whatsapp-web` (`whatsapp-rust`, git rev pinned). Not the default UI. Default CI stays feature-off. Full-screen ToS/ban gate before any QR or pair UI. Session file stays in app-data. Never call it reliable.
-- Discord: bot/OAuth guild inbox only — no self-bots / personal DMs / user tokens. Feature `discord-bot` (twilight) is off by default. The inbox must not wait for Telegram messages (lock change 2026-09-23); the code gate that waits is removed in #35. ADR `0009-discord-bot-inbox-spike`. Default CI stays feature-off.
+- Discord: bot/OAuth guild inbox only — no self-bots / personal DMs / user tokens. Feature `discord-bot` (twilight) is off by default. The inbox must not wait for Telegram messages (lock change 2026-09-23); the code gate that waited is removed (`adfbb8c`, PR #40). ADR `0009-discord-bot-inbox-spike`. Default CI stays feature-off.
 - Slack: official OAuth only — workspace app, not a personal desktop clone
 - Signal: out of v1 (S2); no libsignal / Presage
 - Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session and the Discord bot token (`discord.bot_token`). Phone / code / 2FA stay in the memory vault only. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets. Never put secrets on `AdapterCommand`. Never commit a Discord token.
