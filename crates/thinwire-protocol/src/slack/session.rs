@@ -5,7 +5,7 @@
 //! Socket Mode stream run as child tasks and report back through the queue.
 //! Tokens stay in the vault and in this task. Events carry no secrets.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -310,7 +310,9 @@ where
             }
             AdapterCommand::LoadChats {
                 protocol: ProtocolId::Slack,
-            } => self.load_channels().await,
+            } => {
+                let _ = self.load_channels().await;
+            }
             AdapterCommand::OpenChat {
                 protocol: ProtocolId::Slack,
                 conversation_id,
@@ -336,9 +338,8 @@ where
     }
 
     async fn connect(&mut self) {
-        if let Some(live) = &self.live {
-            let detail = ready_detail(&live.team_name, live.stream.is_some());
-            self.status(AdapterStatus::Ready, detail);
+        if self.live.is_some() {
+            self.refresh_channels().await;
             return;
         }
         if self.install.is_some() {
@@ -482,7 +483,35 @@ where
             AdapterStatus::Ready,
             ready_detail(identity.team_name(), live_events),
         );
-        self.load_channels().await;
+        let _ = self.load_channels().await;
+    }
+
+    /// Refresh on a live workspace. Reset the cursor, walk `conversations.list`
+    /// again, and drop a channel the app is no longer in once the walk finishes.
+    async fn refresh_channels(&mut self) {
+        if let Some(live) = &mut self.live {
+            live.list_done = false;
+            live.next_cursor = None;
+        }
+        let seen = self.load_channels().await;
+        if self.live.as_ref().is_some_and(|live| live.list_done) {
+            let gone: Vec<String> = self
+                .channels
+                .keys()
+                .filter(|id| !seen.contains(*id))
+                .cloned()
+                .collect();
+            for id in gone {
+                if let Some(row) = self.channels.remove(&id) {
+                    emit_conversation_removed(&self.events, ProtocolId::Slack, row.id);
+                }
+            }
+        }
+        let Some(live) = &self.live else {
+            return;
+        };
+        let detail = ready_detail(&live.team_name, live.stream.is_some());
+        self.status(AdapterStatus::Ready, detail);
     }
 
     async fn start_events(&mut self) {
@@ -582,25 +611,26 @@ where
         self.status(AdapterStatus::Error, format!("{error}."));
     }
 
-    async fn load_channels(&mut self) {
+    async fn load_channels(&mut self) -> HashSet<String> {
+        let mut seen = HashSet::new();
         let Some(live) = &self.live else {
             self.status(AdapterStatus::Error, DETAIL_NOT_READY);
-            return;
+            return seen;
         };
         if live.list_done {
-            return;
+            return seen;
         }
         let token = live.token.clone();
         for _ in 0..MAX_CHANNEL_PAGES {
             if self.live.as_ref().is_none_or(|live| live.list_done) {
-                return;
+                return seen;
             }
             let cursor = self.live.as_ref().and_then(|live| live.next_cursor.clone());
             let page = match self.deps.api.list_channels(&token, cursor).await {
                 Ok(page) => page,
                 Err(error) => {
                     self.api_failed(&error).await;
-                    return;
+                    return seen;
                 }
             };
             let next = page.next_cursor.filter(|cursor| !cursor.is_empty());
@@ -612,6 +642,7 @@ where
                 if !channel.is_member {
                     continue;
                 }
+                seen.insert(channel.id.clone());
                 let title = self.channel_title(&token, &channel).await;
                 let conversation = Conversation {
                     protocol: ProtocolId::Slack,
@@ -637,6 +668,7 @@ where
                 }
             }
         }
+        seen
     }
 
     fn upsert(&mut self, channel: String, conversation: Conversation) {

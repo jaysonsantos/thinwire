@@ -530,10 +530,11 @@ async fn channel_list_pages_skip_non_member_channels_and_name_dms() {
     h.send(AdapterCommand::LoadChats {
         protocol: ProtocolId::Slack,
     });
-    h.send(AdapterCommand::Connect {
+    h.send(AdapterCommand::OpenChat {
         protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
     });
-    h.status(AdapterStatus::Ready).await;
+    h.message("first").await;
     let calls = h.calls();
     assert_eq!(
         calls
@@ -552,6 +553,47 @@ async fn channel_list_pages_skip_non_member_channels_and_name_dms() {
         h.browser.last().is_none(),
         "a stored token must not reinstall"
     );
+}
+
+#[tokio::test]
+async fn refresh_reloads_the_channel_list_and_sends_the_diff() {
+    let mut h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:G1").await;
+    let listed = h
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("conversations.list"))
+        .count();
+
+    h.api.with(|state| {
+        state.pages[0]
+            .channels
+            .push(channel("C3", "quiet", SlackChannelKind::Public, true));
+        state.pages[1].channels.retain(|row| row.id != "G1");
+    });
+    h.send(AdapterCommand::Connect {
+        protocol: ProtocolId::Slack,
+    });
+    let added = h.conversation("slack:C3").await;
+    assert_eq!(added.title, "#quiet");
+    let removed = h
+        .until("left channel", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationRemoved { id, .. } if id == "slack:G1"
+            )
+        })
+        .await;
+    assert!(matches!(removed, AdapterEvent::ConversationRemoved { .. }));
+    h.status(AdapterStatus::Ready).await;
+    let listed_again = h
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("conversations.list"))
+        .count();
+    assert_eq!(listed_again, listed + 2);
 }
 
 #[tokio::test]
