@@ -128,8 +128,10 @@ mod tests {
     #[test]
     fn v1_does_not_depend_on_agpl_signal_client_or_presage() {
         // Signal the messenger stays out of v1. Reject Presage and the AGPL
-        // Signal client crates. `wacore-libsignal` is MIT code inside the
-        // optional whatsapp-rust linked-device stack, not a Signal account.
+        // Signal client crates. `wacore-libsignal` is AGPL source inside the
+        // optional whatsapp-rust linked-device stack, not a Signal account
+        // (ADR 0011). This test does not forbid that crate. `whatsapp-web`
+        // stays a local-only feature.
         for manifest in [
             include_str!("../Cargo.toml"),
             include_str!("../../thinwire/Cargo.toml"),

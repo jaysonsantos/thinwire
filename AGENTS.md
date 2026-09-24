@@ -3,7 +3,8 @@
 ## Product lock (S2)
 
 - v1 protocols: Telegram, WhatsApp (experimental), Discord (bot/OAuth inbox only), Slack OAuth
-- Signal is out of v1 — do not link AGPL libsignal / Presage into the MIT binary
+- Signal is out of v1 release builds. Planned feature `signal-local` (#39, ADR `0011-agpl-protocols-local-only`) will link Presage and libsignal
+- WhatsApp feature `whatsapp-web` is local-only. It can link AGPL `wacore-libsignal`. Release builds and OS zips never enable `whatsapp-web` or `signal-local` (`0011`)
 - README must keep the three risk bullets
 - Never claim WhatsApp or Discord personal clients are “reliable”
 - Discord: no self-bots / user-account automation
@@ -17,10 +18,10 @@
 
 - Rust 2024 workspace, egui/eframe, tokio for async adapters
 - Telegram: TDLib / tdlib-rs preferred
-- WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk. Experimental spike is feature `whatsapp-web` (`whatsapp-rust`, git rev pinned). Not the default UI. Default CI stays feature-off. Full-screen ToS/ban gate before any QR or pair UI. Session file stays in app-data. Never call it reliable.
+- WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk. Experimental spike is feature `whatsapp-web` (`whatsapp-rust`, git rev pinned). The feature is local-only because it links AGPL `wacore-libsignal` (`0011`). Release builds and OS zips never enable it. Not the default UI. Default CI stays feature-off. Full-screen ToS/ban gate before any QR or pair UI. Session file stays in app-data. Never call it reliable.
 - Discord: bot/OAuth guild inbox only — no self-bots / personal DMs / user tokens. Feature `discord-bot` (twilight) is off by default. The inbox must not wait for Telegram messages (lock change 2026-09-23); the code gate that waited is removed (`adfbb8c`, PR #40). ADR `0009-discord-bot-inbox-spike`. Default CI stays feature-off.
 - Slack: official OAuth only — workspace app, not a personal desktop clone
-- Signal: out of v1 (S2); no libsignal / Presage
+- Signal: out of v1 release builds (S2, amended by `0011`). Planned feature `signal-local` (#39) will link Presage and libsignal. Release builds and OS zips never enable it. Default CI stays feature-off.
 - Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session and the Discord bot token (`discord.bot_token`). Phone / code / 2FA stay in the memory vault only. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets. Never put secrets on `AdapterCommand`. Never commit a Discord token.
 - Telegram live client is feature `telegram-tdlib` (`tdlib-rs`). Default CI stays feature-off. Unauthorized banner drops only on TDLib Ready. ADR `0006-live-tdlib`.
 - Official `api_id` / `api_hash`: compile-time `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` inject, never in git or public fork-PR CI. Official main OS zips (`.github/workflows/os-zips.yml`) read those names from GitHub repository secrets; local builds export them before cargo; public `ci.yml` never sets them. Values live in GitHub secrets and in arcoiro under the thinwire path (SOPS + Terraform, not watchkeep), not in this tree. Optional Advanced keychain override wins and is not the primary login path. Dev without inject shows credentials missing (not my.telegram.org). ADR `0007-publisher-telegram-api-credentials`. End-user official UX is phone → code → optional 2FA.
@@ -32,7 +33,7 @@
 | --- | --- |
 | `crates/thinwire/` | Desktop binary: egui shell, Telegram login, keychain, system theme, inbox |
 | `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings, and the Telegram / Slack / WhatsApp / Discord adapters (`telegram/`, `slack/`, `whatsapp/`, `discord/`) |
-| `decisions/` | ADRs (0001 option B, 0002 glow, 0003 main-only artifacts, 0004 Signal out, 0005 system theme, `0006-live-tdlib`, `0007-publisher-telegram-api-credentials`, `0008-slack-oauth-workspace-spike`, `0009-discord-bot-inbox-spike`) |
+| `decisions/` | ADRs (0001 option B, 0002 glow, 0003 main-only artifacts, 0004 Signal out, 0005 system theme, `0006-live-tdlib`, `0007-publisher-telegram-api-credentials`, `0008-slack-oauth-workspace-spike`, `0009-discord-bot-inbox-spike`, `0011-agpl-protocols-local-only`) |
 | `ROADMAP.md` | Ordered product-council todo list (ADRs stay in `decisions/`) |
 | `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |

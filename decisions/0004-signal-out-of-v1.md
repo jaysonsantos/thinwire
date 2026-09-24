@@ -25,4 +25,13 @@ This supersedes the Signal-in-v1 portion of ADR 0001. Option B otherwise stands 
 
 ## Consequences
 
-No Signal adapter, `ProtocolId::Signal`, or user-facing Signal auth path in v1. Cargo manifests and the lockfile must not depend on `presage` or `libsignal`. A later major version may revisit Signal only with an explicit license and product decision.
+No Signal adapter, `ProtocolId::Signal`, or user-facing Signal auth path in v1 release builds. Cargo manifests for a release build must not depend on `presage` or `libsignal`.
+
+## Amendment
+
+ADR [0011](0011-agpl-protocols-local-only.md) (2026-09-24) amends this decision for local builds.
+
+- Release builds and OS zips stay free of AGPL code.
+- Local feature `whatsapp-web` can link `wacore-libsignal`.
+- Planned feature `signal-local` (#39) will link Presage and libsignal.
+- Issue #38 researches a separate AGPL helper process.
