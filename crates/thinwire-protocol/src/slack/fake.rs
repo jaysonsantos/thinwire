@@ -682,6 +682,47 @@ async fn an_edit_updates_the_body_and_a_delete_removes_the_row() {
     assert_eq!(message_ids, [original.id]);
 }
 
+#[tokio::test]
+async fn load_chats_names_a_channel_first_seen_by_id() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+
+    h.socket.push(SlackInbound::Message(post(
+        "C9",
+        "1700000300.000100",
+        "U1",
+        "new channel",
+    )));
+    let placeholder = h.conversation("slack:C9").await;
+    assert_eq!(placeholder.title, "#C9");
+
+    h.api.with(|state| {
+        state.pages[0]
+            .channels
+            .push(channel("C9", "shipped", SlackChannelKind::Public, true));
+    });
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    let named = h
+        .until("named channel", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C9" && conversation.title == "#shipped"
+            )
+        })
+        .await;
+    let AdapterEvent::ConversationUpsert { conversation } = named else {
+        unreachable!();
+    };
+    assert_eq!(conversation.preview, "new channel");
+}
+
 fn shell_rank(id: &str) -> i64 {
     id.rsplit(':')
         .next()

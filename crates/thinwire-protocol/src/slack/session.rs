@@ -752,6 +752,12 @@ where
                 last_at: order,
                 is_group: !channel.starts_with('D'),
             };
+            // The title is only the id. A later LoadChats walks the list again
+            // and replaces it with the channel name.
+            if let Some(live) = &mut self.live {
+                live.list_done = false;
+                live.next_cursor = None;
+            }
             self.upsert(channel, conversation);
             return;
         };
