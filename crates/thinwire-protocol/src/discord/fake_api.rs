@@ -40,6 +40,7 @@ pub(crate) struct FakeState {
 pub(crate) struct FakeDiscordApi {
     pub state: Mutex<FakeState>,
     pub hold_history: Option<Arc<Notify>>,
+    pub hold_send: Option<Arc<Notify>>,
 }
 
 fn channel(id: u64, name: &str, kind: ChannelKind, overwrites: Vec<Overwrite>) -> ChannelSummary {
@@ -126,6 +127,7 @@ impl FakeDiscordApi {
         Self {
             state: Mutex::new(state),
             hold_history: None,
+            hold_send: None,
         }
     }
 
@@ -207,6 +209,9 @@ impl DiscordApi for FakeDiscordApi {
     fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary> {
         Box::pin(async move {
             self.check_token()?;
+            if let Some(hold) = &self.hold_send {
+                hold.notified().await;
+            }
             let mut state = self.state();
             if let Some(error) = state.send_error {
                 return Err(error);

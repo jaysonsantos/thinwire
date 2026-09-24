@@ -24,10 +24,17 @@ pub(crate) struct ChannelAccess {
     can_send: bool,
 }
 
+#[derive(Debug, Clone)]
+struct Inflight {
+    conversation_id: String,
+    request: u64,
+}
+
 #[derive(Debug, Default)]
 struct Shared {
     bot_id: Option<u64>,
     channels: HashMap<String, ChannelAccess>,
+    inflight: Vec<Inflight>,
 }
 
 /// Drops events from a replaced session.
@@ -74,6 +81,7 @@ impl Session {
             shared: Arc::new(Mutex::new(Shared {
                 bot_id: None,
                 channels: carried,
+                inflight: Vec::new(),
             })),
             gate: Gate {
                 live: Arc::clone(live),
@@ -181,6 +189,12 @@ impl Session {
         }
         self.next_pending += 1;
         let pending_id = format!("discord:pending:{}", self.next_pending);
+        if let Ok(mut state) = self.shared.lock() {
+            state.inflight.push(Inflight {
+                conversation_id: conversation_id.clone(),
+                request,
+            });
+        }
         emit_message(
             events,
             ChatMessage {
@@ -195,13 +209,21 @@ impl Session {
             },
         );
         let api = Arc::clone(&self.api);
+        let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
         let events = events.clone();
         tokio::spawn(async move {
             let result = api.send(access.channel_id, body).await;
-            if !gate.current() {
-                emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
-                return;
+            {
+                let Ok(mut state) = shared.lock() else {
+                    return;
+                };
+                if !gate.current() {
+                    return;
+                }
+                state
+                    .inflight
+                    .retain(|row| row.request != request || row.conversation_id != conversation_id);
             }
             match result {
                 Ok(sent) => {
@@ -230,6 +252,23 @@ impl Session {
             }
         });
         Ok(())
+    }
+
+    /// The session is gone. Each send still in flight is rejected now.
+    pub(crate) fn reject_inflight(&self, events: &EventTx) {
+        let inflight = self
+            .shared
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.inflight))
+            .unwrap_or_default();
+        for row in inflight {
+            emit_send_rejected(
+                events,
+                ProtocolId::Discord,
+                row.conversation_id,
+                row.request,
+            );
+        }
     }
 
     /// `Ok(None)` means the refusal is a note. The account status stays Ready.

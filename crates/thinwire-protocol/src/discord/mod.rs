@@ -170,7 +170,7 @@ impl DiscordAdapter {
             .as_ref()
             .map(session::Session::carried_channels)
             .unwrap_or_default();
-        self.stop_session();
+        self.stop_session(events);
         let prepared = self.prepared_token()?;
         #[cfg(any(test, feature = "discord-bot"))]
         if let Some(factory) = &self.backend {
@@ -200,11 +200,17 @@ impl DiscordAdapter {
         Ok(())
     }
 
-    fn stop_session(&mut self) {
+    fn stop_session(&mut self, events: &EventTx) {
         #[cfg(any(test, feature = "discord-bot"))]
         {
             self.live.fetch_add(1, Ordering::SeqCst);
-            self.session = None;
+            if let Some(session) = self.session.take() {
+                session.reject_inflight(events);
+            }
+        }
+        #[cfg(not(any(test, feature = "discord-bot")))]
+        {
+            let _ = events;
         }
     }
 
@@ -311,7 +317,7 @@ impl ProtocolAdapter for DiscordAdapter {
 
     /// Drop the bot session, then `Stopped`. Nothing is running until connect.
     fn shutdown(&mut self, events: &EventTx) {
-        self.stop_session();
+        self.stop_session(events);
         super::adapter::emit_stopped(events, ProtocolId::Discord);
     }
 
@@ -329,7 +335,7 @@ impl ProtocolAdapter for DiscordAdapter {
             AdapterCommand::Disconnect {
                 protocol: ProtocolId::Discord,
             } => {
-                self.stop_session();
+                self.stop_session(events);
                 let detail = if Self::bot_inbox_compiled() {
                     "Discord bot inbox disconnected."
                 } else {
@@ -730,6 +736,56 @@ mod tests {
             api.state().sent,
             vec![(GENERAL, "hi from thinwire".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn a_new_session_rejects_inflight_sends() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        for request in [4_u64, 9] {
+            adapter
+                .handle(
+                    AdapterCommand::SendText {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: id.clone(),
+                        body: format!("queued {request}"),
+                        request,
+                    },
+                    &tx,
+                )
+                .expect("queued");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 9, .. })
+        })
+        .await;
+        let rejected: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::SendRejected { request, .. } => Some(*request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rejected, vec![4, 9]);
+        hold.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let later = drain(&mut rx);
+        assert!(!later.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageReplaced { .. } | AdapterEvent::SendRejected { .. }
+        )));
     }
 
     #[tokio::test]
