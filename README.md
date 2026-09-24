@@ -83,6 +83,8 @@ TDLib data folder:
 
 - `THINWIRE_TDLIB_DIR` wins when it is set.
 - With a keychain that saves, the folder is `$XDG_DATA_HOME/thinwire/tdlib`, then `~/.local/share/thinwire/tdlib`. On Unix, the app sets it to mode `0700`.
+- On Linux with keyutils only (no Secret Service), the folder is `thinwire/tdlib-keyutils` under the same base. A keyutils key is lost at a restart, so this folder is separate from the Secret Service folder. If you used keyutils only before this change, sign in once.
+- If Secret Service is present but fails (for example a locked wallet), the app does not use keyutils. It shows "The keychain could not be read" and Try again.
 - With a memory-only keychain, the app uses a throwaway folder. The folder is under `$XDG_RUNTIME_DIR` when that is private, else under the temp folder. The name has 8 random bytes and the mode is `0700`. The app refuses a folder or symlink that is already at that path. A clean shutdown removes the folder.
 - If TDLib reports "Wrong database encryption key", the app moves the old folder aside to `tdlib.stale-<unix seconds>`. It never deletes that folder. The phone step names that folder once. A lock error ("already in use") does not move the folder.
 - Never commit a TDLib folder.
