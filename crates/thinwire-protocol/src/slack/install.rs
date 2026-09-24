@@ -99,6 +99,7 @@ impl SlackInstalledWorkspace {
     pub fn remember(&self, vault: &dyn SlackSecretVault, bot_token: &str) {
         vault.set_secret(SlackSecretKey::BotToken, bot_token);
         vault.set_secret(SlackSecretKey::TeamId, &self.team_id);
+        vault.set_secret(SlackSecretKey::AppId, &self.app_id);
         vault.set_secret(SlackSecretKey::OAuthCode, "");
         vault.set_secret(SlackSecretKey::OAuthState, "");
     }
@@ -354,6 +355,10 @@ mod tests {
         assert_eq!(
             vault.get_secret(SlackSecretKey::TeamId).as_deref(),
             Some("T-test")
+        );
+        assert_eq!(
+            vault.get_secret(SlackSecretKey::AppId).as_deref(),
+            Some("A-test")
         );
         assert_eq!(vault.get_secret(SlackSecretKey::OAuthCode), None);
         assert_eq!(vault.get_secret(SlackSecretKey::OAuthState), None);

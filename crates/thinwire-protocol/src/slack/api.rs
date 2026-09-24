@@ -223,6 +223,15 @@ pub trait SlackEventStream: Send + 'static {
     fn stop(self) -> impl Future<Output = ()> + Send;
 }
 
+/// The workspace this process installed. One app-level Socket Mode token is
+/// shared by every install of the publisher app, so events for other
+/// workspaces must be dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackSocketScope {
+    pub team_id: String,
+    pub app_id: String,
+}
+
 /// Opens Socket Mode with the app-level token. Never on the UI thread.
 pub trait SlackEventSource: Send + Sync + 'static {
     type Stream: SlackEventStream;
@@ -230,6 +239,7 @@ pub trait SlackEventSource: Send + Sync + 'static {
     fn connect(
         &self,
         app_token: SlackAppToken,
+        scope: SlackSocketScope,
         sink: UnboundedSender<SlackInbound>,
     ) -> impl Future<Output = Result<Self::Stream, SlackApiError>> + Send;
 }

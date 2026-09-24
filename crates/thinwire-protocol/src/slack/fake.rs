@@ -12,7 +12,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use super::api::{
     SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
     SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound,
-    SlackInstallGrant, SlackPost, SlackWebApi,
+    SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
 };
 use super::credentials::SlackApiSource;
 use super::install::SlackInstalledWorkspace;
@@ -263,9 +263,11 @@ impl SlackEventSource for FakeSocket {
     async fn connect(
         &self,
         app_token: SlackAppToken,
+        scope: SlackSocketScope,
         sink: UnboundedSender<SlackInbound>,
     ) -> Result<FakeStream, SlackApiError> {
         assert_eq!(app_token.reveal(), APP_TOKEN);
+        assert_eq!(scope.team_id, "T1");
         *self.sink.lock().expect("sink") = Some(sink);
         Ok(FakeStream {
             stopped: Arc::clone(&self.stopped),

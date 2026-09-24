@@ -17,7 +17,7 @@ use tokio::task::AbortHandle;
 use super::api::{
     SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
     SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound, SlackInstallGrant,
-    SlackPost, SlackWebApi,
+    SlackPost, SlackSocketScope, SlackWebApi,
 };
 use super::credentials::{SlackApiSource, resolve_slack_app_token, resolve_slack_client};
 use super::install::{
@@ -230,6 +230,8 @@ where
 
 struct Live<T> {
     token: SlackBotToken,
+    team_id: String,
+    app_id: String,
     team_name: String,
     bot_user_id: String,
     stream: Option<T>,
@@ -453,8 +455,20 @@ where
                 return;
             }
         };
+        let stored_app = self
+            .deps
+            .vault
+            .get_secret(SlackSecretKey::AppId)
+            .unwrap_or_default();
+        let app_id = if identity.app_id().is_empty() {
+            stored_app
+        } else {
+            identity.app_id().to_string()
+        };
         self.live = Some(Live {
             token,
+            team_id: identity.team_id().to_string(),
+            app_id,
             team_name: identity.team_name().to_string(),
             bot_user_id: identity.bot_user_id().to_string(),
             stream: None,
@@ -478,10 +492,21 @@ where
             return;
         };
         let (sink, mut inbound) = unbounded_channel();
+        let scope = self
+            .live
+            .as_ref()
+            .map(|live| SlackSocketScope {
+                team_id: live.team_id.clone(),
+                app_id: live.app_id.clone(),
+            })
+            .unwrap_or(SlackSocketScope {
+                team_id: String::new(),
+                app_id: String::new(),
+            });
         let stream = match self
             .deps
             .socket
-            .connect(SlackAppToken::new(app_token), sink)
+            .connect(SlackAppToken::new(app_token), scope, sink)
             .await
         {
             Ok(stream) => stream,
@@ -539,6 +564,7 @@ where
         self.stop_live().await;
         self.deps.vault.set_secret(SlackSecretKey::BotToken, "");
         self.deps.vault.set_secret(SlackSecretKey::TeamId, "");
+        self.deps.vault.set_secret(SlackSecretKey::AppId, "");
         self.status(AdapterStatus::Error, DETAIL_ENDED);
     }
 

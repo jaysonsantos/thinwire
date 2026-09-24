@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::api::{
     SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
     SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound,
-    SlackInstallGrant, SlackPost, SlackWebApi,
+    SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
 };
 use super::install::SlackInstalledWorkspace;
 use super::morphism::{oauth_v2_access_request, workspace_bot_token};
@@ -414,7 +414,10 @@ impl MorphismSocket {
     }
 }
 
-struct InboundSink(UnboundedSender<SlackInbound>);
+struct InboundSink {
+    sink: UnboundedSender<SlackInbound>,
+    scope: SlackSocketScope,
+}
 
 /// Running Socket Mode listener. `stop` closes every connection.
 pub struct MorphismStream {
@@ -433,12 +436,13 @@ impl SlackEventSource for MorphismSocket {
     async fn connect(
         &self,
         app_token: SlackAppToken,
+        scope: SlackSocketScope,
         sink: UnboundedSender<SlackInbound>,
     ) -> Result<MorphismStream, SlackApiError> {
         let environment = Arc::new(
             SlackClientEventsListenerEnvironment::new(Arc::clone(&self.client))
                 .with_error_handler(on_error)
-                .with_user_state(InboundSink(sink)),
+                .with_user_state(InboundSink { sink, scope }),
         );
         let callbacks = SlackSocketModeListenerCallbacks::new().with_push_events(on_push);
         let listener = SlackClientSocketModeListener::new(
@@ -453,6 +457,15 @@ impl SlackEventSource for MorphismSocket {
         listener.start().await;
         Ok(MorphismStream { listener })
     }
+}
+
+/// `true` when the event belongs to this install. An empty recorded app id
+/// checks only the team, because `auth.test` does not return the app id.
+fn event_matches_install(event_team: &str, event_app: &str, scope: &SlackSocketScope) -> bool {
+    if event_team != scope.team_id {
+        return false;
+    }
+    scope.app_id.is_empty() || event_app == scope.app_id
 }
 
 fn on_error(
@@ -470,6 +483,16 @@ async fn on_push(
     _client: Arc<SlackHyperClient>,
     state: SlackClientEventsUserState,
 ) -> UserCallbackResult<()> {
+    let sink = {
+        let guard = state.read().await;
+        let Some(slot) = guard.get_user_state::<InboundSink>() else {
+            return Ok(());
+        };
+        if !event_matches_install(event.team_id.value(), event.api_app_id.value(), &slot.scope) {
+            return Ok(());
+        }
+        slot.sink.clone()
+    };
     let inbound = match event.event {
         SlackEventCallbackBody::Message(message) => {
             if let Some(inbound) = edit_or_delete(&message) {
@@ -492,16 +515,30 @@ async fn on_push(
         SlackEventCallbackBody::AppUninstalled(_) => SlackInbound::Revoked,
         _ => return Ok(()),
     };
-    let guard = state.read().await;
-    if let Some(InboundSink(sink)) = guard.get_user_state::<InboundSink>() {
-        let _ = sink.send(inbound);
-    }
+    let _ = sink.send(inbound);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_foreign_workspace_or_app_does_not_match_this_install() {
+        let scope = SlackSocketScope {
+            team_id: "T1".into(),
+            app_id: "A1".into(),
+        };
+        assert!(event_matches_install("T1", "A1", &scope));
+        assert!(!event_matches_install("T2", "A1", &scope));
+        assert!(!event_matches_install("T1", "A2", &scope));
+        let team_only = SlackSocketScope {
+            team_id: "T1".into(),
+            app_id: String::new(),
+        };
+        assert!(event_matches_install("T1", "A9", &team_only));
+        assert!(!event_matches_install("T2", "A9", &team_only));
+    }
 
     #[test]
     fn an_edit_and_a_delete_name_the_original_message() {
