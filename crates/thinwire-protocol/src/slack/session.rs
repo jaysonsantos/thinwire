@@ -671,6 +671,20 @@ where
         seen
     }
 
+    fn note_latest(&mut self, channel: &str, order: i64, sent_at: i64, preview: &str) {
+        let Some(row) = self.channels.get(channel) else {
+            return;
+        };
+        if order < row.order {
+            return;
+        }
+        let mut row = row.clone();
+        row.preview = preview.to_string();
+        row.order = order;
+        row.last_at = sent_at;
+        self.upsert(channel.to_string(), row);
+    }
+
     fn upsert(&mut self, channel: String, conversation: Conversation) {
         emit_conversation(&self.events, conversation.clone());
         self.channels.insert(channel, conversation);
@@ -744,7 +758,10 @@ where
         let token = live.token.clone();
         match self.deps.api.post_message(&token, channel, body).await {
             Ok(post) => {
+                let order = ts_rank(&post.ts);
+                let sent_at = ts_order(&post.ts);
                 let message = self.chat_message(&token, post).await;
+                let preview = message.body.clone();
                 emit_send_accepted(
                     &self.events,
                     ProtocolId::Slack,
@@ -752,6 +769,9 @@ where
                     request,
                 );
                 emit_message(&self.events, message);
+                // No Socket Mode echo when the app-level token is absent.
+                // The post response is the only update the inbox will see.
+                self.note_latest(channel, order, sent_at, &preview);
             }
             Err(error) => {
                 emit_send_rejected(&self.events, ProtocolId::Slack, conversation, request);

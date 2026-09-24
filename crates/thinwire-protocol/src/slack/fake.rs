@@ -856,6 +856,40 @@ async fn send_posts_as_the_app_and_shows_the_sent_message() {
 }
 
 #[tokio::test]
+async fn send_without_socket_mode_updates_the_conversation_row() {
+    let mut h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    h.start();
+    let ready = h.status(AdapterStatus::Ready).await;
+    assert!(ready.contains("Live updates are off"));
+    assert!(!h.socket.connected());
+    let before = h.conversation("slack:C1").await;
+    assert!(before.preview.is_empty());
+
+    h.send(AdapterCommand::SendText {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        body: "hello from thinwire".into(),
+        request: 1,
+    });
+    h.message("hello from thinwire").await;
+    let row = h
+        .until("sent preview", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C1"
+                        && conversation.preview == "hello from thinwire"
+            )
+        })
+        .await;
+    let AdapterEvent::ConversationUpsert { conversation } = row else {
+        unreachable!();
+    };
+    assert_eq!(conversation.order, 1_700_000_101_000_100);
+    assert_eq!(conversation.last_at, 1_700_000_101);
+}
+
+#[tokio::test]
 async fn socket_mode_messages_update_preview_and_unread_and_stop_on_disconnect() {
     let vault = installed_vault();
     vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
