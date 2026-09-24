@@ -2188,10 +2188,36 @@ mod tests {
             .take_commands()
             .into_iter()
             .filter_map(|command| match command {
-                AdapterCommand::TelegramAuth { step, epoch: 0 } => Some(step),
+                // Any epoch: the host stamps the real one later (PR #49 review).
+                AdapterCommand::TelegramAuth { step, epoch: _ } => Some(step),
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn auth_steps_sees_a_step_with_any_epoch() {
+        let mut snapshot = Snapshot::new();
+        snapshot.pending.push(AdapterCommand::TelegramAuth {
+            step: TelegramAuthStep::Phone,
+            epoch: 3,
+        });
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::Phone],
+            "a non-zero epoch must not vanish from the helper"
+        );
+        // The snapshot itself queues epoch 0; AdapterHost::send stamps the real one.
+        let store = SecretStore::memory();
+        seed_override(&store);
+        snapshot.open_telegram(&store);
+        assert!(snapshot.take_commands().iter().any(|command| matches!(
+            command,
+            AdapterCommand::TelegramAuth {
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
+            }
+        )));
     }
 
     fn at_phone_step(store: &SecretStore) -> Snapshot {
