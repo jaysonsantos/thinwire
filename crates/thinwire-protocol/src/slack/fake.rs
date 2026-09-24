@@ -685,6 +685,66 @@ async fn an_edit_updates_the_body_and_a_delete_removes_the_row() {
 }
 
 #[tokio::test]
+async fn editing_the_latest_message_updates_the_preview() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000100.000100",
+        "U1",
+        "older",
+    )));
+    h.message("older").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000200.000100",
+        "U1",
+        "newest",
+    )));
+    h.message("newest").await;
+
+    h.socket.push(SlackInbound::Edited {
+        channel: "C1".into(),
+        ts: "1700000100.000100".into(),
+        text: "older, edited".into(),
+    });
+    h.until("older edit", |event| {
+        matches!(event, AdapterEvent::MessageBody { .. })
+    })
+    .await;
+    if let Ok(event) = h.rx.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                AdapterEvent::ConversationUpsert { ref conversation }
+                    if conversation.preview == "older, edited"
+            ),
+            "an older edit must not replace the preview"
+        );
+        h.seen.push(event);
+    }
+
+    h.socket.push(SlackInbound::Edited {
+        channel: "C1".into(),
+        ts: "1700000200.000100".into(),
+        text: "newest, edited".into(),
+    });
+    let row = h
+        .until("preview", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C1" && conversation.preview == "newest, edited"
+            )
+        })
+        .await;
+    assert!(matches!(row, AdapterEvent::ConversationUpsert { .. }));
+}
+
+#[tokio::test]
 async fn load_chats_names_a_channel_first_seen_by_id() {
     let vault = installed_vault();
     vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);

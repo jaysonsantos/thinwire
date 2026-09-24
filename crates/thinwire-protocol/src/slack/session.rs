@@ -728,7 +728,7 @@ where
         }
     }
 
-    fn edit_message(&self, channel: &str, ts: &str, text: &str) {
+    fn edit_message(&mut self, channel: &str, ts: &str, text: &str) {
         emit_message_body(
             &self.events,
             ProtocolId::Slack,
@@ -736,6 +736,15 @@ where
             message_id(channel, ts),
             text,
         );
+        let Some(row) = self.channels.get(channel) else {
+            return;
+        };
+        if ts_order(ts) != row.last_at || row.last_at == 0 {
+            return;
+        }
+        let mut row = row.clone();
+        row.preview = text.to_string();
+        self.upsert(channel.to_string(), row);
     }
 
     fn delete_message(&self, channel: &str, ts: &str) {
