@@ -25,6 +25,21 @@ pub use settings::Settings;
 
 /// Longest wait for TDLib to close before the window closes anyway.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Least time the runtime gets at exit, so the last keychain flush can start.
+const EXIT_FLOOR: Duration = Duration::from_millis(200);
+/// Runtime budget at exit when no close deadline was recorded.
+const EXIT_DEFAULT: Duration = Duration::from_secs(1);
+
+/// Time left for the runtime at exit: up to the close deadline, never below
+/// [`EXIT_FLOOR`]. A blocked keychain task cannot hold the exit longer.
+fn exit_budget(deadline: Option<Instant>, now: Instant) -> Duration {
+    deadline
+        .map_or(EXIT_DEFAULT, |deadline| {
+            deadline.saturating_duration_since(now)
+        })
+        .max(EXIT_FLOOR)
+}
+
 /// Poll step while `on_exit` waits for a late shutdown.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
@@ -169,7 +184,12 @@ impl CloseGate {
 
 /// Native thinwire window. Protocol and keychain work stay off the UI thread.
 pub struct ThinwireApp {
-    runtime: tokio::runtime::Runtime,
+    /// Taken at exit for a bounded `shutdown_timeout` (a plain drop waits for
+    /// every blocking task, for example a stuck keychain call).
+    runtime: Option<tokio::runtime::Runtime>,
+    handle: tokio::runtime::Handle,
+    /// The close gate's deadline; it bounds the runtime shutdown at exit.
+    exit_deadline: Option<Instant>,
     host: AdapterHost,
     snapshot: Snapshot,
     settings: Settings,
@@ -198,8 +218,11 @@ impl ThinwireApp {
         close_on_stop_signal(runtime.handle(), ctx.clone());
         let mut snapshot = Snapshot::new();
         snapshot.status_text = secret_store_status_text(secrets.backend_name());
+        let handle = runtime.handle().clone();
         Self {
-            runtime,
+            runtime: Some(runtime),
+            handle,
+            exit_deadline: None,
             host,
             snapshot,
             settings,
@@ -216,6 +239,7 @@ impl ThinwireApp {
             match self.close_gate.on_close_requested(Instant::now()) {
                 CloseAction::Allow => {}
                 CloseAction::HoldAndShutdown => {
+                    self.exit_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     self.host.send(AdapterCommand::Shutdown {
                         protocol: ProtocolId::Telegram,
@@ -256,13 +280,22 @@ impl ThinwireApp {
             }
         }
         if self.snapshot.take_keychain_flush() {
-            self.secrets.spawn_os_flush(self.runtime.handle());
+            self.secrets.spawn_os_flush(&self.handle);
         }
         if self.snapshot.take_keychain_retry() {
-            self.secrets.spawn_os_attach(self.runtime.handle());
+            self.secrets.spawn_os_attach(&self.handle);
         }
         if let Some(job) = self.settings.take_persist_job() {
-            self.runtime.handle().spawn_blocking(move || job.run());
+            self.handle.spawn_blocking(move || job.run());
+        }
+    }
+
+    /// Last step at exit: try the keychain flush first, then stop the runtime
+    /// within the close deadline instead of waiting for every blocking task.
+    fn finish_exit(&mut self) {
+        self.secrets.spawn_os_flush(&self.handle);
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(exit_budget(self.exit_deadline, Instant::now()));
         }
     }
 }
@@ -295,21 +328,31 @@ impl eframe::App for ThinwireApp {
     /// Safety net for an exit that skipped the close gate. The window is gone,
     /// so a short block here does not freeze the UI.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.close_gate == CloseGate::Done || self.snapshot.telegram_stopped() {
-            return;
-        }
-        self.host.send(AdapterCommand::Shutdown {
-            protocol: ProtocolId::Telegram,
-        });
-        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-        while Instant::now() < deadline {
-            self.drain_events();
-            if self.snapshot.telegram_stopped() {
-                return;
+        if self.close_gate != CloseGate::Done && !self.snapshot.telegram_stopped() {
+            self.host.send(AdapterCommand::Shutdown {
+                protocol: ProtocolId::Telegram,
+            });
+            let deadline = *self
+                .exit_deadline
+                .get_or_insert_with(|| Instant::now() + SHUTDOWN_TIMEOUT);
+            while Instant::now() < deadline && !self.snapshot.telegram_stopped() {
+                self.drain_events();
+                std::thread::sleep(SHUTDOWN_POLL);
             }
-            std::thread::sleep(SHUTDOWN_POLL);
+            if !self.snapshot.telegram_stopped() {
+                tracing::warn!("telegram did not close before exit");
+            }
         }
-        tracing::warn!("telegram did not close before exit");
+        self.finish_exit();
+    }
+}
+
+impl Drop for ThinwireApp {
+    /// Safety net when `on_exit` did not run: still no unbounded wait.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(exit_budget(self.exit_deadline, Instant::now()));
+        }
     }
 }
 
@@ -441,6 +484,43 @@ mod tests {
         );
         assert!(src.contains("SignalKind::terminate()"));
         assert!(src.contains("SignalKind::interrupt()"));
+    }
+
+    #[test]
+    fn exit_budget_stays_within_the_close_deadline() {
+        let now = Instant::now();
+        assert_eq!(exit_budget(None, now), EXIT_DEFAULT);
+        assert_eq!(
+            exit_budget(Some(now + Duration::from_secs(3)), now),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            exit_budget(Some(now), now + Duration::from_secs(2)),
+            EXIT_FLOOR,
+            "a passed deadline still gives the flush a short start"
+        );
+        assert!(exit_budget(Some(now + SHUTDOWN_TIMEOUT), now) <= SHUTDOWN_TIMEOUT);
+    }
+
+    #[test]
+    fn exit_flushes_first_and_never_drops_the_runtime_unbounded() {
+        let src = include_str!("mod.rs");
+        let finish = &src[src.find("fn finish_exit(").expect("finish")..];
+        let finish = &finish[..finish.find("\n    }\n").expect("end")];
+        let flush = finish.find("spawn_os_flush").expect("flush first");
+        let stop = finish
+            .find("shutdown_timeout(exit_budget(")
+            .expect("bounded stop");
+        assert!(
+            flush < stop,
+            "keychain flush attempt before the runtime stops"
+        );
+        assert!(src.contains("runtime: Option<tokio::runtime::Runtime>"));
+        let drop = &src[src.find("impl Drop for ThinwireApp").expect("drop")..];
+        assert!(drop.contains("shutdown_timeout(exit_budget("));
+        let on_exit = &src[src.find("fn on_exit(").expect("on_exit")..];
+        let on_exit = &on_exit[..on_exit.find("\n    }\n").expect("end")];
+        assert!(on_exit.contains("self.finish_exit()"));
     }
 
     #[test]
