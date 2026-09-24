@@ -18,7 +18,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::intent::{
-    AuthField, DiscordIntent, Intent, SlackIntent, TelegramIntent, WhatsAppIntent,
+    AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
 };
 use crate::secrets::SecretStore;
 use crate::settings::Settings;
@@ -257,6 +257,7 @@ impl Core {
                     protocol: ProtocolId::Slack,
                 });
             }
+            Intent::Signal(intent) => self.signal_gate(intent),
         }
         self.state.sync_viewed();
         self.flush();
@@ -380,6 +381,24 @@ impl Core {
     #[cfg(not(feature = "whatsapp-web"))]
     fn whatsapp(&mut self, intent: WhatsAppIntent) {
         let _ = (intent, &self.whatsapp_phone);
+    }
+
+    /// Feature on: the notice gate lives in the state, not in the frontend.
+    #[cfg(feature = "signal-local")]
+    fn signal_gate(&mut self, intent: SignalIntent) {
+        match intent {
+            SignalIntent::OpenNotice => self.state.open_signal_notice(),
+            SignalIntent::CloseGate => self.state.close_signal_gate(),
+            SignalIntent::AcknowledgeNotice => self.state.acknowledge_signal_notice(),
+            SignalIntent::BeginLink => self.state.begin_signal_link(),
+            SignalIntent::CancelLink => self.state.cancel_signal_link(),
+        }
+    }
+
+    /// Feature off: the Signal screens do not exist, so nothing happens.
+    #[cfg(not(feature = "signal-local"))]
+    fn signal_gate(&mut self, intent: SignalIntent) {
+        let _ = intent;
     }
 
     fn flush(&mut self) {
@@ -912,6 +931,47 @@ mod tests {
             ));
         } else {
             assert!(got.is_empty(), "feature off: WhatsApp intents do nothing");
+        }
+    }
+
+    /// A frontend that skips the Signal notice cannot start linking.
+    /// Acknowledge only while the notice shows. Link only after that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signal_intents_without_the_notice_reach_no_adapter() {
+        let mut core = memory_core();
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+
+        core.dispatch(Intent::Signal(SignalIntent::AcknowledgeNotice));
+        core.dispatch(Intent::Signal(SignalIntent::BeginLink));
+        assert!(
+            sent.try_recv().is_err(),
+            "no link command without the notice"
+        );
+
+        core.dispatch(Intent::Signal(SignalIntent::OpenNotice));
+        core.dispatch(Intent::Signal(SignalIntent::BeginLink));
+        assert!(
+            sent.try_recv().is_err(),
+            "link stays blocked until the notice is accepted"
+        );
+
+        core.dispatch(Intent::Signal(SignalIntent::AcknowledgeNotice));
+        core.dispatch(Intent::Signal(SignalIntent::BeginLink));
+        let mut got = Vec::new();
+        while let Ok(command) = sent.try_recv() {
+            got.push(command);
+        }
+        if cfg!(feature = "signal-local") {
+            assert_eq!(
+                got,
+                vec![
+                    AdapterCommand::SignalAcknowledgeNotice,
+                    AdapterCommand::SignalBeginLink
+                ]
+            );
+        } else {
+            assert!(got.is_empty(), "feature off: Signal intents do nothing");
         }
     }
 

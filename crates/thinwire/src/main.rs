@@ -40,7 +40,10 @@ fn init_tracing() {
 fn slack_log_filter()
 -> tracing_subscriber::filter::FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool> {
     tracing_subscriber::filter::filter_fn(|metadata: &tracing::Metadata<'_>| {
-        !metadata.target().starts_with("slack_morphism")
+        let target = metadata.target();
+        !target.starts_with("slack_morphism")
+            && !target.starts_with("presage")
+            && !target.starts_with("libsignal")
     })
 }
 

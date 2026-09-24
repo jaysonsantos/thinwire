@@ -19,6 +19,8 @@ slack-oauth = ["thinwire-core/slack-oauth", "thinwire-protocol/slack-oauth"]
 # Experimental spike. Default CI and the default UI stay feature-off.
 whatsapp-web = ["thinwire-core/whatsapp-web", "thinwire-protocol/whatsapp-web"]
 discord-bot = ["thinwire-core/discord-bot", "thinwire-protocol/discord-bot"]
+# Local-only AGPL Signal client. Release builds and OS zips leave this off.
+signal-local = ["thinwire-core/signal-local", "thinwire-protocol/signal-local"]
 
 [dependencies]
 chrono.workspace = true

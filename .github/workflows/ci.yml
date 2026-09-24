@@ -50,10 +50,23 @@ jobs:
       - name: Build
         run: nix develop --command cargo build --workspace
 
+  release-tree:
+    name: release-tree
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Release cargo tree excludes AGPL Signal and wacore-libsignal
+        run: nix develop --command scripts/check-release-tree.sh
+
   check:
     name: check
     if: always()
-    needs: [lint, test, build]
+    needs: [lint, test, build, release-tree]
     runs-on: ubuntu-26.04
     permissions:
       contents: read

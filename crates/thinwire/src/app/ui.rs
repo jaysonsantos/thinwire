@@ -122,6 +122,11 @@ pub(crate) fn draw(
         super::whatsapp_gate::draw(ui, snapshot, out);
         return;
     }
+    #[cfg(feature = "signal-local")]
+    if snapshot.signal_linking_available() && snapshot.signal_gate_open() {
+        super::signal_gate::draw(ui, snapshot, out);
+        return;
+    }
     top_bar(ui, snapshot, out);
     status_strip(ui, snapshot, out);
     left_panel(ui, snapshot, hints, out);
@@ -394,6 +399,11 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                 super::whatsapp_gate::risk_entry(ui, out);
             }
 
+            #[cfg(feature = "signal-local")]
+            if snapshot.signal_linking_available() {
+                super::signal_gate::notice_entry(ui, out);
+            }
+
             ui.add_space(space::S);
             section_header(ui, "Inbox");
             ui.separator();
@@ -474,7 +484,13 @@ fn account_chip(
             ui.label(format!("status: {}", account.status.as_str()));
         });
     let slack_sign_in = caps.id == ProtocolId::Slack && cfg!(feature = "slack-oauth");
-    if caps.id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web") {
+    if caps.id == ProtocolId::Signal && cfg!(feature = "signal-local") {
+        ui.label(
+            RichText::new("local build only — not in releases")
+                .small()
+                .weak(),
+        );
+    } else if caps.id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web") {
         ui.label(
             RichText::new("experimental spike — ban risk")
                 .small()

@@ -12,3 +12,5 @@ wgpu = "wgpu"
 winit = "winit"
 zizmor = "zizmor"
 prek = "prek"
+# Signal service identifier (ACI), not ACPI.
+Aci = "Aci"

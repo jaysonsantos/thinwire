@@ -70,3 +70,8 @@ apple-native-keyring-store = { version = "1", default-features = false, features
 ] }
 # No `search` (default) — sheds regex; Entry get/set/delete does not need it.
 windows-native-keyring-store = { version = "1", default-features = false }
+
+# presage (feature `signal-local` only) needs Signal's curve25519-dalek fork.
+# The patch is unused unless that feature is on. Release cargo trees stay off it.
+[patch.crates-io]
+curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

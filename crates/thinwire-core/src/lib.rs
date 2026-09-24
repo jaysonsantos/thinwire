@@ -17,7 +17,9 @@ mod theme;
 mod view;
 
 pub use crate::core::{Core, CoreConfig};
-pub use intent::{AuthField, DiscordIntent, Intent, SlackIntent, TelegramIntent, WhatsAppIntent};
+pub use intent::{
+    AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
+};
 pub use secret_text::SecretText;
 pub use signal::{ChangeNotifier, ChangeSignal, change_channel};
 pub use state::{AuthKey, InboxFilter};

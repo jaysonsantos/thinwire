@@ -31,6 +31,9 @@ slack-oauth = [
 # Git revision matches ZapFast 0.14 so the spike builds on stable Rust.
 # Default CI does not enable this feature. Not a supported messenger.
 whatsapp-web = ["dep:whatsapp-rust"]
+# Local-only Signal secondary device (AGPL presage / libsignal).
+# Default CI, release builds, and OS zips stay feature-off.
+signal-local = ["dep:presage", "dep:presage-store-sled", "dep:futures"]
 # Bot/OAuth guild inbox spike via twilight. Default CI stays feature-off.
 # No user-token client. Never put a Discord token in CI or the MIT tree.
 discord-bot = ["dep:twilight-http", "dep:twilight-model", "dep:rustls"]
@@ -48,6 +51,12 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f746
   "tokio-runtime",
   "ureq-client",
   "tokio-native",
+] }
+# 0.7.0. The sled store avoids libsqlite3-sys, which whatsapp-rust already links.
+presage = { git = "https://github.com/whisperfish/presage", rev = "d3a760088617b657b41ccd4f43e4629e3c3188ac", optional = true, default-features = false }
+presage-store-sled = { git = "https://github.com/whisperfish/presage", rev = "d3a760088617b657b41ccd4f43e4629e3c3188ac", optional = true }
+futures = { version = "0.3", optional = true, default-features = false, features = [
+  "std",
 ] }
 twilight-http = { version = "0.17.1", optional = true }
 twilight-model = { version = "0.17.1", optional = true }

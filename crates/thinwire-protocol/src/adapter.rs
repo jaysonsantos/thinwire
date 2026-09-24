@@ -14,17 +14,24 @@ pub type EventTx = UnboundedSender<AdapterEvent>;
 /// the value it started with. The host drops stale ones (issue #42).
 pub(crate) type LoginEpoch = std::sync::Arc<std::sync::atomic::AtomicU64>;
 
-/// v1 protocol identifiers (S2: Signal is out of v1).
+/// Protocol identifiers. Signal is local-only (`signal-local`) and stays out of release builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolId {
     Telegram,
     WhatsApp,
     Discord,
     Slack,
+    Signal,
 }
 
 impl ProtocolId {
-    pub const ALL: [Self; 4] = [Self::Telegram, Self::WhatsApp, Self::Discord, Self::Slack];
+    pub const ALL: [Self; 5] = [
+        Self::Telegram,
+        Self::WhatsApp,
+        Self::Discord,
+        Self::Slack,
+        Self::Signal,
+    ];
 
     #[must_use]
     pub const fn display_name(self) -> &'static str {
@@ -33,6 +40,7 @@ impl ProtocolId {
             Self::WhatsApp => "WhatsApp",
             Self::Discord => "Discord",
             Self::Slack => "Slack",
+            Self::Signal => "Signal",
         }
     }
 }
@@ -292,6 +300,14 @@ pub enum AdapterCommand {
     },
     /// Stops experimental pairing and clears the in-memory risk acknowledgement.
     WhatsAppCancelLink,
+    /// Records that the full-screen Signal local-build notice was accepted.
+    /// Carries no secrets and does not open a network session.
+    SignalAcknowledgeNotice,
+    /// Asks the worker to start local-only secondary-device linking.
+    /// The provisioning URL is not a field. It leaves later as a redacted event.
+    SignalBeginLink,
+    /// Stops local-only linking and clears the in-memory notice acknowledgement.
+    SignalCancelLink,
 }
 
 impl AdapterCommand {
@@ -312,6 +328,9 @@ impl AdapterCommand {
             Self::WhatsAppAcknowledgeRisk
             | Self::WhatsAppBeginLink { .. }
             | Self::WhatsAppCancelLink => ProtocolId::WhatsApp,
+            Self::SignalAcknowledgeNotice | Self::SignalBeginLink | Self::SignalCancelLink => {
+                ProtocolId::Signal
+            }
         }
     }
 }
@@ -465,6 +484,13 @@ pub enum AdapterEvent {
     /// Experimental WhatsApp pair code. Debug output is redacted.
     /// Never log [`RedactedPairingSecret::reveal`].
     WhatsAppPairCode {
+        code: RedactedPairingSecret,
+        /// Link generation that produced this payload. Stale generations are dropped.
+        generation: u64,
+    },
+    /// Local-only Signal provisioning URL. Debug output is redacted.
+    /// Never log [`RedactedPairingSecret::reveal`].
+    SignalQr {
         code: RedactedPairingSecret,
         /// Link generation that produced this payload. Stale generations are dropped.
         generation: u64,

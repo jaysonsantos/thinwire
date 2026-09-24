@@ -7,3 +7,4 @@ cd "$(dirname "$script_dir")"
 
 cargo test --workspace
 scripts/check-core-deps.sh
+scripts/check-release-tree.sh
