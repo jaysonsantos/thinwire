@@ -682,39 +682,39 @@ fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) 
                         .text_style(theme::display())
                         .color(palette.text),
                 );
-        ui.add_space(space::M);
-        if let Some(banner) = super::auth::stub_banner(snapshot) {
-            ui.colored_label(palette.warn, banner);
-            ui.add_space(space::S);
-        }
-        if snapshot.has_api_credentials(secrets) {
-            ui.label(
-                RichText::new(
-                    "Sign in with your phone number, then the login code, then optional 2FA.",
-                )
-                .text_style(theme::secondary())
-                .color(palette.text2),
-            );
-        } else {
-            ui.label(
-                RichText::new(
-                    "This build has no Telegram credentials. Open Advanced to set a keychain override.",
-                )
-                .text_style(theme::secondary())
-                .color(palette.text2),
-            );
-        }
-        ui.add_space(space::M);
-        if ui
-            .add(
-                egui::Button::new(RichText::new("Add Telegram").color(palette.on_accent))
-                    .fill(palette.accent)
-                    .min_size(egui::vec2(ui.available_width(), 40.0)),
-            )
-            .clicked()
-        {
-            snapshot.open_telegram(secrets);
-        }
+                ui.add_space(space::M);
+                if let Some(banner) = super::auth::stub_banner(snapshot) {
+                    ui.colored_label(palette.warn, banner);
+                    ui.add_space(space::S);
+                }
+                if snapshot.has_api_credentials(secrets) {
+                    ui.label(
+                        RichText::new(
+                            "Sign in with your phone number, then the login code, then optional 2FA.",
+                        )
+                        .text_style(theme::secondary())
+                        .color(palette.text2),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(
+                            "This build has no Telegram credentials. Open Advanced to set a keychain override.",
+                        )
+                        .text_style(theme::secondary())
+                        .color(palette.text2),
+                    );
+                }
+                ui.add_space(space::M);
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Add Telegram").color(palette.on_accent))
+                            .fill(palette.accent)
+                            .min_size(egui::vec2(ui.available_width(), 40.0)),
+                    )
+                    .clicked()
+                {
+                    snapshot.open_telegram(secrets);
+                }
             });
         })
         .response;
