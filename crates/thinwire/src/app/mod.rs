@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use thinwire_protocol::{
     AdapterCommand, AdapterHost, DiscordAdapter, DiscordSecretVault, ProtocolId,
-    TelegramSecretVault, WhatsAppPhoneVault,
+    TelegramSecretVault, WhatsAppPhoneVault, catalog,
 };
 
 use secrets::SecretStore;
@@ -172,7 +172,7 @@ impl CloseGate {
         match *self {
             Self::Waiting { deadline } if stopped || now >= deadline => {
                 if !stopped {
-                    tracing::warn!("telegram did not close in time; closing the window anyway");
+                    tracing::warn!("adapters did not close in time; closing the window anyway");
                 }
                 *self = Self::Done;
                 true
@@ -241,19 +241,27 @@ impl ThinwireApp {
                 CloseAction::HoldAndShutdown => {
                     self.exit_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    self.host.send(AdapterCommand::Shutdown {
-                        protocol: ProtocolId::Telegram,
-                    });
-                    self.snapshot.status_text = "Closing Telegram…".into();
+                    self.shutdown_all_adapters();
+                    self.snapshot.status_text = "Closing…".into();
                 }
                 CloseAction::Hold => ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose),
             }
         }
         if self
             .close_gate
-            .poll(Instant::now(), self.snapshot.telegram_stopped())
+            .poll(Instant::now(), self.snapshot.all_stopped())
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Ask every registered adapter to close its sessions (TDLib, the
+    /// WhatsApp bot and its SQLite session, Discord, Slack). Each answers
+    /// `Stopped`; the close gate waits for all of them within one deadline.
+    fn shutdown_all_adapters(&self) {
+        for caps in catalog() {
+            self.host
+                .send(AdapterCommand::Shutdown { protocol: caps.id });
         }
     }
 
@@ -328,19 +336,17 @@ impl eframe::App for ThinwireApp {
     /// Safety net for an exit that skipped the close gate. The window is gone,
     /// so a short block here does not freeze the UI.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.close_gate != CloseGate::Done && !self.snapshot.telegram_stopped() {
-            self.host.send(AdapterCommand::Shutdown {
-                protocol: ProtocolId::Telegram,
-            });
+        if self.close_gate != CloseGate::Done && !self.snapshot.all_stopped() {
+            self.shutdown_all_adapters();
             let deadline = *self
                 .exit_deadline
                 .get_or_insert_with(|| Instant::now() + SHUTDOWN_TIMEOUT);
-            while Instant::now() < deadline && !self.snapshot.telegram_stopped() {
+            while Instant::now() < deadline && !self.snapshot.all_stopped() {
                 self.drain_events();
                 std::thread::sleep(SHUTDOWN_POLL);
             }
-            if !self.snapshot.telegram_stopped() {
-                tracing::warn!("telegram did not close before exit");
+            if !self.snapshot.all_stopped() {
+                tracing::warn!("adapters did not close before exit");
             }
         }
         self.finish_exit();
@@ -534,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_reaches_the_telegram_adapter_and_reports_stopped() {
+    async fn shutdown_reaches_every_adapter_and_each_reports_stopped() {
         let store = SecretStore::memory();
         let store = Arc::new(store);
         let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
@@ -544,24 +550,26 @@ mod tests {
             Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
             whatsapp_phone,
         );
-        host.send(AdapterCommand::Shutdown {
-            protocol: ProtocolId::Telegram,
-        });
+        for caps in catalog() {
+            host.send(AdapterCommand::Shutdown { protocol: caps.id });
+        }
+        let mut snapshot = Snapshot::new();
         let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            if host.poll_events().iter().any(|event| {
-                matches!(
-                    event,
-                    AdapterEvent::Stopped {
-                        protocol: ProtocolId::Telegram
-                    }
-                )
-            }) {
-                return;
+        while !snapshot.all_stopped() {
+            for event in host.poll_events() {
+                snapshot.apply(event);
             }
-            assert!(Instant::now() < deadline, "no Stopped event");
+            assert!(
+                Instant::now() < deadline,
+                "every adapter must answer Shutdown with Stopped"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        let src = include_str!("mod.rs");
+        let close = &src[src.find("fn handle_close(").expect("close")..];
+        let close = &close[..close.find("\n    }\n").expect("end")];
+        assert!(close.contains("self.shutdown_all_adapters()"));
+        assert!(close.contains("self.snapshot.all_stopped()"));
     }
 
     #[test]

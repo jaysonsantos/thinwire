@@ -300,7 +300,8 @@ pub(crate) struct Snapshot {
     /// Unsent compose text per chat. `compose` holds the selected chat's draft.
     drafts: HashMap<String, String>,
     focus_compose: bool,
-    telegram_stopped: bool,
+    /// Protocols that answered `Shutdown` with `Stopped`.
+    stopped: HashSet<ProtocolId>,
     /// Sends the adapter has not accepted yet: chat id → text. One per chat,
     /// so a send in one chat does not block Send in another. The text stays
     /// until the pending row arrives (PR #40 review).
@@ -364,7 +365,7 @@ impl Snapshot {
             scroll_to_selected: false,
             drafts: HashMap::new(),
             focus_compose: false,
-            telegram_stopped: false,
+            stopped: HashSet::new(),
             sending: HashMap::new(),
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
@@ -455,9 +456,7 @@ impl Snapshot {
                 delivery,
             } => self.set_delivery(protocol, &conversation_id, &message_id, delivery),
             AdapterEvent::Stopped { protocol } => {
-                if protocol == ProtocolId::Telegram {
-                    self.telegram_stopped = true;
-                }
+                self.stopped.insert(protocol);
             }
             AdapterEvent::ChatListLoaded { protocol } => {
                 if protocol == ProtocolId::Telegram {
@@ -659,10 +658,13 @@ impl Snapshot {
         self.selected_conversation = id;
     }
 
-    /// Telegram closed every client after `Shutdown`. The app may exit.
+    /// Every adapter answered `Shutdown` with `Stopped`: no session of any
+    /// protocol (TDLib, the WhatsApp bot and its SQLite session) still runs.
     #[must_use]
-    pub(crate) fn telegram_stopped(&self) -> bool {
-        self.telegram_stopped
+    pub(crate) fn all_stopped(&self) -> bool {
+        self.accounts
+            .iter()
+            .all(|row| self.stopped.contains(&row.caps.id))
     }
 
     /// True once after the user picked a chat. The UI then focuses compose.
@@ -2943,6 +2945,23 @@ mod tests {
         assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
         assert!(snapshot.telegram_code.is_empty(), "no stale code");
         assert!(snapshot.telegram_2fa.is_empty(), "no stale password");
+    }
+
+    #[test]
+    fn exit_waits_until_every_adapter_stopped() {
+        let mut snapshot = Snapshot::new();
+        assert!(!snapshot.all_stopped());
+        snapshot.apply(AdapterEvent::Stopped {
+            protocol: ProtocolId::Telegram,
+        });
+        assert!(
+            !snapshot.all_stopped(),
+            "Telegram alone is not enough (Codex 4091477244)"
+        );
+        for protocol in [ProtocolId::WhatsApp, ProtocolId::Discord, ProtocolId::Slack] {
+            snapshot.apply(AdapterEvent::Stopped { protocol });
+        }
+        assert!(snapshot.all_stopped());
     }
 
     #[test]

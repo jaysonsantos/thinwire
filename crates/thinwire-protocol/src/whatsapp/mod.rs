@@ -228,6 +228,24 @@ impl ProtocolAdapter for WhatsAppAdapter {
         self.seed_placeholders(&events);
     }
 
+    /// Stop pairing, close the linked-device bot and its SQLite session, then
+    /// `Stopped`. Without the spike feature nothing runs: `Stopped` at once.
+    fn shutdown(&mut self, events: &EventTx) {
+        self.risk_acknowledged = false;
+        #[cfg(feature = "whatsapp-web")]
+        {
+            self.link.next_generation();
+            let link = Arc::clone(&self.link);
+            let events = events.clone();
+            tokio::spawn(async move {
+                link.shutdown().await;
+                super::adapter::emit_stopped(&events, ProtocolId::WhatsApp);
+            });
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        super::adapter::emit_stopped(events, ProtocolId::WhatsApp);
+    }
+
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         match command {
             AdapterCommand::Connect {
@@ -262,6 +280,37 @@ impl ProtocolAdapter for WhatsAppAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_closes_the_link_then_reports_stopped() {
+        let mut adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
+        adapter.risk_acknowledged = true;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter.shutdown(&tx);
+        assert!(
+            !adapter.risk_acknowledged,
+            "the ban gate must be accepted again"
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Stopped in time")
+            .expect("channel open");
+        assert_eq!(
+            event,
+            AdapterEvent::Stopped {
+                protocol: ProtocolId::WhatsApp
+            }
+        );
+        let src = include_str!("mod.rs");
+        let body = &src[src.find("fn shutdown(&mut self").expect("shutdown")..];
+        let body = &body[..body.find("\n    }\n").expect("end")];
+        let close = body.find("link.shutdown().await").expect("link closes");
+        let stopped = body.find("emit_stopped(&events").expect("then Stopped");
+        assert!(
+            close < stopped,
+            "Stopped only after the bot and its session close"
+        );
+    }
     use crate::adapter::{AdapterEvent, RedactedPairingSecret};
     use tokio::sync::mpsc::unbounded_channel;
 

@@ -188,6 +188,15 @@ impl ProtocolAdapter for TelegramAdapter {
         );
     }
 
+    /// Close every TDLib client, then `Stopped` (no TDLib: `Stopped` at once).
+    fn shutdown(&mut self, events: &EventTx) {
+        self.engine.reset();
+        #[cfg(feature = "telegram-tdlib")]
+        self.tdlib.shutdown(events);
+        #[cfg(not(feature = "telegram-tdlib"))]
+        super::adapter::emit_stopped(events, ProtocolId::Telegram);
+    }
+
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         match command {
             AdapterCommand::TelegramAuth { step } => self.handle_auth(step, events),
@@ -218,16 +227,6 @@ impl ProtocolAdapter for TelegramAdapter {
                     AdapterStatus::Stubbed,
                     "Telegram disconnected.",
                 );
-                Ok(())
-            }
-            AdapterCommand::Shutdown {
-                protocol: ProtocolId::Telegram,
-            } => {
-                self.engine.reset();
-                #[cfg(feature = "telegram-tdlib")]
-                self.tdlib.shutdown(events);
-                #[cfg(not(feature = "telegram-tdlib"))]
-                super::adapter::emit_stopped(events, ProtocolId::Telegram);
                 Ok(())
             }
             AdapterCommand::LoadChats {
@@ -660,14 +659,7 @@ mod tests {
         let mut adapter = TelegramAdapter::memory();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         if !uses_tdlib_hook() {
-            adapter
-                .handle(
-                    AdapterCommand::Shutdown {
-                        protocol: ProtocolId::Telegram,
-                    },
-                    &tx,
-                )
-                .expect("shutdown");
+            adapter.shutdown(&tx);
             assert_eq!(
                 rx.try_recv().expect("stopped"),
                 AdapterEvent::Stopped {

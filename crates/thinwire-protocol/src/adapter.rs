@@ -472,6 +472,12 @@ pub trait ProtocolAdapter: Send {
     fn capabilities(&self) -> ProtocolCapabilities;
     fn start(&mut self, events: EventTx);
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError>;
+
+    /// The app is closing. Close every live session, then emit `Stopped`
+    /// once. The default is for an adapter with nothing running.
+    fn shutdown(&mut self, events: &EventTx) {
+        emit_stopped(events, self.id());
+    }
 }
 
 pub(crate) fn emit_status(
