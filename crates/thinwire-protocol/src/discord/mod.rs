@@ -201,16 +201,12 @@ impl DiscordAdapter {
     }
 
     fn stop_session(&mut self, events: &EventTx) {
+        // In-flight HTTP sends stay open. They settle when the request returns.
+        let _ = events;
         #[cfg(any(test, feature = "discord-bot"))]
         {
             self.live.fetch_add(1, Ordering::SeqCst);
-            if let Some(session) = self.session.take() {
-                session.reject_inflight(events);
-            }
-        }
-        #[cfg(not(any(test, feature = "discord-bot")))]
-        {
-            let _ = events;
+            self.session = None;
         }
     }
 
@@ -772,6 +768,16 @@ mod tests {
                 &tx,
             )
             .expect("reconnect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let early = drain(&mut rx);
+        assert!(
+            !early.iter().any(|event| matches!(
+                event,
+                AdapterEvent::SendRejected { .. } | AdapterEvent::MessagesRemoved { .. }
+            )),
+            "a live HTTP send stays pending until Discord answers"
+        );
+        hold.notify_waiters();
         let events = until(&mut rx, |event| {
             matches!(event, AdapterEvent::SendRejected { request: 9, .. })
         })
@@ -784,7 +790,7 @@ mod tests {
             })
             .collect();
         assert_eq!(rejected, vec![4, 9]);
-        let pending: Vec<&str> = events
+        let pending: Vec<&str> = early
             .iter()
             .filter_map(|event| match event {
                 AdapterEvent::MessageReceived { message } if message.id.contains(":pending:") => {
@@ -803,14 +809,11 @@ mod tests {
             })
             .flatten()
             .collect();
-        assert_eq!(removed, pending);
         assert_eq!(pending, vec!["discord:pending:1", "discord:pending:2"]);
-        hold.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let later = drain(&mut rx);
-        assert!(!later.iter().any(|event| matches!(
+        assert_eq!(removed, pending);
+        assert!(!events.iter().any(|event| matches!(
             event,
-            AdapterEvent::MessageReplaced { .. } | AdapterEvent::SendRejected { .. }
+            AdapterEvent::SendAccepted { .. } | AdapterEvent::MessageReplaced { .. }
         )));
     }
 

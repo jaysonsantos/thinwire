@@ -28,7 +28,6 @@ pub(crate) struct ChannelAccess {
 struct Inflight {
     conversation_id: String,
     request: u64,
-    pending_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -195,7 +194,6 @@ impl Session {
             state.inflight.push(Inflight {
                 conversation_id: conversation_id.clone(),
                 request,
-                pending_id: pending_id.clone(),
             });
         }
         emit_message(
@@ -217,16 +215,19 @@ impl Session {
         let events = events.clone();
         tokio::spawn(async move {
             let result = api.send(access.channel_id, body).await;
-            {
-                let Ok(mut state) = shared.lock() else {
-                    return;
-                };
-                if !gate.current() {
-                    return;
-                }
+            if let Ok(mut state) = shared.lock() {
                 state
                     .inflight
                     .retain(|row| row.request != request || row.conversation_id != conversation_id);
+            }
+            if !gate.current() {
+                let _ = events.send(AdapterEvent::MessagesRemoved {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id.clone(),
+                    message_ids: vec![pending_id],
+                });
+                emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
+                return;
             }
             match result {
                 Ok(sent) => {
@@ -255,28 +256,6 @@ impl Session {
             }
         });
         Ok(())
-    }
-
-    /// The session is gone. Each send still in flight is rejected now.
-    pub(crate) fn reject_inflight(&self, events: &EventTx) {
-        let inflight = self
-            .shared
-            .lock()
-            .map(|mut state| std::mem::take(&mut state.inflight))
-            .unwrap_or_default();
-        for row in inflight {
-            let _ = events.send(AdapterEvent::MessagesRemoved {
-                protocol: ProtocolId::Discord,
-                conversation_id: row.conversation_id.clone(),
-                message_ids: vec![row.pending_id],
-            });
-            emit_send_rejected(
-                events,
-                ProtocolId::Discord,
-                row.conversation_id,
-                row.request,
-            );
-        }
     }
 
     /// `Ok(None)` means the refusal is a note. The account status stays Ready.
