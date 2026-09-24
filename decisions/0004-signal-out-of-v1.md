@@ -33,5 +33,5 @@ ADR [0011](0011-agpl-protocols-local-only.md) (2026-09-24) amends this decision 
 
 - Release builds and OS zips stay free of AGPL code.
 - Local feature `whatsapp-web` can link `wacore-libsignal`.
-- Local feature `signal-local` can link Presage and libsignal (#39).
+- Planned feature `signal-local` (#39) will link Presage and libsignal.
 - Issue #38 researches a separate AGPL helper process.

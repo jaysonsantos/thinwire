@@ -14,11 +14,12 @@ Council lock S2 in ADR 0004 kept Signal out of the release binary. The user deci
 
 ## Decision
 
-`whatsapp-web` and `signal-local` are local-only cargo features.
+`whatsapp-web` is a local-only cargo feature. `signal-local` is a planned local-only feature (#39).
 
 - `whatsapp-web` can link `wacore-libsignal` on a local build.
-- `signal-local` can link Presage and libsignal on a local build (#39).
-- Both features stay off by default.
+- Planned feature `signal-local` (#39) will link Presage and libsignal on a local build.
+- `whatsapp-web` stays off by default.
+- Planned feature `signal-local` stays off by default.
 - Release builds never enable `whatsapp-web`.
 - Release builds never enable `signal-local`.
 - OS zips never enable `whatsapp-web`.
@@ -28,7 +29,7 @@ Council lock S2 in ADR 0004 kept Signal out of the release binary. The user deci
 
 Issue #38 researches a separate AGPL helper process. That research can recommend go, no-go, or later. This ADR does not choose that path.
 
-ADR 0004 still blocks AGPL code in the release binary. This ADR is the exception for the two local features.
+ADR 0004 still blocks AGPL code in the release binary. This ADR is the exception for `whatsapp-web` now and for planned feature `signal-local` (#39).
 
 ## Consequences
 
