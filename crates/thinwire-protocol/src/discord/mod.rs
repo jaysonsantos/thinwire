@@ -693,7 +693,7 @@ mod tests {
             // Looks like a DM channel id. It is not in the guild list.
             "discord:0:777".to_string(),
         ] {
-            let err = adapter
+            adapter
                 .handle(
                     AdapterCommand::SendText {
                         protocol: ProtocolId::Discord,
@@ -703,10 +703,9 @@ mod tests {
                     },
                     &tx,
                 )
-                .unwrap_err();
-            assert!(matches!(err, AdapterError::Refused { .. }));
+                .expect("refusal is a note");
         }
-        let err = adapter
+        adapter
             .handle(
                 AdapterCommand::OpenChat {
                     protocol: ProtocolId::Discord,
@@ -714,11 +713,23 @@ mod tests {
                 },
                 &tx,
             )
-            .unwrap_err();
-        assert!(
-            matches!(err, AdapterError::Refused { reason, .. } if reason.contains("Direct messages are out of scope"))
-        );
-        assert!(drain(&mut rx).is_empty());
+            .expect("unknown channel is a note");
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Notice { text, .. } if text.contains("Send Messages")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Notice { text, .. } if text.contains("Direct messages are out of scope")
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Refused,
+                ..
+            }
+        )));
         assert!(api.state().sent.is_empty());
     }
 

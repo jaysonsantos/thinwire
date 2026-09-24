@@ -12,7 +12,7 @@ use super::inbox::{HISTORY_LIMIT, InboxChannel, chat_message, load_channels};
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
 use crate::adapter::{
     AdapterError, AdapterEvent, AdapterStatus, ChatMessage, EventTx, ProtocolId, emit_conversation,
-    emit_conversation_removed, emit_message, emit_message_replaced, emit_status,
+    emit_conversation_removed, emit_message, emit_message_replaced, emit_notice, emit_status,
 };
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
@@ -104,7 +104,9 @@ impl Session {
         conversation_id: String,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
-        let (access, bot_id) = self.access(&conversation_id)?;
+        let Some((access, bot_id)) = self.noted_access(&conversation_id, events)? else {
+            return Ok(());
+        };
         let api = Arc::clone(&self.api);
         let gate = self.gate.clone();
         let events = events.clone();
@@ -135,12 +137,12 @@ impl Session {
         body: String,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
-        let (access, bot_id) = self.access(&conversation_id)?;
+        let Some((access, bot_id)) = self.noted_access(&conversation_id, events)? else {
+            return Ok(());
+        };
         if !access.can_send {
-            return Err(AdapterError::Refused {
-                protocol: ProtocolId::Discord,
-                reason: READ_ONLY_REFUSAL,
-            });
+            emit_notice(events, ProtocolId::Discord, READ_ONLY_REFUSAL);
+            return Ok(());
         }
         self.next_pending += 1;
         let pending_id = format!("discord:pending:{}", self.next_pending);
@@ -185,6 +187,22 @@ impl Session {
             }
         });
         Ok(())
+    }
+
+    /// `Ok(None)` means the refusal is a note. The account status stays Ready.
+    fn noted_access(
+        &self,
+        conversation_id: &str,
+        events: &EventTx,
+    ) -> Result<Option<(ChannelAccess, u64)>, AdapterError> {
+        match self.access(conversation_id) {
+            Ok(pair) => Ok(Some(pair)),
+            Err(AdapterError::Refused { reason, .. }) => {
+                emit_notice(events, ProtocolId::Discord, reason);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn access(&self, conversation_id: &str) -> Result<(ChannelAccess, u64), AdapterError> {
