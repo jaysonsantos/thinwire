@@ -3,20 +3,18 @@
 //! Compiled only with `whatsapp-web`. The QR and pair screen is unreachable
 //! until the ban acknowledgement. This is not a supported messenger.
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use thinwire_protocol::{CRITIC_RISK_BULLETS, WhatsAppPhoneVault};
 
 use super::snapshot::{Snapshot, WhatsAppScreen};
-
-const WARN: Color32 = Color32::from_rgb(214, 160, 64);
-const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
+use super::theme;
 
 pub(crate) fn risk_entry(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     ui.add_space(8.0);
     ui.label(
         RichText::new("WhatsApp spike — experimental, ban risk")
             .small()
-            .color(WARN),
+            .color(theme::palette(ui).warn),
     );
     if ui.button("Review WhatsApp ban risk").clicked() {
         snapshot.open_whatsapp_risk_gate();
@@ -37,7 +35,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, phone: &WhatsAppP
 fn risk_gate(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     ui.heading("WhatsApp experimental spike");
     ui.colored_label(
-        WARN,
+        theme::palette(ui).warn,
         "Unofficial linked-device pairing can get a personal account banned. This is not a supported messenger.",
     );
     ui.add_space(8.0);
@@ -82,7 +80,7 @@ fn pair_screen(ui: &mut egui::Ui, snapshot: &mut Snapshot, phone: &WhatsAppPhone
     if let Some(qr) = &snapshot.whatsapp_qr {
         ui.add_space(8.0);
         ui.colored_label(
-            WARN,
+            theme::palette(ui).warn,
             "QR payload. Do not commit it, log it, or paste it into a ticket.",
         );
         ui.monospace(qr);
@@ -96,7 +94,7 @@ fn pair_screen(ui: &mut egui::Ui, snapshot: &mut Snapshot, phone: &WhatsAppPhone
     ui.label(
         RichText::new("Cancel returns to the shell and stops the worker task.")
             .small()
-            .color(MUTED),
+            .weak(),
     );
     if ui.button("Cancel pairing").clicked() {
         snapshot.cancel_whatsapp_link(phone);

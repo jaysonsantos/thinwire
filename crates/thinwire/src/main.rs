@@ -19,6 +19,7 @@ fn main() -> eframe::Result<()> {
         "thinwire",
         options,
         Box::new(|cc| {
+            app::install_theme(&cc.egui_ctx);
             let settings = app::Settings::load();
             // First paint follows the stored mode. Missing file → System (ADR 0005).
             settings.apply(&cc.egui_ctx);

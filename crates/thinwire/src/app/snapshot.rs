@@ -2462,13 +2462,15 @@ mod tests {
         let ui = include_str!("ui.rs");
         let bubble = &ui[ui.find("fn bubble(").expect("bubble")..];
         let bubble = &bubble[..bubble.find("\nfn ").expect("next")];
-        assert!(bubble.contains("selection.bg_fill"));
+        assert!(bubble.contains("palette.out"));
+        assert!(bubble.contains("palette.surface"));
         assert!(bubble.contains("egui::Align::Max"));
         assert!(bubble.contains("egui::Align::Min"));
         assert!(bubble.contains("layout.day_break"));
         assert!(bubble.contains("layout.show_sender"));
         assert!(bubble.contains("layout.time"));
-        assert!(bubble.contains(".selectable(true).wrap()"));
+        assert!(bubble.contains(".selectable(true)"));
+        assert!(bubble.contains(".wrap()"));
         assert!(
             !bubble.contains("Color32::from_rgb"),
             "colors come from the theme"

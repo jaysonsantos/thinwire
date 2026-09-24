@@ -4,6 +4,7 @@ mod auth;
 mod secrets;
 mod settings;
 mod snapshot;
+mod theme;
 mod thread_layout;
 mod ui;
 #[cfg(feature = "whatsapp-web")]
@@ -22,6 +23,7 @@ use secrets::SecretStore;
 use snapshot::Snapshot;
 
 pub use settings::Settings;
+pub use theme::install as install_theme;
 
 /// Longest wait for TDLib to close before the window closes anyway.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);

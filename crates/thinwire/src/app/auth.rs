@@ -1,15 +1,13 @@
 //! Non-modal Telegram login. Cancel is always available. Secrets stay off disk
 //! except in the OS keychain (or in-memory when the keychain is unavailable).
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
 use thinwire_protocol::{TelegramAuthError, TelegramCodeVia};
 
 use super::secrets::SecretStore;
 use super::snapshot::{AuthScreen, Snapshot};
-
-const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
-const WARN: Color32 = Color32::from_rgb(214, 160, 64);
+use super::theme::{self, space};
 
 /// Shown until TDLib reports Ready. Feature-off builds stay on this copy.
 pub(crate) const TDLIB_UNAVAILABLE_BANNER: &str = "TDLib unavailable in this build. Enable feature telegram-tdlib after a local TDLib install. These screens do not open a live Telegram session.";
@@ -35,45 +33,97 @@ pub(crate) fn stub_banner(snapshot: &Snapshot) -> Option<&'static str> {
     }
 }
 
+/// Step caption for the three login fields. Other screens have none.
+#[must_use]
+fn step_line(auth: AuthScreen) -> Option<&'static str> {
+    match auth {
+        AuthScreen::TelegramPhone => Some("Step 1 of 3 · Phone"),
+        AuthScreen::TelegramCode => Some("Step 2 of 3 · Code"),
+        AuthScreen::Telegram2fa => Some("Step 3 of 3 · Password"),
+        AuthScreen::Idle
+        | AuthScreen::NeedCredentials
+        | AuthScreen::TelegramApi
+        | AuthScreen::TelegramConnecting => None,
+    }
+}
+
 pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
     if snapshot.auth == AuthScreen::Idle {
         return;
     }
-    ui.separator();
-    ui.heading(auth_heading(snapshot.auth));
-    if let Some(banner) = stub_banner(snapshot) {
-        ui.colored_label(WARN, banner);
-    }
-    ui.label(
-        RichText::new("Your number and code stay on this device. They are never logged.")
-            .small()
-            .color(MUTED),
-    );
-    if snapshot.auth_busy {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label(RichText::new("Waiting for Telegram…").small().color(MUTED));
-        });
-    }
+    theme::show_centered_card(ui, |ui| {
+        let palette = theme::palette(ui);
+        ui.label(
+            RichText::new(auth_heading(snapshot.auth))
+                .text_style(theme::display())
+                .color(palette.text),
+        );
+        if let Some(step) = step_line(snapshot.auth) {
+            ui.add_space(space::XS);
+            ui.label(RichText::new(step).small().color(palette.text3));
+        }
+        if let Some(banner) = stub_banner(snapshot) {
+            ui.add_space(space::S);
+            ui.colored_label(palette.warn, banner);
+        }
+        ui.add_space(space::S);
+        ui.label(
+            RichText::new("Your number and code stay on this device. They are never logged.")
+                .small()
+                .color(palette.text3),
+        );
+        ui.add_space(space::M);
+        let focus = take_focus(ui, snapshot);
+        match snapshot.auth {
+            AuthScreen::Idle => {}
+            AuthScreen::NeedCredentials => need_credentials(ui, snapshot, secrets),
+            AuthScreen::TelegramApi => telegram_api(ui, snapshot, secrets, focus),
+            AuthScreen::TelegramConnecting => telegram_connecting(ui, snapshot, secrets),
+            AuthScreen::TelegramPhone => telegram_phone(ui, snapshot, secrets, focus),
+            AuthScreen::TelegramCode => telegram_code(ui, snapshot, secrets, focus),
+            AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot, secrets, focus),
+        }
+        inline_feedback(ui, snapshot);
+        ui.add_space(space::S);
+        if ui
+            .add(egui::Button::new(RichText::new("Cancel").color(palette.text2)).frame(false))
+            .clicked()
+        {
+            snapshot.cancel_auth(secrets);
+        }
+    });
+}
 
+/// Notice and error under the field. The status strip does not repeat them.
+fn inline_feedback(ui: &mut egui::Ui, snapshot: &Snapshot) {
+    let palette = theme::palette(ui);
+    if snapshot.auth_notice.is_none() && snapshot.error.is_none() {
+        return;
+    }
+    ui.add_space(space::S);
     if let Some(notice) = &snapshot.auth_notice {
-        ui.colored_label(WARN, notice);
+        ui.label(
+            RichText::new(notice)
+                .text_style(theme::secondary())
+                .color(palette.warn),
+        );
     }
-
-    let focus = take_focus(ui, snapshot);
-    match snapshot.auth {
-        AuthScreen::Idle => {}
-        AuthScreen::NeedCredentials => need_credentials(ui, snapshot, secrets),
-        AuthScreen::TelegramApi => telegram_api(ui, snapshot, secrets, focus),
-        AuthScreen::TelegramConnecting => telegram_connecting(ui, snapshot, secrets),
-        AuthScreen::TelegramPhone => telegram_phone(ui, snapshot, secrets, focus),
-        AuthScreen::TelegramCode => telegram_code(ui, snapshot, secrets, focus),
-        AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot, secrets, focus),
-    }
-
-    ui.add_space(8.0);
-    if ui.button("Cancel").clicked() {
-        snapshot.cancel_auth(secrets);
+    if let Some(error) = &snapshot.error {
+        ui.label(
+            RichText::new(&error.happened)
+                .text_style(theme::secondary())
+                .color(palette.error),
+        );
+        ui.label(
+            RichText::new(&error.why)
+                .text_style(theme::secondary())
+                .color(palette.text2),
+        );
+        ui.label(
+            RichText::new(format!("What to do: {}", error.next))
+                .text_style(theme::secondary())
+                .color(palette.text2),
+        );
     }
 }
 
@@ -91,10 +141,22 @@ fn take_focus(ui: &egui::Ui, snapshot: &Snapshot) -> bool {
 
 fn field(ui: &mut egui::Ui, edit: egui::TextEdit<'_>, id: &str, focus: bool) {
     let id = egui::Id::new(("auth-field", id));
-    ui.add(edit.id(id));
+    ui.add(
+        edit.id(id)
+            .desired_width(ui.available_width())
+            .margin(egui::Margin::symmetric(space::M as i8, space::M as i8)),
+    );
     if focus {
         ui.memory_mut(|memory| memory.request_focus(id));
     }
+}
+
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .text_style(theme::secondary())
+            .color(theme::palette(ui).text2),
+    );
 }
 
 fn auth_heading(auth: AuthScreen) -> &'static str {
@@ -163,7 +225,7 @@ fn telegram_connecting(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &Sec
 }
 
 fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
-    ui.label("Your phone number, with + and the country code.");
+    field_label(ui, "Your phone number, with + and the country code.");
     field(
         ui,
         egui::TextEdit::singleline(&mut snapshot.telegram_phone).hint_text("+15551234567"),
@@ -174,7 +236,7 @@ fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretSt
 }
 
 fn telegram_code(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
-    ui.label(code_hint(snapshot.code_via));
+    field_label(ui, code_hint(snapshot.code_via));
     let digits_only = code_is_digits(snapshot.code_via);
     let hint = if digits_only {
         "12345"
@@ -222,7 +284,7 @@ fn code_hint(via: Option<TelegramCodeVia>) -> &'static str {
 }
 
 fn telegram_2fa(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
-    ui.label("Enter your Telegram password.");
+    field_label(ui, "Enter your Telegram password.");
     field(
         ui,
         egui::TextEdit::singleline(&mut snapshot.telegram_2fa)
@@ -235,9 +297,66 @@ fn telegram_2fa(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
 }
 
 fn continue_button(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, label: &str) {
-    ui.add_enabled_ui(snapshot.can_submit_auth(), |ui| {
-        if ui.button(label).clicked() {
-            snapshot.advance_telegram(secrets);
-        }
-    });
+    let palette = theme::palette(ui);
+    if snapshot.auth_busy {
+        ui.add_space(space::S);
+        egui::Frame::new()
+            .fill(palette.surface)
+            .corner_radius(egui::CornerRadius::same(theme::radius::CONTROL))
+            .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.set_min_height(40.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new("Waiting for Telegram…")
+                            .text_style(theme::secondary())
+                            .color(palette.text2),
+                    );
+                });
+            });
+        return;
+    }
+    ui.add_space(space::S);
+    let can_submit = snapshot.can_submit_auth();
+    let (fill, label_color) = if can_submit {
+        (palette.accent, palette.on_accent)
+    } else {
+        (palette.surface, palette.text3)
+    };
+    if ui
+        .add_enabled(
+            can_submit,
+            egui::Button::new(RichText::new(label).color(label_color))
+                .fill(fill)
+                .min_size(egui::vec2(ui.available_width(), 40.0)),
+        )
+        .clicked()
+    {
+        snapshot.advance_telegram(secrets);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthScreen, step_line};
+
+    #[test]
+    fn step_line_names_the_three_login_steps() {
+        assert_eq!(
+            step_line(AuthScreen::TelegramPhone),
+            Some("Step 1 of 3 · Phone")
+        );
+        assert_eq!(
+            step_line(AuthScreen::TelegramCode),
+            Some("Step 2 of 3 · Code")
+        );
+        assert_eq!(
+            step_line(AuthScreen::Telegram2fa),
+            Some("Step 3 of 3 · Password")
+        );
+        assert_eq!(step_line(AuthScreen::TelegramConnecting), None);
+        assert_eq!(step_line(AuthScreen::Idle), None);
+    }
 }
