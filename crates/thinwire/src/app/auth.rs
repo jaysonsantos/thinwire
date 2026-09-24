@@ -216,8 +216,11 @@ fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
     continue_button(ui, snapshot, secrets, "Save override");
 }
 
-/// Between Add Telegram and the phone step. The shared continue control
-/// shows the spinner while the login is busy, and Try again after a failed start.
+/// Between Add Telegram and the phone step.
+///
+/// The first connect is busy until Telegram asks for the phone. The shared
+/// continue control then shows a spinner and "Connecting to Telegram…".
+/// After a failed start the same control shows Try again.
 fn telegram_connecting(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
     continue_button(ui, snapshot, secrets, "Try again");
 }
@@ -305,10 +308,15 @@ fn continue_button(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.set_min_height(40.0);
+                let text = if snapshot.auth == AuthScreen::TelegramConnecting {
+                    "Connecting to Telegram…"
+                } else {
+                    "Waiting for Telegram…"
+                };
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(
-                        RichText::new("Waiting for Telegram…")
+                        RichText::new(text)
                             .text_style(theme::secondary())
                             .color(palette.text2),
                     );
@@ -374,11 +382,16 @@ mod tests {
         let button = &auth[auth.find("fn continue_button(").expect("button")..];
         let button = &button[..button.find("\n#[cfg(test)]").expect("tests")];
         let busy = button.find("if snapshot.auth_busy").expect("busy branch");
-        let spinner = button.find("ui.spinner()").expect("spinner");
+        let connecting = button
+            .find("Connecting to Telegram…")
+            .expect("connecting text");
         let waiting = button.find("Waiting for Telegram…").expect("waiting text");
+        let spinner = button.find("ui.spinner()").expect("spinner");
         let early_return = button.find("return;").expect("busy returns");
         let label = button.find("RichText::new(label)").expect("idle label");
-        assert!(busy < spinner && spinner < waiting && waiting < early_return);
+        assert!(busy < connecting && connecting < waiting);
+        assert!(waiting < spinner && spinner < early_return);
+        assert!(button.contains("AuthScreen::TelegramConnecting"));
         assert!(
             early_return < label,
             "Try again is the label only when the login is not busy"
