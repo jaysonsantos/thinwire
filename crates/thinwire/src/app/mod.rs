@@ -258,6 +258,9 @@ impl ThinwireApp {
         if self.snapshot.take_keychain_flush() {
             self.secrets.spawn_os_flush(self.runtime.handle());
         }
+        if self.snapshot.take_keychain_retry() {
+            self.secrets.spawn_os_attach(self.runtime.handle());
+        }
         if let Some(job) = self.settings.take_persist_job() {
             self.runtime.handle().spawn_blocking(move || job.run());
         }

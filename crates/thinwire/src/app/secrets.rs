@@ -97,6 +97,10 @@ enum AttachPhase {
     Attaching,
     Ready,
     MemoryOnly,
+    /// The OS store opened, but reading an entry failed. The values are not
+    /// known, so a missing key must not look like a lost key. Attach stays
+    /// unsettled until Try again reads every entry.
+    ReadFailed,
 }
 
 type DiscordHydrateHook = Box<dyn FnOnce() + Send>;
@@ -180,7 +184,10 @@ impl SecretStore {
     pub fn backend_name(&self) -> &'static str {
         match self.phase() {
             AttachPhase::Ready => "os-keychain",
-            AttachPhase::Detached | AttachPhase::Attaching | AttachPhase::MemoryOnly => "memory",
+            AttachPhase::Detached
+            | AttachPhase::Attaching
+            | AttachPhase::MemoryOnly
+            | AttachPhase::ReadFailed => "memory",
         }
     }
 
@@ -191,6 +198,13 @@ impl SecretStore {
         matches!(self.phase(), AttachPhase::Ready | AttachPhase::MemoryOnly)
     }
 
+    /// UI thread: the keychain opened, but a read failed. The UI offers Try
+    /// again and does not start a sign-in (no endless spinner).
+    #[must_use]
+    pub fn read_failed(&self) -> bool {
+        self.phase() == AttachPhase::ReadFailed
+    }
+
     /// UI thread: how long a sign-in lasts with the store in use.
     #[must_use]
     pub fn persistence(&self) -> Persistence {
@@ -198,7 +212,9 @@ impl SecretStore {
             return Persistence::ThisSession;
         };
         match (inner.phase, inner.os_backend) {
-            (AttachPhase::Detached | AttachPhase::Attaching, _) => Persistence::Loading,
+            (AttachPhase::Detached | AttachPhase::Attaching | AttachPhase::ReadFailed, _) => {
+                Persistence::Loading
+            }
             (AttachPhase::MemoryOnly, _) => Persistence::ThisSession,
             (AttachPhase::Ready, Some(backend)) if !backend.survives_restart() => {
                 Persistence::UntilRestart
@@ -323,7 +339,7 @@ impl SecretStore {
                     FlushAction::Spawn
                 }
             }
-            AttachPhase::Detached | AttachPhase::Attaching => {
+            AttachPhase::Detached | AttachPhase::Attaching | AttachPhase::ReadFailed => {
                 inner.flush_pending = true;
                 FlushAction::Defer
             }
@@ -339,7 +355,7 @@ impl SecretStore {
             };
             match inner.phase {
                 AttachPhase::Ready | AttachPhase::MemoryOnly => return,
-                AttachPhase::Detached | AttachPhase::Attaching => {
+                AttachPhase::Detached | AttachPhase::Attaching | AttachPhase::ReadFailed => {
                     inner.phase = AttachPhase::Attaching;
                 }
             }
@@ -405,6 +421,10 @@ impl SecretStore {
                 error = %error,
                 "OS keychain hydrate failed; attach stays unsettled so a missing database key is not assumed"
             );
+            // Unsettled, but not "still loading": the UI shows Try again.
+            if let Ok(mut inner) = self.lock() {
+                inner.phase = AttachPhase::ReadFailed;
+            }
             return false;
         }
         let should_flush = self.finish_ready(os_values);
@@ -773,6 +793,12 @@ impl SecretStore {
         Arc::new(Self::blank(AttachPhase::Detached))
     }
 
+    pub(crate) fn fail_attach_for_test(&self) {
+        if let Ok(mut inner) = self.lock() {
+            inner.phase = AttachPhase::ReadFailed;
+        }
+    }
+
     pub(crate) fn complete_ready_attach_for_test(&self, os: &[(SecretKey, &str)]) {
         let values = os
             .iter()
@@ -1047,7 +1073,11 @@ mod tests {
             Some(SecretError::new("OS keychain: platform failure")),
         );
         assert!(!should_flush);
-        assert_eq!(store.phase(), AttachPhase::Attaching);
+        assert_eq!(store.phase(), AttachPhase::ReadFailed);
+        assert!(
+            store.read_failed(),
+            "the UI offers Try again, not a spinner"
+        );
         assert!(!store.attach_settled());
         assert!(!TelegramSecretVault::secrets_hydrated(&store));
         assert_eq!(store.get(SecretKey::Session).expect("session"), None);
@@ -1055,6 +1085,26 @@ mod tests {
         assert!(
             !keyless_recovery_allowed(&store),
             "a read error must not move a valid TDLib folder aside"
+        );
+    }
+
+    #[test]
+    fn a_failed_read_defers_writes_and_a_retry_settles_the_store() {
+        let store = SecretStore::blank(AttachPhase::Detached);
+        store.fail_attach_for_test();
+        assert!(store.read_failed());
+        assert_eq!(store.persistence(), Persistence::Loading);
+        assert_eq!(
+            store.request_flush(),
+            FlushAction::Defer,
+            "no write on a failed read"
+        );
+        store.complete_ready_attach_for_test(&[(SecretKey::DbEncryption, "saved-key")]);
+        assert!(!store.read_failed());
+        assert!(store.attach_settled());
+        assert_eq!(
+            store.get(SecretKey::DbEncryption).expect("get").as_deref(),
+            Some("saved-key")
         );
     }
 

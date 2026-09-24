@@ -116,6 +116,8 @@ pub(crate) enum CenterView {
         connecting: bool,
     },
     FirstRun,
+    /// The keychain opened, but a read failed. Try again reads it again.
+    KeychainFailed,
     Thread,
 }
 
@@ -219,6 +221,9 @@ pub(crate) const SESSION_ENDED_NOTICE: &str = "Your Telegram session ended. Sign
 /// Status line while a new client starts, before the phone step.
 const CONNECTING_STATUS: &str = "Connecting to Telegram…";
 
+/// Center panel copy when a keychain read failed (the values are unknown).
+pub(crate) const KEYCHAIN_READ_FAILED: &str = "The keychain could not be read. Your saved sign-in did not load. Unlock the keychain, then press Try again.";
+
 /// Center panel copy while the keychain read runs.
 pub(crate) const KEYCHAIN_OPENING: &str = "Opening the keychain…";
 
@@ -285,6 +290,10 @@ pub(crate) struct Snapshot {
     resume: Resume,
     /// When the UI first saw the keychain read still running.
     keychain_wait_started: Option<Instant>,
+    /// The last keychain read failed. Copied from the store each frame.
+    keychain_failed: bool,
+    /// The user asked to read the keychain again. The app runs it off the UI thread.
+    keychain_retry: bool,
     chat_list_loading: bool,
     history_loading: HashSet<String>,
     scroll_to_selected: bool,
@@ -344,6 +353,8 @@ impl Snapshot {
             telegram_authorized: false,
             resume: Resume::Waiting,
             keychain_wait_started: None,
+            keychain_failed: false,
+            keychain_retry: false,
             chat_list_loading: false,
             history_loading: HashSet::new(),
             scroll_to_selected: false,
@@ -545,6 +556,7 @@ impl Snapshot {
     /// Call once per frame. It acts only after the keychain read settles, and
     /// only once. The UI thread reads memory only; the command has no secret.
     pub(crate) fn poll_resume(&mut self, store: &SecretStore) {
+        self.keychain_failed = store.read_failed();
         if !store.attach_settled() {
             self.keychain_wait_started.get_or_insert_with(Instant::now);
         }
@@ -589,6 +601,9 @@ impl Snapshot {
         }
         if self.has_primary_account() {
             return CenterView::Thread;
+        }
+        if self.keychain_failed && !self.keychain_retry {
+            return CenterView::KeychainFailed;
         }
         match self.resume {
             Resume::Waiting if super::auth::tdlib_compiled() => {
@@ -977,8 +992,25 @@ impl Snapshot {
                 }
             }
             CenterView::Auth => self.auth_key(key, store),
+            CenterView::KeychainFailed => {
+                if key == AuthKey::Enter {
+                    self.retry_keychain();
+                }
+            }
             CenterView::Resuming { .. } | CenterView::Thread => {}
         }
+    }
+
+    /// Try again after a failed keychain read. The app starts the read.
+    pub(crate) fn retry_keychain(&mut self) {
+        self.keychain_retry = true;
+        self.keychain_wait_started = None;
+        self.error = None;
+    }
+
+    /// True once after Try again: read the keychain again off the UI thread.
+    pub(crate) fn take_keychain_retry(&mut self) -> bool {
+        std::mem::take(&mut self.keychain_retry)
     }
 
     /// Enter submits the current login step. Escape cancels the login.
@@ -1045,6 +1077,14 @@ impl Snapshot {
     pub(crate) fn open_telegram(&mut self, store: &SecretStore) {
         // Until the keychain read ends, a saved DB key looks missing, and the
         // worker would move a good data folder aside.
+        if store.read_failed() {
+            self.set_error(
+                "Telegram sign-in did not start.",
+                "The keychain could not be read, so thinwire does not know your saved sign-in.",
+                "Unlock the keychain, then press Try again.",
+            );
+            return;
+        }
         if !store.attach_settled() {
             self.status_text = KEYCHAIN_LOADING_STATUS.into();
             return;
@@ -2652,6 +2692,60 @@ mod tests {
         assert!(
             snapshot.take_commands().is_empty(),
             "a second end does nothing"
+        );
+    }
+
+    #[test]
+    fn a_failed_keychain_read_blocks_sign_in_and_offers_try_again() {
+        let store = SecretStore::detached_for_test();
+        store.fail_attach_for_test();
+        let mut snapshot =
+            Snapshot::with_api_source(TelegramApiSource::with_publisher("11111", "publisher-hash"));
+        snapshot.poll_resume(&store);
+        assert_eq!(snapshot.center_view(), CenterView::KeychainFailed);
+
+        // No client can start, so no data folder can move (Codex 4091044706).
+        snapshot.open_telegram(&store);
+        snapshot.open_add_account(&store);
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(snapshot.take_commands().is_empty());
+        assert!(snapshot.error.is_some());
+
+        snapshot.center_key(AuthKey::Enter, &store);
+        assert!(snapshot.take_keychain_retry(), "Enter = Try again");
+        assert!(!snapshot.take_keychain_retry(), "one retry per press");
+
+        // The retry reads every entry, including a saved session.
+        store.complete_ready_attach_for_test(&[
+            (SecretKey::ApiId, "11111"),
+            (SecretKey::ApiHash, "hash-value"),
+            (SecretKey::Session, "tdlib-ready"),
+        ]);
+        snapshot.try_resume(&store, true);
+        snapshot.keychain_failed = store.read_failed();
+        assert_eq!(
+            snapshot.center_view(),
+            CenterView::Resuming { connecting: true }
+        );
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ApiCredentials]
+        );
+    }
+
+    #[test]
+    fn a_confirmed_missing_key_still_lets_sign_in_start() {
+        let store = SecretStore::detached_for_test();
+        store.complete_ready_attach_for_test(&[]);
+        let mut snapshot =
+            Snapshot::with_api_source(TelegramApiSource::with_publisher("11111", "publisher-hash"));
+        snapshot.poll_resume(&store);
+        assert_ne!(snapshot.center_view(), CenterView::KeychainFailed);
+        snapshot.open_telegram(&store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ApiCredentials]
         );
     }
 

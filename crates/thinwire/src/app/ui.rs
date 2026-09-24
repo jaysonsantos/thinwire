@@ -12,8 +12,8 @@ use super::auth;
 use super::secrets::{Persistence, SecretStore};
 use super::settings::{Settings, ThemeMode};
 use super::snapshot::{
-    AccountRow, AuthKey, CenterView, InboxFilter, InboxState, RESUME_CONNECTING, Snapshot,
-    ThreadState,
+    AccountRow, AuthKey, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
+    RESUME_CONNECTING, Snapshot, ThreadState,
 };
 use super::thread_layout::{RowLayout, list_time, thread_rows};
 
@@ -318,6 +318,7 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
             CenterView::Auth => auth::draw(ui, snapshot, secrets),
             CenterView::Resuming { connecting } => resuming(ui, snapshot, connecting),
             CenterView::FirstRun => first_run(ui, snapshot, secrets),
+            CenterView::KeychainFailed => keychain_failed(ui, snapshot),
             CenterView::Thread => thread(ui, snapshot),
         }
     });
@@ -333,6 +334,18 @@ fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, connecting: bool) {
             ui.label(RESUME_CONNECTING);
         } else {
             ui.label(snapshot.keychain_wait_text(Instant::now()));
+        }
+    });
+}
+
+fn keychain_failed(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+    let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
+    ui.add_space(top);
+    ui.vertical_centered(|ui| {
+        ui.colored_label(WARN, KEYCHAIN_READ_FAILED);
+        ui.add_space(12.0);
+        if ui.button("Try again").clicked() {
+            snapshot.retry_keychain();
         }
     });
 }
