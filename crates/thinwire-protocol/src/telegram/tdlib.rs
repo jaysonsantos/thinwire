@@ -938,7 +938,11 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
         }
         tdlib_rs::enums::Update::DeleteMessages(update) => {
             // Cache eviction can be fetched again. Rows drop only when the chat lost them.
-            if !emit || update.from_cache {
+            if update.from_cache {
+                return;
+            }
+            live.older.messages_deleted(update.chat_id);
+            if !emit {
                 return;
             }
             let message_ids = update

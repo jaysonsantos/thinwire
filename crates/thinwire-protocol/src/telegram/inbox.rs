@@ -323,6 +323,14 @@ impl OlderHistory {
         self.last_anchor.remove(&chat_id);
     }
 
+    /// Messages of this chat were deleted. If they were the whole last page,
+    /// the oldest shown message is the old anchor again. Clear the repeat
+    /// gate so that request fetches (PR #52 review). The start-of-chat mark
+    /// stays: a delete adds no older message.
+    pub(super) fn messages_deleted(&mut self, chat_id: i64) {
+        self.last_anchor.remove(&chat_id);
+    }
+
     /// Forget a chat when `effect` removes it from the list.
     pub(super) fn follow(&mut self, effect: Option<&ChatEffect>) {
         if let Some(ChatEffect::Remove(id)) = effect
@@ -762,6 +770,28 @@ mod tests {
         gate.follow(kept.as_ref());
         gate.follow(None);
         assert_eq!(gate.begin(3, 50), OlderStep::Repeat);
+    }
+
+    #[test]
+    fn a_deleted_last_page_does_not_consume_its_anchor() {
+        let mut gate = OlderHistory::new();
+        // Anchor 50 loaded 47..=49; then all three are deleted, so the UI
+        // asks again from 50.
+        assert!(gate.finish(1, 50, PageOutcome::Older(3)));
+        assert!(gate.finish(2, 80, PageOutcome::Older(1)));
+        assert_eq!(gate.begin(1, 50), OlderStep::Repeat);
+        gate.messages_deleted(1);
+        assert_eq!(gate.begin(1, 50), OlderStep::Fetch, "not consumed");
+        assert_eq!(
+            gate.begin(2, 80),
+            OlderStep::Repeat,
+            "other chats keep theirs"
+        );
+
+        // The start of the chat stays the start.
+        assert!(!gate.finish(1, 50, PageOutcome::Empty));
+        gate.messages_deleted(1);
+        assert_eq!(gate.begin(1, 50), OlderStep::AtStart);
     }
 
     #[test]
