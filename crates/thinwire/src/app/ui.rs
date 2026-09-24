@@ -142,7 +142,7 @@ fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
             }
             ui.add_space(space::S);
             if let Some(text) = search_field(ui, &snapshot.search) {
-                out.push(Intent::SetSearch(text));
+                out.push(Intent::SetSearch(text.into()));
             }
             if snapshot.can_add_account() && ui.button("Add account").clicked() {
                 out.push(Intent::Telegram(TelegramIntent::AddAccount));
@@ -1093,7 +1093,7 @@ fn compose(
                                 .desired_width(width)
                                 .hint_text(RichText::new("Message").color(palette.text3))
                         }) {
-                            out.push(Intent::SetDraft(text));
+                            out.push(Intent::SetDraft(text.into()));
                         }
                     });
                 let can_send = snapshot.can_send();

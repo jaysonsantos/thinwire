@@ -283,7 +283,7 @@ pub struct AccountRow {
     pub linked: bool,
 }
 
-#[derive(Debug)]
+/// App state. `Debug` is manual: it prints no secret and no user text.
 pub struct Snapshot {
     pub accounts: Vec<AccountRow>,
     conversations: HashMap<ProtocolId, Vec<Conversation>>,
@@ -350,6 +350,40 @@ pub struct Snapshot {
     /// needs it; showing the gate again or cancelling clears it.
     #[cfg(feature = "whatsapp-web")]
     whatsapp_risk_acknowledged: bool,
+}
+
+/// Redacted: login fields, the WhatsApp phone and pairing material, compose,
+/// drafts, search, chat titles, and message bodies never reach `Debug`
+/// (PR #48 review). Only screens, flags, and counts are printed.
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let accounts: Vec<(ProtocolId, AdapterStatus, bool)> = self
+            .accounts
+            .iter()
+            .map(|row| (row.caps.id, row.status, row.linked))
+            .collect();
+        let mut out = f.debug_struct("Snapshot");
+        out.field("accounts", &accounts)
+            .field("selected_protocol", &self.selected_protocol)
+            .field("filter", &self.filter)
+            .field("auth", &self.auth)
+            .field("auth_busy", &self.auth_busy)
+            .field("telegram_authorized", &self.telegram_authorized)
+            .field(
+                "conversations",
+                &self.conversations.values().map(Vec::len).sum::<usize>(),
+            )
+            .field(
+                "messages",
+                &self.messages.values().map(Vec::len).sum::<usize>(),
+            )
+            .field("has_error", &self.error.is_some())
+            .field("pending_commands", &self.pending.len());
+        #[cfg(feature = "whatsapp-web")]
+        out.field("whatsapp_screen", &self.whatsapp_screen)
+            .field("whatsapp_started", &self.whatsapp_started);
+        out.finish_non_exhaustive()
+    }
 }
 
 impl Default for Snapshot {
@@ -4005,5 +4039,50 @@ mod tests {
         snapshot.begin_whatsapp_link(&phone);
         assert!(!snapshot.whatsapp_started);
         assert!(snapshot.take_commands().is_empty());
+    }
+
+    /// PR #48 review (P1): `Snapshot` is public through `View`, so its
+    /// `Debug` must not print a secret or user text.
+    #[test]
+    fn debug_prints_no_secret_and_no_user_text() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: telegram_text(1, 7, "body-fixture-7c1"),
+        });
+        snapshot.telegram_api_id = "id-fixture-4410".into();
+        snapshot.telegram_api_hash = "hash-fixture-9f3".into();
+        snapshot.telegram_phone = "+15550100777".into();
+        snapshot.telegram_code = "code-fixture-5521".into();
+        snapshot.telegram_2fa = "password-fixture-8d2".into();
+        snapshot.compose = "draft-fixture-3b7".into();
+        snapshot.search = "search-fixture-6e5".into();
+        snapshot
+            .drafts
+            .insert("telegram:2".into(), "other-draft-fixture-2a9".into());
+        #[cfg(feature = "whatsapp-web")]
+        {
+            snapshot.whatsapp_phone = "wa-phone-fixture-111".into();
+            snapshot.whatsapp_qr = Some("qr-fixture-222".into());
+            snapshot.whatsapp_pair_code = Some("pair-fixture-333".into());
+        }
+        let shown = format!("{snapshot:?}");
+        for secret in [
+            "id-fixture-4410",
+            "hash-fixture-9f3",
+            "5550100777",
+            "code-fixture-5521",
+            "password-fixture-8d2",
+            "draft-fixture-3b7",
+            "search-fixture-6e5",
+            "other-draft-fixture-2a9",
+            "body-fixture-7c1",
+            "wa-phone-fixture-111",
+            "qr-fixture-222",
+            "pair-fixture-333",
+        ] {
+            assert!(!shown.contains(secret), "{secret} leaked: {shown}");
+        }
+        assert!(shown.contains("telegram_authorized: true"));
     }
 }

@@ -21,7 +21,8 @@ pub enum Intent {
     /// Limit the inbox to one protocol tab, or show All.
     SetFilter(InboxFilter),
     /// Inbox search text. Matches chat title and participant only.
-    SetSearch(String),
+    /// `SecretText` keeps the typed text out of `Debug`.
+    SetSearch(SecretText),
     /// Reload the chat lists of the visible protocols.
     Refresh,
     /// Close the error block ("What happened / Why / What to do").
@@ -29,7 +30,8 @@ pub enum Intent {
     /// Enter or Escape on the center screen: first run or the login form.
     Key(AuthKey),
     /// Unsent text for the selected chat. The core keeps one draft per chat.
-    SetDraft(String),
+    /// `SecretText` keeps the message text out of `Debug`.
+    SetDraft(SecretText),
     /// Send the draft of the selected chat.
     SendDraft,
     /// Send a failed outgoing message again.
@@ -135,10 +137,18 @@ mod tests {
                 SecretText::new("hunter2-fixture"),
             )),
             Intent::WhatsApp(WhatsAppIntent::SetPhone(SecretText::new("+15550100"))),
+            Intent::SetDraft(SecretText::new("draft-fixture-3b7")),
+            Intent::SetSearch(SecretText::new("search-fixture-6e5")),
         ];
         for intent in intents {
             let shown = format!("{intent:?}");
-            for secret in ["24680", "hunter2-fixture", "5550100"] {
+            for secret in [
+                "24680",
+                "hunter2-fixture",
+                "5550100",
+                "draft-fixture-3b7",
+                "search-fixture-6e5",
+            ] {
                 assert!(!shown.contains(secret), "{shown}");
             }
         }

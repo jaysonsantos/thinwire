@@ -22,6 +22,12 @@ impl SecretText {
         &self.0
     }
 
+    /// Take the raw value. Callers must not log or persist it outside the vault.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
     /// True when the value holds no text.
     #[must_use]
     pub fn is_empty(&self) -> bool {
