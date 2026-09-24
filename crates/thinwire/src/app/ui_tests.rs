@@ -362,7 +362,7 @@ fn keychain_try_again_reaches_the_core_attach() {
     assert!(core.contains("Intent::RetryKeychain => self.state.retry_keychain()"));
     let retry = &core[core.find("take_keychain_retry()").expect("retry")..];
     let retry = &retry[..retry.find('}').expect("end")];
-    assert!(retry.contains("spawn_os_attach("));
+    assert!(retry.contains("spawn_os_retry("));
 }
 
 /// qa L1: a hint the frame did not draw stays in the core for a later frame.

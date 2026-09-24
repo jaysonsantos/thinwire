@@ -303,6 +303,22 @@ impl SecretStore {
         }
     }
 
+    /// Try again after a failed read. The phase leaves `ReadFailed` before
+    /// this returns, so a new keychain watch does not stop at the old failure.
+    pub fn spawn_os_retry(self: &Arc<Self>, handle: &Handle) {
+        self.leave_read_failed();
+        self.spawn_os_attach(handle);
+    }
+
+    /// `ReadFailed` → `Attaching`, under the lock, before any worker runs.
+    fn leave_read_failed(&self) {
+        if let Ok(mut inner) = self.lock()
+            && inner.phase == AttachPhase::ReadFailed
+        {
+            inner.phase = AttachPhase::Attaching;
+        }
+    }
+
     pub fn spawn_os_attach(self: &Arc<Self>, handle: &Handle) {
         let store = Arc::clone(self);
         handle.spawn_blocking(move || store.attach_os_keychain());
@@ -1465,5 +1481,16 @@ mod tests {
             self.commits.lock().expect("commits").push(snapshot.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn retry_leaves_read_failed_before_the_worker_runs() {
+        let store = SecretStore::detached_for_test();
+        store.fail_attach_for_test();
+        assert!(store.read_failed());
+        store.leave_read_failed();
+        assert!(!store.read_failed(), "a new watch does not stop at once");
+        assert!(!store.attach_settled());
+        assert_eq!(store.persistence(), Persistence::Loading);
     }
 }

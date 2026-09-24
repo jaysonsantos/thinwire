@@ -3,7 +3,7 @@
 //! The signal carries no state. It only says "read the view again". A
 //! frontend that wakes late sees one change, not a queue of them.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::sync::watch;
 
@@ -22,12 +22,38 @@ impl ChangeNotifier {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
+    /// A handle that does not keep the signal alive. A detached task holds
+    /// this, so it stops when the core is gone.
+    #[must_use]
+    pub(crate) fn downgrade(&self) -> WeakNotifier {
+        WeakNotifier {
+            tx: Arc::downgrade(&self.tx),
+        }
+    }
+
     /// A new consumer. It sees the current revision as already read.
     #[must_use]
     pub fn subscribe(&self) -> ChangeSignal {
         ChangeSignal {
             rx: self.tx.subscribe(),
         }
+    }
+}
+
+/// Producer side that does not keep the core's signal alive.
+#[derive(Debug, Clone)]
+pub(crate) struct WeakNotifier {
+    tx: Weak<watch::Sender<u64>>,
+}
+
+impl WeakNotifier {
+    /// Notify if the core still exists. Returns false when it is gone.
+    pub(crate) fn notify(&self) -> bool {
+        let Some(tx) = self.tx.upgrade() else {
+            return false;
+        };
+        tx.send_modify(|revision| *revision = revision.wrapping_add(1));
+        true
     }
 }
 

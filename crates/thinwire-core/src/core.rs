@@ -22,7 +22,7 @@ use crate::intent::{
 };
 use crate::secrets::SecretStore;
 use crate::settings::Settings;
-use crate::signal::{ChangeNotifier, ChangeSignal, change_channel};
+use crate::signal::{ChangeNotifier, ChangeSignal, WeakNotifier, change_channel};
 use crate::state::{AuthScreen, Snapshot};
 use crate::view::View;
 
@@ -109,8 +109,8 @@ impl Core {
         bind_discord_after_hydrate(&secrets, &host);
         let (notifier, _) = change_channel();
         let (commands, host_events) = host.into_parts();
-        let events = forward_events(runtime, host_events, notifier.clone());
-        watch_keychain(runtime, Arc::clone(&secrets), notifier.clone());
+        let events = forward_events(runtime, host_events, notifier.downgrade());
+        watch_keychain(runtime, Arc::clone(&secrets), &notifier);
         let mut state = Snapshot::new();
         state.status_text = secret_store_status_text(secrets.backend_name());
         Self {
@@ -308,9 +308,10 @@ impl Core {
             self.secrets.spawn_os_flush(&self.runtime);
         }
         if self.state.take_keychain_retry() {
-            // Read again off the caller thread. A failed read is not settled,
-            // so the keychain watch still wakes frontends until this ends.
-            self.secrets.spawn_os_attach(&self.runtime);
+            // Read again off the caller thread, with a fresh watch: the old
+            // one stopped at the failed read.
+            self.secrets.spawn_os_retry(&self.runtime);
+            watch_keychain(&self.runtime, Arc::clone(&self.secrets), &self.notifier);
         }
         if let Some(job) = self.settings.take_persist_job() {
             self.runtime.spawn_blocking(move || job.run());
@@ -328,38 +329,42 @@ impl Core {
 fn forward_events(
     runtime: &Handle,
     mut from_host: UnboundedReceiver<AdapterEvent>,
-    notifier: ChangeNotifier,
+    notifier: WeakNotifier,
 ) -> UnboundedReceiver<AdapterEvent> {
     let (to_core, events) = unbounded_channel();
     runtime.spawn(async move {
         while let Some(event) = from_host.recv().await {
-            if to_core.send(event).is_err() {
+            // The core is gone when its queue or its signal is gone.
+            if to_core.send(event).is_err() || !notifier.notify() {
                 return;
             }
-            notifier.notify();
         }
     });
     events
 }
 
 /// Wake the frontends while the keychain attach runs, and once when it ends.
-fn watch_keychain(runtime: &Handle, secrets: Arc<SecretStore>, notifier: ChangeNotifier) {
+///
+/// The watch stops when the attach settles, when the read fails (Try again
+/// starts a new watch), or when the core is gone: it holds only a weak
+/// notifier (PR #48 review).
+fn watch_keychain(runtime: &Handle, secrets: Arc<SecretStore>, notifier: &ChangeNotifier) {
     runtime.spawn(watch_until(
-        move || secrets.attach_settled(),
-        notifier,
+        move || secrets.attach_settled() || secrets.read_failed(),
+        notifier.downgrade(),
         KEYCHAIN_WATCH_STEP,
     ));
 }
 
-/// Notify every `step` until `settled` is true, then once more.
+/// Notify every `step` until `done` is true, then once more.
 ///
 /// Check first, then notify: the last wake comes after the watch saw the
-/// attach end. So the frame for it sees the end too (qa M2).
-async fn watch_until(settled: impl Fn() -> bool, notifier: ChangeNotifier, step: Duration) {
+/// end. So the frame for it sees the end too (qa M2). Stops at once when
+/// the core is gone.
+async fn watch_until(done: impl Fn() -> bool, notifier: WeakNotifier, step: Duration) {
     loop {
-        let done = settled();
-        notifier.notify();
-        if done {
+        let finished = done();
+        if !notifier.notify() || finished {
             return;
         }
         tokio::time::sleep(step).await;
@@ -625,7 +630,7 @@ mod tests {
         };
         tokio::time::timeout(
             WAIT,
-            watch_until(settled, notifier, Duration::from_millis(1)),
+            watch_until(settled, notifier.downgrade(), Duration::from_millis(1)),
         )
         .await
         .expect("watch ends");
@@ -739,5 +744,58 @@ mod tests {
         } else {
             assert!(got.is_empty(), "feature off: WhatsApp intents do nothing");
         }
+    }
+
+    /// PR #48 review: the keychain watch must not outlive the core. After a
+    /// drop, the change signal ends (no task keeps a strong notifier).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keychain_watch_stops_when_the_core_is_dropped() {
+        // A detached store never settles and never fails: the watch loops.
+        let store = SecretStore::detached_for_test();
+        let core = Core::with_store(
+            &Handle::current(),
+            CoreConfig::new(temp_settings()),
+            Arc::clone(&store),
+        );
+        let mut signal = core.signal();
+        drop(core);
+        let ended = tokio::time::timeout(WAIT, async { while signal.changed().await {} }).await;
+        assert!(ended.is_ok(), "a detached task still holds the notifier");
+        assert!(!store.attach_settled(), "the watch had no end but the drop");
+    }
+
+    /// PR #48 review: a failed read ends the watch after one last wake.
+    #[tokio::test]
+    async fn keychain_watch_stops_at_a_failed_read() {
+        let store = SecretStore::detached_for_test();
+        store.fail_attach_for_test();
+        let (notifier, mut signal) = change_channel();
+        let watched = Arc::clone(&store);
+        tokio::time::timeout(
+            WAIT,
+            watch_until(
+                move || watched.attach_settled() || watched.read_failed(),
+                notifier.downgrade(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the watch ends at ReadFailed");
+        assert!(signal.has_changed(), "one last wake shows Try again");
+        assert_eq!(signal.mark_seen(), 1, "no wake loop after the failure");
+    }
+
+    /// Try again leaves `ReadFailed` at once and starts a fresh watch.
+    #[test]
+    fn keychain_retry_starts_a_fresh_watch() {
+        let src = include_str!("core.rs");
+        let retry = &src[src.find("take_keychain_retry()").expect("retry")..];
+        let retry = &retry[..retry.find("\n        }").expect("end")];
+        let attach = retry.find("spawn_os_retry(").expect("retry attach");
+        let watch = retry.find("watch_keychain(").expect("fresh watch");
+        assert!(
+            attach < watch,
+            "the phase leaves ReadFailed before the watch"
+        );
     }
 }
