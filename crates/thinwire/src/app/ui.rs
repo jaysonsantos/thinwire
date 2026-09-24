@@ -745,7 +745,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     // Compose grows to COMPOSE_MAX_ROWS lines, then scrolls. Leave the whole
     // bar inside the panel when the message list hits its max height.
     let row_height = ui.text_style_height(&egui::TextStyle::Body);
-    let compose_rows = snapshot.compose.lines().count().clamp(1, COMPOSE_MAX_ROWS);
+    let compose_rows = compose_line_count(&snapshot.compose);
     let compose_height = compose_row_height(row_height, COMPOSE_MAX_ROWS);
     let reserve = compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y);
 
@@ -946,6 +946,11 @@ fn bubble_radius(outbound: bool, run_end: bool) -> egui::CornerRadius {
 /// `ui.horizontal` only offers `interact_size` of height, and a vertical
 /// scroll area otherwise stays at its 64px minimum. Compose uses this as
 /// both `min_scrolled_height` and `max_height`, so the bar tracks the text.
+/// Rows in the draft. `str::lines` drops a trailing blank row from Shift+Enter.
+fn compose_line_count(text: &str) -> usize {
+    text.split('\n').count()
+}
+
 fn compose_row_height(row_height: f32, rows: usize) -> f32 {
     let rows = rows.clamp(1, COMPOSE_MAX_ROWS) as f32;
     let pad = space::M * 2.0;
@@ -1013,7 +1018,7 @@ fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
                 let width = (ui.available_width() - send_width - space::S).max(0.0);
                 let visible = compose_row_height(
                     ui.text_style_height(&egui::TextStyle::Body),
-                    snapshot.compose.lines().count(),
+                    compose_line_count(&snapshot.compose),
                 )
                 .min(max_height);
                 egui::ScrollArea::vertical()
@@ -1098,8 +1103,24 @@ mod tests {
         let compose = &compose[..compose.find("\nfn ").expect("next")];
         assert!(compose.contains("min_scrolled_height("));
         assert!(compose.contains("compose_row_height("));
+        assert!(compose.contains("compose_line_count("));
         assert!(compose.contains("FIELD_STROKE_MAX"));
         assert!(compose.contains("SEND_MIN_HEIGHT"));
+        assert!(thread.contains("compose_line_count("));
+        assert!(!thread.contains(".lines().count()"));
+        assert!(!compose.contains(".lines().count()"));
+    }
+
+    #[test]
+    fn compose_line_count_keeps_a_trailing_blank_row() {
+        use super::compose_line_count;
+
+        assert_eq!(compose_line_count(""), 1);
+        assert_eq!(compose_line_count("hi"), 1);
+        assert_eq!(compose_line_count("a\nb"), 2);
+        assert_eq!("hi\n".lines().count(), 1);
+        assert_eq!(compose_line_count("hi\n"), 2);
+        assert_eq!(compose_line_count("a\nb\n"), 3);
     }
 
     fn compose_body(rows: usize) -> String {
@@ -1114,8 +1135,8 @@ mod tests {
     #[test]
     fn compose_bar_stays_inside_the_reserved_clip() {
         use super::{
-            COMPOSE_MAX_ROWS, FIELD_STROKE_MAX, SEND_MIN_HEIGHT, compose, compose_reserve,
-            compose_row_height,
+            COMPOSE_MAX_ROWS, FIELD_STROKE_MAX, SEND_MIN_HEIGHT, compose, compose_line_count,
+            compose_reserve, compose_row_height,
         };
         use crate::app::snapshot::Snapshot;
         use crate::app::theme::{self, space};
@@ -1203,7 +1224,7 @@ mod tests {
                             let row_height = ui.text_style_height(&egui::TextStyle::Body);
                             let reserve = compose_reserve(
                                 row_height,
-                                snapshot.compose.lines().count().clamp(1, COMPOSE_MAX_ROWS),
+                                compose_line_count(&snapshot.compose),
                                 spacing,
                             );
                             let available = ui.available_height();
