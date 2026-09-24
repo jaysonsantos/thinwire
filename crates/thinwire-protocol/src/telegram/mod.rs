@@ -916,6 +916,19 @@ mod tests {
     }
 
     #[test]
+    fn live_tdlib_drops_a_chat_that_left_the_main_list() {
+        let src = include_str!("tdlib.rs");
+        let updates = fn_body(src, "fn apply_chat_update");
+        let arm = &updates[updates.find("Update::ChatLastMessage").expect("arm")..];
+        let arm = &arm[..arm.find("Update::NewMessage").expect("next arm")];
+        assert!(arm.contains("set_main_position(update.chat_id, main_order(&update.positions))"));
+        assert!(
+            !arm.contains("if let Some(order) = main_order"),
+            "None must not be ignored"
+        );
+    }
+
+    #[test]
     fn live_tdlib_has_one_receive_thread_for_the_process() {
         let src = include_str!("tdlib.rs");
         assert_eq!(src.matches("tdlib_rs::receive()").count(), 1);

@@ -718,13 +718,14 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
             );
         }
         tdlib_rs::enums::Update::ChatLastMessage(update) => {
-            if let Some(order) = main_order(&update.positions) {
-                publish(
-                    events,
-                    emit,
-                    live.directory.set_main_order(update.chat_id, order),
-                );
-            }
+            // `positions` is the full list. No Main entry means the chat left
+            // the main list (for example it was archived).
+            publish(
+                events,
+                emit,
+                live.directory
+                    .set_main_position(update.chat_id, main_order(&update.positions)),
+            );
             if let Some(message) = update.last_message.as_ref() {
                 let preview = message_body(&message.content);
                 publish(

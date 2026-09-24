@@ -138,6 +138,18 @@ impl ChatDirectory {
         self.effect(chat_id, Some(previous))
     }
 
+    /// Main-list position from an update that carries the full position list
+    /// (for example `updateChatLastMessage`). `None` means the chat left the
+    /// main list, for example it was archived: its order drops to zero, so it
+    /// leaves the inbox.
+    pub(super) fn set_main_position(
+        &mut self,
+        chat_id: i64,
+        main_order: Option<i64>,
+    ) -> Option<ChatEffect> {
+        self.set_main_order(chat_id, main_order.unwrap_or(0))
+    }
+
     pub(super) fn set_unread(&mut self, chat_id: i64, unread: i32) -> Option<ChatEffect> {
         let previous = self.ensure(chat_id).order;
         if let Some(chat) = self.chats.get_mut(&chat_id) {
@@ -417,6 +429,34 @@ mod tests {
         };
         assert_eq!(chat.last_at, 1_700_000_600);
         assert!(chat.is_group, "a preview update keeps the chat kind");
+    }
+
+    #[test]
+    fn a_last_message_update_without_a_main_position_removes_the_chat() {
+        let mut directory = ChatDirectory::new();
+        directory.upsert(4, seed("Archived later", 50, 0, "hi"));
+        // A fake updateChatLastMessage: new text, positions without Main.
+        let ChatEffect::Remove(id) = directory
+            .set_main_position(4, None)
+            .expect("the chat leaves the main list")
+        else {
+            panic!("expected remove");
+        };
+        assert_eq!(id, "telegram:4");
+        assert!(
+            directory
+                .set_preview(4, "later text", 1_700_000_000)
+                .is_none(),
+            "a preview does not bring it back"
+        );
+        assert!(directory.listed().is_empty());
+        let ChatEffect::Upsert(chat) = directory
+            .set_main_position(4, Some(60))
+            .expect("back in the main list")
+        else {
+            panic!("expected upsert");
+        };
+        assert_eq!(chat.order, 60);
     }
 
     #[test]
