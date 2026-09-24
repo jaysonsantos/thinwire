@@ -48,7 +48,10 @@ impl InboxChannel {
                 .last_message_id
                 .and_then(|id| i64::try_from(id).ok())
                 .unwrap_or(0),
-            last_at: 0,
+            last_at: self
+                .last_message_id
+                .map(snowflake_unix_seconds)
+                .unwrap_or(0),
             is_group: true,
             writable: self.can_send,
             placeholder: false,
@@ -131,6 +134,41 @@ pub(crate) fn chat_message(
         body,
         outbound: message.author_id == bot_id,
         delivery: Delivery::Sent,
-        sent_at: 0,
+        sent_at: snowflake_unix_seconds(message.id),
+    }
+}
+
+/// Discord snowflake epoch, 2015-01-01T00:00:00Z, in milliseconds.
+const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+
+/// Unix seconds in a Discord snowflake.
+#[must_use]
+pub(crate) fn snowflake_unix_seconds(id: u64) -> i64 {
+    let ms = (id >> 22).saturating_add(DISCORD_EPOCH_MS);
+    i64::try_from(ms / 1_000).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::api::MessageSummary;
+    use super::{chat_message, snowflake_unix_seconds};
+
+    #[test]
+    fn a_snowflake_keeps_unix_seconds() {
+        let ms = 1_700_000_000_000_u64;
+        let id = (ms - 1_420_070_400_000) << 22;
+        assert_eq!(snowflake_unix_seconds(id), 1_700_000_000);
+        let row = chat_message(
+            "discord:1:2",
+            9,
+            &MessageSummary {
+                id,
+                author_id: 3,
+                author: "ada".into(),
+                content: "hi".into(),
+                attachments: 0,
+            },
+        );
+        assert_eq!(row.sent_at, 1_700_000_000);
     }
 }
