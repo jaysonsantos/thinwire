@@ -48,7 +48,7 @@ Rejected: reverse-engineered Slack Desktop; a personal user-token client; Slack 
 
 With `slack-oauth` on, the registry uses `SlackInbox` instead of the stub:
 
-- `Connect { Slack }` with no stored bot token starts the install. The worker binds `127.0.0.1:8976`, opens the authorize URL in the system browser, checks `state`, and exchanges `code` with `oauth.v2.access`. A wrong `state` gets HTTP 400 and does not end the install. The install stops after 10 minutes.
+- `Connect { Slack }` with no stored bot token starts the install. The worker binds `127.0.0.1:8976`, opens the authorize URL in the system browser, checks `state`, and exchanges `code` with `oauth.v2.access`. A wrong or missing `state` gets HTTP 400 and does not end the install. The install stops after 10 minutes.
 - With a bot token, the worker calls `auth.test`, lists the channels the app is a member of (`conversations.list`, public, private, DM, group DM), loads history (`conversations.history`), and sends as the app (`chat.postMessage`).
 - Socket Mode starts only when an app-level token resolves. `app_uninstalled`, `invalid_auth`, and `token_revoked` stop Socket Mode and clear the bot token.
 - `slack-morphism` enables its `hyper` feature. `axum` stays off, so there is no inbound HTTP server.

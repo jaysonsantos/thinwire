@@ -100,6 +100,7 @@ async fn serve_one(mut stream: TcpStream, expected_state: &str) -> Outcome {
             let _ = respond(&mut stream, "400 Bad Request", PAGE_BAD_REQUEST).await;
             Outcome::Keep
         }
+        // `MissingCode` is returned only after `state` matches.
         Err(SlackCallbackError::MissingCode) => {
             let _ = respond(&mut stream, "400 Bad Request", PAGE_BAD_REQUEST).await;
             Outcome::Done(Err(SlackCallbackError::MissingCode))
@@ -209,6 +210,43 @@ pub(super) mod tests {
         assert_eq!(
             waiter.await.expect("join"),
             Err(SlackCallbackError::Declined)
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_without_state_does_not_end_the_install() {
+        let (listener, addr) = loopback().await;
+        let waiter = tokio::spawn(async move { listener.wait_for_code("state-test").await });
+
+        assert!(get(addr, "/slack/oauth/callback").await.contains("400"));
+        assert!(
+            get(addr, "/slack/oauth/callback?code=code-test")
+                .await
+                .contains("400")
+        );
+        assert!(
+            get(
+                addr,
+                "/slack/oauth/callback?code=code-test&state=state-test"
+            )
+            .await
+            .contains("200")
+        );
+        assert_eq!(waiter.await.expect("join").expect("code"), "code-test");
+    }
+
+    #[tokio::test]
+    async fn matching_state_without_code_ends_the_install() {
+        let (listener, addr) = loopback().await;
+        let waiter = tokio::spawn(async move { listener.wait_for_code("state-test").await });
+        assert!(
+            get(addr, "/slack/oauth/callback?state=state-test")
+                .await
+                .contains("400")
+        );
+        assert_eq!(
+            waiter.await.expect("join"),
+            Err(SlackCallbackError::MissingCode)
         );
     }
 
