@@ -17,7 +17,7 @@ The public API has four parts:
 1. `Core`: the handle that a frontend owns. `Core::new(runtime, CoreConfig)` starts the adapter host and the keychain attach on the tokio runtime. `Core::dispatch(Intent)` applies one user action. `Core::pump()` applies the adapter events that arrived. `Core::view()` returns the view model. `Core::block_until_stopped(timeout)` closes the clients at exit.
 2. `View<'_>`: a read-only borrow of the state. It derefs to the state type `Snapshot`, so a frontend reads fields and `&self` methods. It cannot call a mutating method. It adds the reads that need the secret store or the settings. The frontend does not clone the message list on each frame.
 3. `Intent`: one enum for user actions. Protocol actions are in sub-enums: `TelegramIntent`, `WhatsAppIntent`, `DiscordIntent`, and `SlackIntent`. Typed secrets use `SecretText`. Its `Debug` output is redacted.
-4. `ChangeSignal`: a `tokio::sync::watch` revision. The core bumps it when an adapter event arrives, while the keychain attach runs, and after each `dispatch`. A frontend waits with `changed().await` or checks `has_changed()`. The core gets the events through `AdapterHost::into_parts`.
+4. `ChangeSignal`: a `tokio::sync::watch` revision. The core bumps it when an adapter event arrives, while the keychain attach runs, and after each `dispatch`. A frontend waits with `changed().await` or checks `has_changed()`. The core gets the events through `AdapterHost::into_parts`. It returns a `HostSender`. `HostSender` keeps the Telegram login epoch rules (issue #42): `send` stamps and bumps the epoch, and `Core::pump` calls `deliver` just before it applies each event.
 
 Rules for the boundary:
 

@@ -73,36 +73,80 @@ impl AdapterHost {
         self.command_tx.clone()
     }
 
-    /// Split into the command sender and the event receiver.
+    /// Split into a [`HostSender`] and the raw event receiver.
     ///
-    /// A caller that wants to wait on events (a frontend core) owns the
-    /// receiver on its own task. `poll_events` is not available after this.
+    /// A caller that waits on events (a frontend core) owns the receiver on
+    /// its own task. It must pass each event through [`HostSender::deliver`]
+    /// on the thread that sends commands, so the Telegram login epoch rules
+    /// of `send` and `poll_events` still hold (issue #42).
     #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        UnboundedSender<AdapterCommand>,
-        UnboundedReceiver<AdapterEvent>,
-    ) {
-        (self.command_tx, self.event_rx)
+    pub fn into_parts(self) -> (HostSender, UnboundedReceiver<AdapterEvent>) {
+        (
+            HostSender {
+                command_tx: self.command_tx,
+                login_epoch: self.login_epoch,
+            },
+            self.event_rx,
+        )
     }
 
     /// Enqueue a command for the worker. Never runs adapter code on the caller.
-    pub fn send(&self, mut command: AdapterCommand) {
-        // Stamp first, then bump. A step sent before Cancel keeps the old
-        // epoch; the adapter ignores it instead of emitting `Failed` after
-        // the secrets were cleared.
-        let epoch = self.login_epoch.load(Ordering::SeqCst);
-        stamp_auth_epoch(&mut command, epoch);
-        // Bump here, on the UI thread, before the next poll: login events that
-        // an old client already queued are then stale and dropped (issue #42).
-        if ends_telegram_login(&command) {
-            self.login_epoch.fetch_add(1, Ordering::SeqCst);
-        }
-        if self.command_tx.send(command).is_err() {
+    pub fn send(&self, command: AdapterCommand) {
+        if !send_stamped(&self.command_tx, &self.login_epoch, command) {
             tracing::warn!("adapter host command channel closed");
         }
     }
+}
+
+/// Command side of a split [`AdapterHost`]. It keeps the Telegram login
+/// epoch rules: `send` stamps and bumps like [`AdapterHost::send`], and
+/// `deliver` unwraps and drops like [`AdapterHost::poll_events`].
+#[derive(Debug, Clone)]
+pub struct HostSender {
+    command_tx: UnboundedSender<AdapterCommand>,
+    login_epoch: LoginEpoch,
+}
+
+impl HostSender {
+    /// Enqueue a command for the worker. False when the worker is gone.
+    pub fn send(&self, command: AdapterCommand) -> bool {
+        send_stamped(&self.command_tx, &self.login_epoch, command)
+    }
+
+    /// Unwrap a stamped login event with the epoch of now; `None` for a stale
+    /// one. Call it on the thread that calls `send`, just before the event is
+    /// applied, so a Cancel sent before this call drops the event.
+    #[must_use]
+    pub fn deliver(&self, event: AdapterEvent) -> Option<AdapterEvent> {
+        deliver(event, self.login_epoch.load(Ordering::SeqCst))
+    }
+
+    /// Test hook: a sender over a channel the test reads, with its own epoch.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test(command_tx: UnboundedSender<AdapterCommand>) -> Self {
+        Self {
+            command_tx,
+            login_epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// Stamp first, then bump. A step sent before Cancel keeps the old epoch; the
+/// adapter ignores it instead of emitting `Failed` after the secrets were
+/// cleared. The bump happens on the sending thread, before the next delivery:
+/// login events that an old client already queued are then stale (issue #42).
+fn send_stamped(
+    command_tx: &UnboundedSender<AdapterCommand>,
+    login_epoch: &LoginEpoch,
+    mut command: AdapterCommand,
+) -> bool {
+    let epoch = login_epoch.load(Ordering::SeqCst);
+    stamp_auth_epoch(&mut command, epoch);
+    if ends_telegram_login(&command) {
+        login_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+    command_tx.send(command).is_ok()
 }
 
 /// The error status of a failed login step carries the step's epoch, so a
@@ -292,5 +336,32 @@ mod tests {
             1,
             "bumped at send time, before the worker handles the command"
         );
+    }
+
+    #[test]
+    fn a_split_host_sender_keeps_the_login_epoch_rules() {
+        let (tx, mut rx) = unbounded_channel();
+        let sender = HostSender::for_test(tx);
+        let queued_before_cancel = stamped(0, TelegramAuthPhase::Ready);
+        assert!(sender.send(AdapterCommand::Disconnect {
+            protocol: ProtocolId::Telegram,
+        }));
+        assert_eq!(sender.deliver(queued_before_cancel), None);
+        assert_eq!(
+            sender.deliver(stamped(1, TelegramAuthPhase::NeedPhone)),
+            Some(AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::NeedPhone
+            })
+        );
+        // A step sent now carries the new epoch.
+        assert!(sender.send(AdapterCommand::TelegramAuth {
+            step: crate::TelegramAuthStep::Phone,
+            epoch: 99,
+        }));
+        let _disconnect = rx.try_recv().expect("disconnect");
+        assert!(matches!(
+            rx.try_recv().expect("step"),
+            AdapterCommand::TelegramAuth { epoch: 1, .. }
+        ));
     }
 }

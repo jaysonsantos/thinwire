@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault as PhoneVault;
 use thinwire_protocol::{
-    AdapterCommand, AdapterEvent, AdapterHost, DiscordAdapter, DiscordSecretVault, ProtocolId,
-    TelegramSecretVault, WhatsAppPhoneVault, catalog,
+    AdapterCommand, AdapterEvent, AdapterHost, DiscordAdapter, DiscordSecretVault, HostSender,
+    ProtocolId, TelegramSecretVault, WhatsAppPhoneVault, catalog,
 };
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::intent::{
     AuthField, DiscordIntent, Intent, SlackIntent, TelegramIntent, WhatsAppIntent,
@@ -71,7 +71,8 @@ impl CoreConfig {
 /// Frontend-independent app core (ADR 0010).
 pub struct Core {
     runtime: Handle,
-    commands: UnboundedSender<AdapterCommand>,
+    /// Command side of the host. It also delivers stamped login events.
+    commands: HostSender,
     events: UnboundedReceiver<AdapterEvent>,
     state: Snapshot,
     settings: Settings,
@@ -148,8 +149,12 @@ impl Core {
     pub fn pump(&mut self) -> bool {
         let mut applied = false;
         while let Ok(event) = self.events.try_recv() {
-            self.state.apply(event);
-            applied = true;
+            // The login epoch check runs here, on the thread that sends
+            // Cancel, not in the forward task (issue #42, PR #49).
+            if let Some(event) = self.commands.deliver(event) {
+                self.state.apply(event);
+                applied = true;
+            }
         }
         if let Some(text) =
             refreshed_secret_store_status(&self.state.status_text, self.secrets.backend_name())
@@ -319,7 +324,7 @@ impl Core {
     }
 
     fn send(&self, command: AdapterCommand) {
-        if self.commands.send(command).is_err() {
+        if !self.commands.send(command) {
             tracing::warn!("adapter host command channel closed");
         }
     }
@@ -681,7 +686,7 @@ mod tests {
     async fn closing_drops_commands_from_later_intents() {
         let mut core = memory_core();
         let (probe, mut sent) = unbounded_channel();
-        core.commands = probe;
+        core.commands = HostSender::for_test(probe);
 
         core.dispatch(Intent::Refresh);
         assert!(
@@ -714,7 +719,7 @@ mod tests {
     async fn whatsapp_intents_without_the_gate_reach_no_adapter() {
         let mut core = memory_core();
         let (probe, mut sent) = unbounded_channel();
-        core.commands = probe;
+        core.commands = HostSender::for_test(probe);
 
         core.dispatch(Intent::WhatsApp(WhatsAppIntent::AcknowledgeRisk));
         core.dispatch(Intent::WhatsApp(WhatsAppIntent::SetPhone(
@@ -797,5 +802,39 @@ mod tests {
             attach < watch,
             "the phase leaves ReadFailed before the watch"
         );
+    }
+
+    /// PR #49 through the core path: a login event that an old client queued
+    /// before Cancel is dropped when the core applies it. A login event of
+    /// the current epoch still applies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_drops_an_old_epoch_login_event_in_the_core() {
+        use thinwire_protocol::TelegramAuthPhase;
+
+        let mut core = memory_core();
+        let (queue, events) = unbounded_channel();
+        core.events = events;
+        let stamped = |epoch, phase| AdapterEvent::Login {
+            epoch,
+            event: Box::new(AdapterEvent::TelegramAuth { phase }),
+        };
+
+        // Queued by the old client before the user pressed Cancel.
+        queue
+            .send(stamped(0, TelegramAuthPhase::Ready))
+            .expect("queue");
+        core.dispatch(Intent::Telegram(TelegramIntent::Cancel));
+        core.pump();
+        assert!(
+            !core.view().telegram_authorized,
+            "an old-epoch Ready must not sign in after Cancel"
+        );
+
+        // The next client runs under the bumped epoch: its events apply.
+        queue
+            .send(stamped(1, TelegramAuthPhase::Ready))
+            .expect("queue");
+        core.pump();
+        assert!(core.view().telegram_authorized);
     }
 }
