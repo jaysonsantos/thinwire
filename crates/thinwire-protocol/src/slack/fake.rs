@@ -18,7 +18,7 @@ use super::credentials::SlackApiSource;
 use super::install::SlackInstalledWorkspace;
 use super::loopback::tests::get;
 use super::secrets::{MemorySlackVault, SlackSecretKey, SlackSecretVault};
-use super::session::{SlackDeps, SlackInbox};
+use super::session::{MAX_CHANNEL_PAGES, SlackDeps, SlackInbox};
 use crate::adapter::{
     AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, ProtocolAdapter,
     ProtocolId,
@@ -39,6 +39,8 @@ struct ApiState {
     identify_error: Option<SlackApiError>,
     pages: Vec<SlackChannelPage>,
     list_error: Option<SlackApiError>,
+    /// Every list call returns another cursor. Used to prove the page cap.
+    list_forever: bool,
     history: HashMap<String, Vec<SlackPost>>,
     history_error: Option<SlackApiError>,
     post_error: Option<SlackApiError>,
@@ -160,6 +162,12 @@ impl SlackWebApi for FakeApi {
             ));
             if let Some(error) = state.list_error.clone() {
                 return Err(error);
+            }
+            if state.list_forever {
+                return Ok(SlackChannelPage {
+                    channels: vec![channel("C9", "extra", SlackChannelKind::Public, true)],
+                    next_cursor: Some("again".into()),
+                });
             }
             let index = usize::from(cursor.is_some());
             Ok(state.pages.get(index).cloned().unwrap_or_default())
@@ -510,17 +518,13 @@ async fn channel_list_pages_skip_non_member_channels_and_name_dms() {
     h.start();
     h.status(AdapterStatus::Ready).await;
     h.conversation("slack:C1").await;
-
-    h.send(AdapterCommand::LoadChats {
-        protocol: ProtocolId::Slack,
-    });
     let dm = h.conversation("slack:D1").await;
     assert_eq!(dm.title, "Ana");
     assert_eq!(dm.participant, "direct message");
     let group = h.conversation("slack:G1").await;
     assert_eq!(group.title, "ana, bo");
 
-    // The last page was loaded; another LoadChats does not call Slack again.
+    // Connect already walked every page. Another LoadChats does not call Slack.
     h.send(AdapterCommand::LoadChats {
         protocol: ProtocolId::Slack,
     });
@@ -546,6 +550,45 @@ async fn channel_list_pages_skip_non_member_channels_and_name_dms() {
         h.browser.last().is_none(),
         "a stored token must not reinstall"
     );
+}
+
+#[tokio::test]
+async fn channel_list_stops_at_the_page_cap() {
+    let api = FakeApi::workspace();
+    api.with(|state| state.list_forever = true);
+    let mut h = Harness::new(api, installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    let mut pages = 0usize;
+    while pages < MAX_CHANNEL_PAGES as usize {
+        h.until("list page", |event| {
+            matches!(event, AdapterEvent::ConversationUpsert { .. })
+        })
+        .await;
+        pages += 1;
+    }
+    let lists = h
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("conversations.list"))
+        .count();
+    assert_eq!(lists, MAX_CHANNEL_PAGES as usize);
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    while pages < (MAX_CHANNEL_PAGES as usize) * 2 {
+        h.until("page after the cap", |event| {
+            matches!(event, AdapterEvent::ConversationUpsert { .. })
+        })
+        .await;
+        pages += 1;
+    }
+    let lists = h
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("conversations.list"))
+        .count();
+    assert_eq!(lists, (MAX_CHANNEL_PAGES as usize) * 2);
 }
 
 #[tokio::test]

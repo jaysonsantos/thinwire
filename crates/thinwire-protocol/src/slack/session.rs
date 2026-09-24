@@ -35,6 +35,11 @@ use crate::adapter::{
 /// Messages loaded when a channel opens.
 const HISTORY_LIMIT: u16 = 50;
 
+/// Pages of `conversations.list` fetched in one load. Each page is one Web API
+/// call, so the live client's rate control applies between them. A later
+/// `LoadChats` continues from the saved cursor when this cap stops the walk.
+pub(super) const MAX_CHANNEL_PAGES: u32 = 50;
+
 /// Time the workspace admin has to approve the install in the browser.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -543,44 +548,50 @@ where
             return;
         }
         let token = live.token.clone();
-        let cursor = live.next_cursor.clone();
-        let page = match self.deps.api.list_channels(&token, cursor).await {
-            Ok(page) => page,
-            Err(error) => {
-                self.api_failed(&error).await;
+        for _ in 0..MAX_CHANNEL_PAGES {
+            if self.live.as_ref().is_none_or(|live| live.list_done) {
                 return;
             }
-        };
-        if let Some(live) = &mut self.live {
-            live.next_cursor = page.next_cursor.filter(|cursor| !cursor.is_empty());
-            live.list_done = live.next_cursor.is_none();
-        }
-        for channel in page.channels {
-            if !channel.is_member {
-                continue;
-            }
-            let title = self.channel_title(&token, &channel).await;
-            let conversation = Conversation {
-                protocol: ProtocolId::Slack,
-                id: conversation_id(&channel.id),
-                title,
-                participant: participant(channel.kind).into(),
-                preview: String::new(),
-                unread: 0,
-                order: 0,
-                last_at: 0,
-                is_group: is_group(channel.kind),
+            let cursor = self.live.as_ref().and_then(|live| live.next_cursor.clone());
+            let page = match self.deps.api.list_channels(&token, cursor).await {
+                Ok(page) => page,
+                Err(error) => {
+                    self.api_failed(&error).await;
+                    return;
+                }
             };
-            if let Some(existing) = self.channels.get(&channel.id) {
-                // Keep live preview, unread, order, and time from Socket Mode.
-                let mut merged = conversation;
-                merged.preview.clone_from(&existing.preview);
-                merged.unread = existing.unread;
-                merged.order = existing.order;
-                merged.last_at = existing.last_at;
-                self.upsert(channel.id, merged);
-            } else {
-                self.upsert(channel.id, conversation);
+            let next = page.next_cursor.filter(|cursor| !cursor.is_empty());
+            if let Some(live) = &mut self.live {
+                live.next_cursor.clone_from(&next);
+                live.list_done = next.is_none();
+            }
+            for channel in page.channels {
+                if !channel.is_member {
+                    continue;
+                }
+                let title = self.channel_title(&token, &channel).await;
+                let conversation = Conversation {
+                    protocol: ProtocolId::Slack,
+                    id: conversation_id(&channel.id),
+                    title,
+                    participant: participant(channel.kind).into(),
+                    preview: String::new(),
+                    unread: 0,
+                    order: 0,
+                    last_at: 0,
+                    is_group: is_group(channel.kind),
+                };
+                if let Some(existing) = self.channels.get(&channel.id) {
+                    // Keep live preview, unread, order, and time from Socket Mode.
+                    let mut merged = conversation;
+                    merged.preview.clone_from(&existing.preview);
+                    merged.unread = existing.unread;
+                    merged.order = existing.order;
+                    merged.last_at = existing.last_at;
+                    self.upsert(channel.id, merged);
+                } else {
+                    self.upsert(channel.id, conversation);
+                }
             }
         }
     }
