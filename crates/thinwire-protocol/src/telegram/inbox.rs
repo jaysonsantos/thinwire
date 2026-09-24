@@ -16,6 +16,9 @@ pub(super) const MAIN_CHAT_LIMIT: i32 = 30;
 /// Page size passed to TDLib `getChatHistory`.
 pub(super) const HISTORY_LIMIT: i32 = 40;
 
+/// Page size for older messages (scroll up in a chat).
+pub(super) const OLDER_PAGE_LIMIT: i32 = 50;
+
 /// TDLib uses 404 when `loadChats` has already reached the end of the list.
 pub(super) const END_OF_CHAT_LIST: i32 = 404;
 
@@ -256,6 +259,129 @@ pub(super) fn parse_message_id(message_id: &str) -> Option<(i64, i64)> {
         return None;
     }
     Some((chat.parse().ok()?, message.parse().ok()?))
+}
+
+/// What the worker does with a request for older messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OlderStep {
+    /// Ask TDLib for the page before this message.
+    Fetch,
+    /// An earlier empty page reached the start of the chat: no TDLib call.
+    AtStart,
+    /// The same anchor was already served: no second TDLib call.
+    Repeat,
+}
+
+/// Per-chat state of older-history requests: the start of the chat once an
+/// empty page came, and the last anchor served. The worker runs one TDLib
+/// call at a time, so this gate only drops repeats and ends at the start.
+#[derive(Debug, Default)]
+pub(super) struct OlderHistory {
+    at_start: HashMap<i64, bool>,
+    last_anchor: HashMap<i64, i64>,
+}
+
+impl OlderHistory {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn begin(&self, chat_id: i64, before: i64) -> OlderStep {
+        if self.at_start.get(&chat_id).copied().unwrap_or(false) {
+            return OlderStep::AtStart;
+        }
+        if self.last_anchor.get(&chat_id) == Some(&before) {
+            return OlderStep::Repeat;
+        }
+        OlderStep::Fetch
+    }
+
+    /// Record a fetched page. Returns `more`. Only an empty TDLib page marks
+    /// the start of the chat. A page with only the anchor records nothing, so
+    /// a later request for the same anchor can try again (PR #52 review).
+    pub(super) fn finish(&mut self, chat_id: i64, before: i64, page: PageOutcome) -> bool {
+        match page {
+            PageOutcome::Older(_) => {
+                self.last_anchor.insert(chat_id, before);
+                self.at_start.insert(chat_id, false);
+                true
+            }
+            PageOutcome::Empty => {
+                self.last_anchor.insert(chat_id, before);
+                self.at_start.insert(chat_id, true);
+                false
+            }
+            PageOutcome::OnlyAnchor => true,
+        }
+    }
+
+    /// Drop the pagination state of a chat that left the main list. Its cached
+    /// messages go away too, so a later load must not reuse an old anchor or
+    /// an old start-of-chat mark (PR #52 review).
+    pub(super) fn forget(&mut self, chat_id: i64) {
+        self.at_start.remove(&chat_id);
+        self.last_anchor.remove(&chat_id);
+    }
+
+    /// Messages of this chat were deleted. If they were the whole last page,
+    /// the oldest shown message is the old anchor again. Clear the repeat
+    /// gate so that request fetches (PR #52 review). The start-of-chat mark
+    /// stays: a delete adds no older message.
+    pub(super) fn messages_deleted(&mut self, chat_id: i64) {
+        self.last_anchor.remove(&chat_id);
+    }
+
+    /// Forget a chat when `effect` removes it from the list.
+    pub(super) fn follow(&mut self, effect: Option<&ChatEffect>) {
+        if let Some(ChatEffect::Remove(id)) = effect
+            && let Some(chat_id) = parse_telegram_chat_id(id)
+        {
+            self.forget(chat_id);
+        }
+    }
+
+    /// `more` for an answer without a TDLib call.
+    #[must_use]
+    pub(super) fn more(&self, chat_id: i64) -> bool {
+        !self.at_start.get(&chat_id).copied().unwrap_or(false)
+    }
+}
+
+/// What one TDLib history page held, relative to the anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PageOutcome {
+    /// This many messages older than the anchor.
+    Older(usize),
+    /// Only the anchor itself (TDLib can return a short page before it has
+    /// the older ones): nothing new yet, retryable. Not the start of the chat.
+    OnlyAnchor,
+    /// TDLib returned no message at all: the start of the chat.
+    Empty,
+}
+
+/// Classify a page by its raw size (before the anchor is removed) and the
+/// number of messages older than the anchor.
+#[must_use]
+pub(super) const fn page_outcome(raw_len: usize, older_len: usize) -> PageOutcome {
+    if older_len > 0 {
+        PageOutcome::Older(older_len)
+    } else if raw_len == 0 {
+        PageOutcome::Empty
+    } else {
+        PageOutcome::OnlyAnchor
+    }
+}
+
+/// Keep only messages older than the anchor, oldest first. TDLib may return
+/// the anchor itself; it is already on screen.
+#[must_use]
+pub(super) fn older_than<T>(newest_first: Vec<T>, before: i64, id: impl Fn(&T) -> i64) -> Vec<T> {
+    let mut older: Vec<T> = newest_first
+        .into_iter()
+        .filter(|item| id(item) < before)
+        .collect();
+    older.reverse();
+    older
 }
 
 #[must_use]
@@ -549,6 +675,123 @@ mod tests {
         assert_eq!(parse_message_id("telegram:9"), None);
         assert_eq!(parse_message_id("telegram:+9:4"), None);
         assert_eq!(parse_message_id("slack:9:4"), None);
+    }
+
+    #[test]
+    fn older_pages_merge_oldest_first_and_stop_at_the_start() {
+        // TDLib gives newest first and can include the anchor (id 50).
+        let page = older_than(vec![50, 49, 48, 47], 50, |id| *id);
+        assert_eq!(page, vec![47, 48, 49], "oldest first, anchor dropped");
+        assert_eq!(OLDER_PAGE_LIMIT, 50);
+
+        let mut gate = OlderHistory::new();
+        assert_eq!(gate.begin(1, 50), OlderStep::Fetch);
+        assert!(
+            gate.finish(1, 50, page_outcome(4, page.len())),
+            "more can load"
+        );
+        assert_eq!(
+            gate.begin(1, 50),
+            OlderStep::Repeat,
+            "the same anchor is not fetched twice"
+        );
+        assert_eq!(gate.begin(1, 47), OlderStep::Fetch, "the next page");
+        assert!(
+            !gate.finish(1, 47, page_outcome(0, 0)),
+            "an empty page is the start of the chat"
+        );
+        assert_eq!(gate.begin(1, 12), OlderStep::AtStart);
+        assert!(!gate.more(1));
+        assert_eq!(
+            gate.begin(2, 9),
+            OlderStep::Fetch,
+            "other chats are separate"
+        );
+        assert!(gate.more(2));
+    }
+
+    #[test]
+    fn an_anchor_only_page_is_retryable_not_the_start_of_the_chat() {
+        // TDLib returned a short page that holds only the anchor (id 50).
+        let page = older_than(vec![50], 50, |id| *id);
+        assert!(page.is_empty());
+        let outcome = page_outcome(1, page.len());
+        assert_eq!(outcome, PageOutcome::OnlyAnchor);
+
+        let mut gate = OlderHistory::new();
+        assert_eq!(gate.begin(1, 50), OlderStep::Fetch);
+        assert!(gate.finish(1, 50, outcome), "more = true: nothing new yet");
+        assert!(gate.more(1));
+        assert_eq!(
+            gate.begin(1, 50),
+            OlderStep::Fetch,
+            "the same anchor can be asked again later"
+        );
+        assert!(
+            gate.finish(1, 50, page_outcome(3, 2)),
+            "then the older page comes"
+        );
+        assert_eq!(page_outcome(0, 0), PageOutcome::Empty);
+        assert!(
+            !gate.finish(1, 48, PageOutcome::Empty),
+            "only an empty page ends it"
+        );
+        assert_eq!(gate.begin(1, 10), OlderStep::AtStart);
+    }
+
+    #[test]
+    fn a_chat_that_leaves_the_main_list_loses_its_older_history_state() {
+        let mut directory = ChatDirectory::new();
+        directory.upsert(3, seed("Ada", 9, 0, ""));
+        let mut gate = OlderHistory::new();
+        assert!(gate.finish(3, 50, PageOutcome::Older(2)));
+        assert!(!gate.finish(3, 20, PageOutcome::Empty));
+        assert!(gate.finish(4, 70, PageOutcome::Older(1)));
+        assert_eq!(gate.begin(3, 20), OlderStep::AtStart);
+
+        // Archived: the chat and its cached messages leave the inbox.
+        let removed = directory.set_main_order(3, 0);
+        assert!(matches!(removed, Some(ChatEffect::Remove(_))));
+        gate.follow(removed.as_ref());
+        assert!(gate.more(3), "no stale start-of-chat mark");
+        assert_eq!(gate.begin(3, 20), OlderStep::Fetch);
+        assert_eq!(gate.begin(3, 50), OlderStep::Fetch, "no stale anchor");
+        assert_eq!(
+            gate.begin(4, 70),
+            OlderStep::Repeat,
+            "other chats keep theirs"
+        );
+
+        // An update that keeps the chat listed forgets nothing.
+        let mut gate = OlderHistory::new();
+        assert!(gate.finish(3, 50, PageOutcome::Older(2)));
+        let kept = directory.set_main_order(3, 5);
+        assert!(matches!(kept, Some(ChatEffect::Upsert(_))));
+        gate.follow(kept.as_ref());
+        gate.follow(None);
+        assert_eq!(gate.begin(3, 50), OlderStep::Repeat);
+    }
+
+    #[test]
+    fn a_deleted_last_page_does_not_consume_its_anchor() {
+        let mut gate = OlderHistory::new();
+        // Anchor 50 loaded 47..=49; then all three are deleted, so the UI
+        // asks again from 50.
+        assert!(gate.finish(1, 50, PageOutcome::Older(3)));
+        assert!(gate.finish(2, 80, PageOutcome::Older(1)));
+        assert_eq!(gate.begin(1, 50), OlderStep::Repeat);
+        gate.messages_deleted(1);
+        assert_eq!(gate.begin(1, 50), OlderStep::Fetch, "not consumed");
+        assert_eq!(
+            gate.begin(2, 80),
+            OlderStep::Repeat,
+            "other chats keep theirs"
+        );
+
+        // The start of the chat stays the start.
+        assert!(!gate.finish(1, 50, PageOutcome::Empty));
+        gate.messages_deleted(1);
+        assert_eq!(gate.begin(1, 50), OlderStep::AtStart);
     }
 
     #[test]

@@ -233,6 +233,13 @@ pub enum AdapterCommand {
     Shutdown {
         protocol: ProtocolId,
     },
+    /// Load one page of messages older than `before_message_id` (the oldest
+    /// message the UI has for this chat). Ids are not secrets.
+    LoadOlderMessages {
+        protocol: ProtocolId,
+        conversation_id: String,
+        before_message_id: String,
+    },
     /// Send a failed outgoing message again. Ids are not secrets.
     ResendMessage {
         protocol: ProtocolId,
@@ -266,6 +273,7 @@ impl AdapterCommand {
             | Self::LoadChats { protocol }
             | Self::OpenChat { protocol, .. }
             | Self::Shutdown { protocol }
+            | Self::LoadOlderMessages { protocol, .. }
             | Self::SendText { protocol, .. }
             | Self::ResendMessage { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
@@ -378,6 +386,15 @@ pub enum AdapterEvent {
     ChatListLoaded {
         protocol: ProtocolId,
     },
+    /// A request for older messages ended. The older messages came before this
+    /// event as `MessageReceived`. `more == false` means the start of the chat
+    /// (or no more can load now): the UI stops asking.
+    OlderHistoryLoaded {
+        protocol: ProtocolId,
+        conversation_id: String,
+        before_message_id: String,
+        more: bool,
+    },
     /// A history load for one chat ended. The UI stops "Loading messages…".
     HistoryLoaded {
         protocol: ProtocolId,
@@ -416,7 +433,8 @@ impl AdapterEvent {
             | Self::SendRejected { protocol, .. }
             | Self::MessageDelivery { protocol, .. }
             | Self::ChatListLoaded { protocol }
-            | Self::HistoryLoaded { protocol, .. } => Some(*protocol),
+            | Self::HistoryLoaded { protocol, .. }
+            | Self::OlderHistoryLoaded { protocol, .. } => Some(*protocol),
             _ => None,
         }
     }
@@ -670,6 +688,21 @@ pub(crate) fn emit_send_rejected(
 
 pub(crate) fn emit_stopped(events: &EventTx, protocol: ProtocolId) {
     let _ = events.send(AdapterEvent::Stopped { protocol });
+}
+
+pub(crate) fn emit_older_history_loaded(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    before_message_id: impl Into<String>,
+    more: bool,
+) {
+    let _ = events.send(AdapterEvent::OlderHistoryLoaded {
+        protocol,
+        conversation_id: conversation_id.into(),
+        before_message_id: before_message_id.into(),
+        more,
+    });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
