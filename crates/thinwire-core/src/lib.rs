@@ -41,4 +41,21 @@ mod tests {
             );
         }
     }
+
+    /// The dependency check runs in public CI, so it must not turn on
+    /// `telegram-tdlib` (TDLib download). It keeps the GUI assertion.
+    #[test]
+    fn dependency_check_stays_on_default_features() {
+        let script = include_str!("../../../scripts/check-core-deps.sh");
+        let command = script
+            .lines()
+            .find(|line| line.contains("cargo tree"))
+            .expect("cargo tree call");
+        assert!(!command.contains("--all-features"));
+        assert!(!command.contains("--features"));
+        assert!(!command.contains("telegram-tdlib"));
+        for name in ["egui", "eframe", "winit"] {
+            assert!(script.contains(name), "the check still rejects {name}");
+        }
+    }
 }
