@@ -2,12 +2,14 @@
 //!
 //! `Bot` runs on a tokio task. The egui thread never calls into this module.
 //! QR payloads and pair codes are events, not command fields, and are not logged.
+//!
+//! Registration and shutdown share [`super::gate::LinkGate`]. A close that
+//! lands after `spawn` and before `publish` waits. It does not report the
+//! link idle and then let this task install the bot.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust::store::SqliteStore;
@@ -25,43 +27,50 @@ const BUILD_FAILED: &str =
     "WhatsApp pairing client could not be built. No session material was logged.";
 
 pub(super) struct LiveLink {
-    generation: AtomicU64,
-    active: AtomicBool,
-    handle: Mutex<Option<whatsapp_rust::bot::BotHandle>>,
+    gate: super::gate::LinkGate<whatsapp_rust::bot::BotHandle>,
 }
 
 impl LiveLink {
     pub(super) fn new() -> Self {
         Self {
-            generation: AtomicU64::new(0),
-            active: AtomicBool::new(false),
-            handle: Mutex::new(None),
+            gate: super::gate::LinkGate::new(),
         }
     }
 
     pub(super) fn next_generation(&self) -> u64 {
-        self.active.store(false, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        self.gate.next_generation()
     }
 
     pub(super) fn mark_active(&self) {
-        self.active.store(true, Ordering::SeqCst);
+        self.gate.mark_active();
     }
 
     pub(super) fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
+        self.gate.is_active()
     }
 
     fn is_current(&self, token: u64) -> bool {
-        self.generation.load(Ordering::SeqCst) == token
+        self.gate.is_current(token)
     }
 
+    /// Close the bot from an older generation, if one is still stored.
+    ///
+    /// Starts newer than the closing generation stay installed.
     pub(super) async fn shutdown(&self) {
-        self.active.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.handle.lock().await.take() {
+        if let Some(handle) = self.gate.shutdown().await {
             handle.shutdown().await;
         }
     }
+}
+
+enum Session {
+    /// Bot is stored. The flight is already over.
+    Started,
+    /// Bot was spawned after this generation closed. Still in flight until
+    /// the caller shuts it down and leaves.
+    Rejected(whatsapp_rust::bot::BotHandle),
+    /// No bot. Still in flight until the caller leaves.
+    Aborted,
 }
 
 pub(super) async fn run_link(
@@ -70,27 +79,44 @@ pub(super) async fn run_link(
     phone: Option<String>,
     events: EventTx,
 ) {
-    if !link.is_current(token) {
-        link.active.store(false, Ordering::SeqCst);
+    if !link.gate.enter(token).await {
+        link.gate.set_inactive();
         return;
     }
-    if let Some(previous) = link.handle.lock().await.take() {
+    match session(&link, token, phone, events).await {
+        Session::Started => {}
+        Session::Rejected(handle) => {
+            handle.shutdown().await;
+            link.gate.leave(token).await;
+            link.gate.set_inactive();
+        }
+        Session::Aborted => {
+            link.gate.leave(token).await;
+            link.gate.set_inactive();
+        }
+    }
+}
+
+async fn session(
+    link: &Arc<LiveLink>,
+    token: u64,
+    phone: Option<String>,
+    events: EventTx,
+) -> Session {
+    if let Some(previous) = link.gate.take_older(token).await {
         previous.shutdown().await;
     }
     if !link.is_current(token) {
-        link.active.store(false, Ordering::SeqCst);
-        return;
+        return Session::Aborted;
     }
 
     let Ok(path) = whatsapp_device_store_path() else {
         fail(&events, DATA_DIR_MISSING);
-        link.active.store(false, Ordering::SeqCst);
-        return;
+        return Session::Aborted;
     };
     let Some(parent) = path.parent().map(std::path::Path::to_path_buf) else {
         fail(&events, DATA_DIR_MISSING);
-        link.active.store(false, Ordering::SeqCst);
-        return;
+        return Session::Aborted;
     };
     let prepared = tokio::task::spawn_blocking(move || prepare_session_dir(&parent))
         .await
@@ -98,38 +124,33 @@ pub(super) async fn run_link(
         .and_then(Result::ok);
     if prepared.is_none() {
         fail(&events, STORE_FAILED);
-        link.active.store(false, Ordering::SeqCst);
-        return;
+        return Session::Aborted;
     }
     let Some(db) = path.to_str() else {
         fail(&events, STORE_FAILED);
-        link.active.store(false, Ordering::SeqCst);
-        return;
+        return Session::Aborted;
     };
     if !link.is_current(token) {
-        link.active.store(false, Ordering::SeqCst);
-        return;
+        return Session::Aborted;
     }
 
     let backend = match SqliteStore::new(db).await {
         Ok(backend) => backend,
         Err(_) => {
             fail(&events, STORE_FAILED);
-            link.active.store(false, Ordering::SeqCst);
-            return;
+            return Session::Aborted;
         }
     };
     let _ = restrict_store_file(&path);
     if !link.is_current(token) {
-        link.active.store(false, Ordering::SeqCst);
-        return;
+        return Session::Aborted;
     }
 
     let bot = match build_bot(
         backend,
         digits_only(phone),
         events.clone(),
-        Arc::clone(&link),
+        Arc::clone(link),
         token,
     )
     .await
@@ -137,28 +158,28 @@ pub(super) async fn run_link(
         Ok(bot) => bot,
         Err(()) => {
             fail(&events, BUILD_FAILED);
-            link.active.store(false, Ordering::SeqCst);
-            return;
+            return Session::Aborted;
         }
     };
-    if !link.is_current(token) {
-        link.active.store(false, Ordering::SeqCst);
-        return;
-    }
 
     let handle = bot.spawn();
-    if !link.is_current(token) {
-        handle.shutdown().await;
-        link.active.store(false, Ordering::SeqCst);
-        return;
+    match link.gate.publish(token, handle).await {
+        Ok(previous) => {
+            if let Some(previous) = previous {
+                previous.shutdown().await;
+            }
+            if link.is_current(token) {
+                emit_status(
+                    &events,
+                    ProtocolId::WhatsApp,
+                    AdapterStatus::Connecting,
+                    "Experimental WhatsApp pairing is running on the worker. This is not a supported messenger.",
+                );
+            }
+            Session::Started
+        }
+        Err(handle) => Session::Rejected(handle),
     }
-    *link.handle.lock().await = Some(handle);
-    emit_status(
-        &events,
-        ProtocolId::WhatsApp,
-        AdapterStatus::Connecting,
-        "Experimental WhatsApp pairing is running on the worker. This is not a supported messenger.",
-    );
 }
 
 fn fail(events: &EventTx, detail: &str) {

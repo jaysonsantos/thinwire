@@ -1,10 +1,13 @@
 //! Test double used to prove workers push events without calling UI APIs.
 
 use super::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
     ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
     emit_message, emit_status,
 };
+
+/// Fixed send time for fake messages: 2026-01-02 03:04:05 UTC.
+const FAKE_SENT_AT: i64 = 1_767_323_045;
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Telegram,
@@ -67,6 +70,8 @@ impl ProtocolAdapter for FakeAdapter {
                         preview: "Pushed from the worker.".into(),
                         unread: 0,
                         order: 0,
+                        last_at: FAKE_SENT_AT,
+                        is_group: false,
                     },
                 );
                 emit_message(
@@ -78,6 +83,8 @@ impl ProtocolAdapter for FakeAdapter {
                         sender: "worker".into(),
                         body: "event from tokio worker".into(),
                         outbound: false,
+                        delivery: Delivery::Sent,
+                        sent_at: FAKE_SENT_AT,
                     },
                 );
                 Ok(())

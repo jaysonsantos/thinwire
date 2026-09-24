@@ -1,19 +1,50 @@
 //! Shell: account switcher + inbox on the left, thread in the center.
 
+use std::time::Instant;
+
+use chrono::Local;
 use eframe::egui::{self, Color32, RichText};
-use thinwire_protocol::{ProtocolId, SupportClass};
+use thinwire_protocol::{Delivery, ProtocolId, SupportClass};
 
 use thinwire_protocol::WhatsAppPhoneVault;
 
 use super::auth;
-use super::secrets::SecretStore;
+use super::secrets::{Persistence, SecretStore};
 use super::settings::{Settings, ThemeMode};
-use super::snapshot::{AccountRow, InboxFilter, Snapshot};
+use super::snapshot::{
+    AccountRow, AuthKey, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
+    RESUME_CONNECTING, Snapshot, ThreadState,
+};
+use super::thread_layout::{RowLayout, list_time, thread_rows};
 
 const SUPPORTED: Color32 = Color32::from_rgb(96, 176, 128);
 const EXPERIMENTAL: Color32 = Color32::from_rgb(214, 160, 64);
 const CONSTRAINED: Color32 = Color32::from_rgb(196, 148, 88);
 const MUTED: Color32 = Color32::from_rgb(160, 160, 168);
+const WARN: Color32 = Color32::from_rgb(214, 160, 64);
+
+/// Shown while the OS keychain is not available. Secrets stay in memory.
+pub(crate) const KEYCHAIN_UNAVAILABLE_NOTICE: &str =
+    "Sign-in is not saved on this device: keychain unavailable.";
+
+/// Shown when only the kernel keyring works. It is lost at restart.
+pub(crate) const KEYCHAIN_UNTIL_RESTART_NOTICE: &str =
+    "Sign-in is kept until you restart the computer.";
+
+/// One notice for the whole window. `None` while the keychain loads or keeps
+/// the sign-in across restarts.
+#[must_use]
+pub(crate) fn keychain_notice(secrets: &SecretStore) -> Option<&'static str> {
+    match secrets.persistence() {
+        Persistence::ThisSession => Some(KEYCHAIN_UNAVAILABLE_NOTICE),
+        Persistence::UntilRestart => Some(KEYCHAIN_UNTIL_RESTART_NOTICE),
+        Persistence::Loading | Persistence::Saved => None,
+    }
+}
+const FAILED: Color32 = Color32::from_rgb(200, 80, 80);
+const COMPOSE_MAX_ROWS: usize = 5;
+/// A message bubble uses at most this share of the thread width.
+const BUBBLE_WIDTH: f32 = 0.75;
 
 pub(crate) fn draw(
     ui: &mut egui::Ui,
@@ -65,10 +96,12 @@ fn top_bar(
             if ui.button("Refresh").clicked() {
                 snapshot.refresh_visible();
             }
-            if ui.button("Add account").clicked() {
+            // One Telegram account per build: no Add account once signed in (ux F8).
+            if snapshot.can_add_account() && ui.button("Add account").clicked() {
                 snapshot.open_add_account(secrets);
             }
-            if ui.button("Advanced").clicked() {
+            // The override applies to a new client only: hidden while signed in.
+            if snapshot.can_add_account() && ui.button("Advanced").clicked() {
                 snapshot.open_api_override(secrets);
             }
             ui.separator();
@@ -89,17 +122,18 @@ fn theme_control(ui: &mut egui::Ui, settings: &mut Settings) {
     }
 }
 
-fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+fn status_strip(ui: &mut egui::Ui, snapshot: &Snapshot, secrets: &SecretStore) {
     egui::Panel::top("status").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Status").strong());
+            // The login form has its own Cancel. One Cancel on screen only.
             ui.label(&snapshot.status_text);
-            if snapshot.auth != super::snapshot::AuthScreen::Idle && ui.button("Cancel").clicked() {
-                snapshot.cancel_auth(secrets);
-            }
         });
+        if let Some(notice) = keychain_notice(secrets) {
+            ui.colored_label(WARN, notice);
+        }
         if let Some(banner) = super::auth::stub_banner(snapshot) {
-            ui.colored_label(Color32::from_rgb(214, 160, 64), banner);
+            ui.colored_label(WARN, banner);
         }
         if let Some(error) = &snapshot.error {
             let happened = &error.happened;
@@ -156,7 +190,10 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
             ui.add_space(8.0);
             ui.heading("Inbox");
             ui.separator();
-            inbox(ui, snapshot);
+            egui::ScrollArea::vertical()
+                .id_salt("inbox")
+                .auto_shrink([false, false])
+                .show(ui, |ui| inbox(ui, snapshot));
         });
 }
 
@@ -193,7 +230,8 @@ fn account_chip(ui: &mut egui::Ui, account: &AccountRow, selected: bool, unread:
 }
 
 fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
-    let rows: Vec<(String, String, String, u32)> = snapshot
+    let now = Local::now();
+    let rows: Vec<(String, String, String, u32, String)> = snapshot
         .visible_conversations()
         .iter()
         .map(|row| {
@@ -202,28 +240,57 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 row.title.clone(),
                 row.preview.clone(),
                 row.unread,
+                list_time(row.last_at, &now),
             )
         })
         .collect();
 
-    if rows.is_empty() {
-        ui.label(
-            RichText::new("No conversations yet.")
-                .italics()
-                .color(MUTED),
-        );
-        return;
+    match snapshot.inbox_state() {
+        InboxState::Rows => {}
+        InboxState::Loading => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Loading chats…").color(MUTED));
+            });
+            return;
+        }
+        InboxState::Empty => {
+            ui.label(RichText::new("No chats.").italics().color(MUTED));
+            return;
+        }
+        InboxState::NoMatch => {
+            let query = snapshot.search.trim();
+            ui.label(
+                RichText::new(format!("No chats match '{query}'."))
+                    .italics()
+                    .color(MUTED),
+            );
+            return;
+        }
     }
 
+    let scroll_to_selected = snapshot.take_scroll_to_selected();
     let mut clicked: Option<String> = None;
-    for (id, title, preview, unread) in rows {
+    for (id, title, preview, unread, time) in rows {
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
         let label = if unread == 0 {
             title
         } else {
             format!("{title}  ({unread})")
         };
-        if ui.selectable_label(selected, label).clicked() {
+        let response = ui
+            .horizontal(|ui| {
+                let response = ui.selectable_label(selected, label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(time).small().color(MUTED));
+                });
+                response
+            })
+            .inner;
+        if selected && scroll_to_selected {
+            response.scroll_to_me(None);
+        }
+        if response.clicked() {
             clicked = Some(id);
         }
         ui.label(RichText::new(preview).small().weak());
@@ -235,17 +302,51 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
 
 fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
     egui::CentralPanel::default().show(ui, |ui| {
-        if snapshot.auth != super::snapshot::AuthScreen::Idle {
-            auth::draw(ui, snapshot, secrets);
-            return;
+        // Keys first, before a text field can take Enter. One press, one action.
+        let (enter, escape) = ui.input(|input| {
+            (
+                input.key_pressed(egui::Key::Enter),
+                input.key_pressed(egui::Key::Escape),
+            )
+        });
+        if escape {
+            snapshot.center_key(AuthKey::Escape, secrets);
+        } else if enter {
+            snapshot.center_key(AuthKey::Enter, secrets);
         }
-
-        if !snapshot.has_primary_account() {
-            first_run(ui, snapshot, secrets);
-            return;
+        match snapshot.center_view() {
+            CenterView::Auth => auth::draw(ui, snapshot, secrets),
+            CenterView::Resuming { connecting } => resuming(ui, snapshot, connecting),
+            CenterView::FirstRun => first_run(ui, snapshot, secrets),
+            CenterView::KeychainFailed => keychain_failed(ui, snapshot),
+            CenterView::Thread => thread(ui, snapshot),
         }
+    });
+}
 
-        thread(ui, snapshot);
+fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, connecting: bool) {
+    let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
+    ui.add_space(top);
+    ui.vertical_centered(|ui| {
+        ui.spinner();
+        ui.add_space(8.0);
+        if connecting {
+            ui.label(RESUME_CONNECTING);
+        } else {
+            ui.label(snapshot.keychain_wait_text(Instant::now()));
+        }
+    });
+}
+
+fn keychain_failed(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+    let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
+    ui.add_space(top);
+    ui.vertical_centered(|ui| {
+        ui.colored_label(WARN, KEYCHAIN_READ_FAILED);
+        ui.add_space(12.0);
+        if ui.button("Try again").clicked() {
+            snapshot.retry_keychain();
+        }
     });
 }
 
@@ -285,49 +386,167 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     }
     ui.separator();
 
-    let messages: Vec<(bool, String, String)> = snapshot
+    let is_group = snapshot
+        .selected_conversation_row()
+        .is_some_and(|row| row.is_group);
+    let layout = thread_rows(snapshot.selected_messages(), is_group, &Local::now());
+    let messages: Vec<Bubble> = snapshot
         .selected_messages()
         .iter()
-        .map(|message| {
-            (
-                message.outbound,
-                message.sender.clone(),
-                message.body.clone(),
-            )
+        .zip(layout)
+        .map(|(message, layout)| Bubble {
+            id: message.id.clone(),
+            outbound: message.outbound,
+            sender: message.sender.clone(),
+            body: message.body.clone(),
+            delivery: message.delivery,
+            layout,
         })
         .collect();
 
+    // Compose grows to COMPOSE_MAX_ROWS lines, then scrolls. Reserve its height.
+    let row_height = ui.text_style_height(&egui::TextStyle::Body);
+    let compose_rows = snapshot.compose.lines().count().clamp(1, COMPOSE_MAX_ROWS);
+    let compose_height = row_height * COMPOSE_MAX_ROWS as f32;
+    let reserve = row_height * compose_rows as f32 + 32.0;
+
+    let state = snapshot.thread_state();
+    let mut retry: Option<String> = None;
+    // One scroll state per chat, so each chat opens at its newest message.
+    let salt = snapshot.selected_conversation.clone().unwrap_or_default();
     egui::ScrollArea::vertical()
+        .id_salt(("thread", salt))
         .auto_shrink([false, true])
-        .max_height(ui.available_height() - 48.0)
+        .stick_to_bottom(true)
+        .max_height(ui.available_height() - reserve)
         .show(ui, |ui| {
-            if messages.is_empty() {
-                ui.label(
-                    RichText::new(
-                        "No messages yet. Select a Telegram chat to load recent messages.",
-                    )
-                    .italics()
-                    .color(MUTED),
-                );
+            match state {
+                ThreadState::Loading => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Loading messages…").color(MUTED));
+                    });
+                }
+                ThreadState::Empty => {
+                    ui.label(
+                        RichText::new("No messages in this chat.")
+                            .italics()
+                            .color(MUTED),
+                    );
+                }
+                ThreadState::NoSelection | ThreadState::Rows => {}
             }
-            for (outbound, sender, body) in messages {
-                ui.group(|ui| {
-                    let who = if outbound { "you" } else { sender.as_str() };
-                    ui.strong(who);
-                    ui.label(body);
-                });
-                ui.add_space(4.0);
+            for message in &messages {
+                bubble(ui, message, &mut retry);
             }
         });
+    if let Some(id) = retry {
+        snapshot.retry_send(&id);
+    }
 
     ui.separator();
+    compose(ui, snapshot, compose_height);
+}
+
+/// One message row, ready to draw.
+struct Bubble {
+    id: String,
+    outbound: bool,
+    sender: String,
+    body: String,
+    delivery: Delivery,
+    layout: RowLayout,
+}
+
+/// Own messages sit on the right in the theme selection color. Others sit
+/// on the left. Both follow the light or dark theme.
+fn bubble(ui: &mut egui::Ui, message: &Bubble, retry: &mut Option<String>) {
+    if let Some(day) = &message.layout.day_break {
+        ui.add_space(6.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(day).small().color(MUTED));
+        });
+        ui.add_space(2.0);
+    }
+    let max_width = ui.available_width() * BUBBLE_WIDTH;
+    let (align, fill) = if message.outbound {
+        (egui::Align::Max, ui.visuals().selection.bg_fill)
+    } else {
+        (egui::Align::Min, ui.visuals().widgets.inactive.weak_bg_fill)
+    };
+    ui.with_layout(egui::Layout::top_down(align), |ui| {
+        egui::Frame::new()
+            .fill(fill)
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_max_width(max_width);
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    if message.layout.show_sender {
+                        ui.label(RichText::new(&message.sender).small().strong());
+                    }
+                    ui.add(egui::Label::new(&message.body).selectable(true).wrap());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&message.layout.time).small().color(MUTED));
+                        match message.delivery {
+                            Delivery::Sent => {}
+                            Delivery::Pending => {
+                                ui.label(RichText::new("Sending…").small().color(MUTED));
+                            }
+                            Delivery::Failed => {
+                                ui.colored_label(FAILED, RichText::new("Not sent").small());
+                                if ui.small_button("Retry").clicked() {
+                                    *retry = Some(message.id.clone());
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+    });
+    ui.add_space(4.0);
+}
+
+/// Multiline compose. Enter sends; Shift+Enter adds a line.
+fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
+    let compose_id = egui::Id::new("thread-compose");
+    if snapshot.take_focus_compose() {
+        ui.memory_mut(|memory| memory.request_focus(compose_id));
+    }
+    if ui.memory(|memory| memory.has_focus(compose_id)) {
+        let (enter, shift, other) = ui.input(|input| {
+            let modifiers = input.modifiers;
+            (
+                input.key_pressed(egui::Key::Enter),
+                modifiers.shift,
+                modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd,
+            )
+        });
+        // Eat plain Enter before the text field sees it, so it does not add a line.
+        if enter && !other && snapshot.compose_enter(shift) {
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        }
+    }
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut snapshot.compose)
-                .desired_width(ui.available_width() - 72.0)
-                .hint_text("Message"),
-        );
-        if ui.button("Send").clicked() {
+        let width = ui.available_width() - 72.0;
+        egui::ScrollArea::vertical()
+            .id_salt("thread-compose-scroll")
+            .max_height(max_height)
+            .max_width(width)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut snapshot.compose)
+                        .id(compose_id)
+                        .desired_rows(1)
+                        .desired_width(width)
+                        .hint_text("Message"),
+                );
+            });
+        if ui
+            .add_enabled(snapshot.can_send(), egui::Button::new("Send"))
+            .clicked()
+        {
             snapshot.send_compose();
         }
     });

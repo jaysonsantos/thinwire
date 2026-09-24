@@ -108,6 +108,8 @@ pub enum TelegramAuthStep {
     ApiCredentials,
     Phone,
     Code,
+    /// Ask Telegram for a new login code (TDLib `resendAuthenticationCode`).
+    ResendCode,
     TwoFactor,
     Complete,
 }
@@ -119,9 +121,51 @@ impl TelegramAuthStep {
             Self::ApiCredentials => "api credentials",
             Self::Phone => "phone",
             Self::Code => "code",
+            Self::ResendCode => "resend code",
             Self::TwoFactor => "2fa",
             Self::Complete => "complete",
         }
+    }
+}
+
+/// Why Telegram refused a login step. Holds an error name or number only,
+/// never a value the user typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramAuthError {
+    PhoneInvalid,
+    CodeInvalid,
+    CodeExpired,
+    PasswordInvalid,
+    /// Too many tries. Telegram asks the client to wait this long.
+    FloodWait {
+        seconds: u32,
+    },
+    /// TDLib refused `setTdlibParameters`, so no login step can run.
+    ClientSetup {
+        code: i32,
+    },
+    /// Any other error. Only the numeric code crosses the channel.
+    Other {
+        code: i32,
+    },
+}
+
+/// How Telegram delivered the login code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramCodeVia {
+    TelegramApp,
+    Sms,
+    /// SMS with a word or a phrase, not digits.
+    SmsWord,
+    Call,
+    Other,
+}
+
+impl TelegramCodeVia {
+    /// `false` for a word or phrase code: the code field must keep letters.
+    #[must_use]
+    pub const fn digits_only(self) -> bool {
+        !matches!(self, Self::SmsWord)
     }
 }
 
@@ -176,11 +220,23 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         conversation_id: String,
     },
+    /// The app is closing. Close every client cleanly, then send `Stopped`.
+    Shutdown {
+        protocol: ProtocolId,
+    },
+    /// Send a failed outgoing message again. Ids are not secrets.
+    ResendMessage {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+    },
     /// Send plain text. The body is the user's message, never a credential.
+    /// `request` is a local id; a rejection names it in `SendRejected`.
     SendText {
         protocol: ProtocolId,
         conversation_id: String,
         body: String,
+        request: u64,
     },
     /// Records that the full-screen WhatsApp ban gate was accepted.
     /// Carries no secrets and does not open a network session.
@@ -200,7 +256,9 @@ impl AdapterCommand {
             | Self::Disconnect { protocol }
             | Self::LoadChats { protocol }
             | Self::OpenChat { protocol, .. }
-            | Self::SendText { protocol, .. } => protocol,
+            | Self::Shutdown { protocol }
+            | Self::SendText { protocol, .. }
+            | Self::ResendMessage { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
             Self::WhatsAppAcknowledgeRisk | Self::WhatsAppBeginLink | Self::WhatsAppCancelLink => {
@@ -227,6 +285,24 @@ pub enum AdapterEvent {
     /// Telegram login state machine. The UI applies this on the next poll.
     TelegramAuth {
         phase: TelegramAuthPhase,
+    },
+    /// Telegram refused the last login step. Sent just before the `Failed` phase.
+    TelegramAuthRejected {
+        error: TelegramAuthError,
+    },
+    /// The old Telegram data folder could not open (its key was lost). It was
+    /// moved aside, and a fresh login follows. Carries no path or value.
+    TelegramDataReset {
+        /// Name of the moved-aside folder, for example `tdlib.stale-1790000000`.
+        /// A file name only, never a path.
+        moved_to: String,
+    },
+    /// A live session ended without a request from this app (remote logout,
+    /// or the session was revoked). The client closes; a new login follows.
+    TelegramSessionEnded,
+    /// Telegram sent a login code. Sent just before the `NeedCode` phase.
+    TelegramCodeSent {
+        via: TelegramCodeVia,
     },
     /// Ask the UI to flush persistent vault keys to the OS keychain.
     /// Never carries secret values.
@@ -255,6 +331,41 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         conversation_id: String,
         message_ids: Vec<String>,
+    },
+    /// The adapter accepted this send: its pending message exists. Only this
+    /// event clears the draft; a history message with the same text does not.
+    SendAccepted {
+        protocol: ProtocolId,
+        conversation_id: String,
+        request: u64,
+    },
+    /// The adapter did not accept this send (no pending message exists). Only
+    /// this event fails the send; other errors leave it pending.
+    SendRejected {
+        protocol: ProtocolId,
+        conversation_id: String,
+        request: u64,
+    },
+    /// Every client of this protocol closed after `Shutdown`. The app may exit.
+    Stopped {
+        protocol: ProtocolId,
+    },
+    /// New delivery state for a message already in the thread.
+    MessageDelivery {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        delivery: Delivery,
+    },
+    /// A chat-list page load ended (loaded, already complete, or failed).
+    /// The UI stops its "Loading chats…" state.
+    ChatListLoaded {
+        protocol: ProtocolId,
+    },
+    /// A history load for one chat ended. The UI stops "Loading messages…".
+    HistoryLoaded {
+        protocol: ProtocolId,
+        conversation_id: String,
     },
     /// Experimental WhatsApp QR payload. Debug output is redacted.
     /// Never log [`RedactedPairingSecret::reveal`].
@@ -312,6 +423,21 @@ pub struct Conversation {
     pub unread: u32,
     /// TDLib main-list order. Higher sorts first. Zero means unordered.
     pub order: i64,
+    /// Unix seconds of the last message. Zero when unknown.
+    pub last_at: i64,
+    /// Group chat: the thread names each run of senders.
+    pub is_group: bool,
+}
+
+/// Delivery of an outgoing message. Incoming messages are always `Sent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Delivery {
+    #[default]
+    Sent,
+    /// Queued on the client. The server has not confirmed it yet.
+    Pending,
+    /// The server did not accept it. The user can retry.
+    Failed,
 }
 
 /// Message shown in the right pane.
@@ -323,6 +449,9 @@ pub struct ChatMessage {
     pub sender: String,
     pub body: String,
     pub outbound: bool,
+    pub delivery: Delivery,
+    /// Unix seconds when the message was sent. Zero when unknown.
+    pub sent_at: i64,
 }
 
 /// Recoverable adapter failure. Never includes secrets.
@@ -359,6 +488,12 @@ pub trait ProtocolAdapter: Send {
     fn capabilities(&self) -> ProtocolCapabilities;
     fn start(&mut self, events: EventTx);
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError>;
+
+    /// The app is closing. Close every live session, then emit `Stopped`
+    /// once. The default is for an adapter with nothing running.
+    fn shutdown(&mut self, events: &EventTx) {
+        emit_stopped(events, self.id());
+    }
 }
 
 pub(crate) fn emit_status(
@@ -384,6 +519,30 @@ pub(crate) fn emit_message(events: &EventTx, message: ChatMessage) {
 
 pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
     let _ = events.send(AdapterEvent::TelegramAuth { phase });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_telegram_auth_rejected(events: &EventTx, error: TelegramAuthError) {
+    let _ = events.send(AdapterEvent::TelegramAuthRejected { error });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_telegram_session_ended(events: &EventTx) {
+    let _ = events.send(AdapterEvent::TelegramSessionEnded);
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_telegram_data_reset(events: &EventTx, moved_to: &str) {
+    // A file name only: drop anything up to the last path separator.
+    let name = moved_to.rsplit(['/', '\\']).next().unwrap_or_default();
+    let _ = events.send(AdapterEvent::TelegramDataReset {
+        moved_to: name.to_string(),
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_telegram_code_sent(events: &EventTx, via: TelegramCodeVia) {
+    let _ = events.send(AdapterEvent::TelegramCodeSent { via });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
@@ -439,6 +598,70 @@ pub(crate) fn emit_message_body(
         conversation_id: conversation_id.into(),
         message_id: message_id.into(),
         body: body.into(),
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_message_delivery(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    message_id: impl Into<String>,
+    delivery: Delivery,
+) {
+    let _ = events.send(AdapterEvent::MessageDelivery {
+        protocol,
+        conversation_id: conversation_id.into(),
+        message_id: message_id.into(),
+        delivery,
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_send_accepted(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    request: u64,
+) {
+    let _ = events.send(AdapterEvent::SendAccepted {
+        protocol,
+        conversation_id: conversation_id.into(),
+        request,
+    });
+}
+
+pub(crate) fn emit_send_rejected(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    request: u64,
+) {
+    let _ = events.send(AdapterEvent::SendRejected {
+        protocol,
+        conversation_id: conversation_id.into(),
+        request,
+    });
+}
+
+pub(crate) fn emit_stopped(events: &EventTx, protocol: ProtocolId) {
+    let _ = events.send(AdapterEvent::Stopped { protocol });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_chat_list_loaded(events: &EventTx, protocol: ProtocolId) {
+    let _ = events.send(AdapterEvent::ChatListLoaded { protocol });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_history_loaded(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+) {
+    let _ = events.send(AdapterEvent::HistoryLoaded {
+        protocol,
+        conversation_id: conversation_id.into(),
     });
 }
 

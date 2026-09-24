@@ -81,6 +81,11 @@ fn dispatch(
         tracing::warn!(%protocol, "no adapter registered");
         return;
     };
+    // Every adapter answers Shutdown, so the app can wait for all of them.
+    if matches!(command, AdapterCommand::Shutdown { .. }) {
+        adapter.shutdown(events);
+        return;
+    }
     if let Err(error) = adapter.handle(command, events) {
         tracing::info!(%error, "adapter refused or failed a command");
         let _ = events.send(AdapterEvent::Status {

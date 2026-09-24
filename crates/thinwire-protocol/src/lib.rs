@@ -11,9 +11,10 @@ mod telegram;
 mod whatsapp;
 
 pub use adapter::{
-    AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Conversation,
+    AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery,
     DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    RedactedPairingSecret, SupportClass, TelegramAuthPhase, TelegramAuthStep,
+    RedactedPairingSecret, SupportClass, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
+    TelegramCodeVia,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -26,9 +27,10 @@ pub use risk::{
     requires_experimental_gate,
 };
 pub use secrets::{
-    MemorySecretVault, TELEGRAM_SECRET_API_HASH, TELEGRAM_SECRET_API_ID, TELEGRAM_SECRET_CODE,
-    TELEGRAM_SECRET_DB_KEY, TELEGRAM_SECRET_PASSWORD, TELEGRAM_SECRET_PHONE,
-    TELEGRAM_SECRET_SERVICE, TELEGRAM_SECRET_SESSION, TelegramSecretKey, TelegramSecretVault,
+    MemorySecretVault, TDLIB_FOLDER, TDLIB_KEYUTILS_FOLDER, TELEGRAM_SECRET_API_HASH,
+    TELEGRAM_SECRET_API_ID, TELEGRAM_SECRET_CODE, TELEGRAM_SECRET_DB_KEY, TELEGRAM_SECRET_PASSWORD,
+    TELEGRAM_SECRET_PHONE, TELEGRAM_SECRET_SERVICE, TELEGRAM_SECRET_SESSION, TelegramSecretKey,
+    TelegramSecretVault,
 };
 pub use slack::{
     MemorySlackVault, SLACK_OAUTH_CALLBACK_PATH, SLACK_OAUTH_LOOPBACK_PORT, SLACK_SECRET_SERVICE,

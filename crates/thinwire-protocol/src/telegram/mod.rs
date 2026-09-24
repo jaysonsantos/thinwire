@@ -5,10 +5,14 @@
 //! credentials from [`TelegramSecretVault`] — never put them on commands, never
 //! log them, never commit them.
 
+mod auth_error;
 mod credentials;
+mod data_dir;
 mod db_key;
 mod engine;
 mod inbox;
+mod lifecycle;
+mod router;
 
 #[cfg(feature = "telegram-tdlib")]
 mod tdlib;
@@ -25,10 +29,12 @@ pub use credentials::{
 };
 pub use inbox::parse_telegram_chat_id;
 
+#[cfg(test)]
+use super::adapter::TelegramCodeVia;
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, EventTx, ProtocolAdapter, ProtocolCapabilities,
-    ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep, emit_flush_secrets, emit_status,
-    emit_telegram_auth,
+    ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep, emit_flush_secrets,
+    emit_send_rejected, emit_status, emit_telegram_auth,
 };
 use super::secrets::TelegramSecretVault;
 
@@ -182,6 +188,15 @@ impl ProtocolAdapter for TelegramAdapter {
         );
     }
 
+    /// Close every TDLib client, then `Stopped` (no TDLib: `Stopped` at once).
+    fn shutdown(&mut self, events: &EventTx) {
+        self.engine.reset();
+        #[cfg(feature = "telegram-tdlib")]
+        self.tdlib.shutdown(events);
+        #[cfg(not(feature = "telegram-tdlib"))]
+        super::adapter::emit_stopped(events, ProtocolId::Telegram);
+    }
+
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         match command {
             AdapterCommand::TelegramAuth { step } => self.handle_auth(step, events),
@@ -229,30 +244,59 @@ impl ProtocolAdapter for TelegramAdapter {
                 }
                 self.dispatch_live(events, LiveCall::OpenChat(conversation_id))
             }
-            AdapterCommand::SendText {
+            AdapterCommand::ResendMessage {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
-                body,
+                message_id,
             } => {
-                if body.trim().is_empty() {
+                let owned = inbox::parse_message_id(&message_id)
+                    .is_some_and(|(chat_id, _)| inbox::conversation_id(chat_id) == conversation_id);
+                if !owned {
                     return Err(AdapterError::Unavailable {
                         protocol: ProtocolId::Telegram,
-                        reason: "message text is empty",
-                    });
-                }
-                if parse_telegram_chat_id(&conversation_id).is_none() {
-                    return Err(AdapterError::Unavailable {
-                        protocol: ProtocolId::Telegram,
-                        reason: "chat id is not a Telegram chat",
+                        reason: "message id is not in this Telegram chat",
                     });
                 }
                 self.dispatch_live(
                     events,
-                    LiveCall::SendText {
+                    LiveCall::Resend {
                         conversation_id,
-                        body,
+                        message_id,
                     },
                 )
+            }
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                body,
+                request,
+            } => {
+                let rejected = if body.trim().is_empty() {
+                    Some("message text is empty")
+                } else if parse_telegram_chat_id(&conversation_id).is_none() {
+                    Some("chat id is not a Telegram chat")
+                } else {
+                    None
+                };
+                let result = match rejected {
+                    Some(reason) => Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason,
+                    }),
+                    None => self.dispatch_live(
+                        events,
+                        LiveCall::SendText {
+                            conversation_id: conversation_id.clone(),
+                            body,
+                            request,
+                        },
+                    ),
+                };
+                // Name this send in the rejection, so the UI fails only it.
+                if result.is_err() {
+                    emit_send_rejected(events, ProtocolId::Telegram, conversation_id, request);
+                }
+                result
             }
             other => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Telegram,
@@ -298,6 +342,11 @@ enum LiveCall {
     SendText {
         conversation_id: String,
         body: String,
+        request: u64,
+    },
+    Resend {
+        conversation_id: String,
+        message_id: String,
     },
 }
 
@@ -316,9 +365,17 @@ impl TelegramAdapter {
                 LiveCall::SendText {
                     conversation_id,
                     body,
+                    request,
                 } => {
                     self.tdlib
-                        .send_text(conversation_id, body, secrets, source, events);
+                        .send_text(conversation_id, body, request, secrets, source, events);
+                }
+                LiveCall::Resend {
+                    conversation_id,
+                    message_id,
+                } => {
+                    self.tdlib
+                        .resend(conversation_id, message_id, secrets, source, events);
                 }
             }
             Ok(())
@@ -394,8 +451,10 @@ mod tests {
         assert!(!caps.detail.to_ascii_lowercase().contains("reliable"));
     }
 
-    #[test]
-    fn telegram_auth_step_does_not_echo_secrets() {
+    // A runtime for the live build's `tokio::spawn` (qa R44). The body never
+    // awaits, so the worker is never polled and no TDLib client starts.
+    #[tokio::test]
+    async fn telegram_auth_step_does_not_echo_secrets() {
         let vault = Arc::new(MemorySecretVault::new());
         vault.set_secret(TelegramSecretKey::ApiId, "11111");
         vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
@@ -510,10 +569,453 @@ mod tests {
         assert!(updates.contains("Update::DeleteMessages"));
         assert!(updates.contains("update.from_cache"));
         assert!(updates.contains("emit_messages_removed"));
-        assert!(updates.contains("set_preview(update.chat_id, \"\")"));
+        assert!(updates.contains("set_preview(update.chat_id, \"\", 0)"));
         let open = fn_body(src, "async fn open_chat");
-        assert!(open.contains("functions::view_messages"));
-        assert!(open.contains("true,"));
+        assert!(open.contains("load_history"));
+        assert!(open.contains("emit_history_loaded"));
+        let history = fn_body(src, "async fn load_history");
+        assert!(history.contains("functions::view_messages"));
+        assert!(history.contains("true,"));
+        let chats = fn_body(src, "async fn load_main_chats");
+        assert!(chats.contains("emit_chat_list_loaded"));
+    }
+
+    // A runtime for the live build's `tokio::spawn` (qa R44). The body never
+    // awaits, so the worker is never polled and no TDLib client starts.
+    #[tokio::test]
+    async fn resend_checks_the_chat_and_uses_tdlib_resend() {
+        let mut adapter = TelegramAdapter::memory();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let foreign = adapter.handle(
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                message_id: "telegram:2:5".into(),
+            },
+            &tx,
+        );
+        assert!(
+            foreign
+                .expect_err("other chat")
+                .to_string()
+                .contains("not in this Telegram chat")
+        );
+        let resend = adapter.handle(
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                message_id: "telegram:1:5".into(),
+            },
+            &tx,
+        );
+        if uses_tdlib_hook() {
+            resend.expect("live resend queues on the worker");
+        } else {
+            assert!(
+                resend
+                    .expect_err("feature off")
+                    .to_string()
+                    .contains("TDLib unavailable")
+            );
+        }
+        let src = include_str!("tdlib.rs");
+        let body = fn_body(src, "async fn resend");
+        assert!(body.contains("functions::resend_messages"));
+        assert!(body.contains("Delivery::Failed"));
+        let mapped = fn_body(src, "fn emit_mapped_message");
+        assert!(mapped.contains("MessageSendingState::Pending"));
+        assert!(mapped.contains("MessageSendingState::Failed"));
+    }
+
+    #[test]
+    fn live_tdlib_reports_why_a_login_step_failed_and_where_the_code_went() {
+        let src = include_str!("tdlib.rs");
+        let steps = fn_body(src, "async fn apply_step");
+        assert_eq!(
+            steps.matches("reject_step(events, &error)").count(),
+            4,
+            "phone, code, resend code, password"
+        );
+        let reject = fn_body(src, "fn reject_step");
+        assert!(reject.contains("auth_error_from_tdlib(error.code, &error.message)"));
+        assert!(reject.contains("emit_telegram_auth_rejected"));
+        assert!(reject.contains("TelegramAuthPhase::Failed"));
+        let auth = fn_body(src, "async fn apply_authorization");
+        assert!(auth.contains("emit_telegram_code_sent(events, code_via("));
+        let via = fn_body(src, "fn code_via");
+        assert!(via.contains("Kind::SmsWord(_) | Kind::SmsPhrase(_) => TelegramCodeVia::SmsWord"));
+        assert!(TelegramCodeVia::Sms.digits_only());
+        assert!(!TelegramCodeVia::SmsWord.digits_only(), "qa R14");
+        assert!(!auth.contains("optional 2FA"));
+        assert!(!src.contains("TDLib worker is not running"));
+    }
+
+    #[test]
+    fn live_tdlib_maps_message_dates_and_group_chats() {
+        let src = include_str!("tdlib.rs");
+        let mapped = fn_body(src, "fn emit_mapped_message");
+        assert!(mapped.contains("sent_at: i64::from(message.date)"));
+        let chat = fn_body(src, "fn note_chat");
+        assert!(chat.contains("i64::from(message.date)"));
+        assert!(chat.contains("ChatType::BasicGroup(_) => true"));
+        assert!(chat.contains("!group.is_channel"));
+        let updates = fn_body(src, "fn apply_chat_update");
+        assert!(updates.contains("i64::from(message.date)"));
+        assert!(updates.contains("i64::from(update.message.date)"));
+    }
+
+    #[test]
+    fn shutdown_reports_stopped_and_workers_close_tdlib_first() {
+        let mut adapter = TelegramAdapter::memory();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        if !uses_tdlib_hook() {
+            adapter.shutdown(&tx);
+            assert_eq!(
+                rx.try_recv().expect("stopped"),
+                AdapterEvent::Stopped {
+                    protocol: ProtocolId::Telegram
+                }
+            );
+        }
+        let src = include_str!("tdlib.rs");
+        let stop = &src[src.find("pub fn stop(").expect("stop")
+            ..src.find("pub fn shutdown(").expect("shutdown")];
+        assert!(
+            stop.contains("TdlibCommand::Close"),
+            "stop closes, it does not drop"
+        );
+        let shutdown = fn_body(src, "pub fn shutdown(");
+        assert!(shutdown.contains("all_done(&workers)"));
+        assert!(shutdown.contains("emit_stopped"));
+        assert!(
+            shutdown.contains("SHUTDOWN_LIMIT"),
+            "shutdown has its own bound"
+        );
+        assert!(
+            src.contains("const SHUTDOWN_LIMIT: Duration = Duration::from_secs(4);"),
+            "below the app's 5 s close limit"
+        );
+        assert!(
+            fn_body(src, "fn receiver_idle").contains("dispatcher.running.load"),
+            "a thread that never started counts as idle"
+        );
+        assert!(
+            shutdown.contains("receiver_idle()"),
+            "exit waits until no thread is in TDLib"
+        );
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        assert!(worker.contains("request_close(client_id)"));
+        assert!(worker.contains("if closed"));
+        let register = worker
+            .find("dispatcher.register(client_id)")
+            .expect("register");
+        let first_request = worker
+            .find("set_log_verbosity_level")
+            .expect("first request");
+        assert!(
+            register < first_request,
+            "register before the first request"
+        );
+        let unregister = worker
+            .find("dispatcher.unregister(client_id)")
+            .expect("unregister");
+        let done = worker.rfind("mark_done(&done)").expect("done");
+        assert!(unregister < done);
+        assert!(fn_body(src, "async fn request_close").contains("functions::close"));
+        assert!(
+            !src.contains("generation"),
+            "no worker is dropped without close"
+        );
+    }
+
+    #[test]
+    fn a_new_client_opens_only_after_the_old_one_released_the_database() {
+        let src = include_str!("tdlib.rs");
+        let stop = &src[src.find("pub fn stop(").expect("stop")
+            ..src.find("pub fn shutdown(").expect("shutdown")];
+        assert!(stop.contains("retire_current()"));
+        let enqueue = fn_body(src, "fn enqueue(");
+        assert!(enqueue.contains("slots.start()"));
+        let guard = enqueue
+            .find("self.slots.is_shut()")
+            .expect("shutdown guard");
+        let spawn = enqueue.find("send_or_respawn").expect("spawn");
+        assert!(guard < spawn, "no new client after Shutdown (qa R50)");
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        let wait = worker.find("wait_for_retired(&wait_for)").expect("wait");
+        let create = worker.find("create_client()").expect("create");
+        assert!(
+            wait < create,
+            "wait before the new client opens the database"
+        );
+        let timeout = fn_body(src, "async fn wait_for_retired");
+        assert!(timeout.contains("RETIRE_TIMEOUT"));
+    }
+
+    #[test]
+    fn failed_tdlib_parameters_stop_the_login_and_log_safely() {
+        let src = include_str!("tdlib.rs");
+        let params = fn_body(src, "async fn set_parameters");
+        assert!(params.contains("if let Err(error) = result"));
+        assert!(fn_body(src, "async fn send_parameters").contains("set_tdlib_parameters("));
+        assert!(params.contains("TelegramAuthError::ClientSetup"));
+        assert!(params.contains("TelegramAuthPhase::Failed"));
+        assert!(params.contains("log_tdlib_error(\"setTdlibParameters\""));
+        let log = fn_body(src, "fn log_tdlib_error");
+        assert!(log.contains("loggable_tdlib_message"));
+    }
+
+    #[test]
+    fn live_tdlib_moves_a_keyless_data_folder_aside_before_it_opens() {
+        let src = include_str!("tdlib.rs");
+        let params = fn_body(src, "async fn set_parameters");
+        let settled = params
+            .find("secrets.secrets_hydrated()")
+            .expect("settled read");
+        let check = params
+            .find("move_aside_if_keyless(&dir, has_key)")
+            .expect("check");
+        let key = params.find("ensure_db_key(").expect("key");
+        assert!(
+            settled < check,
+            "a failed hydrate must not look like a missing key"
+        );
+        assert!(check < key, "check the vault before a new key is made");
+        assert!(params.contains("data_dir::is_wrong_key_error(error.code, &error.message)"));
+        assert!(params.contains("&& moved_to.is_none()"), "retry once only");
+        assert!(params.contains("emit_telegram_data_reset(events, name)"));
+        assert!(
+            !src.contains("remove_dir_all"),
+            "old data is moved, never deleted"
+        );
+    }
+
+    #[test]
+    fn live_tdlib_uses_a_throwaway_folder_without_a_saving_keychain() {
+        let src = include_str!("tdlib.rs");
+        let params = fn_body(src, "async fn set_parameters");
+        assert!(params.contains("tdlib_data_dir(secrets.persists(), secrets.tdlib_folder_name())"));
+        let dir = fn_body(src, "fn tdlib_data_dir");
+        assert!(dir.contains("data_dir::this_process_session_dir()"));
+        let shutdown = &src[src.find("pub fn shutdown(").expect("shutdown")..];
+        let shutdown = &shutdown[..shutdown.find("\n    }\n").expect("end")];
+        let idle = shutdown.find("receiver_idle()").expect("idle");
+        let remove = shutdown
+            .find("data_dir::remove_this_process_session_dir()")
+            .expect("throwaway folder is removed at a clean exit");
+        assert!(idle < remove, "remove only after no thread is in TDLib");
+        assert!(
+            !TelegramSecretVault::persists(&MemorySecretVault::new()),
+            "tests never open the real TDLib folder (qa R45)"
+        );
+    }
+
+    #[test]
+    fn every_tdlib_error_goes_through_the_safe_log() {
+        let src = include_str!("tdlib.rs");
+        for request in [
+            "\"sendMessage (update)\"",
+            "\"close\"",
+            "\"login step\"",
+            "\"loadChats\"",
+            "\"viewMessages\"",
+            "\"getChatHistory\"",
+            "\"sendMessage\"",
+            "\"resendMessages\"",
+            "\"setTdlibParameters\"",
+        ] {
+            assert!(
+                src.contains(&format!("log_tdlib_error({request}")),
+                "{request}"
+            );
+        }
+        assert_eq!(
+            fn_body(src, "fn reject_step")
+                .matches("log_tdlib_error(")
+                .count(),
+            1,
+            "the three login arms log through reject_step"
+        );
+        let log = fn_body(src, "fn log_tdlib_error");
+        assert!(log.contains("loggable_tdlib_message(&error.message)"));
+        assert!(!log.contains("error.message,"), "raw text is never logged");
+    }
+
+    #[test]
+    fn data_reset_event_names_the_folder_never_a_path() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::adapter::emit_telegram_data_reset(
+            &tx,
+            "/home/user/.local/share/thinwire/tdlib.stale-1790000000",
+        );
+        assert_eq!(
+            rx.try_recv().expect("event"),
+            AdapterEvent::TelegramDataReset {
+                moved_to: "tdlib.stale-1790000000".into()
+            }
+        );
+    }
+
+    #[test]
+    fn live_tdlib_reports_a_remote_logout_but_not_its_own_close() {
+        let src = include_str!("tdlib.rs");
+        let auth = fn_body(src, "async fn apply_authorization");
+        let arm = &auth[auth.find("AuthorizationState::LoggingOut").expect("arm")..];
+        assert!(arm.contains("was_authorized && !live.closing"));
+        assert!(arm.contains("live.ended_elsewhere = true"));
+        assert!(
+            !auth.contains("emit_telegram_session_ended"),
+            "not before Closed (qa R74)"
+        );
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        assert!(
+            worker.contains("live.closing = true;"),
+            "our Close is not a logout"
+        );
+        let dropped = worker.find("drop(commands);").expect("drop");
+        let done = worker.rfind("mark_done(&done)").expect("done");
+        let event = worker
+            .find("emit_telegram_session_ended(&events)")
+            .expect("event after the loop");
+        assert!(
+            dropped < done && done < event,
+            "the next command must start a new client"
+        );
+    }
+
+    #[test]
+    fn resend_code_uses_tdlib_resend_and_the_stub_stays_on_the_code_step() {
+        let src = include_str!("tdlib.rs");
+        let steps = fn_body(src, "async fn apply_step");
+        let arm = &steps[steps.find("TelegramAuthStep::ResendCode").expect("arm")..];
+        let arm = &arm[..arm.find("TelegramAuthStep::Code").expect("next arm")];
+        assert!(arm.contains("functions::resend_authentication_code("));
+        assert!(arm.contains("ResendCodeReason::UserRequest"));
+        assert!(arm.contains("reject_step(events, &error)"));
+        assert!(!arm.contains("set_authentication_phone_number"));
+        if uses_tdlib_hook() {
+            return;
+        }
+        let vault = Arc::new(MemorySecretVault::new());
+        vault.set_secret(TelegramSecretKey::ApiId, "11111");
+        vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+        let mut adapter = TelegramAdapter::new(Arc::clone(&vault) as Arc<dyn TelegramSecretVault>);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::ResendCode,
+                },
+                &tx,
+            )
+            .expect("resend");
+        assert_eq!(
+            rx.try_recv().expect("phase"),
+            AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::NeedCode
+            }
+        );
+    }
+
+    #[test]
+    fn live_tdlib_drops_a_chat_that_left_the_main_list() {
+        let src = include_str!("tdlib.rs");
+        let updates = fn_body(src, "fn apply_chat_update");
+        let arm = &updates[updates.find("Update::ChatLastMessage").expect("arm")..];
+        let arm = &arm[..arm.find("Update::NewMessage").expect("next arm")];
+        assert!(arm.contains("set_main_position(update.chat_id, main_order(&update.positions))"));
+        assert!(
+            !arm.contains("if let Some(order) = main_order"),
+            "None must not be ignored"
+        );
+    }
+
+    #[test]
+    fn a_refused_send_names_its_chat_and_request() {
+        let mut adapter = TelegramAdapter::memory();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = adapter.handle(
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:42".into(),
+                body: "   ".into(),
+                request: 7,
+            },
+            &tx,
+        );
+        let mut rejected = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::SendRejected {
+                conversation_id,
+                request,
+                ..
+            } = event
+            {
+                rejected.push((conversation_id, request));
+            }
+        }
+        assert_eq!(rejected, vec![("telegram:42".to_string(), 7)]);
+        let src = include_str!("tdlib.rs");
+        let send = fn_body(src, "async fn send_text");
+        assert_eq!(
+            send.matches("rejected();").count(),
+            4,
+            "not ready, bad chat id, empty text, and TDLib error each name the send"
+        );
+        let pending = send
+            .find("emit_mapped_message(events, &message")
+            .expect("pending row");
+        let accepted = send
+            .find("emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request)")
+            .expect("acceptance names the send");
+        assert!(pending < accepted, "the pending row comes first");
+    }
+
+    #[test]
+    fn live_tdlib_takes_the_data_folder_name_from_the_vault() {
+        let src = include_str!("tdlib.rs");
+        let params = fn_body(src, "async fn set_parameters");
+        assert!(params.contains("tdlib_data_dir(secrets.persists(), secrets.tdlib_folder_name())"));
+        let dir = fn_body(src, "fn tdlib_data_dir");
+        assert!(dir.contains("base.push(folder_name)"));
+        assert!(!dir.contains("base.push(\"tdlib\")"));
+        assert_eq!(
+            TelegramSecretVault::tdlib_folder_name(&MemorySecretVault::new()),
+            crate::secrets::TDLIB_FOLDER
+        );
+    }
+
+    #[test]
+    fn live_tdlib_has_one_receive_thread_for_the_process() {
+        let src = include_str!("tdlib.rs");
+        assert_eq!(src.matches("tdlib_rs::receive()").count(), 1);
+        assert_eq!(src.matches(".name(\"thinwire-tdlib-recv\"").count(), 1);
+        assert!(src.contains("static DISPATCHER: OnceLock"));
+        let receive = fn_body(src, "fn receive_loop");
+        assert!(receive.contains("begin_receive()"));
+        assert!(receive.contains("end_receive()"));
+        assert!(receive.contains("route(client_id, update)"));
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        assert!(
+            !worker.contains("thread::Builder"),
+            "workers do not start receive threads"
+        );
+    }
+
+    #[test]
+    fn live_tdlib_drops_a_stale_session_marker_on_phone_prompt() {
+        let src = include_str!("tdlib.rs");
+        let auth = fn_body(src, "async fn apply_authorization");
+        let start = auth
+            .find("AuthorizationState::WaitPhoneNumber")
+            .expect("phone arm");
+        let end = auth[start..]
+            .find("AuthorizationState::WaitCode")
+            .expect("code arm");
+        let phone = &auth[start..start + end];
+        assert!(phone.contains("set_secret(TelegramSecretKey::Session, \"\")"));
+        assert!(phone.contains("request_secret_flush"));
+        assert!(phone.contains("TelegramAuthPhase::NeedPhone"));
     }
 
     fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
@@ -623,8 +1125,10 @@ mod tests {
         assert!(!debug.contains("db_key"));
     }
 
-    #[test]
-    fn disconnect_resets_engine_and_does_not_emit_ready() {
+    // A runtime for the live build's `tokio::spawn` (qa R44). The body never
+    // awaits, so the worker is never polled and no TDLib client starts.
+    #[tokio::test]
+    async fn disconnect_resets_engine_and_does_not_emit_ready() {
         let vault = Arc::new(MemorySecretVault::new());
         vault.set_secret(TelegramSecretKey::ApiId, "11111");
         vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
@@ -662,8 +1166,10 @@ mod tests {
         assert!(!saw_ready);
     }
 
-    #[test]
-    fn inbox_commands_stay_off_the_ui_and_do_not_carry_secrets() {
+    // A runtime for the live build's `tokio::spawn` (qa R44). The body never
+    // awaits, so the worker is never polled and no TDLib client starts.
+    #[tokio::test]
+    async fn inbox_commands_stay_off_the_ui_and_do_not_carry_secrets() {
         let vault = Arc::new(MemorySecretVault::new());
         vault.set_secret(TelegramSecretKey::ApiId, "11111");
         vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
@@ -686,6 +1192,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:42".into(),
                 body: "   ".into(),
+                request: 1,
             },
             &tx,
         );
@@ -695,6 +1202,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:42".into(),
                 body: "hello".into(),
+                request: 2,
             },
             &tx,
         );
@@ -728,6 +1236,7 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:42".into(),
             body: "hello".into(),
+            request: 3,
         };
         let debug = format!("{command:?}");
         assert!(debug.contains("hello"));

@@ -96,9 +96,39 @@ impl fmt::Debug for TelegramSecretKey {
 }
 
 /// Read/write Telegram secrets without logging values.
+/// The default TDLib data folder name (Secret Service, macOS, Windows).
+pub const TDLIB_FOLDER: &str = "tdlib";
+
+/// The TDLib data folder name when only kernel keyutils holds the keys.
+pub const TDLIB_KEYUTILS_FOLDER: &str = "tdlib-keyutils";
+
 pub trait TelegramSecretVault: Send + Sync {
     fn get_secret(&self, key: TelegramSecretKey) -> Option<String>;
     fn set_secret(&self, key: TelegramSecretKey, value: &str);
+
+    /// Name of the TDLib data folder for this store. A store that loses its
+    /// keys (keyutils at a restart) uses its own folder, so its lost-key
+    /// recovery never moves another store's session.
+    fn tdlib_folder_name(&self) -> &'static str {
+        TDLIB_FOLDER
+    }
+
+    /// `false` when values live in memory only and are lost at exit. The
+    /// TDLib database then uses a throwaway folder, so a key that cannot be
+    /// saved never protects the folder on disk.
+    fn persists(&self) -> bool {
+        true
+    }
+
+    /// `false` while an OS keychain read is unfinished or failed.
+    ///
+    /// A missing database key is confirmed only when this is true and
+    /// [`Self::get_secret`] returns `None` (`Ok(None)` from the keychain).
+    /// A read error must leave this false so it does not look like a missing
+    /// key. Vaults that never talk to an OS keychain stay hydrated.
+    fn secrets_hydrated(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory vault used by tests and as the UI-side map.
@@ -139,6 +169,12 @@ impl TelegramSecretVault for MemorySecretVault {
         } else {
             values.insert(key, trimmed.to_string());
         }
+    }
+
+    /// Memory never persists. A worker on this vault (every test) therefore
+    /// uses a throwaway TDLib folder and never opens the user's real one.
+    fn persists(&self) -> bool {
+        false
     }
 }
 

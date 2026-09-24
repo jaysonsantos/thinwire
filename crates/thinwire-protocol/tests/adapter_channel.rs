@@ -52,6 +52,7 @@ async fn fake_adapter_pushes_events_from_worker_without_ui_apis() {
         AdapterEvent::ConversationUpsert { conversation } => {
             assert_eq!(conversation.id, "fake:chat");
             assert_eq!(conversation.protocol, ProtocolId::Telegram);
+            assert!(conversation.last_at > 0);
         }
         other => panic!("expected conversation, got {other:?}"),
     }
@@ -64,6 +65,7 @@ async fn fake_adapter_pushes_events_from_worker_without_ui_apis() {
         AdapterEvent::MessageReceived { message } => {
             assert_eq!(message.body, "event from tokio worker");
             assert_eq!(message.sender, "worker");
+            assert!(message.sent_at > 0, "the fake fills the send time");
         }
         other => panic!("expected message, got {other:?}"),
     }

@@ -30,11 +30,17 @@ eframe = { version = "0.36", default-features = false, features = [
   "x11",
 ] }
 egui = "0.36"
+# Local time for message timestamps. `clock` reads the OS time zone.
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "std",
+] }
 winit = "0.30"
 thinwire-protocol = { path = "crates/thinwire-protocol" }
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",
+  "signal",
   "sync",
   "time",
 ] }
@@ -46,6 +52,13 @@ dirs = "7"
 # libdbus. Runtime falls back to memory when the platform store is unavailable.
 keyring-core = "1"
 linux-keyutils-keyring-store = "1"
+# Secret Service (KDE Wallet / GNOME Keyring) over pure-Rust zbus: no libdbus
+# at build time. async-io keeps its executor off the tokio blocking pool.
+zbus-secret-service-keyring-store = { version = "1", features = [
+  "rt-async-io-crypto-rust",
+] }
+# Only for the error type: tell "Secret Service not present" from a failure.
+secret-service = { version = "5", default-features = false }
 # `keychain` matches keyring v3's apple-native path for unsigned desktop apps.
 apple-native-keyring-store = { version = "1", default-features = false, features = [
   "keychain",
