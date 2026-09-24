@@ -837,11 +837,24 @@ mod tests {
         let auth = fn_body(src, "async fn apply_authorization");
         let arm = &auth[auth.find("AuthorizationState::LoggingOut").expect("arm")..];
         assert!(arm.contains("was_authorized && !live.closing"));
-        assert!(arm.contains("emit_telegram_session_ended(events)"));
+        assert!(arm.contains("live.ended_elsewhere = true"));
+        assert!(
+            !auth.contains("emit_telegram_session_ended"),
+            "not before Closed (qa R74)"
+        );
         let worker = fn_body(src, "fn spawn_tdlib_worker");
         assert!(
             worker.contains("live.closing = true;"),
             "our Close is not a logout"
+        );
+        let dropped = worker.find("drop(commands);").expect("drop");
+        let done = worker.rfind("mark_done(&done)").expect("done");
+        let event = worker
+            .find("emit_telegram_session_ended(&events)")
+            .expect("event after the loop");
+        assert!(
+            dropped < done && done < event,
+            "the next command must start a new client"
         );
     }
 

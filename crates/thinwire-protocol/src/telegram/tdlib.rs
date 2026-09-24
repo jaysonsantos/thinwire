@@ -59,6 +59,9 @@ struct LiveInbox {
     /// This app asked TDLib to close (shutdown, Cancel, Try again). A close
     /// without this flag came from elsewhere, for example a remote logout.
     closing: bool,
+    /// A live session started to close without our request. Reported once
+    /// the client is fully closed (qa R74).
+    ended_elsewhere: bool,
     directory: ChatDirectory,
     names: NameBook,
 }
@@ -323,6 +326,7 @@ fn spawn_tdlib_worker(
         let mut live = LiveInbox {
             authorized: false,
             closing: false,
+            ended_elsewhere: false,
             directory: ChatDirectory::new(),
             names: NameBook::new(),
         };
@@ -374,8 +378,14 @@ fn spawn_tdlib_worker(
             }
         }
 
+        // Drop the command channel first: a command sent after the event below
+        // then fails here and starts a new client, instead of dying in this queue.
+        drop(commands);
         dispatcher.unregister(client_id);
         mark_done(&done);
+        if live.ended_elsewhere {
+            emit_telegram_session_ended(&events);
+        }
     });
 
     cmd_tx
@@ -630,9 +640,10 @@ async fn apply_authorization(
         | tdlib_rs::enums::AuthorizationState::Closed => {
             let was_authorized = std::mem::replace(&mut live.authorized, false);
             // A live session that closes without our request ended elsewhere,
-            // for example Settings → Devices on another client (qa R73).
+            // for example Settings → Devices on another client (qa R73). The
+            // event goes out only after Closed, when the worker has exited (R74).
             if was_authorized && !live.closing {
-                emit_telegram_session_ended(events);
+                live.ended_elsewhere = true;
             }
             emit_status(
                 events,
