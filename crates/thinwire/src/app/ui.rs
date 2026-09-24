@@ -38,6 +38,8 @@ pub(crate) fn keychain_notice(secrets: &SecretStore) -> Option<&'static str> {
 const COMPOSE_MAX_ROWS: usize = 5;
 /// Send is at least this tall. The field grows with the line count.
 const SEND_MIN_HEIGHT: f32 = 40.0;
+/// Focused field border. Unfocused is 1px. The reserve keeps the thicker ring.
+const FIELD_STROKE_MAX: f32 = 2.0;
 /// A message bubble uses at most this share of the thread width.
 const BUBBLE_WIDTH: f32 = 0.75;
 /// Cap so a wide window does not make a line too long to read.
@@ -740,11 +742,12 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         })
         .collect();
 
-    // Compose grows to COMPOSE_MAX_ROWS lines, then scrolls. Reserve its height.
+    // Compose grows to COMPOSE_MAX_ROWS lines, then scrolls. Leave the whole
+    // bar inside the panel when the message list hits its max height.
     let row_height = ui.text_style_height(&egui::TextStyle::Body);
     let compose_rows = snapshot.compose.lines().count().clamp(1, COMPOSE_MAX_ROWS);
-    let compose_height = row_height * COMPOSE_MAX_ROWS as f32;
-    let reserve = compose_reserve(row_height, compose_rows);
+    let compose_height = compose_row_height(row_height, COMPOSE_MAX_ROWS);
+    let reserve = compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y);
 
     let state = snapshot.thread_state();
     let mut retry: Option<String> = None;
@@ -938,15 +941,27 @@ fn bubble_radius(outbound: bool, run_end: bool) -> egui::CornerRadius {
     }
 }
 
+/// Height of the field row: text, field padding, focus ring, at least Send.
+///
+/// `ui.horizontal` only offers `interact_size` of height, and a vertical
+/// scroll area otherwise stays at its 64px minimum. Compose uses this as
+/// both `min_scrolled_height` and `max_height`, so the bar tracks the text.
+fn compose_row_height(row_height: f32, rows: usize) -> f32 {
+    let rows = rows.clamp(1, COMPOSE_MAX_ROWS) as f32;
+    let pad = space::M * 2.0;
+    let field = row_height * rows + pad + FIELD_STROKE_MAX * 2.0;
+    field.max(SEND_MIN_HEIGHT)
+}
+
 /// Height the message list leaves for the compose bar.
 ///
 /// The outer frame and the field frame each add `space::M` above and below.
-/// The Send button is at least [`SEND_MIN_HEIGHT`].
-fn compose_reserve(row_height: f32, rows: usize) -> f32 {
-    let rows = rows.clamp(1, COMPOSE_MAX_ROWS) as f32;
+/// The field stroke is reserved at its focused width. The Send button is at
+/// least [`SEND_MIN_HEIGHT`]. `item_spacing_y` is the gap egui inserts
+/// before the bar.
+fn compose_reserve(row_height: f32, rows: usize, item_spacing_y: f32) -> f32 {
     let pad = space::M * 2.0;
-    let field = row_height * rows + pad;
-    pad + field.max(SEND_MIN_HEIGHT)
+    pad + compose_row_height(row_height, rows) + item_spacing_y
 }
 
 /// Multiline compose. Enter sends; Shift+Enter adds a line.
@@ -980,7 +995,7 @@ fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
     let field = egui::Frame::new()
         .fill(palette.input)
         .stroke(egui::Stroke::new(
-            if focused { 2.0 } else { 1.0 },
+            if focused { FIELD_STROKE_MAX } else { 1.0 },
             if focused {
                 palette.accent
             } else {
@@ -996,9 +1011,15 @@ fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
             ui.horizontal(|ui| {
                 let send_width = 72.0;
                 let width = (ui.available_width() - send_width - space::S).max(0.0);
+                let visible = compose_row_height(
+                    ui.text_style_height(&egui::TextStyle::Body),
+                    snapshot.compose.lines().count(),
+                )
+                .min(max_height);
                 egui::ScrollArea::vertical()
                     .id_salt("thread-compose-scroll")
-                    .max_height(max_height)
+                    .max_height(visible)
+                    .min_scrolled_height(visible)
                     .max_width(width)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
@@ -1053,18 +1074,152 @@ mod tests {
 
     #[test]
     fn compose_reserve_counts_the_frame_padding() {
-        use super::compose_reserve;
+        use super::{FIELD_STROKE_MAX, SEND_MIN_HEIGHT, compose_reserve, compose_row_height};
         use crate::app::theme::space;
 
         let row = 20.0;
         let pad = space::M * 2.0;
-        assert_eq!(compose_reserve(row, 1), pad + (row + pad).max(40.0));
-        assert!(compose_reserve(row, 1) > row + 32.0);
+        let spacing = 6.0;
+        let field = row + pad + FIELD_STROKE_MAX * 2.0;
+        assert_eq!(compose_row_height(row, 1), field.max(SEND_MIN_HEIGHT));
+        assert_eq!(
+            compose_reserve(row, 1, spacing),
+            pad + field.max(SEND_MIN_HEIGHT) + spacing
+        );
+        assert!(compose_reserve(row, 1, spacing) > row + 32.0);
+        assert!(compose_reserve(1.0, 1, 0.0) >= SEND_MIN_HEIGHT + pad);
         let ui = include_str!("ui.rs");
         let thread = &ui[ui.find("fn thread(").expect("thread")..];
         let thread = &thread[..thread.find("\nfn ").expect("next")];
         assert!(thread.contains("compose_reserve("));
+        assert!(thread.contains("item_spacing"));
         assert!(!thread.contains("+ 32.0"));
+        let compose = &ui[ui.find("fn compose(").expect("compose")..];
+        let compose = &compose[..compose.find("\nfn ").expect("next")];
+        assert!(compose.contains("min_scrolled_height("));
+        assert!(compose.contains("compose_row_height("));
+        assert!(compose.contains("FIELD_STROKE_MAX"));
+        assert!(compose.contains("SEND_MIN_HEIGHT"));
+    }
+
+    fn compose_body(rows: usize) -> String {
+        (0..rows)
+            .map(|row| format!("line {row}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A long thread hits the message scroll's max height. The bar, including
+    /// the focused ring, still ends inside that panel.
+    #[test]
+    fn compose_bar_stays_inside_the_reserved_clip() {
+        use super::{
+            COMPOSE_MAX_ROWS, SEND_MIN_HEIGHT, compose, compose_reserve, compose_row_height,
+        };
+        use crate::app::snapshot::Snapshot;
+        use crate::app::theme;
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        ctx.set_theme(egui::Theme::Dark);
+        let mut snapshot = Snapshot::new();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+
+        for rows in 1..=COMPOSE_MAX_ROWS {
+            snapshot.compose = compose_body(rows);
+            let mut output = ctx.run_ui(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let spacing = ui.spacing().item_spacing.y;
+                    assert_eq!(spacing, 6.0);
+                    let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                    let reserve = compose_reserve(row_height, rows, spacing);
+                    let top = ui.cursor().min.y;
+                    ui.memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new("thread-compose"));
+                    });
+                    compose(
+                        ui,
+                        &mut snapshot,
+                        compose_row_height(row_height, COMPOSE_MAX_ROWS),
+                    );
+                    let height = ui.cursor().min.y - top - spacing;
+                    assert!(
+                        height + spacing <= reserve + 0.05,
+                        "{rows} rows: bar {height} + gap {spacing} exceeds reserve {reserve}"
+                    );
+                    assert!(height + 0.05 >= SEND_MIN_HEIGHT);
+                    if rows == 1 {
+                        let old = row_height + 32.0;
+                        assert!(
+                            height + spacing > old,
+                            "old reserve {old} still covers the bar ({height} + {spacing})"
+                        );
+                    }
+                });
+            });
+            output.textures_delta.clear();
+        }
+
+        for rows in [1, COMPOSE_MAX_ROWS] {
+            snapshot.compose = compose_body(rows);
+            let mut output = ctx.run_ui(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let origin = ui.cursor().min;
+                    let rect = egui::Rect::from_min_size(origin, egui::vec2(640.0, 360.0));
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(rect)
+                            .id_salt(("compose-clip", rows)),
+                        |ui| {
+                            ui.set_clip_rect(rect);
+                            let spacing = ui.spacing().item_spacing.y;
+                            let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                            let reserve = compose_reserve(
+                                row_height,
+                                snapshot.compose.lines().count().clamp(1, COMPOSE_MAX_ROWS),
+                                spacing,
+                            );
+                            let available = ui.available_height();
+                            let before = ui.cursor().min.y;
+                            egui::ScrollArea::vertical()
+                                .id_salt(("reserve-clip", rows))
+                                .auto_shrink([false, true])
+                                .stick_to_bottom(true)
+                                .max_height(available - reserve)
+                                .show(ui, |ui| {
+                                    ui.set_min_height(8_000.0);
+                                });
+                            let scroll_height = ui.cursor().min.y - before - spacing;
+                            assert!(
+                                (scroll_height - (available - reserve)).abs() < 1.0,
+                                "{rows} rows: scroll {scroll_height} did not hit max height"
+                            );
+                            ui.memory_mut(|memory| {
+                                memory.request_focus(egui::Id::new("thread-compose"));
+                            });
+                            compose(
+                                ui,
+                                &mut snapshot,
+                                compose_row_height(row_height, COMPOSE_MAX_ROWS),
+                            );
+                            let compose_bottom = ui.cursor().min.y - spacing;
+                            assert!(
+                                compose_bottom <= rect.bottom() + 0.05,
+                                "{rows} rows: compose ends at {compose_bottom}, clip at {}",
+                                rect.bottom()
+                            );
+                        },
+                    );
+                });
+            });
+            output.textures_delta.clear();
+        }
     }
 
     #[test]
