@@ -633,6 +633,55 @@ async fn a_live_message_ranks_after_older_history() {
     assert!(ranks[0] > 0 && ranks[0] < ranks[1]);
 }
 
+#[tokio::test]
+async fn an_edit_updates_the_body_and_a_delete_removes_the_row() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000001.000100",
+        "U1",
+        "first",
+    )));
+    let original = h.message("first").await;
+
+    h.socket.push(SlackInbound::Edited {
+        channel: "C1".into(),
+        ts: "1700000001.000100".into(),
+        text: "first, edited".into(),
+    });
+    let edited = h
+        .until("edited body", |event| {
+            matches!(event, AdapterEvent::MessageBody { .. })
+        })
+        .await;
+    let AdapterEvent::MessageBody {
+        message_id, body, ..
+    } = edited
+    else {
+        unreachable!();
+    };
+    assert_eq!(message_id, original.id);
+    assert_eq!(body, "first, edited");
+
+    h.socket.push(SlackInbound::Deleted {
+        channel: "C1".into(),
+        ts: "1700000001.000100".into(),
+    });
+    let removed = h
+        .until("deleted row", |event| {
+            matches!(event, AdapterEvent::MessagesRemoved { .. })
+        })
+        .await;
+    let AdapterEvent::MessagesRemoved { message_ids, .. } = removed else {
+        unreachable!();
+    };
+    assert_eq!(message_ids, [original.id]);
+}
+
 fn shell_rank(id: &str) -> i64 {
     id.rsplit(':')
         .next()

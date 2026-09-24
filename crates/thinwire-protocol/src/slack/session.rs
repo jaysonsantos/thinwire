@@ -29,8 +29,8 @@ use super::{CAPABILITIES, SLACK_CONVERSATION_PREFIX};
 use crate::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
     ProtocolAdapter, ProtocolCapabilities, ProtocolId, emit_conversation,
-    emit_conversation_removed, emit_message, emit_send_accepted, emit_send_rejected, emit_status,
-    emit_stopped,
+    emit_conversation_removed, emit_message, emit_message_body, emit_messages_removed,
+    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
 };
 
 /// Messages loaded when a channel opens.
@@ -276,6 +276,12 @@ where
             match job {
                 Job::Command(command) => self.command(command).await,
                 Job::Inbound(SlackInbound::Message(post)) => self.inbound(post).await,
+                Job::Inbound(SlackInbound::Edited { channel, ts, text }) => {
+                    self.edit_message(&channel, &ts, &text);
+                }
+                Job::Inbound(SlackInbound::Deleted { channel, ts }) => {
+                    self.delete_message(&channel, &ts);
+                }
                 Job::Inbound(SlackInbound::Revoked) => self.revoked().await,
                 Job::Installed { attempt, result } => self.installed(attempt, result).await,
             }
@@ -694,6 +700,25 @@ where
                 self.api_failed(&error).await;
             }
         }
+    }
+
+    fn edit_message(&self, channel: &str, ts: &str, text: &str) {
+        emit_message_body(
+            &self.events,
+            ProtocolId::Slack,
+            conversation_id(channel),
+            message_id(channel, ts),
+            text,
+        );
+    }
+
+    fn delete_message(&self, channel: &str, ts: &str) {
+        emit_messages_removed(
+            &self.events,
+            ProtocolId::Slack,
+            conversation_id(channel),
+            vec![message_id(channel, ts)],
+        );
     }
 
     async fn inbound(&mut self, post: SlackPost) {

@@ -337,6 +337,33 @@ fn body(text: Option<String>) -> String {
         .unwrap_or_else(|| NO_TEXT.into())
 }
 
+/// `message_changed` and `message_deleted` are not channel posts. They update
+/// or drop an existing row. The nested message `ts` (or `deleted_ts`) is the
+/// row id; the event `ts` is only when Slack noticed the change.
+fn edit_or_delete(message: &SlackMessageEvent) -> Option<SlackInbound> {
+    let channel = message.origin.channel.as_ref()?.to_string();
+    match message.subtype {
+        Some(SlackMessageEventType::MessageChanged) => {
+            let edited = message.message.as_ref()?;
+            Some(SlackInbound::Edited {
+                channel,
+                ts: edited.ts.to_string(),
+                text: body(
+                    edited
+                        .content
+                        .as_ref()
+                        .and_then(|content| content.text.clone()),
+                ),
+            })
+        }
+        Some(SlackMessageEventType::MessageDeleted) => Some(SlackInbound::Deleted {
+            channel,
+            ts: message.deleted_ts.as_ref()?.to_string(),
+        }),
+        _ => None,
+    }
+}
+
 /// Channel view: allow-listed subtypes, including a thread reply that was also
 /// sent to the channel. A reply that stays in the thread is dropped.
 fn shown_in_channel(subtype: Option<&SlackMessageEventType>, origin: &SlackMessageOrigin) -> bool {
@@ -445,19 +472,22 @@ async fn on_push(
 ) -> UserCallbackResult<()> {
     let inbound = match event.event {
         SlackEventCallbackBody::Message(message) => {
-            if !shown_in_channel(message.subtype.as_ref(), &message.origin) {
+            if let Some(inbound) = edit_or_delete(&message) {
+                inbound
+            } else if !shown_in_channel(message.subtype.as_ref(), &message.origin) {
                 return Ok(());
+            } else {
+                let Some(channel) = message.origin.channel.as_ref() else {
+                    return Ok(());
+                };
+                SlackInbound::Message(SlackPost {
+                    channel: channel.to_string(),
+                    ts: message.origin.ts.to_string(),
+                    user: message.sender.user.map(|user| user.to_string()),
+                    username: message.sender.username,
+                    text: body(message.content.and_then(|content| content.text)),
+                })
             }
-            let Some(channel) = message.origin.channel.as_ref() else {
-                return Ok(());
-            };
-            SlackInbound::Message(SlackPost {
-                channel: channel.to_string(),
-                ts: message.origin.ts.to_string(),
-                user: message.sender.user.map(|user| user.to_string()),
-                username: message.sender.username,
-                text: body(message.content.and_then(|content| content.text)),
-            })
         }
         SlackEventCallbackBody::AppUninstalled(_) => SlackInbound::Revoked,
         _ => return Ok(()),
@@ -472,6 +502,34 @@ async fn on_push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_and_a_delete_name_the_original_message() {
+        let origin = SlackMessageOrigin::new("1700000099.000100".into())
+            .with_channel(SlackChannelId::new("C1".into()));
+        let edited =
+            SlackMessageEventEdited::new(SlackMessageSender::new(), "1700000001.000100".into())
+                .with_content(SlackMessageContent::new().with_text("first, edited".into()));
+        let change = SlackMessageEvent::new(origin.clone(), SlackMessageSender::new())
+            .with_subtype(SlackMessageEventType::MessageChanged)
+            .with_message(edited);
+        let SlackInbound::Edited { channel, ts, text } = edit_or_delete(&change).expect("edit")
+        else {
+            panic!("edit");
+        };
+        assert_eq!(channel, "C1");
+        assert_eq!(ts, "1700000001.000100");
+        assert_eq!(text, "first, edited");
+
+        let delete = SlackMessageEvent::new(origin, SlackMessageSender::new())
+            .with_subtype(SlackMessageEventType::MessageDeleted)
+            .with_deleted_ts("1700000001.000100".into());
+        let SlackInbound::Deleted { channel, ts } = edit_or_delete(&delete).expect("delete") else {
+            panic!("delete");
+        };
+        assert_eq!(channel, "C1");
+        assert_eq!(ts, "1700000001.000100");
+    }
 
     #[test]
     fn thread_broadcast_stays_and_a_plain_reply_does_not() {

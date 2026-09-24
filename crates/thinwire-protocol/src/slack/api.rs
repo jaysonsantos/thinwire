@@ -203,6 +203,17 @@ pub trait SlackWebApi: Send + Sync + 'static {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlackInbound {
     Message(SlackPost),
+    /// `message_changed`: replace the body of an existing row.
+    Edited {
+        channel: String,
+        ts: String,
+        text: String,
+    },
+    /// `message_deleted`: drop the row.
+    Deleted {
+        channel: String,
+        ts: String,
+    },
     /// The app was uninstalled or the token was revoked.
     Revoked,
 }
