@@ -9,6 +9,11 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Unbounded event sink from a worker into the UI poller.
 pub type EventTx = UnboundedSender<AdapterEvent>;
 
+/// Telegram login epoch. The host bumps it on the UI thread when it sends
+/// Telegram `Disconnect` or `Shutdown`; a worker stamps its login events with
+/// the value it started with. The host drops stale ones (issue #42).
+pub(crate) type LoginEpoch = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
 /// v1 protocol identifiers (S2: Signal is out of v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolId {
@@ -208,8 +213,12 @@ pub enum AdapterCommand {
         mode: DiscordAuthMode,
     },
     /// Advances the Telegram login screens. Secrets stay in the secret vault.
+    /// `epoch` is the login client this step was sent for. The host fills it.
+    /// A step from an older epoch is ignored: Cancel may already have cleared
+    /// the secrets.
     TelegramAuth {
         step: TelegramAuthStep,
+        epoch: u64,
     },
     /// Load another page of the main chat list. No secrets.
     LoadChats {
@@ -300,6 +309,13 @@ pub enum AdapterEvent {
     /// A live session ended without a request from this app (remote logout,
     /// or the session was revoked). The client closes; a new login follows.
     TelegramSessionEnded,
+    /// A login event stamped with its client's login epoch. Internal: the host
+    /// unwraps it in `poll_events` and drops it when the epoch is stale, so the
+    /// UI never sees this variant.
+    Login {
+        epoch: u64,
+        event: Box<AdapterEvent>,
+    },
     /// Telegram sent a login code. Sent just before the `NeedCode` phase.
     TelegramCodeSent {
         via: TelegramCodeVia,
@@ -381,6 +397,29 @@ pub enum AdapterEvent {
         /// Link generation that produced this payload. Stale generations are dropped.
         generation: u64,
     },
+}
+
+impl AdapterEvent {
+    /// The protocol of an inbox event: chats, messages, sends, and list
+    /// loads. `None` for login, status, and session events. A frontend drops
+    /// an inbox event of an account that is not linked (PR #49 review).
+    #[must_use]
+    pub fn inbox_protocol(&self) -> Option<ProtocolId> {
+        match self {
+            Self::ConversationUpsert { conversation } => Some(conversation.protocol),
+            Self::MessageReceived { message } => Some(message.protocol),
+            Self::ConversationRemoved { protocol, .. }
+            | Self::MessageReplaced { protocol, .. }
+            | Self::MessageBody { protocol, .. }
+            | Self::MessagesRemoved { protocol, .. }
+            | Self::SendAccepted { protocol, .. }
+            | Self::SendRejected { protocol, .. }
+            | Self::MessageDelivery { protocol, .. }
+            | Self::ChatListLoaded { protocol }
+            | Self::HistoryLoaded { protocol, .. } => Some(*protocol),
+            _ => None,
+        }
+    }
 }
 
 /// Pairing material shown only on the experimental WhatsApp screen.
@@ -516,16 +555,6 @@ pub(crate) fn emit_conversation(events: &EventTx, conversation: Conversation) {
 pub(crate) fn emit_message(events: &EventTx, message: ChatMessage) {
     let _ = events.send(AdapterEvent::MessageReceived { message });
 }
-
-pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
-    let _ = events.send(AdapterEvent::TelegramAuth { phase });
-}
-
-#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_telegram_auth_rejected(events: &EventTx, error: TelegramAuthError) {
-    let _ = events.send(AdapterEvent::TelegramAuthRejected { error });
-}
-
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 pub(crate) fn emit_telegram_session_ended(events: &EventTx) {
     let _ = events.send(AdapterEvent::TelegramSessionEnded);
@@ -538,11 +567,6 @@ pub(crate) fn emit_telegram_data_reset(events: &EventTx, moved_to: &str) {
     let _ = events.send(AdapterEvent::TelegramDataReset {
         moved_to: name.to_string(),
     });
-}
-
-#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_telegram_code_sent(events: &EventTx, via: TelegramCodeVia) {
-    let _ = events.send(AdapterEvent::TelegramCodeSent { via });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
@@ -668,4 +692,43 @@ pub(crate) fn emit_history_loaded(
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 pub(crate) fn emit_flush_secrets(events: &EventTx) {
     let _ = events.send(AdapterEvent::FlushSecrets);
+}
+
+#[cfg(test)]
+mod inbox_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn inbox_events_name_their_protocol_and_login_events_do_not() {
+        assert_eq!(
+            AdapterEvent::ChatListLoaded {
+                protocol: ProtocolId::Telegram
+            }
+            .inbox_protocol(),
+            Some(ProtocolId::Telegram)
+        );
+        assert_eq!(
+            AdapterEvent::ConversationRemoved {
+                protocol: ProtocolId::Slack,
+                id: "slack:1".into(),
+            }
+            .inbox_protocol(),
+            Some(ProtocolId::Slack)
+        );
+        assert_eq!(
+            AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::Ready
+            }
+            .inbox_protocol(),
+            None
+        );
+        assert_eq!(AdapterEvent::TelegramSessionEnded.inbox_protocol(), None);
+        assert_eq!(
+            AdapterEvent::Stopped {
+                protocol: ProtocolId::Telegram
+            }
+            .inbox_protocol(),
+            None
+        );
+    }
 }

@@ -125,6 +125,7 @@ async fn telegram_unavailable_auth_emits_phases_without_secrets_on_the_wire() {
             .handle(
                 AdapterCommand::TelegramAuth {
                     step: TelegramAuthStep::ApiCredentials,
+                    epoch: 0,
                 },
                 &tx,
             )
@@ -133,6 +134,7 @@ async fn telegram_unavailable_auth_emits_phases_without_secrets_on_the_wire() {
             .handle(
                 AdapterCommand::TelegramAuth {
                     step: TelegramAuthStep::Phone,
+                    epoch: 0,
                 },
                 &tx,
             )
@@ -141,6 +143,7 @@ async fn telegram_unavailable_auth_emits_phases_without_secrets_on_the_wire() {
             .handle(
                 AdapterCommand::TelegramAuth {
                     step: TelegramAuthStep::Code,
+                    epoch: 0,
                 },
                 &tx,
             )
@@ -149,6 +152,7 @@ async fn telegram_unavailable_auth_emits_phases_without_secrets_on_the_wire() {
             .handle(
                 AdapterCommand::TelegramAuth {
                     step: TelegramAuthStep::TwoFactor,
+                    epoch: 0,
                 },
                 &tx,
             )
@@ -162,6 +166,11 @@ async fn telegram_unavailable_auth_emits_phases_without_secrets_on_the_wire() {
         assert!(!debug.contains("hash-value"), "{debug}");
         assert!(!debug.contains("+15551234567"), "{debug}");
         assert!(!debug.contains("12345"), "{debug}");
+        // Login phases carry the step's epoch; the host unwraps them.
+        let event = match event {
+            AdapterEvent::Login { event, .. } => *event,
+            other => other,
+        };
         if let AdapterEvent::TelegramAuth { phase } = event {
             phases.push(phase);
         }

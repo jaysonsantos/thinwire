@@ -396,6 +396,12 @@ impl Snapshot {
     }
 
     pub(crate) fn apply(&mut self, event: AdapterEvent) {
+        // Telegram inbox events come only after Ready. One that arrives while
+        // Telegram is not linked is from a cancelled or ended client, for
+        // example queued before Cancel: drop it (PR #49 review).
+        if event.inbox_protocol() == Some(ProtocolId::Telegram) && !self.telegram_authorized {
+            return;
+        }
         match event {
             AdapterEvent::Status {
                 protocol,
@@ -479,6 +485,8 @@ impl Snapshot {
             AdapterEvent::Stopped { protocol } => {
                 self.stopped.insert(protocol);
             }
+            // Internal: the host unwraps stamped login events in poll_events.
+            AdapterEvent::Login { .. } => {}
             AdapterEvent::ChatListLoaded { protocol } => {
                 if protocol == ProtocolId::Telegram {
                     self.chat_list_loading = false;
@@ -1346,7 +1354,9 @@ impl Snapshot {
     }
 
     fn queue_telegram_step(&mut self, step: TelegramAuthStep) {
-        self.pending.push(AdapterCommand::TelegramAuth { step });
+        // The host replaces `epoch` with the login client this step belongs to.
+        self.pending
+            .push(AdapterCommand::TelegramAuth { step, epoch: 0 });
     }
 
     fn mark_auth_busy(&mut self, status: &str) {
@@ -1697,7 +1707,8 @@ mod tests {
                 matches!(
                     command,
                     AdapterCommand::TelegramAuth {
-                        step: TelegramAuthStep::ApiCredentials
+                        step: TelegramAuthStep::ApiCredentials,
+                        epoch: 0
                     }
                 )
             })
@@ -1725,7 +1736,8 @@ mod tests {
         assert!(matches!(
             commands[0],
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::ApiCredentials
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
             }
         ));
         let debug = format!("{commands:?}");
@@ -2182,10 +2194,36 @@ mod tests {
             .take_commands()
             .into_iter()
             .filter_map(|command| match command {
-                AdapterCommand::TelegramAuth { step } => Some(step),
+                // Any epoch: the host stamps the real one later (PR #49 review).
+                AdapterCommand::TelegramAuth { step, epoch: _ } => Some(step),
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn auth_steps_sees_a_step_with_any_epoch() {
+        let mut snapshot = Snapshot::new();
+        snapshot.pending.push(AdapterCommand::TelegramAuth {
+            step: TelegramAuthStep::Phone,
+            epoch: 3,
+        });
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::Phone],
+            "a non-zero epoch must not vanish from the helper"
+        );
+        // The snapshot itself queues epoch 0; AdapterHost::send stamps the real one.
+        let store = SecretStore::memory();
+        seed_override(&store);
+        snapshot.open_telegram(&store);
+        assert!(snapshot.take_commands().iter().any(|command| matches!(
+            command,
+            AdapterCommand::TelegramAuth {
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
+            }
+        )));
     }
 
     fn at_phone_step(store: &SecretStore) -> Snapshot {
@@ -2627,7 +2665,8 @@ mod tests {
                         protocol: ProtocolId::Telegram
                     },
                     AdapterCommand::TelegramAuth {
-                        step: TelegramAuthStep::ApiCredentials
+                        step: TelegramAuthStep::ApiCredentials,
+                        epoch: 0
                     }
                 ]
             ),
@@ -2731,6 +2770,7 @@ mod tests {
     fn a_live_session_hides_add_account_and_cancel_keeps_it() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
+        store.set_secret(SecretKey::Session, "live-session");
         assert!(snapshot.telegram_ready());
         assert!(!snapshot.can_add_account(), "one Telegram account (ux F8)");
         snapshot.open_add_account(&store);
@@ -2754,7 +2794,12 @@ mod tests {
                 .take_commands()
                 .iter()
                 .any(|command| matches!(command, AdapterCommand::Disconnect { .. })),
-            "no Disconnect on a live session"
+            "no Disconnect on a live session, so the worker never logs out"
+        );
+        assert_eq!(
+            store.get(SecretKey::Session).expect("read").as_deref(),
+            Some("live-session"),
+            "the session marker stays"
         );
         assert_eq!(
             snapshot.visible_conversations().len(),
@@ -3195,7 +3240,8 @@ mod tests {
         assert!(commands.iter().any(|c| matches!(
             c,
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::ApiCredentials
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
             }
         )));
         assert!(!format!("{commands:?}").contains("publisher-hash"));
@@ -3283,7 +3329,7 @@ mod tests {
     fn telegram_flow_stores_secrets_and_lands_in_inbox() {
         let store = SecretStore::memory();
         let mut snapshot = Snapshot::new();
-        snapshot.apply(AdapterEvent::ConversationUpsert {
+        let saved = AdapterEvent::ConversationUpsert {
             conversation: Conversation {
                 protocol: ProtocolId::Telegram,
                 id: "telegram:saved".into(),
@@ -3295,10 +3341,17 @@ mod tests {
                 last_at: 0,
                 is_group: false,
             },
-        });
+        };
+        // A row before Ready is from a cancelled or ended client: dropped.
+        snapshot.apply(saved.clone());
+        assert!(
+            snapshot.conversations.is_empty(),
+            "not kept (PR #49 review)"
+        );
         assert!(snapshot.visible_conversations().is_empty());
         assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 0);
         complete_telegram(&mut snapshot, &store);
+        snapshot.apply(saved);
         assert!(snapshot.has_primary_account());
         assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
         assert_eq!(
@@ -3324,19 +3377,22 @@ mod tests {
         assert!(commands.iter().any(|c| matches!(
             c,
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::ApiCredentials
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
             }
         )));
         assert!(commands.iter().any(|c| matches!(
             c,
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::TwoFactor
+                step: TelegramAuthStep::TwoFactor,
+                epoch: 0
             }
         )));
         assert!(!commands.iter().any(|c| matches!(
             c,
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::Complete
+                step: TelegramAuthStep::Complete,
+                epoch: 0
             }
         )));
         let debug = format!("{commands:?}");
@@ -3653,6 +3709,7 @@ mod tests {
     #[test]
     fn search_v1_matches_title_and_participant_only() {
         let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: Conversation {
                 protocol: ProtocolId::Telegram,
@@ -3917,6 +3974,7 @@ mod tests {
     #[test]
     fn messages_upsert_replace_and_body_edits_keep_sender() {
         let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
         snapshot.selected_protocol = ProtocolId::Telegram;
         snapshot.selected_conversation = Some("telegram:4".into());
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -3994,8 +4052,52 @@ mod tests {
     }
 
     #[test]
+    fn inbox_events_queued_before_cancel_leave_no_rows() {
+        // The worker linked, then the user pressed Cancel before the UI polled
+        // Ready. The host drops the stamped Ready. The chat rows and messages
+        // queued after it arrive unstamped: the snapshot drops them.
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        seed_override(&store);
+        snapshot.open_telegram(&store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        snapshot.cancel_auth(&store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(4, "Ada", 9),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:4".into(),
+                id: "telegram:4:1".into(),
+                sender: "Ada".into(),
+                body: "from the cancelled account".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 0,
+            },
+        });
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        assert!(snapshot.conversations.is_empty());
+        assert!(snapshot.messages.is_empty());
+
+        // A different account that links later starts with no old rows.
+        complete_telegram(&mut snapshot, &store);
+        assert!(snapshot.visible_conversations().is_empty());
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(5, "Bob", 3),
+        });
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+    }
+
+    #[test]
     fn deleted_message_ids_leave_the_thread() {
         let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
         snapshot.selected_protocol = ProtocolId::Telegram;
         snapshot.selected_conversation = Some("telegram:4".into());
         for (id, body) in [("telegram:4:1", "keep"), ("telegram:4:2", "drop")] {

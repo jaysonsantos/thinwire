@@ -32,9 +32,9 @@ pub use inbox::parse_telegram_chat_id;
 #[cfg(test)]
 use super::adapter::TelegramCodeVia;
 use super::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, EventTx, ProtocolAdapter, ProtocolCapabilities,
-    ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep, emit_flush_secrets,
-    emit_send_rejected, emit_status, emit_telegram_auth,
+    AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
+    ProtocolCapabilities, ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep,
+    emit_flush_secrets, emit_send_rejected, emit_status,
 };
 use super::secrets::TelegramSecretVault;
 
@@ -59,6 +59,8 @@ pub struct TelegramAdapter {
     secrets: Arc<dyn TelegramSecretVault>,
     api_source: TelegramApiSource,
     engine: TelegramAuthEngine,
+    /// Host login epoch. A step sent under an older value is ignored.
+    login_epoch: super::adapter::LoginEpoch,
     #[cfg(feature = "telegram-tdlib")]
     tdlib: tdlib::TdlibRuntime,
 }
@@ -74,12 +76,24 @@ impl TelegramAdapter {
         secrets: Arc<dyn TelegramSecretVault>,
         api_source: TelegramApiSource,
     ) -> Self {
+        Self::with_login_epoch(secrets, api_source, std::sync::Arc::default())
+    }
+
+    /// The host's adapter: it shares the host's login epoch, so a step queued
+    /// before Cancel is ignored, and login events of that client are dropped.
+    #[must_use]
+    pub(crate) fn with_login_epoch(
+        secrets: Arc<dyn TelegramSecretVault>,
+        api_source: TelegramApiSource,
+        login_epoch: super::adapter::LoginEpoch,
+    ) -> Self {
         Self {
             secrets,
             api_source,
             engine: TelegramAuthEngine::new(),
+            login_epoch: std::sync::Arc::clone(&login_epoch),
             #[cfg(feature = "telegram-tdlib")]
-            tdlib: tdlib::TdlibRuntime::new(),
+            tdlib: tdlib::TdlibRuntime::with_login_epoch(login_epoch),
         }
     }
 
@@ -112,15 +126,30 @@ impl TelegramAdapter {
     fn handle_auth(
         &mut self,
         step: TelegramAuthStep,
+        epoch: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
+        // Cancel bumps the epoch and clears the secrets before this command
+        // is dequeued. Running it would emit an unstamped `Failed` (the phone
+        // or code is already gone) onto the cancelled screen or the next login.
+        if epoch != self.login_epoch.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
         let phase = match self
             .engine
             .submit(step, self.secrets.as_ref(), &self.api_source)
         {
             Ok(phase) => phase,
             Err(error) => {
-                emit_telegram_auth(events, TelegramAuthPhase::Failed);
+                // Cancel can clear the phone or code between the check above
+                // and here. Stamp the failure with the step's epoch: the host
+                // drops it at delivery if Cancel moved the epoch (PR #49 review).
+                let _ = events.send(AdapterEvent::Login {
+                    epoch,
+                    event: Box::new(AdapterEvent::TelegramAuth {
+                        phase: TelegramAuthPhase::Failed,
+                    }),
+                });
                 return Err(error);
             }
         };
@@ -137,7 +166,10 @@ impl TelegramAdapter {
         }
         #[cfg(not(feature = "telegram-tdlib"))]
         {
-            emit_telegram_auth(events, phase);
+            let _ = events.send(AdapterEvent::Login {
+                epoch,
+                event: Box::new(AdapterEvent::TelegramAuth { phase }),
+            });
             emit_status(
                 events,
                 ProtocolId::Telegram,
@@ -199,7 +231,7 @@ impl ProtocolAdapter for TelegramAdapter {
 
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         match command {
-            AdapterCommand::TelegramAuth { step } => self.handle_auth(step, events),
+            AdapterCommand::TelegramAuth { step, epoch } => self.handle_auth(step, epoch, events),
             AdapterCommand::Connect {
                 protocol: ProtocolId::Telegram,
             } => {
@@ -430,6 +462,14 @@ mod tests {
     use crate::AdapterEvent;
     use crate::secrets::{MemorySecretVault, TelegramSecretKey};
 
+    /// A login phase carries its step's epoch; the host unwraps it.
+    fn unstamp(event: AdapterEvent) -> AdapterEvent {
+        match event {
+            AdapterEvent::Login { event, .. } => *event,
+            other => other,
+        }
+    }
+
     #[test]
     fn default_build_uses_compile_safe_unavailable_path() {
         assert_eq!(
@@ -464,13 +504,14 @@ mod tests {
             .handle(
                 AdapterCommand::TelegramAuth {
                     step: TelegramAuthStep::ApiCredentials,
+                    epoch: 0,
                 },
                 &tx,
             )
             .expect("auth step");
         let mut saw_phase = false;
         while let Ok(event) = rx.try_recv() {
-            match event {
+            match unstamp(event) {
                 AdapterEvent::TelegramAuth { phase } => {
                     assert_eq!(phase, TelegramAuthPhase::NeedPhone);
                     saw_phase = true;
@@ -489,7 +530,8 @@ mod tests {
         let debug = format!(
             "{:?}",
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::ApiCredentials
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
             }
         );
         assert!(debug.contains("ApiCredentials"));
@@ -525,9 +567,9 @@ mod tests {
         ];
         for (step, expected) in steps {
             adapter
-                .handle(AdapterCommand::TelegramAuth { step }, &tx)
+                .handle(AdapterCommand::TelegramAuth { step, epoch: 0 }, &tx)
                 .expect("step");
-            let event = rx.try_recv().expect("phase event");
+            let event = unstamp(rx.try_recv().expect("phase event"));
             match event {
                 AdapterEvent::TelegramAuth { phase } => assert_eq!(phase, expected),
                 other => panic!("expected phase, got {other:?}"),
@@ -632,16 +674,16 @@ mod tests {
         let src = include_str!("tdlib.rs");
         let steps = fn_body(src, "async fn apply_step");
         assert_eq!(
-            steps.matches("reject_step(events, &error)").count(),
+            steps.matches("reject_step(&login, &error)").count(),
             4,
             "phone, code, resend code, password"
         );
         let reject = fn_body(src, "fn reject_step");
         assert!(reject.contains("auth_error_from_tdlib(error.code, &error.message)"));
-        assert!(reject.contains("emit_telegram_auth_rejected"));
+        assert!(reject.contains("login.rejected(reason)"));
         assert!(reject.contains("TelegramAuthPhase::Failed"));
         let auth = fn_body(src, "async fn apply_authorization");
-        assert!(auth.contains("emit_telegram_code_sent(events, code_via("));
+        assert!(auth.contains("login.code_sent(code_via("));
         let via = fn_body(src, "fn code_via");
         assert!(via.contains("Kind::SmsWord(_) | Kind::SmsPhrase(_) => TelegramCodeVia::SmsWord"));
         assert!(TelegramCodeVia::Sms.digits_only());
@@ -783,7 +825,7 @@ mod tests {
         assert!(check < key, "check the vault before a new key is made");
         assert!(params.contains("data_dir::is_wrong_key_error(error.code, &error.message)"));
         assert!(params.contains("&& moved_to.is_none()"), "retry once only");
-        assert!(params.contains("emit_telegram_data_reset(events, name)"));
+        assert!(params.contains("login.data_reset(name)"));
         assert!(
             !src.contains("remove_dir_all"),
             "old data is moved, never deleted"
@@ -869,7 +911,7 @@ mod tests {
         );
         let worker = fn_body(src, "fn spawn_tdlib_worker");
         assert!(
-            worker.contains("live.closing = true;"),
+            worker.contains("live.closing.mark();"),
             "our Close is not a logout"
         );
         let dropped = worker.find("drop(commands);").expect("drop");
@@ -891,7 +933,7 @@ mod tests {
         let arm = &arm[..arm.find("TelegramAuthStep::Code").expect("next arm")];
         assert!(arm.contains("functions::resend_authentication_code("));
         assert!(arm.contains("ResendCodeReason::UserRequest"));
-        assert!(arm.contains("reject_step(events, &error)"));
+        assert!(arm.contains("reject_step(&login, &error)"));
         assert!(!arm.contains("set_authentication_phone_number"));
         if uses_tdlib_hook() {
             return;
@@ -905,14 +947,18 @@ mod tests {
             .handle(
                 AdapterCommand::TelegramAuth {
                     step: TelegramAuthStep::ResendCode,
+                    epoch: 0,
                 },
                 &tx,
             )
             .expect("resend");
         assert_eq!(
             rx.try_recv().expect("phase"),
-            AdapterEvent::TelegramAuth {
-                phase: TelegramAuthPhase::NeedCode
+            AdapterEvent::Login {
+                epoch: 0,
+                event: Box::new(AdapterEvent::TelegramAuth {
+                    phase: TelegramAuthPhase::NeedCode
+                }),
             }
         );
     }
@@ -982,6 +1028,135 @@ mod tests {
         assert_eq!(
             TelegramSecretVault::tdlib_folder_name(&MemorySecretVault::new()),
             crate::secrets::TDLIB_FOLDER
+        );
+    }
+
+    #[test]
+    fn a_closing_client_sends_no_login_updates_after_cancel() {
+        let src = include_str!("tdlib.rs");
+        let stop = &src[src.find("pub fn stop(").expect("stop")
+            ..src.find("pub fn shutdown(").expect("shutdown")];
+        let mark = stop.find("closing.mark()").expect("stop marks the client");
+        let close = stop.find("TdlibCommand::Close").expect("then queues Close");
+        assert!(
+            mark < close,
+            "no login event after Cancel, even before Close is read"
+        );
+        let auth = fn_body(src, "async fn apply_authorization");
+        assert!(
+            !auth.contains("emit_telegram_auth("),
+            "every login event is gated"
+        );
+        let ready = &auth[auth.find("AuthorizationState::Ready").expect("ready")..];
+        let guard = ready.find("if !login.open()").expect("ready guard");
+        let marker = ready.find("TDLIB_SESSION_MARKER").expect("marker");
+        assert!(
+            guard < marker,
+            "a closing client does not link or save a session"
+        );
+        for body in [
+            "async fn apply_step",
+            "fn reject_step",
+            "async fn set_parameters",
+        ] {
+            let body = fn_body(src, body);
+            assert!(!body.contains("emit_telegram_auth("), "{body}");
+            assert!(!body.contains("emit_telegram_auth_rejected("));
+        }
+    }
+
+    #[test]
+    fn a_step_that_fails_after_cancel_cleared_its_secret_is_dropped_at_delivery() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let vault = Arc::new(MemorySecretVault::new());
+        vault.set_secret(TelegramSecretKey::ApiId, "11111");
+        vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+        let epoch = Arc::new(AtomicU64::new(0));
+        let mut adapter = TelegramAdapter::with_login_epoch(
+            Arc::clone(&vault) as Arc<dyn TelegramSecretVault>,
+            TelegramApiSource::from_build(),
+            Arc::clone(&epoch),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // The step passed the epoch check; then Cancel cleared the phone.
+        let result = adapter.handle(
+            AdapterCommand::TelegramAuth {
+                step: TelegramAuthStep::Phone,
+                epoch: 0,
+            },
+            &tx,
+        );
+        assert!(result.is_err(), "the phone is gone");
+        let failed = rx.try_recv().expect("a failure event");
+        assert!(
+            matches!(failed, AdapterEvent::Login { epoch: 0, .. }),
+            "stamped with the step's epoch, not raw: {failed:?}"
+        );
+        // Cancel's bump then makes the host drop it at delivery.
+        epoch.fetch_add(1, Ordering::SeqCst);
+        let AdapterEvent::Login { epoch: stamped, .. } = failed else {
+            unreachable!()
+        };
+        assert_ne!(stamped, epoch.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn ready_side_effects_stop_at_cancel_and_roll_back_after_it() {
+        let src = include_str!("tdlib.rs");
+        // Inbox events stop at the worker once Cancel moves the epoch.
+        let linked = &src[src.find("fn linked(&self)").expect("linked")..];
+        let linked = &linked[..linked.find("\n    }").expect("end")];
+        assert!(linked.contains("self.authorized && self.closing.current()"));
+        assert!(fn_body(src, "fn apply_chat_update").contains("let emit = live.linked();"));
+        assert!(src.contains("load_main_chats(client_id, live.linked(), &events)"));
+        assert!(
+            !src.contains("if !live.authorized"),
+            "every inbox gate uses linked()"
+        );
+        let auth = fn_body(src, "async fn apply_authorization");
+        let ready = &auth[auth.find("AuthorizationState::Ready").expect("ready")..];
+        let ready = &ready[..ready
+            .find("AuthorizationState::WaitEmailAddress")
+            .expect("next arm")];
+        let first_check = ready.find("if !login.open()").expect("check");
+        let marker = ready.find("TDLIB_SESSION_MARKER").expect("marker");
+        let load = ready.find("load_main_chats(").expect("chat load");
+        assert!(first_check < marker);
+        assert!(
+            ready[marker..load].contains("if !login.open()"),
+            "checked again right before the chat load"
+        );
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        let close = &worker[worker
+            .find("TdlibCommand::Close { cancel }")
+            .expect("close")..];
+        assert!(close.contains("let signed_in = live.authorized || live.late_ready;"));
+        assert!(close.contains("close_kind(signed_in, live.new_login, cancel)"));
+        let skip = &ready[..marker];
+        assert!(skip.contains("late_ready(live.new_login, live.close_cancel)"));
+        assert!(skip.contains("LateReady::Wait => live.late_ready = true"));
+        assert!(skip.contains("LateReady::LogOut => request_log_out(client_id).await"));
+        let auth_states = &auth[..auth.find("AuthorizationState::Ready").expect("ready")];
+        for state in [
+            "WaitPhoneNumber =>",
+            "WaitCode(state) =>",
+            "WaitPassword(_) =>",
+        ] {
+            let arm = &auth_states[auth_states.find(state).expect(state)..];
+            let arm = &arm[..arm.find("login.phase(").expect("phase")];
+            assert!(arm.contains("live.new_login = true"), "{state}");
+        }
+        assert!(
+            !ready.contains("new_login = true"),
+            "a resumed session goes straight to Ready and is never logged out"
+        );
+        assert!(close.contains("set_secret(TelegramSecretKey::Session, \"\")"));
+        assert!(close.contains("request_log_out(client_id)"));
+        assert!(fn_body(src, "async fn request_log_out").contains("functions::log_out"));
+        let shutdown = &src[src.find("pub fn shutdown(").expect("shutdown")..];
+        assert!(
+            shutdown.contains("self.stop_client(false)"),
+            "shutdown keeps the session"
         );
     }
 
@@ -1138,6 +1313,7 @@ mod tests {
             .handle(
                 AdapterCommand::TelegramAuth {
                     step: TelegramAuthStep::ApiCredentials,
+                    epoch: 0,
                 },
                 &tx,
             )
@@ -1245,6 +1421,61 @@ mod tests {
     }
 
     #[test]
+    fn a_step_queued_before_cancel_does_not_emit_a_failure() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let epoch = Arc::new(AtomicU64::new(0));
+        let vault = Arc::new(MemorySecretVault::new());
+        vault.set_secret(TelegramSecretKey::ApiId, "11111");
+        vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+        vault.set_secret(TelegramSecretKey::Phone, "+15551234567");
+        let mut adapter = TelegramAdapter::with_login_epoch(
+            Arc::clone(&vault) as Arc<dyn TelegramSecretVault>,
+            TelegramApiSource::from_build(),
+            Arc::clone(&epoch),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Cancel cleared the phone and bumped the epoch before this step ran.
+        vault.set_secret(TelegramSecretKey::Phone, "");
+        epoch.store(1, Ordering::SeqCst);
+        adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::Phone,
+                    epoch: 0,
+                },
+                &tx,
+            )
+            .expect("stale step is ignored");
+        assert!(
+            rx.try_recv().is_err(),
+            "no Failed and no error status from a cancelled step"
+        );
+
+        let err = adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::Phone,
+                    epoch: 1,
+                },
+                &tx,
+            )
+            .expect_err("the current client still reports a missing phone");
+        assert!(err.to_string().contains("phone"));
+        assert!(!err.to_string().contains("+1555"));
+        match rx.try_recv().expect("failed phase") {
+            AdapterEvent::Login { epoch: 1, event }
+                if matches!(
+                    *event,
+                    AdapterEvent::TelegramAuth {
+                        phase: TelegramAuthPhase::Failed
+                    }
+                ) => {}
+            other => panic!("expected Failed stamped with epoch 1, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn nonnumeric_api_id_emits_failed_phase() {
         let vault = Arc::new(MemorySecretVault::new());
         vault.set_secret(TelegramSecretKey::ApiId, "not-a-number");
@@ -1255,6 +1486,7 @@ mod tests {
             .handle(
                 AdapterCommand::TelegramAuth {
                     step: TelegramAuthStep::ApiCredentials,
+                    epoch: 0,
                 },
                 &tx,
             )
@@ -1263,10 +1495,14 @@ mod tests {
         assert!(!err.to_string().contains("not-a-number"));
         let event = rx.try_recv().expect("failed phase");
         match event {
-            AdapterEvent::TelegramAuth {
-                phase: TelegramAuthPhase::Failed,
-            } => {}
-            other => panic!("expected Failed, got {other:?}"),
+            AdapterEvent::Login { epoch: 0, event }
+                if matches!(
+                    *event,
+                    AdapterEvent::TelegramAuth {
+                        phase: TelegramAuthPhase::Failed
+                    }
+                ) => {}
+            other => panic!("expected Failed stamped with epoch 0, got {other:?}"),
         }
     }
 }
