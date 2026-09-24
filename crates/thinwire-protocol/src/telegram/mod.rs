@@ -1120,7 +1120,21 @@ mod tests {
         let close = &worker[worker
             .find("TdlibCommand::Close { cancel }")
             .expect("close")..];
-        assert!(close.contains("close_kind(live.authorized, cancel)"));
+        assert!(close.contains("close_kind(live.authorized, live.new_login, cancel)"));
+        let auth_states = &auth[..auth.find("AuthorizationState::Ready").expect("ready")];
+        for state in [
+            "WaitPhoneNumber =>",
+            "WaitCode(state) =>",
+            "WaitPassword(_) =>",
+        ] {
+            let arm = &auth_states[auth_states.find(state).expect(state)..];
+            let arm = &arm[..arm.find("login.phase(").expect("phase")];
+            assert!(arm.contains("live.new_login = true"), "{state}");
+        }
+        assert!(
+            !ready.contains("new_login = true"),
+            "a resumed session goes straight to Ready and is never logged out"
+        );
         assert!(close.contains("set_secret(TelegramSecretKey::Session, \"\")"));
         assert!(close.contains("request_log_out(client_id)"));
         assert!(fn_body(src, "async fn request_log_out").contains("functions::log_out"));

@@ -2762,6 +2762,7 @@ mod tests {
     fn a_live_session_hides_add_account_and_cancel_keeps_it() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
+        store.set_secret(SecretKey::Session, "live-session");
         assert!(snapshot.telegram_ready());
         assert!(!snapshot.can_add_account(), "one Telegram account (ux F8)");
         snapshot.open_add_account(&store);
@@ -2785,7 +2786,12 @@ mod tests {
                 .take_commands()
                 .iter()
                 .any(|command| matches!(command, AdapterCommand::Disconnect { .. })),
-            "no Disconnect on a live session"
+            "no Disconnect on a live session, so the worker never logs out"
+        );
+        assert_eq!(
+            store.get(SecretKey::Session).expect("read").as_deref(),
+            Some("live-session"),
+            "the session marker stays"
         );
         assert_eq!(
             snapshot.visible_conversations().len(),

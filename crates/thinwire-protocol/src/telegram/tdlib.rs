@@ -68,6 +68,9 @@ const SHUTDOWN_LIMIT: Duration = Duration::from_secs(4);
 
 struct LiveInbox {
     authorized: bool,
+    /// This worker asked for a phone, code, or password step. Only such a
+    /// login is rolled back on Cancel; a resumed session never is (ux F8).
+    new_login: bool,
     /// This app asked TDLib to close (shutdown, Cancel, Try again). The runtime
     /// sets it before the worker reads `Close`. A close without it came from
     /// elsewhere, for example a remote logout.
@@ -385,6 +388,7 @@ fn spawn_tdlib_worker(
 
         let mut live = LiveInbox {
             authorized: false,
+            new_login: false,
             closing: closing.clone(),
             close_requested: false,
             ended_elsewhere: false,
@@ -412,7 +416,7 @@ fn spawn_tdlib_worker(
                             }
                             live.close_requested = true;
                             live.closing.mark();
-                            match close_kind(live.authorized, cancel) {
+                            match close_kind(live.authorized, live.new_login, cancel) {
                                 CloseKind::LogOut => {
                                     // Ready ran before Cancel, but the UI dropped
                                     // it: do not keep that session (PR #49 review).
@@ -670,6 +674,7 @@ async fn apply_authorization(
             set_parameters(client_id, secrets, source, events, &live.closing).await;
         }
         tdlib_rs::enums::AuthorizationState::WaitPhoneNumber => {
+            live.new_login = true;
             // A saved session that lands here expired or was revoked. Drop the
             // marker so the next launch does not try to resume it again.
             if secrets.get_secret(TelegramSecretKey::Session).is_some() {
@@ -685,6 +690,7 @@ async fn apply_authorization(
             );
         }
         tdlib_rs::enums::AuthorizationState::WaitCode(state) => {
+            live.new_login = true;
             login.code_sent(code_via(&state.code_info.r#type));
             login.phase(TelegramAuthPhase::NeedCode);
             emit_status(
@@ -695,6 +701,7 @@ async fn apply_authorization(
             );
         }
         tdlib_rs::enums::AuthorizationState::WaitPassword(_) => {
+            live.new_login = true;
             login.phase(TelegramAuthPhase::NeedTwoFactor);
             emit_status(
                 events,

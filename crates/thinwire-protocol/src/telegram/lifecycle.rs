@@ -113,14 +113,18 @@ impl<'a> LoginEvents<'a> {
 pub(super) enum CloseKind {
     /// Keep the session (app shutdown, or not signed in).
     Close,
-    /// Cancel reached a client that already became Ready, but the UI dropped
-    /// that Ready: roll back. Clear the session marker and log out.
+    /// Cancel reached a client that became Ready from a login in this worker
+    /// (phone, code, or password step), but the UI dropped that Ready: roll
+    /// back. Clear the session marker and log out.
     LogOut,
 }
 
+/// `new_login` is true only when this worker asked for a login step before
+/// Ready. A resumed saved session never asks, so a Cancel that races its
+/// Ready never logs it out (ux F8: Cancel does not end a live session).
 #[must_use]
-pub(super) const fn close_kind(authorized: bool, cancel: bool) -> CloseKind {
-    if authorized && cancel {
+pub(super) const fn close_kind(authorized: bool, new_login: bool, cancel: bool) -> CloseKind {
+    if authorized && new_login && cancel {
         CloseKind::LogOut
     } else {
         CloseKind::Close
@@ -314,18 +318,26 @@ mod tests {
 
     #[test]
     fn only_a_cancelled_signed_in_client_is_rolled_back() {
-        assert_eq!(close_kind(true, true), CloseKind::LogOut);
+        assert_eq!(close_kind(true, true, true), CloseKind::LogOut);
         assert_eq!(
-            close_kind(true, false),
+            close_kind(true, true, false),
             CloseKind::Close,
             "shutdown keeps the session"
         );
         assert_eq!(
-            close_kind(false, true),
+            close_kind(false, true, true),
             CloseKind::Close,
             "nothing to roll back"
         );
-        assert_eq!(close_kind(false, false), CloseKind::Close);
+        assert_eq!(close_kind(false, false, false), CloseKind::Close);
+    }
+
+    #[test]
+    fn cancel_never_logs_out_a_resumed_session() {
+        // A saved session goes to Ready with no login step. A Cancel that
+        // races that Ready closes the client and keeps the session (ux F8).
+        assert_eq!(close_kind(true, false, true), CloseKind::Close);
+        assert_eq!(close_kind(true, false, false), CloseKind::Close);
     }
 
     #[tokio::test]
