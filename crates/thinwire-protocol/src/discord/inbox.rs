@@ -49,7 +49,7 @@ impl InboxChannel {
                 .and_then(|id| i64::try_from(id).ok())
                 .unwrap_or(0),
             last_at: 0,
-            is_group: false,
+            is_group: true,
             writable: self.can_send,
             placeholder: false,
         }

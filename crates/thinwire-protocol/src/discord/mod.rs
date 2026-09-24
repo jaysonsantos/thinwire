@@ -586,6 +586,8 @@ mod tests {
         assert_eq!(general.title, "#general");
         assert_eq!(general.participant, "Test guild");
         assert!(general.preview.contains("read and send"));
+        assert!(general.is_group);
+        assert!(rows[1].is_group);
         assert!(rows[1].preview.contains("read only"));
 
         let ready_at = events
