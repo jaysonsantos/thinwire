@@ -36,6 +36,8 @@ pub(crate) fn keychain_notice(secrets: &SecretStore) -> Option<&'static str> {
 }
 
 const COMPOSE_MAX_ROWS: usize = 5;
+/// Send is at least this tall. The field grows with the line count.
+const SEND_MIN_HEIGHT: f32 = 40.0;
 /// A message bubble uses at most this share of the thread width.
 const BUBBLE_WIDTH: f32 = 0.75;
 /// Cap so a wide window does not make a line too long to read.
@@ -742,7 +744,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
     let row_height = ui.text_style_height(&egui::TextStyle::Body);
     let compose_rows = snapshot.compose.lines().count().clamp(1, COMPOSE_MAX_ROWS);
     let compose_height = row_height * COMPOSE_MAX_ROWS as f32;
-    let reserve = row_height * compose_rows as f32 + 32.0;
+    let reserve = compose_reserve(row_height, compose_rows);
 
     let state = snapshot.thread_state();
     let mut retry: Option<String> = None;
@@ -936,6 +938,17 @@ fn bubble_radius(outbound: bool, run_end: bool) -> egui::CornerRadius {
     }
 }
 
+/// Height the message list leaves for the compose bar.
+///
+/// The outer frame and the field frame each add `space::M` above and below.
+/// The Send button is at least [`SEND_MIN_HEIGHT`].
+fn compose_reserve(row_height: f32, rows: usize) -> f32 {
+    let rows = rows.clamp(1, COMPOSE_MAX_ROWS) as f32;
+    let pad = space::M * 2.0;
+    let field = row_height * rows + pad;
+    pad + field.max(SEND_MIN_HEIGHT)
+}
+
 /// Multiline compose. Enter sends; Shift+Enter adds a line.
 fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
     let compose_id = egui::Id::new("thread-compose");
@@ -1005,7 +1018,7 @@ fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
                             RichText::new("Send").color(send_label(can_send, palette)),
                         )
                         .fill(send_fill(can_send, palette))
-                        .min_size(egui::vec2(send_width, 40.0))
+                        .min_size(egui::vec2(send_width, SEND_MIN_HEIGHT))
                     })
                     .clicked()
                 {
@@ -1037,6 +1050,22 @@ fn send_label(can_send: bool, palette: &theme::Palette) -> egui::Color32 {
 mod tests {
     use super::{account_label, badge_text};
     use thinwire_protocol::AdapterStatus;
+
+    #[test]
+    fn compose_reserve_counts_the_frame_padding() {
+        use super::compose_reserve;
+        use crate::app::theme::space;
+
+        let row = 20.0;
+        let pad = space::M * 2.0;
+        assert_eq!(compose_reserve(row, 1), pad + (row + pad).max(40.0));
+        assert!(compose_reserve(row, 1) > row + 32.0);
+        let ui = include_str!("ui.rs");
+        let thread = &ui[ui.find("fn thread(").expect("thread")..];
+        let thread = &thread[..thread.find("\nfn ").expect("next")];
+        assert!(thread.contains("compose_reserve("));
+        assert!(!thread.contains("+ 32.0"));
+    }
 
     #[test]
     fn send_button_colors_change_with_the_enabled_state() {
