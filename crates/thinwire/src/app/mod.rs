@@ -21,8 +21,10 @@ pub use thinwire_core::settings::Settings;
 
 /// Longest wait for TDLib to close before the window closes anyway.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Repaint step while the close gate waits for its deadline.
-const CLOSE_POLL: Duration = Duration::from_millis(100);
+/// Idle repaint step (10 Hz). The change signal wakes the window at once for
+/// core changes. This timer covers what the core does not see: the OS
+/// light/dark switch in System mode (ADR 0005) and the close deadline.
+const IDLE_REPAINT: Duration = Duration::from_millis(100);
 
 /// What to do on a stop signal (SIGTERM, SIGINT, or Ctrl+C).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,10 +145,6 @@ impl CloseGate {
         }
     }
 
-    const fn waiting(self) -> bool {
-        matches!(self, Self::Waiting { .. })
-    }
-
     /// `true` once: the window may close now.
     fn poll(&mut self, now: Instant, stopped: bool) -> bool {
         match *self {
@@ -245,10 +243,9 @@ impl eframe::App for ThinwireApp {
         if theme_mode::follow_os_live(ctx, self.core.view().theme(), &mut self.last_os_theme) {
             ctx.request_repaint();
         }
-        if self.close_gate.waiting() {
-            // The close deadline is a timer, not a core change.
-            ctx.request_repaint_after(CLOSE_POLL);
-        }
+        // Some platforms send no theme event. logic() still runs when the
+        // window is hidden after a repaint request.
+        ctx.request_repaint_after(IDLE_REPAINT);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -306,9 +303,8 @@ mod tests {
     fn close_waits_for_stopped_then_allows_the_next_request() {
         let start = Instant::now();
         let mut gate = CloseGate::Open;
-        assert!(!gate.waiting());
         assert_eq!(gate.on_close_requested(start), CloseAction::HoldAndShutdown);
-        assert!(gate.waiting(), "the deadline needs repaints while closing");
+        assert!(matches!(gate, CloseGate::Waiting { .. }));
         assert_eq!(
             gate.on_close_requested(start),
             CloseAction::Hold,
@@ -381,5 +377,25 @@ mod tests {
         let on_exit = &src[src.find("fn on_exit(").expect("on_exit")..];
         let on_exit = &on_exit[..on_exit.find("\n    }\n").expect("end")];
         assert!(on_exit.contains("self.finish_exit()"));
+    }
+
+    /// ADR 0005: System mode follows the OS while idle. Some platforms send
+    /// no theme event, so `logic()` asks for a repaint on every frame (qa M1).
+    #[test]
+    fn idle_repaint_keeps_the_os_theme_follow_live() {
+        assert_eq!(IDLE_REPAINT, Duration::from_millis(100));
+        let src = include_str!("mod.rs");
+        let logic = &src[src.find("fn logic(").expect("logic")..];
+        let logic = &logic[..logic.find("\n    fn ").expect("next fn")];
+        assert!(logic.contains("theme_mode::follow_os_live("));
+        let repaint = logic
+            .find("ctx.request_repaint_after(IDLE_REPAINT);")
+            .expect("unconditional idle repaint");
+        let line_start = logic[..repaint].rfind('\n').expect("line");
+        assert_eq!(
+            &logic[line_start + 1..repaint],
+            "        ",
+            "the idle repaint is not inside an if"
+        );
     }
 }
