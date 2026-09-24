@@ -1074,8 +1074,9 @@ impl Snapshot {
     pub fn center_key(&mut self, key: AuthKey, store: &SecretStore) {
         match self.center_view() {
             CenterView::FirstRun => {
+                // Same call as the Add Telegram button, with its guard (qa L3).
                 if key == AuthKey::Enter {
-                    self.open_telegram(store);
+                    self.open_add_account(store);
                 }
             }
             CenterView::Auth => self.auth_key(key, store),
@@ -3922,5 +3923,24 @@ mod tests {
             conversation: telegram_chat(5, "Bob", 3),
         });
         assert_eq!(snapshot.visible_conversations().len(), 1);
+    }
+
+    /// qa L3: Enter on first run and the Add Telegram button take one path.
+    /// Signed in but not linked yet, neither opens a second login.
+    #[test]
+    fn first_run_enter_uses_the_add_account_guard() {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+        assert!(!snapshot.can_add_account());
+        snapshot.center_key(AuthKey::Enter, &store);
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(snapshot.take_commands().is_empty());
+
+        snapshot.telegram_authorized = false;
+        snapshot.center_key(AuthKey::Enter, &store);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
     }
 }
