@@ -753,7 +753,7 @@ where
         ChatMessage {
             protocol: ProtocolId::Slack,
             conversation_id: conversation_id(&post.channel),
-            id: format!("{SLACK_CONVERSATION_PREFIX}{}:{}", post.channel, post.ts),
+            id: message_id(&post.channel, &post.ts),
             sender,
             body: post.text,
             outbound,
@@ -776,6 +776,11 @@ fn ready_detail(team_name: &str, live_events: bool) -> String {
 
 fn conversation_id(channel: &str) -> String {
     format!("{SLACK_CONVERSATION_PREFIX}{channel}")
+}
+
+/// `slack:<channel>:<rank>`. The shell parses the last segment as `i64`.
+fn message_id(channel: &str, ts: &str) -> String {
+    format!("{SLACK_CONVERSATION_PREFIX}{channel}:{}", ts_rank(ts))
 }
 
 fn channel_id(conversation: &str) -> Option<&str> {
@@ -815,6 +820,29 @@ fn ts_order(ts: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Slack `ts` (`seconds.microseconds`) as the integer the shell sorts on.
+/// A dotted timestamp does not parse as `i64`, so every message would rank 0.
+fn ts_rank(ts: &str) -> i64 {
+    let (seconds, fraction) = ts.split_once('.').unwrap_or((ts, ""));
+    let Ok(seconds) = seconds.parse::<i64>() else {
+        return 0;
+    };
+    if seconds < 0 {
+        return 0;
+    }
+    let digits: String = fraction
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .take(6)
+        .collect();
+    let micros = if digits.is_empty() {
+        0
+    } else {
+        format!("{digits:0<6}").parse::<i64>().unwrap_or(0)
+    };
+    seconds.saturating_mul(1_000_000).saturating_add(micros)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +862,13 @@ mod tests {
         assert_eq!(group_title("mpdm-ana--bo"), "ana, bo");
         assert_eq!(ts_order("1712345678.000200"), 1_712_345_678);
         assert_eq!(ts_order("bad"), 0);
+        assert_eq!(ts_rank("1700000001.000100"), 1_700_000_001_000_100);
+        assert_eq!(ts_rank("1700000200.000100"), 1_700_000_200_000_100);
+        assert!(ts_rank("1700000001.000100") < ts_rank("1700000200.000100"));
+        assert_eq!(
+            message_id("C1", "1700000001.000100"),
+            "slack:C1:1700000001000100"
+        );
+        assert_eq!(ts_rank("bad"), 0);
     }
 }

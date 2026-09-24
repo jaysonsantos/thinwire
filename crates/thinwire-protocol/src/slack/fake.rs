@@ -604,10 +604,40 @@ async fn history_is_oldest_first_with_names_and_the_app_as_outbound() {
     let first = h.message("first").await;
     assert_eq!(first.sender, "Ana");
     assert!(!first.outbound);
-    assert_eq!(first.id, "slack:C1:1700000001.000100");
+    assert_eq!(first.id, "slack:C1:1700000001000100");
     let second = h.message("second, from the app").await;
     assert!(second.outbound);
     assert_eq!(second.conversation_id, "slack:C1");
+}
+
+#[tokio::test]
+async fn a_live_message_ranks_after_older_history() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000200.000100",
+        "U1",
+        "live hello",
+    )));
+    let live = h.message("live hello").await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    let first = h.message("first").await;
+    let ranks = [shell_rank(&first.id), shell_rank(&live.id)];
+    assert!(ranks[0] > 0 && ranks[0] < ranks[1]);
+}
+
+fn shell_rank(id: &str) -> i64 {
+    id.rsplit(':')
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0)
 }
 
 #[tokio::test]
