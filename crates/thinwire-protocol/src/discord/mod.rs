@@ -654,6 +654,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopen_drops_rows_missing_from_the_new_history_page() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::HistoryLoaded { .. })
+        })
+        .await;
+        api.state()
+            .history
+            .get_mut(&GENERAL)
+            .expect("history")
+            .retain(|message| message.id != 1);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "still sending".into(),
+                    request: 3,
+                },
+                &tx,
+            )
+            .expect("pending");
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("reopen");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::HistoryLoaded { .. })
+        })
+        .await;
+        let removed: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessagesRemoved { message_ids, .. } => {
+                    Some(message_ids.iter().map(String::as_str))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(removed, vec!["discord:1"]);
+        hold.notify_waiters();
+    }
+
+    #[tokio::test]
     async fn history_failure_is_a_channel_note_and_not_ready() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;

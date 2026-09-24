@@ -35,6 +35,8 @@ struct Shared {
     bot_id: Option<u64>,
     channels: HashMap<String, ChannelAccess>,
     inflight: Vec<Inflight>,
+    /// Message ids from the last history page for each channel.
+    history: HashMap<String, Vec<String>>,
 }
 
 /// Drops events from a replaced session.
@@ -82,6 +84,7 @@ impl Session {
                 bot_id: None,
                 channels: carried,
                 inflight: Vec::new(),
+                history: HashMap::new(),
             })),
             gate: Gate {
                 live: Arc::clone(live),
@@ -135,6 +138,7 @@ impl Session {
             return Ok(());
         };
         let api = Arc::clone(&self.api);
+        let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
         let events = events.clone();
         tokio::spawn(async move {
@@ -144,8 +148,37 @@ impl Session {
             }
             match result {
                 Ok(messages) => {
-                    for message in messages.iter().rev() {
-                        emit_message(&events, chat_message(&conversation_id, bot_id, message));
+                    let rows: Vec<ChatMessage> = messages
+                        .iter()
+                        .rev()
+                        .map(|message| chat_message(&conversation_id, bot_id, message))
+                        .collect();
+                    let new_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+                    let gone = {
+                        let Ok(mut state) = shared.lock() else {
+                            return;
+                        };
+                        if !gate.current() {
+                            return;
+                        }
+                        let previous = state.history.entry(conversation_id.clone()).or_default();
+                        let gone: Vec<String> = previous
+                            .iter()
+                            .filter(|id| !new_ids.iter().any(|next| next == *id))
+                            .cloned()
+                            .collect();
+                        *previous = new_ids;
+                        gone
+                    };
+                    if !gone.is_empty() {
+                        let _ = events.send(AdapterEvent::MessagesRemoved {
+                            protocol: ProtocolId::Discord,
+                            conversation_id: conversation_id.clone(),
+                            message_ids: gone,
+                        });
+                    }
+                    for row in rows {
+                        emit_message(&events, row);
                     }
                     emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                 }
