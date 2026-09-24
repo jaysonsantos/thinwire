@@ -149,8 +149,16 @@ fn free_stale_path(dir: &Path, unix_secs: u64) -> io::Result<PathBuf> {
     ))
 }
 
-/// TDLib's text when the key does not open the database.
+/// TDLib's text when the key does not open the database. Checked against the
+/// bundled TDLib 1.8.61 (`strings libtdcore.a`: "Wrong database encryption key").
 const WRONG_KEY_ERROR: &str = "wrong database encryption key";
+
+/// TDLib code for an unauthorized request. With "encryption key" in the text,
+/// it is the fallback match if a later TDLib words the error differently.
+const UNAUTHORIZED_CODE: i32 = 401;
+
+/// Part of the fallback text for code 401.
+const ENCRYPTION_KEY: &str = "encryption key";
 
 /// Text of a lock error: another client (for example a second thinwire)
 /// uses the folder. Such a folder is alive and must never move.
@@ -159,10 +167,16 @@ const LOCK_MARKERS: [&str; 2] = ["already in use", "lock"];
 /// Only TDLib's wrong-key error can be fixed by a fresh folder. Any other
 /// error (a bad api_id, or a folder another instance holds) cannot, and a
 /// wrong match would move a live folder aside and clear its key.
+///
+/// It matches the exact TDLib text, or code 401 with "encryption key" in the
+/// text. A lock error never matches.
 #[must_use]
-pub(super) fn is_wrong_key_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains(WRONG_KEY_ERROR) && !LOCK_MARKERS.iter().any(|lock| message.contains(lock))
+pub(super) fn is_wrong_key_error(code: i32, message: &str) -> bool {
+    let message = message.trim().to_ascii_lowercase();
+    if LOCK_MARKERS.iter().any(|lock| message.contains(lock)) {
+        return false;
+    }
+    message == WRONG_KEY_ERROR || (code == UNAUTHORIZED_CODE && message.contains(ENCRYPTION_KEY))
 }
 
 #[cfg(test)]
@@ -269,16 +283,28 @@ mod tests {
 
     #[test]
     fn only_the_wrong_key_error_triggers_a_fresh_folder() {
-        assert!(is_wrong_key_error("Wrong database encryption key"));
-        assert!(!is_wrong_key_error("Can't open database"));
-        assert!(!is_wrong_key_error("database /x is already in use"));
+        // The exact TDLib 1.8.61 text, with any code.
+        assert!(is_wrong_key_error(400, "Wrong database encryption key"));
+        assert!(is_wrong_key_error(500, " Wrong database encryption key "));
+        // Fallback: code 401 with "encryption key".
+        assert!(is_wrong_key_error(401, "Invalid database encryption key"));
+        assert!(!is_wrong_key_error(400, "Invalid database encryption key"));
+        assert!(!is_wrong_key_error(401, "Unauthorized"));
+        assert!(
+            !is_wrong_key_error(401, "encryption key is locked"),
+            "a lock never matches"
+        );
+        assert!(!is_wrong_key_error(400, "Can't open database"));
+        assert!(!is_wrong_key_error(400, "database /x is already in use"));
         assert!(!is_wrong_key_error(
+            400,
             "Can't lock file \"/a/database/td.binlog\", because it is already in use; check for another program instance running"
         ));
         assert!(!is_wrong_key_error(
+            401,
             "Wrong database encryption key, and the file lock is held"
         ));
-        assert!(!is_wrong_key_error("Valid api_id must be provided"));
-        assert!(!is_wrong_key_error("PHONE_NUMBER_INVALID"));
+        assert!(!is_wrong_key_error(400, "Valid api_id must be provided"));
+        assert!(!is_wrong_key_error(400, "PHONE_NUMBER_INVALID"));
     }
 }

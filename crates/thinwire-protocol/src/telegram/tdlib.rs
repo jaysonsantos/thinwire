@@ -1193,7 +1193,7 @@ async fn set_parameters(
     .await;
     if let Err(error) = &result
         && moved_to.is_none()
-        && data_dir::is_wrong_key_error(&error.message)
+        && data_dir::is_wrong_key_error(error.code, &error.message)
     {
         // The key in the vault does not open this folder. Keep the old folder,
         // start a fresh one with a new key, and try once more.

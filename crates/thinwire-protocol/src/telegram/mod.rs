@@ -763,7 +763,7 @@ mod tests {
             "a failed hydrate must not look like a missing key"
         );
         assert!(check < key, "check the vault before a new key is made");
-        assert!(params.contains("data_dir::is_wrong_key_error(&error.message)"));
+        assert!(params.contains("data_dir::is_wrong_key_error(error.code, &error.message)"));
         assert!(params.contains("&& moved_to.is_none()"), "retry once only");
         assert!(params.contains("emit_telegram_data_reset(events, name)"));
         assert!(
