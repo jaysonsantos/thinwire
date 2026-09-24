@@ -173,7 +173,9 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
     egui::Panel::top("status").show(ui, |ui| {
         let palette = theme::palette(ui);
         if show_status && let Some(text) = public_status(&snapshot.status_text) {
-            let color = if text == "Sending…" || text == "Refreshing…" {
+            let color = if load_failure_text(&snapshot.status_text).is_some() {
+                palette.error
+            } else if text == "Sending…" || text == "Refreshing…" {
                 palette.warn
             } else {
                 palette.text2
@@ -218,13 +220,37 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
     }
 }
 
-/// A line the strip may show. Lines that name TDLib stay in the log only.
+/// A line the strip may show.
+///
+/// A failed chat list, history load, or read mark stays on the strip. The
+/// library name and the code stay off it. Other lines that name the library
+/// stay in the log only.
 fn public_status(text: &str) -> Option<&str> {
     let text = text.trim();
-    if text.is_empty() || text.contains("TDLib") {
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(shown) = load_failure_text(text) {
+        return Some(shown);
+    }
+    if text.contains("TDLib") {
         None
     } else {
         Some(text)
+    }
+}
+
+/// User-facing copy for a failed chat list, history load, or read mark.
+fn load_failure_text(text: &str) -> Option<&'static str> {
+    let text = text.trim();
+    if text.starts_with("Could not load Telegram chats (TDLib ") {
+        Some("Could not load chats.")
+    } else if text.starts_with("Could not load messages (TDLib ") {
+        Some("Could not load messages.")
+    } else if text.starts_with("Could not mark messages read (TDLib ") {
+        Some("Could not mark messages read.")
+    } else {
+        None
     }
 }
 
@@ -1121,7 +1147,6 @@ mod tests {
         assert!(is_idle_status("Recent messages loaded."));
         assert!(!is_idle_status("Sending…"));
         assert!(!is_idle_status("Refreshing…"));
-        assert_eq!(public_status("Could not load messages (TDLib 500)."), None);
         assert_eq!(
             public_status("TDLib unavailable in this build. No live session."),
             None
@@ -1136,6 +1161,43 @@ mod tests {
         );
         snapshot.status_text = "Sending…".into();
         assert!(status_strip_visible(&snapshot, None));
+    }
+
+    #[test]
+    fn load_failures_stay_on_the_status_strip() {
+        use super::{load_failure_text, public_status, status_strip_visible};
+        use crate::app::snapshot::Snapshot;
+
+        let cases = [
+            (
+                "Could not load Telegram chats (TDLib 500).",
+                "Could not load chats.",
+            ),
+            (
+                "Could not load messages (TDLib 500).",
+                "Could not load messages.",
+            ),
+            (
+                "Could not mark messages read (TDLib 401).",
+                "Could not mark messages read.",
+            ),
+        ];
+        let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
+        for (raw, shown) in cases {
+            assert_eq!(load_failure_text(raw), Some(shown));
+            assert_eq!(public_status(raw), Some(shown));
+            assert!(!shown.contains("TDLib"));
+            snapshot.status_text = raw.into();
+            assert!(
+                status_strip_visible(&snapshot, None),
+                "a load failure stays on the strip"
+            );
+        }
+        assert_eq!(
+            public_status("Telegram did not send the message (TDLib 500)."),
+            None
+        );
     }
 
     #[test]
