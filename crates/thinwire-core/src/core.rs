@@ -280,7 +280,7 @@ impl Core {
         let phone: &PhoneVault = &self.whatsapp_phone;
         match intent {
             WhatsAppIntent::OpenRiskGate => self.state.open_whatsapp_risk_gate(),
-            WhatsAppIntent::CloseGate => self.state.close_whatsapp_gate(),
+            WhatsAppIntent::CloseGate => self.state.close_whatsapp_gate(phone),
             WhatsAppIntent::AcknowledgeRisk => self.state.acknowledge_whatsapp_risk(),
             WhatsAppIntent::SetPhone(value) => {
                 self.state.whatsapp_phone = value.expose().to_owned()

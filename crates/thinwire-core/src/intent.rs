@@ -93,7 +93,8 @@ pub enum TelegramIntent {
 pub enum WhatsAppIntent {
     /// Show the full-screen ToS and ban risk gate.
     OpenRiskGate,
-    /// Leave the gate or the pair screen.
+    /// Leave the gate or the pair screen. On the pair screen this is
+    /// `CancelLink`: pairing stops and the acknowledgement resets.
     CloseGate,
     /// The user accepted the risk gate.
     AcknowledgeRisk,

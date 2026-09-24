@@ -1684,9 +1684,20 @@ impl Snapshot {
     }
 
     #[cfg(feature = "whatsapp-web")]
-    pub fn close_whatsapp_gate(&mut self) {
+    /// Leave the gate or the pair screen. After the risk was accepted this is
+    /// Cancel: pairing stops, the phone vault clears, and the acknowledgement
+    /// resets (PR #48 review). From the gate alone it only hides the screen.
+    pub fn close_whatsapp_gate(&mut self, phone: &WhatsAppPhoneVault) {
+        if self.whatsapp_screen == WhatsAppScreen::Pair
+            || self.whatsapp_risk_acknowledged
+            || self.whatsapp_started
+        {
+            self.cancel_whatsapp_link(phone);
+            return;
+        }
         self.whatsapp_screen = WhatsAppScreen::Hidden;
         self.whatsapp_phone.clear();
+        phone.clear();
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -4084,5 +4095,42 @@ mod tests {
             assert!(!shown.contains(secret), "{secret} leaked: {shown}");
         }
         assert!(shown.contains("telegram_authorized: true"));
+    }
+
+    /// PR #48 review (P2): leaving the pair screen is Cancel, not a hide.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn closing_the_pair_screen_cancels_pairing() {
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.whatsapp_phone = "15550100".into();
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(snapshot.whatsapp_started);
+        assert!(phone.phone().is_some());
+        snapshot.take_commands();
+
+        snapshot.close_whatsapp_gate(&phone);
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        assert!(!snapshot.whatsapp_started);
+        assert!(phone.phone().is_none(), "the phone vault is cleared");
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![AdapterCommand::WhatsAppCancelLink]
+        );
+
+        // The acknowledgement is gone: pairing needs the gate again.
+        snapshot.whatsapp_screen = WhatsAppScreen::Pair;
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(!snapshot.whatsapp_started);
+        assert!(snapshot.take_commands().is_empty());
+
+        // Back from the gate alone only hides it and sends nothing.
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.take_commands();
+        snapshot.close_whatsapp_gate(&phone);
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        assert!(snapshot.take_commands().is_empty());
     }
 }
