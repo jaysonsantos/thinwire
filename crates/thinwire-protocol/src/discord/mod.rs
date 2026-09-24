@@ -1031,10 +1031,11 @@ mod tests {
         ));
         let events = drain(&mut rx);
         assert!(messages(&events).is_empty());
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            AdapterEvent::Notice { .. }
-        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Notice { .. }))
+        );
         hold.notify_waiters();
     }
 
