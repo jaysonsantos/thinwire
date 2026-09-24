@@ -670,4 +670,36 @@ mod tests {
         assert_eq!(core.view().auth, AuthScreen::Idle);
         assert!(core.view().telegram_phone.is_empty());
     }
+
+    /// qa L4: after `Shutdown`, a later intent sends nothing to the host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_drops_commands_from_later_intents() {
+        let mut core = memory_core();
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = probe;
+
+        core.dispatch(Intent::Refresh);
+        assert!(
+            sent.try_recv().is_ok(),
+            "before close, Refresh reaches the host"
+        );
+        while sent.try_recv().is_ok() {}
+
+        core.dispatch(Intent::Shutdown);
+        for caps in catalog() {
+            assert_eq!(
+                sent.try_recv().ok(),
+                Some(AdapterCommand::Shutdown { protocol: caps.id }),
+                "one Shutdown per adapter"
+            );
+        }
+        core.dispatch(Intent::Refresh);
+        core.dispatch(Intent::Discord(DiscordIntent::Connect));
+        core.dispatch(Intent::Shutdown);
+        core.pump();
+        assert!(
+            sent.try_recv().is_err(),
+            "no command reaches the host while closing"
+        );
+    }
 }
