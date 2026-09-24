@@ -270,8 +270,7 @@ impl SlackWebApi for MorphismWebApi {
         Ok(response
             .messages
             .into_iter()
-            .filter(|message| shown_subtype(message.subtype.as_ref()))
-            .filter(|message| !is_thread_reply(&message.origin))
+            .filter(|message| shown_in_channel(message.subtype.as_ref(), &message.origin))
             .map(|message| SlackPost {
                 channel: channel.to_string(),
                 ts: message.origin.ts.to_string(),
@@ -336,6 +335,13 @@ impl SlackWebApi for MorphismWebApi {
 fn body(text: Option<String>) -> String {
     text.filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| NO_TEXT.into())
+}
+
+/// Channel view: allow-listed subtypes, including a thread reply that was also
+/// sent to the channel. A reply that stays in the thread is dropped.
+fn shown_in_channel(subtype: Option<&SlackMessageEventType>, origin: &SlackMessageOrigin) -> bool {
+    matches!(subtype, Some(SlackMessageEventType::ThreadBroadcast))
+        || (shown_subtype(subtype) && !is_thread_reply(origin))
 }
 
 /// Plain messages and the subtypes a reader expects in a channel view.
@@ -439,7 +445,7 @@ async fn on_push(
 ) -> UserCallbackResult<()> {
     let inbound = match event.event {
         SlackEventCallbackBody::Message(message) => {
-            if !shown_subtype(message.subtype.as_ref()) || is_thread_reply(&message.origin) {
+            if !shown_in_channel(message.subtype.as_ref(), &message.origin) {
                 return Ok(());
             }
             let Some(channel) = message.origin.channel.as_ref() else {
@@ -466,6 +472,26 @@ async fn on_push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_broadcast_stays_and_a_plain_reply_does_not() {
+        let broadcast = SlackMessageOrigin::new("1700000002.000200".into())
+            .with_thread_ts("1700000001.000100".into());
+        assert!(shown_in_channel(
+            Some(&SlackMessageEventType::ThreadBroadcast),
+            &broadcast
+        ));
+        let reply = SlackMessageOrigin::new("1700000003.000300".into())
+            .with_thread_ts("1700000001.000100".into());
+        assert!(!shown_in_channel(None, &reply));
+        let parent = SlackMessageOrigin::new("1700000001.000100".into())
+            .with_thread_ts("1700000001.000100".into());
+        assert!(shown_in_channel(None, &parent));
+        assert!(!shown_in_channel(
+            Some(&SlackMessageEventType::ChannelJoin),
+            &SlackMessageOrigin::new("1700000004.000100".into())
+        ));
+    }
 
     #[test]
     fn rate_control_retries_after_slack_says_wait() {
