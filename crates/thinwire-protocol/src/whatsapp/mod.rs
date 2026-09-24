@@ -6,6 +6,9 @@
 
 mod path;
 
+#[cfg(any(test, feature = "whatsapp-web"))]
+mod gate;
+
 #[cfg(feature = "whatsapp-web")]
 mod live;
 
@@ -309,6 +312,36 @@ mod tests {
         assert!(
             close < stopped,
             "Stopped only after the bot and its session close"
+        );
+    }
+
+    /// The old race stored the bot in a separate lock step after `is_current`.
+    /// Shutdown could see no handle, emit Stopped, and then lose the bot.
+    #[test]
+    fn run_link_publishes_through_the_gate_before_it_can_install_late() {
+        let src = include_str!("live.rs");
+        let start = src.find("pub(super) async fn run_link").expect("run_link");
+        let end = src.find("fn fail(").expect("fail");
+        let body = &src[start..end];
+        let enter = body.find(".enter(").expect("count the start");
+        let spawn = body.find("bot.spawn()").expect("spawn");
+        let publish = body.find(".publish(").expect("publish under the gate");
+        assert!(enter < spawn, "the start is in flight before a bot exists");
+        assert!(
+            spawn < publish,
+            "spawn then publish; the generation check stays with the store"
+        );
+        let close_rejected = body
+            .find("handle.shutdown().await")
+            .expect("close a rejected bot");
+        let leave = body.find(".leave(").expect("leave after the bot is closed");
+        assert!(
+            close_rejected < leave,
+            "a bot that lost the race is shut down before shutdown may finish"
+        );
+        assert!(
+            !body.contains("handle.lock()"),
+            "a direct store races with shutdown"
         );
     }
     use crate::adapter::{AdapterEvent, RedactedPairingSecret};
