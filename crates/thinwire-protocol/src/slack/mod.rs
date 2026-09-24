@@ -255,6 +255,10 @@ mod tests {
         assert!(protocol.contains("slack-oauth = ["));
         // Socket Mode only: no inbound HTTP server (`axum`) for Slack events.
         assert!(!protocol.contains("slack-morphism/axum"));
+        let agents = include_str!("../../../../AGENTS.md");
+        assert!(agents.contains("`hyper` on from 2026-09-24"));
+        assert!(agents.contains("`axum` off"));
+        assert!(!agents.contains("`hyper` off"));
         assert!(protocol.contains("default = []"));
         // The library logs the one-time Socket Mode URL; the binary turns it off.
         assert!(include_str!("../../../thinwire/src/main.rs").contains("slack_morphism=off"));
