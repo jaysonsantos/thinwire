@@ -74,7 +74,12 @@ impl AdapterHost {
     }
 
     /// Enqueue a command for the worker. Never runs adapter code on the caller.
-    pub fn send(&self, command: AdapterCommand) {
+    pub fn send(&self, mut command: AdapterCommand) {
+        // Stamp first, then bump. A step sent before Cancel keeps the old
+        // epoch; the adapter ignores it instead of emitting `Failed` after
+        // the secrets were cleared.
+        let epoch = self.login_epoch.load(Ordering::SeqCst);
+        stamp_auth_epoch(&mut command, epoch);
         // Bump here, on the UI thread, before the next poll: login events that
         // an old client already queued are then stale and dropped (issue #42).
         if ends_telegram_login(&command) {
@@ -83,6 +88,13 @@ impl AdapterHost {
         if self.command_tx.send(command).is_err() {
             tracing::warn!("adapter host command channel closed");
         }
+    }
+}
+
+/// Record the login epoch a Telegram step was sent under.
+fn stamp_auth_epoch(command: &mut AdapterCommand, epoch: u64) {
+    if let AdapterCommand::TelegramAuth { epoch: slot, .. } = command {
+        *slot = epoch;
     }
 }
 
@@ -152,6 +164,23 @@ mod tests {
             epoch,
             event: Box::new(AdapterEvent::TelegramAuth { phase }),
         }
+    }
+
+    #[test]
+    fn an_auth_step_is_stamped_with_the_epoch_it_was_sent_under() {
+        use crate::TelegramAuthStep;
+        let mut step = AdapterCommand::TelegramAuth {
+            step: TelegramAuthStep::Phone,
+            epoch: 99,
+        };
+        stamp_auth_epoch(&mut step, 0);
+        assert!(matches!(
+            step,
+            AdapterCommand::TelegramAuth {
+                step: TelegramAuthStep::Phone,
+                epoch: 0
+            }
+        ));
     }
 
     #[test]

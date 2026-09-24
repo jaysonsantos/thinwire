@@ -1348,7 +1348,9 @@ impl Snapshot {
     }
 
     fn queue_telegram_step(&mut self, step: TelegramAuthStep) {
-        self.pending.push(AdapterCommand::TelegramAuth { step });
+        // The host replaces `epoch` with the login client this step belongs to.
+        self.pending
+            .push(AdapterCommand::TelegramAuth { step, epoch: 0 });
     }
 
     fn mark_auth_busy(&mut self, status: &str) {
@@ -1699,7 +1701,8 @@ mod tests {
                 matches!(
                     command,
                     AdapterCommand::TelegramAuth {
-                        step: TelegramAuthStep::ApiCredentials
+                        step: TelegramAuthStep::ApiCredentials,
+                        epoch: 0
                     }
                 )
             })
@@ -1727,7 +1730,8 @@ mod tests {
         assert!(matches!(
             commands[0],
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::ApiCredentials
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
             }
         ));
         let debug = format!("{commands:?}");
@@ -2184,7 +2188,7 @@ mod tests {
             .take_commands()
             .into_iter()
             .filter_map(|command| match command {
-                AdapterCommand::TelegramAuth { step } => Some(step),
+                AdapterCommand::TelegramAuth { step, epoch: 0 } => Some(step),
                 _ => None,
             })
             .collect()
@@ -2627,7 +2631,8 @@ mod tests {
                         protocol: ProtocolId::Telegram
                     },
                     AdapterCommand::TelegramAuth {
-                        step: TelegramAuthStep::ApiCredentials
+                        step: TelegramAuthStep::ApiCredentials,
+                        epoch: 0
                     }
                 ]
             ),
@@ -3195,7 +3200,8 @@ mod tests {
         assert!(commands.iter().any(|c| matches!(
             c,
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::ApiCredentials
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
             }
         )));
         assert!(!format!("{commands:?}").contains("publisher-hash"));
@@ -3324,19 +3330,22 @@ mod tests {
         assert!(commands.iter().any(|c| matches!(
             c,
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::ApiCredentials
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0
             }
         )));
         assert!(commands.iter().any(|c| matches!(
             c,
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::TwoFactor
+                step: TelegramAuthStep::TwoFactor,
+                epoch: 0
             }
         )));
         assert!(!commands.iter().any(|c| matches!(
             c,
             AdapterCommand::TelegramAuth {
-                step: TelegramAuthStep::Complete
+                step: TelegramAuthStep::Complete,
+                epoch: 0
             }
         )));
         let debug = format!("{commands:?}");

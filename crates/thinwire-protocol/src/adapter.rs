@@ -213,8 +213,12 @@ pub enum AdapterCommand {
         mode: DiscordAuthMode,
     },
     /// Advances the Telegram login screens. Secrets stay in the secret vault.
+    /// `epoch` is the login client this step was sent for. The host fills it.
+    /// A step from an older epoch is ignored: Cancel may already have cleared
+    /// the secrets.
     TelegramAuth {
         step: TelegramAuthStep,
+        epoch: u64,
     },
     /// Load another page of the main chat list. No secrets.
     LoadChats {

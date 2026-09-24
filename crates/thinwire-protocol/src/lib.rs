@@ -63,7 +63,11 @@ pub(crate) fn registry(
     login_epoch: adapter::LoginEpoch,
 ) -> Vec<Box<dyn ProtocolAdapter>> {
     vec![
-        Box::new(TelegramAdapter::with_login_epoch(secrets, login_epoch)),
+        Box::new(TelegramAdapter::with_login_epoch(
+            secrets,
+            crate::telegram::TelegramApiSource::from_build(),
+            login_epoch,
+        )),
         Box::new(WhatsAppAdapter::new(whatsapp_phone)),
         Box::new(DiscordAdapter::new(discord)),
         Box::new(SlackAdapter),
