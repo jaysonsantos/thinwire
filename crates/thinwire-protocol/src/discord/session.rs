@@ -18,7 +18,7 @@ use crate::adapter::{
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
 
 #[derive(Debug, Clone, Copy)]
-struct ChannelAccess {
+pub(crate) struct ChannelAccess {
     channel_id: u64,
     can_send: bool,
 }
@@ -50,12 +50,30 @@ pub(crate) struct Session {
 }
 
 impl Session {
+    /// Channel ids from the last list. A later connect uses them to drop gone rows.
+    pub(crate) fn carried_channels(&self) -> HashMap<String, ChannelAccess> {
+        self.shared
+            .lock()
+            .map(|state| state.channels.clone())
+            .unwrap_or_default()
+    }
+
     /// Starts a new generation and loads the channel list.
-    pub(crate) fn start(api: Arc<dyn DiscordApi>, live: &Arc<AtomicU64>, events: &EventTx) -> Self {
+    ///
+    /// `carried` is the previous list. An empty map is a first connect.
+    pub(crate) fn start(
+        api: Arc<dyn DiscordApi>,
+        live: &Arc<AtomicU64>,
+        events: &EventTx,
+        carried: HashMap<String, ChannelAccess>,
+    ) -> Self {
         let generation = live.fetch_add(1, Ordering::SeqCst) + 1;
         let session = Self {
             api,
-            shared: Arc::new(Mutex::new(Shared::default())),
+            shared: Arc::new(Mutex::new(Shared {
+                bot_id: None,
+                channels: carried,
+            })),
             gate: Gate {
                 live: Arc::clone(live),
                 generation,

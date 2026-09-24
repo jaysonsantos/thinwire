@@ -164,6 +164,12 @@ impl DiscordAdapter {
     }
 
     fn connect_bot_inbox(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        #[cfg(any(test, feature = "discord-bot"))]
+        let carried = self
+            .session
+            .as_ref()
+            .map(session::Session::carried_channels)
+            .unwrap_or_default();
         self.stop_session();
         let prepared = self.prepared_token()?;
         #[cfg(any(test, feature = "discord-bot"))]
@@ -179,7 +185,7 @@ impl DiscordAdapter {
                 ),
                 Some(token) => {
                     let api = factory(token);
-                    self.session = Some(session::Session::start(api, &self.live, events));
+                    self.session = Some(session::Session::start(api, &self.live, events, carried));
                 }
             }
             return Ok(());
@@ -750,6 +756,31 @@ mod tests {
                 &tx,
             )
             .expect("reload");
+        let events = until(&mut rx, is_ready).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if *id == conversation_id(GUILD, NEWS)
+        )));
+        assert_eq!(conversations(&events).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn connect_removes_channels_that_left_the_list() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state()
+            .channels
+            .get_mut(&GUILD)
+            .expect("guild")
+            .retain(|channel| channel.id != NEWS);
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
         let events = until(&mut rx, is_ready).await;
         assert!(events.iter().any(|event| matches!(
             event,
