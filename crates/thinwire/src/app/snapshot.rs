@@ -1181,6 +1181,11 @@ impl Snapshot {
         }
         let resuming = std::mem::replace(&mut self.resume, Resume::Settled) == Resume::Connecting;
         self.auth_notice = None;
+        if phase == TelegramAuthPhase::NeedPhone {
+            // TDLib is back at the phone step: an old code or password is stale.
+            self.telegram_code.clear();
+            self.telegram_2fa.clear();
+        }
         match phase {
             TelegramAuthPhase::NeedPhone if self.data_reset.is_some() => {
                 let notice = data_reset_notice(&self.data_reset.take().unwrap_or_default());
@@ -2890,6 +2895,20 @@ mod tests {
         let error = snapshot.error.clone().expect("error block");
         assert_eq!(error.happened, "Message not sent.");
         assert!(snapshot.can_send(), "the user can send it again");
+    }
+
+    #[test]
+    fn a_new_phone_step_drops_a_stale_code_and_password() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        snapshot.telegram_code = "12345".into();
+        snapshot.telegram_2fa = "old-password".into();
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert!(snapshot.telegram_code.is_empty(), "no stale code");
+        assert!(snapshot.telegram_2fa.is_empty(), "no stale password");
     }
 
     #[test]
