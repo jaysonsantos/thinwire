@@ -296,19 +296,54 @@ impl OlderHistory {
         OlderStep::Fetch
     }
 
-    /// Record a fetched page. `new_messages` counts only messages older than
-    /// the anchor. Zero means the start of the chat. Returns `more`.
-    pub(super) fn finish(&mut self, chat_id: i64, before: i64, new_messages: usize) -> bool {
-        self.last_anchor.insert(chat_id, before);
-        let at_start = new_messages == 0;
-        self.at_start.insert(chat_id, at_start);
-        !at_start
+    /// Record a fetched page. Returns `more`. Only an empty TDLib page marks
+    /// the start of the chat. A page with only the anchor records nothing, so
+    /// a later request for the same anchor can try again (PR #52 review).
+    pub(super) fn finish(&mut self, chat_id: i64, before: i64, page: PageOutcome) -> bool {
+        match page {
+            PageOutcome::Older(_) => {
+                self.last_anchor.insert(chat_id, before);
+                self.at_start.insert(chat_id, false);
+                true
+            }
+            PageOutcome::Empty => {
+                self.last_anchor.insert(chat_id, before);
+                self.at_start.insert(chat_id, true);
+                false
+            }
+            PageOutcome::OnlyAnchor => true,
+        }
     }
 
     /// `more` for an answer without a TDLib call.
     #[must_use]
     pub(super) fn more(&self, chat_id: i64) -> bool {
         !self.at_start.get(&chat_id).copied().unwrap_or(false)
+    }
+}
+
+/// What one TDLib history page held, relative to the anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PageOutcome {
+    /// This many messages older than the anchor.
+    Older(usize),
+    /// Only the anchor itself (TDLib can return a short page before it has
+    /// the older ones): nothing new yet, retryable. Not the start of the chat.
+    OnlyAnchor,
+    /// TDLib returned no message at all: the start of the chat.
+    Empty,
+}
+
+/// Classify a page by its raw size (before the anchor is removed) and the
+/// number of messages older than the anchor.
+#[must_use]
+pub(super) const fn page_outcome(raw_len: usize, older_len: usize) -> PageOutcome {
+    if older_len > 0 {
+        PageOutcome::Older(older_len)
+    } else if raw_len == 0 {
+        PageOutcome::Empty
+    } else {
+        PageOutcome::OnlyAnchor
     }
 }
 
@@ -626,7 +661,10 @@ mod tests {
 
         let mut gate = OlderHistory::new();
         assert_eq!(gate.begin(1, 50), OlderStep::Fetch);
-        assert!(gate.finish(1, 50, page.len()), "more can load");
+        assert!(
+            gate.finish(1, 50, page_outcome(4, page.len())),
+            "more can load"
+        );
         assert_eq!(
             gate.begin(1, 50),
             OlderStep::Repeat,
@@ -634,7 +672,7 @@ mod tests {
         );
         assert_eq!(gate.begin(1, 47), OlderStep::Fetch, "the next page");
         assert!(
-            !gate.finish(1, 47, 0),
+            !gate.finish(1, 47, page_outcome(0, 0)),
             "an empty page is the start of the chat"
         );
         assert_eq!(gate.begin(1, 12), OlderStep::AtStart);
@@ -645,6 +683,35 @@ mod tests {
             "other chats are separate"
         );
         assert!(gate.more(2));
+    }
+
+    #[test]
+    fn an_anchor_only_page_is_retryable_not_the_start_of_the_chat() {
+        // TDLib returned a short page that holds only the anchor (id 50).
+        let page = older_than(vec![50], 50, |id| *id);
+        assert!(page.is_empty());
+        let outcome = page_outcome(1, page.len());
+        assert_eq!(outcome, PageOutcome::OnlyAnchor);
+
+        let mut gate = OlderHistory::new();
+        assert_eq!(gate.begin(1, 50), OlderStep::Fetch);
+        assert!(gate.finish(1, 50, outcome), "more = true: nothing new yet");
+        assert!(gate.more(1));
+        assert_eq!(
+            gate.begin(1, 50),
+            OlderStep::Fetch,
+            "the same anchor can be asked again later"
+        );
+        assert!(
+            gate.finish(1, 50, page_outcome(3, 2)),
+            "then the older page comes"
+        );
+        assert_eq!(page_outcome(0, 0), PageOutcome::Empty);
+        assert!(
+            !gate.finish(1, 48, PageOutcome::Empty),
+            "only an empty page ends it"
+        );
+        assert_eq!(gate.begin(1, 10), OlderStep::AtStart);
     }
 
     #[test]

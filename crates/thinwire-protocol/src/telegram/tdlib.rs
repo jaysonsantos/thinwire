@@ -15,7 +15,7 @@ use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resol
 use super::data_dir;
 use super::inbox::{
     self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook, OlderHistory,
-    OlderStep,
+    OlderStep, PageOutcome,
 };
 use super::lifecycle::{
     CloseKind, ClosingFlag, DoneFlag, LateReady, LoginEvents, WorkerSlots, all_done, close_kind,
@@ -1205,23 +1205,18 @@ async fn load_older(
         }
         OlderStep::Fetch => {}
     }
-    match tdlib_rs::functions::get_chat_history(
-        chat_id,
-        before,
-        0,
-        inbox::OLDER_PAGE_LIMIT,
-        false,
-        client_id,
-    )
-    .await
-    {
-        Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
-            let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
-            let older = inbox::older_than(messages, before, |message| message.id);
+    // TDLib can answer the first call with only the anchor (a short page
+    // before it has older messages). Ask once more in that case.
+    let mut page = fetch_older_page(client_id, chat_id, before).await;
+    if matches!(page, Ok((PageOutcome::OnlyAnchor, _))) {
+        page = fetch_older_page(client_id, chat_id, before).await;
+    }
+    match page {
+        Ok((outcome, older)) => {
             for message in &older {
                 emit_mapped_message(events, message, live, None);
             }
-            let more = live.older.finish(chat_id, before, older.len());
+            let more = live.older.finish(chat_id, before, outcome);
             done(more);
         }
         Err(error) => {
@@ -1236,6 +1231,28 @@ async fn load_older(
             done(true);
         }
     }
+}
+
+/// One TDLib page older than `before`, classified. Older messages come
+/// oldest first, without the anchor.
+async fn fetch_older_page(
+    client_id: i32,
+    chat_id: i64,
+    before: i64,
+) -> Result<(PageOutcome, Vec<tdlib_rs::types::Message>), tdlib_rs::types::Error> {
+    let tdlib_rs::enums::Messages::Messages(batch) = tdlib_rs::functions::get_chat_history(
+        chat_id,
+        before,
+        0,
+        inbox::OLDER_PAGE_LIMIT,
+        false,
+        client_id,
+    )
+    .await?;
+    let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
+    let raw_len = messages.len();
+    let older = inbox::older_than(messages, before, |message| message.id);
+    Ok((inbox::page_outcome(raw_len, older.len()), older))
 }
 
 async fn send_text(

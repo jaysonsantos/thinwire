@@ -1150,10 +1150,17 @@ mod tests {
         let older = &src[src.find("async fn load_older").expect("load_older")
             ..src.find("async fn send_text(").expect("next fn")];
         assert!(older.contains("live.older.begin(chat_id, before)"));
-        assert!(older.contains("inbox::OLDER_PAGE_LIMIT"));
-        assert!(older.contains("functions::get_chat_history("));
-        assert!(older.contains("inbox::older_than(messages, before"));
-        assert!(older.contains("live.older.finish(chat_id, before, older.len())"));
+        assert!(older.contains("fetch_older_page(client_id, chat_id, before)"));
+        assert!(
+            older.contains("PageOutcome::OnlyAnchor"),
+            "an anchor-only page is asked once more, not the start"
+        );
+        assert!(older.contains("live.older.finish(chat_id, before, outcome)"));
+        let fetch = &src[src.find("async fn fetch_older_page").expect("fetch")
+            ..src.find("async fn send_text(").expect("next fn")];
+        assert!(fetch.contains("inbox::OLDER_PAGE_LIMIT"));
+        assert!(fetch.contains("functions::get_chat_history("));
+        assert!(fetch.contains("inbox::page_outcome(raw_len, older.len())"));
         assert!(older.contains("log_tdlib_error(\"getChatHistory (older)\""));
         assert!(!older.contains("tracing::"), "no message text in logs");
         assert!(
