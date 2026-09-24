@@ -29,6 +29,32 @@ impl TwilightApi {
             client: Client::new(token),
         }
     }
+
+    fn guild_page(&self, after: Option<u64>) -> ApiFuture<'_, Vec<GuildSummary>> {
+        Box::pin(async move {
+            let mut request = self
+                .client
+                .current_user_guilds()
+                .limit(super::api::GUILD_PAGE_LIMIT);
+            if let Some(raw) = after {
+                request = request.after(id(raw)?);
+            }
+            let response = request.await.map_err(|e| map_error(&e))?;
+            let guilds = response
+                .models()
+                .await
+                .map_err(|_| DiscordApiError::Transport)?;
+            Ok(guilds
+                .into_iter()
+                .map(|guild| GuildSummary {
+                    id: guild.id.get(),
+                    name: guild.name,
+                    owner: guild.owner,
+                    permissions: guild.permissions.bits(),
+                })
+                .collect())
+        })
+    }
 }
 
 impl fmt::Debug for TwilightApi {
@@ -116,26 +142,9 @@ impl DiscordApi for TwilightApi {
     }
 
     fn guilds(&self) -> ApiFuture<'_, Vec<GuildSummary>> {
-        Box::pin(async move {
-            let response = self
-                .client
-                .current_user_guilds()
-                .await
-                .map_err(|e| map_error(&e))?;
-            let guilds = response
-                .models()
-                .await
-                .map_err(|_| DiscordApiError::Transport)?;
-            Ok(guilds
-                .into_iter()
-                .map(|guild| GuildSummary {
-                    id: guild.id.get(),
-                    name: guild.name,
-                    owner: guild.owner,
-                    permissions: guild.permissions.bits(),
-                })
-                .collect())
-        })
+        Box::pin(
+            async move { super::api::collect_guild_pages(|after| self.guild_page(after)).await },
+        )
     }
 
     fn member_roles(&self, guild_id: u64, user_id: u64) -> ApiFuture<'_, Vec<u64>> {
