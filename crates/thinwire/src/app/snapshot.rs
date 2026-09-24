@@ -458,6 +458,15 @@ impl Snapshot {
                 message_id,
                 delivery,
             } => self.set_delivery(protocol, &conversation_id, &message_id, delivery),
+            AdapterEvent::SendAccepted {
+                protocol,
+                conversation_id,
+                request,
+            } => {
+                if protocol == ProtocolId::Telegram {
+                    self.note_send_accepted(&conversation_id, request);
+                }
+            }
             AdapterEvent::SendRejected {
                 protocol,
                 conversation_id,
@@ -487,7 +496,6 @@ impl Snapshot {
                 self.remove_conversation(protocol, &id);
             }
             AdapterEvent::MessageReceived { message } => {
-                self.note_send_accepted(&message);
                 let before =
                     self.delivery_of(message.protocol, &message.conversation_id, &message.id);
                 self.note_delivery(before, &message);
@@ -1038,20 +1046,17 @@ impl Snapshot {
         std::mem::take(&mut self.keychain_retry)
     }
 
-    /// The pending (or sent) row of the unaccepted send arrived: the adapter
-    /// accepted it. Only now does the compose text (or the chat's draft) clear.
-    fn note_send_accepted(&mut self, message: &ChatMessage) {
-        if !message.outbound {
-            return;
-        }
-        let chat = &message.conversation_id;
-        if self.sending.get(chat).map(|(_, body)| body.as_str()) != Some(message.body.trim()) {
+    /// The adapter accepted this send (chat and request id match). Only now
+    /// does the compose text (or the chat's draft) clear. A history message
+    /// with the same text is not an acceptance (Codex 4091552898).
+    fn note_send_accepted(&mut self, chat: &str, request: u64) {
+        if self.sending.get(chat).map(|(id, _)| *id) != Some(request) {
             return;
         }
         let Some((_, body)) = self.sending.remove(chat) else {
             return;
         };
-        let selected = self.selected_conversation.as_deref() == Some(chat.as_str());
+        let selected = self.selected_conversation.as_deref() == Some(chat);
         if selected && self.compose.trim() == body {
             self.compose.clear();
         } else if self
@@ -2017,6 +2022,7 @@ mod tests {
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 100, "line one\nline two", Delivery::Pending),
         });
+        accept(&mut snapshot, "telegram:1");
         assert!(
             snapshot.compose.is_empty(),
             "cleared once the send is accepted"
@@ -2091,6 +2097,7 @@ mod tests {
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 100, "hi", Delivery::Pending),
         });
+        accept(&mut snapshot, "telegram:1");
         assert!(snapshot.compose.is_empty());
         snapshot.apply(AdapterEvent::MessageReplaced {
             protocol: ProtocolId::Telegram,
@@ -2899,6 +2906,7 @@ mod tests {
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 100, "hello", Delivery::Pending),
         });
+        accept(&mut snapshot, "telegram:1");
         assert!(
             snapshot.compose.is_empty(),
             "the pending row means accepted"
@@ -2922,6 +2930,7 @@ mod tests {
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 100, "for Ada", Delivery::Pending),
         });
+        accept(&mut snapshot, "telegram:1");
         snapshot.select_conversation("telegram:1".into());
         assert!(
             snapshot.compose.is_empty(),
@@ -2976,7 +2985,44 @@ mod tests {
         snapshot.apply(AdapterEvent::MessageReceived {
             message: outgoing(1, 100, "hello", Delivery::Pending),
         });
+        accept(&mut snapshot, "telegram:1");
         assert!(snapshot.compose.is_empty(), "then accepted as usual");
+    }
+
+    /// The adapter accepts the in-flight send of `chat` (its own request id).
+    fn accept(snapshot: &mut Snapshot, chat: &str) {
+        let request = snapshot.sending.get(chat).expect("a send in flight").0;
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: chat.into(),
+            request,
+        });
+    }
+
+    #[test]
+    fn a_history_message_with_the_same_text_is_not_an_acceptance() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "ok".into();
+        snapshot.send_compose();
+        let request = sent_request(&mut snapshot);
+        // History (still loading) has an older outgoing "ok" in this chat.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 5, "ok", Delivery::Sent),
+        });
+        assert_eq!(snapshot.compose, "ok", "history does not accept the send");
+        assert!(!snapshot.can_send(), "the real send is still in flight");
+        // The real send then fails at once: the draft is still there.
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(snapshot.compose, "ok");
+        assert_eq!(
+            snapshot.error.clone().expect("error").happened,
+            "Message not sent."
+        );
     }
 
     fn sent_request(snapshot: &mut Snapshot) -> u64 {

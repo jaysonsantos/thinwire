@@ -332,6 +332,13 @@ pub enum AdapterEvent {
         conversation_id: String,
         message_ids: Vec<String>,
     },
+    /// The adapter accepted this send: its pending message exists. Only this
+    /// event clears the draft; a history message with the same text does not.
+    SendAccepted {
+        protocol: ProtocolId,
+        conversation_id: String,
+        request: u64,
+    },
     /// The adapter did not accept this send (no pending message exists). Only
     /// this event fails the send; other errors leave it pending.
     SendRejected {
@@ -607,6 +614,20 @@ pub(crate) fn emit_message_delivery(
         conversation_id: conversation_id.into(),
         message_id: message_id.into(),
         delivery,
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_send_accepted(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    request: u64,
+) {
+    let _ = events.send(AdapterEvent::SendAccepted {
+        protocol,
+        conversation_id: conversation_id.into(),
+        request,
     });
 }
 

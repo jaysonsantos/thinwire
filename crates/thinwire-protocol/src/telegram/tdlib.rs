@@ -22,8 +22,8 @@ use crate::adapter::{
     AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
     emit_conversation_removed, emit_history_loaded, emit_message, emit_message_body,
-    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_send_rejected,
-    emit_status, emit_stopped, emit_telegram_auth, emit_telegram_auth_rejected,
+    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_send_accepted,
+    emit_send_rejected, emit_status, emit_stopped, emit_telegram_auth, emit_telegram_auth_rejected,
     emit_telegram_code_sent, emit_telegram_data_reset, emit_telegram_session_ended,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
@@ -1085,6 +1085,8 @@ async fn send_text(
     match tdlib_rs::functions::send_message(chat_id, None, None, None, content, client_id).await {
         Ok(tdlib_rs::enums::Message::Message(message)) => {
             emit_mapped_message(events, &message, live, None);
+            // After the pending row, name this send as accepted.
+            emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request);
         }
         Err(error) => {
             log_tdlib_error("sendMessage", &error);
