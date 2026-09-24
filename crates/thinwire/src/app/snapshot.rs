@@ -1071,8 +1071,10 @@ impl Snapshot {
         !self.auth_busy && !(self.auth == AuthScreen::Telegram2fa && self.telegram_2fa.is_empty())
     }
 
-    /// Back from the code step to the phone step. No command: the next phone
-    /// submit asks Telegram for a new code.
+    /// Back from the code step to the phone step. No command here: TDLib
+    /// 1.8.61 accepts `setAuthenticationPhoneNumber` in `authorizationStateWaitCode`
+    /// (when no auth query is pending), so the next phone submit moves the live
+    /// TDLib state to the new number and sends a new code.
     pub(crate) fn change_number(&mut self) {
         if self.auth != AuthScreen::TelegramCode {
             return;
@@ -1086,14 +1088,15 @@ impl Snapshot {
         self.status_text = "Telegram: enter a phone number.".into();
     }
 
-    /// Ask for a new code: submit the same phone number again.
-    pub(crate) fn resend_code(&mut self, store: &SecretStore) {
+    /// Ask Telegram for a new code with TDLib `resendAuthenticationCode`
+    /// (the `ResendCode` step). The code step stays on screen.
+    pub(crate) fn resend_code(&mut self) {
         if self.auth != AuthScreen::TelegramCode || self.auth_busy {
             return;
         }
         self.telegram_code.clear();
-        self.auth = AuthScreen::TelegramPhone;
-        self.advance_telegram(store);
+        self.queue_telegram_step(TelegramAuthStep::ResendCode);
+        self.mark_auth_busy("Telegram: asking for a new code.");
     }
 
     /// Queue the compose text. Does nothing when [`Self::can_send`] is false;
@@ -2313,7 +2316,7 @@ mod tests {
     }
 
     #[test]
-    fn send_a_new_code_submits_the_phone_again() {
+    fn send_a_new_code_asks_telegram_to_resend_it() {
         let store = SecretStore::memory();
         let mut snapshot = at_phone_step(&store);
         snapshot.telegram_phone = "+15551234567".into();
@@ -2328,10 +2331,54 @@ mod tests {
         snapshot.apply(AdapterEvent::TelegramAuth {
             phase: TelegramAuthPhase::Failed,
         });
-        snapshot.resend_code(&store);
-        snapshot.resend_code(&store);
-        assert_eq!(auth_steps(&mut snapshot), vec![TelegramAuthStep::Phone]);
+        snapshot.telegram_code = "11111".into();
+        snapshot.resend_code();
+        snapshot.resend_code();
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::ResendCode],
+            "resendAuthenticationCode, not a new phone submit"
+        );
+        assert_eq!(
+            snapshot.auth,
+            AuthScreen::TelegramCode,
+            "the code step stays"
+        );
+        assert!(snapshot.telegram_code.is_empty());
         assert!(snapshot.auth_busy);
+        snapshot.apply(AdapterEvent::TelegramCodeSent {
+            via: TelegramCodeVia::Sms,
+        });
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedCode,
+        });
+        assert!(!snapshot.auth_busy);
+        assert_eq!(snapshot.code_via, Some(TelegramCodeVia::Sms));
+    }
+
+    #[test]
+    fn change_number_submits_the_new_phone_from_the_code_step() {
+        let store = SecretStore::memory();
+        let mut snapshot = at_phone_step(&store);
+        snapshot.telegram_phone = "+15551234567".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedCode,
+        });
+        snapshot.take_commands();
+        snapshot.change_number();
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        snapshot.telegram_phone = "+15557654321".into();
+        snapshot.auth_key(AuthKey::Enter, &store);
+        assert_eq!(
+            auth_steps(&mut snapshot),
+            vec![TelegramAuthStep::Phone],
+            "setAuthenticationPhoneNumber in WaitCode moves TDLib to the new number"
+        );
+        assert_eq!(
+            store.get(SecretKey::Phone).expect("phone").as_deref(),
+            Some("+15557654321")
+        );
     }
 
     #[test]

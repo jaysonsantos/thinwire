@@ -108,6 +108,8 @@ pub enum TelegramAuthStep {
     ApiCredentials,
     Phone,
     Code,
+    /// Ask Telegram for a new login code (TDLib `resendAuthenticationCode`).
+    ResendCode,
     TwoFactor,
     Complete,
 }
@@ -119,6 +121,7 @@ impl TelegramAuthStep {
             Self::ApiCredentials => "api credentials",
             Self::Phone => "phone",
             Self::Code => "code",
+            Self::ResendCode => "resend code",
             Self::TwoFactor => "2fa",
             Self::Complete => "complete",
         }

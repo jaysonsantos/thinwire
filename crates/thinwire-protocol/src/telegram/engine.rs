@@ -53,6 +53,11 @@ impl TelegramAuthEngine {
                 require(vault, TelegramSecretKey::Code)?;
                 TelegramAuthPhase::NeedTwoFactor
             }
+            // A new code for the same phone: the code step stays.
+            TelegramAuthStep::ResendCode => {
+                require_resolved_api(vault, source)?;
+                TelegramAuthPhase::NeedCode
+            }
             TelegramAuthStep::TwoFactor | TelegramAuthStep::Complete => {
                 if crate::telegram::uses_tdlib_hook() {
                     TelegramAuthPhase::NeedTwoFactor

@@ -476,6 +476,18 @@ async fn apply_step(
                 );
             }
         }
+        TelegramAuthStep::ResendCode => {
+            // Valid in WaitCode once the server timeout passed. A refusal comes
+            // back as a normal rejected step with its error.
+            if let Err(error) = tdlib_rs::functions::resend_authentication_code(
+                Some(tdlib_rs::enums::ResendCodeReason::UserRequest),
+                client_id,
+            )
+            .await
+            {
+                reject_step(events, &error);
+            }
+        }
         TelegramAuthStep::Code => {
             let Some(code) = secrets.get_secret(TelegramSecretKey::Code) else {
                 emit_telegram_auth(events, TelegramAuthPhase::Failed);

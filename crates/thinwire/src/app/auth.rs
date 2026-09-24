@@ -198,7 +198,7 @@ fn telegram_code(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretSto
         if snapshot.auth_rejection == Some(TelegramAuthError::CodeExpired)
             && ui.link("Send a new code").clicked()
         {
-            snapshot.resend_code(secrets);
+            snapshot.resend_code();
         }
     });
 }

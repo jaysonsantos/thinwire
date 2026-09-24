@@ -622,7 +622,11 @@ mod tests {
     fn live_tdlib_reports_why_a_login_step_failed_and_where_the_code_went() {
         let src = include_str!("tdlib.rs");
         let steps = fn_body(src, "async fn apply_step");
-        assert_eq!(steps.matches("reject_step(events, &error)").count(), 3);
+        assert_eq!(
+            steps.matches("reject_step(events, &error)").count(),
+            4,
+            "phone, code, resend code, password"
+        );
         let reject = fn_body(src, "fn reject_step");
         assert!(reject.contains("auth_error_from_tdlib(error.code, &error.message)"));
         assert!(reject.contains("emit_telegram_auth_rejected"));
@@ -874,6 +878,40 @@ mod tests {
         assert!(
             dropped < done && done < event,
             "the next command must start a new client"
+        );
+    }
+
+    #[test]
+    fn resend_code_uses_tdlib_resend_and_the_stub_stays_on_the_code_step() {
+        let src = include_str!("tdlib.rs");
+        let steps = fn_body(src, "async fn apply_step");
+        let arm = &steps[steps.find("TelegramAuthStep::ResendCode").expect("arm")..];
+        let arm = &arm[..arm.find("TelegramAuthStep::Code").expect("next arm")];
+        assert!(arm.contains("functions::resend_authentication_code("));
+        assert!(arm.contains("ResendCodeReason::UserRequest"));
+        assert!(arm.contains("reject_step(events, &error)"));
+        assert!(!arm.contains("set_authentication_phone_number"));
+        if uses_tdlib_hook() {
+            return;
+        }
+        let vault = Arc::new(MemorySecretVault::new());
+        vault.set_secret(TelegramSecretKey::ApiId, "11111");
+        vault.set_secret(TelegramSecretKey::ApiHash, "hash-value");
+        let mut adapter = TelegramAdapter::new(Arc::clone(&vault) as Arc<dyn TelegramSecretVault>);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::TelegramAuth {
+                    step: TelegramAuthStep::ResendCode,
+                },
+                &tx,
+            )
+            .expect("resend");
+        assert_eq!(
+            rx.try_recv().expect("phase"),
+            AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::NeedCode
+            }
         );
     }
 
