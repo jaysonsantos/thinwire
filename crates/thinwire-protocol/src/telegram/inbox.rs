@@ -315,6 +315,23 @@ impl OlderHistory {
         }
     }
 
+    /// Drop the pagination state of a chat that left the main list. Its cached
+    /// messages go away too, so a later load must not reuse an old anchor or
+    /// an old start-of-chat mark (PR #52 review).
+    pub(super) fn forget(&mut self, chat_id: i64) {
+        self.at_start.remove(&chat_id);
+        self.last_anchor.remove(&chat_id);
+    }
+
+    /// Forget a chat when `effect` removes it from the list.
+    pub(super) fn follow(&mut self, effect: Option<&ChatEffect>) {
+        if let Some(ChatEffect::Remove(id)) = effect
+            && let Some(chat_id) = parse_telegram_chat_id(id)
+        {
+            self.forget(chat_id);
+        }
+    }
+
     /// `more` for an answer without a TDLib call.
     #[must_use]
     pub(super) fn more(&self, chat_id: i64) -> bool {
@@ -712,6 +729,39 @@ mod tests {
             "only an empty page ends it"
         );
         assert_eq!(gate.begin(1, 10), OlderStep::AtStart);
+    }
+
+    #[test]
+    fn a_chat_that_leaves_the_main_list_loses_its_older_history_state() {
+        let mut directory = ChatDirectory::new();
+        directory.upsert(3, seed("Ada", 9, 0, ""));
+        let mut gate = OlderHistory::new();
+        assert!(gate.finish(3, 50, PageOutcome::Older(2)));
+        assert!(!gate.finish(3, 20, PageOutcome::Empty));
+        assert!(gate.finish(4, 70, PageOutcome::Older(1)));
+        assert_eq!(gate.begin(3, 20), OlderStep::AtStart);
+
+        // Archived: the chat and its cached messages leave the inbox.
+        let removed = directory.set_main_order(3, 0);
+        assert!(matches!(removed, Some(ChatEffect::Remove(_))));
+        gate.follow(removed.as_ref());
+        assert!(gate.more(3), "no stale start-of-chat mark");
+        assert_eq!(gate.begin(3, 20), OlderStep::Fetch);
+        assert_eq!(gate.begin(3, 50), OlderStep::Fetch, "no stale anchor");
+        assert_eq!(
+            gate.begin(4, 70),
+            OlderStep::Repeat,
+            "other chats keep theirs"
+        );
+
+        // An update that keeps the chat listed forgets nothing.
+        let mut gate = OlderHistory::new();
+        assert!(gate.finish(3, 50, PageOutcome::Older(2)));
+        let kept = directory.set_main_order(3, 5);
+        assert!(matches!(kept, Some(ChatEffect::Upsert(_))));
+        gate.follow(kept.as_ref());
+        gate.follow(None);
+        assert_eq!(gate.begin(3, 50), OlderStep::Repeat);
     }
 
     #[test]

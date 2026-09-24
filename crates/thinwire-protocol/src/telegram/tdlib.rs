@@ -828,12 +828,18 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
     let emit = live.linked();
     match update {
         tdlib_rs::enums::Update::NewChat(update) => {
-            publish(events, emit, note_chat(&mut live.directory, &update.chat));
+            publish(
+                events,
+                emit,
+                &mut live.older,
+                note_chat(&mut live.directory, &update.chat),
+            );
         }
         tdlib_rs::enums::Update::ChatTitle(update) => {
             publish(
                 events,
                 emit,
+                &mut live.older,
                 live.directory.set_title(update.chat_id, &update.title),
             );
         }
@@ -842,6 +848,7 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
                 publish(
                     events,
                     emit,
+                    &mut live.older,
                     live.directory
                         .set_main_order(update.chat_id, update.position.order),
                 );
@@ -851,6 +858,7 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
             publish(
                 events,
                 emit,
+                &mut live.older,
                 live.directory
                     .set_unread(update.chat_id, update.unread_count),
             );
@@ -861,6 +869,7 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
             publish(
                 events,
                 emit,
+                &mut live.older,
                 live.directory
                     .set_main_position(update.chat_id, main_order(&update.positions)),
             );
@@ -869,6 +878,7 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
                 publish(
                     events,
                     emit,
+                    &mut live.older,
                     live.directory
                         .set_preview(update.chat_id, &preview, i64::from(message.date)),
                 );
@@ -879,6 +889,7 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
                 publish(
                     events,
                     emit,
+                    &mut live.older,
                     live.directory.set_preview(update.chat_id, "", 0),
                 );
             }
@@ -893,6 +904,7 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
             publish(
                 events,
                 emit,
+                &mut live.older,
                 live.directory.set_preview(chat_id, &preview, at),
             );
         }
@@ -957,7 +969,10 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
     }
 }
 
-fn publish(events: &EventTx, emit: bool, effect: Option<ChatEffect>) {
+fn publish(events: &EventTx, emit: bool, older: &mut OlderHistory, effect: Option<ChatEffect>) {
+    // A chat that leaves the list drops its paging state too, even before
+    // Ready (PR #52 review).
+    older.follow(effect.as_ref());
     if emit {
         emit_effect(events, effect);
     }
