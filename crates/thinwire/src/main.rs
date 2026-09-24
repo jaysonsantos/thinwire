@@ -1,5 +1,7 @@
 mod app;
 
+use app::SettingsEgui;
+
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {

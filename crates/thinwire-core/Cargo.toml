@@ -16,6 +16,7 @@ default = []
 test-support = []
 
 [dependencies]
+dirs.workspace = true
 keyring-core.workspace = true
 thinwire-protocol.workspace = true
 tokio.workspace = true

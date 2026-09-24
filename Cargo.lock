@@ -4619,6 +4619,7 @@ name = "thinwire-core"
 version = "0.1.0"
 dependencies = [
  "apple-native-keyring-store",
+ "dirs 7.0.0",
  "keyring-core",
  "linux-keyutils-keyring-store",
  "secret-service",

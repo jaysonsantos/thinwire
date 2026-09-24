@@ -8,6 +8,7 @@
 mod intent;
 mod secret_text;
 pub mod secrets;
+pub mod settings;
 mod signal;
 mod theme;
 

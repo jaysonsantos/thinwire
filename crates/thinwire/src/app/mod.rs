@@ -1,9 +1,9 @@
 //! eframe application: polls adapter events and draws the shell.
 
 mod auth;
-mod settings;
 mod snapshot;
 mod theme;
+mod theme_mode;
 mod thread_layout;
 mod ui;
 #[cfg(feature = "whatsapp-web")]
@@ -21,8 +21,9 @@ use thinwire_protocol::{
 use snapshot::Snapshot;
 use thinwire_core::secrets::SecretStore;
 
-pub use settings::Settings;
 pub use theme::install as install_theme;
+pub use theme_mode::SettingsEgui;
+pub use thinwire_core::settings::Settings;
 
 /// Longest wait for TDLib to close before the window closes anyway.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
