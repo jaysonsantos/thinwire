@@ -647,6 +647,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_failure_is_a_channel_note_and_not_ready() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().next_error = Some(api::DiscordApiError::Transport);
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::HistoryLoaded { .. })
+        })
+        .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Notice { detail, .. } if detail.contains("network error")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Ready,
+                ..
+            }
+        )));
+        assert!(messages(&events).is_empty());
+    }
+
+    #[tokio::test]
     async fn send_text_shows_pending_then_the_sent_message() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;

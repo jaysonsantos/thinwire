@@ -12,8 +12,8 @@ use super::inbox::{HISTORY_LIMIT, InboxChannel, chat_message, load_channels};
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
 use crate::adapter::{
     AdapterError, AdapterEvent, AdapterStatus, ChatMessage, EventTx, ProtocolId, emit_conversation,
-    emit_conversation_removed, emit_message, emit_message_replaced, emit_notice,
-    emit_send_accepted, emit_send_rejected, emit_status,
+    emit_conversation_removed, emit_history_loaded, emit_message, emit_message_replaced,
+    emit_notice, emit_send_accepted, emit_send_rejected, emit_status,
 };
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
@@ -142,7 +142,12 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord history failed");
-                    emit_ready(&events, &format!("History did not load: {error}."));
+                    emit_notice(
+                        &events,
+                        ProtocolId::Discord,
+                        format!("History did not load: {error}."),
+                    );
+                    emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                 }
             }
         });
