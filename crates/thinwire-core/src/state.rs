@@ -346,6 +346,10 @@ pub struct Snapshot {
     pub whatsapp_pair_code: Option<String>,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_started: bool,
+    /// The user accepted the full-screen ban gate in this session. Pairing
+    /// needs it; showing the gate again or cancelling clears it.
+    #[cfg(feature = "whatsapp-web")]
+    whatsapp_risk_acknowledged: bool,
 }
 
 impl Default for Snapshot {
@@ -413,6 +417,8 @@ impl Snapshot {
             whatsapp_pair_code: None,
             #[cfg(feature = "whatsapp-web")]
             whatsapp_started: false,
+            #[cfg(feature = "whatsapp-web")]
+            whatsapp_risk_acknowledged: false,
         }
     }
 
@@ -1639,6 +1645,7 @@ impl Snapshot {
         self.whatsapp_qr = None;
         self.whatsapp_pair_code = None;
         self.whatsapp_started = false;
+        self.whatsapp_risk_acknowledged = false;
         self.whatsapp_phone.clear();
     }
 
@@ -1650,6 +1657,12 @@ impl Snapshot {
 
     #[cfg(feature = "whatsapp-web")]
     pub fn acknowledge_whatsapp_risk(&mut self) {
+        // The ban gate must be on screen: a frontend cannot skip it.
+        if self.whatsapp_screen != WhatsAppScreen::RiskGate {
+            tracing::warn!("whatsapp risk acknowledgement dropped: the risk gate is not shown");
+            return;
+        }
+        self.whatsapp_risk_acknowledged = true;
         self.whatsapp_screen = WhatsAppScreen::Pair;
         self.error = None;
         self.status_text = "WhatsApp ban gate accepted. Pairing has not started.".into();
@@ -1658,6 +1671,11 @@ impl Snapshot {
 
     #[cfg(feature = "whatsapp-web")]
     pub fn begin_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
+        // Pairing starts only from the pair screen, after the gate was accepted.
+        if self.whatsapp_screen != WhatsAppScreen::Pair || !self.whatsapp_risk_acknowledged {
+            tracing::warn!("whatsapp pairing dropped: the risk gate was not accepted");
+            return;
+        }
         if self.whatsapp_started {
             return;
         }
@@ -1676,6 +1694,7 @@ impl Snapshot {
         self.whatsapp_qr = None;
         self.whatsapp_pair_code = None;
         self.whatsapp_started = false;
+        self.whatsapp_risk_acknowledged = false;
         self.whatsapp_screen = WhatsAppScreen::Hidden;
         self.status_text = "WhatsApp pairing cancelled.".into();
         self.pending.push(AdapterCommand::WhatsAppCancelLink);
@@ -3942,5 +3961,49 @@ mod tests {
         snapshot.telegram_authorized = false;
         snapshot.center_key(AuthKey::Enter, &store);
         assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
+    }
+
+    /// PR #48 review (P1): the core refuses pairing without the ban gate.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn whatsapp_pairing_needs_the_risk_gate_in_order() {
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        assert!(snapshot.whatsapp_pairing_available());
+
+        // No gate on screen: both steps are dropped.
+        snapshot.acknowledge_whatsapp_risk();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        snapshot.whatsapp_phone = "15550100".into();
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(!snapshot.whatsapp_started);
+        assert!(snapshot.take_commands().is_empty());
+
+        // Gate shown, not accepted: pairing is still dropped.
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(!snapshot.whatsapp_started);
+        assert!(snapshot.take_commands().is_empty());
+
+        // Normal order works.
+        snapshot.acknowledge_whatsapp_risk();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(snapshot.whatsapp_started);
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![
+                AdapterCommand::WhatsAppAcknowledgeRisk,
+                AdapterCommand::WhatsAppBeginLink
+            ]
+        );
+
+        // Cancel drops the acknowledgement: a new link needs the gate again.
+        snapshot.cancel_whatsapp_link(&phone);
+        snapshot.take_commands();
+        snapshot.whatsapp_screen = WhatsAppScreen::Pair;
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(!snapshot.whatsapp_started);
+        assert!(snapshot.take_commands().is_empty());
     }
 }

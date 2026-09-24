@@ -81,6 +81,11 @@ pub enum TelegramIntent {
 }
 
 /// Experimental WhatsApp actions. The risk gate comes before any pairing.
+///
+/// The core checks the order: `AcknowledgeRisk` only while the gate is on
+/// screen, and `BeginLink` only after that. Any other order is dropped. A
+/// future gated protocol must follow the same rule in the core, not in a
+/// frontend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WhatsAppIntent {

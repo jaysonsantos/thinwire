@@ -702,4 +702,42 @@ mod tests {
             "no command reaches the host while closing"
         );
     }
+
+    /// PR #48 review (P1): a headless frontend that skips the WhatsApp ban
+    /// gate cannot start pairing. The normal order still works.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn whatsapp_intents_without_the_gate_reach_no_adapter() {
+        let mut core = memory_core();
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = probe;
+
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::AcknowledgeRisk));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::SetPhone(
+            "15550100".into(),
+        )));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::BeginLink));
+        assert!(
+            sent.try_recv().is_err(),
+            "no pairing command without the risk gate"
+        );
+
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::AcknowledgeRisk));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::BeginLink));
+        let mut got = Vec::new();
+        while let Ok(command) = sent.try_recv() {
+            got.push(command);
+        }
+        if cfg!(feature = "whatsapp-web") {
+            assert_eq!(
+                got,
+                vec![
+                    AdapterCommand::WhatsAppAcknowledgeRisk,
+                    AdapterCommand::WhatsAppBeginLink
+                ]
+            );
+        } else {
+            assert!(got.is_empty(), "feature off: WhatsApp intents do nothing");
+        }
+    }
 }
