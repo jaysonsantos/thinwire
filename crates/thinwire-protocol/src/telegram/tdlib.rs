@@ -21,7 +21,7 @@ use super::lifecycle::{
 };
 use super::router::{self, Router};
 use crate::adapter::{
-    AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthError, TelegramAuthPhase,
+    AdapterStatus, Delivery, EventTx, LoginEpoch, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
     emit_conversation_removed, emit_history_loaded, emit_message, emit_message_body,
     emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_send_accepted,
@@ -85,12 +85,21 @@ pub struct TdlibRuntime {
     slots: WorkerSlots,
     /// Closing flag of the current worker. `stop()` marks it at once.
     current_closing: Option<ClosingFlag>,
+    /// The host's Telegram login epoch. A new worker stamps its login events
+    /// with the value it starts with.
+    login_epoch: LoginEpoch,
 }
 
 impl TdlibRuntime {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_login_epoch(Arc::default())
+    }
+
+    #[must_use]
+    pub(crate) fn with_login_epoch(login_epoch: LoginEpoch) -> Self {
         Self {
+            login_epoch,
             commands: None,
             slots: WorkerSlots::new(),
             current_closing: None,
@@ -221,9 +230,10 @@ impl TdlibRuntime {
         }
         let slots = &mut self.slots;
         let current_closing = &mut self.current_closing;
+        let login_epoch = Arc::clone(&self.login_epoch);
         let sent = super::send_or_respawn(&mut self.commands, command, || {
             let (done, wait_for) = slots.start().unwrap_or_default();
-            let closing = ClosingFlag::default();
+            let closing = ClosingFlag::new(login_epoch.load(Ordering::SeqCst));
             *current_closing = Some(closing.clone());
             spawn_tdlib_worker(
                 Arc::clone(&secrets),

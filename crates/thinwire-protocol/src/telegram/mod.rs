@@ -83,6 +83,24 @@ impl TelegramAdapter {
         }
     }
 
+    /// The host's adapter: it shares the host's login epoch, so the host can
+    /// drop login events of a cancelled client (issue #42).
+    #[must_use]
+    pub(crate) fn with_login_epoch(
+        secrets: Arc<dyn TelegramSecretVault>,
+        login_epoch: super::adapter::LoginEpoch,
+    ) -> Self {
+        #[cfg(not(feature = "telegram-tdlib"))]
+        let _ = login_epoch;
+        Self {
+            secrets,
+            api_source: TelegramApiSource::from_build(),
+            engine: TelegramAuthEngine::new(),
+            #[cfg(feature = "telegram-tdlib")]
+            tdlib: tdlib::TdlibRuntime::with_login_epoch(login_epoch),
+        }
+    }
+
     /// Test helper that owns a process-local vault.
     #[must_use]
     pub fn memory() -> Self {

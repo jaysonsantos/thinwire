@@ -479,6 +479,8 @@ impl Snapshot {
             AdapterEvent::Stopped { protocol } => {
                 self.stopped.insert(protocol);
             }
+            // Internal: the host unwraps stamped login events in poll_events.
+            AdapterEvent::Login { .. } => {}
             AdapterEvent::ChatListLoaded { protocol } => {
                 if protocol == ProtocolId::Telegram {
                     self.chat_list_loading = false;

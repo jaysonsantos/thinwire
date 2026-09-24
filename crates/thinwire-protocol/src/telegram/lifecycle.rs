@@ -14,23 +14,35 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::adapter::{
-    EventTx, TelegramAuthError, TelegramAuthPhase, TelegramCodeVia, emit_telegram_auth,
-    emit_telegram_auth_rejected, emit_telegram_code_sent, emit_telegram_data_reset,
+    AdapterEvent, EventTx, TelegramAuthError, TelegramAuthPhase, TelegramCodeVia,
+    emit_telegram_data_reset,
 };
 
-/// Set by the runtime when it asks a worker's client to close (Cancel, Try
-/// again, shutdown). It is set before the worker reads its `Close` command.
+/// One client's identity for login events: its login epoch, and a flag the
+/// runtime sets when it asks the client to close (Cancel, Try again,
+/// shutdown), before the worker reads its `Close` command.
 #[derive(Debug, Clone, Default)]
-pub(super) struct ClosingFlag(Arc<AtomicBool>);
+pub(super) struct ClosingFlag {
+    closing: Arc<AtomicBool>,
+    epoch: u64,
+}
 
 impl ClosingFlag {
+    /// A new client started under login epoch `epoch`.
+    pub(super) fn new(epoch: u64) -> Self {
+        Self {
+            closing: Arc::new(AtomicBool::new(false)),
+            epoch,
+        }
+    }
+
     pub(super) fn mark(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.closing.store(true, Ordering::SeqCst);
     }
 
     #[must_use]
     pub(super) fn is_set(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.closing.load(Ordering::SeqCst)
     }
 }
 
@@ -53,28 +65,34 @@ impl<'a> LoginEvents<'a> {
         !self.closing.is_set()
     }
 
-    pub(super) fn phase(&self, phase: TelegramAuthPhase) {
+    /// Send `event` stamped with this client's epoch, while it is not closing.
+    /// The host drops it later if Cancel bumped the epoch meanwhile.
+    fn send(&self, event: AdapterEvent) {
         if self.open() {
-            emit_telegram_auth(self.events, phase);
+            let _ = self.events.send(AdapterEvent::Login {
+                epoch: self.closing.epoch,
+                event: Box::new(event),
+            });
         }
+    }
+
+    pub(super) fn phase(&self, phase: TelegramAuthPhase) {
+        self.send(AdapterEvent::TelegramAuth { phase });
     }
 
     pub(super) fn rejected(&self, error: TelegramAuthError) {
-        if self.open() {
-            emit_telegram_auth_rejected(self.events, error);
-        }
+        self.send(AdapterEvent::TelegramAuthRejected { error });
     }
 
     pub(super) fn code_sent(&self, via: TelegramCodeVia) {
-        if self.open() {
-            emit_telegram_code_sent(self.events, via);
-        }
+        self.send(AdapterEvent::TelegramCodeSent { via });
     }
 
+    /// Not a login step: a folder already moved on disk. It goes out even
+    /// when the client is closing, unstamped, so the next phone step can name
+    /// the kept folder (PR #49 review).
     pub(super) fn data_reset(&self, moved_to: &str) {
-        if self.open() {
-            emit_telegram_data_reset(self.events, moved_to);
-        }
+        emit_telegram_data_reset(self.events, moved_to);
     }
 }
 
@@ -197,37 +215,47 @@ mod tests {
 
     #[test]
     fn a_closing_client_sends_no_login_events() {
-        use crate::adapter::AdapterEvent;
-
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let closing = ClosingFlag::default();
+        let closing = ClosingFlag::new(7);
         // The runtime keeps a clone; Cancel marks it before `Close` is read.
         let runtime_side = closing.clone();
         let login = LoginEvents::new(&tx, &closing);
         login.phase(TelegramAuthPhase::NeedCode);
         assert_eq!(
             rx.try_recv().expect("open client"),
-            AdapterEvent::TelegramAuth {
-                phase: TelegramAuthPhase::NeedCode
-            }
+            AdapterEvent::Login {
+                epoch: 7,
+                event: Box::new(AdapterEvent::TelegramAuth {
+                    phase: TelegramAuthPhase::NeedCode
+                }),
+            },
+            "stamped with the client's epoch"
         );
 
         runtime_side.mark();
-        // A fake closing client reports late login updates: none reach the UI.
+        // A fake closing client reports late login updates: none go out.
         login.phase(TelegramAuthPhase::NeedPhone);
         login.phase(TelegramAuthPhase::Ready);
         login.phase(TelegramAuthPhase::Failed);
         login.rejected(TelegramAuthError::CodeInvalid);
         login.code_sent(TelegramCodeVia::Sms);
-        login.data_reset("tdlib.stale-1");
         assert!(
             rx.try_recv().is_err(),
             "no login event after Cancel (issue #42)"
         );
         assert!(!login.open());
 
+        // The data-reset notice is file state, not a login step: it still goes out.
+        login.data_reset("tdlib.stale-1");
+        assert_eq!(
+            rx.try_recv().expect("kept notice"),
+            AdapterEvent::TelegramDataReset {
+                moved_to: "tdlib.stale-1".into()
+            }
+        );
+
         // A new client has its own flag: a clean login state.
-        let fresh = ClosingFlag::default();
+        let fresh = ClosingFlag::new(8);
         LoginEvents::new(&tx, &fresh).phase(TelegramAuthPhase::NeedPhone);
         assert!(rx.try_recv().is_ok());
     }

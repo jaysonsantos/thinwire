@@ -9,6 +9,11 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Unbounded event sink from a worker into the UI poller.
 pub type EventTx = UnboundedSender<AdapterEvent>;
 
+/// Telegram login epoch. The host bumps it on the UI thread when it sends
+/// Telegram `Disconnect` or `Shutdown`; a worker stamps its login events with
+/// the value it started with. The host drops stale ones (issue #42).
+pub(crate) type LoginEpoch = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
 /// v1 protocol identifiers (S2: Signal is out of v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolId {
@@ -300,6 +305,13 @@ pub enum AdapterEvent {
     /// A live session ended without a request from this app (remote logout,
     /// or the session was revoked). The client closes; a new login follows.
     TelegramSessionEnded,
+    /// A login event stamped with its client's login epoch. Internal: the host
+    /// unwraps it in `poll_events` and drops it when the epoch is stale, so the
+    /// UI never sees this variant.
+    Login {
+        epoch: u64,
+        event: Box<AdapterEvent>,
+    },
     /// Telegram sent a login code. Sent just before the `NeedCode` phase.
     TelegramCodeSent {
         via: TelegramCodeVia,
@@ -522,11 +534,6 @@ pub(crate) fn emit_telegram_auth(events: &EventTx, phase: TelegramAuthPhase) {
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_telegram_auth_rejected(events: &EventTx, error: TelegramAuthError) {
-    let _ = events.send(AdapterEvent::TelegramAuthRejected { error });
-}
-
-#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 pub(crate) fn emit_telegram_session_ended(events: &EventTx) {
     let _ = events.send(AdapterEvent::TelegramSessionEnded);
 }
@@ -538,11 +545,6 @@ pub(crate) fn emit_telegram_data_reset(events: &EventTx, moved_to: &str) {
     let _ = events.send(AdapterEvent::TelegramDataReset {
         moved_to: name.to_string(),
     });
-}
-
-#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_telegram_code_sent(events: &EventTx, via: TelegramCodeVia) {
-    let _ = events.send(AdapterEvent::TelegramCodeSent { via });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
