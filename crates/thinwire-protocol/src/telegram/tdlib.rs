@@ -14,7 +14,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
 use super::data_dir;
 use super::inbox::{
-    self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook,
+    self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook, OlderHistory,
+    OlderStep,
 };
 use super::lifecycle::{
     CloseKind, ClosingFlag, DoneFlag, LateReady, LoginEvents, WorkerSlots, all_done, close_kind,
@@ -25,8 +26,8 @@ use crate::adapter::{
     AdapterStatus, Delivery, EventTx, LoginEpoch, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
     emit_conversation_removed, emit_history_loaded, emit_message, emit_message_body,
-    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_send_accepted,
-    emit_send_rejected, emit_status, emit_stopped, emit_telegram_session_ended,
+    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_older_history_loaded,
+    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped, emit_telegram_session_ended,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -46,6 +47,10 @@ enum TdlibCommand {
     Resend {
         conversation_id: String,
         message_id: String,
+    },
+    LoadOlder {
+        conversation_id: String,
+        before_message_id: String,
     },
     /// Ask TDLib to close. The worker exits after `authorizationStateClosed`.
     /// `cancel` is true for a Cancel (Disconnect): a client that already became
@@ -68,6 +73,7 @@ const SHUTDOWN_LIMIT: Duration = Duration::from_secs(4);
 
 struct LiveInbox {
     authorized: bool,
+    older: OlderHistory,
     /// This worker asked for a phone, code, or password step. Only such a
     /// login is rolled back on Cancel; a resumed session never is (ux F8).
     new_login: bool,
@@ -219,6 +225,25 @@ impl TdlibRuntime {
                 conversation_id,
                 body,
                 request,
+            },
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    pub fn load_older(
+        &mut self,
+        conversation_id: String,
+        before_message_id: String,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::LoadOlder {
+                conversation_id,
+                before_message_id,
             },
             secrets,
             source,
@@ -402,6 +427,7 @@ fn spawn_tdlib_worker(
 
         let mut live = LiveInbox {
             authorized: false,
+            older: OlderHistory::new(),
             new_login: false,
             closing: closing.clone(),
             close_requested: false,
@@ -456,6 +482,9 @@ fn spawn_tdlib_worker(
                         }
                         TdlibCommand::SendText { conversation_id, body, request } => {
                             send_text(client_id, &conversation_id, &body, request, &live, &events).await;
+                        }
+                        TdlibCommand::LoadOlder { conversation_id, before_message_id } => {
+                            load_older(client_id, &conversation_id, &before_message_id, &mut live, &events).await;
                         }
                         TdlibCommand::Resend { conversation_id, message_id } => {
                             resend(client_id, &conversation_id, &message_id, &live, &events).await;
@@ -1138,6 +1167,73 @@ async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &E
                 AdapterStatus::Error,
                 format!("Could not load messages (TDLib {}).", error.code),
             );
+        }
+    }
+}
+
+/// One page of messages older than `before_message_id`. The worker runs
+/// one command at a time, so one TDLib history call runs at a time. Message
+/// text is never logged.
+async fn load_older(
+    client_id: i32,
+    conversation_id: &str,
+    before_message_id: &str,
+    live: &mut LiveInbox,
+    events: &EventTx,
+) {
+    let done = |more: bool| {
+        emit_older_history_loaded(
+            events,
+            ProtocolId::Telegram,
+            conversation_id,
+            before_message_id,
+            more,
+        );
+    };
+    let Some((chat_id, before)) = inbox::parse_message_id(before_message_id) else {
+        done(false);
+        return;
+    };
+    if !live.linked() {
+        done(true);
+        return;
+    }
+    match live.older.begin(chat_id, before) {
+        OlderStep::AtStart | OlderStep::Repeat => {
+            done(live.older.more(chat_id));
+            return;
+        }
+        OlderStep::Fetch => {}
+    }
+    match tdlib_rs::functions::get_chat_history(
+        chat_id,
+        before,
+        0,
+        inbox::OLDER_PAGE_LIMIT,
+        false,
+        client_id,
+    )
+    .await
+    {
+        Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
+            let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
+            let older = inbox::older_than(messages, before, |message| message.id);
+            for message in &older {
+                emit_mapped_message(events, message, live, None);
+            }
+            let more = live.older.finish(chat_id, before, older.len());
+            done(more);
+        }
+        Err(error) => {
+            log_tdlib_error("getChatHistory (older)", &error);
+            emit_status(
+                events,
+                ProtocolId::Telegram,
+                AdapterStatus::Error,
+                format!("Could not load older messages (TDLib {}).", error.code),
+            );
+            // Not the start of the chat: a later scroll can try again.
+            done(true);
         }
     }
 }

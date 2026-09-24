@@ -487,6 +487,9 @@ impl Snapshot {
             }
             // Internal: the host unwraps stamped login events in poll_events.
             AdapterEvent::Login { .. } => {}
+            // The UI half of #30 (older messages on scroll up) comes with the
+            // thinwire-core UI state (PR #48). Until then the event is ignored.
+            AdapterEvent::OlderHistoryLoaded { .. } => {}
             AdapterEvent::ChatListLoaded { protocol } => {
                 if protocol == ProtocolId::Telegram {
                     self.chat_list_loading = false;

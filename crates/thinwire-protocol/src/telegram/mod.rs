@@ -34,7 +34,7 @@ use super::adapter::TelegramCodeVia;
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
     ProtocolCapabilities, ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep,
-    emit_flush_secrets, emit_send_rejected, emit_status,
+    emit_flush_secrets, emit_older_history_loaded, emit_send_rejected, emit_status,
 };
 use super::secrets::TelegramSecretVault;
 
@@ -276,6 +276,40 @@ impl ProtocolAdapter for TelegramAdapter {
                 }
                 self.dispatch_live(events, LiveCall::OpenChat(conversation_id))
             }
+            AdapterCommand::LoadOlderMessages {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                before_message_id,
+            } => {
+                let owned = inbox::parse_message_id(&before_message_id)
+                    .is_some_and(|(chat_id, _)| inbox::conversation_id(chat_id) == conversation_id);
+                let result = if owned {
+                    self.dispatch_live(
+                        events,
+                        LiveCall::LoadOlder {
+                            conversation_id: conversation_id.clone(),
+                            before_message_id: before_message_id.clone(),
+                        },
+                    )
+                } else {
+                    Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason: "message id is not in this Telegram chat",
+                    })
+                };
+                // A refused request ends too, so the UI stops its spinner and
+                // does not ask again in this state.
+                if result.is_err() {
+                    emit_older_history_loaded(
+                        events,
+                        ProtocolId::Telegram,
+                        conversation_id,
+                        before_message_id,
+                        false,
+                    );
+                }
+                result
+            }
             AdapterCommand::ResendMessage {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -380,6 +414,10 @@ enum LiveCall {
         conversation_id: String,
         message_id: String,
     },
+    LoadOlder {
+        conversation_id: String,
+        before_message_id: String,
+    },
 }
 
 impl TelegramAdapter {
@@ -401,6 +439,18 @@ impl TelegramAdapter {
                 } => {
                     self.tdlib
                         .send_text(conversation_id, body, request, secrets, source, events);
+                }
+                LiveCall::LoadOlder {
+                    conversation_id,
+                    before_message_id,
+                } => {
+                    self.tdlib.load_older(
+                        conversation_id,
+                        before_message_id,
+                        secrets,
+                        source,
+                        events,
+                    );
                 }
                 LiveCall::Resend {
                     conversation_id,
@@ -1028,6 +1078,92 @@ mod tests {
         assert_eq!(
             TelegramSecretVault::tdlib_folder_name(&MemorySecretVault::new()),
             crate::secrets::TDLIB_FOLDER
+        );
+    }
+
+    // A runtime for the live build's `tokio::spawn`. The body never awaits,
+    // so the worker is never polled and no TDLib client starts.
+    #[tokio::test]
+    async fn older_history_requests_are_checked_and_always_end() {
+        let mut adapter = TelegramAdapter::memory();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let foreign = adapter.handle(
+            AdapterCommand::LoadOlderMessages {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                before_message_id: "telegram:2:50".into(),
+            },
+            &tx,
+        );
+        assert!(
+            foreign
+                .expect_err("other chat")
+                .to_string()
+                .contains("not in this Telegram chat")
+        );
+        assert_eq!(
+            rx.try_recv().expect("the request ends"),
+            AdapterEvent::OlderHistoryLoaded {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                before_message_id: "telegram:2:50".into(),
+                more: false,
+            }
+        );
+        let valid = adapter.handle(
+            AdapterCommand::LoadOlderMessages {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                before_message_id: "telegram:1:50".into(),
+            },
+            &tx,
+        );
+        if uses_tdlib_hook() {
+            valid.expect("queued on the worker");
+        } else {
+            assert!(
+                valid
+                    .expect_err("feature off")
+                    .to_string()
+                    .contains("TDLib unavailable")
+            );
+            assert!(matches!(
+                rx.try_recv().expect("ends without TDLib"),
+                AdapterEvent::OlderHistoryLoaded { more: false, .. }
+            ));
+        }
+        let debug = format!(
+            "{:?}",
+            AdapterCommand::LoadOlderMessages {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                before_message_id: "telegram:1:50".into(),
+            }
+        );
+        assert!(debug.contains("telegram:1:50"), "ids only, no secret");
+    }
+
+    #[test]
+    fn live_tdlib_loads_older_pages_off_the_ui_thread_without_logging_text() {
+        let src = include_str!("tdlib.rs");
+        // Bounded by hand: `fn_body` looks for the next sync `fn` first.
+        let older = &src[src.find("async fn load_older").expect("load_older")
+            ..src.find("async fn send_text(").expect("next fn")];
+        assert!(older.contains("live.older.begin(chat_id, before)"));
+        assert!(older.contains("inbox::OLDER_PAGE_LIMIT"));
+        assert!(older.contains("functions::get_chat_history("));
+        assert!(older.contains("inbox::older_than(messages, before"));
+        assert!(older.contains("live.older.finish(chat_id, before, older.len())"));
+        assert!(older.contains("log_tdlib_error(\"getChatHistory (older)\""));
+        assert!(!older.contains("tracing::"), "no message text in logs");
+        assert!(
+            older.matches("done(").count() >= 5,
+            "every path ends the request"
+        );
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        assert!(
+            worker.contains("TdlibCommand::LoadOlder"),
+            "runs on the worker, one command at a time"
         );
     }
 

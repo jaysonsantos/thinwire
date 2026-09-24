@@ -16,6 +16,9 @@ pub(super) const MAIN_CHAT_LIMIT: i32 = 30;
 /// Page size passed to TDLib `getChatHistory`.
 pub(super) const HISTORY_LIMIT: i32 = 40;
 
+/// Page size for older messages (scroll up in a chat).
+pub(super) const OLDER_PAGE_LIMIT: i32 = 50;
+
 /// TDLib uses 404 when `loadChats` has already reached the end of the list.
 pub(super) const END_OF_CHAT_LIST: i32 = 404;
 
@@ -256,6 +259,69 @@ pub(super) fn parse_message_id(message_id: &str) -> Option<(i64, i64)> {
         return None;
     }
     Some((chat.parse().ok()?, message.parse().ok()?))
+}
+
+/// What the worker does with a request for older messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OlderStep {
+    /// Ask TDLib for the page before this message.
+    Fetch,
+    /// An earlier empty page reached the start of the chat: no TDLib call.
+    AtStart,
+    /// The same anchor was already served: no second TDLib call.
+    Repeat,
+}
+
+/// Per-chat state of older-history requests: the start of the chat once an
+/// empty page came, and the last anchor served. The worker runs one TDLib
+/// call at a time, so this gate only drops repeats and ends at the start.
+#[derive(Debug, Default)]
+pub(super) struct OlderHistory {
+    at_start: HashMap<i64, bool>,
+    last_anchor: HashMap<i64, i64>,
+}
+
+impl OlderHistory {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn begin(&self, chat_id: i64, before: i64) -> OlderStep {
+        if self.at_start.get(&chat_id).copied().unwrap_or(false) {
+            return OlderStep::AtStart;
+        }
+        if self.last_anchor.get(&chat_id) == Some(&before) {
+            return OlderStep::Repeat;
+        }
+        OlderStep::Fetch
+    }
+
+    /// Record a fetched page. `new_messages` counts only messages older than
+    /// the anchor. Zero means the start of the chat. Returns `more`.
+    pub(super) fn finish(&mut self, chat_id: i64, before: i64, new_messages: usize) -> bool {
+        self.last_anchor.insert(chat_id, before);
+        let at_start = new_messages == 0;
+        self.at_start.insert(chat_id, at_start);
+        !at_start
+    }
+
+    /// `more` for an answer without a TDLib call.
+    #[must_use]
+    pub(super) fn more(&self, chat_id: i64) -> bool {
+        !self.at_start.get(&chat_id).copied().unwrap_or(false)
+    }
+}
+
+/// Keep only messages older than the anchor, oldest first. TDLib may return
+/// the anchor itself; it is already on screen.
+#[must_use]
+pub(super) fn older_than<T>(newest_first: Vec<T>, before: i64, id: impl Fn(&T) -> i64) -> Vec<T> {
+    let mut older: Vec<T> = newest_first
+        .into_iter()
+        .filter(|item| id(item) < before)
+        .collect();
+    older.reverse();
+    older
 }
 
 #[must_use]
@@ -549,6 +615,36 @@ mod tests {
         assert_eq!(parse_message_id("telegram:9"), None);
         assert_eq!(parse_message_id("telegram:+9:4"), None);
         assert_eq!(parse_message_id("slack:9:4"), None);
+    }
+
+    #[test]
+    fn older_pages_merge_oldest_first_and_stop_at_the_start() {
+        // TDLib gives newest first and can include the anchor (id 50).
+        let page = older_than(vec![50, 49, 48, 47], 50, |id| *id);
+        assert_eq!(page, vec![47, 48, 49], "oldest first, anchor dropped");
+        assert_eq!(OLDER_PAGE_LIMIT, 50);
+
+        let mut gate = OlderHistory::new();
+        assert_eq!(gate.begin(1, 50), OlderStep::Fetch);
+        assert!(gate.finish(1, 50, page.len()), "more can load");
+        assert_eq!(
+            gate.begin(1, 50),
+            OlderStep::Repeat,
+            "the same anchor is not fetched twice"
+        );
+        assert_eq!(gate.begin(1, 47), OlderStep::Fetch, "the next page");
+        assert!(
+            !gate.finish(1, 47, 0),
+            "an empty page is the start of the chat"
+        );
+        assert_eq!(gate.begin(1, 12), OlderStep::AtStart);
+        assert!(!gate.more(1));
+        assert_eq!(
+            gate.begin(2, 9),
+            OlderStep::Fetch,
+            "other chats are separate"
+        );
+        assert!(gate.more(2));
     }
 
     #[test]
