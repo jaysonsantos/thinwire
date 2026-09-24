@@ -4609,6 +4609,7 @@ dependencies = [
  "egui",
  "keyring-core",
  "linux-keyutils-keyring-store",
+ "secret-service",
  "thinwire-protocol",
  "tokio",
  "tracing",

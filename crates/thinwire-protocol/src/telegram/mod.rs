@@ -794,7 +794,7 @@ mod tests {
     fn live_tdlib_uses_a_throwaway_folder_without_a_saving_keychain() {
         let src = include_str!("tdlib.rs");
         let params = fn_body(src, "async fn set_parameters");
-        assert!(params.contains("tdlib_data_dir(secrets.persists())"));
+        assert!(params.contains("tdlib_data_dir(secrets.persists(), secrets.tdlib_folder_name())"));
         let dir = fn_body(src, "fn tdlib_data_dir");
         assert!(dir.contains("data_dir::this_process_session_dir()"));
         let shutdown = &src[src.find("pub fn shutdown(").expect("shutdown")..];
@@ -969,6 +969,20 @@ mod tests {
             .find("emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request)")
             .expect("acceptance names the send");
         assert!(pending < accepted, "the pending row comes first");
+    }
+
+    #[test]
+    fn live_tdlib_takes_the_data_folder_name_from_the_vault() {
+        let src = include_str!("tdlib.rs");
+        let params = fn_body(src, "async fn set_parameters");
+        assert!(params.contains("tdlib_data_dir(secrets.persists(), secrets.tdlib_folder_name())"));
+        let dir = fn_body(src, "fn tdlib_data_dir");
+        assert!(dir.contains("base.push(folder_name)"));
+        assert!(!dir.contains("base.push(\"tdlib\")"));
+        assert_eq!(
+            TelegramSecretVault::tdlib_folder_name(&MemorySecretVault::new()),
+            crate::secrets::TDLIB_FOLDER
+        );
     }
 
     #[test]

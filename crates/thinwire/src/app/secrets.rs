@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use keyring_core::Entry;
 use thinwire_protocol::{
-    DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordSecretVault, TELEGRAM_SECRET_SERVICE,
-    TelegramSecretKey, TelegramSecretVault,
+    DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordSecretVault, TDLIB_FOLDER,
+    TDLIB_KEYUTILS_FOLDER, TELEGRAM_SECRET_SERVICE, TelegramSecretKey, TelegramSecretVault,
 };
 use tokio::runtime::Handle;
 
@@ -365,7 +365,21 @@ impl SecretStore {
             self.signal_discord_hydrated();
             return;
         }
-        match probe_os() {
+        let probed = match probe_os() {
+            Ok(backend) => Ok(backend),
+            Err(AttachError::Absent(error)) => Err(error),
+            Err(AttachError::ReadFailed(error)) => {
+                // A store that is present but failing: its keys are unknown, not
+                // missing. Try again reads it; nothing falls back (Codex 4091651519).
+                tracing::warn!(
+                    error = %error,
+                    "OS keychain is present but could not be read; sign-in data stays unloaded until Try again"
+                );
+                self.finish_read_failed();
+                return;
+            }
+        };
+        match probed {
             Ok(backend) => {
                 let discord_token = read_discord_os_token();
                 let should_flush = match read_os_snapshot() {
@@ -392,6 +406,13 @@ impl SecretStore {
                 self.finish_memory_only();
                 self.signal_discord_hydrated();
             }
+        }
+    }
+
+    /// Unsettled after a failed read: keys unknown, the UI offers Try again.
+    fn finish_read_failed(&self) {
+        if let Ok(mut inner) = self.lock() {
+            inner.phase = AttachPhase::ReadFailed;
         }
     }
 
@@ -422,9 +443,7 @@ impl SecretStore {
                 "OS keychain hydrate failed; attach stays unsettled so a missing database key is not assumed"
             );
             // Unsettled, but not "still loading": the UI shows Try again.
-            if let Ok(mut inner) = self.lock() {
-                inner.phase = AttachPhase::ReadFailed;
-            }
+            self.finish_read_failed();
             return false;
         }
         let should_flush = self.finish_ready(os_values);
@@ -620,6 +639,17 @@ impl TelegramSecretVault for SecretStore {
     fn persists(&self) -> bool {
         self.persistence() != Persistence::ThisSession
     }
+
+    fn tdlib_folder_name(&self) -> &'static str {
+        let keyutils = self
+            .lock()
+            .is_ok_and(|inner| inner.os_backend == Some(OsBackend::KernelKeyring));
+        if keyutils {
+            TDLIB_KEYUTILS_FOLDER
+        } else {
+            TDLIB_FOLDER
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,19 +691,65 @@ fn memory_requested() -> bool {
     std::env::var_os(KEYRING_ENV).is_some_and(|value| value == KEYRING_MEMORY)
 }
 
-fn probe_os() -> Result<OsBackend, SecretError> {
-    ensure_default_store()?;
-    probe_entry()?;
+/// Why no OS store settled.
+#[derive(Debug)]
+enum AttachError {
+    /// No usable OS store: memory-only for this session.
+    Absent(SecretError),
+    /// A store is present but failed (locked, prompt dismissed, timeout, D-Bus
+    /// error). Its keys are unknown, never "missing": the UI offers Try again.
+    ReadFailed(SecretError),
+}
+
+impl AttachError {
+    fn into_secret_error(self) -> SecretError {
+        match self {
+            Self::Absent(error) | Self::ReadFailed(error) => error,
+        }
+    }
+}
+
+/// What the Linux attach does after Secret Service failed.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxFallback {
+    /// Secret Service is not on this system (no provider, no D-Bus session).
+    UseKeyutils,
+    /// Secret Service is there but failed. Keyutils would show no keys and
+    /// could make a saved session look lost, so it is not used.
+    ReadFailed,
+}
+
+/// Only `secret_service::Error::Unavailable` means "not present". The
+/// `secret-service` crate maps a missing bus address, bus socket, or provider
+/// interface to it at connect time.
+#[cfg(target_os = "linux")]
+fn linux_fallback(error: &keyring_core::Error) -> LinuxFallback {
+    let keyring_core::Error::PlatformFailure(inner) = error else {
+        return LinuxFallback::ReadFailed;
+    };
+    match inner.downcast_ref::<secret_service::Error>() {
+        Some(secret_service::Error::Unavailable) => LinuxFallback::UseKeyutils,
+        _ => LinuxFallback::ReadFailed,
+    }
+}
+
+fn probe_os() -> Result<OsBackend, AttachError> {
+    if keyring_core::get_default_store().is_none() {
+        let backend = install_platform_store()?;
+        let _ = OS_BACKEND.set(backend);
+        return Ok(backend);
+    }
+    probe_entry().map_err(|error| AttachError::ReadFailed(map_keyring_error(error)))?;
     Ok(OS_BACKEND.get().copied().unwrap_or(OsBackend::Native))
 }
 
 /// Read one entry. A missing entry proves the store works.
-fn probe_entry() -> Result<(), SecretError> {
-    let entry = Entry::new(TELEGRAM_SECRET_SERVICE, SecretKey::ApiId.account())
-        .map_err(map_keyring_error)?;
+fn probe_entry() -> Result<(), keyring_core::Error> {
+    let entry = Entry::new(TELEGRAM_SECRET_SERVICE, SecretKey::ApiId.account())?;
     match entry.get_password() {
         Ok(_) | Err(keyring_core::Error::NoEntry) => Ok(()),
-        Err(error) => Err(map_keyring_error(error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -681,57 +757,75 @@ fn ensure_default_store() -> Result<(), SecretError> {
     if keyring_core::get_default_store().is_some() {
         return Ok(());
     }
-    let backend = install_platform_store()?;
+    let backend = install_platform_store().map_err(AttachError::into_secret_error)?;
     let _ = OS_BACKEND.set(backend);
     Ok(())
 }
 
+/// Secret Service first. Keyutils only when Secret Service is not present.
 #[cfg(target_os = "linux")]
-fn install_platform_store() -> Result<OsBackend, SecretError> {
-    let mut last_error = SecretError::new("OS keychain: no Linux backend");
-    for backend in LINUX_BACKENDS {
-        match install_linux_store(backend).and_then(|()| probe_entry()) {
-            Ok(()) => return Ok(backend),
-            Err(error) => {
-                tracing::info!(?backend, error = %error, "keychain backend not usable; trying the next one");
-                keyring_core::unset_default_store();
-                last_error = error;
+fn install_platform_store() -> Result<OsBackend, AttachError> {
+    let [primary, fallback] = LINUX_BACKENDS;
+    match try_linux_store(primary) {
+        Ok(()) => return Ok(primary),
+        Err(error) => {
+            keyring_core::unset_default_store();
+            match linux_fallback(&error) {
+                LinuxFallback::UseKeyutils => {
+                    tracing::info!(error = %error, "Secret Service is not present; using keyutils");
+                }
+                LinuxFallback::ReadFailed => {
+                    return Err(AttachError::ReadFailed(map_keyring_error(error)));
+                }
             }
         }
     }
-    Err(last_error)
+    try_linux_store(fallback)
+        .map(|()| fallback)
+        .map_err(|error| {
+            keyring_core::unset_default_store();
+            AttachError::Absent(map_keyring_error(error))
+        })
 }
 
 #[cfg(target_os = "linux")]
-fn install_linux_store(backend: OsBackend) -> Result<(), SecretError> {
+fn try_linux_store(backend: OsBackend) -> Result<(), keyring_core::Error> {
     match backend {
-        OsBackend::SecretService => keyring_core::set_default_store(
-            zbus_secret_service_keyring_store::Store::new().map_err(map_keyring_error)?,
-        ),
-        OsBackend::KernelKeyring | OsBackend::Native => keyring_core::set_default_store(
-            linux_keyutils_keyring_store::Store::new().map_err(map_keyring_error)?,
-        ),
+        OsBackend::SecretService => {
+            keyring_core::set_default_store(zbus_secret_service_keyring_store::Store::new()?);
+        }
+        OsBackend::KernelKeyring | OsBackend::Native => {
+            keyring_core::set_default_store(linux_keyutils_keyring_store::Store::new()?);
+        }
     }
-    Ok(())
+    probe_entry()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_platform_store() -> Result<OsBackend, SecretError> {
+fn install_platform_store() -> Result<OsBackend, AttachError> {
     let store = {
         #[cfg(target_os = "macos")]
         {
-            apple_native_keyring_store::keychain::Store::new().map_err(map_keyring_error)?
+            apple_native_keyring_store::keychain::Store::new()
+                .map_err(|error| AttachError::Absent(map_keyring_error(error)))?
         }
         #[cfg(windows)]
         {
-            windows_native_keyring_store::Store::new().map_err(map_keyring_error)?
+            windows_native_keyring_store::Store::new()
+                .map_err(|error| AttachError::Absent(map_keyring_error(error)))?
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {
-            return Err(SecretError::new("OS keychain: unsupported platform"));
+            return Err(AttachError::Absent(SecretError::new(
+                "OS keychain: unsupported platform",
+            )));
         }
     };
     keyring_core::set_default_store(store);
+    probe_entry().map_err(|error| {
+        keyring_core::unset_default_store();
+        AttachError::ReadFailed(map_keyring_error(error))
+    })?;
     Ok(OsBackend::Native)
 }
 
@@ -1005,6 +1099,57 @@ mod tests {
             TelegramSecretVault::persists(&ready),
             "keyutils keeps the key until restart; the stale-folder move covers that"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_missing_secret_service_falls_back_to_keyutils() {
+        use keyring_core::Error as KeyringError;
+        let absent = KeyringError::PlatformFailure(Box::new(secret_service::Error::Unavailable));
+        assert_eq!(linux_fallback(&absent), LinuxFallback::UseKeyutils);
+        for failing in [
+            KeyringError::NoStorageAccess(Box::new(secret_service::Error::Locked)),
+            KeyringError::NoStorageAccess(Box::new(secret_service::Error::Prompt)),
+            KeyringError::PlatformFailure(Box::new(secret_service::Error::PromptDisconnected)),
+            KeyringError::PlatformFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "D-Bus call timed out",
+            ))),
+            KeyringError::NoEntry,
+        ] {
+            assert_eq!(
+                linux_fallback(&failing),
+                LinuxFallback::ReadFailed,
+                "{failing:?} must not look like missing keys (Codex 4091651519)"
+            );
+        }
+        let src = include_str!("secrets.rs");
+        let install = &src[src
+            .find("fn install_platform_store() -> Result<OsBackend, AttachError> {")
+            .expect("linux install")..];
+        let read_failed = install
+            .find("return Err(AttachError::ReadFailed(")
+            .expect("fail closed");
+        let keyutils = install.find("try_linux_store(fallback)").expect("fallback");
+        assert!(
+            read_failed < keyutils,
+            "a failing Secret Service never reaches keyutils"
+        );
+    }
+
+    #[test]
+    fn a_keyutils_store_uses_its_own_tdlib_folder() {
+        let store = SecretStore::blank(AttachPhase::Detached);
+        store.complete_ready_attach_for_test(&[]);
+        store.set_backend_for_test(OsBackend::SecretService);
+        assert_eq!(TelegramSecretVault::tdlib_folder_name(&store), TDLIB_FOLDER);
+        store.set_backend_for_test(OsBackend::KernelKeyring);
+        assert_eq!(
+            TelegramSecretVault::tdlib_folder_name(&store),
+            TDLIB_KEYUTILS_FOLDER,
+            "a keyutils lost-key move can never touch the Secret Service session"
+        );
+        assert_ne!(TDLIB_FOLDER, TDLIB_KEYUTILS_FOLDER);
     }
 
     #[test]

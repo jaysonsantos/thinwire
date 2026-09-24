@@ -1207,7 +1207,7 @@ async fn set_parameters(
         );
         return;
     }
-    let dir = match tdlib_data_dir(secrets.persists()) {
+    let dir = match tdlib_data_dir(secrets.persists(), secrets.tdlib_folder_name()) {
         Ok(dir) => dir,
         Err(error) => {
             tracing::warn!(%error, "no private folder for the Telegram session");
@@ -1355,7 +1355,7 @@ fn generate_db_key() -> String {
 /// The TDLib folder. `THINWIRE_TDLIB_DIR` wins. Without a keychain that
 /// persists, each process uses its own private throwaway folder
 /// (see [`data_dir::this_process_session_dir`]).
-fn tdlib_data_dir(persists: bool) -> std::io::Result<PathBuf> {
+fn tdlib_data_dir(persists: bool, folder_name: &str) -> std::io::Result<PathBuf> {
     Ok(if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
         PathBuf::from(dir)
     } else if !persists {
@@ -1369,7 +1369,7 @@ fn tdlib_data_dir(persists: bool) -> std::io::Result<PathBuf> {
             })
             .unwrap_or_else(std::env::temp_dir);
         base.push("thinwire");
-        base.push("tdlib");
+        base.push(folder_name);
         base
     })
 }
