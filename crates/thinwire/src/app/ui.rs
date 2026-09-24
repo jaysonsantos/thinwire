@@ -1114,10 +1114,11 @@ mod tests {
     #[test]
     fn compose_bar_stays_inside_the_reserved_clip() {
         use super::{
-            COMPOSE_MAX_ROWS, SEND_MIN_HEIGHT, compose, compose_reserve, compose_row_height,
+            COMPOSE_MAX_ROWS, FIELD_STROKE_MAX, SEND_MIN_HEIGHT, compose, compose_reserve,
+            compose_row_height,
         };
         use crate::app::snapshot::Snapshot;
-        use crate::app::theme;
+        use crate::app::theme::{self, space};
 
         let ctx = egui::Context::default();
         theme::install(&ctx);
@@ -1161,6 +1162,26 @@ mod tests {
                             "old reserve {old} still covers the bar ({height} + {spacing})"
                         );
                     }
+                    // The scroll cap must hold the field, including its margin.
+                    // A short cap clips lines 4 and 5.
+                    let cap = compose_row_height(row_height, rows);
+                    let mut body = snapshot.compose.clone();
+                    let palette = theme::palette(ui);
+                    let field = egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(space::M as i8, space::M as i8))
+                        .stroke(egui::Stroke::new(FIELD_STROKE_MAX, palette.accent));
+                    let edit = ui.add(
+                        egui::TextEdit::multiline(&mut body)
+                            .id_salt(("compose-cap", rows))
+                            .frame(field)
+                            .desired_rows(rows)
+                            .desired_width(320.0),
+                    );
+                    assert!(
+                        edit.rect.height() <= cap + 0.05,
+                        "{rows} rows: field {} exceeds cap {cap}",
+                        edit.rect.height()
+                    );
                 });
             });
             output.textures_delta.clear();
