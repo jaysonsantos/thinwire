@@ -39,8 +39,9 @@ fn inbox_and_thread_scroll_and_show_load_states() {
 #[test]
 fn compose_ui_uses_enter_multiline_and_disabled_send() {
     let ui = include_str!("ui.rs");
-    assert!(ui.contains("TextEdit::multiline(&mut snapshot.compose)"));
-    assert!(ui.contains("compose_enter(shift)"));
+    assert!(ui.contains("edited(ui, &snapshot.compose"));
+    assert!(ui.contains("TextEdit::multiline(text)"));
+    assert!(ui.contains("if enter && !other && !shift {"));
     assert!(ui.contains("add_enabled(snapshot.can_send()"));
     assert!(ui.contains("request_focus(compose_id)"));
     assert!(ui.contains("\"Not sent\""));
@@ -110,28 +111,37 @@ fn thread_draws_bubbles_by_side_with_times_and_day_breaks() {
 fn keychain_notice_shows_only_when_secrets_stay_in_memory() {
     use super::ui::{KEYCHAIN_UNAVAILABLE_NOTICE, keychain_notice};
     assert_eq!(
-        keychain_notice(&SecretStore::memory()),
+        keychain_notice(SecretStore::memory().persistence()),
         Some(KEYCHAIN_UNAVAILABLE_NOTICE)
     );
     let attaching = SecretStore::detached_for_test();
-    assert_eq!(keychain_notice(&attaching), None, "no notice while loading");
+    assert_eq!(
+        keychain_notice(attaching.persistence()),
+        None,
+        "no notice while loading"
+    );
     attaching.complete_ready_attach_for_test(&[]);
     attaching.set_backend_for_test(OsBackend::SecretService);
-    assert_eq!(keychain_notice(&attaching), None, "Secret Service keeps it");
+    assert_eq!(
+        keychain_notice(attaching.persistence()),
+        None,
+        "Secret Service keeps it"
+    );
     attaching.set_backend_for_test(OsBackend::Native);
-    assert_eq!(keychain_notice(&attaching), None);
+    assert_eq!(keychain_notice(attaching.persistence()), None);
     attaching.set_backend_for_test(OsBackend::KernelKeyring);
     assert_eq!(
-        keychain_notice(&attaching),
+        keychain_notice(attaching.persistence()),
         Some(super::ui::KEYCHAIN_UNTIL_RESTART_NOTICE),
         "keyutils is lost at restart"
     );
     let ui = include_str!("ui.rs");
     let strip = &ui[ui.find("fn status_strip(").expect("strip")..];
     let strip = &strip[..strip.find("\nfn ").expect("next")];
-    assert!(strip.contains("keychain_notice(secrets)"));
+    assert!(strip.contains("keychain_notice(snapshot.persistence())"));
     assert_eq!(
-        ui.matches("keychain_notice(secrets)").count(),
+        ui.matches("keychain_notice(snapshot.persistence())")
+            .count(),
         1,
         "one notice only"
     );
@@ -147,8 +157,8 @@ fn keys_are_read_once_in_the_center_panel() {
     let ui = include_str!("ui.rs");
     let center = &ui[ui.find("fn center_panel(").expect("center")..];
     let center = &center[..center.find("\nfn ").expect("next")];
-    assert!(center.contains("center_key(AuthKey::Enter"));
-    assert!(center.contains("center_key(AuthKey::Escape"));
+    assert!(center.contains("Intent::Key(AuthKey::Enter)"));
+    assert!(center.contains("Intent::Key(AuthKey::Escape)"));
 }
 
 #[test]
@@ -337,4 +347,20 @@ fn whatsapp_spike_ui_is_feature_gated() {
     assert!(!os_zips.contains("whatsapp-web"));
     let test_sh = include_str!("../../../../scripts/test.sh");
     assert!(!test_sh.contains("whatsapp-web"));
+}
+
+/// Try again on a failed keychain read goes through the core, and the core
+/// reads the keychain again off the UI thread.
+#[test]
+fn keychain_try_again_reaches_the_core_attach() {
+    let ui = include_str!("ui.rs");
+    let screen = &ui[ui.find("fn keychain_failed(").expect("screen")..];
+    let screen = &screen[..screen.find("\nfn ").expect("next")];
+    assert!(screen.contains("KEYCHAIN_READ_FAILED"));
+    assert!(screen.contains("out.push(Intent::RetryKeychain)"));
+    let core = include_str!("../../../thinwire-core/src/core.rs");
+    assert!(core.contains("Intent::RetryKeychain => self.state.retry_keychain()"));
+    let retry = &core[core.find("take_keychain_retry()").expect("retry")..];
+    let retry = &retry[..retry.find('}').expect("end")];
+    assert!(retry.contains("spawn_os_attach("));
 }

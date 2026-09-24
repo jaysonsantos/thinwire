@@ -4,19 +4,18 @@ use std::time::Instant;
 
 use chrono::Local;
 use eframe::egui::{self, RichText};
-use thinwire_protocol::{AdapterStatus, Delivery, ProtocolId, WhatsAppPhoneVault};
+use thinwire_protocol::{AdapterStatus, Delivery, ProtocolId};
 
 use super::auth;
 use super::theme::{self, radius, size, space};
-use super::theme_mode::{SettingsEgui, ThemeModeEgui};
+use super::theme_mode::ThemeModeEgui;
 use super::thread_layout::{RowLayout, list_time, thread_rows};
-use thinwire_core::ThemeMode;
-use thinwire_core::secrets::{Persistence, SecretStore};
-use thinwire_core::settings::Settings;
+use thinwire_core::secrets::Persistence;
 use thinwire_core::state::{
     AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
     RESUME_CONNECTING, Snapshot, ThreadState,
 };
+use thinwire_core::{Intent, TelegramIntent, ThemeMode, View};
 
 /// Shown while the OS keychain is not available. Secrets stay in memory.
 pub(crate) const KEYCHAIN_UNAVAILABLE_NOTICE: &str =
@@ -29,8 +28,8 @@ pub(crate) const KEYCHAIN_UNTIL_RESTART_NOTICE: &str =
 /// One notice for the whole window. `None` while the keychain loads or keeps
 /// the sign-in across restarts.
 #[must_use]
-pub(crate) fn keychain_notice(secrets: &SecretStore) -> Option<&'static str> {
-    match secrets.persistence() {
+pub(crate) fn keychain_notice(persistence: Persistence) -> Option<&'static str> {
+    match persistence {
         Persistence::ThisSession => Some(KEYCHAIN_UNAVAILABLE_NOTICE),
         Persistence::UntilRestart => Some(KEYCHAIN_UNTIL_RESTART_NOTICE),
         Persistence::Loading | Persistence::Saved => None,
@@ -51,33 +50,41 @@ const SAME_RUN_GAP: f32 = 2.0;
 /// Gap before the first bubble of the next sender run.
 const NEXT_RUN_GAP: f32 = 10.0;
 
-pub(crate) fn draw(
-    ui: &mut egui::Ui,
-    snapshot: &mut Snapshot,
-    settings: &mut Settings,
-    secrets: &SecretStore,
-    whatsapp_phone: &WhatsAppPhoneVault,
-) {
-    settings.apply(ui.ctx());
-    #[cfg(feature = "whatsapp-web")]
-    if snapshot.whatsapp_pairing_available() && snapshot.whatsapp_gate_open() {
-        super::whatsapp_gate::draw(ui, snapshot, whatsapp_phone);
-        return;
-    }
-    #[cfg(not(feature = "whatsapp-web"))]
-    let _ = whatsapp_phone;
-    top_bar(ui, snapshot, settings, secrets);
-    status_strip(ui, snapshot, secrets);
-    left_panel(ui, snapshot);
-    center_panel(ui, snapshot, secrets);
+/// One-shot hints the core hands out once per change.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Hints {
+    /// Put the cursor in the compose field.
+    pub focus_compose: bool,
+    /// Scroll the selected inbox row into view.
+    pub scroll_to_selected: bool,
 }
 
-fn top_bar(
+/// Draw one frame. User actions go to `out`; the app dispatches them after.
+pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
+    super::theme_mode::apply(ui.ctx(), snapshot.theme());
+    #[cfg(feature = "whatsapp-web")]
+    if snapshot.whatsapp_pairing_available() && snapshot.whatsapp_gate_open() {
+        super::whatsapp_gate::draw(ui, snapshot, out);
+        return;
+    }
+    top_bar(ui, snapshot, out);
+    status_strip(ui, snapshot, out);
+    left_panel(ui, snapshot, hints, out);
+    center_panel(ui, snapshot, hints, out);
+}
+
+/// Single-line or multiline text bound to a core value. A change becomes an intent.
+pub(crate) fn edited(
     ui: &mut egui::Ui,
-    snapshot: &mut Snapshot,
-    settings: &mut Settings,
-    secrets: &SecretStore,
-) {
+    current: &str,
+    edit: impl FnOnce(&mut String) -> egui::TextEdit<'_>,
+) -> Option<String> {
+    let mut text = current.to_owned();
+    let changed = ui.add(edit(&mut text)).changed();
+    changed.then_some(text)
+}
+
+fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     egui::Panel::top("top").show(ui, |ui| {
         let palette = theme::palette(ui);
         ui.add_space(space::XS);
@@ -91,26 +98,28 @@ fn top_bar(
             for filter in InboxFilter::chrome_filters() {
                 let selected = snapshot.filter == *filter;
                 if filter_pill(ui, filter.label(), selected).clicked() {
-                    snapshot.set_filter(*filter);
+                    out.push(Intent::SetFilter(*filter));
                 }
             }
             ui.add_space(space::S);
-            search_field(ui, &mut snapshot.search);
+            if let Some(text) = search_field(ui, &snapshot.search) {
+                out.push(Intent::SetSearch(text));
+            }
             if snapshot.can_add_account() && ui.button("Add account").clicked() {
-                snapshot.open_add_account(secrets);
+                out.push(Intent::Telegram(TelegramIntent::AddAccount));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button("⋯", |ui| {
                     if ui.button("Refresh").clicked() {
-                        snapshot.refresh_visible();
+                        out.push(Intent::Refresh);
                         ui.close();
                     }
                     if snapshot.can_add_account() && ui.button("Advanced").clicked() {
-                        snapshot.open_api_override(secrets);
+                        out.push(Intent::Telegram(TelegramIntent::OpenApiOverride));
                         ui.close();
                     }
                     ui.separator();
-                    theme_control(ui, settings);
+                    theme_control(ui, snapshot.theme(), out);
                 });
             });
         });
@@ -138,7 +147,7 @@ fn filter_pill(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response
     )
 }
 
-fn search_field(ui: &mut egui::Ui, search: &mut String) {
+fn search_field(ui: &mut egui::Ui, search: &str) -> Option<String> {
     let palette = theme::palette(ui);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
     let center = rect.center() - egui::vec2(1.0, 1.0);
@@ -148,26 +157,26 @@ fn search_field(ui: &mut egui::Ui, search: &mut String) {
         [center + egui::vec2(3.2, 3.2), center + egui::vec2(6.0, 6.0)],
         stroke,
     );
-    ui.add(
-        egui::TextEdit::singleline(search)
+    edited(ui, search, |text| {
+        egui::TextEdit::singleline(text)
             .desired_width(160.0)
-            .hint_text("title / participant"),
-    );
+            .hint_text("title / participant")
+    })
 }
 
-fn theme_control(ui: &mut egui::Ui, settings: &mut Settings) {
+fn theme_control(ui: &mut egui::Ui, current: ThemeMode, out: &mut Vec<Intent>) {
     ui.label("Theme");
-    let mut preference = settings.theme().to_egui();
+    let mut preference = current.to_egui();
     preference.radio_buttons(ui);
     let chosen = ThemeMode::from_egui(preference);
-    if chosen != settings.theme() {
-        settings.set_theme(chosen);
-        settings.apply(ui.ctx());
+    if chosen != current {
+        out.push(Intent::SetTheme(chosen));
+        super::theme_mode::apply(ui.ctx(), chosen);
     }
 }
 
-fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    let notice = keychain_notice(secrets);
+fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    let notice = keychain_notice(snapshot.persistence());
     let show_error = snapshot.auth == AuthScreen::Idle && snapshot.error.is_some();
     let show_status =
         public_status(&snapshot.status_text).is_some_and(|text| !is_idle_status(text));
@@ -222,7 +231,7 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
         }
     });
     if dismiss {
-        snapshot.error = None;
+        out.push(Intent::DismissError);
     }
 }
 
@@ -280,7 +289,7 @@ fn status_strip_visible(snapshot: &Snapshot, notice: Option<&str>) -> bool {
     notice.is_some() || show_error || show_status
 }
 
-fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
     egui::Panel::left("switcher")
         .resizable(true)
         .default_size(280.0)
@@ -311,12 +320,12 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 ui.add_space(4.0);
             }
             if let Some(protocol) = clicked {
-                snapshot.select_protocol(protocol);
+                out.push(Intent::SelectProtocol(protocol));
             }
 
             #[cfg(feature = "whatsapp-web")]
             if snapshot.whatsapp_pairing_available() {
-                super::whatsapp_gate::risk_entry(ui, snapshot);
+                super::whatsapp_gate::risk_entry(ui, out);
             }
 
             ui.add_space(space::S);
@@ -325,7 +334,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
             egui::ScrollArea::vertical()
                 .id_salt("inbox")
                 .auto_shrink([false, false])
-                .show(ui, |ui| inbox(ui, snapshot));
+                .show(ui, |ui| inbox(ui, snapshot, hints, out));
         });
 }
 
@@ -428,7 +437,7 @@ fn show_no_chats(snapshot: &Snapshot) -> bool {
     snapshot.telegram_ready() || snapshot.selected_protocol != ProtocolId::Telegram
 }
 
-fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
     let now = Local::now();
     let rows: Vec<(String, String, String, u32, String)> = snapshot
         .visible_conversations()
@@ -470,7 +479,7 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         }
     }
 
-    let scroll_to_selected = snapshot.take_scroll_to_selected();
+    let scroll_to_selected = hints.scroll_to_selected;
     let mut clicked: Option<String> = None;
     for (id, title, preview, unread, time) in rows {
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
@@ -483,7 +492,7 @@ fn inbox(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         }
     }
     if let Some(id) = clicked {
-        snapshot.select_conversation(id);
+        out.push(Intent::SelectConversation { id });
     }
 }
 
@@ -616,7 +625,7 @@ fn account_label(status: AdapterStatus) -> &'static str {
     }
 }
 
-fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
     let fill = theme::palette(ui).bg;
     let frame = egui::Frame::central_panel(ui.style())
         .fill(fill)
@@ -630,16 +639,16 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
             )
         });
         if escape {
-            snapshot.center_key(AuthKey::Escape, secrets);
+            out.push(Intent::Key(AuthKey::Escape));
         } else if enter {
-            snapshot.center_key(AuthKey::Enter, secrets);
+            out.push(Intent::Key(AuthKey::Enter));
         }
         match snapshot.center_view() {
-            CenterView::Auth => auth::draw(ui, snapshot, secrets),
+            CenterView::Auth => auth::draw(ui, snapshot, out),
             CenterView::Resuming { connecting } => resuming(ui, snapshot, connecting),
-            CenterView::FirstRun => first_run(ui, snapshot, secrets),
-            CenterView::KeychainFailed => keychain_failed(ui, snapshot),
-            CenterView::Thread => thread(ui, snapshot),
+            CenterView::FirstRun => first_run(ui, snapshot, out),
+            CenterView::KeychainFailed => keychain_failed(ui, out),
+            CenterView::Thread => thread(ui, snapshot, hints, out),
         }
     });
 }
@@ -658,19 +667,19 @@ fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, connecting: bool) {
     });
 }
 
-fn keychain_failed(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+fn keychain_failed(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
     let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
     ui.add_space(top);
     ui.vertical_centered(|ui| {
         ui.colored_label(theme::palette(ui).warn, KEYCHAIN_READ_FAILED);
         ui.add_space(12.0);
         if ui.button("Try again").clicked() {
-            snapshot.retry_keychain();
+            out.push(Intent::RetryKeychain);
         }
     });
 }
 
-fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+fn first_run(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let id = ui.id().with("first-run-card-height");
     let known = ui.data(|data| data.get_temp::<f32>(id).unwrap_or(0.0));
     let spare = (ui.available_height() - known).max(0.0);
@@ -689,7 +698,7 @@ fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) 
                     ui.colored_label(palette.warn, banner);
                     ui.add_space(space::S);
                 }
-                if snapshot.has_api_credentials(secrets) {
+                if snapshot.has_api_credentials() {
                     ui.label(
                         RichText::new(
                             "Sign in with your phone number, then the login code, then optional 2FA.",
@@ -715,7 +724,7 @@ fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) 
                     )
                     .clicked()
                 {
-                    snapshot.open_telegram(secrets);
+                    out.push(Intent::Telegram(TelegramIntent::AddAccount));
                 }
             });
         })
@@ -723,7 +732,7 @@ fn first_run(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) 
     ui.data_mut(|data| data.insert_temp(id, response.rect.height()));
 }
 
-fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: Hints, out: &mut Vec<Intent>) {
     thread_header(ui, snapshot);
 
     let is_group = snapshot
@@ -779,11 +788,11 @@ fn thread(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
                 gap_before = Some(message.layout.run_end);
             }
         });
-    if let Some(id) = retry {
-        snapshot.retry_send(&id);
+    if let Some(message_id) = retry {
+        out.push(Intent::Retry { message_id });
     }
 
-    compose(ui, snapshot, compose_height);
+    compose(ui, snapshot, hints, compose_height, out);
 }
 
 /// One message row, ready to draw.
@@ -972,9 +981,15 @@ fn compose_reserve(row_height: f32, rows: usize, item_spacing_y: f32) -> f32 {
 }
 
 /// Multiline compose. Enter sends; Shift+Enter adds a line.
-fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
+fn compose(
+    ui: &mut egui::Ui,
+    snapshot: &View<'_>,
+    hints: Hints,
+    max_height: f32,
+    out: &mut Vec<Intent>,
+) {
     let compose_id = egui::Id::new("thread-compose");
-    if snapshot.take_focus_compose() {
+    if hints.focus_compose {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
     }
     if ui.memory(|memory| memory.has_focus(compose_id)) {
@@ -987,7 +1002,8 @@ fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
             )
         });
         // Eat plain Enter before the text field sees it, so it does not add a line.
-        if enter && !other && snapshot.compose_enter(shift) {
+        if enter && !other && !shift {
+            out.push(Intent::SendDraft);
             ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         }
     }
@@ -1030,14 +1046,16 @@ fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
                     .max_width(width)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut snapshot.compose)
+                        if let Some(text) = edited(ui, &snapshot.compose, |text| {
+                            egui::TextEdit::multiline(text)
                                 .id(compose_id)
                                 .frame(field)
                                 .desired_rows(1)
                                 .desired_width(width)
-                                .hint_text(RichText::new("Message").color(palette.text3)),
-                        );
+                                .hint_text(RichText::new("Message").color(palette.text3))
+                        }) {
+                            out.push(Intent::SetDraft(text));
+                        }
                     });
                 let can_send = snapshot.can_send();
                 if ui
@@ -1050,7 +1068,7 @@ fn compose(ui: &mut egui::Ui, snapshot: &mut Snapshot, max_height: f32) {
                     })
                     .clicked()
                 {
-                    snapshot.send_compose();
+                    out.push(Intent::SendDraft);
                 }
             });
         });
@@ -1147,6 +1165,10 @@ mod tests {
         theme::install(&ctx);
         ctx.set_theme(egui::Theme::Dark);
         let mut snapshot = Snapshot::new();
+        let store = thinwire_core::secrets::SecretStore::memory();
+        let settings = thinwire_core::settings::Settings::load_from(
+            std::env::temp_dir().join("thinwire-ui-compose-test.toml"),
+        );
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1169,8 +1191,10 @@ mod tests {
                     });
                     compose(
                         ui,
-                        &mut snapshot,
+                        &thinwire_core::View::from_parts(&snapshot, &store, &settings),
+                        super::Hints::default(),
                         compose_row_height(row_height, COMPOSE_MAX_ROWS),
+                        &mut Vec::new(),
                     );
                     let height = ui.cursor().min.y - top - spacing;
                     assert!(
@@ -1249,8 +1273,10 @@ mod tests {
                             });
                             compose(
                                 ui,
-                                &mut snapshot,
+                                &thinwire_core::View::from_parts(&snapshot, &store, &settings),
+                                super::Hints::default(),
                                 compose_row_height(row_height, COMPOSE_MAX_ROWS),
+                                &mut Vec::new(),
                             );
                             let compose_bottom = ui.cursor().min.y - spacing;
                             assert!(

@@ -1,7 +1,5 @@
 mod app;
 
-use app::SettingsEgui;
-
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
@@ -24,7 +22,7 @@ fn main() -> eframe::Result<()> {
             app::install_theme(&cc.egui_ctx);
             let settings = app::Settings::load();
             // First paint follows the stored mode. Missing file → System (ADR 0005).
-            settings.apply(&cc.egui_ctx);
+            app::apply_theme(&cc.egui_ctx, settings.theme());
             Ok(Box::new(app::ThinwireApp::new(settings, &cc.egui_ctx)))
         }),
     )

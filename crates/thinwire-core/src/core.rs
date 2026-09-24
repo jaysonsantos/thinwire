@@ -157,10 +157,12 @@ impl Core {
             Intent::SetFilter(filter) => self.state.set_filter(filter),
             Intent::SetSearch(text) => self.state.search = text,
             Intent::Refresh => self.state.refresh_visible(),
+            Intent::DismissError => self.state.error = None,
             Intent::Key(key) => self.state.center_key(key, &self.secrets),
             Intent::SetDraft(text) => self.state.compose = text,
             Intent::SendDraft => self.state.send_compose(),
             Intent::Retry { message_id } => self.state.retry_send(&message_id),
+            Intent::RetryKeychain => self.state.retry_keychain(),
             Intent::SetTheme(theme) => self.settings.set_theme(theme),
             Intent::Shutdown => self.shutdown(),
             Intent::Telegram(intent) => self.telegram(intent),
@@ -188,6 +190,12 @@ impl Core {
     /// The selected row moved; scroll it into view, once.
     pub fn take_scroll_to_selected(&mut self) -> bool {
         self.state.take_scroll_to_selected()
+    }
+
+    /// Start a keychain flush of the persistent keys on the runtime. The
+    /// caller does not wait. The app calls it last at exit.
+    pub fn flush_keychain(&self) {
+        self.secrets.spawn_os_flush(&self.runtime);
     }
 
     /// Every adapter answered [`Intent::Shutdown`] with `Stopped`.
@@ -281,6 +289,11 @@ impl Core {
         }
         if self.state.take_keychain_flush() {
             self.secrets.spawn_os_flush(&self.runtime);
+        }
+        if self.state.take_keychain_retry() {
+            // Read again off the caller thread. A failed read is not settled,
+            // so the keychain watch still wakes frontends until this ends.
+            self.secrets.spawn_os_attach(&self.runtime);
         }
         if let Some(job) = self.settings.take_persist_job() {
             self.runtime.spawn_blocking(move || job.run());

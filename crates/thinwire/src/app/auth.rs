@@ -6,9 +6,10 @@ use eframe::egui::{self, RichText};
 use thinwire_protocol::{TelegramAuthError, TelegramCodeVia};
 
 use super::theme::{self, space};
-use thinwire_core::secrets::SecretStore;
+use super::ui::edited;
 pub(crate) use thinwire_core::state::stub_banner;
 use thinwire_core::state::{AuthScreen, Snapshot};
+use thinwire_core::{AuthField, Intent, SecretText, TelegramIntent, View};
 
 /// Step caption for the three login fields. Other screens have none.
 #[must_use]
@@ -24,7 +25,7 @@ fn step_line(auth: AuthScreen) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     if snapshot.auth == AuthScreen::Idle {
         return;
     }
@@ -53,12 +54,12 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
         let focus = take_focus(ui, snapshot);
         match snapshot.auth {
             AuthScreen::Idle => {}
-            AuthScreen::NeedCredentials => need_credentials(ui, snapshot, secrets),
-            AuthScreen::TelegramApi => telegram_api(ui, snapshot, secrets, focus),
-            AuthScreen::TelegramConnecting => telegram_connecting(ui, snapshot, secrets),
-            AuthScreen::TelegramPhone => telegram_phone(ui, snapshot, secrets, focus),
-            AuthScreen::TelegramCode => telegram_code(ui, snapshot, secrets, focus),
-            AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot, secrets, focus),
+            AuthScreen::NeedCredentials => need_credentials(ui, out),
+            AuthScreen::TelegramApi => telegram_api(ui, snapshot, focus, out),
+            AuthScreen::TelegramConnecting => telegram_connecting(ui, snapshot, out),
+            AuthScreen::TelegramPhone => telegram_phone(ui, snapshot, focus, out),
+            AuthScreen::TelegramCode => telegram_code(ui, snapshot, focus, out),
+            AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot, focus, out),
         }
         inline_feedback(ui, snapshot);
         ui.add_space(space::S);
@@ -66,7 +67,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
             .add(egui::Button::new(RichText::new("Cancel").color(palette.text2)).frame(false))
             .clicked()
         {
-            snapshot.cancel_auth(secrets);
+            out.push(Intent::Telegram(TelegramIntent::Cancel));
         }
     });
 }
@@ -116,16 +117,34 @@ fn take_focus(ui: &egui::Ui, snapshot: &Snapshot) -> bool {
     previous != Some(now) && !snapshot.auth_busy
 }
 
-fn field(ui: &mut egui::Ui, edit: egui::TextEdit<'_>, id: &str, focus: bool) {
-    let id = egui::Id::new(("auth-field", id));
-    ui.add(
-        edit.id(id)
-            .desired_width(ui.available_width())
-            .margin(egui::Margin::symmetric(space::M as i8, space::M as i8)),
-    );
+/// One login field. Returns the new text when the user changed it.
+fn field(
+    ui: &mut egui::Ui,
+    current: &str,
+    auth_field: AuthField,
+    focus: bool,
+    edit: impl FnOnce(&mut String) -> egui::TextEdit<'_>,
+) -> Option<String> {
+    let id = egui::Id::new(("auth-field", auth_field));
+    let width = ui.available_width();
+    let changed = edited(ui, current, |text| {
+        edit(text)
+            .id(id)
+            .desired_width(width)
+            .margin(egui::Margin::symmetric(space::M as i8, space::M as i8))
+    });
     if focus {
         ui.memory_mut(|memory| memory.request_focus(id));
     }
+    changed
+}
+
+/// Send a login field value to the core as a [`SecretText`].
+fn set_field(out: &mut Vec<Intent>, auth_field: AuthField, value: String) {
+    out.push(Intent::Telegram(TelegramIntent::SetField(
+        auth_field,
+        SecretText::new(value),
+    )));
 }
 
 fn field_label(ui: &mut egui::Ui, text: &str) {
@@ -148,7 +167,7 @@ fn auth_heading(auth: AuthScreen) -> &'static str {
     }
 }
 
-fn need_credentials(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
+fn need_credentials(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
     ui.label(
         "Credentials missing. Official / publisher binaries inject TELEGRAM_API_ID and TELEGRAM_API_HASH at compile time. They are not in the MIT git tree and are not set in public CI for fork PRs.",
     );
@@ -160,37 +179,44 @@ fn need_credentials(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &Secret
         .button("Advanced: set custom api_id / api_hash")
         .clicked()
     {
-        snapshot.open_api_override(secrets);
+        out.push(Intent::Telegram(TelegramIntent::OpenApiOverride));
     }
 }
 
-fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
+fn telegram_api(ui: &mut egui::Ui, snapshot: &Snapshot, focus: bool, out: &mut Vec<Intent>) {
     ui.label(
         "Power-user override. This pair wins over a publisher inject. Help: https://my.telegram.org — API development tools.",
     );
     ui.label("Values stay in the OS keychain or memory. They are not logged.");
     ui.horizontal(|ui| {
         ui.label("api_id");
-        field(
+        if let Some(value) = field(
             ui,
-            egui::TextEdit::singleline(&mut snapshot.telegram_api_id)
-                .hint_text("numeric id from my.telegram.org"),
-            "api_id",
+            &snapshot.telegram_api_id,
+            AuthField::ApiId,
             focus,
-        );
+            |text| egui::TextEdit::singleline(text).hint_text("numeric id from my.telegram.org"),
+        ) {
+            set_field(out, AuthField::ApiId, value);
+        }
     });
     ui.horizontal(|ui| {
         ui.label("api_hash");
-        field(
+        if let Some(value) = field(
             ui,
-            egui::TextEdit::singleline(&mut snapshot.telegram_api_hash)
-                .password(true)
-                .hint_text("from my.telegram.org"),
-            "api_hash",
+            &snapshot.telegram_api_hash,
+            AuthField::ApiHash,
             false,
-        );
+            |text| {
+                egui::TextEdit::singleline(text)
+                    .password(true)
+                    .hint_text("from my.telegram.org")
+            },
+        ) {
+            set_field(out, AuthField::ApiHash, value);
+        }
     });
-    continue_button(ui, snapshot, secrets, "Save override");
+    continue_button(ui, snapshot, "Save override", out);
 }
 
 /// Between Add Telegram and the phone step.
@@ -198,22 +224,25 @@ fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
 /// The first connect is busy until Telegram asks for the phone. The shared
 /// continue control then shows a spinner and "Connecting to Telegram…".
 /// After a failed start the same control shows Try again.
-fn telegram_connecting(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    continue_button(ui, snapshot, secrets, "Try again");
+fn telegram_connecting(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
+    continue_button(ui, snapshot, "Try again", out);
 }
 
-fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
+fn telegram_phone(ui: &mut egui::Ui, snapshot: &Snapshot, focus: bool, out: &mut Vec<Intent>) {
     field_label(ui, "Your phone number, with + and the country code.");
-    field(
+    if let Some(value) = field(
         ui,
-        egui::TextEdit::singleline(&mut snapshot.telegram_phone).hint_text("+15551234567"),
-        "phone",
+        &snapshot.telegram_phone,
+        AuthField::Phone,
         focus,
-    );
-    continue_button(ui, snapshot, secrets, "Send code");
+        |text| egui::TextEdit::singleline(text).hint_text("+15551234567"),
+    ) {
+        set_field(out, AuthField::Phone, value);
+    }
+    continue_button(ui, snapshot, "Send code", out);
 }
 
-fn telegram_code(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
+fn telegram_code(ui: &mut egui::Ui, snapshot: &Snapshot, focus: bool, out: &mut Vec<Intent>) {
     field_label(ui, code_hint(snapshot.code_via));
     let digits_only = code_is_digits(snapshot.code_via);
     let hint = if digits_only {
@@ -221,24 +250,27 @@ fn telegram_code(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretSto
     } else {
         "word or phrase"
     };
-    field(
+    if let Some(mut value) = field(
         ui,
-        egui::TextEdit::singleline(&mut snapshot.telegram_code).hint_text(hint),
-        "code",
+        &snapshot.telegram_code,
+        AuthField::Code,
         focus,
-    );
-    if digits_only {
-        snapshot.telegram_code.retain(|c| c.is_ascii_digit());
+        |text| egui::TextEdit::singleline(text).hint_text(hint),
+    ) {
+        if digits_only {
+            value.retain(|c| c.is_ascii_digit());
+        }
+        set_field(out, AuthField::Code, value);
     }
-    continue_button(ui, snapshot, secrets, "Continue");
+    continue_button(ui, snapshot, "Continue", out);
     ui.horizontal(|ui| {
         if ui.link("Change number").clicked() {
-            snapshot.change_number();
+            out.push(Intent::Telegram(TelegramIntent::ChangeNumber));
         }
         if snapshot.auth_rejection == Some(TelegramAuthError::CodeExpired)
             && ui.link("Send a new code").clicked()
         {
-            snapshot.resend_code();
+            out.push(Intent::Telegram(TelegramIntent::ResendCode));
         }
     });
 }
@@ -261,20 +293,25 @@ fn code_hint(via: Option<TelegramCodeVia>) -> &'static str {
     }
 }
 
-fn telegram_2fa(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
+fn telegram_2fa(ui: &mut egui::Ui, snapshot: &Snapshot, focus: bool, out: &mut Vec<Intent>) {
     field_label(ui, "Enter your Telegram password.");
-    field(
+    if let Some(value) = field(
         ui,
-        egui::TextEdit::singleline(&mut snapshot.telegram_2fa)
-            .password(true)
-            .hint_text("password"),
-        "password",
+        &snapshot.telegram_2fa,
+        AuthField::Password,
         focus,
-    );
-    continue_button(ui, snapshot, secrets, "Finish");
+        |text| {
+            egui::TextEdit::singleline(text)
+                .password(true)
+                .hint_text("password")
+        },
+    ) {
+        set_field(out, AuthField::Password, value);
+    }
+    continue_button(ui, snapshot, "Finish", out);
 }
 
-fn continue_button(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, label: &str) {
+fn continue_button(ui: &mut egui::Ui, snapshot: &Snapshot, label: &str, out: &mut Vec<Intent>) {
     let palette = theme::palette(ui);
     if snapshot.auth_busy {
         ui.add_space(space::S);
@@ -317,7 +354,7 @@ fn continue_button(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretS
         )
         .clicked()
     {
-        snapshot.advance_telegram(secrets);
+        out.push(Intent::Telegram(TelegramIntent::Submit));
     }
 }
 
@@ -349,7 +386,7 @@ mod tests {
         let connecting = &auth[auth.find("fn telegram_connecting(").expect("connecting")..];
         let connecting = &connecting[..connecting.find("\nfn ").expect("next")];
         assert!(
-            connecting.contains("continue_button(ui, snapshot, secrets, \"Try again\")"),
+            connecting.contains("continue_button(ui, snapshot, \"Try again\", out)"),
             "Try again stays on the connecting screen"
         );
         assert!(

@@ -6,7 +6,6 @@
 
 use eframe::egui;
 use thinwire_core::ThemeMode;
-use thinwire_core::settings::Settings;
 
 /// egui mapping for the core [`ThemeMode`]. The core does not know egui.
 pub trait ThemeModeEgui: Sized {
@@ -32,27 +31,22 @@ impl ThemeModeEgui for ThemeMode {
     }
 }
 
-/// egui calls on the core [`Settings`].
-pub trait SettingsEgui {
-    /// Apply the stored mode. System follows the OS and updates when it changes.
-    fn apply(&self, ctx: &egui::Context);
-
-    /// Keep System mode in sync with live OS changes (egui-winit `ThemeChanged`).
-    ///
-    /// Returns true when the OS light/dark preference changed this frame so the
-    /// caller can request an immediate repaint.
-    fn follow_os_live(&self, ctx: &egui::Context, last_os_theme: &mut Option<egui::Theme>) -> bool;
+/// Apply the stored mode. System follows the OS and updates when it changes.
+pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
+    ctx.set_theme(mode.to_egui());
 }
 
-impl SettingsEgui for Settings {
-    fn apply(&self, ctx: &egui::Context) {
-        ctx.set_theme(self.theme().to_egui());
-    }
-
-    fn follow_os_live(&self, ctx: &egui::Context, last_os_theme: &mut Option<egui::Theme>) -> bool {
-        self.apply(ctx);
-        live_os_theme_changed(self.theme(), last_os_theme, ctx.system_theme())
-    }
+/// Keep System mode in sync with live OS changes (egui-winit `ThemeChanged`).
+///
+/// Returns true when the OS light/dark preference changed this frame so the
+/// caller can request an immediate repaint.
+pub fn follow_os_live(
+    ctx: &egui::Context,
+    mode: ThemeMode,
+    last_os_theme: &mut Option<egui::Theme>,
+) -> bool {
+    apply(ctx, mode);
+    live_os_theme_changed(mode, last_os_theme, ctx.system_theme())
 }
 
 /// True when preference is System and the polled OS theme changed.

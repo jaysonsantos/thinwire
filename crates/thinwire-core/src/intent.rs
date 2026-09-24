@@ -24,6 +24,8 @@ pub enum Intent {
     SetSearch(String),
     /// Reload the chat lists of the visible protocols.
     Refresh,
+    /// Close the error block ("What happened / Why / What to do").
+    DismissError,
     /// Enter or Escape on the center screen: first run or the login form.
     Key(AuthKey),
     /// Unsent text for the selected chat. The core keeps one draft per chat.
@@ -32,6 +34,8 @@ pub enum Intent {
     SendDraft,
     /// Send a failed outgoing message again.
     Retry { message_id: String },
+    /// Read the OS keychain again after a failed read. The read runs off the caller thread.
+    RetryKeychain,
     /// Store the light/dark preference. Disk I/O runs off the caller thread.
     SetTheme(ThemeMode),
     /// Close every client cleanly. The view reports when all stopped.

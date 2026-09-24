@@ -37,6 +37,24 @@ impl View<'_> {
     }
 }
 
+/// Test hook: a view over parts that a test owns.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+impl<'a> View<'a> {
+    #[must_use]
+    pub fn from_parts(
+        state: &'a Snapshot,
+        secrets: &'a SecretStore,
+        settings: &'a Settings,
+    ) -> Self {
+        Self {
+            state,
+            secrets,
+            settings,
+        }
+    }
+}
+
 impl Deref for View<'_> {
     type Target = Snapshot;
 
