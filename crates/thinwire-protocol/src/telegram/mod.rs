@@ -632,16 +632,16 @@ mod tests {
         let src = include_str!("tdlib.rs");
         let steps = fn_body(src, "async fn apply_step");
         assert_eq!(
-            steps.matches("reject_step(events, &error)").count(),
+            steps.matches("reject_step(&login, &error)").count(),
             4,
             "phone, code, resend code, password"
         );
         let reject = fn_body(src, "fn reject_step");
         assert!(reject.contains("auth_error_from_tdlib(error.code, &error.message)"));
-        assert!(reject.contains("emit_telegram_auth_rejected"));
+        assert!(reject.contains("login.rejected(reason)"));
         assert!(reject.contains("TelegramAuthPhase::Failed"));
         let auth = fn_body(src, "async fn apply_authorization");
-        assert!(auth.contains("emit_telegram_code_sent(events, code_via("));
+        assert!(auth.contains("login.code_sent(code_via("));
         let via = fn_body(src, "fn code_via");
         assert!(via.contains("Kind::SmsWord(_) | Kind::SmsPhrase(_) => TelegramCodeVia::SmsWord"));
         assert!(TelegramCodeVia::Sms.digits_only());
@@ -783,7 +783,7 @@ mod tests {
         assert!(check < key, "check the vault before a new key is made");
         assert!(params.contains("data_dir::is_wrong_key_error(error.code, &error.message)"));
         assert!(params.contains("&& moved_to.is_none()"), "retry once only");
-        assert!(params.contains("emit_telegram_data_reset(events, name)"));
+        assert!(params.contains("login.data_reset(name)"));
         assert!(
             !src.contains("remove_dir_all"),
             "old data is moved, never deleted"
@@ -869,7 +869,7 @@ mod tests {
         );
         let worker = fn_body(src, "fn spawn_tdlib_worker");
         assert!(
-            worker.contains("live.closing = true;"),
+            worker.contains("live.closing.mark();"),
             "our Close is not a logout"
         );
         let dropped = worker.find("drop(commands);").expect("drop");
@@ -891,7 +891,7 @@ mod tests {
         let arm = &arm[..arm.find("TelegramAuthStep::Code").expect("next arm")];
         assert!(arm.contains("functions::resend_authentication_code("));
         assert!(arm.contains("ResendCodeReason::UserRequest"));
-        assert!(arm.contains("reject_step(events, &error)"));
+        assert!(arm.contains("reject_step(&login, &error)"));
         assert!(!arm.contains("set_authentication_phone_number"));
         if uses_tdlib_hook() {
             return;
@@ -983,6 +983,40 @@ mod tests {
             TelegramSecretVault::tdlib_folder_name(&MemorySecretVault::new()),
             crate::secrets::TDLIB_FOLDER
         );
+    }
+
+    #[test]
+    fn a_closing_client_sends_no_login_updates_after_cancel() {
+        let src = include_str!("tdlib.rs");
+        let stop = &src[src.find("pub fn stop(").expect("stop")
+            ..src.find("pub fn shutdown(").expect("shutdown")];
+        let mark = stop.find("closing.mark()").expect("stop marks the client");
+        let close = stop.find("TdlibCommand::Close").expect("then queues Close");
+        assert!(
+            mark < close,
+            "no login event after Cancel, even before Close is read"
+        );
+        let auth = fn_body(src, "async fn apply_authorization");
+        assert!(
+            !auth.contains("emit_telegram_auth("),
+            "every login event is gated"
+        );
+        let ready = &auth[auth.find("AuthorizationState::Ready").expect("ready")..];
+        let guard = ready.find("if !login.open()").expect("ready guard");
+        let marker = ready.find("TDLIB_SESSION_MARKER").expect("marker");
+        assert!(
+            guard < marker,
+            "a closing client does not link or save a session"
+        );
+        for body in [
+            "async fn apply_step",
+            "fn reject_step",
+            "async fn set_parameters",
+        ] {
+            let body = fn_body(src, body);
+            assert!(!body.contains("emit_telegram_auth("), "{body}");
+            assert!(!body.contains("emit_telegram_auth_rejected("));
+        }
     }
 
     #[test]
