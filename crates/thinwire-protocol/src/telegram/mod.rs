@@ -1103,6 +1103,16 @@ mod tests {
     #[test]
     fn ready_side_effects_stop_at_cancel_and_roll_back_after_it() {
         let src = include_str!("tdlib.rs");
+        // Inbox events stop at the worker once Cancel moves the epoch.
+        let linked = &src[src.find("fn linked(&self)").expect("linked")..];
+        let linked = &linked[..linked.find("\n    }").expect("end")];
+        assert!(linked.contains("self.authorized && self.closing.current()"));
+        assert!(fn_body(src, "fn apply_chat_update").contains("let emit = live.linked();"));
+        assert!(src.contains("load_main_chats(client_id, live.linked(), &events)"));
+        assert!(
+            !src.contains("if !live.authorized"),
+            "every inbox gate uses linked()"
+        );
         let auth = fn_body(src, "async fn apply_authorization");
         let ready = &auth[auth.find("AuthorizationState::Ready").expect("ready")..];
         let ready = &ready[..ready

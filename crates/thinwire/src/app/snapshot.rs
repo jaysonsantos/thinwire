@@ -396,6 +396,12 @@ impl Snapshot {
     }
 
     pub(crate) fn apply(&mut self, event: AdapterEvent) {
+        // Telegram inbox events come only after Ready. One that arrives while
+        // Telegram is not linked is from a cancelled or ended client, for
+        // example queued before Cancel: drop it (PR #49 review).
+        if event.inbox_protocol() == Some(ProtocolId::Telegram) && !self.telegram_authorized {
+            return;
+        }
         match event {
             AdapterEvent::Status {
                 protocol,
@@ -3321,7 +3327,7 @@ mod tests {
     fn telegram_flow_stores_secrets_and_lands_in_inbox() {
         let store = SecretStore::memory();
         let mut snapshot = Snapshot::new();
-        snapshot.apply(AdapterEvent::ConversationUpsert {
+        let saved = AdapterEvent::ConversationUpsert {
             conversation: Conversation {
                 protocol: ProtocolId::Telegram,
                 id: "telegram:saved".into(),
@@ -3333,10 +3339,17 @@ mod tests {
                 last_at: 0,
                 is_group: false,
             },
-        });
+        };
+        // A row before Ready is from a cancelled or ended client: dropped.
+        snapshot.apply(saved.clone());
+        assert!(
+            snapshot.conversations.is_empty(),
+            "not kept (PR #49 review)"
+        );
         assert!(snapshot.visible_conversations().is_empty());
         assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 0);
         complete_telegram(&mut snapshot, &store);
+        snapshot.apply(saved);
         assert!(snapshot.has_primary_account());
         assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
         assert_eq!(
@@ -3694,6 +3707,7 @@ mod tests {
     #[test]
     fn search_v1_matches_title_and_participant_only() {
         let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: Conversation {
                 protocol: ProtocolId::Telegram,
@@ -3958,6 +3972,7 @@ mod tests {
     #[test]
     fn messages_upsert_replace_and_body_edits_keep_sender() {
         let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
         snapshot.selected_protocol = ProtocolId::Telegram;
         snapshot.selected_conversation = Some("telegram:4".into());
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -4035,8 +4050,52 @@ mod tests {
     }
 
     #[test]
+    fn inbox_events_queued_before_cancel_leave_no_rows() {
+        // The worker linked, then the user pressed Cancel before the UI polled
+        // Ready. The host drops the stamped Ready. The chat rows and messages
+        // queued after it arrive unstamped: the snapshot drops them.
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        seed_override(&store);
+        snapshot.open_telegram(&store);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        snapshot.cancel_auth(&store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(4, "Ada", 9),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:4".into(),
+                id: "telegram:4:1".into(),
+                sender: "Ada".into(),
+                body: "from the cancelled account".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 0,
+            },
+        });
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        assert!(snapshot.conversations.is_empty());
+        assert!(snapshot.messages.is_empty());
+
+        // A different account that links later starts with no old rows.
+        complete_telegram(&mut snapshot, &store);
+        assert!(snapshot.visible_conversations().is_empty());
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(5, "Bob", 3),
+        });
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+    }
+
+    #[test]
     fn deleted_message_ids_leave_the_thread() {
         let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
         snapshot.selected_protocol = ProtocolId::Telegram;
         snapshot.selected_conversation = Some("telegram:4".into());
         for (id, body) in [("telegram:4:1", "keep"), ("telegram:4:2", "drop")] {

@@ -399,6 +399,29 @@ pub enum AdapterEvent {
     },
 }
 
+impl AdapterEvent {
+    /// The protocol of an inbox event: chats, messages, sends, and list
+    /// loads. `None` for login, status, and session events. A frontend drops
+    /// an inbox event of an account that is not linked (PR #49 review).
+    #[must_use]
+    pub fn inbox_protocol(&self) -> Option<ProtocolId> {
+        match self {
+            Self::ConversationUpsert { conversation } => Some(conversation.protocol),
+            Self::MessageReceived { message } => Some(message.protocol),
+            Self::ConversationRemoved { protocol, .. }
+            | Self::MessageReplaced { protocol, .. }
+            | Self::MessageBody { protocol, .. }
+            | Self::MessagesRemoved { protocol, .. }
+            | Self::SendAccepted { protocol, .. }
+            | Self::SendRejected { protocol, .. }
+            | Self::MessageDelivery { protocol, .. }
+            | Self::ChatListLoaded { protocol }
+            | Self::HistoryLoaded { protocol, .. } => Some(*protocol),
+            _ => None,
+        }
+    }
+}
+
 /// Pairing material shown only on the experimental WhatsApp screen.
 ///
 /// `Debug` is redacted. Do not put this value on [`AdapterCommand`].
@@ -669,4 +692,43 @@ pub(crate) fn emit_history_loaded(
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 pub(crate) fn emit_flush_secrets(events: &EventTx) {
     let _ = events.send(AdapterEvent::FlushSecrets);
+}
+
+#[cfg(test)]
+mod inbox_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn inbox_events_name_their_protocol_and_login_events_do_not() {
+        assert_eq!(
+            AdapterEvent::ChatListLoaded {
+                protocol: ProtocolId::Telegram
+            }
+            .inbox_protocol(),
+            Some(ProtocolId::Telegram)
+        );
+        assert_eq!(
+            AdapterEvent::ConversationRemoved {
+                protocol: ProtocolId::Slack,
+                id: "slack:1".into(),
+            }
+            .inbox_protocol(),
+            Some(ProtocolId::Slack)
+        );
+        assert_eq!(
+            AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::Ready
+            }
+            .inbox_protocol(),
+            None
+        );
+        assert_eq!(AdapterEvent::TelegramSessionEnded.inbox_protocol(), None);
+        assert_eq!(
+            AdapterEvent::Stopped {
+                protocol: ProtocolId::Telegram
+            }
+            .inbox_protocol(),
+            None
+        );
+    }
 }

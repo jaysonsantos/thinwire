@@ -89,6 +89,15 @@ struct LiveInbox {
     names: NameBook,
 }
 
+impl LiveInbox {
+    /// Signed in, not closing, and the login epoch is still current. Every
+    /// inbox event checks this, so Cancel stops the chat list and messages
+    /// at the worker (PR #49 review).
+    fn linked(&self) -> bool {
+        self.authorized && self.closing.current()
+    }
+}
+
 /// Owns the command sink into the current worker and the workers' done flags.
 ///
 /// A worker never drops its TDLib client without `close`: an unclean exit
@@ -440,7 +449,7 @@ fn spawn_tdlib_worker(
                             apply_step(client_id, step, secrets.as_ref(), &events, &live.closing).await;
                         }
                         TdlibCommand::LoadChats => {
-                            load_main_chats(client_id, live.authorized, &events).await;
+                            load_main_chats(client_id, live.linked(), &events).await;
                         }
                         TdlibCommand::OpenChat(conversation_id) => {
                             open_chat(client_id, &conversation_id, &live, &events).await;
@@ -786,7 +795,8 @@ async fn apply_authorization(
 }
 
 fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, events: &EventTx) {
-    let emit = live.authorized;
+    // No inbox event from a closing client or a cancelled epoch (PR #49 review).
+    let emit = live.linked();
     match update {
         tdlib_rs::enums::Update::NewChat(update) => {
             publish(events, emit, note_chat(&mut live.directory, &update.chat));
@@ -1055,7 +1065,7 @@ async fn load_main_chats(client_id: i32, authorized: bool, events: &EventTx) {
 }
 
 async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, events: &EventTx) {
-    if !live.authorized {
+    if !live.linked() {
         emit_status(
             events,
             ProtocolId::Telegram,
@@ -1144,7 +1154,7 @@ async fn send_text(
     let rejected = || {
         emit_send_rejected(events, ProtocolId::Telegram, conversation_id, request);
     };
-    if !live.authorized {
+    if !live.linked() {
         rejected();
         emit_status(
             events,
@@ -1213,7 +1223,7 @@ async fn resend(
             Delivery::Failed,
         );
     };
-    if !live.authorized {
+    if !live.linked() {
         failed();
         emit_status(
             events,
