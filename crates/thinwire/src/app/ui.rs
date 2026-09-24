@@ -1028,6 +1028,12 @@ fn compose(
     out: &mut Vec<Intent>,
 ) {
     let compose_id = egui::Id::new("thread-compose");
+    // The chat this frame drew. Drafts and sends name it, so a click on
+    // another chat in the same frame cannot move them (PR #48 review).
+    let chat = snapshot
+        .selected_conversation
+        .clone()
+        .map(|id| (snapshot.selected_protocol, id));
     if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
     }
@@ -1042,7 +1048,12 @@ fn compose(
         });
         // Eat plain Enter before the text field sees it, so it does not add a line.
         if enter && !other && !shift {
-            out.push(Intent::SendDraft);
+            if let Some((protocol, conversation_id)) = chat.clone() {
+                out.push(Intent::SendDraft {
+                    protocol,
+                    conversation_id,
+                });
+            }
             ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         }
     }
@@ -1092,8 +1103,13 @@ fn compose(
                                 .desired_rows(1)
                                 .desired_width(width)
                                 .hint_text(RichText::new("Message").color(palette.text3))
-                        }) {
-                            out.push(Intent::SetDraft(text.into()));
+                        }) && let Some((protocol, conversation_id)) = chat.clone()
+                        {
+                            out.push(Intent::SetDraft {
+                                protocol,
+                                conversation_id,
+                                text: text.into(),
+                            });
                         }
                     });
                 let can_send = snapshot.can_send();
@@ -1106,8 +1122,12 @@ fn compose(
                         .min_size(egui::vec2(send_width, SEND_MIN_HEIGHT))
                     })
                     .clicked()
+                    && let Some((protocol, conversation_id)) = chat.clone()
                 {
-                    out.push(Intent::SendDraft);
+                    out.push(Intent::SendDraft {
+                        protocol,
+                        conversation_id,
+                    });
                 }
             });
         });

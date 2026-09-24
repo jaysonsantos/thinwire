@@ -176,8 +176,23 @@ impl Core {
             Intent::Refresh => self.state.refresh_visible(),
             Intent::DismissError => self.state.error = None,
             Intent::Key(key) => self.state.center_key(key, &self.secrets),
-            Intent::SetDraft(text) => self.state.compose = text.into_inner(),
-            Intent::SendDraft => self.state.send_compose(),
+            Intent::SetDraft {
+                protocol,
+                conversation_id,
+                text,
+            } => self
+                .state
+                .set_draft(protocol, &conversation_id, text.into_inner()),
+            Intent::SendDraft {
+                protocol,
+                conversation_id,
+            } => {
+                if self.state.is_selected_chat(protocol, &conversation_id) {
+                    self.state.send_compose();
+                } else {
+                    tracing::warn!("send dropped: its chat is no longer selected");
+                }
+            }
             Intent::Retry { message_id } => self.state.retry_send(&message_id),
             Intent::RetryKeychain => self.state.retry_keychain(),
             Intent::SetTheme(theme) => self.settings.set_theme(theme),
@@ -465,7 +480,12 @@ mod tests {
         core.dispatch(Intent::SetSearch("alice".into()));
         assert!(signal.has_changed());
         assert_eq!(core.view().search, "alice");
-        core.dispatch(Intent::SetDraft("hello".into()));
+        core.state.selected_conversation = Some("telegram:1".into());
+        core.dispatch(Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            text: "hello".into(),
+        });
         assert_eq!(core.view().compose, "hello");
         core.dispatch(Intent::SetTheme(ThemeMode::Dark));
         assert_eq!(core.view().theme(), ThemeMode::Dark);
@@ -836,5 +856,96 @@ mod tests {
             .expect("queue");
         core.pump();
         assert!(core.view().telegram_authorized);
+    }
+
+    /// PR #48 review (P1): one frame with a click on chat B and an edit of
+    /// chat A. The frontend sends `SelectConversation(B)` first, then the
+    /// edit. The edit must stay with A.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_same_frame_edit_and_select_keep_each_draft_in_its_chat() {
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        // The same frame: click on chat 2, then the key typed in chat 1.
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:2".into(),
+        });
+        core.dispatch(Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            text: "for Ada only".into(),
+        });
+        assert_eq!(core.view().compose, "", "chat 2 gets no text from chat 1");
+
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        assert_eq!(
+            core.view().compose,
+            "for Ada only",
+            "chat 1 keeps its draft"
+        );
+    }
+
+    /// PR #48 review (P1): a send named for chat A after a click on chat B
+    /// sends nothing to B.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_for_another_chat_is_dropped() {
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        core.dispatch(Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            text: "for Ada only".into(),
+        });
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:2".into(),
+        });
+        while sent.try_recv().is_ok() {}
+
+        core.dispatch(Intent::SendDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+        });
+        let mut commands = Vec::new();
+        while let Ok(command) = sent.try_recv() {
+            commands.push(command);
+        }
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SendText { .. })),
+            "no send after the selection moved: {commands:?}"
+        );
+
+        // Back on chat 1, the same send goes to chat 1.
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        core.dispatch(Intent::SendDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+        });
+        let mut sends = Vec::new();
+        while let Ok(command) = sent.try_recv() {
+            if let AdapterCommand::SendText {
+                conversation_id, ..
+            } = command
+            {
+                sends.push(conversation_id);
+            }
+        }
+        assert_eq!(sends, vec!["telegram:1".to_owned()]);
     }
 }

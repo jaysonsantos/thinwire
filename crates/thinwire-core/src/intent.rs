@@ -29,11 +29,20 @@ pub enum Intent {
     DismissError,
     /// Enter or Escape on the center screen: first run or the login form.
     Key(AuthKey),
-    /// Unsent text for the selected chat. The core keeps one draft per chat.
-    /// `SecretText` keeps the message text out of `Debug`.
-    SetDraft(SecretText),
-    /// Send the draft of the selected chat.
-    SendDraft,
+    /// Unsent text of one chat. It names the chat it was typed in, so a
+    /// selection change in the same frame cannot move the text to another
+    /// chat (PR #48 review). `SecretText` keeps the text out of `Debug`.
+    SetDraft {
+        protocol: ProtocolId,
+        conversation_id: String,
+        text: SecretText,
+    },
+    /// Send the draft of this chat. Dropped when the chat is no longer the
+    /// selected one, so it never goes to another chat.
+    SendDraft {
+        protocol: ProtocolId,
+        conversation_id: String,
+    },
     /// Send a failed outgoing message again.
     Retry { message_id: String },
     /// Read the OS keychain again after a failed read. The read runs off the caller thread.
@@ -138,7 +147,11 @@ mod tests {
                 SecretText::new("hunter2-fixture"),
             )),
             Intent::WhatsApp(WhatsAppIntent::SetPhone(SecretText::new("+15550100"))),
-            Intent::SetDraft(SecretText::new("draft-fixture-3b7")),
+            Intent::SetDraft {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                text: SecretText::new("draft-fixture-3b7"),
+            },
             Intent::SetSearch(SecretText::new("search-fixture-6e5")),
         ];
         for intent in intents {

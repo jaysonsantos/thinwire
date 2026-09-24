@@ -744,6 +744,25 @@ impl Snapshot {
     }
 
     /// Change the selected chat. The compose text stays with the chat it was typed in.
+    /// True when this chat of this protocol is the selected one.
+    #[must_use]
+    pub fn is_selected_chat(&self, protocol: ProtocolId, chat: &str) -> bool {
+        self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(chat)
+    }
+
+    /// Store unsent text of one chat. The selected chat keeps it in `compose`,
+    /// another chat in its draft. Never "the selected chat" by default: the
+    /// text stays with the chat it was typed in (PR #48 review).
+    pub fn set_draft(&mut self, protocol: ProtocolId, chat: &str, text: String) {
+        if self.is_selected_chat(protocol, chat) {
+            self.compose = text;
+        } else if text.is_empty() {
+            self.drafts.remove(chat);
+        } else {
+            self.drafts.insert(chat.to_owned(), text);
+        }
+    }
+
     fn set_selected_conversation(&mut self, id: Option<String>) {
         if self.selected_conversation == id {
             return;
