@@ -33,8 +33,8 @@ pub use inbox::parse_telegram_chat_id;
 use super::adapter::TelegramCodeVia;
 use super::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, EventTx, ProtocolAdapter, ProtocolCapabilities,
-    ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep, emit_flush_secrets, emit_status,
-    emit_telegram_auth,
+    ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep, emit_flush_secrets,
+    emit_send_rejected, emit_status, emit_telegram_auth,
 };
 use super::secrets::TelegramSecretVault;
 
@@ -269,26 +269,34 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
                 body,
+                request,
             } => {
-                if body.trim().is_empty() {
-                    return Err(AdapterError::Unavailable {
+                let rejected = if body.trim().is_empty() {
+                    Some("message text is empty")
+                } else if parse_telegram_chat_id(&conversation_id).is_none() {
+                    Some("chat id is not a Telegram chat")
+                } else {
+                    None
+                };
+                let result = match rejected {
+                    Some(reason) => Err(AdapterError::Unavailable {
                         protocol: ProtocolId::Telegram,
-                        reason: "message text is empty",
-                    });
+                        reason,
+                    }),
+                    None => self.dispatch_live(
+                        events,
+                        LiveCall::SendText {
+                            conversation_id: conversation_id.clone(),
+                            body,
+                            request,
+                        },
+                    ),
+                };
+                // Name this send in the rejection, so the UI fails only it.
+                if result.is_err() {
+                    emit_send_rejected(events, ProtocolId::Telegram, conversation_id, request);
                 }
-                if parse_telegram_chat_id(&conversation_id).is_none() {
-                    return Err(AdapterError::Unavailable {
-                        protocol: ProtocolId::Telegram,
-                        reason: "chat id is not a Telegram chat",
-                    });
-                }
-                self.dispatch_live(
-                    events,
-                    LiveCall::SendText {
-                        conversation_id,
-                        body,
-                    },
-                )
+                result
             }
             other => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Telegram,
@@ -334,6 +342,7 @@ enum LiveCall {
     SendText {
         conversation_id: String,
         body: String,
+        request: u64,
     },
     Resend {
         conversation_id: String,
@@ -356,9 +365,10 @@ impl TelegramAdapter {
                 LiveCall::SendText {
                     conversation_id,
                     body,
+                    request,
                 } => {
                     self.tdlib
-                        .send_text(conversation_id, body, secrets, source, events);
+                        .send_text(conversation_id, body, request, secrets, source, events);
                 }
                 LiveCall::Resend {
                     conversation_id,
@@ -921,6 +931,40 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_send_names_its_chat_and_request() {
+        let mut adapter = TelegramAdapter::memory();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = adapter.handle(
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:42".into(),
+                body: "   ".into(),
+                request: 7,
+            },
+            &tx,
+        );
+        let mut rejected = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::SendRejected {
+                conversation_id,
+                request,
+                ..
+            } = event
+            {
+                rejected.push((conversation_id, request));
+            }
+        }
+        assert_eq!(rejected, vec![("telegram:42".to_string(), 7)]);
+        let src = include_str!("tdlib.rs");
+        let send = fn_body(src, "async fn send_text");
+        assert_eq!(
+            send.matches("rejected();").count(),
+            4,
+            "not ready, bad chat id, empty text, and TDLib error each name the send"
+        );
+    }
+
+    #[test]
     fn live_tdlib_has_one_receive_thread_for_the_process() {
         let src = include_str!("tdlib.rs");
         assert_eq!(src.matches("tdlib_rs::receive()").count(), 1);
@@ -1127,6 +1171,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:42".into(),
                 body: "   ".into(),
+                request: 1,
             },
             &tx,
         );
@@ -1136,6 +1181,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:42".into(),
                 body: "hello".into(),
+                request: 2,
             },
             &tx,
         );
@@ -1169,6 +1215,7 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:42".into(),
             body: "hello".into(),
+            request: 3,
         };
         let debug = format!("{command:?}");
         assert!(debug.contains("hello"));

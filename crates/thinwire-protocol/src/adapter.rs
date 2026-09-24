@@ -231,10 +231,12 @@ pub enum AdapterCommand {
         message_id: String,
     },
     /// Send plain text. The body is the user's message, never a credential.
+    /// `request` is a local id; a rejection names it in `SendRejected`.
     SendText {
         protocol: ProtocolId,
         conversation_id: String,
         body: String,
+        request: u64,
     },
     /// Records that the full-screen WhatsApp ban gate was accepted.
     /// Carries no secrets and does not open a network session.
@@ -329,6 +331,13 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         conversation_id: String,
         message_ids: Vec<String>,
+    },
+    /// The adapter did not accept this send (no pending message exists). Only
+    /// this event fails the send; other errors leave it pending.
+    SendRejected {
+        protocol: ProtocolId,
+        conversation_id: String,
+        request: u64,
     },
     /// Every client of this protocol closed after `Shutdown`. The app may exit.
     Stopped {
@@ -598,6 +607,19 @@ pub(crate) fn emit_message_delivery(
         conversation_id: conversation_id.into(),
         message_id: message_id.into(),
         delivery,
+    });
+}
+
+pub(crate) fn emit_send_rejected(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    request: u64,
+) {
+    let _ = events.send(AdapterEvent::SendRejected {
+        protocol,
+        conversation_id: conversation_id.into(),
+        request,
     });
 }
 

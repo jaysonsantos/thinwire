@@ -302,10 +302,13 @@ pub(crate) struct Snapshot {
     focus_compose: bool,
     /// Protocols that answered `Shutdown` with `Stopped`.
     stopped: HashSet<ProtocolId>,
-    /// Sends the adapter has not accepted yet: chat id → text. One per chat,
-    /// so a send in one chat does not block Send in another. The text stays
-    /// until the pending row arrives (PR #40 review).
-    sending: HashMap<String, String>,
+    /// Sends the adapter has not accepted yet: chat id → (request id, text).
+    /// One per chat, so a send in one chat does not block Send in another.
+    /// The text stays until the pending row arrives; only a matching
+    /// `SendRejected` fails the send (PR #40 review).
+    sending: HashMap<String, (u64, String)>,
+    /// Local id for the next `SendText`.
+    next_send_request: u64,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
     api_source: TelegramApiSource,
@@ -367,6 +370,7 @@ impl Snapshot {
             focus_compose: false,
             stopped: HashSet::new(),
             sending: HashMap::new(),
+            next_send_request: 1,
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
@@ -418,7 +422,6 @@ impl Snapshot {
                         if self.auth != AuthScreen::Idle {
                             self.auth_busy = false;
                         }
-                        self.fail_unaccepted_send();
                         self.resume = Resume::Settled;
                         // A failed load does not send its end event. Stop the spinners.
                         self.chat_list_loading = false;
@@ -455,6 +458,15 @@ impl Snapshot {
                 message_id,
                 delivery,
             } => self.set_delivery(protocol, &conversation_id, &message_id, delivery),
+            AdapterEvent::SendRejected {
+                protocol,
+                conversation_id,
+                request,
+            } => {
+                if protocol == ProtocolId::Telegram {
+                    self.fail_unaccepted_send(&conversation_id, request);
+                }
+            }
             AdapterEvent::Stopped { protocol } => {
                 self.stopped.insert(protocol);
             }
@@ -1033,10 +1045,10 @@ impl Snapshot {
             return;
         }
         let chat = &message.conversation_id;
-        if self.sending.get(chat).map(String::as_str) != Some(message.body.trim()) {
+        if self.sending.get(chat).map(|(_, body)| body.as_str()) != Some(message.body.trim()) {
             return;
         }
-        let Some(body) = self.sending.remove(chat) else {
+        let Some((_, body)) = self.sending.remove(chat) else {
             return;
         };
         let selected = self.selected_conversation.as_deref() == Some(chat.as_str());
@@ -1051,14 +1063,14 @@ impl Snapshot {
         }
     }
 
-    /// A Telegram error came before the pending row: the send was not
-    /// accepted. The error does not name a chat, so every unaccepted send
-    /// ends. Each text is still in its compose field or draft.
-    fn fail_unaccepted_send(&mut self) {
-        if self.sending.is_empty() {
+    /// The adapter rejected this send (chat and request id match): it was
+    /// not accepted. The text is still in its compose field or draft. Other
+    /// errors (for example a history load error) never fail a send.
+    fn fail_unaccepted_send(&mut self, chat: &str, request: u64) {
+        if self.sending.get(chat).map(|(id, _)| *id) != Some(request) {
             return;
         }
-        self.sending.clear();
+        self.sending.remove(chat);
         self.set_error(
             "Message not sent.",
             "Telegram did not accept the message.",
@@ -1121,12 +1133,16 @@ impl Snapshot {
         };
         let body = self.compose.trim().to_string();
         // Keep the text until the adapter accepts the send; see note_send_accepted.
-        self.sending.insert(conversation_id.clone(), body.clone());
+        let request = self.next_send_request;
+        self.next_send_request += 1;
+        self.sending
+            .insert(conversation_id.clone(), (request, body.clone()));
         self.error = None;
         self.pending.push(AdapterCommand::SendText {
             protocol: ProtocolId::Telegram,
             conversation_id,
             body,
+            request,
         });
         self.status_text = "Sending…".into();
     }
@@ -2921,16 +2937,57 @@ mod tests {
         let mut snapshot = ready_with_chats(&store);
         snapshot.compose = "hello".into();
         snapshot.send_compose();
-        snapshot.take_commands();
-        snapshot.apply(AdapterEvent::Status {
+        let request = sent_request(&mut snapshot);
+        // A stale or other request id does not fail this send.
+        snapshot.apply(AdapterEvent::SendRejected {
             protocol: ProtocolId::Telegram,
-            status: AdapterStatus::Error,
-            detail: "Telegram did not send the message (TDLib 400).".into(),
+            conversation_id: "telegram:1".into(),
+            request: request + 100,
+        });
+        assert!(!snapshot.can_send(), "still pending");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
         });
         assert_eq!(snapshot.compose, "hello", "no pending row: the text stays");
         let error = snapshot.error.clone().expect("error block");
         assert_eq!(error.happened, "Message not sent.");
         assert!(snapshot.can_send(), "the user can send it again");
+    }
+
+    #[test]
+    fn an_unrelated_telegram_error_keeps_the_send_pending() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "Could not load messages (TDLib 500).".into(),
+        });
+        assert!(
+            snapshot.error.is_none(),
+            "no \"Message not sent\" for a history error"
+        );
+        assert!(!snapshot.can_send(), "the send is still pending");
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 100, "hello", Delivery::Pending),
+        });
+        assert!(snapshot.compose.is_empty(), "then accepted as usual");
+    }
+
+    fn sent_request(snapshot: &mut Snapshot) -> u64 {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("a SendText")
     }
 
     #[test]
@@ -3726,6 +3783,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
                 body,
+                ..
             } if conversation_id == "telegram:42" && body == "hello"
         )));
         let debug = format!("{commands:?}");

@@ -22,9 +22,9 @@ use crate::adapter::{
     AdapterStatus, Delivery, EventTx, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
     emit_conversation_removed, emit_history_loaded, emit_message, emit_message_body,
-    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_status, emit_stopped,
-    emit_telegram_auth, emit_telegram_auth_rejected, emit_telegram_code_sent,
-    emit_telegram_data_reset, emit_telegram_session_ended,
+    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_send_rejected,
+    emit_status, emit_stopped, emit_telegram_auth, emit_telegram_auth_rejected,
+    emit_telegram_code_sent, emit_telegram_data_reset, emit_telegram_session_ended,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -39,6 +39,7 @@ enum TdlibCommand {
     SendText {
         conversation_id: String,
         body: String,
+        request: u64,
     },
     Resend {
         conversation_id: String,
@@ -159,6 +160,7 @@ impl TdlibRuntime {
         &mut self,
         conversation_id: String,
         body: String,
+        request: u64,
         secrets: Arc<dyn TelegramSecretVault>,
         source: TelegramApiSource,
         events: &EventTx,
@@ -167,6 +169,7 @@ impl TdlibRuntime {
             TdlibCommand::SendText {
                 conversation_id,
                 body,
+                request,
             },
             secrets,
             source,
@@ -377,8 +380,8 @@ fn spawn_tdlib_worker(
                         TdlibCommand::OpenChat(conversation_id) => {
                             open_chat(client_id, &conversation_id, &live, &events).await;
                         }
-                        TdlibCommand::SendText { conversation_id, body } => {
-                            send_text(client_id, &conversation_id, &body, &live, &events).await;
+                        TdlibCommand::SendText { conversation_id, body, request } => {
+                            send_text(client_id, &conversation_id, &body, request, &live, &events).await;
                         }
                         TdlibCommand::Resend { conversation_id, message_id } => {
                             resend(client_id, &conversation_id, &message_id, &live, &events).await;
@@ -1037,10 +1040,16 @@ async fn send_text(
     client_id: i32,
     conversation_id: &str,
     body: &str,
+    request: u64,
     live: &LiveInbox,
     events: &EventTx,
 ) {
+    // Every refusal names this send, so the UI fails only this send.
+    let rejected = || {
+        emit_send_rejected(events, ProtocolId::Telegram, conversation_id, request);
+    };
     if !live.authorized {
+        rejected();
         emit_status(
             events,
             ProtocolId::Telegram,
@@ -1050,6 +1059,7 @@ async fn send_text(
         return;
     }
     let Some(chat_id) = inbox::parse_telegram_chat_id(conversation_id) else {
+        rejected();
         emit_status(
             events,
             ProtocolId::Telegram,
@@ -1060,6 +1070,7 @@ async fn send_text(
     };
     let text = body.trim();
     if text.is_empty() {
+        rejected();
         return;
     }
     let content =
@@ -1077,6 +1088,7 @@ async fn send_text(
         }
         Err(error) => {
             log_tdlib_error("sendMessage", &error);
+            rejected();
             emit_status(
                 events,
                 ProtocolId::Telegram,
