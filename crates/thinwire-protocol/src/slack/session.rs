@@ -27,9 +27,9 @@ use super::loopback::SlackLoopback;
 use super::secrets::{SlackSecretKey, SlackSecretVault};
 use super::{CAPABILITIES, SLACK_CONVERSATION_PREFIX};
 use crate::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, EventTx,
+    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
     ProtocolAdapter, ProtocolCapabilities, ProtocolId, emit_conversation, emit_message,
-    emit_status,
+    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
 };
 
 /// Messages loaded when a channel opens.
@@ -205,6 +205,21 @@ where
                 reason: "slack worker stopped",
             })
     }
+
+    fn shutdown(&mut self, events: &EventTx) {
+        let Some(jobs) = &self.jobs else {
+            emit_stopped(events, ProtocolId::Slack);
+            return;
+        };
+        if jobs
+            .send(Job::Command(AdapterCommand::Shutdown {
+                protocol: ProtocolId::Slack,
+            }))
+            .is_err()
+        {
+            emit_stopped(events, ProtocolId::Slack);
+        }
+    }
 }
 
 struct Live<T> {
@@ -290,7 +305,15 @@ where
                 protocol: ProtocolId::Slack,
                 conversation_id,
                 body,
-            } => self.send(&conversation_id, &body).await,
+                request,
+            } => self.send(&conversation_id, &body, request).await,
+            AdapterCommand::Shutdown {
+                protocol: ProtocolId::Slack,
+            } => {
+                self.cancel_install();
+                self.stop_live().await;
+                emit_stopped(&self.events, ProtocolId::Slack);
+            }
             _ => self.status(
                 AdapterStatus::Error,
                 "command is not handled by the Slack workspace app",
@@ -545,13 +568,16 @@ where
                 preview: String::new(),
                 unread: 0,
                 order: 0,
+                last_at: 0,
+                is_group: is_group(channel.kind),
             };
             if let Some(existing) = self.channels.get(&channel.id) {
-                // Keep live preview, unread, and order from Socket Mode.
+                // Keep live preview, unread, order, and time from Socket Mode.
                 let mut merged = conversation;
                 merged.preview.clone_from(&existing.preview);
                 merged.unread = existing.unread;
                 merged.order = existing.order;
+                merged.last_at = existing.last_at;
                 self.upsert(channel.id, merged);
             } else {
                 self.upsert(channel.id, conversation);
@@ -618,12 +644,14 @@ where
         }
     }
 
-    async fn send(&mut self, conversation: &str, body: &str) {
+    async fn send(&mut self, conversation: &str, body: &str, request: u64) {
         let Some(channel) = channel_id(conversation) else {
+            emit_send_rejected(&self.events, ProtocolId::Slack, conversation, request);
             self.status(AdapterStatus::Error, "Unknown Slack conversation.");
             return;
         };
         let Some(live) = &self.live else {
+            emit_send_rejected(&self.events, ProtocolId::Slack, conversation, request);
             self.status(AdapterStatus::Error, DETAIL_NOT_READY);
             return;
         };
@@ -631,9 +659,18 @@ where
         match self.deps.api.post_message(&token, channel, body).await {
             Ok(post) => {
                 let message = self.chat_message(&token, post).await;
+                emit_send_accepted(
+                    &self.events,
+                    ProtocolId::Slack,
+                    message.conversation_id.clone(),
+                    request,
+                );
                 emit_message(&self.events, message);
             }
-            Err(error) => self.api_failed(&error).await,
+            Err(error) => {
+                emit_send_rejected(&self.events, ProtocolId::Slack, conversation, request);
+                self.api_failed(&error).await;
+            }
         }
     }
 
@@ -665,6 +702,8 @@ where
                 preview,
                 unread: u32::from(!outbound),
                 order,
+                last_at: order,
+                is_group: !channel.starts_with('D'),
             };
             self.upsert(channel, conversation);
             return;
@@ -672,6 +711,7 @@ where
         let mut row = row.clone();
         row.preview = preview;
         row.order = row.order.max(order);
+        row.last_at = row.last_at.max(order);
         if !outbound {
             row.unread = row.unread.saturating_add(1);
         }
@@ -695,6 +735,8 @@ where
             sender,
             body: post.text,
             outbound,
+            delivery: Delivery::Sent,
+            sent_at: ts_order(&post.ts),
         }
     }
 }
@@ -718,6 +760,10 @@ fn channel_id(conversation: &str) -> Option<&str> {
     conversation
         .strip_prefix(SLACK_CONVERSATION_PREFIX)
         .filter(|id| !id.is_empty() && !id.contains(':'))
+}
+
+const fn is_group(kind: SlackChannelKind) -> bool {
+    !matches!(kind, SlackChannelKind::DirectMessage)
 }
 
 const fn participant(kind: SlackChannelKind) -> &'static str {

@@ -340,6 +340,10 @@ impl Harness {
         self.adapter.handle(command, &self.tx).expect("queued");
     }
 
+    fn shutdown(&mut self) {
+        self.adapter.shutdown(&self.tx);
+    }
+
     /// Wait until an event matches. Keeps every event for later checks.
     async fn until(&mut self, what: &str, test: impl Fn(&AdapterEvent) -> bool) -> AdapterEvent {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -573,6 +577,7 @@ async fn send_posts_as_the_app_and_shows_the_sent_message() {
         protocol: ProtocolId::Slack,
         conversation_id: "slack:C1".into(),
         body: "hello from thinwire".into(),
+        request: 1,
     });
     let sent = h.message("hello from thinwire").await;
     assert!(sent.outbound);
@@ -709,6 +714,7 @@ async fn rate_limit_on_send_keeps_the_install() {
         protocol: ProtocolId::Slack,
         conversation_id: "slack:C1".into(),
         body: "not sent".into(),
+        request: 1,
     });
     let detail = h.status(AdapterStatus::Error).await;
     assert!(detail.contains("rate limit"));
@@ -726,8 +732,34 @@ async fn rate_limit_on_send_keeps_the_install() {
         protocol: ProtocolId::Slack,
         conversation_id: "slack:C1".into(),
         body: "sent after the limit".into(),
+        request: 2,
     });
     h.message("sent after the limit").await;
+}
+
+#[tokio::test]
+async fn shutdown_stops_the_socket_and_reports_stopped() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    assert!(h.socket.connected());
+    h.shutdown();
+    h.until("stopped", |event| {
+        matches!(
+            event,
+            AdapterEvent::Stopped {
+                protocol: ProtocolId::Slack
+            }
+        )
+    })
+    .await;
+    assert!(h.socket.stopped.load(Ordering::SeqCst));
+    assert_eq!(
+        h.vault.get_secret(SlackSecretKey::BotToken).as_deref(),
+        Some(BOT_TOKEN)
+    );
 }
 
 #[tokio::test]
