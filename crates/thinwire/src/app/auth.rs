@@ -216,12 +216,10 @@ fn telegram_api(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStor
     continue_button(ui, snapshot, secrets, "Save override");
 }
 
-/// Between Add Telegram and the phone step. Busy shows the spinner above;
-/// after a failed start, the error block explains and Try again retries.
+/// Between Add Telegram and the phone step. The shared continue control
+/// shows the spinner while the login is busy, and Try again after a failed start.
 fn telegram_connecting(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore) {
-    if !snapshot.auth_busy {
-        continue_button(ui, snapshot, secrets, "Try again");
-    }
+    continue_button(ui, snapshot, secrets, "Try again");
 }
 
 fn telegram_phone(ui: &mut egui::Ui, snapshot: &mut Snapshot, secrets: &SecretStore, focus: bool) {
@@ -358,5 +356,32 @@ mod tests {
         );
         assert_eq!(step_line(AuthScreen::TelegramConnecting), None);
         assert_eq!(step_line(AuthScreen::Idle), None);
+    }
+
+    #[test]
+    fn connecting_shows_waiting_chrome_while_busy() {
+        let auth = include_str!("auth.rs");
+        let connecting = &auth[auth.find("fn telegram_connecting(").expect("connecting")..];
+        let connecting = &connecting[..connecting.find("\nfn ").expect("next")];
+        assert!(
+            connecting.contains("continue_button(ui, snapshot, secrets, \"Try again\")"),
+            "Try again stays on the connecting screen"
+        );
+        assert!(
+            !connecting.contains("auth_busy"),
+            "a busy connection still reaches the shared continue control"
+        );
+        let button = &auth[auth.find("fn continue_button(").expect("button")..];
+        let button = &button[..button.find("\n#[cfg(test)]").expect("tests")];
+        let busy = button.find("if snapshot.auth_busy").expect("busy branch");
+        let spinner = button.find("ui.spinner()").expect("spinner");
+        let waiting = button.find("Waiting for Telegram…").expect("waiting text");
+        let early_return = button.find("return;").expect("busy returns");
+        let label = button.find("RichText::new(label)").expect("idle label");
+        assert!(busy < spinner && spinner < waiting && waiting < early_return);
+        assert!(
+            early_return < label,
+            "Try again is the label only when the login is not busy"
+        );
     }
 }
