@@ -71,6 +71,9 @@ struct PendingLoad {
 /// - Once `revoked` is set, a send is not inserted. `register_send` queues
 ///   `SendRejected` in that step, and if `Unlinked` is not queued yet it queues
 ///   that rejection first. No send is registered for a revoked generation.
+/// - `pending_unlink` stays until this generation queues `Unlinked`, or a new
+///   session bumps `generation`. LoadChats, OpenChat, SendText, and ViewChat
+///   do not clear it. They answer `CommandFailed` or `SendRejected`.
 /// - The shared live counter moves only in this step, and only after the
 ///   generation check: replacing the session, or publishing `Unlinked`.
 #[derive(Debug, Default)]
@@ -89,10 +92,14 @@ struct Shared {
     /// Bumped when a later connect replaces this session. In-flight results
     /// captured the old value and are dropped when it no longer matches.
     generation: u64,
-    /// A 401 revoked the token. The adapter drops this session on the next command.
+    /// A 401 revoked the token. After `Unlinked` is queued, the next command
+    /// drops this session. While `pending_unlink` is set, ordinary commands
+    /// leave the session in place.
     revoked: bool,
     /// A 401 rejected tracked work and has not queued `Unlinked` yet.
-    /// `register_send` puts its `SendRejected` ahead of that event.
+    /// Cleared only by `publish_unlink` for this generation, or when a new
+    /// session bumps `generation`. `register_send` puts its `SendRejected`
+    /// ahead of that event.
     pending_unlink: Option<DiscordApiError>,
     /// Send tasks still running. Shutdown waits until this is zero.
     send_tasks: u64,
@@ -152,9 +159,34 @@ impl Session {
             .unwrap_or_default()
     }
 
-    /// True after a 401. The adapter drops the session on the next command.
+    /// True after a 401. The adapter drops the session on the next command
+    /// once `Unlinked` has been queued.
     pub(crate) fn is_revoked(&self) -> bool {
         self.shared.lock().is_ok_and(|state| state.revoked)
+    }
+
+    /// A 401 has settled and `Unlinked` is not queued yet.
+    pub(crate) fn unlink_pending(&self) -> bool {
+        self.shared
+            .lock()
+            .is_ok_and(|state| state.pending_unlink.is_some())
+    }
+
+    /// Answers one ordinary command while `Unlinked` is still pending.
+    /// Does not clear that pending unlink.
+    pub(crate) fn refuse_pending_unlink(
+        &self,
+        events: &EventTx,
+        conversation_id: Option<String>,
+    ) -> bool {
+        let Ok(state) = self.shared.lock() else {
+            return false;
+        };
+        let Some(error) = state.pending_unlink else {
+            return false;
+        };
+        emit_command_failed(events, ProtocolId::Discord, conversation_id, error.reason());
+        true
     }
 
     /// Starts a new generation and loads the channel list.
@@ -216,6 +248,10 @@ impl Session {
             let Ok(mut state) = self.shared.lock() else {
                 return;
             };
+            if let Some(error) = state.pending_unlink {
+                emit_command_failed(events, ProtocolId::Discord, None, error.reason());
+                return;
+            }
             if state.revoked {
                 return;
             }
@@ -259,6 +295,15 @@ impl Session {
             let Ok(mut state) = self.shared.lock() else {
                 return Err(refused_channel());
             };
+            if let Some(error) = state.pending_unlink {
+                emit_command_failed(
+                    events,
+                    ProtocolId::Discord,
+                    Some(conversation_id),
+                    error.reason(),
+                );
+                return Ok(());
+            }
             if state.revoked {
                 return Ok(());
             }

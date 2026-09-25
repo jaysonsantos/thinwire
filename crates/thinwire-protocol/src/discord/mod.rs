@@ -318,6 +318,16 @@ impl DiscordAdapter {
             .as_ref()
             .is_some_and(session::Session::is_revoked)
         {
+            // A pending unlink belongs to this generation. Retiring here would
+            // bump it and the seal would drop `Unlinked`. Connect and
+            // Disconnect still retire through `stop_session`.
+            if self
+                .session
+                .as_ref()
+                .is_some_and(session::Session::unlink_pending)
+            {
+                return;
+            }
             self.stop_session(events);
         }
         #[cfg(not(any(test, feature = "discord-bot")))]
@@ -392,6 +402,12 @@ impl ProtocolAdapter for DiscordAdapter {
     }
 
     fn view_chat(&mut self, conversation_id: Option<&str>, events: &EventTx) {
+        #[cfg(any(test, feature = "discord-bot"))]
+        if self.session.as_ref().is_some_and(|session| {
+            session.refuse_pending_unlink(events, conversation_id.map(str::to_owned))
+        }) {
+            return;
+        }
         let _ = events;
         self.viewed = conversation_id.map(str::to_owned);
     }
@@ -399,6 +415,7 @@ impl ProtocolAdapter for DiscordAdapter {
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         // A send checks revocation under the session lock and rejects in that
         // step. Dropping the session first would skip `SendRejected`.
+        // `drop_if_revoked` leaves a still-pending unlink alone.
         if !matches!(
             command,
             AdapterCommand::SendText {
@@ -1911,6 +1928,101 @@ mod tests {
                 )
             }),
             "session 2's generation was not bumped by the stale 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_load_during_a_401_seal_still_unlinks() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().hold_unlink = Some(Arc::clone(&hold));
+        api.state().unlink_at_barrier = Some(Arc::clone(&arrived));
+        api.state().unauthorized = true;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("401 is waiting to unlink");
+        let _ = drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("load while unlink is pending");
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open while unlink is pending");
+        adapter.view_chat(Some(&id), &tx);
+        let during = drain(&mut rx);
+        assert!(
+            during.iter().any(|event| matches!(
+                event,
+                AdapterEvent::CommandFailed {
+                    conversation_id: None,
+                    ..
+                }
+            )),
+            "LoadChats is answered as revoked"
+        );
+        assert!(
+            during.iter().any(|event| matches!(
+                event,
+                AdapterEvent::CommandFailed {
+                    conversation_id: Some(chat),
+                    ..
+                } if chat == &id
+            )),
+            "OpenChat is answered as revoked"
+        );
+        assert!(
+            !during.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                }
+            )),
+            "ordinary commands leave the pending unlink in place"
+        );
+        hold.notify_one();
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                }
+            )),
+            "the pending unlink still arrives"
         );
     }
 
