@@ -466,12 +466,8 @@ fn row_and_message(
         ),
         _ => super::message::Incoming::Other,
     };
-    let Some(shown) = super::message::visible_text(incoming) else {
-        return None;
-    };
-    let Ok(thread) = Thread::try_from(content) else {
-        return None;
-    };
+    let shown = super::message::visible_text(incoming)?;
+    let thread = Thread::try_from(content).ok()?;
     let uuid = content.metadata.sender.raw_uuid().to_string();
     let (conversation_id, sender, title, is_group) = match &thread {
         Thread::Contact(id) => {
