@@ -306,6 +306,7 @@ impl ProtocolAdapter for TelegramAdapter {
                         conversation_id,
                         before_message_id,
                         false,
+                        None,
                     );
                 }
                 result
@@ -1108,6 +1109,7 @@ mod tests {
                 conversation_id: "telegram:1".into(),
                 before_message_id: "telegram:2:50".into(),
                 more: false,
+                note: None,
             }
         );
         let valid = adapter.handle(
@@ -1164,7 +1166,7 @@ mod tests {
         assert!(older.contains("log_tdlib_error(\"getChatHistory (older)\""));
         assert!(!older.contains("tracing::"), "no message text in logs");
         assert!(
-            older.matches("done(").count() >= 5,
+            older.matches("done(").count() + older.matches("end(more, note)").count() >= 5,
             "every path ends the request"
         );
         let worker = fn_body(src, "fn spawn_tdlib_worker");

@@ -347,6 +347,20 @@ impl OlderHistory {
     }
 }
 
+/// How an older-history request ends: `more`, and the note for this chat.
+/// A failed page is a note for the chat, not an account `Error` status, and
+/// it is not the start of the chat, so a later scroll can try again. A
+/// success sends no note, which clears an earlier one (#57).
+pub(super) fn older_end(result: Result<bool, i32>) -> (bool, Option<String>) {
+    match result {
+        Ok(more) => (more, None),
+        Err(code) => (
+            true,
+            Some(format!("Could not load older messages (TDLib {code}).")),
+        ),
+    }
+}
+
 /// What one TDLib history page held, relative to the anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PageOutcome {
@@ -792,6 +806,28 @@ mod tests {
         assert!(!gate.finish(1, 50, PageOutcome::Empty));
         gate.messages_deleted(1);
         assert_eq!(gate.begin(1, 50), OlderStep::AtStart);
+    }
+
+    #[test]
+    fn a_failed_older_page_is_a_chat_note_and_a_success_clears_it() {
+        let (more, note) = older_end(Err(500));
+        assert!(more, "a later scroll can try again");
+        assert_eq!(
+            note.as_deref(),
+            Some("Could not load older messages (TDLib 500).")
+        );
+        assert_eq!(older_end(Ok(true)), (true, None), "success clears the note");
+        assert_eq!(older_end(Ok(false)), (false, None));
+
+        let src = include_str!("tdlib.rs");
+        let load = &src[src.find("async fn load_older(").expect("load_older")..];
+        let load = &load[..load.find("\n}\n").expect("end")];
+        assert!(
+            !load.contains("emit_status("),
+            "no account error for one page"
+        );
+        assert!(load.contains("older_end(Err(error.code))"));
+        assert!(load.contains("older_end(Ok(more))"));
     }
 
     #[test]
