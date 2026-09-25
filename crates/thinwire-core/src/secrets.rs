@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use keyring_core::Entry;
 use thinwire_protocol::{
-    DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordSecretVault, TDLIB_FOLDER,
-    TDLIB_KEYUTILS_FOLDER, TELEGRAM_SECRET_SERVICE, TelegramSecretKey, TelegramSecretVault,
+    DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordSecretVault, SLACK_SECRET_SERVICE,
+    SlackSecretKey, SlackSecretVault, TDLIB_FOLDER, TDLIB_KEYUTILS_FOLDER, TELEGRAM_SECRET_SERVICE,
+    TelegramSecretKey, TelegramSecretVault,
 };
 use tokio::runtime::Handle;
 
@@ -104,6 +105,12 @@ enum AttachPhase {
 }
 
 type DiscordHydrateHook = Box<dyn FnOnce() + Send>;
+type SlackHydrateHook = Box<dyn FnOnce() + Send>;
+
+enum SlackHydrate {
+    Waiting { hook: Option<SlackHydrateHook> },
+    Settled { notify: bool },
+}
 
 enum DiscordHydrate {
     /// OS attach has not finished. The hook runs once a token is stored.
@@ -118,11 +125,14 @@ struct Inner {
     dirty: HashSet<SecretKey>,
     discord_bot_token: Option<String>,
     discord_token_dirty: bool,
+    slack: HashMap<SlackSecretKey, String>,
+    slack_dirty: HashSet<SlackSecretKey>,
     flush_pending: bool,
     flush_in_flight: bool,
     phase: AttachPhase,
     os_backend: Option<OsBackend>,
     discord_hydrate: DiscordHydrate,
+    slack_hydrate: SlackHydrate,
 }
 
 /// Memory-first store. OS keychain attach/flush is worker-only.
@@ -138,6 +148,8 @@ impl SecretStore {
                 dirty: HashSet::new(),
                 discord_bot_token: None,
                 discord_token_dirty: false,
+                slack: HashMap::new(),
+                slack_dirty: HashSet::new(),
                 flush_pending: false,
                 flush_in_flight: false,
                 phase,
@@ -146,6 +158,11 @@ impl SecretStore {
                     DiscordHydrate::Settled { notify: false }
                 } else {
                     DiscordHydrate::Waiting { hook: None }
+                },
+                slack_hydrate: if phase == AttachPhase::MemoryOnly {
+                    SlackHydrate::Settled { notify: false }
+                } else {
+                    SlackHydrate::Waiting { hook: None }
                 },
             }),
         }
@@ -379,6 +396,7 @@ impl SecretStore {
         if memory_requested() {
             self.finish_memory_only();
             self.signal_discord_hydrated();
+            self.signal_slack_hydrated();
             return;
         }
         let probed = match probe_os() {
@@ -397,22 +415,12 @@ impl SecretStore {
         };
         match probed {
             Ok(backend) => {
-                let discord_token = read_discord_os_token();
-                let should_flush = match read_os_snapshot() {
-                    Ok(os_values) => self.settle_after_probe(backend, os_values, None),
-                    Err(error) => self.settle_after_probe(backend, HashMap::new(), Some(error)),
-                };
-                self.store_hydrated_discord_token(discord_token);
-                if self.phase() == AttachPhase::Ready {
-                    tracing::info!(?backend, "using the OS keychain for Telegram secrets");
-                }
-                if should_flush && let Err(error) = self.flush_os() {
-                    tracing::warn!(
-                        error = %error,
-                        "OS keychain flush after attach failed; secrets stay in memory"
-                    );
-                }
-                self.signal_discord_hydrated();
+                self.store_probed_secrets(
+                    backend,
+                    read_os_snapshot(),
+                    read_discord_os_token(),
+                    read_slack_os(),
+                );
             }
             Err(error) => {
                 tracing::warn!(
@@ -421,8 +429,46 @@ impl SecretStore {
                 );
                 self.finish_memory_only();
                 self.signal_discord_hydrated();
+                self.signal_slack_hydrated();
             }
         }
+    }
+
+    /// Apply one OS probe. A Slack read error leaves attach unsettled, the
+    /// same as a Telegram hydrate error: no `Ready`, and the Slack reconnect
+    /// hook stays waiting for Try again.
+    fn store_probed_secrets(
+        &self,
+        backend: OsBackend,
+        telegram: Result<HashMap<SecretKey, String>, SecretError>,
+        discord_token: Result<Option<String>, SecretError>,
+        slack_install: Result<Vec<(SlackSecretKey, String)>, SecretError>,
+    ) {
+        if let Err(error) = &slack_install {
+            tracing::warn!(
+                error = %error,
+                "slack install hydrate failed; attach stays unsettled"
+            );
+            self.finish_read_failed();
+            return;
+        }
+        let should_flush = match telegram {
+            Ok(os_values) => self.settle_after_probe(backend, os_values, None),
+            Err(error) => self.settle_after_probe(backend, HashMap::new(), Some(error)),
+        };
+        self.store_hydrated_discord_token(discord_token);
+        self.store_hydrated_slack(slack_install);
+        if self.phase() == AttachPhase::Ready {
+            tracing::info!(?backend, "using the OS keychain for Telegram secrets");
+        }
+        if should_flush && let Err(error) = self.flush_os() {
+            tracing::warn!(
+                error = %error,
+                "OS keychain flush after attach failed; secrets stay in memory"
+            );
+        }
+        self.signal_discord_hydrated();
+        self.signal_slack_hydrated();
     }
 
     /// Unsettled after a failed read: keys unknown, the UI offers Try again.
@@ -492,8 +538,10 @@ impl SecretStore {
             }
         }
         inner.phase = AttachPhase::Ready;
-        let should_flush =
-            inner.flush_pending || !inner.dirty.is_empty() || inner.discord_token_dirty;
+        let should_flush = inner.flush_pending
+            || !inner.dirty.is_empty()
+            || inner.discord_token_dirty
+            || !inner.slack_dirty.is_empty();
         inner.flush_pending = false;
         inner.dirty.clear();
         if should_flush {
@@ -503,16 +551,25 @@ impl SecretStore {
     }
 
     fn flush_os(&self) -> Result<(), SecretError> {
-        self.flush_loop(|snapshot| {
-            for (key, value) in snapshot {
-                match value {
-                    Some(value) => os_set(*key, value)?,
-                    None => os_delete(*key)?,
-                }
+        self.flush_loop(|snapshot| self.write_keychain(snapshot))
+    }
+
+    /// Telegram, Discord, and Slack writes share one in-flight guard. A second
+    /// flush stays deferred until this snapshot, including Slack, has finished.
+    fn write_keychain(&self, snapshot: &FlushSnapshot) -> Result<(), SecretError> {
+        let probing = flush_probe_installed();
+        run_flush_probe();
+        if probing {
+            return Ok(());
+        }
+        for (key, value) in snapshot {
+            match value {
+                Some(value) => os_set(*key, value)?,
+                None => os_delete(*key)?,
             }
-            Ok(())
-        })?;
-        self.flush_discord_token()
+        }
+        self.flush_discord_token()?;
+        self.flush_slack()
     }
 
     fn flush_discord_token(&self) -> Result<(), SecretError> {
@@ -584,6 +641,104 @@ impl SecretStore {
         }
     }
 
+    /// Run `hook` once OS attach has stored a Slack bot token.
+    ///
+    /// A memory-only store never fires, because nothing is hydrated from the OS.
+    pub fn on_slack_token_hydrated(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut hook = Some(hook);
+        let fire_now = {
+            let Ok(mut inner) = self.lock() else {
+                return;
+            };
+            match &mut inner.slack_hydrate {
+                SlackHydrate::Waiting { hook: slot } => {
+                    if let Some(hook) = hook.take() {
+                        *slot = Some(Box::new(hook));
+                    }
+                    false
+                }
+                SlackHydrate::Settled { notify } => {
+                    *notify && inner.slack.contains_key(&SlackSecretKey::BotToken)
+                }
+            }
+        };
+        if fire_now && let Some(hook) = hook.take() {
+            hook();
+        }
+    }
+
+    fn signal_slack_hydrated(&self) {
+        let (hook, token_present) = {
+            let Ok(mut inner) = self.lock() else {
+                return;
+            };
+            let SlackHydrate::Waiting { hook } = &mut inner.slack_hydrate else {
+                return;
+            };
+            let hook = hook.take();
+            let token_present = inner.slack.contains_key(&SlackSecretKey::BotToken);
+            inner.slack_hydrate = SlackHydrate::Settled {
+                notify: token_present,
+            };
+            (hook, token_present)
+        };
+        if token_present && let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn store_hydrated_slack(&self, value: Result<Vec<(SlackSecretKey, String)>, SecretError>) {
+        let Ok(mut inner) = self.lock() else {
+            return;
+        };
+        match value {
+            Ok(pairs) => {
+                for (key, raw) in pairs {
+                    if inner.slack_dirty.contains(&key) {
+                        continue;
+                    }
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        inner.slack.remove(&key);
+                    } else {
+                        inner.slack.insert(key, trimmed.to_string());
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "slack install hydrate failed");
+            }
+        }
+    }
+
+    fn flush_slack(&self) -> Result<(), SecretError> {
+        let snapshot = {
+            let mut inner = self.lock()?;
+            if inner.phase != AttachPhase::Ready || inner.slack_dirty.is_empty() {
+                return Ok(());
+            }
+            let keys: Vec<SlackSecretKey> = inner.slack_dirty.drain().collect();
+            keys.into_iter()
+                .map(|key| (key, inner.slack.get(&key).cloned()))
+                .collect::<Vec<_>>()
+        };
+        for (index, (key, value)) in snapshot.iter().enumerate() {
+            let write = match value {
+                Some(value) => slack_os_set(*key, value),
+                None => slack_os_delete(*key),
+            };
+            if let Err(error) = write {
+                if let Ok(mut inner) = self.lock() {
+                    let pending: Vec<SlackSecretKey> =
+                        snapshot[index..].iter().map(|(key, _)| *key).collect();
+                    requeue_slack(&mut inner.slack_dirty, &pending);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     fn flush_loop<F>(&self, mut commit: F) -> Result<(), SecretError>
     where
         F: FnMut(&FlushSnapshot) -> Result<(), SecretError>,
@@ -629,6 +784,51 @@ impl SecretStore {
 }
 
 type FlushSnapshot = [(SecretKey, Option<String>); 4];
+
+#[cfg(test)]
+fn flush_probe_installed() -> bool {
+    FLUSH_PROBE.lock().expect("flush probe").is_some()
+}
+
+#[cfg(not(test))]
+fn flush_probe_installed() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn run_flush_probe() {
+    let probe = FLUSH_PROBE.lock().expect("flush probe").clone();
+    if let Some(probe) = probe {
+        probe();
+    }
+}
+
+#[cfg(not(test))]
+fn run_flush_probe() {}
+
+#[cfg(test)]
+static FLUSH_PROBE: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+impl SlackSecretVault for SecretStore {
+    fn get_secret(&self, key: SlackSecretKey) -> Option<String> {
+        self.lock().ok()?.slack.get(&key).cloned()
+    }
+
+    fn set_secret(&self, key: SlackSecretKey, value: &str) {
+        let Ok(mut inner) = self.lock() else {
+            return;
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            inner.slack.remove(&key);
+        } else {
+            inner.slack.insert(key, trimmed.to_string());
+        }
+        if key.persist_to_os() {
+            inner.slack_dirty.insert(key);
+        }
+    }
+}
 
 impl DiscordSecretVault for SecretStore {
     fn bot_token(&self) -> Option<String> {
@@ -918,6 +1118,48 @@ fn discord_os_set(value: &str) -> Result<(), SecretError> {
         .map_err(map_keyring_error)
 }
 
+fn slack_os_entry(key: SlackSecretKey) -> Result<Entry, SecretError> {
+    ensure_default_store()?;
+    Entry::new(SLACK_SECRET_SERVICE, key.account()).map_err(map_keyring_error)
+}
+
+fn slack_os_get(key: SlackSecretKey) -> Result<Option<String>, SecretError> {
+    match slack_os_entry(key)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
+        Err(error) => Err(map_keyring_error(error)),
+    }
+}
+
+fn requeue_slack(dirty: &mut HashSet<SlackSecretKey>, pending: &[SlackSecretKey]) {
+    for key in pending {
+        dirty.insert(*key);
+    }
+}
+
+fn slack_os_set(key: SlackSecretKey, value: &str) -> Result<(), SecretError> {
+    slack_os_entry(key)?
+        .set_password(value)
+        .map_err(map_keyring_error)
+}
+
+fn slack_os_delete(key: SlackSecretKey) -> Result<(), SecretError> {
+    match slack_os_entry(key)?.delete_credential() {
+        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+        Err(error) => Err(map_keyring_error(error)),
+    }
+}
+
+fn read_slack_os() -> Result<Vec<(SlackSecretKey, String)>, SecretError> {
+    let mut found = Vec::new();
+    for key in SlackSecretKey::PERSISTENT {
+        if let Some(value) = slack_os_get(key)? {
+            found.push((key, value));
+        }
+    }
+    Ok(found)
+}
+
 fn discord_os_delete() -> Result<(), SecretError> {
     match discord_os_entry()?.delete_credential() {
         Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
@@ -1111,7 +1353,90 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("fixture-bot-token"));
         assert_eq!(DISCORD_SECRET_BOT_TOKEN, "discord.bot_token");
+    }
+
+    #[test]
+    fn slack_install_stays_in_memory_and_out_of_debug() {
+        let store = SecretStore::memory();
+        SlackSecretVault::set_secret(&store, SlackSecretKey::BotToken, "  xoxb-fixture  ");
+        SlackSecretVault::set_secret(&store, SlackSecretKey::TeamId, "T1");
+        SlackSecretVault::set_secret(&store, SlackSecretKey::AppId, "A1");
+        SlackSecretVault::set_secret(&store, SlackSecretKey::OAuthState, "one-time");
+        assert_eq!(
+            SlackSecretVault::get_secret(&store, SlackSecretKey::BotToken).as_deref(),
+            Some("xoxb-fixture")
+        );
+        assert_eq!(
+            SlackSecretVault::get_secret(&store, SlackSecretKey::OAuthState).as_deref(),
+            Some("one-time")
+        );
+        SlackSecretVault::set_secret(&store, SlackSecretKey::BotToken, " ");
+        assert_eq!(
+            SlackSecretVault::get_secret(&store, SlackSecretKey::BotToken),
+            None
+        );
+        let shown = format!("{store:?}");
+        assert!(!shown.contains("xoxb-fixture"));
+        assert!(!shown.contains("one-time"));
+        assert!(!SlackSecretKey::OAuthState.persist_to_os());
+        assert!(SlackSecretKey::BotToken.persist_to_os());
         assert_eq!(store.request_flush(), FlushAction::Ignore);
+    }
+
+    #[test]
+    fn a_failed_slack_flush_requeues_every_unwritten_key() {
+        let mut dirty = HashSet::new();
+        let pending = [
+            SlackSecretKey::BotToken,
+            SlackSecretKey::TeamId,
+            SlackSecretKey::ClientId,
+        ];
+        requeue_slack(&mut dirty, &pending);
+        assert!(dirty.contains(&SlackSecretKey::BotToken));
+        assert!(dirty.contains(&SlackSecretKey::TeamId));
+        assert!(dirty.contains(&SlackSecretKey::ClientId));
+    }
+
+    #[test]
+    fn a_failed_slack_keychain_read_leaves_attach_unsettled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = SecretStore::blank(AttachPhase::Attaching);
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        store.on_slack_token_hydrated(move || flag.store(true, Ordering::Relaxed));
+        let mut telegram = HashMap::new();
+        telegram.insert(SecretKey::Session, "saved-session".to_string());
+        store.store_probed_secrets(
+            OsBackend::SecretService,
+            Ok(telegram),
+            Ok(None),
+            Err(SecretError::new("OS keychain: platform failure")),
+        );
+        assert_eq!(store.phase(), AttachPhase::ReadFailed);
+        assert!(store.read_failed());
+        assert!(!store.attach_settled());
+        assert!(!fired.load(Ordering::Relaxed));
+        assert_eq!(
+            SlackSecretVault::get_secret(&store, SlackSecretKey::BotToken),
+            None
+        );
+        assert_eq!(store.get(SecretKey::Session).expect("get"), None);
+
+        let mut telegram = HashMap::new();
+        telegram.insert(SecretKey::Session, "saved-session".to_string());
+        store.store_probed_secrets(
+            OsBackend::SecretService,
+            Ok(telegram),
+            Ok(None),
+            Ok(vec![(SlackSecretKey::BotToken, "xoxb-fixture".to_string())]),
+        );
+        assert!(store.attach_settled());
+        assert!(fired.load(Ordering::Relaxed));
+        assert_eq!(
+            SlackSecretVault::get_secret(&store, SlackSecretKey::BotToken).as_deref(),
+            Some("xoxb-fixture")
+        );
     }
 
     #[test]
@@ -1447,6 +1772,37 @@ mod tests {
         assert_eq!(store.request_flush(), FlushAction::Defer);
         store.finish_in_flight_flush_for_test();
         assert_eq!(store.request_flush(), FlushAction::Spawn);
+    }
+
+    #[test]
+    fn a_second_flush_waits_until_slack_keychain_writes_finish() {
+        let store = Arc::new(SecretStore::blank(AttachPhase::Ready));
+        store.set(SecretKey::ApiId, "11111").expect("set");
+        SlackSecretVault::set_secret(store.as_ref(), SlackSecretKey::BotToken, "xoxb-fixture");
+        assert_eq!(store.request_flush(), FlushAction::Spawn);
+
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let started_probe = Arc::clone(&started);
+        let release_probe = Arc::clone(&release);
+        let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked_probe = Arc::clone(&parked);
+        *FLUSH_PROBE.lock().expect("probe") = Some(Arc::new(move || {
+            if parked_probe.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            started_probe.wait();
+            release_probe.wait();
+        }));
+
+        let worker_store = Arc::clone(&store);
+        let worker = std::thread::spawn(move || worker_store.flush_os());
+        started.wait();
+        SlackSecretVault::set_secret(store.as_ref(), SlackSecretKey::BotToken, "");
+        assert_eq!(store.request_flush(), FlushAction::Defer);
+        release.wait();
+        let _ = worker.join().expect("flush worker");
+        *FLUSH_PROBE.lock().expect("probe") = None;
     }
 
     #[test]

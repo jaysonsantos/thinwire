@@ -301,6 +301,34 @@ fn a_live_session_hides_add_account_and_cancel_keeps_it() {
 }
 
 #[test]
+fn slack_sign_in_is_compiled_only_with_the_feature() {
+    let ui = include_str!("ui.rs");
+    let on = ui
+        .find("#[cfg(feature = \"slack-oauth\")]\nfn add_slack_workspace")
+        .expect("feature-on helper");
+    let off = ui
+        .find("#[cfg(not(feature = \"slack-oauth\"))]\nfn add_slack_workspace")
+        .expect("feature-off helper");
+    let on_body = &ui[on..off];
+    assert!(on_body.contains("Add Slack workspace"));
+    assert!(on_body.contains("SlackIntent::Connect"));
+    assert!(on_body.contains("SlackIntent::Cancel"));
+    let off_body = &ui[off..];
+    let off_body = &off_body[..off_body.find("\nfn ").expect("next")];
+    assert!(
+        !off_body.contains("Add Slack workspace"),
+        "the default build helper draws no Slack control"
+    );
+    let first = &ui[ui.find("fn first_run(").expect("first")..];
+    let first = &first[..first.find("\nfn ").expect("next")];
+    assert!(first.contains("add_slack_workspace("));
+    assert!(!first.contains("Add Slack workspace"));
+    let bar = &ui[ui.find("fn top_bar(").expect("bar")..];
+    let bar = &bar[..bar.find("\nfn ").expect("next")];
+    assert!(bar.contains("add_slack_workspace("));
+}
+
+#[test]
 fn auth_ui_is_telegram_only_this_beat() {
     let src = include_str!("auth.rs");
     assert!(src.contains("TELEGRAM_API_ID"));

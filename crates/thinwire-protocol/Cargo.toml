@@ -17,11 +17,16 @@ default = []
 # api_id / api_hash stay compile-time env (credentials.rs). Public CI must
 # not set them. Main-only os-zips injects repository secrets.
 telegram-tdlib = ["dep:tdlib-rs"]
-# Official Slack workspace-app OAuth via `slack-morphism` (OAuth v2 types and
-# Socket Mode config). Default CI stays feature-off. No HTTP client in this
-# spike (`hyper` stays off). Publisher client credentials stay compile-time
-# env in `slack/credentials.rs`. Public CI must not set them.
-slack-oauth = ["dep:slack-morphism"]
+# Official Slack workspace app via `slack-morphism`: OAuth v2 install on a
+# loopback redirect, Web API and Socket Mode over its `hyper` client. Default
+# CI stays feature-off. Publisher client credentials stay compile-time env in
+# `slack/credentials.rs`. Public CI must not set them.
+slack-oauth = [
+  "dep:slack-morphism",
+  "slack-morphism/hyper",
+  "dep:webbrowser",
+  "dep:rustls",
+]
 # Experimental WhatsApp Web / linked-device client (MIT, oxidezap).
 # Git revision matches ZapFast 0.14 so the spike builds on stable Rust.
 # Default CI does not enable this feature. Not a supported messenger.
@@ -36,6 +41,7 @@ tdlib-rs = { version = "1.4", optional = true, default-features = false, feature
   "static",
 ] }
 slack-morphism = { version = "2.29", optional = true, default-features = false }
+webbrowser = { version = "1", optional = true }
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f7468ae2920a2b0aedbd0848cf121de56a07f93c", optional = true, default-features = false, features = [
   "sqlite-storage-bundled",
   "tokio-transport",
@@ -45,14 +51,14 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f746
 ] }
 twilight-http = { version = "0.17.1", optional = true }
 twilight-model = { version = "0.17.1", optional = true }
-# twilight-http 0.17 leaves rustls without a process crypto provider.
-# `ring` is the single provider for the bot HTTP client.
+# twilight-http 0.17 and hyper-rustls leave rustls without a process crypto
+# provider. `ring` is the single provider for the Discord and Slack clients.
 rustls = { version = "0.23", optional = true, default-features = false, features = [
   "ring",
 ] }
 dirs.workspace = true
 getrandom = "0.4"
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
 tracing.workspace = true
 
 [lints]

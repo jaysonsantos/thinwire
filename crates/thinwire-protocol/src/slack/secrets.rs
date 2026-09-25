@@ -18,6 +18,7 @@ pub const SLACK_SECRET_CLIENT_SECRET: &str = "slack.client_secret";
 pub const SLACK_SECRET_APP_TOKEN: &str = "slack.app_token";
 pub const SLACK_SECRET_BOT_TOKEN: &str = "slack.bot_token";
 pub const SLACK_SECRET_TEAM_ID: &str = "slack.team_id";
+pub const SLACK_SECRET_APP_ID: &str = "slack.app_id";
 pub const SLACK_SECRET_OAUTH_CODE: &str = "slack.oauth_code";
 pub const SLACK_SECRET_OAUTH_STATE: &str = "slack.oauth_state";
 
@@ -31,28 +32,32 @@ pub enum SlackSecretKey {
     /// Workspace install bot token from `oauth.v2.access`. Never a user token.
     BotToken,
     TeamId,
+    /// Slack app id (`A…`) from the install. Not the client id.
+    AppId,
     OAuthCode,
     OAuthState,
 }
 
 impl SlackSecretKey {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ClientId,
         Self::ClientSecret,
         Self::AppToken,
         Self::BotToken,
         Self::TeamId,
+        Self::AppId,
         Self::OAuthCode,
         Self::OAuthState,
     ];
 
     /// Keys that may be flushed to the OS keychain.
-    pub const PERSISTENT: [Self; 5] = [
+    pub const PERSISTENT: [Self; 6] = [
         Self::ClientId,
         Self::ClientSecret,
         Self::AppToken,
         Self::BotToken,
         Self::TeamId,
+        Self::AppId,
     ];
 
     /// Keys that stay in the process map only.
@@ -66,6 +71,7 @@ impl SlackSecretKey {
             Self::AppToken => SLACK_SECRET_APP_TOKEN,
             Self::BotToken => SLACK_SECRET_BOT_TOKEN,
             Self::TeamId => SLACK_SECRET_TEAM_ID,
+            Self::AppId => SLACK_SECRET_APP_ID,
             Self::OAuthCode => SLACK_SECRET_OAUTH_CODE,
             Self::OAuthState => SLACK_SECRET_OAUTH_STATE,
         }
@@ -75,7 +81,12 @@ impl SlackSecretKey {
     pub const fn persist_to_os(self) -> bool {
         matches!(
             self,
-            Self::ClientId | Self::ClientSecret | Self::AppToken | Self::BotToken | Self::TeamId
+            Self::ClientId
+                | Self::ClientSecret
+                | Self::AppToken
+                | Self::BotToken
+                | Self::TeamId
+                | Self::AppId
         )
     }
 }
@@ -88,6 +99,7 @@ impl fmt::Debug for SlackSecretKey {
             Self::AppToken => "AppToken",
             Self::BotToken => "BotToken",
             Self::TeamId => "TeamId",
+            Self::AppId => "AppId",
             Self::OAuthCode => "OAuthCode",
             Self::OAuthState => "OAuthState",
         })
@@ -163,7 +175,7 @@ mod tests {
         for key in SlackSecretKey::EPHEMERAL {
             assert!(!key.persist_to_os(), "{key:?}");
         }
-        assert_eq!(SlackSecretKey::ALL.len(), 7);
+        assert_eq!(SlackSecretKey::ALL.len(), 8);
         assert!(SlackSecretKey::BotToken.persist_to_os());
         assert!(!SlackSecretKey::OAuthCode.persist_to_os());
         let accounts: Vec<_> = SlackSecretKey::ALL
