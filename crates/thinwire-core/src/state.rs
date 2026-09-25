@@ -971,11 +971,19 @@ impl Snapshot {
     }
 
     /// The status line is a finished success: the adapter sent it with
-    /// `AdapterStatus::Ready`, and nothing replaced it since. The kind comes
-    /// from the adapter status, not from the text (#56).
+    /// `AdapterStatus::Ready`, nothing replaced it since, and no load runs.
+    /// The kind comes from the adapter status and the load state, not from
+    /// the text (#56).
     #[must_use]
     pub fn status_is_idle(&self) -> bool {
-        self.ready_status.as_deref() == Some(self.status_text.as_str())
+        !self.is_loading() && self.ready_status.as_deref() == Some(self.status_text.as_str())
+    }
+
+    /// A chat list, a history page, or a send is still running. A `Ready`
+    /// line such as "Loading recent messages." is not idle then (#64 review).
+    #[must_use]
+    pub fn is_loading(&self) -> bool {
+        self.chat_list_loading || !self.history_loading.is_empty() || !self.sending.is_empty()
     }
 
     #[must_use]

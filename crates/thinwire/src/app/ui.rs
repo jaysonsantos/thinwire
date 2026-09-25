@@ -321,7 +321,7 @@ fn is_idle_status(text: &str) -> bool {
 }
 
 /// True when the status strip draws a panel.
-fn status_strip_visible(snapshot: &Snapshot, notice: Option<&str>) -> bool {
+pub(super) fn status_strip_visible(snapshot: &Snapshot, notice: Option<&str>) -> bool {
     let show_error = snapshot.auth == AuthScreen::Idle && snapshot.error.is_some();
     let show_status = !snapshot.status_is_idle()
         && public_status(&snapshot.status_text).is_some_and(|text| !is_idle_status(text));

@@ -398,3 +398,43 @@ fn hints_count_as_used_only_where_their_widget_draws() {
     let rows_only = inbox.find("InboxState::Rows").expect("rows");
     assert!(inbox.find("hints.take_scroll_to_selected()").expect("take") > rows_only);
 }
+
+#[test]
+fn a_ready_loading_line_stays_busy_until_the_history_loads() {
+    use super::ui::status_strip_visible;
+    let store = SecretStore::memory();
+    let mut snapshot = ready_with_chats(&store);
+    snapshot.apply(AdapterEvent::ChatListLoaded {
+        protocol: ProtocolId::Telegram,
+    });
+    snapshot.apply(AdapterEvent::HistoryLoaded {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+    });
+    assert!(!snapshot.is_loading());
+    // Open a chat: its history starts to load.
+    snapshot.select_conversation("telegram:2".into());
+    let status = |status, detail: &str| AdapterEvent::Status {
+        protocol: ProtocolId::Telegram,
+        status,
+        detail: detail.into(),
+    };
+    snapshot.apply(status(AdapterStatus::Ready, "Loading recent messages."));
+    assert!(snapshot.is_loading());
+    assert!(!snapshot.status_is_idle(), "busy while the history loads");
+    assert!(
+        status_strip_visible(&snapshot, None),
+        "the loading line shows"
+    );
+
+    snapshot.apply(AdapterEvent::HistoryLoaded {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:2".into(),
+    });
+    assert!(!snapshot.is_loading());
+    assert!(snapshot.status_is_idle());
+    assert!(!status_strip_visible(&snapshot, None));
+
+    snapshot.apply(status(AdapterStatus::Ready, "Message sent."));
+    assert!(snapshot.status_is_idle(), "a finished send is idle");
+}
