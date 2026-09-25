@@ -20,7 +20,7 @@ sha2 = "0.10.9"
 thinwire-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-presage = { git = "https://github.com/whisperfish/presage", rev = "d3a760088617b657b41ccd4f43e4629e3c3188ac", optional = true, default-features = false }
+presage = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb", optional = true, default-features = false }
 presage-store-sled = { git = "https://github.com/whisperfish/presage", rev = "d3a760088617b657b41ccd4f43e4629e3c3188ac", optional = true }
 futures = { version = "0.3", optional = true, default-features = false, features = [
   "std",
