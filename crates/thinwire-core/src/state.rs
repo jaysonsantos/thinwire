@@ -387,6 +387,9 @@ pub struct Snapshot {
     /// The last Telegram status line that came as `AdapterStatus::Ready`: a
     /// finished success such as "Message sent." (#56).
     ready_status: Option<String>,
+    /// The last Telegram status line that came as `Error` or `Refused`. While
+    /// `status_text` still holds it, it wins over every loading line (#90).
+    failure_status: Option<String>,
     pub compose: String,
     pub auth_busy: bool,
     /// One line above the active login form. Never holds a secret.
@@ -564,6 +567,7 @@ impl Snapshot {
             error: None,
             status_text: "Sign in with Telegram to get started.".into(),
             ready_status: None,
+            failure_status: None,
             compose: String::new(),
             auth_busy: false,
             auth_notice: None,
@@ -681,6 +685,7 @@ impl Snapshot {
                     )
                 {
                     self.ready_status = (status == AdapterStatus::Ready).then(|| detail.clone());
+                    self.failure_status = (status != AdapterStatus::Ready).then(|| detail.clone());
                     self.status_text = detail;
                     if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                         if self.auth != AuthScreen::Idle {
@@ -1346,8 +1351,25 @@ impl Snapshot {
     /// With no load, it is the last status line.
     #[must_use]
     pub fn status_line(&self) -> std::borrow::Cow<'_, str> {
+        self.status_source().0
+    }
+
+    /// The status line is the line of a running load. The strip shows it in
+    /// the busy colour. A finished line or a failure is not busy (#82 qa L1).
+    #[must_use]
+    pub fn status_line_loads(&self) -> bool {
+        self.status_source().1
+    }
+
+    /// The status line, and whether it is a running load's line. A Telegram
+    /// failure that is still the last status wins over every load: a slow load
+    /// of another protocol must not hide it (#90).
+    fn status_source(&self) -> (std::borrow::Cow<'_, str>, bool) {
+        if self.failure_status.as_deref() == Some(self.status_text.as_str()) {
+            return (self.status_text.as_str().into(), false);
+        }
         if let Some(line) = self.loading_line(self.selected_protocol) {
-            return line.into();
+            return (line.into(), true);
         }
         let other = self
             .accounts
@@ -1356,8 +1378,8 @@ impl Snapshot {
             .filter(|id| *id != self.selected_protocol && self.account_surface_visible(*id))
             .find_map(|id| self.loading_line(id).map(|line| (id, line)));
         match other {
-            Some((id, line)) => format!("{}: {line}", id.display_name()).into(),
-            None => self.status_text.as_str().into(),
+            Some((id, line)) => (format!("{}: {line}", id.display_name()).into(), true),
+            None => (self.status_text.as_str().into(), false),
         }
     }
 
@@ -7336,6 +7358,56 @@ mod tests {
         );
         snapshot.select_protocol(ProtocolId::Discord);
         assert_eq!(snapshot.status_line(), LOADING_CHATS_STATUS);
+    }
+
+    /// A Telegram session with its loads done, and Slack linked and visible.
+    fn telegram_idle_slack_linked(store: &SecretStore) -> Snapshot {
+        let mut snapshot = ready_with_chats(store);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        snapshot.history_loading.clear();
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot
+    }
+
+    /// #90 item 1: a Telegram failure line wins over a load of another
+    /// protocol. After a later Ready line, the load shows again.
+    #[test]
+    fn a_telegram_failure_wins_over_another_protocols_load() {
+        let store = SecretStore::memory();
+        let mut snapshot = telegram_idle_slack_linked(&store);
+        snapshot.chat_list_loading.insert(ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "Telegram connection lost.".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Telegram connection lost.");
+        assert!(!snapshot.status_line_loads(), "a failure is not busy");
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Message sent.".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Slack: Loading chats…");
+        assert!(snapshot.status_line_loads());
+    }
+
+    /// #82 qa L1: a load of a protocol with no visible surface does not make
+    /// the shown line busy.
+    #[test]
+    fn a_hidden_protocols_load_does_not_make_the_line_busy() {
+        let store = SecretStore::memory();
+        let mut snapshot = telegram_idle_slack_linked(&store);
+        snapshot.extra_visible.remove(&ProtocolId::Slack);
+        snapshot.chat_list_loading.insert(ProtocolId::Slack);
+        snapshot.status_text = "Message sent.".into();
+        assert!(snapshot.is_loading());
+        assert_eq!(snapshot.status_line(), "Message sent.");
+        assert!(!snapshot.status_line_loads());
     }
 
     // endregion: #80

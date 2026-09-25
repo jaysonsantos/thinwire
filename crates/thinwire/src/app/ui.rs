@@ -254,7 +254,7 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         if show_status && let Some(text) = public_status(&line) {
             let color = if load_failure_text(&line).is_some() {
                 palette.error
-            } else if snapshot.is_loading() || text == "Refreshing…" {
+            } else if snapshot.status_line_loads() || text == "Refreshing…" {
                 palette.warn
             } else {
                 palette.text2
