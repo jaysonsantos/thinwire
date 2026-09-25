@@ -526,6 +526,7 @@ fn row(
         last_at: NOW - (4 - order) * HOUR,
         is_group,
         writable: true,
+        muted: false,
         placeholder: false,
     }
 }
@@ -545,6 +546,7 @@ fn message(chat: &str, index: usize, sender: &str, body: &str, sent_at: i64) -> 
         outbound: sender == "You",
         delivery: Delivery::Sent,
         sent_at,
+        arrival: thinwire_protocol::Arrival::History,
     }
 }
 

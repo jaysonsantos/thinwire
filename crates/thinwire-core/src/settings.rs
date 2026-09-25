@@ -108,6 +108,8 @@ impl Settings {
     pub fn in_memory() -> Self {
         Self {
             theme: ThemeMode::System,
+            notifications: true,
+            notification_preview: true,
             path: PathBuf::new(),
             persist_pending: false,
             persist_epoch: 0,
