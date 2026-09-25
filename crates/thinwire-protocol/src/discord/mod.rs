@@ -306,6 +306,21 @@ impl DiscordAdapter {
     ) -> Result<(), AdapterError> {
         Err(not_ready())
     }
+
+    fn drop_if_revoked(&mut self, events: &EventTx) {
+        #[cfg(any(test, feature = "discord-bot"))]
+        if self
+            .session
+            .as_ref()
+            .is_some_and(session::Session::is_revoked)
+        {
+            self.stop_session(events);
+        }
+        #[cfg(not(any(test, feature = "discord-bot")))]
+        {
+            let _ = (self, events);
+        }
+    }
 }
 
 const fn not_ready() -> AdapterError {
@@ -377,6 +392,7 @@ impl ProtocolAdapter for DiscordAdapter {
     }
 
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
+        self.drop_if_revoked(events);
         match command {
             AdapterCommand::ConnectDiscord {
                 mode: DiscordAuthMode::UserAccount,
@@ -885,6 +901,81 @@ mod tests {
             }
         )));
         assert!(messages(&events).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_token_on_history_unlinks_the_account() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().unauthorized = true;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::HistoryLoaded { .. })
+        })
+        .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Unlinked,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Notice { text, .. } if text.contains("Replace discord.bot_token")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::CommandFailed { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_send_drops_the_session() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().unauthorized = true;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "too late".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Notice { .. })
+        })
+        .await;
+        let err = adapter.handle(
+            AdapterCommand::OpenChat {
+                protocol: ProtocolId::Discord,
+                conversation_id: id,
+            },
+            &tx,
+        );
+        assert!(matches!(
+            err,
+            Err(AdapterError::Unavailable { reason, .. }) if reason == NOT_CONNECTED_REASON
+        ));
     }
 
     #[tokio::test]

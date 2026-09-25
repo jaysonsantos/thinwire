@@ -53,6 +53,8 @@ struct Shared {
     bodies: HashMap<String, String>,
     /// Latest `reload` in this session. An older list must not publish.
     reload_ticket: u64,
+    /// A 401 revoked the token. The adapter drops this session on the next command.
+    revoked: bool,
     /// Send tasks still running. Shutdown waits until this is zero.
     send_tasks: u64,
     send_idle: Arc<Notify>,
@@ -106,6 +108,11 @@ impl Session {
             .unwrap_or_default()
     }
 
+    /// True after a 401. The adapter drops the session on the next command.
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.shared.lock().is_ok_and(|state| state.revoked)
+    }
+
     /// Starts a new generation and loads the channel list.
     ///
     /// `carried` is the previous list. An empty map is a first connect.
@@ -127,6 +134,7 @@ impl Session {
                 history,
                 bodies,
                 reload_ticket: 0,
+                revoked: false,
                 send_tasks: 0,
                 send_idle: Arc::new(Notify::new()),
             })),
@@ -178,7 +186,7 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
-                    if error == DiscordApiError::Unauthorized {
+                    if note_unauthorized(&shared, error) {
                         emit_account(&events, ProtocolId::Discord, AccountState::Unlinked);
                     } else {
                         emit_command_failed(
@@ -267,12 +275,17 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord history failed");
-                    emit_command_failed(
-                        &events,
-                        ProtocolId::Discord,
-                        Some(conversation_id.clone()),
-                        format!("History did not load: {error}."),
-                    );
+                    if note_unauthorized(&shared, error) {
+                        emit_account(&events, ProtocolId::Discord, AccountState::Unlinked);
+                        emit_notice(&events, ProtocolId::Discord, error.reason());
+                    } else {
+                        emit_command_failed(
+                            &events,
+                            ProtocolId::Discord,
+                            Some(conversation_id.clone()),
+                            format!("History did not load: {error}."),
+                        );
+                    }
                     emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                 }
             }
@@ -373,6 +386,7 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord send failed");
+                    note_unauthorized(&shared, error);
                     fail_send(&events, &conversation_id, &pending_id, request, error);
                 }
             }
@@ -451,6 +465,7 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord resend failed");
+                    note_unauthorized(&shared, error);
                     fail_send(&events, &conversation_id, &message_id, request, error);
                 }
             }
@@ -537,6 +552,17 @@ fn publish_channels(
     for channel in channels {
         emit_conversation(events, channel.conversation());
     }
+}
+
+/// A 401 means the token is dead. Remember it so the adapter drops this session.
+fn note_unauthorized(shared: &Arc<Mutex<Shared>>, error: DiscordApiError) -> bool {
+    if error != DiscordApiError::Unauthorized {
+        return false;
+    }
+    if let Ok(mut state) = shared.lock() {
+        state.revoked = true;
+    }
+    true
 }
 
 /// A send or retry failed. A revoked token unlinks the account. Other
