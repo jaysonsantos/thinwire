@@ -751,8 +751,38 @@ fn linux_fallback(error: &keyring_core::Error) -> LinuxFallback {
     };
     match inner.downcast_ref::<secret_service::Error>() {
         Some(secret_service::Error::Unavailable) => LinuxFallback::UseKeyutils,
+        Some(secret_service::Error::Zbus(zbus)) if no_bus_at_connect(zbus) => {
+            LinuxFallback::UseKeyutils
+        }
         _ => LinuxFallback::ReadFailed,
     }
+}
+
+/// zbus 5.19 reports a failed connect as `Connection(io::Error, Address)`.
+/// `secret-service` 5.2 maps only the older `InputOutput(NotFound)` to
+/// `Unavailable`, so a missing bus socket reaches us as `Zbus(..)` (#45).
+/// Only a socket that is not there, or that refuses the connection, counts.
+/// Other failures (a lock, a prompt, a timeout, a broken pipe on a live
+/// session) stay `ReadFailed`.
+#[cfg(target_os = "linux")]
+fn no_bus_at_connect(error: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind;
+    let mut next = error.source();
+    while let Some(source) = next {
+        let io = source.downcast_ref::<std::io::Error>().or_else(|| {
+            source
+                .downcast_ref::<std::sync::Arc<std::io::Error>>()
+                .map(AsRef::as_ref)
+        });
+        if let Some(io) = io {
+            return matches!(
+                io.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused
+            );
+        }
+        next = source.source();
+    }
+    false
 }
 
 fn probe_os() -> Result<OsBackend, AttachError> {
@@ -1157,6 +1187,59 @@ mod tests {
         assert!(
             read_failed < keyutils,
             "a failing Secret Service never reaches keyutils"
+        );
+    }
+
+    /// Set in the child process of
+    /// `a_missing_dbus_session_falls_back_to_keyutils`.
+    #[cfg(target_os = "linux")]
+    const NO_BUS_CHILD_ENV: &str = "THINWIRE_TEST_NO_BUS_CHILD";
+
+    /// With no D-Bus session, the real keyring store must reach
+    /// `linux_fallback` as "not present", so keyutils is used (#45). The
+    /// keyring wrapper keeps the inner `secret_service::Error` for the
+    /// downcast. zbus 5.19 reports the missing socket as `Zbus(Connection)`,
+    /// not as `Unavailable`; `no_bus_at_connect` covers that.
+    /// The check runs in a child process: the bad bus address is set only
+    /// there, and no other test thread sees it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_missing_dbus_session_falls_back_to_keyutils() {
+        const NAME: &str = "secrets::tests::a_missing_dbus_session_falls_back_to_keyutils";
+        if std::env::var_os(NO_BUS_CHILD_ENV).is_some() {
+            let error = try_linux_store(OsBackend::SecretService)
+                .expect_err("no D-Bus session: Secret Service cannot open");
+            keyring_core::unset_default_store();
+            assert!(
+                matches!(&error, keyring_core::Error::PlatformFailure(_)),
+                "{error:?}"
+            );
+            assert_eq!(
+                linux_fallback(&error),
+                LinuxFallback::UseKeyutils,
+                "no bus means no Secret Service: {error:?}"
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env(NO_BUS_CHILD_ENV, "1")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent/thinwire-test/bus",
+            )
+            .env_remove(KEYRING_ENV)
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran the check: {stdout}"
         );
     }
 
