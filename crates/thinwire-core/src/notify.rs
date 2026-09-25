@@ -177,7 +177,11 @@ impl Notifications {
         if self.closing {
             return Err(SkipReason::Disabled);
         }
-        decide(message, chat, ctx)?;
+        if let Err(reason) = decide(message, chat, ctx) {
+            // For a live test: which rule skipped it. No chat id and no text.
+            tracing::debug!(reason = ?reason, protocol = ?message.protocol, "no notification");
+            return Err(reason);
+        }
         let Some(chat) = chat else {
             return Err(SkipReason::UnknownChat);
         };
@@ -202,6 +206,7 @@ impl Notifications {
         self.queue
             .retain(|command| !matches!(command, NotifyCommand::Show(shown) if shown.key == key));
         self.push(NotifyCommand::Show(notification));
+        tracing::info!(protocol = ?message.protocol, "notification queued");
         Ok(())
     }
 

@@ -68,6 +68,13 @@ impl Notifier {
                         NotifyCommand::Show(notification) => backend.show(notification),
                         NotifyCommand::Dismiss(key) => backend.dismiss(key),
                     };
+                    if result.is_ok() {
+                        let kind = match &command {
+                            NotifyCommand::Show(_) => "show",
+                            NotifyCommand::Dismiss(_) => "dismiss",
+                        };
+                        tracing::debug!(kind, "desktop notification sent to the OS");
+                    }
                     if let Err(BackendError(kind)) = result {
                         tracing::warn!(kind, "desktop notifications are off for this run");
                         on = false;
