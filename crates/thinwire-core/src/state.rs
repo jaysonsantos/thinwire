@@ -795,7 +795,13 @@ impl Snapshot {
                 protocol,
                 conversation_id,
             } => {
-                self.history_loading.remove(&(protocol, conversation_id));
+                let key = (protocol, conversation_id);
+                // The history came during a reconnect: Linked need not load
+                // the chat again (Codex on #111).
+                if self.open_on_link.as_ref() == Some(&key) {
+                    self.open_on_link = None;
+                }
+                self.history_loading.remove(&key);
             }
             AdapterEvent::ConversationRemoved { protocol, id } => {
                 self.remove_conversation(protocol, &id);
@@ -7077,6 +7083,28 @@ mod tests {
             open_chats(&mut snapshot),
             vec![(ProtocolId::Slack, "slack:C1".to_owned())]
         );
+    }
+
+    /// Codex on #111: history that comes during the reconnect clears the
+    /// reopen mark, so Linked does not load the chat again.
+    #[test]
+    fn history_during_the_reconnect_clears_the_reopen() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        assert_eq!(open_chats(&mut snapshot).len(), 1, "sent, no answer yet");
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+        });
+        link(&mut snapshot, ProtocolId::Slack);
+        assert!(open_chats(&mut snapshot).is_empty(), "no reload");
     }
 
     /// qa Low on #111: a queued open of a chat that is no longer selected is
