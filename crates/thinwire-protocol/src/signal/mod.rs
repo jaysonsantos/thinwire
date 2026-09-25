@@ -67,7 +67,7 @@ pub struct SignalAdapter {
     notice_accepted: bool,
     engine: Engine,
     #[cfg(feature = "signal-local")]
-    worker: Option<std::thread::JoinHandle<()>>,
+    worker: Option<SignalWorker>,
 }
 
 impl SignalAdapter {
@@ -167,7 +167,7 @@ impl SignalAdapter {
     }
 
     #[cfg(feature = "signal-local")]
-    fn spawn_worker(&self, events: &EventTx) -> Option<std::thread::JoinHandle<()>> {
+    fn spawn_worker(&self, events: &EventTx) -> Option<SignalWorker> {
         let Engine::Live(session) = &self.engine else {
             return None;
         };
@@ -177,7 +177,8 @@ impl SignalAdapter {
         let task_events = events.clone();
         // Presage's store is not `Send`. It runs on its own current-thread
         // runtime, off the UI thread.
-        std::thread::Builder::new()
+        let (abort_tx, abort_rx) = std::sync::mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
             .name("thinwire-signal".into())
             .spawn(move || {
                 let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -192,9 +193,18 @@ impl SignalAdapter {
                     );
                     return;
                 };
-                runtime.block_on(live::run(session, token, task_events));
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&runtime, async move {
+                    let task = tokio::task::spawn_local(live::run(session, token, task_events));
+                    let _ = abort_tx.send(task.abort_handle());
+                    let _ = task.await;
+                });
             })
-            .ok()
+            .ok()?;
+        let abort = abort_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .ok()?;
+        Some(SignalWorker { thread, abort })
     }
 
     fn cancel_link(&mut self, events: &EventTx) -> Result<(), AdapterError> {
@@ -323,25 +333,31 @@ impl SignalAdapter {
     }
 }
 
-/// `true` when the thread ended inside the limit. `None` means no thread.
-#[cfg(feature = "signal-local")]
-async fn join_worker(
-    worker: Option<std::thread::JoinHandle<()>>,
-    limit: std::time::Duration,
-) -> Option<bool> {
-    let handle = worker?;
+struct SignalWorker {
+    thread: std::thread::JoinHandle<()>,
+    abort: tokio::task::AbortHandle,
+}
+
+/// Join the worker. If it misses `limit`, abort its task and wait until the
+/// thread has ended. `Stopped` comes only after this returns.
+async fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
+    let SignalWorker { thread, abort } = worker;
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let _ = handle.join();
+        let _ = thread.join();
         let _ = tx.send(());
     });
-    Some(tokio::time::timeout(limit, rx).await.is_ok())
+    tokio::pin!(rx);
+    if tokio::time::timeout(limit, &mut rx).await.is_err() {
+        abort.abort();
+        let _ = rx.await;
+    }
 }
 
 #[cfg(all(test, feature = "signal-local"))]
 impl SignalAdapter {
-    fn install_worker_for_test(&mut self, handle: std::thread::JoinHandle<()>) {
-        self.worker = Some(handle);
+    fn install_worker_for_test(&mut self, worker: SignalWorker) {
+        self.worker = Some(worker);
     }
 }
 
@@ -382,7 +398,9 @@ impl ProtocolAdapter for SignalAdapter {
                 let events = events.clone();
                 tokio::spawn(async move {
                     session.shutdown().await;
-                    let _joined = join_worker(worker, SHUTDOWN_LIMIT).await;
+                    if let Some(worker) = worker {
+                        finish_worker(worker, SHUTDOWN_LIMIT).await;
+                    }
                     emit_stopped(&events, ProtocolId::Signal);
                 });
             } else {
@@ -696,7 +714,7 @@ mod tests {
         assert!(src.contains("from_secs(4)"));
         let body = &src[src.find("fn shutdown(&mut self").expect("shutdown")..];
         let body = &body[..body.find("fn handle(").expect("handle")];
-        let join = body.find("join_worker").expect("join");
+        let join = body.find("finish_worker").expect("join");
         let stopped = body.find("emit_stopped").expect("Stopped");
         assert!(join < stopped, "Stopped only after the worker join");
     }
@@ -709,7 +727,11 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let _ = release_rx.recv();
         });
-        adapter.install_worker_for_test(handle);
+        let abort = tokio::spawn(async {}).abort_handle();
+        adapter.install_worker_for_test(SignalWorker {
+            thread: handle,
+            abort,
+        });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         adapter.shutdown(&tx);
         assert!(
@@ -729,5 +751,37 @@ mod tests {
                 protocol: ProtocolId::Signal
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::time::{Duration, Instant};
+
+    use super::SignalWorker;
+    use super::finish_worker;
+
+    #[tokio::test]
+    async fn missed_deadline_aborts_the_task_then_the_thread_ends() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&runtime, async move {
+                let task = tokio::task::spawn_local(std::future::pending::<()>());
+                ready_tx.send(task.abort_handle()).expect("abort handle");
+                let _ = task.await;
+            });
+        });
+        let abort = ready_rx.recv().expect("worker started");
+        let started = Instant::now();
+        finish_worker(SignalWorker { thread, abort }, Duration::from_millis(30)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "abort must end the worker; Stopped waits for that"
+        );
     }
 }
