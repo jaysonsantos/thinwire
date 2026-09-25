@@ -14,8 +14,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use super::credentials::{TelegramApiSource, parse_resolved_api_id, require_resolved_api};
 use super::data_dir;
 use super::inbox::{
-    self, ChatDirectory, ChatEffect, ChatSeed, InboxMessage, MessageParty, NameBook, OlderHistory,
-    OlderStep, PageOutcome,
+    self, ChatDirectory, ChatEffect, ChatMute, ChatSeed, InboxMessage, MessageParty, MuteScope,
+    NameBook, OlderHistory, OlderStep, PageOutcome,
 };
 use super::lifecycle::{
     CloseKind, ClosingFlag, DoneFlag, LateReady, LoginEvents, WorkerSlots, all_done, close_kind,
@@ -23,11 +23,12 @@ use super::lifecycle::{
 };
 use super::router::{self, Router};
 use crate::adapter::{
-    AdapterStatus, Delivery, EventTx, LoginEpoch, ProtocolId, TelegramAuthError, TelegramAuthPhase,
-    TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
-    emit_conversation_removed, emit_history_loaded, emit_message, emit_message_body,
-    emit_message_delivery, emit_message_replaced, emit_messages_removed, emit_older_history_loaded,
-    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped, emit_telegram_session_ended,
+    AdapterStatus, Arrival, ChatMessage, Delivery, EventTx, LoginEpoch, ProtocolId,
+    TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded,
+    emit_conversation, emit_conversation_removed, emit_history_loaded, emit_message,
+    emit_message_body, emit_message_delivery, emit_message_replaced, emit_messages_removed,
+    emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
+    emit_telegram_session_ended,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -845,6 +846,24 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
                 );
             }
         }
+        tdlib_rs::enums::Update::ChatNotificationSettings(update) => {
+            publish(
+                events,
+                emit,
+                &mut live.older,
+                live.directory
+                    .set_mute(update.chat_id, chat_mute(&update.notification_settings)),
+            );
+        }
+        tdlib_rs::enums::Update::ScopeNotificationSettings(update) => {
+            let muted = update.notification_settings.mute_for > 0;
+            for effect in live
+                .directory
+                .set_scope_mute(mute_scope(&update.scope), muted)
+            {
+                publish(events, emit, &mut live.older, Some(effect));
+            }
+        }
         tdlib_rs::enums::Update::ChatReadInbox(update) => {
             publish(
                 events,
@@ -890,7 +909,7 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
             let chat_id = update.message.chat_id;
             let at = i64::from(update.message.date);
             if emit {
-                emit_mapped_message(events, &update.message, live, None);
+                emit_mapped_message_as(events, &update.message, live, None, Arrival::Live);
             }
             publish(
                 events,
@@ -999,6 +1018,14 @@ fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Opt
         tdlib_rs::enums::ChatType::Supergroup(group) => !group.is_channel,
         tdlib_rs::enums::ChatType::Private(_) | tdlib_rs::enums::ChatType::Secret(_) => false,
     };
+    let scope = match &chat.r#type {
+        tdlib_rs::enums::ChatType::Private(_) | tdlib_rs::enums::ChatType::Secret(_) => {
+            MuteScope::Private
+        }
+        tdlib_rs::enums::ChatType::BasicGroup(_) => MuteScope::Group,
+        tdlib_rs::enums::ChatType::Supergroup(group) if group.is_channel => MuteScope::Channel,
+        tdlib_rs::enums::ChatType::Supergroup(_) => MuteScope::Group,
+    };
     directory.upsert(
         chat.id,
         ChatSeed {
@@ -1009,8 +1036,25 @@ fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Opt
             participant: &chat.title,
             last_at,
             is_group,
+            scope,
+            mute: chat_mute(&chat.notification_settings),
         },
     )
+}
+
+fn chat_mute(settings: &tdlib_rs::types::ChatNotificationSettings) -> ChatMute {
+    ChatMute {
+        use_default: settings.use_default_mute_for,
+        mute_for: settings.mute_for,
+    }
+}
+
+fn mute_scope(scope: &tdlib_rs::enums::NotificationSettingsScope) -> MuteScope {
+    match scope {
+        tdlib_rs::enums::NotificationSettingsScope::PrivateChats => MuteScope::Private,
+        tdlib_rs::enums::NotificationSettingsScope::GroupChats => MuteScope::Group,
+        tdlib_rs::enums::NotificationSettingsScope::ChannelChats => MuteScope::Channel,
+    }
 }
 
 fn main_order(positions: &[tdlib_rs::types::ChatPosition]) -> Option<i64> {
@@ -1025,6 +1069,18 @@ fn emit_mapped_message(
     message: &tdlib_rs::types::Message,
     live: &LiveInbox,
     replace_old: Option<String>,
+) {
+    emit_mapped_message_as(events, message, live, replace_old, Arrival::History);
+}
+
+/// `arrival` is `Live` only for `updateNewMessage`: a history page, a last
+/// message refresh, and a send result never notify (#32).
+fn emit_mapped_message_as(
+    events: &EventTx,
+    message: &tdlib_rs::types::Message,
+    live: &LiveInbox,
+    replace_old: Option<String>,
+    arrival: Arrival,
 ) {
     let party = match &message.sender_id {
         tdlib_rs::enums::MessageSender::User(user) => MessageParty::User(user.user_id),
@@ -1047,6 +1103,7 @@ fn emit_mapped_message(
         &live.names,
         live.directory.title(message.chat_id),
     );
+    let mapped = ChatMessage { arrival, ..mapped };
     if let Some(old_id) = replace_old.filter(|old_id| *old_id != mapped.id) {
         emit_message_replaced(events, old_id, mapped);
         return;
