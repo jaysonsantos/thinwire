@@ -1798,6 +1798,12 @@ impl Snapshot {
         self.expire_sends_at(Instant::now())
     }
 
+    /// Forget timed-out sends older than `EXPIRED_KEEP` (#90 item 3). Call it
+    /// after the queued events are applied.
+    pub(crate) fn prune_late_answers(&mut self) {
+        self.sends.prune_expired(Instant::now());
+    }
+
     /// When the next send or retry expires, if one is in flight.
     pub(crate) fn next_send_deadline(&self) -> Option<Instant> {
         self.sends.next_deadline()
