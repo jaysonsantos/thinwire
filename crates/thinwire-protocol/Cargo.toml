@@ -36,7 +36,7 @@ tdlib-rs = { version = "1.4", optional = true, default-features = false, feature
   "static",
 ] }
 slack-morphism = { version = "2.29", optional = true, default-features = false }
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9eb43b9bc2bc561cc34a672b4295528bf4c2d733", optional = true, default-features = false, features = [
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f7468ae2920a2b0aedbd0848cf121de56a07f93c", optional = true, default-features = false, features = [
   "sqlite-storage-bundled",
   "tokio-transport",
   "tokio-runtime",
