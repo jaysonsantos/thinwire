@@ -296,6 +296,16 @@ pub enum WhatsAppScreen {
     Pair,
 }
 
+/// A send or retry that expired and shows in the timeout error (#69). A late
+/// accept removes only its own entry (PR #81 review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TimedOut {
+    protocol: ProtocolId,
+    chat: String,
+    request: u64,
+    retry: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserError {
     pub happened: String,
@@ -375,6 +385,11 @@ pub struct Snapshot {
     notices: HashMap<ProtocolId, String>,
     /// The chat the adapters were last told the user looks at (`ViewChat`).
     viewed: Option<(ProtocolId, String)>,
+    /// The expired sends that the timeout error lists, and the error as the
+    /// core last set it. When `error` is no longer that value (the user
+    /// closed it, or another error came), the list starts again.
+    timed_out: Vec<TimedOut>,
+    timeout_error: Option<UserError>,
     /// Protocols with a session: they reached `Linked` and did not end. A
     /// `Linking` after `Linked` is a reconnect; the session stays (ADR 0010).
     sessions: HashSet<ProtocolId>,
@@ -518,6 +533,8 @@ impl Snapshot {
             older_retry: HashMap::new(),
             notices: HashMap::new(),
             viewed: None,
+            timed_out: Vec::new(),
+            timeout_error: None,
             sessions: HashSet::new(),
             #[cfg(test)]
             visible_for_test: HashSet::new(),
@@ -1052,9 +1069,9 @@ impl Snapshot {
             return;
         }
         // One send or retry per chat. Only this retry's own answer ends it.
-        let Some(request) = self
-            .sends
-            .begin_retry(protocol, &conversation_id, message_id)
+        let Some(request) =
+            self.sends
+                .begin_retry(protocol, &conversation_id, message_id, Instant::now())
         else {
             return;
         };
@@ -1498,10 +1515,101 @@ impl Snapshot {
     /// does the compose text (or the chat's draft) clear. A history message
     /// with the same text is not an acceptance (Codex 4091552898).
     fn note_send_accepted(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
-        // An accepted retry needs nothing more: its delivery events move the row.
-        let Some(Pending::Send { body, .. }) = self.sends.settle(protocol, chat, request) else {
+        match self.sends.settle(protocol, chat, request) {
+            // An accepted retry needs nothing more: its delivery events move the row.
+            Some(Pending::Send { body, .. }) => self.clear_sent_text(protocol, chat, &body),
+            Some(Pending::Retry { .. }) => {}
+            None => self.note_late_accept(protocol, chat, request),
+        }
+    }
+
+    /// A `SendAccepted` after the send expired (PR #81 review). The message
+    /// went out, so the user must not send it again: clear the compose text
+    /// only if it still holds exactly that text, mark a retried row sent, and
+    /// drop the "did not answer in time" error.
+    fn note_late_accept(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
+        let Some(pending) = self.sends.settle_expired(protocol, chat, request) else {
             return;
         };
+        match pending {
+            Pending::Send { body, .. } => self.clear_sent_text(protocol, chat, &body),
+            Pending::Retry { message_id, .. } => {
+                self.set_delivery(protocol, chat, &message_id, Delivery::Sent);
+                // A new retry of the same row must not fail it again.
+                self.sends.drop_retry_of(protocol, chat, &message_id);
+            }
+        }
+        // Only this send's part of the timeout error goes.
+        let shown = self.error.is_some() && self.error == self.timeout_error;
+        self.timed_out.retain(|entry| {
+            !(entry.protocol == protocol && entry.chat == chat && entry.request == request)
+        });
+        if shown {
+            self.show_timeouts();
+        }
+    }
+
+    /// Set the timeout error from `timed_out`: one line per expired send, or
+    /// no error when the list is empty.
+    fn show_timeouts(&mut self) {
+        let error = match self.timed_out.as_slice() {
+            [] => None,
+            [one] => Some(UserError {
+                happened: "Message not sent.".into(),
+                why: format!("{} did not answer in time.", one.protocol.display_name()),
+                next: self.resend_hint(one.protocol, &one.chat, one.retry),
+            }),
+            many => {
+                let chats: Vec<String> = many
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{} ({})",
+                            self.chat_title(entry.protocol, &entry.chat),
+                            entry.protocol.display_name()
+                        )
+                    })
+                    .collect();
+                Some(UserError {
+                    happened: format!("{} messages not sent.", many.len()),
+                    why: format!("No answer in time for {}.", chats.join(", ")),
+                    next: "Each text is still in its chat. Send it again, or press Retry.".into(),
+                })
+            }
+        };
+        self.error.clone_from(&error);
+        self.timeout_error = error;
+    }
+
+    /// Where the unsent text is, and what to do (qa on #81): the compose
+    /// field of the chat that shows, or the draft of another chat.
+    fn resend_hint(&self, protocol: ProtocolId, chat: &str, retry: bool) -> String {
+        let selected = self.is_selected_chat(protocol, chat);
+        match (retry, selected) {
+            (false, true) => "The text is still in the compose field. Send it again.".into(),
+            (false, false) => format!(
+                "The text is in the draft of {}. Send it again.",
+                self.chat_title(protocol, chat)
+            ),
+            (true, true) => "Press Retry to send it again.".into(),
+            (true, false) => format!(
+                "Open {} and press Retry to send it again.",
+                self.chat_title(protocol, chat)
+            ),
+        }
+    }
+
+    /// The title of a chat, or its id when the row is gone.
+    fn chat_title(&self, protocol: ProtocolId, chat: &str) -> String {
+        self.conversations
+            .get(&protocol)
+            .and_then(|rows| rows.iter().find(|row| row.id == chat))
+            .map_or_else(|| chat.to_owned(), |row| row.title.clone())
+    }
+
+    /// The text of an accepted send left the compose field or its draft, if
+    /// it is still exactly that text.
+    fn clear_sent_text(&mut self, protocol: ProtocolId, chat: &str, body: &str) {
         let selected = self.is_selected_chat(protocol, chat);
         if selected && self.compose.trim() == body {
             self.compose.clear();
@@ -1514,20 +1622,74 @@ impl Snapshot {
         }
     }
 
+    /// Expire sends and retries with no answer after `SEND_TIMEOUT` (#69).
+    /// The core calls it on every pump.
+    /// Returns true when an entry expired, so the state changed.
+    pub(crate) fn expire_sends(&mut self) -> bool {
+        self.expire_sends_at(Instant::now())
+    }
+
+    /// When the next send or retry expires, if one is in flight.
+    pub(crate) fn next_send_deadline(&self) -> Option<Instant> {
+        self.sends.next_deadline()
+    }
+
+    /// Test hook: age every tracked send by `by`.
+    #[cfg(test)]
+    pub(crate) fn age_sends_for_test(&mut self, by: Duration) {
+        self.sends.age_for_test(by);
+    }
+
+    /// `expire_sends` with the clock as a parameter, for tests. An expired
+    /// send keeps its text; an expired retry sets its row back to `Failed`.
+    fn expire_sends_at(&mut self, now: Instant) -> bool {
+        let expired = self.sends.expire(now);
+        if expired.is_empty() {
+            return false;
+        }
+        if self.error != self.timeout_error {
+            self.timed_out.clear();
+        }
+        for (protocol, chat, pending) in expired {
+            let retry = match &pending {
+                Pending::Send { .. } => false,
+                Pending::Retry { message_id, .. } => {
+                    self.set_delivery(protocol, &chat, message_id, Delivery::Failed);
+                    true
+                }
+            };
+            self.timed_out.push(TimedOut {
+                protocol,
+                chat,
+                request: pending.request(),
+                retry,
+            });
+        }
+        // Every expired send shows, not only the last one (qa on #81).
+        self.show_timeouts();
+        true
+    }
+
     /// The adapter rejected this send (chat and request id match): it was
     /// not accepted. The text is still in its compose field or draft. Other
     /// errors (for example a history load error) never fail a send.
     fn fail_unaccepted_send(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
         let why = format!("{} did not accept the message.", protocol.display_name());
-        match self.sends.settle(protocol, chat, request) {
-            Some(Pending::Send { .. }) => self.set_error(
-                "Message not sent.",
-                &why,
-                "The text is still in the compose field. Send it again.",
-            ),
+        let settled = self.sends.settle(protocol, chat, request);
+        if settled.is_none() {
+            // A late rejection after the send expired changes nothing: the
+            // expiry already failed it (PR #81 review).
+            let _ = self.sends.settle_expired(protocol, chat, request);
+        }
+        match settled {
+            Some(Pending::Send { .. }) => {
+                let next = self.resend_hint(protocol, chat, false);
+                self.set_error("Message not sent.", &why, &next);
+            }
             Some(Pending::Retry { message_id, .. }) => {
                 self.set_delivery(protocol, chat, &message_id, Delivery::Failed);
-                self.set_error("Message not sent.", &why, "Press Retry to send it again.");
+                let next = self.resend_hint(protocol, chat, true);
+                self.set_error("Message not sent.", &why, &next);
             }
             None => {}
         }
@@ -1589,7 +1751,10 @@ impl Snapshot {
         let body = self.compose.trim().to_string();
         // Keep the text until the adapter accepts the send; see note_send_accepted.
         let protocol = self.selected_protocol;
-        let Some(request) = self.sends.begin_send(protocol, &conversation_id, &body) else {
+        let Some(request) =
+            self.sends
+                .begin_send(protocol, &conversation_id, &body, Instant::now())
+        else {
             return;
         };
         self.error = None;
@@ -6030,4 +6195,279 @@ mod tests {
     }
 
     // endregion: #70
+
+    // region: #69 unanswered sends
+
+    /// Sends "hello" in the selected chat and lets it expire. Returns the
+    /// request id.
+    fn expired_send(snapshot: &mut Snapshot) -> u64 {
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .sends
+            .request_of(ProtocolId::Telegram, "telegram:1")
+            .expect("send");
+        assert!(!snapshot.can_send());
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        request
+    }
+
+    fn late_answer(snapshot: &mut Snapshot, request: u64, accepted: bool) {
+        let conversation_id = "telegram:1".to_owned();
+        let protocol = ProtocolId::Telegram;
+        snapshot.apply(if accepted {
+            AdapterEvent::SendAccepted {
+                protocol,
+                conversation_id,
+                request,
+            }
+        } else {
+            AdapterEvent::SendRejected {
+                protocol,
+                conversation_id,
+                request,
+            }
+        });
+    }
+
+    /// #69: a send with no answer unlocks its chat after the timeout. The text
+    /// stays and the error shows.
+    #[test]
+    fn an_unanswered_send_unlocks_its_chat() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        expired_send(&mut snapshot);
+        assert!(snapshot.can_send(), "the chat is unlocked");
+        assert_eq!(snapshot.compose, "hello", "the text stays");
+        assert_eq!(
+            snapshot.error.as_ref().map(|error| error.why.as_str()),
+            Some("Telegram did not answer in time.")
+        );
+    }
+
+    /// PR #81 review: a late accept means the message went out. The
+    /// unchanged text leaves the compose field, so the user does not send it
+    /// twice, and the timeout error goes.
+    #[test]
+    fn a_late_accept_clears_the_unchanged_text() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = expired_send(&mut snapshot);
+        late_answer(&mut snapshot, request, true);
+        assert_eq!(snapshot.compose, "", "the sent text is cleared");
+        assert!(snapshot.error.is_none(), "the timeout error goes");
+    }
+
+    /// PR #81 review: after the expiry the user edits the text. A late
+    /// accept keeps the new text.
+    #[test]
+    fn a_late_accept_keeps_edited_text() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = expired_send(&mut snapshot);
+        snapshot.compose = "hello again".into();
+        late_answer(&mut snapshot, request, true);
+        assert_eq!(snapshot.compose, "hello again");
+    }
+
+    /// PR #81 review: a late accept for a chat the user left clears only its
+    /// unchanged draft.
+    #[test]
+    fn a_late_accept_clears_the_unchanged_draft_of_another_chat() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = expired_send(&mut snapshot);
+        let key = (ProtocolId::Telegram, "telegram:1".to_owned());
+        snapshot.select_conversation("telegram:2".into());
+        assert!(snapshot.drafts.contains_key(&key), "the text is a draft");
+        late_answer(&mut snapshot, request, true);
+        assert!(!snapshot.drafts.contains_key(&key));
+    }
+
+    /// PR #81 review: a late rejection after the expiry changes nothing.
+    #[test]
+    fn a_late_reject_changes_nothing() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = expired_send(&mut snapshot);
+        let error = snapshot.error.clone();
+        late_answer(&mut snapshot, request, false);
+        assert_eq!(snapshot.compose, "hello");
+        assert_eq!(snapshot.error, error);
+        assert!(snapshot.can_send());
+        // A later accept for the same request finds nothing either.
+        late_answer(&mut snapshot, request, true);
+        assert_eq!(snapshot.compose, "hello");
+    }
+
+    /// #69: an unanswered retry sets its row back to Failed.
+    #[test]
+    fn an_unanswered_retry_fails_its_row_again() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        retry_failed_row(&mut snapshot);
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+        assert!(snapshot.error.is_some());
+    }
+
+    /// PR #81 review: a late accept of an expired retry marks its row sent.
+    #[test]
+    fn a_late_retry_accept_marks_the_row_sent() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = retry_failed_row(&mut snapshot);
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+        late_answer(&mut snapshot, request, true);
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Sent);
+        assert!(snapshot.error.is_none());
+    }
+
+    fn answer_in(snapshot: &mut Snapshot, chat: &str, request: u64, accepted: bool) {
+        let conversation_id = chat.to_owned();
+        let protocol = ProtocolId::Telegram;
+        snapshot.apply(if accepted {
+            AdapterEvent::SendAccepted {
+                protocol,
+                conversation_id,
+                request,
+            }
+        } else {
+            AdapterEvent::SendRejected {
+                protocol,
+                conversation_id,
+                request,
+            }
+        });
+    }
+
+    /// Codex on #81: a late accept of a timed-out retry wins over a newer
+    /// retry of the same row. The newer retry's rejection cannot fail the
+    /// sent row again, and the chat unlocks.
+    #[test]
+    fn a_late_retry_accept_untracks_the_newer_retry() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let first = retry_failed_row(&mut snapshot);
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        let second = retry_failed_row_again(&mut snapshot);
+        assert_ne!(first, second);
+
+        answer_in(&mut snapshot, "telegram:1", first, true);
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Sent);
+        assert_eq!(
+            snapshot
+                .sends
+                .request_of(ProtocolId::Telegram, "telegram:1"),
+            None,
+            "the newer retry is no longer tracked"
+        );
+        answer_in(&mut snapshot, "telegram:1", second, false);
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Sent);
+        assert!(snapshot.error.is_none(), "no error for the old retry");
+    }
+
+    /// Retries the row that `retry_failed_row` made, after it failed again.
+    fn retry_failed_row_again(snapshot: &mut Snapshot) -> u64 {
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+        snapshot.error = None;
+        snapshot.retry_send("telegram:1:101");
+        snapshot
+            .take_commands()
+            .iter()
+            .find_map(|command| match command {
+                AdapterCommand::ResendMessage { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("a second ResendMessage")
+    }
+
+    /// Two sends in two chats, both expired in one pump. Returns the two
+    /// request ids: Ada's (telegram:1) and Bob's (telegram:2, selected).
+    fn two_expired_sends(snapshot: &mut Snapshot) -> (u64, u64) {
+        snapshot.compose = "to ada".into();
+        snapshot.send_compose();
+        let ada = snapshot
+            .sends
+            .request_of(ProtocolId::Telegram, "telegram:1")
+            .expect("send to Ada");
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.compose = "to bob".into();
+        snapshot.send_compose();
+        let bob = snapshot
+            .sends
+            .request_of(ProtocolId::Telegram, "telegram:2")
+            .expect("send to Bob");
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        (ada, bob)
+    }
+
+    /// qa L2 on #81: two expiries in one pump both show, by chat.
+    #[test]
+    fn two_expired_sends_both_show() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        two_expired_sends(&mut snapshot);
+        let error = snapshot.error.clone().expect("an error");
+        assert_eq!(error.happened, "2 messages not sent.");
+        assert!(error.why.contains("Ada (Telegram)"), "{error:?}");
+        assert!(error.why.contains("Bob (Telegram)"), "{error:?}");
+    }
+
+    /// Codex on #81: a late accept removes only its own send from the
+    /// timeout error. The other chat's send still shows.
+    #[test]
+    fn a_late_accept_clears_only_its_own_timeout() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let (ada, _bob) = two_expired_sends(&mut snapshot);
+        answer_in(&mut snapshot, "telegram:1", ada, true);
+        assert_eq!(
+            snapshot.error,
+            Some(UserError {
+                happened: "Message not sent.".into(),
+                why: "Telegram did not answer in time.".into(),
+                next: "The text is still in the compose field. Send it again.".into(),
+            }),
+            "Bob's send still shows"
+        );
+    }
+
+    /// Codex on #81: a late accept never clears an error that is not the
+    /// timeout error.
+    #[test]
+    fn a_late_accept_keeps_another_error() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = expired_send(&mut snapshot);
+        snapshot.set_error(
+            "Chat not loaded.",
+            "Telegram did not answer in time.",
+            "Try again.",
+        );
+        late_answer(&mut snapshot, request, true);
+        assert_eq!(
+            snapshot.error.as_ref().map(|error| error.happened.as_str()),
+            Some("Chat not loaded."),
+            "the same why text, but not the timeout error"
+        );
+    }
+
+    /// qa L1 on #81: when the user left the chat, the error names its draft.
+    #[test]
+    fn a_timeout_in_another_chat_names_its_draft() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert_eq!(
+            snapshot.error.as_ref().map(|error| error.next.as_str()),
+            Some("The text is in the draft of Ada. Send it again.")
+        );
+    }
+
+    // endregion: #69
 }
