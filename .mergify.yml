@@ -1,0 +1,28 @@
+# Mergify merge queue. Docs: https://docs.mergify.com/merge-queue/
+#
+# `main` has no branch protection, so this file names the merge
+# requirement itself: the `check` job in ci.yml. That job waits for
+# lint, test, and build.
+
+queue_rules:
+  - name: default
+    queue_conditions:
+      - check-success = check
+    merge_conditions:
+      - check-success = check
+    # Every pull request lands as one Conventional Commit with its number,
+    # as in the history of `main`. The review-fix commits on a branch do
+    # not reach `main`.
+    merge_method: squash
+    update_method: rebase
+    # Stack up to 20 pull requests on one temporary branch and run CI once
+    # for the whole batch.
+    batch_size: 20
+    batch_max_wait_time: 5 min
+    checks_timeout: 30 min
+
+merge_protections_settings:
+  # `main` requires 0 approvals, so an explicit label is the merge gate.
+  # Without it, any green pull request from any contributor merges itself.
+  auto_merge_conditions:
+    - label = ready-to-merge
