@@ -63,6 +63,11 @@ pub(crate) struct FakeDiscordApi {
     pub sends_at_hold: AtomicUsize,
     /// When set, a finished send waits after its result event is queued.
     pub send_result_pause: Option<Arc<SendResultPause>>,
+    /// While false, a one-message preview waits. `None` does not wait.
+    pub hold_preview: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub preview_calls: AtomicUsize,
+    pub preview_in_flight: AtomicUsize,
+    pub preview_max_in_flight: AtomicUsize,
 }
 
 fn channel(id: u64, name: &str, kind: ChannelKind, overwrites: Vec<Overwrite>) -> ChannelSummary {
@@ -155,6 +160,10 @@ impl FakeDiscordApi {
             hold_send: None,
             sends_at_hold: AtomicUsize::new(0),
             send_result_pause: None,
+            hold_preview: None,
+            preview_calls: AtomicUsize::new(0),
+            preview_in_flight: AtomicUsize::new(0),
+            preview_max_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -242,13 +251,21 @@ impl DiscordApi for FakeDiscordApi {
         Box::pin(async move {
             self.check_token()?;
             if limit == 1 {
+                self.preview_calls.fetch_add(1, Ordering::SeqCst);
+                let now = self.preview_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.preview_max_in_flight.fetch_max(now, Ordering::SeqCst);
+                if let Some(flag) = &self.hold_preview {
+                    while !flag.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                self.preview_in_flight.fetch_sub(1, Ordering::SeqCst);
                 let failed = self.state().preview_failures.remove(&channel_id);
                 if let Some(error) = failed {
                     return Err(error);
                 }
             }
-            // A one-message preview runs during the channel list. The hold is
-            // for an open chat (limit 50), so the list can finish first.
+            // The hold is for an open chat (limit 50). A preview is limit 1.
             if limit > 1
                 && let Some(hold) = &self.hold_history
             {

@@ -3,8 +3,10 @@
 //! Bot token only. Errors map to [`DiscordApiError`] and drop response bodies.
 
 use std::fmt;
+use std::time::Duration;
 
 use twilight_http::Client;
+use twilight_http::api_error::ApiError;
 use twilight_http::error::{Error, ErrorType};
 use twilight_model::channel::message::Message;
 use twilight_model::channel::permission_overwrite::PermissionOverwriteType;
@@ -13,7 +15,7 @@ use twilight_model::id::Id;
 
 use super::api::{
     ApiFuture, ChannelKind, ChannelSummary, DiscordApi, DiscordApiError, GuildSummary,
-    MessageSummary, Overwrite, OverwriteTarget,
+    MessageSummary, Overwrite, OverwriteTarget, RATE_LIMIT_FALLBACK,
 };
 
 pub(crate) struct TwilightApi {
@@ -70,16 +72,33 @@ fn id<T>(raw: u64) -> Result<Id<T>, DiscordApiError> {
 fn map_error(error: &Error) -> DiscordApiError {
     match error.kind() {
         ErrorType::Unauthorized => DiscordApiError::Unauthorized,
-        ErrorType::Response { status, .. } => match status.get() {
+        ErrorType::Response {
+            status,
+            error: api_error,
+            ..
+        } => match status.get() {
             401 => DiscordApiError::Unauthorized,
             403 => DiscordApiError::Forbidden,
             404 => DiscordApiError::NotFound,
-            429 => DiscordApiError::RateLimited,
+            429 => DiscordApiError::RateLimited {
+                retry_after: retry_after_of(api_error),
+            },
             _ => DiscordApiError::Rejected,
         },
         ErrorType::Validation | ErrorType::BuildingRequest => DiscordApiError::Rejected,
         _ => DiscordApiError::Transport,
     }
+}
+
+fn retry_after_of(error: &ApiError) -> Duration {
+    let ApiError::Ratelimited(body) = error else {
+        return RATE_LIMIT_FALLBACK;
+    };
+    let seconds = body.retry_after;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return RATE_LIMIT_FALLBACK;
+    }
+    Duration::try_from_secs_f64(seconds.min(30.0)).unwrap_or(RATE_LIMIT_FALLBACK)
 }
 
 fn channel_summary(channel: Channel) -> ChannelSummary {
