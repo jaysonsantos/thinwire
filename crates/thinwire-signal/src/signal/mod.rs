@@ -16,12 +16,14 @@ mod wake;
 
 #[cfg(feature = "signal-local")]
 mod live;
+#[cfg(feature = "signal-local")]
+mod owner;
 
 #[cfg(feature = "signal-local")]
 use std::sync::Arc;
 
-#[cfg(feature = "signal-local")]
-use thinwire_protocol::{AccountState, emit_account};
+#[cfg(all(test, feature = "signal-local"))]
+use thinwire_protocol::AccountState;
 use thinwire_protocol::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
     ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, emit_chat_list_loaded,
@@ -75,7 +77,7 @@ pub struct SignalAdapter {
     /// Chat the user is looking at. `ViewChat` sets it.
     viewed: Option<String>,
     #[cfg(feature = "signal-local")]
-    worker: Option<SignalWorker>,
+    link: Option<owner::Handle>,
 }
 
 impl SignalAdapter {
@@ -89,7 +91,7 @@ impl SignalAdapter {
             engine: Engine::Sync(Box::new(FeatureOff)),
             viewed: None,
             #[cfg(feature = "signal-local")]
-            worker: None,
+            link: None,
         }
     }
 
@@ -100,7 +102,7 @@ impl SignalAdapter {
             engine: Engine::Sync(Box::new(device)),
             viewed: None,
             #[cfg(feature = "signal-local")]
-            worker: None,
+            link: None,
         }
     }
 
@@ -120,6 +122,17 @@ impl SignalAdapter {
         Ok(())
     }
 
+    #[cfg(feature = "signal-local")]
+    fn owner_handle(&mut self) -> &owner::Handle {
+        let Engine::Live(session) = &self.engine else {
+            unreachable!("link owner is only for the live engine");
+        };
+        if self.link.is_none() {
+            self.link = Some(link_owner(session));
+        }
+        self.link.as_ref().expect("owner")
+    }
+
     fn begin_link(&mut self, events: &EventTx, generation: u64) -> Result<(), AdapterError> {
         if !self.notice_accepted {
             return Err(AdapterError::Refused {
@@ -129,16 +142,7 @@ impl SignalAdapter {
         }
         #[cfg(feature = "signal-local")]
         if matches!(self.engine, Engine::Live(_)) {
-            if let Engine::Live(session) = &self.engine {
-                session.set_pairing(generation);
-            }
-            self.worker = self.spawn_worker(events);
-            emit_status(
-                events,
-                ProtocolId::Signal,
-                AdapterStatus::Connecting,
-                "Signal linking was queued on the worker. This build is local only.",
-            );
+            self.owner_handle().begin(generation, events);
             return Ok(());
         }
         match &mut self.engine {
@@ -179,72 +183,11 @@ impl SignalAdapter {
         }
     }
 
-    #[cfg(feature = "signal-local")]
-    fn spawn_worker(&self, events: &EventTx) -> Option<SignalWorker> {
-        let Engine::Live(session) = &self.engine else {
-            return None;
-        };
-        let (token, wake) = session.begin_attempt();
-        session.mark_active();
-        let session = Arc::clone(session);
-        let task_events = events.clone();
-        // Presage's store is not `Send`. It runs on its own current-thread
-        // runtime, off the UI thread.
-        let (abort_tx, abort_rx) = std::sync::mpsc::sync_channel(1);
-        let thread = std::thread::Builder::new()
-            .name("thinwire-signal".into())
-            .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    emit_status(
-                        &task_events,
-                        ProtocolId::Signal,
-                        AdapterStatus::Error,
-                        "Signal worker runtime could not start. No session was opened.",
-                    );
-                    return;
-                };
-                let local = tokio::task::LocalSet::new();
-                local.block_on(&runtime, async move {
-                    let task =
-                        tokio::task::spawn_local(live::run(session, token, wake, task_events));
-                    let _ = abort_tx.send(task.abort_handle());
-                    let _ = task.await;
-                });
-            })
-            .ok()?;
-        let abort = abort_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .ok()?;
-        Some(SignalWorker { thread, abort })
-    }
-
     fn cancel_link(&mut self, events: &EventTx) -> Result<(), AdapterError> {
         self.notice_accepted = false;
         #[cfg(feature = "signal-local")]
-        if let Engine::Live(session) = &self.engine {
-            session.cancel_attempt();
-            let session = Arc::clone(session);
-            let worker = self.worker.take();
-            let events = events.clone();
-            tokio::spawn(async move {
-                if let Some(worker) = worker {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        finish_worker(worker, SHUTDOWN_LIMIT);
-                    })
-                    .await;
-                }
-                session.shutdown().await;
-                emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
-                emit_status(
-                    &events,
-                    ProtocolId::Signal,
-                    AdapterStatus::Stubbed,
-                    "Signal linking cancelled. No session is running.",
-                );
-            });
+        if matches!(self.engine, Engine::Live(_)) {
+            self.owner_handle().cancel(events);
             return Ok(());
         }
         emit_status(
@@ -479,16 +422,60 @@ impl SignalAdapter {
     }
 }
 
+#[cfg(feature = "signal-local")]
+fn link_owner(session: &Arc<live::Session>) -> owner::Handle {
+    let session = Arc::clone(session);
+    owner::Handle::spawn(Arc::clone(&session), Box::new(spawn_worker))
+}
+
+#[cfg(feature = "signal-local")]
+fn spawn_worker(session: &Arc<live::Session>, events: &EventTx) -> Option<SignalWorker> {
+    let (token, wake) = session.begin_attempt();
+    session.mark_active();
+    let session = Arc::clone(session);
+    let task_events = events.clone();
+    // Presage's store is not `Send`. It runs on its own current-thread
+    // runtime, off the UI thread.
+    let (abort_tx, abort_rx) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+        .name("thinwire-signal".into())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                emit_status(
+                    &task_events,
+                    ProtocolId::Signal,
+                    AdapterStatus::Error,
+                    "Signal worker runtime could not start. No session was opened.",
+                );
+                return;
+            };
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&runtime, async move {
+                let task = tokio::task::spawn_local(live::run(session, token, wake, task_events));
+                let _ = abort_tx.send(task.abort_handle());
+                let _ = task.await;
+            });
+        })
+        .ok()?;
+    let abort = abort_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .ok()?;
+    Some(SignalWorker { thread, abort })
+}
+
 #[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
-struct SignalWorker {
-    thread: std::thread::JoinHandle<()>,
-    abort: tokio::task::AbortHandle,
+pub(super) struct SignalWorker {
+    pub(super) thread: std::thread::JoinHandle<()>,
+    pub(super) abort: tokio::task::AbortHandle,
 }
 
 /// Join the worker inside `limit`. That bound is 4 seconds, under the 5 second
 /// close deadline. The caller runs this on `spawn_blocking`, not the host thread.
 #[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
-fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
+pub(super) fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
     let SignalWorker { thread, abort } = worker;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -508,7 +495,13 @@ fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
 #[cfg(all(test, feature = "signal-local"))]
 impl SignalAdapter {
     fn install_worker_for_test(&mut self, worker: SignalWorker) {
-        self.worker = Some(worker);
+        let Engine::Live(session) = &self.engine else {
+            return;
+        };
+        if self.link.is_none() {
+            self.link = Some(link_owner(session));
+        }
+        self.owner_handle().attach(worker);
     }
 }
 
@@ -542,22 +535,8 @@ impl ProtocolAdapter for SignalAdapter {
         self.notice_accepted = false;
         #[cfg(feature = "signal-local")]
         {
-            if let Engine::Live(session) = &self.engine {
-                session.cancel_attempt();
-                let session = Arc::clone(session);
-                let worker = self.worker.take();
-                let events = events.clone();
-                tokio::spawn(async move {
-                    session.shutdown().await;
-                    if let Some(worker) = worker {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            finish_worker(worker, SHUTDOWN_LIMIT);
-                        })
-                        .await;
-                    }
-                    emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
-                    emit_stopped(&events, ProtocolId::Signal);
-                });
+            if matches!(self.engine, Engine::Live(_)) {
+                self.owner_handle().shutdown(events);
             } else {
                 emit_stopped(events, ProtocolId::Signal);
             }
@@ -1004,16 +983,16 @@ mod tests {
                 protocol: ProtocolId::Signal
             }
         );
-        let src = include_str!("mod.rs");
-        assert!(src.contains("from_secs(4)"));
-        let body = &src[src.find("fn shutdown(&mut self").expect("shutdown")..];
-        let body = &body[..body.find("fn handle(").expect("handle")];
-        let join = body.find("finish_worker").expect("join");
-        let stopped = body.find("emit_stopped").expect("Stopped");
+        let src = include_str!("owner.rs");
+        assert!(include_str!("mod.rs").contains("from_secs(4)"));
+        let shutdown = &src[src.find("async fn shutdown").expect("shutdown")..];
+        let shutdown = &shutdown[..shutdown.find("async fn cleanup").expect("cleanup")];
+        let join = shutdown.find("cleanup()").expect("join");
+        let stopped = shutdown.find("emit_stopped").expect("Stopped");
         assert!(join < stopped, "Stopped only after the worker join");
-        let cancel = &src[src.find("fn cancel_link").expect("cancel")..];
-        let cancel = &cancel[..cancel.find("fn load_chats").expect("load")];
-        let release = cancel.find("finish_worker").expect("cancel joins");
+        let cancel = &src[src.find("async fn cancel").expect("cancel")..];
+        let cancel = &cancel[..cancel.find("async fn shutdown").expect("shutdown")];
+        let release = cancel.find("cleanup()").expect("cancel joins");
         let status = cancel
             .find("Signal linking cancelled")
             .expect("cancelled status");

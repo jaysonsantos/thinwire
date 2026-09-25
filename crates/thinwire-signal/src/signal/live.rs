@@ -139,6 +139,10 @@ impl Session {
         self.active.load(Ordering::SeqCst)
     }
 
+    pub(super) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     fn is_current(&self, token: u64) -> bool {
         self.generation.load(Ordering::SeqCst) == token
     }
@@ -177,7 +181,9 @@ pub(super) async fn run(
     events: EventTx,
 ) {
     run_linked(Arc::clone(&session), token, wake, events.clone()).await;
-    emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
+    if session.is_current(token) {
+        emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
+    }
 }
 
 async fn run_linked(
