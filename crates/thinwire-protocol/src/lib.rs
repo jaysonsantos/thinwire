@@ -162,8 +162,6 @@ mod tests {
     #[test]
     fn v1_does_not_depend_on_agpl_signal_client_or_presage() {
         let protocol = include_str!("../Cargo.toml");
-        let protocol_deps =
-            package_dependencies(include_str!("../../../Cargo.lock"), "thinwire-protocol");
         for name in [
             "presage",
             "libsignal",
@@ -173,10 +171,6 @@ mod tests {
             assert!(
                 !protocol.contains(name),
                 "thinwire-protocol must not name {name}"
-            );
-            assert!(
-                !protocol_deps.iter().any(|dep| dep.starts_with(name)),
-                "thinwire-protocol must not depend on {name}"
             );
         }
         let app = include_str!("../../thinwire/Cargo.toml");
@@ -199,27 +193,82 @@ mod tests {
                 "release builds must not name {name}"
             );
         }
+        for (label, args) in [
+            ("default features", &[][..]),
+            ("telegram-tdlib", &["--features", "telegram-tdlib"][..]),
+        ] {
+            let tree = release_cargo_tree(args);
+            let found = forbidden_crates_in_tree(&tree);
+            assert!(
+                found.is_empty(),
+                "release cargo tree ({label}) contains {found:?}"
+            );
+        }
     }
 
-    fn package_dependencies<'a>(lock: &'a str, package: &str) -> Vec<&'a str> {
-        let header = format!("name = \"{package}\"");
-        let Some(start) = lock.find(&header) else {
-            return Vec::new();
-        };
-        let rest = &lock[start..];
-        let Some(deps) = rest.split("dependencies = [").nth(1) else {
-            return Vec::new();
-        };
-        let block = deps.split("]").next().unwrap_or("");
-        block
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim().trim_matches(',');
-                trimmed
-                    .strip_prefix('"')
-                    .and_then(|value| value.split('"').next())
-            })
-            .collect()
+    #[test]
+    fn a_transitive_agpl_crate_is_visible_in_the_tree() {
+        let tree = "\
+thinwire v0.1.0
+thinwire-protocol v0.1.0
+whatsapp-rust v0.7.0
+wacore v0.7.0
+wacore-libsignal v0.1.0
+libsignalx v0.1.0
+";
+        let found = forbidden_crates_in_tree(tree);
+        assert_eq!(found, vec!["wacore-libsignal".to_string()]);
+    }
+
+    /// Package names from `cargo tree --prefix none`, including `├──` lines.
+    fn forbidden_crates_in_tree(tree: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for line in tree.lines() {
+            let Some(name) = package_name_on_tree_line(line) else {
+                continue;
+            };
+            if is_forbidden_agpl_crate(name) && !found.iter().any(|seen| seen == name) {
+                found.push(name.to_string());
+            }
+        }
+        found
+    }
+
+    fn package_name_on_tree_line(line: &str) -> Option<&str> {
+        let trimmed = line.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+        let name = trimmed.split_whitespace().next()?;
+        if name.is_empty() { None } else { Some(name) }
+    }
+
+    /// `libsignal-service` counts. `libsignalx` does not.
+    fn is_forbidden_agpl_crate(name: &str) -> bool {
+        for root in ["presage", "libsignal", "wacore-libsignal"] {
+            if name == root
+                || name
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('-'))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn release_cargo_tree(extra: &[&str]) -> String {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let output = std::process::Command::new(env!("CARGO"))
+            .current_dir(root)
+            .args(["tree", "-p", "thinwire", "--prefix", "none"])
+            .args(extra)
+            .env("CARGO_BUILD_JOBS", "4")
+            .output()
+            .expect("cargo tree");
+        assert!(
+            output.status.success(),
+            "cargo tree failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("cargo tree utf-8")
     }
 
     #[test]
