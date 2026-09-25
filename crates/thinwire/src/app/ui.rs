@@ -181,6 +181,8 @@ fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                     }
                     ui.separator();
                     theme_control(ui, snapshot.theme(), out);
+                    ui.separator();
+                    notification_control(ui, snapshot, out);
                 });
             });
         });
@@ -233,6 +235,22 @@ fn theme_control(ui: &mut egui::Ui, current: ThemeMode, out: &mut Vec<Intent>) {
     if chosen != current {
         out.push(Intent::SetTheme(chosen));
         super::theme_mode::apply(ui.ctx(), chosen);
+    }
+}
+
+/// Settings switches for desktop notifications (#32).
+fn notification_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    ui.label("Notifications");
+    let mut on = snapshot.notifications();
+    if ui.checkbox(&mut on, "Show notifications").changed() {
+        out.push(Intent::SetNotifications(on));
+    }
+    let mut hide = !snapshot.notification_preview();
+    if ui
+        .add_enabled(on, egui::Checkbox::new(&mut hide, "Hide message text"))
+        .changed()
+    {
+        out.push(Intent::SetNotificationPreview(!hide));
     }
 }
 
