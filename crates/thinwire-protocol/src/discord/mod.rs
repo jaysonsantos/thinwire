@@ -366,7 +366,6 @@ impl ProtocolAdapter for DiscordAdapter {
                 live.fetch_add(1, Ordering::SeqCst);
                 super::adapter::emit_stopped(&events, ProtocolId::Discord);
             });
-            return;
         }
         #[cfg(not(any(test, feature = "discord-bot")))]
         super::adapter::emit_stopped(events, ProtocolId::Discord);
