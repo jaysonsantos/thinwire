@@ -15,10 +15,10 @@ mod live;
 use std::sync::Arc;
 
 use super::adapter::{
-    AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage,
-    Conversation, Delivery, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    SupportClass, emit_chat_list_loaded, emit_conversation, emit_history_loaded, emit_message,
-    emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status,
+    AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_chat_list_loaded,
+    emit_history_loaded, emit_older_history_loaded, emit_send_accepted, emit_send_rejected,
+    emit_status,
 };
 
 #[cfg(not(feature = "whatsapp-web"))]
@@ -39,9 +39,6 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     // The session history pages from memory (LoadOlderMessages).
     pages_history: cfg!(feature = "whatsapp-web"),
 };
-
-/// Conversation id of the offline placeholder row. Not a real chat.
-pub(crate) const PLACEHOLDER_ID: &str = "whatsapp:placeholder";
 
 const STOP_TIMEOUT: &str =
     "The WhatsApp client did not stop in time. The app closes at its own limit.";
@@ -133,41 +130,14 @@ impl WhatsAppAdapter {
         CAPABILITIES
     }
 
-    fn seed_placeholders(&self, events: &EventTx) {
+    /// The status line only. No seed rows: the shell drops inbox events of
+    /// an account that is not linked (ADR 0010 rule 1).
+    fn seed_status(&self, events: &EventTx) {
         emit_status(
             events,
             ProtocolId::WhatsApp,
             AdapterStatus::Stubbed,
             CAPABILITIES.detail,
-        );
-        emit_conversation(
-            events,
-            Conversation {
-                protocol: ProtocolId::WhatsApp,
-                id: PLACEHOLDER_ID.into(),
-                title: "Placeholder chat".into(),
-                participant: "Placeholder contact".into(),
-                preview: "Experimental unofficial path — not connected.".into(),
-                unread: 1,
-                order: 0,
-                last_at: 0,
-                is_group: false,
-                writable: false,
-                placeholder: true,
-            },
-        );
-        emit_message(
-            events,
-            ChatMessage {
-                protocol: ProtocolId::WhatsApp,
-                conversation_id: PLACEHOLDER_ID.into(),
-                id: "whatsapp:placeholder:1".into(),
-                sender: "thinwire".into(),
-                body: "WhatsApp is experimental. Unofficial linked-device code can get a personal account banned. This is not a live session.".into(),
-                outbound: false,
-                delivery: Delivery::Sent,
-                sent_at: 0,
-            },
         );
     }
 
@@ -492,7 +462,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
 
     fn start(&mut self, events: EventTx) {
         tracing::info!("whatsapp adapter start (experimental; no network)");
-        self.seed_placeholders(&events);
+        self.seed_status(&events);
     }
 
     /// Stop pairing, close the linked-device bot and its SQLite session, then
@@ -591,6 +561,11 @@ impl ProtocolAdapter for WhatsAppAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::adapter::Delivery;
+
+    /// A WhatsApp-looking id with no JID. The adapter never lists it.
+    const PLACEHOLDER_ID: &str = "whatsapp:placeholder";
 
     #[tokio::test]
     async fn shutdown_closes_the_link_then_reports_stopped() {
@@ -837,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn fake_pair_flow_reaches_ready_and_drops_the_placeholder() {
+    fn fake_pair_flow_reaches_ready_with_no_early_inbox_event() {
         let (tx, mut rx) = unbounded_channel();
         let adapter = with_sender(Arc::new(FakeSender::default()));
         let session = &adapter.session;
@@ -868,10 +843,24 @@ mod tests {
             statuses(&events),
             vec![AdapterStatus::Connecting, AdapterStatus::Ready]
         );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AdapterEvent::ConversationRemoved { id, .. } if id == PLACEHOLDER_ID
-        )));
+        // ADR 0010 rule 1: no inbox event before Account Linked.
+        let linked = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Linked,
+                        ..
+                    }
+                )
+            })
+            .expect("Linked");
+        assert!(
+            !events[..linked]
+                .iter()
+                .any(|event| event.inbox_protocol().is_some())
+        );
         let debug = format!("{events:?}");
         assert!(!debug.contains("qr-secret"));
         assert!(!debug.contains("PAIR-1234"));
@@ -1598,6 +1587,7 @@ mod tests {
     fn stale_link_events_are_dropped_after_cancel_or_replace() {
         let (tx, mut rx) = unbounded_channel();
         let adapter = with_sender(Arc::new(FakeSender::default()));
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
         adapter.session.apply(history(), 1, &tx);
         assert!(!drain(&mut rx).is_empty());
 
@@ -2011,6 +2001,61 @@ mod tests {
                 assert!(statuses(&events).is_empty(), "no Status for a page");
             }
         }
+    }
+
+    /// ADR 0010 rule 1: history before `Connected` stays in the inbox and
+    /// goes out after Linked, with the chat page.
+    #[test]
+    fn history_before_connect_waits_for_linked() {
+        let (tx, mut rx) = unbounded_channel();
+        let adapter = with_sender(Arc::new(FakeSender::default()));
+        adapter.session.apply(history(), 1, &tx);
+        adapter.session.apply(
+            LinkEvent::Messages(vec![message(CHAT, "early", "early", 11)]),
+            1,
+            &tx,
+        );
+        assert!(drain(&mut rx).is_empty(), "no inbox event before Linked");
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        let events = drain(&mut rx);
+        assert!(matches!(
+            events.iter().find(|event| event.inbox_protocol().is_some()
+                || matches!(event, AdapterEvent::Account { .. })),
+            Some(AdapterEvent::Account {
+                state: AccountState::Linked,
+                ..
+            })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation } if conversation.preview == "early"
+        )));
+        // A cancel before Linked removes nothing the shell never saw.
+        let adapter = with_sender(Arc::new(FakeSender::default()));
+        adapter.session.apply(history(), 1, &tx);
+        assert!(adapter.session.reset().is_empty());
+    }
+
+    /// ADR 0010 contract kit (#109): the WhatsApp adapter with a fake
+    /// sender, linked through its session, passes every kit check.
+    #[tokio::test]
+    async fn contract_kit_passes() {
+        let adapter = with_sender(Arc::new(FakeSender::default()));
+        let session = adapter.session.clone();
+        // The test build compiles WhatsApp without `whatsapp-web`, so check
+        // against the capabilities of the feature build.
+        let mut kit = crate::contract::Contract::new(Box::new(adapter)).with_capabilities(
+            ProtocolCapabilities {
+                sends_text: true,
+                pages_history: true,
+                ..CAPABILITIES
+            },
+        );
+        let events = kit.events();
+        session.apply(history(), 1, &events);
+        session.apply(LinkEvent::Connected, 1, &events);
+        kit.linked().await;
+        kit.run_all().await;
     }
 
     #[test]

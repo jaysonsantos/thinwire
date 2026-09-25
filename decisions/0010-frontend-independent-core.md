@@ -60,7 +60,7 @@ The shell treats every protocol the same. Only the Telegram login and the first-
 
 `crates/thinwire-protocol/src/contract.rs` checks these rules in tests. A test links its adapter against its own offline fake and gives it to `Contract`. The kit sends commands through the host's `dispatch`, with the same routing and error handling as the app. `run_all` checks rules 1, 3, 4, 5, 7, and 9, and the `Shutdown` answer. `check_stream` checks rules 1, 3, 4, and 8 over every event. A failed check names its rule.
 
-- The fake adapter, the Discord bot inbox, and the Slack workspace inbox run the whole kit in default CI.
+- The fake adapter, the Discord bot inbox, the Slack workspace inbox, and the WhatsApp linked-device inbox (with a fake sender) run the whole kit in default CI.
 - Telegram has no offline TDLib fake. Only its default-build stub runs the kit (start, shutdown, and the event stream).
 - A new adapter adds one kit test next to its own tests.
 

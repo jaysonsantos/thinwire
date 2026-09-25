@@ -103,6 +103,10 @@ struct State {
     pairing: u64,
     /// Status text of the event that stopped the link. Cleared on a new link.
     stopped: Option<&'static str>,
+    /// This link sent `Account { Linked }`. Until then the shell drops inbox
+    /// events (ADR 0010 rule 1), so the session keeps them in the inbox and
+    /// sends the chat page on `Connected`.
+    announced: bool,
 }
 
 impl LinkEvent {
@@ -203,7 +207,13 @@ impl Session {
         state.sender = None;
         state.stopped = None;
         state.generation = NO_LINK;
-        state.inbox.clear()
+        let removed = state.inbox.clear();
+        // Rows the shell never saw need no removal.
+        if std::mem::take(&mut state.announced) {
+            removed
+        } else {
+            Vec::new()
+        }
     }
 
     /// Status text of the event that stopped the last link, if any.
@@ -219,6 +229,7 @@ impl Session {
         state.stopped = None;
         state.generation = generation;
         state.sender = None;
+        state.announced = false;
     }
 
     /// The session still belongs to link `generation`: no cancel reset it
@@ -278,13 +289,10 @@ impl Session {
             }
             LinkEvent::Connected => {
                 state.connected = true;
+                state.announced = true;
                 status(events, AdapterStatus::Ready, CONNECTED);
                 // ADR 0010 rule 1: Linked comes before the first inbox event.
                 let mut out = vec![account(AccountState::Linked)];
-                out.push(AdapterEvent::ConversationRemoved {
-                    protocol: ProtocolId::WhatsApp,
-                    id: super::PLACEHOLDER_ID.into(),
-                });
                 out.extend(state.inbox.chat_page());
                 out
             }
@@ -304,10 +312,15 @@ impl Session {
                 status(events, AdapterStatus::Error, TEMPORARY_BAN);
                 Vec::new()
             }
+            // Before Linked the rows stay in the inbox only (rule 1).
             LinkEvent::History { chats, push_names } => {
-                state.inbox.apply_history(chats, push_names)
+                let rows = state.inbox.apply_history(chats, push_names);
+                if state.announced { rows } else { Vec::new() }
             }
-            LinkEvent::Messages(messages) => state.inbox.apply_messages(messages),
+            LinkEvent::Messages(messages) => {
+                let rows = state.inbox.apply_messages(messages);
+                if state.announced { rows } else { Vec::new() }
+            }
         };
         let mut out = out;
         if let Some(detail) = stop {
