@@ -650,7 +650,7 @@ pub trait ProtocolAdapter: Send {
     }
 }
 
-pub(crate) fn emit_status(
+pub fn emit_status(
     events: &EventTx,
     protocol: ProtocolId,
     status: AdapterStatus,
@@ -663,11 +663,11 @@ pub(crate) fn emit_status(
     });
 }
 
-pub(crate) fn emit_conversation(events: &EventTx, conversation: Conversation) {
+pub fn emit_conversation(events: &EventTx, conversation: Conversation) {
     let _ = events.send(AdapterEvent::ConversationUpsert { conversation });
 }
 
-pub(crate) fn emit_message(events: &EventTx, message: ChatMessage) {
+pub fn emit_message(events: &EventTx, message: ChatMessage) {
     let _ = events.send(AdapterEvent::MessageReceived { message });
 }
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
@@ -757,7 +757,7 @@ pub(crate) fn emit_message_delivery(
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_send_accepted(
+pub fn emit_send_accepted(
     events: &EventTx,
     protocol: ProtocolId,
     conversation_id: impl Into<String>,
@@ -770,7 +770,7 @@ pub(crate) fn emit_send_accepted(
     });
 }
 
-pub(crate) fn emit_send_rejected(
+pub fn emit_send_rejected(
     events: &EventTx,
     protocol: ProtocolId,
     conversation_id: impl Into<String>,
@@ -783,7 +783,7 @@ pub(crate) fn emit_send_rejected(
     });
 }
 
-pub(crate) fn emit_account(events: &EventTx, protocol: ProtocolId, state: AccountState) {
+pub fn emit_account(events: &EventTx, protocol: ProtocolId, state: AccountState) {
     let _ = events.send(AdapterEvent::Account { protocol, state });
 }
 
@@ -807,7 +807,7 @@ pub(crate) fn emit_notice(events: &EventTx, protocol: ProtocolId, text: impl Int
     });
 }
 
-pub(crate) fn emit_stopped(events: &EventTx, protocol: ProtocolId) {
+pub fn emit_stopped(events: &EventTx, protocol: ProtocolId) {
     let _ = events.send(AdapterEvent::Stopped { protocol });
 }
 
@@ -829,12 +829,12 @@ pub(crate) fn emit_older_history_loaded(
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_chat_list_loaded(events: &EventTx, protocol: ProtocolId) {
+pub fn emit_chat_list_loaded(events: &EventTx, protocol: ProtocolId) {
     let _ = events.send(AdapterEvent::ChatListLoaded { protocol });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_history_loaded(
+pub fn emit_history_loaded(
     events: &EventTx,
     protocol: ProtocolId,
     conversation_id: impl Into<String>,

@@ -15,7 +15,9 @@ pub use adapter::{
     AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage,
     Conversation, Delivery, DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities,
     ProtocolId, RedactedPairingSecret, SupportClass, TelegramAuthError, TelegramAuthPhase,
-    TelegramAuthStep, TelegramCodeVia,
+    TelegramAuthStep, TelegramCodeVia, emit_account, emit_chat_list_loaded, emit_conversation,
+    emit_history_loaded, emit_message, emit_send_accepted, emit_send_rejected, emit_status,
+    emit_stopped,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -69,8 +71,9 @@ pub(crate) fn registry(
     slack: std::sync::Arc<dyn SlackSecretVault>,
     whatsapp_phone: std::sync::Arc<WhatsAppPhoneVault>,
     login_epoch: adapter::LoginEpoch,
+    signal: Option<Box<dyn ProtocolAdapter>>,
 ) -> Vec<Box<dyn ProtocolAdapter>> {
-    vec![
+    let mut adapters: Vec<Box<dyn ProtocolAdapter>> = vec![
         Box::new(TelegramAdapter::with_login_epoch(
             secrets,
             crate::telegram::TelegramApiSource::from_build(),
@@ -80,7 +83,15 @@ pub(crate) fn registry(
         Box::new(DiscordAdapter::new(discord)),
         slack::registry_adapter(slack),
         Box::new(signal::SignalAdapter::new()),
-    ]
+    ];
+    if let Some(signal) = signal
+        && let Some(slot) = adapters
+            .iter_mut()
+            .find(|adapter| adapter.id() == ProtocolId::Signal)
+    {
+        *slot = signal;
+    }
+    adapters
 }
 
 #[cfg(test)]
@@ -164,10 +175,16 @@ mod tests {
                 "whatsapp-web must stay off the default feature set"
             );
         }
-        assert!(protocol.contains("signal-local"));
-        assert!(protocol.contains("optional = true"));
+        assert!(
+            !protocol.contains("presage"),
+            "thinwire-protocol must not depend on the AGPL Signal crate"
+        );
+        assert!(app.contains("thinwire-signal"));
         assert!(app.contains("signal-local"));
         assert!(core.contains("signal-local"));
+        let signal = include_str!("../../thinwire-signal/Cargo.toml");
+        assert!(signal.contains("AGPL-3.0-only"));
+        assert!(signal.contains("presage"));
         let release = include_str!("../../../.github/workflows/os-zips.yml");
         assert!(release.contains("--features telegram-tdlib"));
         assert!(!release.contains("signal-local"));

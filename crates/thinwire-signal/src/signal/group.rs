@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 #![cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 //! Signal group v2 threads. The conversation id is `signal:group:` plus the master key.
 

@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use thinwire_protocol::WhatsAppPhoneVault as PhoneVault;
 use thinwire_protocol::{
     AdapterCommand, AdapterEvent, AdapterHost, DiscordAdapter, DiscordSecretVault, HostSender,
-    ProtocolId, SlackAdapter, SlackSecretVault, TelegramSecretVault, WhatsAppPhoneVault, catalog,
+    ProtocolAdapter, ProtocolId, SlackAdapter, SlackSecretVault, TelegramSecretVault,
+    WhatsAppPhoneVault, catalog,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -109,10 +110,44 @@ impl Core {
         } else {
             SecretStore::for_ui(runtime)
         };
-        Self::with_store(runtime, config, secrets)
+        Self::with_store(runtime, config, secrets, None)
     }
 
-    fn with_store(runtime: &Handle, config: CoreConfig, secrets: Arc<SecretStore>) -> Self {
+    /// Same as [`Self::new`], with the AGPL Signal adapter in place of the stub.
+    ///
+    /// Only a `signal-local` binary calls this. The core crate does not depend
+    /// on `thinwire-signal`.
+    #[must_use]
+    pub fn with_signal_adapter(
+        runtime: &Handle,
+        config: CoreConfig,
+        signal: Box<dyn ProtocolAdapter>,
+    ) -> Self {
+        let caps = signal.capabilities();
+        let secrets = if config.memory_secrets {
+            Arc::new(SecretStore::memory())
+        } else {
+            SecretStore::for_ui(runtime)
+        };
+        let mut core = Self::with_store(runtime, config, secrets, Some(signal));
+        if let Some(row) = core
+            .state
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+        {
+            row.detail = caps.detail.to_string();
+            row.caps = caps;
+        }
+        core
+    }
+
+    fn with_store(
+        runtime: &Handle,
+        config: CoreConfig,
+        secrets: Arc<SecretStore>,
+        signal: Option<Box<dyn ProtocolAdapter>>,
+    ) -> Self {
         let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
         let host = AdapterHost::spawn(
             runtime,
@@ -120,6 +155,7 @@ impl Core {
             Arc::clone(&secrets) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&secrets) as Arc<dyn SlackSecretVault>,
             Arc::clone(&whatsapp_phone),
+            signal,
         );
         // `for_ui` only schedules keychain attach. A start can run before
         // that blocking read finishes, so arm Discord and Slack again once
@@ -682,6 +718,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&store) as Arc<dyn SlackSecretVault>,
             Arc::clone(&whatsapp_phone),
+            None,
         );
         bind_discord_after_hydrate(&store, &host);
 
@@ -737,6 +774,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&store) as Arc<dyn SlackSecretVault>,
             whatsapp_phone,
+            None,
         );
         for caps in catalog() {
             host.send(AdapterCommand::Shutdown { protocol: caps.id });
@@ -985,6 +1023,7 @@ mod tests {
             &Handle::current(),
             CoreConfig::new(temp_settings()),
             Arc::clone(&store),
+            None,
         );
         let mut signal = core.signal();
         drop(core);

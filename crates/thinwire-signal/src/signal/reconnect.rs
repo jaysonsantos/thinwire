@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 #![cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 //! Backoff after the Signal receive stream ends.
 //!

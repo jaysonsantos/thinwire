@@ -4,6 +4,7 @@ members = [
   "crates/thinwire",
   "crates/thinwire-core",
   "crates/thinwire-protocol",
+  "crates/thinwire-signal",
 ]
 
 [workspace.package]
@@ -42,6 +43,7 @@ chrono = { version = "0.4", default-features = false, features = [
 winit = "0.30"
 thinwire-core = { path = "crates/thinwire-core" }
 thinwire-protocol = { path = "crates/thinwire-protocol" }
+thinwire-signal = { path = "crates/thinwire-signal" }
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",

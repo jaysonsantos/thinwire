@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 #![cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 //! Wakes a Signal worker that is blocked in `select`.
 

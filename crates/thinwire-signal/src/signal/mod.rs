@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Local-only Signal adapter (presage / libsignal, AGPL).
 //!
 //! The default build keeps a stub and does not open a network session.
@@ -20,8 +21,8 @@ mod live;
 use std::sync::Arc;
 
 #[cfg(feature = "signal-local")]
-use crate::adapter::{AccountState, emit_account};
-use crate::adapter::{
+use thinwire_protocol::{AccountState, emit_account};
+use thinwire_protocol::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
     ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, emit_chat_list_loaded,
     emit_conversation, emit_history_loaded, emit_message, emit_status, emit_stopped,
@@ -316,14 +317,14 @@ impl SignalAdapter {
                 match device.send(conversation_id, body) {
                     Ok(message) => {
                         emit_message(events, message);
-                        crate::adapter::emit_send_accepted(
+                        thinwire_protocol::emit_send_accepted(
                             events,
                             ProtocolId::Signal,
                             conversation_id,
                             request,
                         );
                     }
-                    Err(_) => crate::adapter::emit_send_rejected(
+                    Err(_) => thinwire_protocol::emit_send_rejected(
                         events,
                         ProtocolId::Signal,
                         conversation_id,
@@ -347,7 +348,7 @@ impl SignalAdapter {
                         })
                         .await;
                     if !queued {
-                        crate::adapter::emit_send_rejected(
+                        thinwire_protocol::emit_send_rejected(
                             &task_events,
                             ProtocolId::Signal,
                             conversation_id,
@@ -372,14 +373,14 @@ impl SignalAdapter {
                 match device.resend(conversation_id, message_id) {
                     Ok(message) => {
                         emit_message(events, message);
-                        crate::adapter::emit_send_accepted(
+                        thinwire_protocol::emit_send_accepted(
                             events,
                             ProtocolId::Signal,
                             conversation_id,
                             request,
                         );
                     }
-                    Err(_) => crate::adapter::emit_send_rejected(
+                    Err(_) => thinwire_protocol::emit_send_rejected(
                         events,
                         ProtocolId::Signal,
                         conversation_id,
@@ -396,7 +397,7 @@ impl SignalAdapter {
                 let task_events = events.clone();
                 tokio::spawn(async move {
                     let Some(body) = session.recall(&message_id).await else {
-                        crate::adapter::emit_send_rejected(
+                        thinwire_protocol::emit_send_rejected(
                             &task_events,
                             ProtocolId::Signal,
                             conversation_id,
@@ -412,7 +413,7 @@ impl SignalAdapter {
                         })
                         .await;
                     if !queued {
-                        crate::adapter::emit_send_rejected(
+                        thinwire_protocol::emit_send_rejected(
                             &task_events,
                             ProtocolId::Signal,
                             conversation_id,
@@ -561,10 +562,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::adapter::AdapterEvent;
-    use crate::adapter::ProtocolAdapter;
-    use crate::adapter::{ChatMessage, Conversation};
     use device::FakeDevice;
+    use thinwire_protocol::AdapterEvent;
+    use thinwire_protocol::ProtocolAdapter;
+    use thinwire_protocol::{ChatMessage, Conversation};
     use tokio::sync::mpsc::unbounded_channel;
 
     fn sample_chat() -> Conversation {
@@ -591,7 +592,7 @@ mod tests {
             sender: "Ada".into(),
             body: "hello from the fixture".into(),
             outbound: false,
-            delivery: crate::adapter::Delivery::Sent,
+            delivery: thinwire_protocol::Delivery::Sent,
             sent_at: 0,
         }
     }

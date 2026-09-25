@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! App-data location for the local-only Signal session.
 //!
 //! The directory is never created inside the git checkout. Callers that open

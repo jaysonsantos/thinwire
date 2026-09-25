@@ -52,3 +52,6 @@ An OS zip does not contain AGPL code.
 Issue #77 moves code that links an AGPL library into an AGPL-licensed crate folder in this repo.
 The root `LICENSE` stays MIT.
 After that move, MIT crates do not depend on those AGPL crates.
+The Signal folder is `crates/thinwire-signal` (AGPL-3.0-only).
+`thinwire` depends on it only with feature `signal-local`.
+`thinwire-protocol` does not depend on it.

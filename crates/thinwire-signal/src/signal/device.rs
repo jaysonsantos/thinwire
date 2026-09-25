@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! In-process Signal device used by tests and by builds without `signal-local`.
 //!
 //! The provisioning URL and message text stay out of logs. Callers emit the
@@ -7,8 +8,8 @@
 use std::collections::HashMap;
 
 #[cfg(test)]
-use crate::adapter::Delivery;
-use crate::adapter::{ChatMessage, Conversation};
+use thinwire_protocol::Delivery;
+use thinwire_protocol::{ChatMessage, Conversation};
 
 /// Sync device. The live presage client does not implement this trait.
 pub(crate) trait SignalDevice: Send {
@@ -113,7 +114,7 @@ impl SignalDevice for FakeDevice {
             return Err("Signal chat was not found");
         }
         let message = ChatMessage {
-            protocol: crate::ProtocolId::Signal,
+            protocol: thinwire_protocol::ProtocolId::Signal,
             conversation_id: conversation_id.to_string(),
             id: format!("signal:{conversation_id}:sent"),
             sender: "me".into(),

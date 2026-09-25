@@ -13,3 +13,7 @@ if grep -E '^(egui|eframe|winit|epaint|egui-winit|egui_glow)[ @]' <<<"$tree"; th
   echo "thinwire-core depends on a GUI toolkit crate (ADR 0010)" >&2
   exit 1
 fi
+if grep -E '^thinwire-signal[ @]' <<<"$tree"; then
+  echo "thinwire-core depends on the AGPL Signal crate (ADR 0011)" >&2
+  exit 1
+fi

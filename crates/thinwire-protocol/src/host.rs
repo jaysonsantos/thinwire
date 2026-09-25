@@ -29,6 +29,7 @@ impl AdapterHost {
         discord: Arc<dyn DiscordSecretVault>,
         slack: Arc<dyn SlackSecretVault>,
         whatsapp_phone: Arc<WhatsAppPhoneVault>,
+        signal: Option<Box<dyn ProtocolAdapter>>,
     ) -> Self {
         let (event_tx, event_rx) = unbounded_channel();
         let (command_tx, mut command_rx) = unbounded_channel();
@@ -36,7 +37,8 @@ impl AdapterHost {
         let adapter_epoch = Arc::clone(&login_epoch);
 
         handle.spawn(async move {
-            let mut adapters = registry(secrets, discord, slack, whatsapp_phone, adapter_epoch);
+            let mut adapters =
+                registry(secrets, discord, slack, whatsapp_phone, adapter_epoch, signal);
             for adapter in &mut adapters {
                 adapter.start(event_tx.clone());
             }
@@ -337,6 +339,7 @@ mod tests {
             Arc::new(crate::MemoryDiscordVault::new()) as Arc<dyn DiscordSecretVault>,
             Arc::new(crate::MemorySlackVault::new()) as Arc<dyn SlackSecretVault>,
             Arc::new(WhatsAppPhoneVault::new()),
+            None,
         );
         assert_eq!(host.login_epoch.load(Ordering::SeqCst), 0);
         host.send(AdapterCommand::Disconnect {

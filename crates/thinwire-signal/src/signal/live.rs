@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Secondary-device client. Compiled only with `signal-local`.
 //!
 //! Presage runs on a tokio task. The egui thread never calls into this module.
@@ -28,7 +29,7 @@ use tokio::sync::{Mutex, mpsc};
 use super::path::{prepare_session_dir, signal_session_path};
 use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::CancelWake;
-use crate::adapter::{
+use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
     ProtocolId, RedactedPairingSecret, emit_account, emit_conversation, emit_message, emit_status,
 };
@@ -309,7 +310,7 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
                 .await
                 .is_err()
             {
-                crate::adapter::emit_send_rejected(
+                thinwire_protocol::emit_send_rejected(
                     &events,
                     ProtocolId::Signal,
                     conversation_id,
@@ -555,7 +556,7 @@ async fn send_text(
                 .map_err(|_| ())?;
         }
     }
-    crate::adapter::emit_send_accepted(
+    thinwire_protocol::emit_send_accepted(
         events,
         ProtocolId::Signal,
         &outbound.conversation_id,

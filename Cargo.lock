@@ -5912,6 +5912,7 @@ dependencies = [
  "qrcode",
  "thinwire-core",
  "thinwire-protocol",
+ "thinwire-signal",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5939,10 +5940,7 @@ name = "thinwire-protocol"
 version = "0.1.0"
 dependencies = [
  "dirs 7.0.0",
- "futures",
  "getrandom 0.4.3",
- "presage",
- "presage-store-sled",
  "rustls",
  "slack-morphism",
  "tdlib-rs",
@@ -5952,6 +5950,19 @@ dependencies = [
  "twilight-model",
  "webbrowser",
  "whatsapp-rust",
+]
+
+[[package]]
+name = "thinwire-signal"
+version = "0.1.0"
+dependencies = [
+ "dirs 7.0.0",
+ "futures",
+ "presage",
+ "presage-store-sled",
+ "thinwire-protocol",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
