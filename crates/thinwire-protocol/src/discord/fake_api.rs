@@ -223,7 +223,11 @@ impl DiscordApi for FakeDiscordApi {
     fn history(&self, channel_id: u64, limit: u16) -> ApiFuture<'_, Vec<MessageSummary>> {
         Box::pin(async move {
             self.check_token()?;
-            if let Some(hold) = &self.hold_history {
+            // A one-message preview runs during the channel list. The hold is
+            // for an open chat (limit 50), so the list can finish first.
+            if limit > 1
+                && let Some(hold) = &self.hold_history
+            {
                 hold.notified().await;
             }
             let mut messages = self
