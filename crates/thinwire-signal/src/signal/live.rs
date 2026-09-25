@@ -812,6 +812,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_start_after_cancel_stays_running() {
+        let session = Session::new();
+        let first = session.bump_generation();
+        session.mark_active();
+        session.next_generation();
+        assert!(
+            !session.is_current(first),
+            "cancel ends the previous worker"
+        );
+
+        session.clear_cancel();
+        let token = session.bump_generation();
+        session.mark_active();
+        assert!(session.is_current(token));
+        assert!(session.is_active());
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            session.cancel.cancelled(),
+        )
+        .await;
+        assert!(
+            pending.is_err(),
+            "a new link must not see the previous cancel"
+        );
+        assert!(session.is_current(token));
+        assert!(session.is_active());
+    }
+
+    #[tokio::test]
     async fn invalidation_wakes_a_waiting_worker() {
         let session = Arc::new(Session::new());
         let waiting = Arc::clone(&session);
