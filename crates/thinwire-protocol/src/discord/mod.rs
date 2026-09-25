@@ -1843,6 +1843,116 @@ mod tests {
         );
     }
 
+    /// Codex r4108983123: a 401 settles a send in flight. When a reconnect
+    /// comes during the seal, the optimistic row does not stay pending: the
+    /// 401 step removes it with the send's one `SendRejected`.
+    #[tokio::test]
+    async fn a_401_removes_the_optimistic_row_before_a_reconnect() {
+        let hold = Arc::new(Notify::new());
+        let seal = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "keep me".into(),
+                    request: 7,
+                },
+                &tx,
+            )
+            .expect("send");
+        let sent = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReceived { .. })
+        })
+        .await;
+        let pending_id = messages(&sent)
+            .iter()
+            .find(|message| message.id.contains(":pending:"))
+            .map(|message| message.id.clone())
+            .expect("pending row");
+        // The send is past the token check and waits for Discord's answer.
+        for _ in 0..50 {
+            if api.sends_at_hold.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            api.sends_at_hold.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the send is in flight"
+        );
+        api.state().hold_unlink = Some(Arc::clone(&seal));
+        api.state().unlink_at_barrier = Some(Arc::clone(&arrived));
+        api.state().unauthorized = true;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("401 is waiting to unlink");
+        let settled = drain(&mut rx);
+        let removed = settled
+            .iter()
+            .position(|event| matches!(
+                event,
+                AdapterEvent::MessagesRemoved { message_ids, .. } if message_ids.contains(&pending_id)
+            ))
+            .expect("the optimistic row is removed in the 401 step");
+        let rejected = settled
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::SendRejected { request: 7, .. }))
+            .expect("the send is rejected in the 401 step");
+        assert!(removed < rejected);
+
+        // A reconnect wins the seal. The row is already settled.
+        api.state().unauthorized = false;
+        api.state().hold_unlink = None;
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Linked,
+                    ..
+                }
+            )
+        })
+        .await;
+        seal.notify_one();
+        hold.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late.iter().any(|event| matches!(
+                event,
+                AdapterEvent::SendAccepted { request: 7, .. }
+                    | AdapterEvent::SendRejected { request: 7, .. }
+                    | AdapterEvent::MessageReplaced { .. }
+            )),
+            "the send has one result, and its row is not replaced later"
+        );
+    }
+
     #[tokio::test]
     async fn a_paused_401_does_not_unlink_the_session_that_replaced_it() {
         let hold = Arc::new(Notify::new());

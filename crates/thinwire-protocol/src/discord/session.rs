@@ -44,6 +44,9 @@ pub(crate) struct ChannelAccess {
 struct Inflight {
     conversation_id: String,
     request: u64,
+    /// The row of this send: the 401 step settles it with the result.
+    message_id: String,
+    row: SendRow,
 }
 
 #[derive(Debug)]
@@ -59,8 +62,10 @@ struct PendingLoad {
 ///   `SendAccepted` or `SendRejected` is queued, or the 401 step queues that
 ///   `SendRejected`.
 /// - After `revoked`, starting a send queues `SendRejected` and does not insert.
-/// - A 401 step queues one result for every send still in the map, finishes
-///   every load in `loads`, then queues `Unlinked`, before the lock is released.
+/// - A 401 step, under the lock, queues one result for every send still in
+///   the map (and settles its row: the optimistic row goes, a retried row
+///   fails), and finishes every load in `loads`. `Unlinked` then waits in
+///   `pending_unlink` until the seal ends.
 /// - A task that observes `revoked`, or no longer finds its entry, queues nothing.
 /// - A channel-list reload publishes `Linked`, the rows, and `ChatListLoaded`
 ///   in this same step, and queues none of them if the session is already revoked.
@@ -72,8 +77,10 @@ struct PendingLoad {
 ///   `SendRejected` in that step, and if `Unlinked` is not queued yet it queues
 ///   that rejection first. No send is registered for a revoked generation.
 /// - `pending_unlink` stays until this generation queues `Unlinked`, or a new
-///   session bumps `generation`. LoadChats, OpenChat, SendText, and ViewChat
-///   do not clear it. They answer `CommandFailed` or `SendRejected`.
+///   session bumps `generation`. LoadChats, OpenChat, and ViewChat do not
+///   clear it; they answer `CommandFailed`. SendText and ResendMessage answer
+///   `SendRejected` and then call `publish_unlink`, which queues `Unlinked`
+///   for this generation (and so clears it).
 /// - The shared live counter moves only in this step, and only after the
 ///   generation check: replacing the session, or publishing `Unlinked`.
 #[derive(Debug, Default)]
@@ -532,6 +539,8 @@ impl Session {
                     Inflight {
                         conversation_id: conversation_id.to_owned(),
                         request,
+                        message_id: message_id.clone(),
+                        row: SendRow::Pending,
                     },
                 );
                 emit_message(
@@ -559,6 +568,8 @@ impl Session {
                     Inflight {
                         conversation_id: conversation_id.to_owned(),
                         request,
+                        message_id: message_id.clone(),
+                        row: SendRow::Retry,
                     },
                 );
                 (body, message_id, SendRow::Retry)
@@ -744,6 +755,11 @@ fn settle_unauthorized(state: &mut Shared, events: &EventTx, error: DiscordApiEr
     let sends = std::mem::take(&mut state.inflight);
     let loads = std::mem::take(&mut state.loads);
     for send in sends.into_values() {
+        // The task of this send publishes nothing now, so settle its row
+        // here: remove the optimistic row, or fail the retried row. A
+        // reconnect during the seal must not leave it pending (Codex
+        // r4108983123).
+        settle_row(events, &send.conversation_id, &send.message_id, send.row);
         emit_send_rejected(
             events,
             ProtocolId::Discord,
@@ -763,6 +779,27 @@ fn settle_unauthorized(state: &mut Shared, events: &EventTx, error: DiscordApiEr
     }
     if state.pending_unlink.is_none() {
         state.pending_unlink = Some(error);
+    }
+}
+
+/// A send that gets no accepted result: remove its optimistic row, or set a
+/// retried row back to failed.
+fn settle_row(events: &EventTx, conversation_id: &str, message_id: &str, row: SendRow) {
+    match row {
+        SendRow::Pending => {
+            let _ = events.send(AdapterEvent::MessagesRemoved {
+                protocol: ProtocolId::Discord,
+                conversation_id: conversation_id.to_owned(),
+                message_ids: vec![message_id.to_owned()],
+            });
+        }
+        SendRow::Retry => emit_message_delivery(
+            events,
+            ProtocolId::Discord,
+            conversation_id.to_owned(),
+            message_id.to_owned(),
+            Delivery::Failed,
+        ),
     }
 }
 
@@ -827,6 +864,7 @@ fn session_revoked(shared: &Arc<Mutex<Shared>>) -> bool {
 }
 
 /// Optimistic row (`Pending`) or a retry of a row the shell already has.
+#[derive(Debug, Clone, Copy)]
 enum SendRow {
     Pending,
     Retry,
@@ -935,22 +973,7 @@ fn queue_send_result(
         return false;
     }
     if state.generation != generation || !gate.current() {
-        match row {
-            SendRow::Pending => {
-                let _ = events.send(AdapterEvent::MessagesRemoved {
-                    protocol: ProtocolId::Discord,
-                    conversation_id: conversation_id.clone(),
-                    message_ids: vec![message_id],
-                });
-            }
-            SendRow::Retry => emit_message_delivery(
-                events,
-                ProtocolId::Discord,
-                conversation_id.clone(),
-                message_id,
-                Delivery::Failed,
-            ),
-        }
+        settle_row(events, &conversation_id, &message_id, row);
         emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
         return true;
     }
