@@ -961,6 +961,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         |id| messages.iter().any(|message| message.id == id),
         output.state.offset.y,
         output.content_size.y,
+        cannot_leave_zone(output.content_size.y, output.inner_rect.height()),
     );
     if step.restore.is_some() {
         // Older rows went in above: the next frame moves down by their height,
@@ -981,9 +982,13 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
             },
         );
     });
+    // The core says when a request may go out: not during a wait after a
+    // page that brought nothing. So a thread that cannot scroll does not
+    // send an intent on every repaint (#67).
     if step.at_top
         && state == ThreadState::Rows
         && older == OlderState::Idle
+        && snapshot.older_can_ask()
         && let Some((protocol, conversation_id)) = snapshot
             .selected_conversation
             .clone()
@@ -1004,6 +1009,13 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
 /// Distance from the top of the thread, in points, that asks for older
 /// messages.
 const OLDER_TRIGGER: f32 = 24.0;
+
+/// The view cannot scroll out of the top zone: its largest scroll offset is
+/// not more than `OLDER_TRIGGER`. A thread that fits, or is only a little
+/// taller than the view, is such a thread (#74 review).
+fn cannot_leave_zone(content_height: f32, view_height: f32) -> bool {
+    content_height - view_height <= OLDER_TRIGGER
+}
 
 /// What the thread remembers between frames for older-message paging (#30).
 #[derive(Debug, Clone, Default)]
@@ -1042,6 +1054,7 @@ fn older_step(
     has_row: impl Fn(&str) -> bool,
     offset: f32,
     content_height: f32,
+    stuck: bool,
 ) -> OlderStep {
     let idle = OlderStep {
         at_top: false,
@@ -1054,7 +1067,9 @@ fn older_step(
     let zone = offset <= OLDER_TRIGGER;
     match memo.first_id.as_deref() {
         Some(old) if old == first => OlderStep {
-            at_top: memo.restore.is_none() && zone && !memo.in_zone,
+            // A thread that cannot leave the zone (`cannot_leave_zone`) asks
+            // while it stays there, and the core paces it (#67).
+            at_top: memo.restore.is_none() && zone && (!memo.in_zone || stuck),
             restore: None,
             in_zone: zone,
         },
@@ -1397,7 +1412,7 @@ mod tests {
         // A chat that just opened: no ask, even at offset 0.
         let fresh = ThreadMemo::default();
         assert_eq!(
-            older_step(&fresh, Some("t:1:50"), has, 0.0, 800.0),
+            older_step(&fresh, Some("t:1:50"), has, 0.0, 800.0, false),
             OlderStep {
                 at_top: false,
                 restore: None,
@@ -1411,10 +1426,20 @@ mod tests {
             restore: None,
             in_zone: false,
         };
-        assert!(older_step(&seen, Some("t:1:50"), has, OLDER_TRIGGER, 800.0).at_top);
-        assert!(!older_step(&seen, Some("t:1:50"), has, OLDER_TRIGGER + 1.0, 800.0).at_top);
+        assert!(older_step(&seen, Some("t:1:50"), has, OLDER_TRIGGER, 800.0, false).at_top);
+        assert!(
+            !older_step(
+                &seen,
+                Some("t:1:50"),
+                has,
+                OLDER_TRIGGER + 1.0,
+                800.0,
+                false
+            )
+            .at_top
+        );
         // 300 points of older rows went in above: move down by 300.
-        let step = older_step(&seen, Some("t:1:40"), has, 4.0, 1100.0);
+        let step = older_step(&seen, Some("t:1:40"), has, 4.0, 1100.0, false);
         assert_eq!(
             step,
             OlderStep {
@@ -1430,14 +1455,47 @@ mod tests {
             restore: Some(304.0),
             in_zone: false,
         };
-        assert!(!older_step(&restoring, Some("t:1:40"), has, 304.0, 1100.0).at_top);
+        assert!(!older_step(&restoring, Some("t:1:40"), has, 304.0, 1100.0, false).at_top);
         // Another chat's rows (the old top row is gone): no offset change.
         assert_eq!(
-            older_step(&seen, Some("t:2:9"), |id| id == "t:2:9", 0.0, 500.0).restore,
+            older_step(&seen, Some("t:2:9"), |id| id == "t:2:9", 0.0, 500.0, false).restore,
             None
         );
         // No rows: nothing.
-        assert!(!older_step(&seen, None, has, 0.0, 0.0).at_top);
+        assert!(!older_step(&seen, None, has, 0.0, 0.0, false).at_top);
+    }
+
+    #[test]
+    fn a_thread_that_cannot_leave_the_zone_keeps_asking_at_the_top() {
+        use super::{ThreadMemo, older_step};
+
+        let has = |id: &str| id == "t:1:50";
+        let memo = ThreadMemo {
+            first_id: Some("t:1:50".into()),
+            content_height: 300.0,
+            restore: None,
+            in_zone: true,
+        };
+        // It cannot scroll, so it never leaves the zone: still asks (#67).
+        assert!(older_step(&memo, Some("t:1:50"), has, 0.0, 300.0, true).at_top);
+        // 10 pt taller than the view: the largest offset is 10 pt, inside
+        // the zone, so it gets the timed retry too.
+        use super::{OLDER_TRIGGER, cannot_leave_zone};
+        assert!(cannot_leave_zone(300.0, 300.0));
+        assert!(cannot_leave_zone(310.0, 300.0));
+        assert!(cannot_leave_zone(300.0 + OLDER_TRIGGER, 300.0));
+        assert!(!cannot_leave_zone(301.0 + OLDER_TRIGGER, 300.0));
+        let taller = cannot_leave_zone(310.0, 300.0);
+        assert!(older_step(&memo, Some("t:1:50"), has, 10.0, 310.0, taller).at_top);
+        // A thread that can scroll out waits for leave and return.
+        assert!(!older_step(&memo, Some("t:1:50"), has, 0.0, 300.0, false).at_top);
+        let ui = include_str!("ui.rs");
+        let thread = &ui[ui.find("fn thread(").expect("thread")..];
+        let thread = &thread[..thread.find("\nfn ").expect("next")];
+        assert!(
+            thread.contains("snapshot.older_can_ask()"),
+            "the core paces it"
+        );
     }
 
     #[test]
@@ -1452,7 +1510,7 @@ mod tests {
             in_zone: false,
         };
         let frame = |memo: &mut ThreadMemo, offset: f32| {
-            let step = older_step(memo, Some("t:1:50"), has, offset, 800.0);
+            let step = older_step(memo, Some("t:1:50"), has, offset, 800.0, false);
             memo.in_zone = step.in_zone;
             memo.restore = step.restore;
             step.at_top
