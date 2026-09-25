@@ -91,6 +91,14 @@ impl Session {
             .unwrap_or_default()
     }
 
+    /// Bodies of outgoing rows, so Retry still works after a reconnect.
+    pub(crate) fn carried_bodies(&self) -> HashMap<String, String> {
+        self.shared
+            .lock()
+            .map(|state| state.bodies.clone())
+            .unwrap_or_default()
+    }
+
     /// Starts a new generation and loads the channel list.
     ///
     /// `carried` is the previous list. An empty map is a first connect.
@@ -100,6 +108,7 @@ impl Session {
         events: &EventTx,
         carried: HashMap<String, ChannelAccess>,
         history: HashMap<String, Vec<String>>,
+        bodies: HashMap<String, String>,
     ) -> Self {
         let generation = live.fetch_add(1, Ordering::SeqCst) + 1;
         let session = Self {
@@ -109,7 +118,7 @@ impl Session {
                 channels: carried,
                 inflight: Vec::new(),
                 history,
-                bodies: HashMap::new(),
+                bodies,
             })),
             gate: Gate {
                 live: Arc::clone(live),

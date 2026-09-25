@@ -178,6 +178,11 @@ impl DiscordAdapter {
             .as_ref()
             .map(session::Session::carried_history)
             .unwrap_or_default();
+        let bodies = self
+            .session
+            .as_ref()
+            .map(session::Session::carried_bodies)
+            .unwrap_or_default();
         self.stop_session(events);
         let prepared = self.prepared_token()?;
         #[cfg(any(test, feature = "discord-bot"))]
@@ -197,7 +202,9 @@ impl DiscordAdapter {
                 Some(token) => {
                     let api = factory(token);
                     self.session =
-                        Some(session::Session::start(api, &self.live, events, carried, history));
+                        Some(session::Session::start(
+                            api, &self.live, events, carried, history, bodies,
+                        ));
                 }
             }
             return Ok(());
@@ -1088,6 +1095,58 @@ mod tests {
                 if old_id == &pending && message.body == "blocked"
         )));
         assert_eq!(api.state().sent, vec![(GENERAL, "blocked".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn retry_after_reconnect_posts_the_failed_body() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        api.state().send_error = Some(api::DiscordApiError::Forbidden);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "try later".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("queued");
+        let events = until(&mut rx, is_ready).await;
+        let pending = messages(&events)[0].id.clone();
+        api.state().send_error = None;
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = inbox_loaded(&mut rx).await;
+        adapter
+            .handle(
+                AdapterCommand::ResendMessage {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                    message_id: pending,
+                    request: 4,
+                },
+                &tx,
+            )
+            .expect("retry");
+        let retried = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReplaced { .. })
+        })
+        .await;
+        assert!(
+            retried
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendAccepted { request: 4, .. }))
+        );
+        assert_eq!(api.state().sent, vec![(GENERAL, "try later".to_string())]);
     }
 
     #[tokio::test]
