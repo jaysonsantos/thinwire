@@ -1166,7 +1166,6 @@ impl Snapshot {
             self.compose.clear();
         }
         self.error = None;
-        self.status_text = "Sending…".into();
         self.pending.push(AdapterCommand::ResendMessage {
             protocol,
             conversation_id,
@@ -1981,7 +1980,6 @@ impl Snapshot {
             body,
             request,
         });
-        self.status_text = "Sending…".into();
     }
 
     pub fn open_telegram(&mut self, store: &SecretStore) {
@@ -7281,6 +7279,25 @@ mod tests {
             snapshot.error.as_ref().map(|error| error.next.as_str()),
             Some("The text is in the draft of Ada. Send it again.")
         );
+    }
+
+    /// #90 item 5: the line shows "Sending…" only while a send is in flight.
+    /// After the last send times out, the line is no longer busy.
+    #[test]
+    fn the_sending_line_ends_with_the_last_timeout() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        snapshot.history_loading.clear();
+        snapshot.status_text = "Telegram is ready.".into();
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert_eq!(snapshot.status_line(), "Telegram is ready.");
+        assert!(!snapshot.status_line_loads());
     }
 
     // endregion: #69
