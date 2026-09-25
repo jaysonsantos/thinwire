@@ -11,6 +11,7 @@ mod message;
 mod path;
 mod reconnect;
 mod time;
+mod wake;
 
 #[cfg(feature = "signal-local")]
 mod live;

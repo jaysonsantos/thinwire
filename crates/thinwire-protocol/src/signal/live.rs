@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use super::path::{prepare_session_dir, signal_session_path};
 use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
+use super::wake::CancelWake;
 use crate::adapter::{
     AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx, ProtocolId,
     RedactedPairingSecret, emit_conversation, emit_message, emit_status,
@@ -51,6 +52,7 @@ pub(super) struct Session {
     generation: AtomicU64,
     active: AtomicBool,
     outbound: Mutex<Option<mpsc::UnboundedSender<Outbound>>>,
+    cancel: CancelWake,
 }
 
 impl Session {
@@ -59,12 +61,15 @@ impl Session {
             generation: AtomicU64::new(0),
             active: AtomicBool::new(false),
             outbound: Mutex::new(None),
+            cancel: CancelWake::new(),
         }
     }
 
     pub(super) fn next_generation(&self) -> u64 {
         self.active.store(false, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.cancel.wake();
+        next
     }
 
     pub(super) fn mark_active(&self) {
@@ -198,6 +203,9 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
                 }
                 tokio::select! {
                     biased;
+                    _ = session.cancel.cancelled() => {
+                        break;
+                    }
                     command = rx.recv() => {
                         pending = command;
                         break;
