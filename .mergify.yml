@@ -11,7 +11,6 @@ queue_rules:
     # it, any green pull request from any contributor would merge itself.
     # (merge_protections_settings.auto_merge_conditions did not queue by
     # itself, and Mergify rejects it next to autoqueue.)
-    autoqueue: true
     queue_conditions:
       - label = ready-to-merge
       - check-success = check
@@ -27,3 +26,5 @@ queue_rules:
     batch_size: 20
     batch_max_wait_time: 5 min
     checks_timeout: 30 min
+merge_protections_settings:
+  auto_merge_conditions: true
