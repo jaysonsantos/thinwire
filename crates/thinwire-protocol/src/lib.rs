@@ -101,7 +101,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_lists_protocols_with_honest_support() {
+    fn catalog_lists_v1_four_protocols_with_honest_support() {
         let caps = catalog();
         let ids: Vec<ProtocolId> = caps.iter().map(|c| c.id).collect();
         assert_eq!(
@@ -159,6 +159,272 @@ mod tests {
                 assert!(!contains_word(&blob, "official"), "{name}");
             }
         }
+    }
+
+    #[test]
+    fn v1_does_not_depend_on_agpl_signal_client_or_presage() {
+        let protocol = include_str!("../Cargo.toml");
+        for name in [
+            "presage",
+            "libsignal",
+            "libsignal-service",
+            "wacore-libsignal",
+        ] {
+            assert!(
+                !protocol.contains(name),
+                "thinwire-protocol must not name {name}"
+            );
+        }
+        let app = include_str!("../../thinwire/Cargo.toml");
+        assert!(
+            app.lines().any(|line| line.trim() == "default = []"),
+            "the default feature set stays empty"
+        );
+        let release = include_str!("../../../.github/workflows/os-zips.yml");
+        assert!(release.contains("--features telegram-tdlib"));
+        for name in [
+            "signal-local",
+            "whatsapp-web",
+            "presage",
+            "libsignal",
+            "libsignal-service",
+            "wacore-libsignal",
+        ] {
+            assert!(
+                !release.contains(name),
+                "release builds must not name {name}"
+            );
+        }
+        let closure = dependency_closure(
+            include_str!("../../../Cargo.lock"),
+            "thinwire-protocol",
+            &release_skipped_deps(protocol),
+        );
+        for name in [
+            "presage",
+            "libsignal",
+            "libsignal-service",
+            "wacore-libsignal",
+        ] {
+            assert!(
+                !closure.iter().any(|pkg| pkg == name),
+                "thinwire-protocol closure contains {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lock_walk_finds_an_agpl_crate_two_levels_down() {
+        let lock = r#"
+[[package]]
+name = "thinwire-protocol"
+version = "0.1.0"
+dependencies = [
+    "middle 1.0.0",
+]
+
+[[package]]
+name = "middle"
+version = "1.0.0"
+dependencies = [
+    "wacore-libsignal 0.7.0",
+]
+
+[[package]]
+name = "middle"
+version = "2.0.0"
+dependencies = [
+    "not-selected",
+]
+
+[[package]]
+name = "wacore-libsignal"
+version = "0.7.0"
+dependencies = [
+]
+
+[[package]]
+name = "wacore-libsignal"
+version = "9.9.9"
+dependencies = [
+    "other-version",
+]
+
+[[package]]
+name = "not-selected"
+version = "1.0.0"
+dependencies = [
+]
+
+[[package]]
+name = "other-version"
+version = "1.0.0"
+dependencies = [
+]
+"#;
+        let closure = dependency_closure(lock, "thinwire-protocol", &[]);
+        assert!(closure.contains("wacore-libsignal"));
+        assert!(closure.contains("middle"));
+        assert!(!closure.contains("not-selected"));
+        assert!(!closure.contains("other-version"));
+    }
+
+    /// Every package reachable from `root` in `Cargo.lock`.
+    /// A dependency line is `name` or `name version` (source text after the version is ignored).
+    /// A line with no version follows every version of that name.
+    /// Optional dependencies that `default` and `telegram-tdlib` do not enable.
+    /// The lock still lists them. The release closure does not enter them.
+    fn release_skipped_deps(manifest: &str) -> Vec<String> {
+        let optional = optional_dep_names(manifest);
+        let enabled = enabled_dep_names(manifest, &["default", "telegram-tdlib"]);
+        optional
+            .into_iter()
+            .filter(|name| !enabled.iter().any(|on| on == name))
+            .collect()
+    }
+
+    fn optional_dep_names(manifest: &str) -> Vec<String> {
+        manifest
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if !trimmed.contains("optional = true") {
+                    return None;
+                }
+                let name = trimmed.split('=').next()?.trim();
+                if name.is_empty() || name.starts_with('[') {
+                    None
+                } else {
+                    Some(name.to_string())
+                }
+            })
+            .collect()
+    }
+
+    fn enabled_dep_names(manifest: &str, features: &[&str]) -> Vec<String> {
+        let mut names = Vec::new();
+        for feature in features {
+            let header = format!("{feature} =");
+            let Some(start) = manifest.find(&header) else {
+                continue;
+            };
+            let rest = &manifest[start + header.len()..];
+            let body = if let Some(inline) = rest.trim_start().strip_prefix('[') {
+                inline.split(']').next().unwrap_or("")
+            } else {
+                ""
+            };
+            for token in body.split([',', '"', '\n']) {
+                let token = token.trim();
+                if let Some(name) = token.strip_prefix("dep:") {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    fn dependency_closure(
+        lock: &str,
+        root: &str,
+        skip_from_root: &[String],
+    ) -> std::collections::BTreeSet<String> {
+        let packages = lock_packages(lock);
+        let mut by_name: std::collections::BTreeMap<&str, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, package) in packages.iter().enumerate() {
+            by_name.entry(package.name).or_default().push(index);
+        }
+        let mut seen_ids = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
+        let mut stack: Vec<usize> = by_name.get(root).cloned().unwrap_or_default();
+        while let Some(index) = stack.pop() {
+            let id = (packages[index].name, packages[index].version);
+            if !seen_ids.insert(id) {
+                continue;
+            }
+            names.insert(packages[index].name.to_string());
+            for dep in &packages[index].deps {
+                if packages[index].name == root
+                    && skip_from_root.iter().any(|name| name == dep.name)
+                {
+                    continue;
+                }
+                let Some(indexes) = by_name.get(dep.name) else {
+                    continue;
+                };
+                for &dep_index in indexes {
+                    if dep
+                        .version
+                        .is_none_or(|version| packages[dep_index].version == version)
+                    {
+                        stack.push(dep_index);
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    struct LockPackage<'a> {
+        name: &'a str,
+        version: &'a str,
+        deps: Vec<LockDep<'a>>,
+    }
+
+    struct LockDep<'a> {
+        name: &'a str,
+        version: Option<&'a str>,
+    }
+
+    fn lock_packages(lock: &str) -> Vec<LockPackage<'_>> {
+        lock.split("[[package]]")
+            .skip(1)
+            .filter_map(parse_lock_package)
+            .collect()
+    }
+
+    fn parse_lock_package(block: &str) -> Option<LockPackage<'_>> {
+        let name = field(block, "name")?;
+        let version = field(block, "version").unwrap_or("");
+        let deps = block
+            .split("dependencies = [")
+            .nth(1)
+            .and_then(|rest| rest.split("]").next())
+            .map(parse_dep_lines)
+            .unwrap_or_default();
+        Some(LockPackage {
+            name,
+            version,
+            deps,
+        })
+    }
+
+    fn field<'a>(block: &'a str, key: &str) -> Option<&'a str> {
+        let prefix = format!("{key} = \"");
+        let line = block
+            .lines()
+            .find(|line| line.trim().starts_with(&prefix))?;
+        let start = line.find('"')? + 1;
+        let end = line[start..].find('"')? + start;
+        Some(&line[start..end])
+    }
+
+    fn parse_dep_lines(block: &str) -> Vec<LockDep<'_>> {
+        block
+            .lines()
+            .filter_map(|line| {
+                let quoted = line.trim().trim_matches(',').trim().strip_prefix('"')?;
+                let spec = quoted.split('"').next()?.trim();
+                if spec.is_empty() {
+                    return None;
+                }
+                let mut parts = spec.split_whitespace();
+                let name = parts.next()?;
+                let version = parts.next();
+                Some(LockDep { name, version })
+            })
+            .collect()
     }
 
     #[test]
