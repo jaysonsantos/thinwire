@@ -1055,6 +1055,147 @@ async fn resend_posts_the_same_text_again() {
 }
 
 #[tokio::test]
+async fn an_older_socket_event_does_not_replace_the_preview() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000300.000200",
+        "U1",
+        "newer",
+    )));
+    h.until("newer preview", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.preview == "newer"
+        )
+    })
+    .await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000200.000100",
+        "U1",
+        "older",
+    )));
+    let message = h.message("older").await;
+    assert_eq!(message.body, "older");
+    let row = h.conversation("slack:C1").await;
+    assert_eq!(row.preview, "newer");
+}
+
+#[tokio::test]
+async fn deleting_an_unread_post_clears_the_badge() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000400.000100",
+        "U1",
+        "unread one",
+    )));
+    h.until("badge", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.unread == 1
+        )
+    })
+    .await;
+    h.socket.push(SlackInbound::Deleted {
+        channel: "C1".into(),
+        ts: "1700000400.000100".into(),
+    });
+    h.until("badge cleared", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.unread == 0
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_new_session_does_not_keep_posts_from_the_previous_one() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.history.insert(
+            "C1".into(),
+            vec![
+                post("C1", "1700000100.000100", "U1", "gone"),
+                post("C1", "1700000200.000100", "U1", "kept"),
+            ],
+        );
+    });
+    let mut h = Harness::new(api, vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.message("kept").await;
+    h.send(AdapterCommand::Disconnect {
+        protocol: ProtocolId::Slack,
+    });
+    h.status(AdapterStatus::Stubbed).await;
+    h.api.with(|state| {
+        state.history.insert(
+            "C1".into(),
+            vec![post("C1", "1700000200.000100", "U1", "kept")],
+        );
+    });
+    h.send(AdapterCommand::Connect {
+        protocol: ProtocolId::Slack,
+    });
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.message("kept").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000200.000100",
+        "U1",
+        "kept",
+    )));
+    h.until("row rank", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.preview == "kept"
+        )
+    })
+    .await;
+    h.socket.push(SlackInbound::Deleted {
+        channel: "C1".into(),
+        ts: "1700000200.000100".into(),
+    });
+    h.until("preview cleared", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.preview.is_empty()
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn socket_mode_messages_update_preview_and_unread_and_stop_on_disconnect() {
     let vault = installed_vault();
     vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);

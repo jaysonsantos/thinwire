@@ -267,7 +267,8 @@ where
     /// Channel the user is looking at. Inbound messages there stay read.
     viewing: Option<String>,
     /// Texts this session has shown, newest kept, so a delete can move the preview.
-    shown: HashMap<String, Vec<(String, String)>>,
+    /// The flag is true when that post increased `unread`.
+    shown: HashMap<String, Vec<(String, String, bool)>>,
 }
 
 impl<A, S, B> Session<A, S, B>
@@ -629,6 +630,7 @@ where
             emit_conversation_removed(&self.events, ProtocolId::Slack, id);
         }
         self.channels.clear();
+        self.shown.clear();
     }
 
     async fn revoked(&mut self) {
@@ -832,7 +834,7 @@ where
     async fn resend(&mut self, conversation: &str, message_id: &str, request: u64) {
         let text = channel_id(conversation).and_then(|channel| {
             self.shown.get(channel).and_then(|rows| {
-                rows.iter().find_map(|(ts, text)| {
+                rows.iter().find_map(|(ts, text, _)| {
                     (message_id == message_id_of(channel, ts)).then(|| text.clone())
                 })
             })
@@ -889,7 +891,7 @@ where
             text,
         );
         if let Some(rows) = self.shown.get_mut(channel)
-            && let Some(row) = rows.iter_mut().find(|(seen, _)| seen == ts)
+            && let Some(row) = rows.iter_mut().find(|(seen, _, _)| seen == ts)
         {
             row.1 = text.to_string();
         }
@@ -911,21 +913,27 @@ where
             conversation_id(channel),
             vec![message_id_of(channel, ts)],
         );
-        if let Some(rows) = self.shown.get_mut(channel) {
-            rows.retain(|(seen, _)| seen != ts);
-        }
+        let counted = self.drop_shown(channel, ts);
         let Some(row) = self.channels.get(channel) else {
             return;
         };
-        if ts_rank(ts) != row.order || row.order == 0 {
+        let latest = ts_rank(ts) == row.order && row.order != 0;
+        if !latest && !counted {
             return;
         }
         let next = self.shown.get(channel).and_then(|rows| {
             rows.iter()
-                .max_by_key(|(seen, _)| ts_rank(seen))
-                .map(|(seen, text)| (seen.clone(), text.clone()))
+                .max_by_key(|(seen, _, _)| ts_rank(seen))
+                .map(|(seen, text, _)| (seen.clone(), text.clone()))
         });
         let mut row = row.clone();
+        if counted {
+            row.unread = row.unread.saturating_sub(1);
+        }
+        if !latest {
+            self.upsert(channel.to_string(), row);
+            return;
+        }
         match next {
             Some((next_ts, text)) => {
                 row.preview = text;
@@ -947,6 +955,7 @@ where
         };
         let token = live.token.clone();
         let channel = post.channel.clone();
+        let post_ts = post.ts.clone();
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
         let message = self.chat_message(&token, post).await;
@@ -980,26 +989,49 @@ where
                 live.list_done = false;
                 live.next_cursor = None;
             }
+            if conversation.unread > 0 {
+                self.count_unread(&channel, &post_ts);
+            }
             self.upsert(channel, conversation);
             return;
         };
         let mut row = row.clone();
-        row.preview = preview;
-        row.order = row.order.max(order);
-        row.last_at = row.last_at.max(sent_at);
+        if order >= row.order {
+            row.preview = preview;
+            row.order = order;
+            row.last_at = sent_at;
+        }
         if !outbound && self.viewing.as_deref() != Some(channel.as_str()) {
             row.unread = row.unread.saturating_add(1);
+            self.count_unread(&channel, &post_ts);
         }
         self.upsert(channel, row);
     }
 
+    fn drop_shown(&mut self, channel: &str, ts: &str) -> bool {
+        let Some(rows) = self.shown.get_mut(channel) else {
+            return false;
+        };
+        let counted = rows.iter().any(|(seen, _, unread)| seen == ts && *unread);
+        rows.retain(|(seen, _, _)| seen != ts);
+        counted
+    }
+
+    fn count_unread(&mut self, channel: &str, ts: &str) {
+        if let Some(rows) = self.shown.get_mut(channel)
+            && let Some(row) = rows.iter_mut().find(|(seen, _, _)| seen == ts)
+        {
+            row.2 = true;
+        }
+    }
+
     fn remember(&mut self, post: &SlackPost) {
         let rows = self.shown.entry(post.channel.clone()).or_default();
-        if let Some(row) = rows.iter_mut().find(|(ts, _)| ts == &post.ts) {
+        if let Some(row) = rows.iter_mut().find(|(ts, _, _)| ts == &post.ts) {
             row.1.clone_from(&post.text);
             return;
         }
-        rows.push((post.ts.clone(), post.text.clone()));
+        rows.push((post.ts.clone(), post.text.clone(), false));
         let cap = usize::from(HISTORY_LIMIT);
         if rows.len() > cap {
             let extra = rows.len() - cap;
