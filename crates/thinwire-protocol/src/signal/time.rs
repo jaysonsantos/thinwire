@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 //! Signal timestamps are milliseconds. `ChatMessage::sent_at` is Unix seconds.
 
 #[must_use]

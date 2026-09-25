@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 //! Backoff after the Signal receive stream ends.
 //!
 //! An empty poll must not spin. The wait is sliced so shutdown can stop it.
