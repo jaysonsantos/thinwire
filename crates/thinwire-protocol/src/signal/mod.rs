@@ -19,13 +19,13 @@ mod live;
 #[cfg(feature = "signal-local")]
 use std::sync::Arc;
 
+#[cfg(feature = "signal-local")]
+use crate::adapter::{AccountState, emit_account};
 use crate::adapter::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
     ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, emit_conversation,
     emit_message, emit_status, emit_stopped,
 };
-#[cfg(feature = "signal-local")]
-use crate::adapter::{AccountState, emit_account};
 
 #[cfg(not(feature = "signal-local"))]
 use device::FeatureOff;
