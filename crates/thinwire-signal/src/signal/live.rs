@@ -89,6 +89,11 @@ impl Session {
         self.sent.lock().await.get(message_id).cloned()
     }
 
+    /// Drop a cancel permit left by a worker that was not waiting.
+    pub(super) fn clear_cancel(&self) {
+        self.cancel.clear();
+    }
+
     /// Advance the generation. This does not wake `CancelWake`.
     /// Startup calls it before any task waits, so a stored permit cannot
     /// cancel the new receive loop.

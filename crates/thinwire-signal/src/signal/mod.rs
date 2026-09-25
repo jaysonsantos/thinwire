@@ -184,7 +184,7 @@ impl SignalAdapter {
         let Engine::Live(session) = &self.engine else {
             return None;
         };
-        session.cancel.clear();
+        session.clear_cancel();
         let token = session.bump_generation();
         session.mark_active();
         let session = Arc::clone(session);
@@ -227,13 +227,25 @@ impl SignalAdapter {
         if let Engine::Live(session) = &self.engine {
             session.next_generation();
             let session = Arc::clone(session);
-            if let Some(worker) = self.worker.take() {
-                finish_worker(worker, SHUTDOWN_LIMIT);
-            }
+            let worker = self.worker.take();
+            let events = events.clone();
             tokio::spawn(async move {
+                if let Some(worker) = worker {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        finish_worker(worker, SHUTDOWN_LIMIT);
+                    })
+                    .await;
+                }
                 session.shutdown().await;
+                emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
+                emit_status(
+                    &events,
+                    ProtocolId::Signal,
+                    AdapterStatus::Stubbed,
+                    "Signal linking cancelled. No session is running.",
+                );
             });
-            emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
+            return Ok(());
         }
         emit_status(
             events,
@@ -446,7 +458,7 @@ fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
     });
     if rx.recv_timeout(limit).is_err() {
         abort.abort();
-        let _ = rx.recv();
+        let _ = rx.recv_timeout(limit);
     }
 }
 
@@ -495,7 +507,10 @@ impl ProtocolAdapter for SignalAdapter {
                 tokio::spawn(async move {
                     session.shutdown().await;
                     if let Some(worker) = worker {
-                        finish_worker(worker, SHUTDOWN_LIMIT);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            finish_worker(worker, SHUTDOWN_LIMIT);
+                        })
+                        .await;
                     }
                     emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
                     emit_stopped(&events, ProtocolId::Signal);
@@ -934,10 +949,7 @@ mod tests {
         let mut adapter = SignalAdapter::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         adapter.shutdown(&tx);
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("Stopped in time")
-            .expect("channel open");
+        let event = stopped_event(&mut rx).await;
         assert_eq!(
             event,
             AdapterEvent::Stopped {
@@ -985,10 +997,7 @@ mod tests {
             "Stopped waits for the worker"
         );
         release_tx.send(()).expect("release");
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("Stopped in time")
-            .expect("channel open");
+        let event = stopped_event(&mut rx).await;
         assert!(matches!(
             event,
             AdapterEvent::Stopped {
@@ -998,44 +1007,54 @@ mod tests {
     }
 
     #[cfg(feature = "signal-local")]
-    #[test]
-    fn cancel_joins_the_linking_worker_before_it_returns() {
+    #[tokio::test]
+    async fn cancel_joins_the_linking_worker_before_it_returns() {
         let mut adapter = SignalAdapter::new();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let _ = release_rx.recv();
         });
-        let abort = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(async { tokio::spawn(async {}).abort_handle() });
+        let abort = tokio::spawn(async {}).abort_handle();
         adapter.install_worker_for_test(SignalWorker {
             thread: handle,
             abort,
         });
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-            runtime.block_on(async move {
-                adapter.cancel_link(&tx).expect("cancel");
-            });
-            done_tx.send(()).expect("done");
-        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter.cancel_link(&tx).expect("cancel");
         assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_millis(200))
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
                 .is_err(),
-            "Cancel waits for the linking worker"
+            "Cancel status waits for the linking worker"
         );
         release_tx.send(()).expect("release");
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("worker ended");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("status in time")
+            .expect("channel open");
+        assert!(matches!(
+            event,
+            AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Unlinked,
+            }
+        ));
+    }
+}
+
+#[cfg(test)]
+async fn stopped_event(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<thinwire_protocol::AdapterEvent>,
+) -> thinwire_protocol::AdapterEvent {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let event = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("Stopped in time")
+            .expect("channel open");
+        if matches!(event, thinwire_protocol::AdapterEvent::Stopped { .. }) {
+            return event;
+        }
     }
 }
 
