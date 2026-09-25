@@ -283,8 +283,8 @@ pub struct AccountRow {
     pub linked: bool,
 }
 
-/// Why `sync_focused_row` runs. A query change or a highlight move always scrolls.
-/// A list change scrolls only when the visible ids differ.
+/// Why `sync_focused_row` runs. A search change or a key move always scrolls.
+/// A list change scrolls only when the highlight's visible index changes.
 enum FocusFollow {
     Query,
     List,
@@ -927,7 +927,7 @@ impl Snapshot {
         {
             self.select_protocol(first);
         }
-        self.sync_focused_row(FocusFollow::Query);
+        self.sync_focused_row(FocusFollow::List);
     }
 
     /// New inbox search. A highlight that the query hides is cleared.
@@ -1634,10 +1634,10 @@ impl Snapshot {
         self.sync_focused_row(FocusFollow::List);
     }
 
-    /// Keep the highlight on a visible row, and request a scroll when it must move on screen.
+    /// Keep the highlight on a visible row.
     ///
-    /// While a highlight exists, a search or filter change, a visible-list change,
-    /// or a move of the highlight sets `scroll_to_focused`.
+    /// Set `scroll_to_focused` when the highlight moves by key, when the search
+    /// text changes, or when the highlight's visible index changes.
     fn sync_focused_row(&mut self, reason: FocusFollow) {
         let ids = self.visible_ids();
         let kept = self
@@ -1655,8 +1655,17 @@ impl Snapshot {
     fn highlight_needs_scroll(&self, reason: FocusFollow, ids: &[String]) -> bool {
         match reason {
             FocusFollow::Query | FocusFollow::Moved => true,
-            FocusFollow::List => self.seen_visible_ids != ids,
+            FocusFollow::List => self.highlight_index_changed(ids),
         }
+    }
+
+    fn highlight_index_changed(&self, ids: &[String]) -> bool {
+        let Some(id) = self.focused_row.as_deref() else {
+            return false;
+        };
+        let old = self.seen_visible_ids.iter().position(|row| row == id);
+        let new = ids.iter().position(|row| row == id);
+        old.is_some() && new.is_some() && old != new
     }
 
     fn visible_ids(&self) -> Vec<String> {
@@ -2314,7 +2323,7 @@ mod tests {
     }
 
     #[test]
-    fn a_highlight_scrolls_on_search_resort_and_filter() {
+    fn a_highlight_scrolls_only_when_its_place_changes() {
         let store = SecretStore::memory();
         let mut snapshot = Snapshot::new();
         complete_telegram(&mut snapshot, &store);
@@ -2327,16 +2336,16 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(3, "Cara", 10),
         });
-        snapshot.set_search("Cara".into());
-        snapshot.move_inbox_selection(1);
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
+        snapshot.move_inbox_selection(-1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
         assert!(snapshot.take_scroll_to_focused());
 
-        snapshot.set_search(String::new());
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(4, "Dee", 1),
+        });
         assert!(
-            snapshot.take_scroll_to_focused(),
-            "clearing a narrow search scrolls the highlight"
+            !snapshot.wants_scroll_to_focused(),
+            "a row below the highlight does not scroll"
         );
 
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -2344,14 +2353,16 @@ mod tests {
         });
         assert!(
             snapshot.take_scroll_to_focused(),
-            "a resort scrolls the highlight"
+            "a resort that moves the highlight scrolls"
         );
 
-        snapshot.set_filter(InboxFilter::Telegram);
-        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
+        snapshot.set_search("Ada".into());
+        assert!(snapshot.take_scroll_to_focused());
+        snapshot.set_search(String::new());
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
         assert!(
             snapshot.take_scroll_to_focused(),
-            "a filter change scrolls the highlight"
+            "clearing a search scrolls the highlight"
         );
     }
 
