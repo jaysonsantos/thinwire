@@ -64,6 +64,9 @@ struct PendingLoad {
 ///   value they started with. If it moved, the result is dropped in this step
 ///   and does not unlink whatever session replaced it. Channel previews are
 ///   part of the reload result on this path, not a second task.
+/// - Once `revoked` is set, a send is not inserted. `register_send` queues
+///   `SendRejected` in that step, and if `Unlinked` is not queued yet it queues
+///   that rejection first. No send is registered for a revoked generation.
 #[derive(Debug, Default)]
 struct Shared {
     bot_id: Option<u64>,
@@ -82,6 +85,9 @@ struct Shared {
     generation: u64,
     /// A 401 revoked the token. The adapter drops this session on the next command.
     revoked: bool,
+    /// A 401 rejected tracked work and has not queued `Unlinked` yet.
+    /// `register_send` puts its `SendRejected` ahead of that event.
+    pending_unlink: Option<DiscordApiError>,
     /// Send tasks still running. Shutdown waits until this is zero.
     send_tasks: u64,
     send_idle: Arc<Notify>,
@@ -169,6 +175,7 @@ impl Session {
                 reload_ticket: 0,
                 generation,
                 revoked: false,
+                pending_unlink: None,
                 send_tasks: 0,
                 send_idle: Arc::new(Notify::new()),
             })),
@@ -218,7 +225,15 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
-                    finish_reload(&shared, &gate, generation, &events, error);
+                    if finish_reload(&shared, generation, &events, error) {
+                        seal_unlink(api.as_ref(), &shared, &gate, &events).await;
+                        emit_status(
+                            &events,
+                            ProtocolId::Discord,
+                            AdapterStatus::Error,
+                            format!("Discord bot inbox did not load: {error}"),
+                        );
+                    }
                 }
             }
         });
@@ -315,39 +330,45 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord history failed");
-                    let Ok(mut state) = shared.lock() else {
-                        drop_load(&shared, &conversation_id);
-                        emit_command_failed(
-                            &events,
-                            ProtocolId::Discord,
-                            Some(conversation_id.clone()),
-                            format!("History did not load: {error}."),
-                        );
-                        emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
-                        return;
-                    };
-                    if state.generation != generation {
-                        drop(state);
-                        finish_replaced_load(&shared, &events, conversation_id);
-                        return;
-                    }
-                    if error == DiscordApiError::Unauthorized {
-                        if !state.revoked {
-                            settle_unauthorized(&mut state, &gate, &events, error);
+                    let unauthorized = {
+                        let Ok(mut state) = shared.lock() else {
+                            drop_load(&shared, &conversation_id);
+                            emit_command_failed(
+                                &events,
+                                ProtocolId::Discord,
+                                Some(conversation_id.clone()),
+                                format!("History did not load: {error}."),
+                            );
+                            emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
+                            return;
+                        };
+                        if state.generation != generation {
+                            drop(state);
+                            finish_replaced_load(&shared, &events, conversation_id);
+                            return;
                         }
-                        return;
+                        if error == DiscordApiError::Unauthorized {
+                            if !state.revoked {
+                                settle_unauthorized(&mut state, &events, error);
+                            }
+                            true
+                        } else if state.revoked {
+                            false
+                        } else {
+                            drop_load_locked(&mut state, &conversation_id);
+                            emit_command_failed(
+                                &events,
+                                ProtocolId::Discord,
+                                Some(conversation_id.clone()),
+                                format!("History did not load: {error}."),
+                            );
+                            emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
+                            false
+                        }
+                    };
+                    if unauthorized {
+                        seal_unlink(api.as_ref(), &shared, &gate, &events).await;
                     }
-                    if state.revoked {
-                        return;
-                    }
-                    drop_load_locked(&mut state, &conversation_id);
-                    emit_command_failed(
-                        &events,
-                        ProtocolId::Discord,
-                        Some(conversation_id.clone()),
-                        format!("History did not load: {error}."),
-                    );
-                    emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                 }
             }
         });
@@ -419,7 +440,10 @@ impl Session {
             return Ok(None);
         };
         if state.revoked {
+            // This generation is already revoked. Reject here and do not insert.
+            // When `Unlinked` is still pending, it is queued after this rejection.
             emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
+            publish_unlink(&mut state, &self.gate, events);
             return Ok(None);
         }
         let (access, bot_id) = match (state.channels.get(conversation_id), state.bot_id) {
@@ -608,42 +632,46 @@ fn publish_channels(
 ///
 /// A 401 from this generation unlinks. A result whose generation already
 /// moved is dropped, so it cannot unlink the session that replaced it.
+/// `true` when this generation's list failed with 401. The caller then seals
+/// `Unlinked` and emits the error status, after a send waiting on the lock
+/// has queued its `SendRejected`.
 fn finish_reload(
     shared: &Arc<Mutex<Shared>>,
-    gate: &Gate,
     generation: u64,
     events: &EventTx,
     error: DiscordApiError,
-) {
+) -> bool {
     let Ok(mut state) = shared.lock() else {
-        return;
+        return false;
     };
     if state.generation != generation {
-        return;
+        return false;
     }
     if error == DiscordApiError::Unauthorized {
         if !state.revoked {
-            settle_unauthorized(&mut state, gate, events, error);
+            settle_unauthorized(&mut state, events, error);
         }
-    } else {
-        emit_command_failed(
-            events,
-            ProtocolId::Discord,
-            None,
-            format!("Discord bot inbox did not load: {error}"),
-        );
+        return true;
     }
+    emit_command_failed(
+        events,
+        ProtocolId::Discord,
+        None,
+        format!("Discord bot inbox did not load: {error}"),
+    );
     emit_status(
         events,
         ProtocolId::Discord,
         AdapterStatus::Error,
         format!("Discord bot inbox did not load: {error}"),
     );
+    false
 }
 
-/// Caller holds the session lock. Queues every still-tracked result, then
-/// `Unlinked`, before that lock is released.
-fn settle_unauthorized(state: &mut Shared, gate: &Gate, events: &EventTx, error: DiscordApiError) {
+/// Caller holds the session lock. Queues every still-tracked result and leaves
+/// `Unlinked` pending, so a `register_send` that takes the lock next can queue
+/// its `SendRejected` first.
+fn settle_unauthorized(state: &mut Shared, events: &EventTx, error: DiscordApiError) {
     state.revoked = true;
     let sends = std::mem::take(&mut state.inflight);
     let loads = std::mem::take(&mut state.loads);
@@ -665,9 +693,36 @@ fn settle_unauthorized(state: &mut Shared, gate: &Gate, events: &EventTx, error:
         );
         emit_history_loaded(events, ProtocolId::Discord, load.conversation_id);
     }
+    if state.pending_unlink.is_none() {
+        state.pending_unlink = Some(error);
+    }
+}
+
+/// Queues `Unlinked` for this generation. A no-op once it has been queued.
+fn publish_unlink(state: &mut Shared, gate: &Gate, events: &EventTx) {
+    let Some(error) = state.pending_unlink.take() else {
+        return;
+    };
     emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
     emit_notice(events, ProtocolId::Discord, error.reason());
     gate.invalidate();
+}
+
+/// Lets a send blocked on the session lock reject itself, then queues `Unlinked`
+/// if that send did not.
+async fn seal_unlink(
+    api: &dyn DiscordApi,
+    shared: &Arc<Mutex<Shared>>,
+    gate: &Gate,
+    events: &EventTx,
+) {
+    tokio::task::yield_now().await;
+    if let Some(hold) = api.unlink_pause() {
+        hold.notified().await;
+    }
+    if let Ok(mut state) = shared.lock() {
+        publish_unlink(&mut state, gate, events);
+    }
 }
 
 fn session_revoked(shared: &Arc<Mutex<Shared>>) -> bool {
@@ -735,6 +790,12 @@ async fn finish_send(
     returned: ReturnedSend,
 ) {
     let queued = queue_send_result(shared, gate, events, returned);
+    let needs_seal = shared
+        .lock()
+        .is_ok_and(|state| state.pending_unlink.is_some());
+    if needs_seal {
+        seal_unlink(api, shared, gate, events).await;
+    }
     if queued {
         // The result is already on the channel. A test can run a 401 here.
         if let Some(pause) = api.send_result_pause() {
@@ -816,7 +877,7 @@ fn queue_send_result(
             );
             emit_send_rejected(events, ProtocolId::Discord, &conversation_id, request);
             if error == DiscordApiError::Unauthorized {
-                settle_unauthorized(&mut state, gate, events, error);
+                settle_unauthorized(&mut state, events, error);
             } else {
                 emit_ready(events, &format!("Send failed: {error}."));
             }

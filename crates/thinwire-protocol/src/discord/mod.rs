@@ -1760,6 +1760,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_send_that_registers_after_the_401_step_is_rejected_before_unlink() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().hold_unlink = Some(Arc::clone(&hold));
+        api.state().unlink_at_barrier = Some(Arc::clone(&arrived));
+        api.state().unauthorized = true;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("401 is waiting to unlink");
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                    body: "keep me".into(),
+                    request: 9,
+                },
+                &tx,
+            )
+            .expect("send");
+        hold.notify_one();
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Notice { .. })
+        })
+        .await;
+        let rejected = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::SendRejected { request: 9, .. }))
+            .expect("rejected");
+        let unlinked = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )
+            })
+            .expect("unlinked");
+        assert!(
+            rejected < unlinked,
+            "SendRejected is queued before Unlinked"
+        );
+        assert!(
+            api.state().sent.is_empty(),
+            "a revoked generation does not register the send"
+        );
+    }
+
+    #[tokio::test]
     async fn read_only_and_unknown_channels_refuse_send() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;

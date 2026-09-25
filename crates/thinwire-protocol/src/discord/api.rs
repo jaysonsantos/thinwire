@@ -126,6 +126,14 @@ pub(crate) trait DiscordApi: Send + Sync {
     fn send_result_pause(&self) -> Option<Arc<SendResultPause>> {
         None
     }
+
+    /// Set by tests. The live client leaves this empty.
+    ///
+    /// The 401 step waits here after it has marked the generation revoked and
+    /// before it queues `Unlinked`, so a send can reject itself first.
+    fn unlink_pause(&self) -> Option<Arc<Notify>> {
+        None
+    }
 }
 
 /// Test barrier between a queued send result and the task ending.

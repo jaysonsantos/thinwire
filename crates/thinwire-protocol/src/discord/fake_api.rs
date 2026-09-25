@@ -41,6 +41,10 @@ pub(crate) struct FakeState {
     pub hold_channels: Option<Arc<Notify>>,
     /// Fired when `channels` is about to wait on `hold_channels`.
     pub channels_at_barrier: Option<Arc<Notify>>,
+    /// Pauses the 401 step after revocation and before `Unlinked`.
+    pub hold_unlink: Option<Arc<Notify>>,
+    /// Fired when that pause is about to wait.
+    pub unlink_at_barrier: Option<Arc<Notify>>,
     pub next_id: u64,
 }
 
@@ -245,6 +249,15 @@ impl DiscordApi for FakeDiscordApi {
 
     fn send_result_pause(&self) -> Option<Arc<SendResultPause>> {
         self.send_result_pause.clone()
+    }
+
+    fn unlink_pause(&self) -> Option<Arc<Notify>> {
+        let state = self.state();
+        let hold = state.hold_unlink.clone()?;
+        if let Some(arrived) = state.unlink_at_barrier.clone() {
+            arrived.notify_one();
+        }
+        Some(hold)
     }
 
     fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary> {
