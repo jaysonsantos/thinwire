@@ -9,6 +9,8 @@ mod theme;
 mod theme_mode;
 mod thread_layout;
 mod ui;
+#[cfg(all(test, feature = "ui-snapshots"))]
+mod ui_snapshots;
 #[cfg(test)]
 mod ui_tests;
 #[cfg(feature = "whatsapp-web")]
