@@ -231,8 +231,9 @@ fn theme_control(ui: &mut egui::Ui, current: ThemeMode, out: &mut Vec<Intent>) {
 fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let notice = keychain_notice(snapshot.persistence());
     let show_error = snapshot.auth == AuthScreen::Idle && snapshot.error.is_some();
+    let line = snapshot.status_line();
     let show_status = !snapshot.status_is_idle()
-        && public_status(&snapshot.status_text).is_some_and(|text| !is_idle_status(text));
+        && public_status(&line).is_some_and(|text| !is_idle_status(text));
     // Idle chrome with no notice and no error draws no panel, so the strip is 0 px.
     if !status_strip_visible(snapshot, notice) {
         return;
@@ -240,10 +241,12 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let mut dismiss = false;
     egui::Panel::top("status").show(ui, |ui| {
         let palette = theme::palette(ui);
-        if show_status && let Some(text) = public_status(&snapshot.status_text) {
-            let color = if load_failure_text(&snapshot.status_text).is_some() {
+        // One line: a running load of any protocol first, never a finished
+        // Ready line while a load runs (#80).
+        if show_status && let Some(text) = public_status(&line) {
+            let color = if load_failure_text(&line).is_some() {
                 palette.error
-            } else if text == "Sending…" || text == "Refreshing…" {
+            } else if snapshot.is_loading() || text == "Refreshing…" {
                 palette.warn
             } else {
                 palette.text2
@@ -342,8 +345,9 @@ fn is_idle_status(text: &str) -> bool {
 /// True when the status strip draws a panel.
 pub(super) fn status_strip_visible(snapshot: &Snapshot, notice: Option<&str>) -> bool {
     let show_error = snapshot.auth == AuthScreen::Idle && snapshot.error.is_some();
+    let line = snapshot.status_line();
     let show_status = !snapshot.status_is_idle()
-        && public_status(&snapshot.status_text).is_some_and(|text| !is_idle_status(text));
+        && public_status(&line).is_some_and(|text| !is_idle_status(text));
     let note = snapshot.notice(snapshot.selected_protocol).is_some();
     notice.is_some() || show_error || show_status || note
 }
