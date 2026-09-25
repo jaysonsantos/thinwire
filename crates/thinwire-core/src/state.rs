@@ -283,6 +283,14 @@ pub struct AccountRow {
     pub linked: bool,
 }
 
+/// Why `sync_focused_row` runs. A query change or a highlight move always scrolls.
+/// A list change scrolls only when the visible ids differ.
+enum FocusFollow {
+    Query,
+    List,
+    Moved,
+}
+
 /// App state. `Debug` is manual: it prints no secret and no user text.
 pub struct Snapshot {
     pub accounts: Vec<AccountRow>,
@@ -322,6 +330,8 @@ pub struct Snapshot {
     history_loading: HashSet<String>,
     scroll_to_selected: bool,
     scroll_to_focused: bool,
+    /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
+    seen_visible_ids: Vec<String>,
     /// Unsent compose text per chat. `compose` holds the selected chat's draft.
     drafts: HashMap<String, String>,
     focus_compose: bool,
@@ -437,6 +447,7 @@ impl Snapshot {
             history_loading: HashSet::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
+            seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
             focus_compose: false,
             stopped: HashSet::new(),
@@ -513,10 +524,6 @@ impl Snapshot {
                 let selected = (self.selected_protocol == protocol)
                     .then(|| self.selected_conversation.clone())
                     .flatten();
-                let focused = (self.selected_protocol == protocol)
-                    .then(|| self.focused_row.clone())
-                    .flatten();
-                let focus_before = focused.as_deref().and_then(|id| self.visible_index(id));
                 {
                     let list = self.conversations.entry(protocol).or_default();
                     let before = selected
@@ -535,12 +542,8 @@ impl Snapshot {
                         self.scroll_to_selected = true;
                     }
                 }
-                let focus_after = focused.as_deref().and_then(|id| self.visible_index(id));
-                if focus_before.is_some() && focus_after.is_some() && focus_before != focus_after {
-                    self.scroll_to_focused = true;
-                }
                 self.ensure_conversation_selection();
-                self.sync_focused_row();
+                self.sync_focused_row(FocusFollow::List);
             }
             AdapterEvent::MessageDelivery {
                 protocol,
@@ -790,7 +793,7 @@ impl Snapshot {
             return;
         }
         self.focused_row = Some(id);
-        self.scroll_to_focused = true;
+        self.sync_focused_row(FocusFollow::Moved);
     }
 
     /// Change the selected chat. The compose text stays with the chat it was typed in.
@@ -909,6 +912,9 @@ impl Snapshot {
     }
 
     pub fn set_filter(&mut self, filter: InboxFilter) {
+        if self.filter == filter {
+            return;
+        }
         self.filter = filter;
         if !filter.matches(self.selected_protocol)
             && let Some(first) = self
@@ -921,7 +927,7 @@ impl Snapshot {
         {
             self.select_protocol(first);
         }
-        self.sync_focused_row();
+        self.sync_focused_row(FocusFollow::Query);
     }
 
     /// New inbox search. A highlight that the query hides is cleared.
@@ -930,7 +936,7 @@ impl Snapshot {
             return;
         }
         self.search = text;
-        self.sync_focused_row();
+        self.sync_focused_row(FocusFollow::Query);
     }
 
     /// Discord inbox chrome when feature `discord-bot` is compiled.
@@ -957,13 +963,6 @@ impl Snapshot {
     #[must_use]
     pub fn shows_in_switcher(&self, protocol: ProtocolId) -> bool {
         self.filter.shows_in_switcher(protocol) && self.account_surface_visible(protocol)
-    }
-
-    /// Place of `id` in the filtered inbox. `None` when the search hides it.
-    fn visible_index(&self, id: &str) -> Option<usize> {
-        self.visible_conversations()
-            .iter()
-            .position(|row| row.id == id)
     }
 
     pub fn visible_conversations(&self) -> Vec<&Conversation> {
@@ -1632,18 +1631,39 @@ impl Snapshot {
             self.selected_conversation = None;
             self.ensure_conversation_selection();
         }
-        self.sync_focused_row();
+        self.sync_focused_row(FocusFollow::List);
     }
 
-    /// Drop the keyboard highlight when it is not in the visible rows.
-    fn sync_focused_row(&mut self) {
-        let visible = self
+    /// Keep the highlight on a visible row, and request a scroll when it must move on screen.
+    ///
+    /// While a highlight exists, a search or filter change, a visible-list change,
+    /// or a move of the highlight sets `scroll_to_focused`.
+    fn sync_focused_row(&mut self, reason: FocusFollow) {
+        let ids = self.visible_ids();
+        let kept = self
             .focused_row
             .as_ref()
-            .is_some_and(|id| self.visible_conversations().iter().any(|row| &row.id == id));
-        if !visible {
+            .is_some_and(|id| ids.iter().any(|row| row == id));
+        if !kept {
             self.focused_row = None;
+        } else if self.highlight_needs_scroll(reason, &ids) {
+            self.scroll_to_focused = true;
         }
+        self.seen_visible_ids = ids;
+    }
+
+    fn highlight_needs_scroll(&self, reason: FocusFollow, ids: &[String]) -> bool {
+        match reason {
+            FocusFollow::Query | FocusFollow::Moved => true,
+            FocusFollow::List => self.seen_visible_ids != ids,
+        }
+    }
+
+    fn visible_ids(&self) -> Vec<String> {
+        self.visible_conversations()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect()
     }
 
     /// The highlight, when it is one of the rows on screen. Enter uses this.
@@ -2279,18 +2299,67 @@ mod tests {
         snapshot.set_search("a".into());
         snapshot.move_inbox_selection(1);
         assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
-        assert_eq!(snapshot.visible_index("telegram:3"), Some(1));
+        assert_eq!(visible_place(&snapshot, "telegram:3"), Some(1));
         assert!(snapshot.take_scroll_to_focused());
 
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(2, "Bea", 20),
         });
         assert_eq!(
-            snapshot.visible_index("telegram:3"),
+            visible_place(&snapshot, "telegram:3"),
             Some(2),
             "Bea joins the filtered list above Cara"
         );
         assert!(snapshot.take_scroll_to_focused());
+    }
+
+    #[test]
+    fn a_highlight_scrolls_on_search_resort_and_filter() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, &store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 30),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 20),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(3, "Cara", 10),
+        });
+        snapshot.set_search("Cara".into());
+        snapshot.move_inbox_selection(1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
+        assert!(snapshot.take_scroll_to_focused());
+
+        snapshot.set_search(String::new());
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
+        assert!(
+            snapshot.take_scroll_to_focused(),
+            "clearing a narrow search scrolls the highlight"
+        );
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 5),
+        });
+        assert!(
+            snapshot.take_scroll_to_focused(),
+            "a resort scrolls the highlight"
+        );
+
+        snapshot.set_filter(InboxFilter::Telegram);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
+        assert!(
+            snapshot.take_scroll_to_focused(),
+            "a filter change scrolls the highlight"
+        );
+    }
+
+    fn visible_place(snapshot: &Snapshot, id: &str) -> Option<usize> {
+        snapshot
+            .visible_conversations()
+            .iter()
+            .position(|row| row.id == id)
     }
 
     fn outgoing(chat: i64, id: i64, body: &str, delivery: Delivery) -> ChatMessage {
