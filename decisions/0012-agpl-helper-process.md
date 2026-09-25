@@ -2,7 +2,7 @@
 
 **Status:** proposed
 
-**Refs:** issue #38, ADR [0004](0004-signal-out-of-v1.md), ADR [0010](0010-frontend-independent-core.md), ADR [0011](0011-agpl-protocols-local-only.md)
+**Refs:** issue #38, issue #77, ADR [0004](0004-signal-out-of-v1.md), ADR [0010](0010-frontend-independent-core.md), ADR [0011](0011-agpl-protocols-local-only.md)
 
 **Date:** 2026-09-25
 
@@ -19,6 +19,11 @@ Issue #38 asks one question: can a separate AGPL helper process carry WhatsApp a
 
 This ADR is an engineering analysis. It is not legal advice. Section 1 lists the questions for a lawyer.
 
+User decisions of 2026-09-25 that apply here:
+
+- All code stays in this repository. AGPL code goes into its own crate folders with an AGPL license file (issue #77).
+- Public CI can download AGPL source, for example the git dependencies in `Cargo.lock`.
+
 ## Options
 
 1. **Go:** build the helper now. Release builds offer WhatsApp and Signal through it.
@@ -32,7 +37,7 @@ The helper is a separate program only if the boundary is a real program boundary
 - The helper is its own executable. The app does not link it, load it as a library, or share memory with it.
 - The two programs talk only through a documented message protocol over a pipe. They exchange messages (chats, messages, statuses). They do not exchange internal data structures.
 - The app works without the helper. Telegram, Discord, and Slack need no helper.
-- The helper has its own repository, license file, version, and release.
+- The helper is its own crate in this repository, with its own AGPL license file, version, and release artifact (issue #77).
 
 The FSF GPL FAQ ("aggregate" and "plug-ins" entries) states that pipes, sockets, and command-line arguments are normally a boundary between separate programs. It also states that the semantics of the exchange count. A protocol that sends complex internal data structures can make two processes one program. The design below keeps the protocol small and at the level of user-visible data.
 
@@ -42,7 +47,7 @@ Questions for a lawyer, before any release build offers the helper:
 
 1. Is a JSON-lines protocol over the helper's stdin and stdout, at the level of section 2 below, a boundary between separate programs?
 2. Can the MIT app start the helper as a child process, and can it download or find the helper? Or must the user install the helper as a separate step?
-3. Can one release page offer both the MIT app zip and the AGPL helper zip? Does a source tarball of the same tag satisfy the source offer?
+3. Can one release page of this repository offer both the MIT app zip and the AGPL helper zip? Does a source tarball of the same tag satisfy the source offer?
 4. `whatsapp-rust` calls itself MIT, but it links AGPL files. What license applies to a helper binary that links it? Is AGPL-3.0-only for the full helper enough?
 5. Does the MIT `thinwire-ipc` crate (section 2) stay MIT when the AGPL helper uses it?
 
@@ -80,7 +85,9 @@ On the app side, one MIT `HelperAdapter` implements `ProtocolAdapter` for each p
 
 The helper must follow the adapter contract of ADR 0010: `Account { Linked / Linking / Unlinked }` before inbox events, one `SendAccepted` or `SendRejected` per `request`, `CommandFailed`, `Notice`, and the pairing `generation` on each QR and pair-code event.
 
-WhatsApp commands on the wire: `Connect`, `LoadChats`, `OpenChat`, `SendText`, `ResendMessage`, `WhatsAppAcknowledgeRisk`, `WhatsAppBeginLink { generation }`, `WhatsAppCancelLink`. Signal uses the same list with its own pairing commands from #39.
+WhatsApp commands on the wire: `Connect`, `Disconnect`, `LoadChats`, `OpenChat`, `SendText`, `ResendMessage`, `WhatsAppAcknowledgeRisk`, `WhatsAppBeginLink { generation }`, `WhatsAppCancelLink`. Signal uses the same list with its own pairing commands from #39.
+
+`Disconnect` is a log out. The helper ends the linked session, deletes its session store, and sends `Account { Unlinked }`. A stop or a restart of the helper is not a log out: the session store stays, and the account links again at the next start. `WhatsAppCancelLink` only stops a pairing that is not complete.
 
 ### Secrets on the wire
 
@@ -92,12 +99,13 @@ WhatsApp commands on the wire: `Connect`, `LoadChats`, `OpenChat`, `SendText`, `
 ### Failure
 
 - The helper exits or sends a line that does not parse: the `HelperAdapter` sends `Account { Linking }` and a `Notice`. It starts the helper again after 1 s, 2 s, 4 s, and so on, up to 60 s. After 5 failures it stops and sends `Account { Unlinked }` with a note.
-- Every open `SendText` gets `SendRejected` after a restart (ADR 0010 rule 4).
+- After a restart, every open request with a request id gets `SendRejected`: each `SendText` and each `ResendMessage` (ADR 0010 rule 4). The `HelperAdapter` keeps the open request ids for this, so no send or retry stays pending.
 - The helper is not installed: the app does not offer WhatsApp or Signal. It shows one line in Add account: "Needs the thinwire helper (AGPL). See the README."
 
 ## 3. Distribution
 
-- A separate repository, for example `thinwire-helper`, with license AGPL-3.0-only. It depends on the MIT `thinwire-ipc` crate at a pinned version.
+- A separate crate in this repository, for example `crates/thinwire-helper/`, with its own `LICENSE` file (AGPL-3.0-only) and `license = "AGPL-3.0-only"` in its manifest (issue #77). It depends on the MIT `thinwire-ipc` crate in the same workspace.
+- The MIT app crates never depend on the helper crate. A CI guard checks `cargo tree` of the app for the AGPL crates, as ADR 0011 requires.
 - A separate release artifact for each OS: `thinwire-helper-<version>-<os>-<arch>.zip`, plus the source tarball of the same tag. The release page links the source. This is the source offer.
 - The app zip never contains the helper. The user installs the helper as a separate step. This keeps the app release free of AGPL code, as ADR 0004 and ADR 0011 require. Section 1, question 2, can relax this later.
 - Discovery: the app looks for the helper at a fixed path under the app-data folder, then on `PATH`. A setting can name another path. The app does not download the helper.
@@ -112,7 +120,7 @@ WhatsApp commands on the wire: `Connect`, `LoadChats`, `OpenChat`, `SendText`, `
 - The helper listens on no port and no socket. Only its parent process can talk to it.
 - The helper checks each line: size limit, known type, known protocol. It closes on a bad line.
 - Logs: the helper writes to stderr. The app reads stderr and writes it at level `debug` with the prefix `helper:`. The helper never writes message text, phone numbers, QR data, or pair codes.
-- Supply chain: the helper pins `whatsapp-rust` by git rev (as the app does today) and pins Presage and libsignal. Its CI runs `cargo deny` for advisories. Its license check allows AGPL.
+- Supply chain: the helper pins `whatsapp-rust` by git rev (as the app does today) and pins Presage and libsignal. Its CI jobs run `cargo deny` for advisories. The license check allows AGPL for the helper crates only.
 - The WhatsApp ToS and ban risk do not change. The full-screen ban gate stays in the app, before any pairing command goes to the helper. The README risk bullets stay verbatim.
 
 ## 5. Cost
@@ -123,14 +131,14 @@ These are estimates for one engineer. They include tests and CI, but not the leg
 | --- | --- |
 | `thinwire-ipc` crate: wire types, framing, version check, tests | 2 to 3 days |
 | `HelperAdapter` in the app: spawn, restart with backoff, discovery, settings | 3 to 4 days |
-| Helper skeleton: stdin/stdout loop, WhatsApp adapter moved from `crates/thinwire-protocol/src/whatsapp/` | 3 to 5 days |
+| Helper skeleton: stdin/stdout loop, uses the WhatsApp adapter crate from #77 | 3 to 5 days |
 | Signal in the helper (after #39 exists as a local feature) | 5 to 10 days |
-| Helper CI on 3 OS, release workflow, source tarball, README | 2 to 3 days |
+| Helper CI jobs on 3 OS in this repository, release workflow, source tarball, README | 2 to 3 days |
 | Total | about 3 to 5 weeks |
 
 Recurring cost:
 
-- Two release pipelines and two version numbers. Each change to the wire types needs a release of both.
+- Two release artifacts and two version numbers in one repository. Each change to the wire types needs a release of both.
 - The `whatsapp-rust` stack changes often, and WhatsApp changes its protocol. The helper needs updates for that. This cost exists today for the local feature too.
 - The helper CI builds libsignal on 3 OS. That adds CI minutes to each helper release.
 - Support: users can run a helper that does not match the app. The version check and the notes must cover it.
@@ -160,10 +168,10 @@ Start the "go" work when all of these are true:
 1. A lawyer answers the questions in section 1, and the answers allow the design.
 2. `signal-local` (#39) works in local builds, or the helper carries WhatsApp only by decision.
 3. `whatsapp-web` passes live tests on Linux, macOS, and Windows.
-4. A maintainer accepts to own the AGPL repository and its releases.
+4. A maintainer accepts to own the AGPL helper crate and its releases.
 
 ## Consequences
 
 - ADR 0011 stays in force. Release builds and OS zips never enable `whatsapp-web` or `signal-local`.
-- No new crate or repository now.
+- No helper crate now. Issue #77 moves the WhatsApp and Signal adapters into AGPL crate folders in this repository. A helper, if built later, uses those crates.
 - If this ADR is accepted, a later ADR records "go" with the legal answers, and it supersedes the "later" part.
