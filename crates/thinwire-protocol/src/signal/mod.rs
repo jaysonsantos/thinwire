@@ -24,7 +24,7 @@ use crate::adapter::{AccountState, emit_account};
 use crate::adapter::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
     ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, emit_conversation,
-    emit_message, emit_status, emit_stopped,
+    emit_history_loaded, emit_message, emit_status, emit_stopped,
 };
 
 #[cfg(not(feature = "signal-local"))]
@@ -285,17 +285,18 @@ impl SignalAdapter {
                 for message in history {
                     emit_message(events, message);
                 }
+                emit_history_loaded(events, ProtocolId::Signal, conversation_id);
                 Ok(())
             }
             #[cfg(feature = "signal-local")]
             Engine::Live(_) => {
-                let _ = conversation_id;
                 emit_status(
                     events,
                     ProtocolId::Signal,
                     AdapterStatus::Ready,
                     "Signal history was loaded with the chat list.",
                 );
+                emit_history_loaded(events, ProtocolId::Signal, conversation_id);
                 Ok(())
             }
         }
@@ -658,6 +659,34 @@ mod tests {
         )));
     }
 
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn live_open_chat_emits_history_loaded() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut adapter = SignalAdapter::new();
+        let Engine::Live(session) = &adapter.engine else {
+            panic!("live engine");
+        };
+        session.mark_active();
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Signal,
+                    conversation_id: "chat-1".into(),
+                },
+                &tx,
+            )
+            .expect("history");
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::HistoryLoaded {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+            } if conversation_id == "chat-1"
+        )));
+    }
+
     #[cfg(not(feature = "signal-local"))]
     #[test]
     fn feature_off_refuses_link_after_notice() {
@@ -722,6 +751,13 @@ mod tests {
         assert!(history.iter().any(|event| matches!(
             event,
             AdapterEvent::MessageReceived { message } if message.body == "hello from the fixture"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            event,
+            AdapterEvent::HistoryLoaded {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+            } if conversation_id == "chat-1"
         )));
 
         adapter
