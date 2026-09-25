@@ -29,7 +29,8 @@ fn main() -> eframe::Result<()> {
 
 /// `slack_morphism` logs the one-time Socket Mode URL. Presage and libsignal
 /// log the provisioning URL. A more specific `RUST_LOG` directive wins over
-/// an `EnvFilter` level, so this layer drops those targets on its own.
+/// `slack_morphism=off` on an `EnvFilter`, so this layer drops those targets
+/// on its own.
 fn init_tracing() {
     use tracing_subscriber::filter::FilterExt;
     let layer = tracing_subscriber::fmt::layer()
