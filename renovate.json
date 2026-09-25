@@ -12,6 +12,11 @@
       "matchDatasources": ["git-refs"],
       "matchSourceUrls": ["https://github.com/whisperfish/presage"],
       "groupName": "whisperfish/presage"
+    },
+    {
+      "description": "libsqlite3-sys must match presage-store-sqlite and whatsapp-rust. Only one version can link.",
+      "matchPackageNames": ["libsqlite3-sys"],
+      "allowedVersions": "<0.37"
     }
   ]
 }
