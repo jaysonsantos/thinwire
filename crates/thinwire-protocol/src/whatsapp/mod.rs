@@ -354,22 +354,25 @@ impl WhatsAppAdapter {
     /// Send a failed row again under the same local id.
     ///
     /// If the resend cannot start (offline, or the row is not a failed send),
-    /// nothing changes: the row stays Failed and the account stays linked.
-    fn resend(&self, conversation_id: &str, message_id: &str, events: &EventTx) {
-        let Some(jid) = inbox::parse_conversation_id(conversation_id) else {
-            return;
-        };
-        let jid = jid.to_string();
-        let Some(sender) = self.session.sender() else {
-            return;
-        };
-        let Some((body, event)) = self
-            .session
-            .with_inbox(|inbox| inbox.retry_send(&jid, message_id))
-        else {
+    /// the row stays Failed, the account stays linked, and the shell gets
+    /// `SendRejected` for the request.
+    fn resend(&self, conversation_id: &str, message_id: &str, request: u64, events: &EventTx) {
+        let started = inbox::parse_conversation_id(conversation_id)
+            .map(str::to_string)
+            .zip(self.session.sender())
+            .and_then(|(jid, sender)| {
+                let (body, event) = self
+                    .session
+                    .with_inbox(|inbox| inbox.retry_send(&jid, message_id))?;
+                Some((jid, sender, body, event))
+            });
+        // ADR 0010 rule 4: every retry ends with SendAccepted or SendRejected.
+        let Some((jid, sender, body, event)) = started else {
+            emit_send_rejected(events, ProtocolId::WhatsApp, conversation_id, request);
             return;
         };
         let _ = events.send(event);
+        emit_send_accepted(events, ProtocolId::WhatsApp, conversation_id, request);
         self.spawn_send(sender, jid, message_id.to_string(), body, events);
     }
 
@@ -495,9 +498,9 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 protocol: ProtocolId::WhatsApp,
                 conversation_id,
                 message_id,
-                request: _,
+                request,
             } => {
-                self.resend(&conversation_id, &message_id, events);
+                self.resend(&conversation_id, &message_id, request, events);
                 Ok(())
             }
             AdapterCommand::Disconnect {
@@ -994,7 +997,7 @@ mod tests {
                     protocol: ProtocolId::WhatsApp,
                     conversation_id: "whatsapp:111@s.whatsapp.net".into(),
                     message_id: pending.clone(),
-                    request: 1,
+                    request: 2,
                 },
                 &tx,
             )
@@ -1005,6 +1008,10 @@ mod tests {
                 delivery: Delivery::Pending,
                 ..
             }
+        ));
+        assert!(matches!(
+            rx.recv().await.expect("retry accepted"),
+            AdapterEvent::SendAccepted { request: 2, .. }
         ));
         let _status = rx.recv().await.expect("status");
         assert!(matches!(
@@ -1020,13 +1027,18 @@ mod tests {
                     protocol: ProtocolId::WhatsApp,
                     conversation_id: "whatsapp:111@s.whatsapp.net".into(),
                     message_id: "h1".into(),
-                    request: 1,
+                    request: 3,
                 },
                 &tx,
             )
-            .expect("a resend of a history row is a no-op, not an adapter error");
-        assert!(
-            drain(&mut rx).is_empty(),
+            .expect("a resend of a history row is not an adapter error");
+        assert_eq!(
+            drain(&mut rx),
+            vec![AdapterEvent::SendRejected {
+                protocol: ProtocolId::WhatsApp,
+                conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                request: 3,
+            }],
             "history rows are not failed sends"
         );
     }
@@ -1418,7 +1430,7 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, AdapterEvent::SendRejected { request: 1, .. }))
             .count();
-        assert_eq!(rejected, 2, "one rejection per send, none for the resend");
+        assert_eq!(rejected, 3, "one rejection per send and per retry");
     }
 
     /// Codex r4093058040: a stale start that finishes late must not replace
