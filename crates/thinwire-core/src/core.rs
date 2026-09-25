@@ -243,6 +243,11 @@ impl Core {
                     protocol: ProtocolId::Slack,
                 });
             }
+            Intent::Slack(SlackIntent::Cancel) => {
+                self.state.queue(AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Slack,
+                });
+            }
         }
         self.state.sync_viewed();
         self.flush();
@@ -816,6 +821,27 @@ mod tests {
         assert!(
             sent.try_recv().is_err(),
             "no command reaches the host while closing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slack_connect_and_cancel_reach_the_adapter() {
+        let mut core = memory_core();
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        core.dispatch(Intent::Slack(SlackIntent::Connect));
+        assert_eq!(
+            sent.try_recv().ok(),
+            Some(AdapterCommand::Connect {
+                protocol: ProtocolId::Slack,
+            })
+        );
+        core.dispatch(Intent::Slack(SlackIntent::Cancel));
+        assert_eq!(
+            sent.try_recv().ok(),
+            Some(AdapterCommand::Disconnect {
+                protocol: ProtocolId::Slack,
+            })
         );
     }
 

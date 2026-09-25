@@ -137,8 +137,10 @@ pub enum DiscordIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SlackIntent {
-    /// Arm the workspace app with the tokens that are in the keychain.
+    /// Start the workspace install, or resume a stored bot token.
     Connect,
+    /// Stop the install. The loopback listener closes.
+    Cancel,
 }
 
 #[cfg(test)]

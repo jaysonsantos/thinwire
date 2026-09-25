@@ -1299,7 +1299,9 @@ impl Snapshot {
             if self.protocol_linked(protocol) {
                 self.chat_list_loading.insert(protocol);
                 self.pending.push(AdapterCommand::LoadChats { protocol });
-            } else {
+            } else if protocol != ProtocolId::Slack {
+                // Slack Connect with no token opens the browser. Only the
+                // Add Slack workspace button starts that install.
                 self.pending.push(AdapterCommand::Connect { protocol });
             }
         }
@@ -4850,6 +4852,22 @@ mod tests {
                 protocol: ProtocolId::Telegram,
             }
         )));
+    }
+
+    #[test]
+    fn refresh_does_not_start_an_unlinked_slack_install() {
+        let mut snapshot = Snapshot::new();
+        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.refresh_visible();
+        assert!(
+            snapshot.take_commands().iter().all(|command| !matches!(
+                command,
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Slack,
+                }
+            )),
+            "Refresh must not open the Slack install"
+        );
     }
 
     #[test]
