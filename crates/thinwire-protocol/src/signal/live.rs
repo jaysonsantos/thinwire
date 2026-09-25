@@ -392,8 +392,6 @@ async fn send_text(
     outbound: &Outbound,
     events: &EventTx,
 ) -> Result<(), ()> {
-    let uuid = Uuid::parse_str(&outbound.conversation_id).map_err(|_| ())?;
-    let service_id = ServiceId::Aci(uuid.into());
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ())?
@@ -403,10 +401,22 @@ async fn send_text(
         timestamp: Some(timestamp),
         ..Default::default()
     };
-    manager
-        .send_message(service_id, data_message, timestamp)
-        .await
-        .map_err(|_| ())?;
+    match super::group::outbound_target(&outbound.conversation_id)? {
+        super::group::OutboundTarget::Group(master_key) => {
+            manager
+                .send_message_to_group(&master_key, data_message, timestamp)
+                .await
+                .map_err(|_| ())?;
+        }
+        super::group::OutboundTarget::Contact => {
+            let uuid = Uuid::parse_str(&outbound.conversation_id).map_err(|_| ())?;
+            let service_id = ServiceId::Aci(uuid.into());
+            manager
+                .send_message(service_id, data_message, timestamp)
+                .await
+                .map_err(|_| ())?;
+        }
+    }
     crate::adapter::emit_send_accepted(
         events,
         ProtocolId::Signal,
