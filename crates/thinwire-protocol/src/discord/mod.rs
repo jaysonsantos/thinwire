@@ -1938,4 +1938,29 @@ mod tests {
         assert!(!lock.contains(concat!("seren", "ity")));
         assert!(lock.contains("name = \"twilight-http\""));
     }
+
+    /// Refresh ends with `ChatListLoaded`, so the shell stops the chat-list
+    /// spinner (contract kit finding, ADR 0010 rule 9).
+    #[tokio::test]
+    async fn refresh_ends_with_chat_list_loaded() {
+        let (mut adapter, tx, mut rx, _) =
+            connected(Arc::new(FakeDiscordApi::guild_fixture())).await;
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("refresh");
+        until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::ChatListLoaded {
+                    protocol: ProtocolId::Discord
+                }
+            )
+        })
+        .await;
+    }
 }

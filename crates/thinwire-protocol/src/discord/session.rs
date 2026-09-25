@@ -14,9 +14,9 @@ use super::inbox::{HISTORY_LIMIT, InboxChannel, chat_message, load_channels};
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
 use crate::adapter::{
     AccountState, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Delivery, EventTx,
-    ProtocolId, emit_account, emit_command_failed, emit_conversation, emit_conversation_removed,
-    emit_history_loaded, emit_message, emit_message_delivery, emit_message_replaced, emit_notice,
-    emit_send_accepted, emit_send_rejected, emit_status,
+    ProtocolId, emit_account, emit_chat_list_loaded, emit_command_failed, emit_conversation,
+    emit_conversation_removed, emit_history_loaded, emit_message, emit_message_delivery,
+    emit_message_replaced, emit_notice, emit_send_accepted, emit_send_rejected, emit_status,
 };
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
@@ -170,7 +170,12 @@ impl Session {
                 return;
             }
             match result {
-                Ok((bot_id, channels)) => publish_channels(&shared, &events, bot_id, &channels),
+                Ok((bot_id, channels)) => {
+                    publish_channels(&shared, &events, bot_id, &channels);
+                    // The shell stops the chat-list spinner on this event
+                    // (adapter contract rule 9, ADR 0010).
+                    emit_chat_list_loaded(&events, ProtocolId::Discord);
+                }
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
                     if error == DiscordApiError::Unauthorized {
