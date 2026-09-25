@@ -346,11 +346,13 @@ enum FocusFollow {
     Moved,
 }
 
-/// Text the adapter rejected. `from_row` is a retry: the words live on the
-/// failed message, not in compose, so an empty compose has not replaced them.
+/// Text the adapter rejected for one chat. A compose send and a retry are
+/// separate: the compose text wins when it still matches, otherwise the
+/// retry text fills an empty draft.
+#[derive(Default)]
 struct RejectedBody {
-    text: String,
-    from_row: bool,
+    compose: Option<String>,
+    row: Option<String>,
 }
 
 /// App state. `Debug` is manual: it prints no secret and no user text.
@@ -1758,13 +1760,10 @@ impl Snapshot {
         match settled {
             Some(Pending::Send { body, .. }) => {
                 if !body.is_empty() {
-                    self.rejected_bodies.insert(
-                        (protocol, chat.to_owned()),
-                        RejectedBody {
-                            text: body,
-                            from_row: false,
-                        },
-                    );
+                    self.rejected_bodies
+                        .entry((protocol, chat.to_owned()))
+                        .or_default()
+                        .compose = Some(body);
                 }
                 let next = self.resend_hint(protocol, chat, false);
                 self.set_error("Message not sent.", &why, &next);
@@ -1775,13 +1774,10 @@ impl Snapshot {
                     .message_body(protocol, chat, &message_id)
                     .filter(|text| !text.is_empty())
                 {
-                    self.rejected_bodies.insert(
-                        (protocol, chat.to_owned()),
-                        RejectedBody {
-                            text,
-                            from_row: true,
-                        },
-                    );
+                    self.rejected_bodies
+                        .entry((protocol, chat.to_owned()))
+                        .or_default()
+                        .row = Some(text);
                 }
                 let next = self.resend_hint(protocol, chat, true);
                 self.set_error("Message not sent.", &why, &next);
@@ -1796,16 +1792,14 @@ impl Snapshot {
         self.rejected_bodies.remove(&(protocol, chat.to_owned()));
     }
 
-    /// The rejected text is still what the user would send. A compose send
-    /// stays only while compose or the draft still equals it. A retry's text
-    /// lives on the failed row, so an empty compose means nothing newer
-    /// replaced it.
-    fn holds_rejected_body(
+    /// Compose-rejected text wins when it still matches. Otherwise a retry's
+    /// text fills an empty draft.
+    fn text_to_keep(
         &self,
         protocol: ProtocolId,
         chat: &str,
         rejected: &RejectedBody,
-    ) -> bool {
+    ) -> Option<String> {
         let current = if self.is_selected_chat(protocol, chat) {
             self.compose.trim()
         } else {
@@ -1813,10 +1807,18 @@ impl Snapshot {
                 .get(&(protocol, chat.to_owned()))
                 .map_or("", |draft| draft.trim())
         };
-        if current == rejected.text {
-            return true;
+        if let Some(compose) = &rejected.compose
+            && current == compose
+        {
+            return Some(compose.clone());
         }
-        rejected.from_row && current.is_empty()
+        rejected
+            .row
+            .as_ref()
+            .filter(|row| {
+                current.is_empty() || (rejected.compose.is_none() && current == row.as_str())
+            })
+            .cloned()
     }
 
     fn message_body(&self, protocol: ProtocolId, chat: &str, message_id: &str) -> Option<String> {
@@ -2284,10 +2286,13 @@ impl Snapshot {
         } else {
             self.rejected_bodies
                 .iter()
-                .filter(|((owner, chat), rejected)| {
-                    *owner == protocol && self.holds_rejected_body(protocol, chat, rejected)
+                .filter_map(|((owner, chat), rejected)| {
+                    if *owner != protocol {
+                        return None;
+                    }
+                    self.text_to_keep(protocol, chat, rejected)
+                        .map(|text| (chat.clone(), text))
                 })
-                .map(|((_, chat), rejected)| (chat.clone(), rejected.text.clone()))
                 .collect()
         };
         self.rejected_bodies
@@ -6378,6 +6383,71 @@ mod tests {
         });
         snapshot.select_conversation("discord:1:2".into());
         assert_eq!(snapshot.compose, "keep me");
+    }
+
+    /// Send 'A' is rejected and stays in compose. A later retry of row 'B'
+    /// that gets 401 must not replace 'A'.
+    #[test]
+    fn a_rejected_compose_survives_a_retry_that_unlinks() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:1:2", true),
+        });
+        snapshot.selected_conversation = Some("discord:1:2".into());
+        snapshot.compose = "A".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("send");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1:2".into(),
+            request,
+        });
+        assert_eq!(snapshot.compose, "A");
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Discord,
+                conversation_id: "discord:1:2".into(),
+                id: "discord:row-b".into(),
+                sender: "bot".into(),
+                body: "B".into(),
+                outbound: true,
+                delivery: Delivery::Failed,
+                sent_at: 1,
+            },
+        });
+        snapshot.retry_send("discord:row-b");
+        let retry = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::ResendMessage { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("retry");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1:2".into(),
+            request: retry,
+        });
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Discord,
+            state: AccountState::Unlinked,
+        });
+        link(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:1:2", true),
+        });
+        snapshot.select_conversation("discord:1:2".into());
+        assert_eq!(snapshot.compose, "A");
     }
 
     /// Codex P2 (PR #68): unlinking one protocol keeps the draft of the same
