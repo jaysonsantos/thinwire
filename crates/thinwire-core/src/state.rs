@@ -516,29 +516,27 @@ impl Snapshot {
                 let focused = (self.selected_protocol == protocol)
                     .then(|| self.focused_row.clone())
                     .flatten();
-                let list = self.conversations.entry(protocol).or_default();
-                let before = selected
-                    .as_ref()
-                    .and_then(|id| list.iter().position(|row| row.id == *id));
-                let focus_before = focused
-                    .as_ref()
-                    .and_then(|id| list.iter().position(|row| row.id == *id));
-                if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
-                    *existing = conversation;
-                } else {
-                    list.push(conversation);
+                let focus_before = focused.as_deref().and_then(|id| self.visible_index(id));
+                {
+                    let list = self.conversations.entry(protocol).or_default();
+                    let before = selected
+                        .as_ref()
+                        .and_then(|id| list.iter().position(|row| row.id == *id));
+                    if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
+                        *existing = conversation;
+                    } else {
+                        list.push(conversation);
+                    }
+                    sort_conversations(list);
+                    let after = selected
+                        .as_ref()
+                        .and_then(|id| list.iter().position(|row| row.id == *id));
+                    if before.is_some() && before != after {
+                        self.scroll_to_selected = true;
+                    }
                 }
-                sort_conversations(list);
-                let after = selected
-                    .as_ref()
-                    .and_then(|id| list.iter().position(|row| row.id == *id));
-                if before.is_some() && before != after {
-                    self.scroll_to_selected = true;
-                }
-                let focus_after = focused
-                    .as_ref()
-                    .and_then(|id| list.iter().position(|row| row.id == *id));
-                if focus_before.is_some() && focus_before != focus_after {
+                let focus_after = focused.as_deref().and_then(|id| self.visible_index(id));
+                if focus_before.is_some() && focus_after.is_some() && focus_before != focus_after {
                     self.scroll_to_focused = true;
                 }
                 self.ensure_conversation_selection();
@@ -959,6 +957,13 @@ impl Snapshot {
     #[must_use]
     pub fn shows_in_switcher(&self, protocol: ProtocolId) -> bool {
         self.filter.shows_in_switcher(protocol) && self.account_surface_visible(protocol)
+    }
+
+    /// Place of `id` in the filtered inbox. `None` when the search hides it.
+    fn visible_index(&self, id: &str) -> Option<usize> {
+        self.visible_conversations()
+            .iter()
+            .position(|row| row.id == id)
     }
 
     pub fn visible_conversations(&self) -> Vec<&Conversation> {
@@ -2255,6 +2260,37 @@ mod tests {
         });
         assert!(snapshot.take_scroll_to_focused());
         assert!(!snapshot.wants_scroll_to_focused(), "one request per move");
+    }
+
+    #[test]
+    fn a_search_scrolls_the_highlight_when_its_visible_place_changes() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, &store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 30),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 20),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(3, "Cara", 10),
+        });
+        snapshot.set_search("a".into());
+        snapshot.move_inbox_selection(1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
+        assert_eq!(snapshot.visible_index("telegram:3"), Some(1));
+        assert!(snapshot.take_scroll_to_focused());
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bea", 20),
+        });
+        assert_eq!(
+            snapshot.visible_index("telegram:3"),
+            Some(2),
+            "Bea joins the filtered list above Cara"
+        );
+        assert!(snapshot.take_scroll_to_focused());
     }
 
     fn outgoing(chat: i64, id: i64, body: &str, delivery: Delivery) -> ChatMessage {
