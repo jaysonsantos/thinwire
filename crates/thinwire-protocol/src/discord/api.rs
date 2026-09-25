@@ -6,6 +6,9 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+
+use tokio::sync::Notify;
 
 /// Boxed future returned by [`DiscordApi`] calls. Runs on the tokio worker.
 pub(crate) type ApiFuture<'a, T> =
@@ -115,6 +118,23 @@ pub(crate) trait DiscordApi: Send + Sync {
     fn history(&self, channel_id: u64, limit: u16) -> ApiFuture<'_, Vec<MessageSummary>>;
     /// Send plain text as the bot.
     fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary>;
+
+    /// Set by tests. The live client leaves this empty.
+    ///
+    /// Fired after this task has queued `SendAccepted` or `SendRejected` and
+    /// released the session lock, so a 401 can settle without a second result.
+    fn send_result_pause(&self) -> Option<Arc<SendResultPause>> {
+        None
+    }
+}
+
+/// Test barrier between a queued send result and the task ending.
+#[derive(Debug, Default)]
+pub(crate) struct SendResultPause {
+    /// The send task has queued its one result.
+    pub arrived: Notify,
+    /// The test has finished the 401 settle.
+    pub release: Notify,
 }
 
 /// Discord returns at most this many guilds per `current_user_guilds` page.

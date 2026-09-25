@@ -7,7 +7,7 @@ use tokio::sync::Notify;
 
 use super::api::{
     ApiFuture, ChannelKind, ChannelSummary, DiscordApi, DiscordApiError, GuildSummary,
-    MessageSummary, Overwrite, OverwriteTarget,
+    MessageSummary, Overwrite, OverwriteTarget, SendResultPause,
 };
 use super::permissions::{READ_BITS, SEND_MESSAGES, VIEW_CHANNEL};
 
@@ -47,6 +47,8 @@ pub(crate) struct FakeDiscordApi {
     pub state: Mutex<FakeState>,
     pub hold_history: Option<Arc<Notify>>,
     pub hold_send: Option<Arc<Notify>>,
+    /// When set, a finished send waits after its result event is queued.
+    pub send_result_pause: Option<Arc<SendResultPause>>,
 }
 
 fn channel(id: u64, name: &str, kind: ChannelKind, overwrites: Vec<Overwrite>) -> ChannelSummary {
@@ -134,6 +136,7 @@ impl FakeDiscordApi {
             state: Mutex::new(state),
             hold_history: None,
             hold_send: None,
+            send_result_pause: None,
         }
     }
 
@@ -229,6 +232,10 @@ impl DiscordApi for FakeDiscordApi {
             messages.truncate(usize::from(limit));
             Ok(messages)
         })
+    }
+
+    fn send_result_pause(&self) -> Option<Arc<SendResultPause>> {
+        self.send_result_pause.clone()
     }
 
     fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary> {

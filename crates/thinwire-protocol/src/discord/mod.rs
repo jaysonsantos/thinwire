@@ -1053,6 +1053,90 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_send_completing_beside_a_401_settle_emits_one_result() {
+        use super::api::SendResultPause;
+
+        let pause = Arc::new(SendResultPause::default());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.send_result_pause = Some(Arc::clone(&pause));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "keep me".into(),
+                    request: 7,
+                },
+                &tx,
+            )
+            .expect("send");
+        // The send has queued its result and is waiting. The 401 runs now.
+        pause.arrived.notified().await;
+        api.state().unauthorized = true;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                },
+                &tx,
+            )
+            .expect("open");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Notice { .. })
+        })
+        .await;
+        let results: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    AdapterEvent::SendAccepted { request: 7, .. }
+                        | AdapterEvent::SendRejected { request: 7, .. }
+                )
+            })
+            .collect();
+        assert_eq!(results.len(), 1, "exactly one result event for the send");
+        let unlinked = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )
+            })
+            .expect("unlinked");
+        assert!(
+            results[0].0 < unlinked,
+            "the result is queued before Unlinked"
+        );
+        assert!(matches!(
+            results[0].1,
+            AdapterEvent::SendAccepted { request: 7, .. }
+        ));
+        pause.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let rest = drain(&mut rx);
+        assert!(
+            !rest.iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::SendAccepted { request: 7, .. }
+                        | AdapterEvent::SendRejected { request: 7, .. }
+                )
+            }),
+            "the send task does not queue a second result after the 401"
+        );
+    }
+
     #[tokio::test]
     async fn a_revoked_send_drops_the_session() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
