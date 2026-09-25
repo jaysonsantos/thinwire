@@ -50,6 +50,29 @@ impl ReceiveLoop {
     }
 }
 
+/// After EOF the account is Connecting. The next open stream is Ready again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Relink {
+    pending: bool,
+}
+
+impl Relink {
+    pub(crate) const fn new() -> Self {
+        Self { pending: false }
+    }
+
+    pub(crate) const fn note_end(&mut self) {
+        self.pending = true;
+    }
+
+    /// `true` when this new stream should report the account linked again.
+    pub(crate) const fn on_stream(&mut self) -> bool {
+        let ready = self.pending;
+        self.pending = false;
+        ready
+    }
+}
+
 pub(crate) fn next_backoff(current: Duration) -> Duration {
     let doubled = current.saturating_mul(2);
     if doubled > RECONNECT_BACKOFF_MAX {
@@ -95,6 +118,15 @@ mod tests {
             }
         );
         assert_eq!(loop_.on_item(false, false), StreamPoll::Stop);
+    }
+
+    #[test]
+    fn the_stream_after_eof_is_linked_again() {
+        let mut relink = Relink::new();
+        assert!(!relink.on_stream());
+        relink.note_end();
+        assert!(relink.on_stream());
+        assert!(!relink.on_stream());
     }
 
     #[test]

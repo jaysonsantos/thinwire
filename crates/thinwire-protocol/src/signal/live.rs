@@ -24,7 +24,7 @@ use presage_store_sled::{MigrationConflictStrategy, SledStore};
 use tokio::sync::{Mutex, mpsc};
 
 use super::path::{prepare_session_dir, signal_session_path};
-use super::reconnect::{ReceiveLoop, StreamPoll};
+use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use crate::adapter::{
     AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx, ProtocolId,
     RedactedPairingSecret, emit_conversation, emit_message, emit_status,
@@ -170,11 +170,20 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     *session.outbound.lock().await = Some(tx);
     let mut receive = ReceiveLoop::new();
+    let mut relink = Relink::new();
     while session.is_current(token) {
         let Ok(stream) = manager.receive_messages().await else {
             fail(&events, SYNC_FAILED);
             break;
         };
+        if relink.on_stream() {
+            emit_status(
+                &events,
+                ProtocolId::Signal,
+                AdapterStatus::Ready,
+                "Signal is linked on this local build. This binary is not a release.",
+            );
+        }
         let mut pending: Option<Outbound> = None;
         let mut reconnect_after = None;
         {
@@ -216,6 +225,7 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
             if !wait_backoff(session.as_ref(), token, after).await {
                 break;
             }
+            relink.note_end();
             continue;
         }
         if let Some(outbound) = pending {
