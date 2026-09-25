@@ -7,6 +7,7 @@
 
 mod device;
 mod group;
+mod message;
 mod path;
 mod reconnect;
 mod time;

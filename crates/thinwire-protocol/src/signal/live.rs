@@ -355,10 +355,19 @@ fn conversation_from_group(key: &[u8], group: &Group) -> Conversation {
 }
 
 fn emit_content(events: &EventTx, content: &Content, names: &HashMap<String, String>) {
-    let ContentBody::DataMessage(DataMessage {
-        body: Some(body), ..
-    }) = &content.body
-    else {
+    let incoming = match &content.body {
+        ContentBody::DataMessage(DataMessage { body, .. }) => {
+            super::message::Incoming::Data(body.as_deref())
+        }
+        ContentBody::SynchronizeMessage(sync) => super::message::Incoming::SentSync(
+            sync.sent
+                .as_ref()
+                .and_then(|sent| sent.message.as_ref())
+                .and_then(|message| message.body.as_deref()),
+        ),
+        _ => super::message::Incoming::Other,
+    };
+    let Some(shown) = super::message::visible_text(incoming) else {
         return;
     };
     let Ok(thread) = Thread::try_from(content) else {
@@ -378,9 +387,13 @@ fn emit_content(events: &EventTx, content: &Content, names: &HashMap<String, Str
             protocol: ProtocolId::Signal,
             conversation_id,
             id: content.metadata.timestamp.to_string(),
-            sender,
-            body: body.clone(),
-            outbound: false,
+            sender: if shown.outbound {
+                "me".to_string()
+            } else {
+                sender
+            },
+            body: shown.body.to_string(),
+            outbound: shown.outbound,
             delivery: Delivery::Sent,
             sent_at: super::time::sent_at_secs(content.metadata.timestamp),
         },
