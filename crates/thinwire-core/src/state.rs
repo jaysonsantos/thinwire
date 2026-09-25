@@ -153,6 +153,17 @@ pub enum InboxState {
     NoMatch,
 }
 
+/// Older-message paging of the selected chat (#30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OlderState {
+    /// More can load when the thread reaches the top.
+    Idle,
+    /// "Loading older messages…"
+    Loading,
+    /// "Start of chat": nothing older.
+    StartOfChat,
+}
+
 /// What the thread shows for the selected chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
@@ -318,6 +329,11 @@ pub struct Snapshot {
     keychain_retry: bool,
     chat_list_loading: bool,
     history_loading: HashSet<String>,
+    /// Telegram chats with a request for older messages in flight (#30).
+    /// One request at a time for each chat.
+    older_loading: HashSet<String>,
+    /// Telegram chats whose start is loaded. No more older requests (#30).
+    older_at_start: HashSet<String>,
     scroll_to_selected: bool,
     /// Unsent compose text per chat. `compose` holds the selected chat's draft.
     drafts: HashMap<String, String>,
@@ -431,6 +447,8 @@ impl Snapshot {
             keychain_retry: false,
             chat_list_loading: false,
             history_loading: HashSet::new(),
+            older_loading: HashSet::new(),
+            older_at_start: HashSet::new(),
             scroll_to_selected: false,
             drafts: HashMap::new(),
             focus_compose: false,
@@ -500,6 +518,7 @@ impl Snapshot {
                         // A failed load does not send its end event. Stop the spinners.
                         self.chat_list_loading = false;
                         self.history_loading.clear();
+                        self.older_loading.clear();
                     }
                 }
             }
@@ -555,9 +574,19 @@ impl Snapshot {
             }
             // Internal: the host unwraps stamped login events in poll_events.
             AdapterEvent::Login { .. } => {}
-            // The UI half of #30 (older messages on scroll up) comes with the
-            // thinwire-core UI state (PR #48). Until then the event is ignored.
-            AdapterEvent::OlderHistoryLoaded { .. } => {}
+            AdapterEvent::OlderHistoryLoaded {
+                protocol,
+                conversation_id,
+                more,
+                ..
+            } => {
+                if protocol == ProtocolId::Telegram {
+                    self.older_loading.remove(&conversation_id);
+                    if !more {
+                        self.older_at_start.insert(conversation_id);
+                    }
+                }
+            }
             AdapterEvent::ChatListLoaded { protocol } => {
                 if protocol == ProtocolId::Telegram {
                     self.chat_list_loading = false;
@@ -977,6 +1006,51 @@ impl Snapshot {
             return ThreadState::Loading;
         }
         ThreadState::Empty
+    }
+
+    /// Older-message paging of the selected chat (#30).
+    #[must_use]
+    pub fn older_state(&self) -> OlderState {
+        let Some(id) = self.selected_conversation.as_ref() else {
+            return OlderState::Idle;
+        };
+        if self.selected_protocol != ProtocolId::Telegram {
+            return OlderState::Idle;
+        }
+        if self.older_loading.contains(id) {
+            OlderState::Loading
+        } else if self.older_at_start.contains(id) {
+            OlderState::StartOfChat
+        } else {
+            OlderState::Idle
+        }
+    }
+
+    /// Ask for the page before the oldest loaded message of the selected
+    /// chat. Only Telegram answers `LoadOlderMessages` today. Nothing goes out
+    /// while a request runs, the first page loads, or the start is loaded.
+    pub(crate) fn load_older(&mut self) {
+        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
+            return;
+        }
+        let Some(id) = self.selected_conversation.clone() else {
+            return;
+        };
+        if self.history_loading.contains(&id)
+            || self.older_loading.contains(&id)
+            || self.older_at_start.contains(&id)
+        {
+            return;
+        }
+        let Some(oldest) = self.selected_messages().first().map(|row| row.id.clone()) else {
+            return;
+        };
+        self.older_loading.insert(id.clone());
+        self.pending.push(AdapterCommand::LoadOlderMessages {
+            protocol: ProtocolId::Telegram,
+            conversation_id: id,
+            before_message_id: oldest,
+        });
     }
 
     /// True once after the selected row moved in the sorted list.
@@ -1416,6 +1490,8 @@ impl Snapshot {
         self.messages
             .retain(|(protocol, _), _| *protocol != ProtocolId::Telegram);
         self.history_loading.clear();
+        self.older_loading.clear();
+        self.older_at_start.clear();
         self.chat_list_loading = false;
         self.drafts.clear();
         self.compose.clear();
@@ -1549,6 +1625,10 @@ impl Snapshot {
         }
         self.messages
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
+        if protocol == ProtocolId::Telegram {
+            self.older_loading.remove(id);
+            self.older_at_start.remove(id);
+        }
         if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
             self.drafts.remove(id);
             self.compose.clear();
@@ -2144,6 +2224,145 @@ mod tests {
             delivery,
             sent_at: 0,
         }
+    }
+
+    fn older_requests(snapshot: &mut Snapshot) -> Vec<String> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::LoadOlderMessages {
+                    before_message_id, ..
+                } => Some(before_message_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn older_loaded(chat: i64, before: i64, more: bool) -> AdapterEvent {
+        AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Telegram,
+            conversation_id: format!("telegram:{chat}"),
+            before_message_id: format!("telegram:{chat}:{before}"),
+            more,
+        }
+    }
+
+    /// A chat with messages 50 and 51 loaded, and its first page done.
+    fn chat_with_recent_page(store: &SecretStore) -> Snapshot {
+        let mut snapshot = ready_with_chats(store);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        for id in [51, 50] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: outgoing(1, id, "recent", Delivery::Sent),
+            });
+        }
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+        });
+        snapshot.take_commands();
+        snapshot
+    }
+
+    #[test]
+    fn older_pages_merge_above_and_stop_at_the_start_of_the_chat() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+
+        snapshot.load_older();
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:50"]);
+        assert_eq!(snapshot.older_state(), OlderState::Loading);
+        snapshot.load_older();
+        assert!(
+            older_requests(&mut snapshot).is_empty(),
+            "one request at a time"
+        );
+
+        // The older page arrives newest first; it merges above, oldest first.
+        for id in [42, 40] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: outgoing(1, id, "older", Delivery::Sent),
+            });
+        }
+        snapshot.apply(older_loaded(1, 50, true));
+        let ids: Vec<&str> = snapshot
+            .selected_messages()
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "telegram:1:40",
+                "telegram:1:42",
+                "telegram:1:50",
+                "telegram:1:51"
+            ]
+        );
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+
+        snapshot.load_older();
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:40"]);
+        snapshot.apply(older_loaded(1, 40, false));
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+        snapshot.load_older();
+        assert!(
+            older_requests(&mut snapshot).is_empty(),
+            "no request after the start"
+        );
+
+        // Another chat pages on its own.
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(2, 9, "bob", Delivery::Sent),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+        });
+        snapshot.take_commands();
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+        snapshot.load_older();
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:2:9"]);
+    }
+
+    #[test]
+    fn no_older_request_before_the_first_page_or_after_a_failure_stops_it() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.take_commands();
+        // The first page of telegram:1 is still loading.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 50, "recent", Delivery::Sent),
+        });
+        snapshot.load_older();
+        assert!(older_requests(&mut snapshot).is_empty());
+
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.load_older();
+        assert_eq!(older_requests(&mut snapshot).len(), 1);
+        // A failed load sends no end event: the error status stops the row.
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "history failed".into(),
+        });
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+
+        // A removed chat forgets its paging.
+        snapshot.load_older();
+        snapshot.apply(older_loaded(1, 50, false));
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Telegram,
+            id: "telegram:1".into(),
+        });
+        assert!(!snapshot.older_at_start.contains("telegram:1"));
     }
 
     fn send_texts(snapshot: &mut Snapshot) -> Vec<String> {

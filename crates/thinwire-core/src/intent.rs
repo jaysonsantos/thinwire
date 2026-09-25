@@ -45,6 +45,13 @@ pub enum Intent {
     },
     /// Send a failed outgoing message again.
     Retry { message_id: String },
+    /// The thread of this chat reached the top: load the page before its
+    /// oldest message. Dropped when the chat is no longer the selected one.
+    /// The core sends one request at a time for each chat (#30).
+    LoadOlderMessages {
+        protocol: ProtocolId,
+        conversation_id: String,
+    },
     /// Read the OS keychain again after a failed read. The read runs off the caller thread.
     RetryKeychain,
     /// Store the light/dark preference. Disk I/O runs off the caller thread.
