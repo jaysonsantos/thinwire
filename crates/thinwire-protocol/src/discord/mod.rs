@@ -533,13 +533,20 @@ mod tests {
     }
 
     fn conversations(events: &[AdapterEvent]) -> Vec<&crate::Conversation> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                AdapterEvent::ConversationUpsert { conversation } => Some(conversation),
-                _ => None,
-            })
-            .collect()
+        let mut index = std::collections::HashMap::<&str, usize>::new();
+        let mut rows = Vec::new();
+        for event in events {
+            let AdapterEvent::ConversationUpsert { conversation } = event else {
+                continue;
+            };
+            if let Some(slot) = index.get(conversation.id.as_str()).copied() {
+                rows[slot] = conversation;
+            } else {
+                index.insert(conversation.id.as_str(), rows.len());
+                rows.push(conversation);
+            }
+        }
+        rows
     }
 
     fn messages(events: &[AdapterEvent]) -> Vec<&crate::ChatMessage> {
@@ -699,10 +706,10 @@ mod tests {
         assert_eq!(general.protocol, ProtocolId::Discord);
         assert_eq!(general.title, "#general");
         assert_eq!(general.participant, "Test guild");
-        assert!(general.preview.contains("read and send"));
+        assert_eq!(general.preview, "reply from the bot");
         assert!(general.writable);
         assert!(!rows[1].writable);
-        assert!(rows[1].preview.contains("read only"));
+        assert!(rows[1].preview.is_empty());
 
         let ready_at = events
             .iter()
@@ -748,6 +755,188 @@ mod tests {
                 status: AdapterStatus::Connecting,
                 ..
             }
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_failed_preview_keeps_the_channel_list() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        api.state().history.insert(
+            NEWS,
+            vec![super::api::MessageSummary {
+                id: 9,
+                author_id: 42,
+                author: "ada".into(),
+                content: "news line".into(),
+                images: 0,
+                files: 0,
+                embeds: 0,
+                stickers: 0,
+            }],
+        );
+        // A 500 is `Rejected`, not Forbidden or NotFound.
+        api.state()
+            .preview_failures
+            .insert(GENERAL, super::api::DiscordApiError::Rejected);
+        let (mut adapter, tx, mut rx, events) = connected(Arc::clone(&api)).await;
+        assert_preview_failure_keeps_channels(&events);
+        api.state()
+            .preview_failures
+            .insert(GENERAL, super::api::DiscordApiError::Rejected);
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        let reloaded = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.preview == "news line"
+            )
+        })
+        .await;
+        assert_preview_failure_keeps_channels(&reloaded);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn linked_before_preview_fetches_and_previews_stay_bounded() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::api::{ChannelKind, ChannelSummary};
+        use super::inbox::PREVIEW_FETCH_CONCURRENCY;
+
+        let mut fake = FakeDiscordApi::guild_fixture();
+        let release = Arc::new(AtomicBool::new(false));
+        fake.hold_preview = Some(Arc::clone(&release));
+        fake.state().channels.insert(
+            GUILD,
+            (0..20)
+                .map(|n| ChannelSummary {
+                    id: 3_000 + n,
+                    name: format!("c{n}"),
+                    kind: ChannelKind::Text,
+                    last_message_id: None,
+                    overwrites: Vec::new(),
+                })
+                .collect(),
+        );
+        let api = Arc::new(fake);
+        let (mut adapter, _vault) = fake_adapter(Arc::clone(&api), Some(FIXTURE_TOKEN));
+        let (tx, mut rx) = unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::ConnectDiscord {
+                    mode: DiscordAuthMode::Bot,
+                },
+                &tx,
+            )
+            .expect("connect");
+        let mut events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Linked,
+                    ..
+                }
+            )
+        })
+        .await;
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            api.preview_calls.load(Ordering::SeqCst),
+            0,
+            "Linked before any preview fetch"
+        );
+        let rows = conversations(&events);
+        assert_eq!(rows.len(), 20, "the list is published before previews");
+        assert!(rows.iter().all(|row| row.preview.is_empty()));
+
+        for _ in 0..200 {
+            if api.preview_in_flight.load(Ordering::SeqCst) >= PREVIEW_FETCH_CONCURRENCY {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            api.preview_calls.load(Ordering::SeqCst),
+            PREVIEW_FETCH_CONCURRENCY,
+            "20 channels do not all call history before the first batch finishes"
+        );
+        assert!(api.preview_max_in_flight.load(Ordering::SeqCst) <= PREVIEW_FETCH_CONCURRENCY);
+
+        release.store(true, Ordering::SeqCst);
+        for _ in 0..2_000 {
+            if api.preview_calls.load(Ordering::SeqCst) == 20
+                && api.preview_in_flight.load(Ordering::SeqCst) == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(api.preview_calls.load(Ordering::SeqCst), 20);
+        assert!(api.preview_max_in_flight.load(Ordering::SeqCst) <= PREVIEW_FETCH_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_preview_is_retried() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        api.state().preview_failures.insert(
+            GENERAL,
+            super::api::DiscordApiError::RateLimited {
+                retry_after: Duration::from_millis(1),
+            },
+        );
+        let (_adapter, _tx, _rx, events) = connected(Arc::clone(&api)).await;
+        let general = conversations(&events)
+            .into_iter()
+            .find(|row| row.title == "#general")
+            .expect("general");
+        assert_eq!(general.preview, "reply from the bot");
+        assert!(
+            api.preview_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "a 429 is tried again"
+        );
+    }
+
+    fn assert_preview_failure_keeps_channels(events: &[AdapterEvent]) {
+        let rows = conversations(events);
+        assert_eq!(rows.len(), 2, "one preview failure does not drop the list");
+        let general = rows
+            .iter()
+            .find(|row| row.title == "#general")
+            .expect("general");
+        let news = rows.iter().find(|row| row.title == "#news").expect("news");
+        assert!(general.preview.is_empty());
+        assert!(!general.preview.contains("Guild channel"));
+        assert_eq!(news.preview, "news line");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Linked,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::CommandFailed { .. }
+                | AdapterEvent::Status {
+                    status: AdapterStatus::Error,
+                    ..
+                }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Ready,
+                detail,
+                ..
+            } if detail.contains("2 guild channels")
         )));
     }
 
@@ -934,6 +1123,56 @@ mod tests {
             api.state().sent,
             vec![(GENERAL, "hi from thinwire".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn an_empty_send_is_refused_and_a_blank_echo_keeps_the_posted_text() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "   ".into(),
+                    request: 4,
+                },
+                &tx,
+            )
+            .expect("empty send");
+        let refused = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 4, .. })
+        })
+        .await;
+        assert!(
+            refused
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 4, .. }))
+        );
+        assert!(api.state().sent.is_empty());
+
+        api.state().echo_empty_content = true;
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                    body: "kept text".into(),
+                    request: 5,
+                },
+                &tx,
+            )
+            .expect("send");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReplaced { .. })
+        })
+        .await;
+        let Some(AdapterEvent::MessageReplaced { message, .. }) = events.last() else {
+            panic!("replace event");
+        };
+        assert_eq!(message.body, "kept text");
+        assert_eq!(api.state().sent, vec![(GENERAL, "kept text".to_string())]);
     }
 
     #[tokio::test]
@@ -1656,7 +1895,13 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_stops_the_channel_list() {
-        channel_list_fails(api::DiscordApiError::RateLimited, "rate limit").await;
+        channel_list_fails(
+            api::DiscordApiError::RateLimited {
+                retry_after: Duration::ZERO,
+            },
+            "rate limit",
+        )
+        .await;
     }
 
     #[tokio::test]
