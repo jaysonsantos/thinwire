@@ -481,7 +481,7 @@ fn account_chip(
         )
         .on_hover_ui(|ui| {
             ui.colored_label(palette.support(caps.support), caps.short_label);
-            ui.label(format!("status: {}", account.status.as_str()));
+            ui.label(account.status.plain_words());
         });
     let slack_sign_in = caps.id == ProtocolId::Slack && cfg!(feature = "slack-oauth");
     if caps.id == ProtocolId::Signal && cfg!(feature = "signal-local") {

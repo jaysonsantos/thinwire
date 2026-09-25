@@ -84,7 +84,7 @@ const CAPABILITY_DETAIL: &str = "Official Slack OAuth / workspace app (slack-mor
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Slack,
     support: SupportClass::Supported,
-    short_label: "Supported · OAuth-only",
+    short_label: "Supported · official workspace app",
     detail: CAPABILITY_DETAIL,
     official_api: true,
     allows_user_account_automation: false,
