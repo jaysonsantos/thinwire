@@ -1048,6 +1048,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
             sender: message.sender.clone(),
             body: message.body.clone(),
             delivery: message.delivery,
+            group: is_group,
             layout,
         })
         .collect();
@@ -1241,6 +1242,8 @@ struct Bubble {
     sender: String,
     body: String,
     delivery: Delivery,
+    /// Group chat. The AccessKit name keeps the sender on every row.
+    group: bool,
     layout: RowLayout,
 }
 
@@ -1347,19 +1350,29 @@ fn bubble(
                             .response
                             .rect;
                         let line = ui.text_style_height(&egui::TextStyle::Small);
+                        let has_time = !message.layout.time.is_empty();
                         let extra = match message.delivery {
                             Delivery::Pending => 1,
                             Delivery::Failed => 2,
                             Delivery::Sent => 0,
                         };
-                        let lines = usize::from(!message.layout.time.is_empty()) + extra;
-                        if lines > 0 {
+                        if has_time || extra > 0 {
                             let gap_y = ui.spacing().item_spacing.y;
-                            let meta_h =
-                                line * lines as f32 + gap_y * lines.saturating_sub(1) as f32;
+                            let time_h = if has_time { line } else { 0.0 };
+                            // The time shares the last body line. Status rows continue below it.
+                            let extra_h = if extra == 0 {
+                                0.0
+                            } else {
+                                gap_y + line * extra as f32 + gap_y * (extra - 1) as f32
+                            };
+                            let meta_top = if has_time {
+                                body_rect.bottom() - time_h
+                            } else {
+                                body_rect.bottom() + gap_y
+                            };
                             let meta_rect = egui::Rect::from_min_size(
-                                egui::pos2(body_rect.right() + gap, body_rect.bottom() - meta_h),
-                                egui::vec2(meta_width.max(1.0), meta_h),
+                                egui::pos2(body_rect.right() + gap, meta_top),
+                                egui::vec2(meta_width.max(1.0), time_h + extra_h),
                             );
                             ui.scope_builder(
                                 egui::UiBuilder::new()
@@ -1438,9 +1451,13 @@ fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery) -> f32 {
     width
 }
 
-/// AccessKit name of a bubble: the message, or the sender, the time, and the message.
+/// AccessKit name of a bubble.
+///
+/// A group row names the sender and the time on every message. A private
+/// row names the message. The visual sender header stays on the first row
+/// of a run.
 fn bubble_access_label(message: &Bubble) -> String {
-    if message.layout.show_sender {
+    if message.group {
         format!(
             "{} {} {}",
             message.sender, message.layout.time, message.body

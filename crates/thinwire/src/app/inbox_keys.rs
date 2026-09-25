@@ -322,6 +322,70 @@ fn a_wrapped_message_keeps_the_time_on_the_bottom() {
 }
 
 #[test]
+fn a_pending_message_keeps_the_time_on_the_last_line() {
+    let body = "On my way with the long note that wraps onto another line in this thread.";
+    let mut message = chat_message("telegram:1:pend", body, 1_790_300_000);
+    message.outbound = true;
+    message.delivery = Delivery::Pending;
+    let mut state = InboxUi::ready();
+    state
+        .snapshot
+        .apply(AdapterEvent::MessageReceived { message });
+    let mut harness = harness(state);
+    harness.run();
+    let text = harness.get_by_role_and_label(egui::accesskit::Role::Label, body);
+    let time = harness
+        .query_all(By::new().role(egui::accesskit::Role::Label))
+        .filter(|node| node.rect().left() >= text.rect().right() - 2.0)
+        .min_by(|left, right| {
+            (left.rect().bottom() - text.rect().bottom())
+                .abs()
+                .total_cmp(&(right.rect().bottom() - text.rect().bottom()).abs())
+        })
+        .expect("time beside the message");
+    let gap = (time.rect().bottom() - text.rect().bottom()).abs();
+    assert!(gap < 6.0, "the time stays on the last line, gap {gap}");
+    let sending = harness.get_by_role_and_label(egui::accesskit::Role::Label, "Sending…");
+    assert!(
+        sending.rect().top() + 2.0 >= time.rect().bottom(),
+        "Sending… sits under the time"
+    );
+}
+
+#[test]
+fn a_group_run_names_the_sender_on_every_message() {
+    let mut state = InboxUi::ready();
+    let mut conversation = telegram_chat(1, "Book club", 10);
+    conversation.is_group = true;
+    state
+        .snapshot
+        .apply(AdapterEvent::ConversationUpsert { conversation });
+    for (id, body) in [
+        ("telegram:1:a", "First line from Nora"),
+        ("telegram:1:b", "Second line from Nora"),
+    ] {
+        let mut message = chat_message(id, body, 1_790_300_000);
+        message.sender = "Nora".into();
+        state
+            .snapshot
+            .apply(AdapterEvent::MessageReceived { message });
+    }
+    let mut harness = harness(state);
+    harness.run();
+    for body in ["First line from Nora", "Second line from Nora"] {
+        harness.get(By::new().role(egui::accesskit::Role::Pane).predicate({
+            let body = body.to_owned();
+            move |node| {
+                let Some(label) = node.label() else {
+                    return false;
+                };
+                label.contains("Nora") && label.contains(&body)
+            }
+        }));
+    }
+}
+
+#[test]
 fn inbox_row_puts_the_title_left_and_the_badge_right() {
     let mut state = InboxUi::ready();
     let mut conversation = telegram_chat(1, "Zelda Title", 30);
