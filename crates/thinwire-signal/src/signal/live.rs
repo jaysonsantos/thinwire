@@ -205,8 +205,8 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
         return;
     }
     emit_account(&events, ProtocolId::Signal, AccountState::Linked);
-    let mut known = match publish_chats(&manager, &events).await {
-        Ok(known) => known,
+    let (mut known, mut group_titles) = match publish_chats(&manager, &events).await {
+        Ok(published) => published,
         Err(()) => {
             fail(&events, SYNC_FAILED);
             session.active.store(false, Ordering::SeqCst);
@@ -276,10 +276,17 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
                         match receive.on_item(item.is_none(), session.is_current(token)) {
                             StreamPoll::Continue => {
                                 if let Some(Received::Content(content)) = item {
+                                    remember_group_title(
+                                        &manager,
+                                        content.as_ref(),
+                                        &mut group_titles,
+                                    )
+                                    .await;
                                     emit_incoming(
                                         &events,
                                         content.as_ref(),
                                         &names,
+                                        &group_titles,
                                         &mut known,
                                     );
                                 }
@@ -375,8 +382,9 @@ async fn contact_names(manager: &Manager<SledStore, Registered>) -> HashMap<Stri
 async fn publish_chats(
     manager: &Manager<SledStore, Registered>,
     events: &EventTx,
-) -> Result<HashSet<String>, ()> {
+) -> Result<(HashSet<String>, HashMap<String, String>), ()> {
     let mut known = HashSet::new();
+    let mut group_titles = HashMap::new();
     let names = contact_names(manager).await;
     let contacts = manager.store().contacts().await.map_err(|_| ())?;
     for contact in contacts.flatten() {
@@ -388,13 +396,14 @@ async fn publish_chats(
             continue;
         };
         for message in messages.flatten() {
-            emit_content(events, &message, &names);
+            emit_content(events, &message, &names, &group_titles);
         }
     }
     let groups = manager.store().groups().await.map_err(|_| ())?;
     for group in groups.flatten() {
         let (key, group) = group;
         let conversation = conversation_from_group(&key, &group);
+        group_titles.insert(conversation.id.clone(), conversation.title.clone());
         known.insert(conversation.id.clone());
         emit_conversation(events, conversation);
         let thread = Thread::Group(key);
@@ -402,10 +411,33 @@ async fn publish_chats(
             continue;
         };
         for message in messages.flatten() {
-            emit_content(events, &message, &names);
+            emit_content(events, &message, &names, &group_titles);
         }
     }
-    Ok(known)
+    Ok((known, group_titles))
+}
+
+async fn remember_group_title(
+    manager: &Manager<SledStore, Registered>,
+    content: &Content,
+    titles: &mut HashMap<String, String>,
+) {
+    let Ok(Thread::Group(key)) = Thread::try_from(content) else {
+        return;
+    };
+    let id = super::group::group_id(&key);
+    if titles.contains_key(&id) {
+        return;
+    }
+    let stored = manager
+        .store()
+        .group(key)
+        .await
+        .ok()
+        .flatten()
+        .map(|group| group.title);
+    let title = super::group::group_chat(&key, stored.as_deref().unwrap_or("")).title;
+    titles.insert(id, title);
 }
 
 fn conversation_from_contact(contact: &Contact) -> Conversation {
@@ -446,9 +478,10 @@ fn emit_incoming(
     events: &EventTx,
     content: &Content,
     names: &HashMap<String, String>,
+    group_titles: &HashMap<String, String>,
     known: &mut HashSet<String>,
 ) {
-    let Some((conversation, message)) = row_and_message(content, names) else {
+    let Some((conversation, message)) = row_and_message(content, names, group_titles) else {
         return;
     };
     known.insert(conversation.id.clone());
@@ -456,8 +489,13 @@ fn emit_incoming(
     emit_message(events, message);
 }
 
-fn emit_content(events: &EventTx, content: &Content, names: &HashMap<String, String>) {
-    let Some((conversation, message)) = row_and_message(content, names) else {
+fn emit_content(
+    events: &EventTx,
+    content: &Content,
+    names: &HashMap<String, String>,
+    group_titles: &HashMap<String, String>,
+) {
+    let Some((conversation, message)) = row_and_message(content, names, group_titles) else {
         return;
     };
     emit_conversation(events, conversation);
@@ -467,6 +505,7 @@ fn emit_content(events: &EventTx, content: &Content, names: &HashMap<String, Str
 fn row_and_message(
     content: &Content,
     names: &HashMap<String, String>,
+    group_titles: &HashMap<String, String>,
 ) -> Option<(Conversation, ChatMessage)> {
     let incoming = match &content.body {
         ContentBody::DataMessage(DataMessage { body, .. }) => {
@@ -493,12 +532,19 @@ fn row_and_message(
                 .unwrap_or_else(|| conversation_id.clone());
             (conversation_id, uuid, title, false)
         }
-        Thread::Group(key) => (
-            super::group::group_id(key),
-            super::group::sender_name(&uuid, names),
-            super::group::group_chat(key, "").title,
-            true,
-        ),
+        Thread::Group(key) => {
+            let conversation_id = super::group::group_id(key);
+            let title = group_titles
+                .get(&conversation_id)
+                .cloned()
+                .unwrap_or_else(|| super::group::group_chat(key, "").title);
+            (
+                conversation_id,
+                super::group::sender_name(&uuid, names),
+                title,
+                true,
+            )
+        }
     };
     let message = ChatMessage {
         protocol: ProtocolId::Signal,
@@ -633,7 +679,7 @@ mod tests {
     fn events_for(content: &Content, names: &HashMap<String, String>) -> Vec<AdapterEvent> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut known = HashSet::new();
-        emit_incoming(&tx, content, names, &mut known);
+        emit_incoming(&tx, content, names, &HashMap::new(), &mut known);
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -738,7 +784,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut known = HashSet::new();
         known.insert(contact.to_string());
-        emit_incoming(&tx, &content, &HashMap::new(), &mut known);
+        emit_incoming(&tx, &content, &HashMap::new(), &HashMap::new(), &mut known);
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -755,6 +801,39 @@ mod tests {
             events.get(1),
             Some(AdapterEvent::MessageReceived { message })
                 if message.body == "second line"
+        ));
+    }
+
+    #[test]
+    fn a_stored_group_title_stays_on_a_new_message() {
+        let sender = Uuid::from_u128(0x3333_3333_3333_3333_3333_3333_3333_3333);
+        let key = vec![0x22; 32];
+        let content = envelope(
+            sender,
+            DataMessage {
+                body: Some("named group".into()),
+                group_v2: Some(GroupContextV2 {
+                    master_key: Some(key.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let id = super::super::group::group_id(&key);
+        let mut titles = HashMap::new();
+        titles.insert(id.clone(), "Book club".into());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut known = HashSet::new();
+        known.insert(id.clone());
+        emit_incoming(&tx, &content, &HashMap::new(), &titles, &mut known);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(matches!(
+            events.first(),
+            Some(AdapterEvent::ConversationUpsert { conversation })
+                if conversation.id == id && conversation.title == "Book club"
         ));
     }
 }
