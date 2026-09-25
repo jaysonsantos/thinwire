@@ -362,6 +362,8 @@ pub struct Snapshot {
     history_loading: HashSet<(ProtocolId, String)>,
     /// The last note of each protocol (`AdapterEvent::Notice`). Never an error.
     notices: HashMap<ProtocolId, String>,
+    /// The chat the adapters were last told the user looks at (`ViewChat`).
+    viewed: Option<(ProtocolId, String)>,
     /// Test hook: protocols the shell shows even with their feature off, so
     /// default CI can test the shell with more than Telegram.
     #[cfg(test)]
@@ -497,6 +499,7 @@ impl Snapshot {
             older_at_start: HashSet::new(),
             older_retry: HashMap::new(),
             notices: HashMap::new(),
+            viewed: None,
             #[cfg(test)]
             visible_for_test: HashSet::new(),
             scroll_to_selected: false,
@@ -1795,6 +1798,52 @@ impl Snapshot {
             protocol,
             conversation_id: id,
         });
+    }
+
+    /// Tell the adapters which chat shows now (shell plan 9). Sends only the
+    /// difference: `None` to the protocol the user left, then the new chat.
+    /// The core calls it after every dispatch and pump, so every path (a
+    /// click, an auto-select, a removed chat, a session end, a login form
+    /// over the thread) is covered.
+    pub(crate) fn sync_viewed(&mut self) {
+        let now = self.viewed_chat();
+        if now == self.viewed {
+            return;
+        }
+        let before = std::mem::replace(&mut self.viewed, now.clone());
+        let left_protocol = match (&before, &now) {
+            (Some((old, _)), Some((new, _))) => (old != new).then_some(*old),
+            (Some((old, _)), None) => Some(*old),
+            (None, _) => None,
+        };
+        if let Some(protocol) = left_protocol {
+            self.pending.push(AdapterCommand::ViewChat {
+                protocol,
+                conversation_id: None,
+            });
+        }
+        if let Some((protocol, id)) = now {
+            self.pending.push(AdapterCommand::ViewChat {
+                protocol,
+                conversation_id: Some(id),
+            });
+        }
+    }
+
+    /// The chat that shows in the thread now, if any.
+    fn viewed_chat(&self) -> Option<(ProtocolId, String)> {
+        if self.center_view() != CenterView::Thread {
+            return None;
+        }
+        let protocol = self.selected_protocol;
+        let id = self.selected_conversation.clone()?;
+        let listed = self.protocol_linked(protocol)
+            && self.account_surface_visible(protocol)
+            && self
+                .conversations
+                .get(&protocol)
+                .is_some_and(|rows| rows.iter().any(|row| row.id == id));
+        listed.then_some((protocol, id))
     }
 
     /// New link state of one protocol (`AdapterEvent::Account`).
@@ -5394,4 +5443,96 @@ mod tests {
     }
 
     // endregion: protocol-independent shell
+
+    // region: viewed chat (plan item 9)
+
+    fn view_commands(snapshot: &mut Snapshot) -> Vec<(ProtocolId, Option<String>)> {
+        snapshot.sync_viewed();
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::ViewChat {
+                    protocol,
+                    conversation_id,
+                } => Some((protocol, conversation_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn view_chat_follows_the_selection_and_sends_only_changes() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, Some("telegram:1".into()))]
+        );
+        assert!(
+            view_commands(&mut snapshot).is_empty(),
+            "no change, no command"
+        );
+
+        snapshot.select_conversation("telegram:2".into());
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, Some("telegram:2".into()))]
+        );
+        snapshot.select_conversation("telegram:2".into());
+        assert!(
+            view_commands(&mut snapshot).is_empty(),
+            "the same chat again"
+        );
+
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_protocol(ProtocolId::Slack);
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![
+                (ProtocolId::Telegram, None),
+                (ProtocolId::Slack, Some("slack:C1".into()))
+            ],
+            "the old protocol hears None first"
+        );
+
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Slack,
+            id: "slack:C1".into(),
+        });
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Slack, None)]
+        );
+    }
+
+    #[test]
+    fn view_chat_clears_on_session_end_and_under_a_login_form() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        view_commands(&mut snapshot);
+        // Advanced opens a form over the thread (only while not signed in,
+        // so use the auth screen directly).
+        snapshot.auth = AuthScreen::TelegramApi;
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, None)]
+        );
+        snapshot.auth = AuthScreen::Idle;
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, Some("telegram:1".into()))]
+        );
+        snapshot.apply(AdapterEvent::TelegramSessionEnded);
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, None)]
+        );
+    }
+
+    // endregion: viewed chat
 }
