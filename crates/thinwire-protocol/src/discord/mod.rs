@@ -637,6 +637,45 @@ mod tests {
         ));
     }
 
+    /// A stored bot token must not appear in events or `Debug`, and it must
+    /// not mark the account ready before the guild list returns.
+    #[tokio::test]
+    async fn stored_bot_token_is_not_logged_and_does_not_mark_ready() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let reached = arrived.notified();
+        tokio::pin!(reached);
+        api.state().hold_channels = Some(Arc::clone(&hold));
+        api.state().channels_at_barrier = Some(Arc::clone(&arrived));
+        let (mut adapter, _vault) = fake_adapter(Arc::clone(&api), Some(FIXTURE_TOKEN));
+        let (tx, mut rx) = unbounded_channel();
+        adapter.start(tx);
+        tokio::time::timeout(Duration::from_secs(2), reached)
+            .await
+            .expect("channel request reached the barrier");
+        let events = drain(&mut rx);
+        let rendered = format!("{events:?} {adapter:?}");
+        assert!(
+            !rendered.contains(FIXTURE_TOKEN),
+            "the bot token must not be logged"
+        );
+        assert!(
+            events.iter().all(|event| !is_ready(event)),
+            "a stored token is not Ready before the guild list returns"
+        );
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Linked,
+                    ..
+                }
+            )
+        }));
+        hold.notify_one();
+    }
+
     #[tokio::test]
     async fn channel_list_shows_only_readable_guild_text_channels() {
         let (_adapter, _tx, _rx, events) =
