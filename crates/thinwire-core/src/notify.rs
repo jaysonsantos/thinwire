@@ -285,6 +285,7 @@ mod tests {
             is_group: false,
             writable: true,
             muted: false,
+            placeholder: false,
         }
     }
 
