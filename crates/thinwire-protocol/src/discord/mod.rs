@@ -221,9 +221,11 @@ impl DiscordAdapter {
         #[cfg(any(test, feature = "discord-bot"))]
         {
             if let Some(session) = self.session.take() {
+                // Generation and the live counter move together under the session lock.
                 session.retire();
+            } else {
+                self.live.fetch_add(1, Ordering::SeqCst);
             }
-            self.live.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -372,15 +374,16 @@ impl ProtocolAdapter for DiscordAdapter {
         #[cfg(any(test, feature = "discord-bot"))]
         {
             const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
-            let pending = self.session.as_ref().map(session::Session::wait_for_sends);
-            let live = Arc::clone(&self.live);
-            self.session = None;
+            let session = self.session.take();
+            let pending = session.as_ref().map(session::Session::wait_for_sends);
             let events = events.clone();
             tokio::spawn(async move {
                 if let Some(pending) = pending {
                     let _ = tokio::time::timeout(SHUTDOWN_LIMIT, pending).await;
                 }
-                live.fetch_add(1, Ordering::SeqCst);
+                if let Some(session) = session {
+                    session.retire();
+                }
                 super::adapter::emit_stopped(&events, ProtocolId::Discord);
             });
         }
@@ -1820,6 +1823,94 @@ mod tests {
         assert!(
             api.state().sent.is_empty(),
             "a revoked generation does not register the send"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paused_401_does_not_unlink_the_session_that_replaced_it() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().hold_unlink = Some(Arc::clone(&hold));
+        api.state().unlink_at_barrier = Some(Arc::clone(&arrived));
+        api.state().unauthorized = true;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("401 is waiting to unlink");
+        api.state().unauthorized = false;
+        api.state().hold_unlink = None;
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Linked,
+                    ..
+                }
+            )
+        })
+        .await;
+        let _ = drain(&mut rx);
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late.iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )
+            }),
+            "session 1's paused 401 does not unlink session 2"
+        );
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("session 2 stays linked");
+        let opened = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+            )
+        })
+        .await;
+        assert!(
+            !opened.iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )
+            }),
+            "session 2's generation was not bumped by the stale 401"
         );
     }
 

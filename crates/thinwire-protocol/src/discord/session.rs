@@ -67,6 +67,8 @@ struct PendingLoad {
 /// - Once `revoked` is set, a send is not inserted. `register_send` queues
 ///   `SendRejected` in that step, and if `Unlinked` is not queued yet it queues
 ///   that rejection first. No send is registered for a revoked generation.
+/// - The shared live counter moves only in this step, and only after the
+///   generation check: replacing the session, or publishing `Unlinked`.
 #[derive(Debug, Default)]
 struct Shared {
     bot_id: Option<u64>,
@@ -154,6 +156,8 @@ impl Session {
     /// Starts a new generation and loads the channel list.
     ///
     /// `carried` is the previous list. An empty map is a first connect.
+    /// The live-counter bump happens while this session's lock is held, before
+    /// any task can publish.
     pub(crate) fn start(
         api: Arc<dyn DiscordApi>,
         live: &Arc<AtomicU64>,
@@ -162,23 +166,29 @@ impl Session {
         history: HashMap<String, Vec<String>>,
         bodies: HashMap<String, String>,
     ) -> Self {
-        let generation = live.fetch_add(1, Ordering::SeqCst) + 1;
+        let shared = Arc::new(Mutex::new(Shared {
+            bot_id: None,
+            channels: carried,
+            inflight: HashMap::new(),
+            loads: Vec::new(),
+            history,
+            bodies,
+            reload_ticket: 0,
+            generation: 0,
+            revoked: false,
+            pending_unlink: None,
+            send_tasks: 0,
+            send_idle: Arc::new(Notify::new()),
+        }));
+        let generation = {
+            let mut state = shared.lock().unwrap_or_else(|err| err.into_inner());
+            let generation = live.fetch_add(1, Ordering::SeqCst) + 1;
+            state.generation = generation;
+            generation
+        };
         let session = Self {
             api,
-            shared: Arc::new(Mutex::new(Shared {
-                bot_id: None,
-                channels: carried,
-                inflight: HashMap::new(),
-                loads: Vec::new(),
-                history,
-                bodies,
-                reload_ticket: 0,
-                generation,
-                revoked: false,
-                pending_unlink: None,
-                send_tasks: 0,
-                send_idle: Arc::new(Notify::new()),
-            })),
+            shared,
             gate: Gate {
                 live: Arc::clone(live),
                 generation,
@@ -226,7 +236,7 @@ impl Session {
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
                     if finish_reload(&shared, generation, &events, error) {
-                        seal_unlink(api.as_ref(), &shared, &gate, &events).await;
+                        seal_unlink(api.as_ref(), &shared, &gate, generation, &events).await;
                         emit_status(
                             &events,
                             ProtocolId::Discord,
@@ -367,7 +377,7 @@ impl Session {
                         }
                     };
                     if unauthorized {
-                        seal_unlink(api.as_ref(), &shared, &gate, &events).await;
+                        seal_unlink(api.as_ref(), &shared, &gate, generation, &events).await;
                     }
                 }
             }
@@ -443,7 +453,7 @@ impl Session {
             // This generation is already revoked. Reject here and do not insert.
             // When `Unlinked` is still pending, it is queued after this rejection.
             emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
-            publish_unlink(&mut state, &self.gate, events);
+            publish_unlink(&mut state, &self.gate, self.gate.generation, events);
             return Ok(None);
         }
         let (access, bot_id) = match (state.channels.get(conversation_id), state.bot_id) {
@@ -558,10 +568,18 @@ impl Session {
     }
 
     /// Moves this session's generation so a result that already started is dropped.
+    ///
+    /// The shared live counter moves in this same step, and only when the
+    /// generation still matches. A stale task cannot bump it later.
     pub(crate) fn retire(&self) {
-        if let Ok(mut state) = self.shared.lock() {
-            state.generation = state.generation.wrapping_add(1);
+        let Ok(mut state) = self.shared.lock() else {
+            return;
+        };
+        if state.generation != self.gate.generation {
+            return;
         }
+        state.generation = state.generation.wrapping_add(1);
+        self.gate.invalidate();
     }
 }
 
@@ -698,8 +716,14 @@ fn settle_unauthorized(state: &mut Shared, events: &EventTx, error: DiscordApiEr
     }
 }
 
-/// Queues `Unlinked` for this generation. A no-op once it has been queued.
-fn publish_unlink(state: &mut Shared, gate: &Gate, events: &EventTx) {
+/// Queues `Unlinked` for this generation. A no-op once it has been queued,
+/// and a no-op when a later connect already moved the generation. The live
+/// counter moves here, under the same lock as that check.
+fn publish_unlink(state: &mut Shared, gate: &Gate, generation: u64, events: &EventTx) {
+    if state.generation != generation {
+        state.pending_unlink = None;
+        return;
+    }
     let Some(error) = state.pending_unlink.take() else {
         return;
     };
@@ -709,11 +733,12 @@ fn publish_unlink(state: &mut Shared, gate: &Gate, events: &EventTx) {
 }
 
 /// Lets a send blocked on the session lock reject itself, then queues `Unlinked`
-/// if that send did not.
+/// if that send did not and this generation is still current.
 async fn seal_unlink(
     api: &dyn DiscordApi,
     shared: &Arc<Mutex<Shared>>,
     gate: &Gate,
+    generation: u64,
     events: &EventTx,
 ) {
     tokio::task::yield_now().await;
@@ -721,7 +746,7 @@ async fn seal_unlink(
         hold.notified().await;
     }
     if let Ok(mut state) = shared.lock() {
-        publish_unlink(&mut state, gate, events);
+        publish_unlink(&mut state, gate, generation, events);
     }
 }
 
@@ -789,12 +814,13 @@ async fn finish_send(
     events: &EventTx,
     returned: ReturnedSend,
 ) {
+    let generation = returned.generation;
     let queued = queue_send_result(shared, gate, events, returned);
     let needs_seal = shared
         .lock()
         .is_ok_and(|state| state.pending_unlink.is_some());
     if needs_seal {
-        seal_unlink(api, shared, gate, events).await;
+        seal_unlink(api, shared, gate, generation, events).await;
     }
     if queued {
         // The result is already on the channel. A test can run a 401 here.
