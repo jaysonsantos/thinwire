@@ -41,6 +41,9 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 /// Conversation id of the offline placeholder row. Not a real chat.
 pub(crate) const PLACEHOLDER_ID: &str = "whatsapp:placeholder";
 
+const STOP_TIMEOUT: &str =
+    "The WhatsApp client did not stop in time. The app closes at its own limit.";
+
 const NOT_CONNECTED: &str = "WhatsApp is not connected. Pass the ban gate and pair a device first.";
 const BAD_CHAT_ID: &str = "that conversation is not a WhatsApp chat";
 const UNKNOWN_CHAT: &str = "that WhatsApp chat is not in the synced list";
@@ -232,6 +235,24 @@ impl WhatsAppAdapter {
 }
 
 impl WhatsAppAdapter {
+    /// `Stopped` means that no WhatsApp client runs (#44). The owner stops
+    /// the client after any start in progress, and the wait has its own bound
+    /// below the app close limit. If that bound runs out, the client may
+    /// still run: send an error, not `Stopped`. The app then closes at its
+    /// own limit.
+    fn finish_shutdown(stopped: bool, events: &EventTx) {
+        if stopped {
+            super::adapter::emit_stopped(events, ProtocolId::WhatsApp);
+        } else {
+            emit_status(
+                events,
+                ProtocolId::WhatsApp,
+                AdapterStatus::Error,
+                STOP_TIMEOUT,
+            );
+        }
+    }
+
     fn connect(&self, events: &EventTx) {
         if self.session.is_connected() {
             emit_status(
@@ -456,10 +477,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
         };
         let events = events.clone();
         tokio::spawn(async move {
-            // The owner stops the client after any start in progress; the
-            // wait has its own bound below the app close limit (#44).
-            link.shutdown().await;
-            super::adapter::emit_stopped(&events, ProtocolId::WhatsApp);
+            Self::finish_shutdown(link.shutdown().await, &events);
         });
     }
 
@@ -566,14 +584,30 @@ mod tests {
                 protocol: ProtocolId::WhatsApp
             }
         );
-        let src = include_str!("mod.rs");
-        let body = &src[src.find("fn shutdown(&mut self").expect("shutdown")..];
-        let body = &body[..body.find("\n    }\n").expect("end")];
-        let close = body.find("link.shutdown().await").expect("link closes");
-        let stopped = body.find("emit_stopped(&events").expect("then Stopped");
-        assert!(
-            close < stopped,
-            "Stopped only after the bot and its session close"
+
+        // With a running client, Stopped comes only after the client stopped.
+        let (fake, handle, owner_session, _owner_rx) =
+            link::tests::owner(link::tests::Fake::default());
+        handle.begin(None, 1);
+        handle.flush().await;
+        let mut adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
+        adapter.session = owner_session;
+        adapter.link = Some(handle);
+        adapter.shutdown(&tx);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Stopped in time")
+            .expect("channel open");
+        assert_eq!(
+            event,
+            AdapterEvent::Stopped {
+                protocol: ProtocolId::WhatsApp
+            }
+        );
+        assert_eq!(
+            fake.log(),
+            vec!["start 1", "stop 1"],
+            "Stopped only after the client stopped"
         );
     }
 
@@ -1752,6 +1786,61 @@ mod tests {
             "the owner stops the client and deletes the revoked store"
         );
         assert!(!adapter.session.is_connected());
+    }
+
+    /// Codex r4093899833: `Stopped` only when the client really stopped.
+    #[test]
+    fn shutdown_timeout_sends_no_stopped() {
+        let (tx, mut rx) = unbounded_channel();
+        WhatsAppAdapter::finish_shutdown(false, &tx);
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Stopped { .. }))
+        );
+        assert_eq!(statuses(&events), vec![AdapterStatus::Error]);
+        WhatsAppAdapter::finish_shutdown(true, &tx);
+        assert_eq!(
+            drain(&mut rx),
+            vec![AdapterEvent::Stopped {
+                protocol: ProtocolId::WhatsApp
+            }]
+        );
+    }
+
+    /// The whole path: a client that never stops gets no `Stopped`.
+    #[tokio::test]
+    async fn shutdown_of_a_hanging_client_sends_no_stopped() {
+        let (_fake, handle, owner_session, _owner_rx) = link::tests::owner(link::tests::Fake {
+            stop_hangs: true,
+            ..link::tests::Fake::default()
+        });
+        handle.begin(None, 1);
+        handle.flush().await;
+        let mut adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
+        adapter.session = owner_session;
+        adapter.link = Some(handle);
+        let (tx, mut rx) = unbounded_channel();
+        adapter.shutdown(&tx);
+        let event = tokio::time::timeout(
+            link::SHUTDOWN_WAIT + std::time::Duration::from_secs(2),
+            rx.recv(),
+        )
+        .await
+        .expect("an answer after the bound")
+        .expect("open channel");
+        assert!(
+            matches!(
+                event,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Error,
+                    ..
+                }
+            ),
+            "{event:?}"
+        );
+        assert!(rx.try_recv().is_err(), "no Stopped after the error");
     }
 
     #[test]
