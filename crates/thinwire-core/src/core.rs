@@ -181,6 +181,7 @@ impl Core {
             self.state.status_text = text;
         }
         self.state.poll_resume(&self.secrets);
+        self.state.expire_sends();
         self.state.sync_viewed();
         self.flush();
         applied

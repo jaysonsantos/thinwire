@@ -48,7 +48,7 @@ The shell treats every protocol the same. Only the Telegram login and the first-
     - `Unlinked` from any other state ends the session. The shell drops that protocol's rows, messages, drafts, spinners, notes, and sends.
 2. Use `Status` for the session status line only. A `Status { Error }` never unlinks and never hides the inbox.
 3. Set `ProtocolCapabilities::sends_text` and `Conversation::writable`. The shell offers Send only for a linked protocol that sends text, in a writable chat.
-4. Answer each `SendText` and `ResendMessage` with `SendAccepted` or `SendRejected` for its `request`. Nothing else ends a send or a retry. Answer with `SendRejected` also after a reconnect that lost the request.
+4. Answer each `SendText` and `ResendMessage` with `SendAccepted` or `SendRejected` for its `request`. Nothing else from the adapter ends a send or a retry. Answer with `SendRejected` also after a reconnect that lost the request. As a safety net, the core ends a send or retry with no answer after 30 s (`SEND_TIMEOUT`, #69): the chat unlocks, the text stays, and a late answer changes nothing.
 5. Report a failed command that leaves the session up as `CommandFailed`. It stops that command's spinner and shows the error.
 6. Report information for the user as `Notice`. It is a note, not an error or a refusal.
 7. Override `ProtocolAdapter::view_chat` to track the chat the user looks at (`ViewChat`), for example for unread counts. The default ignores it.

@@ -1052,9 +1052,9 @@ impl Snapshot {
             return;
         }
         // One send or retry per chat. Only this retry's own answer ends it.
-        let Some(request) = self
-            .sends
-            .begin_retry(protocol, &conversation_id, message_id)
+        let Some(request) =
+            self.sends
+                .begin_retry(protocol, &conversation_id, message_id, Instant::now())
         else {
             return;
         };
@@ -1514,6 +1514,31 @@ impl Snapshot {
         }
     }
 
+    /// Expire sends and retries with no answer after `SEND_TIMEOUT` (#69).
+    /// The core calls it on every pump.
+    pub(crate) fn expire_sends(&mut self) {
+        self.expire_sends_at(Instant::now());
+    }
+
+    /// `expire_sends` with the clock as a parameter, for tests. An expired
+    /// send keeps its text; an expired retry sets its row back to `Failed`.
+    fn expire_sends_at(&mut self, now: Instant) {
+        for (protocol, chat, pending) in self.sends.expire(now) {
+            let why = format!("{} did not answer in time.", protocol.display_name());
+            match pending {
+                Pending::Send { .. } => self.set_error(
+                    "Message not sent.",
+                    &why,
+                    "The text is still in the compose field. Send it again.",
+                ),
+                Pending::Retry { message_id, .. } => {
+                    self.set_delivery(protocol, &chat, &message_id, Delivery::Failed);
+                    self.set_error("Message not sent.", &why, "Press Retry to send it again.");
+                }
+            }
+        }
+    }
+
     /// The adapter rejected this send (chat and request id match): it was
     /// not accepted. The text is still in its compose field or draft. Other
     /// errors (for example a history load error) never fail a send.
@@ -1589,7 +1614,10 @@ impl Snapshot {
         let body = self.compose.trim().to_string();
         // Keep the text until the adapter accepts the send; see note_send_accepted.
         let protocol = self.selected_protocol;
-        let Some(request) = self.sends.begin_send(protocol, &conversation_id, &body) else {
+        let Some(request) =
+            self.sends
+                .begin_send(protocol, &conversation_id, &body, Instant::now())
+        else {
             return;
         };
         self.error = None;
@@ -6030,4 +6058,49 @@ mod tests {
     }
 
     // endregion: #70
+
+    // region: #69 unanswered sends
+
+    /// #69: a send with no answer unlocks its chat after the timeout. The text
+    /// stays, the error shows, and a late answer changes nothing.
+    #[test]
+    fn an_unanswered_send_unlocks_its_chat() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .sends
+            .request_of(ProtocolId::Telegram, "telegram:1")
+            .expect("send");
+        assert!(!snapshot.can_send());
+
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert!(snapshot.can_send(), "the chat is unlocked");
+        assert_eq!(snapshot.compose, "hello", "the text stays");
+        assert_eq!(
+            snapshot.error.as_ref().map(|error| error.why.as_str()),
+            Some("Telegram did not answer in time.")
+        );
+
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(snapshot.compose, "hello", "a late answer changes nothing");
+    }
+
+    /// #69: an unanswered retry sets its row back to Failed.
+    #[test]
+    fn an_unanswered_retry_fails_its_row_again() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        retry_failed_row(&mut snapshot);
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+        assert!(snapshot.error.is_some());
+    }
+
+    // endregion: #69
 }
