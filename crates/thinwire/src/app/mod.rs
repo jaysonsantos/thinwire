@@ -1,6 +1,8 @@
 //! eframe application: draws the core view and sends user intents to the core.
 
 mod auth;
+#[cfg(test)]
+mod inbox_keys;
 mod theme;
 mod theme_mode;
 mod thread_layout;

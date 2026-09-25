@@ -533,6 +533,35 @@ fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Ve
     if let Some(id) = clicked {
         out.push(Intent::SelectConversation { id });
     }
+    inbox_keys(ui, snapshot, out);
+}
+
+/// Arrow keys move the highlight. Enter opens that chat.
+/// A focused text field keeps the keys. Login keeps Enter.
+fn inbox_keys(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
+    if snapshot.inbox_state() != InboxState::Rows {
+        return;
+    }
+    if snapshot.center_view() != CenterView::Thread {
+        return;
+    }
+    if ui.ctx().text_edit_focused() {
+        return;
+    }
+    let (up, down, enter) = ui.input(|input| {
+        (
+            input.key_pressed(egui::Key::ArrowUp),
+            input.key_pressed(egui::Key::ArrowDown),
+            input.key_pressed(egui::Key::Enter),
+        )
+    });
+    if up {
+        out.push(Intent::MoveInbox { delta: -1 });
+    } else if down {
+        out.push(Intent::MoveInbox { delta: 1 });
+    } else if enter && let Some(id) = snapshot.selected_conversation.clone() {
+        out.push(Intent::SelectConversation { id });
+    }
 }
 
 /// One inbox row. The whole rect is the click target, including the preview.
@@ -605,7 +634,11 @@ fn inbox_row(
             );
         });
     });
-    ui.interact(rect, ui.id().with(("inbox-row", id)), egui::Sense::click())
+    let response = ui.interact(rect, ui.id().with(("inbox-row", id)), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, title)
+    });
+    response
 }
 
 /// Unread pill. `text` comes from [`badge_text`].

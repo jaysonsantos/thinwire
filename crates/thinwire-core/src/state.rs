@@ -743,6 +743,32 @@ impl Snapshot {
         self.queue_open_chat();
     }
 
+    /// Move the highlight among the visible inbox rows.
+    /// The chat stays closed and the compose field stays unfocused.
+    pub fn move_inbox_selection(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        let ids: Vec<String> = self
+            .visible_conversations()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_conversation
+            .as_deref()
+            .and_then(|id| ids.iter().position(|row| row == id));
+        let next = match current {
+            Some(index) => (index as i32 + delta).clamp(0, ids.len() as i32 - 1) as usize,
+            None if delta < 0 => ids.len() - 1,
+            None => 0,
+        };
+        self.set_selected_conversation(Some(ids[next].clone()));
+    }
+
     /// Change the selected chat. The compose text stays with the chat it was typed in.
     /// True when this chat of this protocol is the selected one.
     #[must_use]
@@ -2189,6 +2215,46 @@ mod tests {
         );
         assert!(send_texts(&mut snapshot).is_empty());
         assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn arrow_moves_the_inbox_and_enter_opens_the_chat() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        snapshot.move_inbox_selection(1);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:2")
+        );
+        assert!(!snapshot.wants_focus_compose());
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "an arrow does not open the chat"
+        );
+        snapshot.move_inbox_selection(1);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:2"),
+            "the last row stays selected"
+        );
+        snapshot.move_inbox_selection(-1);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        snapshot.select_conversation("telegram:2".into());
+        assert!(snapshot.take_focus_compose());
+        assert!(
+            snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::OpenChat { .. })),
+            "Enter opens the highlighted chat"
+        );
     }
 
     #[test]

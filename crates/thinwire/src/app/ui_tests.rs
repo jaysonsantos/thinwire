@@ -159,6 +159,12 @@ fn keys_are_read_once_in_the_center_panel() {
     let center = &center[..center.find("\nfn ").expect("next")];
     assert!(center.contains("Intent::Key(AuthKey::Enter)"));
     assert!(center.contains("Intent::Key(AuthKey::Escape)"));
+    let inbox = &ui[ui.find("fn inbox_keys(").expect("inbox keys")..];
+    let inbox = &inbox[..inbox.find("\nfn ").expect("next")];
+    assert!(inbox.contains("text_edit_focused()"));
+    assert!(inbox.contains("CenterView::Thread"));
+    assert!(inbox.contains("Intent::MoveInbox"));
+    assert!(inbox.contains("Intent::SelectConversation"));
 }
 
 #[test]
