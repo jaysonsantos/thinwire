@@ -420,3 +420,66 @@ fn inbox_row_puts_the_title_left_and_the_badge_right() {
         "the title stays left of the badge"
     );
 }
+
+#[test]
+fn tab_then_two_arrows_land_on_row_3_and_enter_opens_it() {
+    let mut state = InboxUi::ready();
+    let mut conversation = telegram_chat(3, "Cara", 1);
+    conversation.preview = "seen from Cara".into();
+    state
+        .snapshot
+        .apply(AdapterEvent::ConversationUpsert { conversation });
+    let mut harness = harness(state);
+    harness.run();
+    let mut tabbed = false;
+    for _ in 0..40 {
+        harness.key_press(egui::Key::Tab);
+        harness.step();
+        if harness.state().snapshot.focused_row.as_deref() == Some("telegram:1") {
+            tabbed = true;
+            break;
+        }
+    }
+    assert!(tabbed, "Tab reaches Ada");
+    let ada = harness.get_by_role_and_label(egui::accesskit::Role::Button, "Ada");
+    assert!(
+        ada.accesskit_node().is_focused(),
+        "widget focus is on the Tab row"
+    );
+    assert_eq!(
+        harness.state().snapshot.focused_row.as_deref(),
+        Some("telegram:1"),
+        "the highlight is on the Tab row"
+    );
+    harness.key_press(egui::Key::ArrowDown);
+    harness.step();
+    harness.key_press(egui::Key::ArrowDown);
+    harness.step();
+    assert_eq!(
+        harness.state().snapshot.focused_row.as_deref(),
+        Some("telegram:3")
+    );
+    let cara = harness.get_by_role_and_label(egui::accesskit::Role::Button, "Cara");
+    assert!(
+        cara.accesskit_node().is_focused(),
+        "widget focus is on row 3"
+    );
+    assert_eq!(
+        harness.state().selects,
+        0,
+        "an arrow does not open the chat"
+    );
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:1"),
+        "an arrow leaves Ada open"
+    );
+    harness.state_mut().selects = 0;
+    harness.key_press(egui::Key::Enter);
+    harness.step();
+    assert_eq!(harness.state().selects, 1, "Enter sends one open");
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:3")
+    );
+}
