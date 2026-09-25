@@ -430,6 +430,10 @@ pub struct Snapshot {
     /// Protocols the shell shows even with their feature off: the demo
     /// adapters (#120), and tests of the shell with more than Telegram.
     pub(crate) extra_visible: HashSet<ProtocolId>,
+    /// Test hook: protocols the shell hides even with their feature on, so a
+    /// test holds in every feature build (qa on #111).
+    #[cfg(test)]
+    hidden_for_test: HashSet<ProtocolId>,
     /// Telegram chats with a request for older messages in flight (#30).
     /// One request at a time for each chat.
     older_loading: HashSet<String>,
@@ -591,6 +595,8 @@ impl Snapshot {
             open_on_link: None,
             sessions: HashSet::new(),
             extra_visible: HashSet::new(),
+            #[cfg(test)]
+            hidden_for_test: HashSet::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
@@ -1217,6 +1223,10 @@ impl Snapshot {
     /// when their cargo features are on.
     #[must_use]
     pub fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
+        #[cfg(test)]
+        if self.hidden_for_test.contains(&protocol) {
+            return false;
+        }
         if self.extra_visible.contains(&protocol) {
             return true;
         }
@@ -2397,6 +2407,20 @@ impl Snapshot {
             let in_flight = self.history_loading.contains(&(protocol, id.clone()));
             if queued || in_flight {
                 self.open_on_link = Some((protocol, id));
+            }
+        }
+        // A dropped open of another chat loads nothing: stop its spinner
+        // (qa Low on #111). The marked chat keeps its spinner until Linked.
+        let marked = self.open_on_link.clone();
+        for command in self.pending.iter().filter(|command| is_open(command)) {
+            if let AdapterCommand::OpenChat {
+                conversation_id, ..
+            } = command
+            {
+                let key = (protocol, conversation_id.clone());
+                if marked.as_ref() != Some(&key) {
+                    self.history_loading.remove(&key);
+                }
             }
         }
         self.pending.retain(|command| !is_open(command));
@@ -7055,6 +7079,38 @@ mod tests {
         );
     }
 
+    /// qa Low on #111: a queued open of a chat that is no longer selected is
+    /// dropped at Linking, and its spinner stops.
+    #[test]
+    fn a_dropped_open_of_another_chat_stops_its_spinner() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        for id in ["slack:C1", "slack:C2"] {
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: chat(ProtocolId::Slack, id, true),
+            });
+        }
+        snapshot.take_commands();
+        snapshot.select_conversation("slack:C2".into());
+        snapshot.select_conversation("slack:C1".into());
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert!(
+            !snapshot
+                .history_loading
+                .contains(&(ProtocolId::Slack, "slack:C2".to_owned())),
+            "no spinner for the dropped open"
+        );
+        assert!(
+            snapshot
+                .history_loading
+                .contains(&(ProtocolId::Slack, "slack:C1".to_owned())),
+            "the selected chat waits for Linked"
+        );
+    }
+
     /// #90 item 7 (qa on #86): an `OpenChat` in flight when a reconnect
     /// starts can be lost. `Linked` sends it again.
     #[test]
@@ -7577,6 +7633,8 @@ mod tests {
         let store = SecretStore::memory();
         let mut snapshot = telegram_idle_slack_linked(&store);
         snapshot.extra_visible.remove(&ProtocolId::Slack);
+        // Hidden in every feature build, also with slack-oauth on.
+        snapshot.hidden_for_test.insert(ProtocolId::Slack);
         snapshot.chat_list_loading.insert(ProtocolId::Slack);
         snapshot.status_text = "Message sent.".into();
         assert!(snapshot.is_loading());
