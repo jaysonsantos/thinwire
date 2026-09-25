@@ -20,7 +20,11 @@ slack-oauth = ["thinwire-core/slack-oauth", "thinwire-protocol/slack-oauth"]
 whatsapp-web = ["thinwire-core/whatsapp-web", "thinwire-protocol/whatsapp-web"]
 discord-bot = ["thinwire-core/discord-bot", "thinwire-protocol/discord-bot"]
 # Local-only AGPL Signal client. Release builds and OS zips leave this off.
-signal-local = ["thinwire-core/signal-local", "thinwire-protocol/signal-local"]
+signal-local = [
+  "dep:qrcode",
+  "thinwire-core/signal-local",
+  "thinwire-protocol/signal-local",
+]
 
 [dependencies]
 chrono.workspace = true
@@ -32,6 +36,8 @@ winit.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# QR for the Signal provisioning URI. Feature `signal-local` only.
+qrcode = { version = "0.14", optional = true, default-features = false }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", default-features = false }

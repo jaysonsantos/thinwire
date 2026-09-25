@@ -73,6 +73,15 @@ fn link_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
             theme::palette(ui).warn,
             "Provisioning URL. Do not commit it, log it, or paste it into a ticket.",
         );
+        if let Some(image) = provisioning_qr_image(qr) {
+            let texture = ui.ctx().load_texture(
+                "signal-provisioning-qr",
+                image,
+                egui::TextureOptions::NEAREST,
+            );
+            ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(240.0, 240.0)));
+            ui.add_space(8.0);
+        }
         ui.monospace(qr);
     }
     ui.add_space(12.0);
@@ -83,5 +92,58 @@ fn link_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
     );
     if ui.button("Cancel linking").clicked() {
         out.push(Intent::Signal(SignalIntent::CancelLink));
+    }
+}
+
+/// QR modules plus a quiet zone, scaled so a phone camera can read the URI.
+const QR_SCALE: usize = 8;
+const QR_QUIET: usize = 4;
+
+fn provisioning_qr_image(uri: &str) -> Option<egui::ColorImage> {
+    let code = qrcode::QrCode::new(uri.as_bytes()).ok()?;
+    let modules = code.width();
+    let side = modules + QR_QUIET * 2;
+    let size = side * QR_SCALE;
+    let mut pixels = Vec::with_capacity(size * size);
+    for y in 0..size {
+        for x in 0..size {
+            let mx = x / QR_SCALE;
+            let my = y / QR_SCALE;
+            let dark = mx >= QR_QUIET
+                && my >= QR_QUIET
+                && mx < QR_QUIET + modules
+                && my < QR_QUIET + modules
+                && code[(mx - QR_QUIET, my - QR_QUIET)] == qrcode::Color::Dark;
+            pixels.push(if dark {
+                egui::Color32::BLACK
+            } else {
+                egui::Color32::WHITE
+            });
+        }
+    }
+    Some(egui::ColorImage::new([size, size], pixels))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provisioning_uri_becomes_a_square_qr() {
+        let image = provisioning_qr_image("sgnl://link-device?uuid=fixture").expect("qr");
+        assert_eq!(image.size[0], image.size[1]);
+        assert!(image.size[0] >= (21 + QR_QUIET * 2) * QR_SCALE);
+        assert!(
+            image
+                .pixels
+                .iter()
+                .any(|pixel| *pixel == egui::Color32::BLACK)
+        );
+        assert!(
+            image
+                .pixels
+                .iter()
+                .any(|pixel| *pixel == egui::Color32::WHITE)
+        );
     }
 }
