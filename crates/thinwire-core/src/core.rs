@@ -1092,9 +1092,12 @@ mod tests {
 
         let mut core = memory_core();
         core.state = ready_with_chats(&core.secrets);
-        // No adapter answers: commands go to a probe.
+        // No adapter answers: commands go to a probe, and no adapter event
+        // comes in, so `pump()` reports only the expiry.
         let (probe, _sent) = unbounded_channel();
         core.commands = HostSender::for_test(probe);
+        let (_quiet, events) = unbounded_channel();
+        core.events = events;
         core.dispatch(Intent::SelectConversation {
             id: "telegram:1".into(),
         });
