@@ -248,6 +248,19 @@ impl SendTracker {
             .collect()
     }
 
+    /// The sends and retries of one protocol that expired and still wait for
+    /// a late answer (kept for `EXPIRED_KEEP`), oldest request first.
+    pub(crate) fn expired_of(&self, protocol: ProtocolId) -> Vec<(String, Pending)> {
+        let mut expired: Vec<(String, Pending)> = self
+            .expired
+            .iter()
+            .filter(|((owner, _, _), _)| *owner == protocol)
+            .map(|((_, chat, _), expired)| (chat.clone(), expired.pending.clone()))
+            .collect();
+        expired.sort_by_key(|(_, pending)| pending.request());
+        expired
+    }
+
     /// The protocol's session ended: its sends and retries are gone.
     pub(crate) fn drop_protocol(&mut self, protocol: ProtocolId) {
         self.open.retain(|(owner, _), _| *owner != protocol);

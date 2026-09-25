@@ -1868,13 +1868,17 @@ impl Snapshot {
         }
     }
 
-    /// The text of each send or retry in flight that a session end keeps as
-    /// its chat's draft (#135): the chat's text is empty or still that text.
-    /// A retry keeps the text of its row, which the session end drops.
+    /// The text of each send or retry with no answer that a session end
+    /// keeps as its chat's draft (#135): one in flight, or one that expired
+    /// and still waits for a late answer (Codex r4109058384). The chat's text
+    /// must be empty or still that text. A retry keeps the text of its row,
+    /// which the session end drops. A send in flight comes last, so it wins
+    /// over an older expired send of the same chat.
     fn pending_texts_to_keep(&self, protocol: ProtocolId) -> Vec<(String, String)> {
         self.sends
-            .open_of(protocol)
+            .expired_of(protocol)
             .into_iter()
+            .chain(self.sends.open_of(protocol))
             .filter_map(|(chat, pending)| {
                 let text = match pending {
                     Pending::Send { body, .. } => body,
@@ -7440,6 +7444,33 @@ mod tests {
                 .get(&(ProtocolId::Slack, "slack:C1".to_owned())),
             None
         );
+    }
+
+    /// Codex r4109058384 on #135: a send that timed out keeps its text too.
+    /// Send, timeout, Unlinked, relink: the text is back.
+    #[test]
+    fn a_session_end_keeps_the_text_of_an_expired_send() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        slack_send_in_flight(&mut snapshot, "hello");
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert!(snapshot.can_send(), "the send expired");
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        assert_eq!(
+            snapshot
+                .drafts
+                .get(&(ProtocolId::Slack, "slack:C1".to_owned()))
+                .map(String::as_str),
+            Some("hello")
+        );
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_conversation("slack:C1".into());
+        assert_eq!(snapshot.compose, "hello", "the text is back");
     }
 
     /// #135 keeps the R73 rule: a Telegram session end drops every draft,
