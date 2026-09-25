@@ -54,12 +54,13 @@ The shell treats every protocol the same. Only the Telegram login and the first-
 7. Override `ProtocolAdapter::view_chat` to track the chat the user looks at (`ViewChat`), for example for unread counts. The default ignores it.
 8. Put the generation of the begin command on every pairing payload: `WhatsAppBeginLink { generation }` for `WhatsAppQr` and `WhatsAppPairCode`, and the same for Signal (`SignalQr`, feature `signal-local`, #39) when it lands. The core assigns the generation. The shell shows only payloads of the current pairing and drops older ones.
 9. End each load command with its answer or a failure. `LoadChats` ends with `ChatListLoaded`. `OpenChat` ends with `HistoryLoaded` for the chat. `LoadOlderMessages` ends with `OlderHistoryLoaded` for its `before_message_id`. A failure is `CommandFailed` for the chat (or for no chat), or an error from `handle` (the host shows it as a `Status` error). Without an answer the spinner of that load never stops. Load commands have no timeout.
+10. Set `ProtocolCapabilities::pages_history` only if the adapter answers `LoadOlderMessages` as rule 9 says, also when the account is offline or the chat is unknown. The shell sends `LoadOlderMessages` only to a linked protocol with `pages_history`.
 
 #### Contract kit
 
 `crates/thinwire-protocol/src/contract.rs` checks these rules in tests. A test links its adapter against its own offline fake and gives it to `Contract`. The kit sends commands through the host's `dispatch`, with the same routing and error handling as the app. `run_all` checks rules 1, 3, 4, 5, 7, and 9, and the `Shutdown` answer. `check_stream` checks rules 1, 3, 4, and 8 over every event. A failed check names its rule.
 
-- The fake adapter, the Discord bot inbox, and the Slack workspace inbox run the whole kit in default CI.
+- The fake adapter, the Discord bot inbox, the Slack workspace inbox, and the WhatsApp linked-device inbox (with a fake sender) run the whole kit in default CI.
 - Telegram has no offline TDLib fake. Only its default-build stub runs the kit (start, shutdown, and the event stream).
 - A new adapter adds one kit test next to its own tests.
 
