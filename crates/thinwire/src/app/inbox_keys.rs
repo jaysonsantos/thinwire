@@ -373,21 +373,69 @@ fn a_group_run_names_the_sender_on_every_message() {
     let mut harness = harness(state);
     harness.run();
     for body in ["First line from Nora", "Second line from Nora"] {
-        harness.get(By::new().role(egui::accesskit::Role::Pane).predicate({
-            let body = body.to_owned();
-            move |node| {
-                let Some(label) = node.label() else {
-                    return false;
-                };
-                !node.is_hidden() && label.contains("Nora") && label.contains(&body)
-            }
-        }));
+        let spoken = harness
+            .query_all(By::new().predicate({
+                let body = body.to_owned();
+                move |node| {
+                    if node.is_hidden() || node.role() == egui::accesskit::Role::TextRun {
+                        return false;
+                    }
+                    let Some(label) = node.label() else {
+                        return false;
+                    };
+                    label.contains("Nora") && label.contains(&body)
+                }
+            }))
+            .count();
+        assert_eq!(spoken, 1, "a screen reader reads {body} once");
         let painted = harness.get_by_role_and_label(egui::accesskit::Role::Label, body);
         assert!(
             painted.accesskit_node().is_hidden(),
             "the painted body stays out of the screen reader tree"
         );
+        let text = painted.rect();
+        let beside = |node: &egui_kittest::Node<'_>| {
+            node.rect().left() >= text.right() - 2.0
+                && (node.rect().center().y - text.center().y).abs() < 24.0
+        };
+        let side_labels = harness
+            .query_all(By::new().role(egui::accesskit::Role::Label))
+            .filter(|node| beside(node))
+            .count();
+        let hidden_side = harness
+            .query_all(By::new().role(egui::accesskit::Role::Label))
+            .filter(|node| beside(node) && node.accesskit_node().is_hidden())
+            .count();
+        assert!(side_labels > 0, "the time is painted beside {body}");
+        assert_eq!(
+            hidden_side, side_labels,
+            "the time stays out of the spoken name"
+        );
+        let selectable = harness
+            .query_all(By::new().role(egui::accesskit::Role::TextRun).predicate({
+                let body = body.to_owned();
+                move |node| {
+                    !node.is_hidden()
+                        && node
+                            .value()
+                            .is_some_and(|value| !value.is_empty() && body.contains(value.as_str()))
+                }
+            }))
+            .count();
+        assert!(selectable >= 1, "assistive tech can select part of {body}");
     }
+    let sender_headers = harness
+        .query_all(By::new().role(egui::accesskit::Role::Label).label("Nora"))
+        .count();
+    let hidden_headers = harness
+        .query_all(By::new().role(egui::accesskit::Role::Label).label("Nora"))
+        .filter(|node| node.accesskit_node().is_hidden())
+        .count();
+    assert!(sender_headers > 0, "the group header is painted");
+    assert_eq!(
+        hidden_headers, sender_headers,
+        "the group header stays out of the spoken name"
+    );
 }
 
 #[test]
