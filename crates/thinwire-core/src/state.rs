@@ -393,6 +393,10 @@ pub struct Snapshot {
     /// The shell's id for the next WhatsApp pairing.
     #[cfg(feature = "whatsapp-web")]
     next_pairing_generation: u64,
+    /// The id of the pairing that runs now. A QR or pair code of any other
+    /// pairing is dropped (shell plan 12). `None`: no pairing runs.
+    #[cfg(feature = "whatsapp-web")]
+    pairing_generation: Option<u64>,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
     api_source: TelegramApiSource,
@@ -511,6 +515,8 @@ impl Snapshot {
             sends: SendTracker::default(),
             #[cfg(feature = "whatsapp-web")]
             next_pairing_generation: 1,
+            #[cfg(feature = "whatsapp-web")]
+            pairing_generation: None,
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
@@ -719,30 +725,24 @@ impl Snapshot {
             AdapterEvent::FlushSecrets => {
                 self.keychain_flush = true;
             }
-            AdapterEvent::WhatsAppQr {
-                code,
-                generation: _,
-            } => {
+            AdapterEvent::WhatsAppQr { code, generation } => {
                 #[cfg(feature = "whatsapp-web")]
-                {
+                if self.current_pairing(generation) {
                     self.whatsapp_qr = Some(code.reveal().to_string());
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
-                    let _ = code;
+                    let _ = (code, generation);
                 }
             }
-            AdapterEvent::WhatsAppPairCode {
-                code,
-                generation: _,
-            } => {
+            AdapterEvent::WhatsAppPairCode { code, generation } => {
                 #[cfg(feature = "whatsapp-web")]
-                {
+                if self.current_pairing(generation) {
                     self.whatsapp_pair_code = Some(code.reveal().to_string());
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
-                    let _ = code;
+                    let _ = (code, generation);
                 }
             }
         }
@@ -1897,6 +1897,10 @@ impl Snapshot {
             self.older_at_start.clear();
             self.older_retry.clear();
         }
+        #[cfg(feature = "whatsapp-web")]
+        if protocol == ProtocolId::WhatsApp {
+            self.end_pairing();
+        }
         if self.selected_protocol == protocol {
             self.compose.clear();
             self.selected_conversation = None;
@@ -2153,8 +2157,7 @@ impl Snapshot {
             self.pending.push(AdapterCommand::WhatsAppCancelLink);
         }
         self.whatsapp_screen = WhatsAppScreen::RiskGate;
-        self.whatsapp_qr = None;
-        self.whatsapp_pair_code = None;
+        self.end_pairing();
         self.whatsapp_started = false;
         self.whatsapp_risk_acknowledged = false;
         self.whatsapp_phone.clear();
@@ -2208,6 +2211,7 @@ impl Snapshot {
         self.status_text = "WhatsApp pairing requested.".into();
         let generation = self.next_pairing_generation;
         self.next_pairing_generation += 1;
+        self.pairing_generation = Some(generation);
         self.pending
             .push(AdapterCommand::WhatsAppBeginLink { generation });
     }
@@ -2221,17 +2225,34 @@ impl Snapshot {
             return;
         }
         self.whatsapp_screen = WhatsAppScreen::Hidden;
+        self.end_pairing();
+        self.whatsapp_phone.clear();
+    }
+
+    /// No pairing runs any more: drop the shown QR and pair code, and every
+    /// later payload of the old pairing.
+    #[cfg(feature = "whatsapp-web")]
+    fn end_pairing(&mut self) {
+        self.pairing_generation = None;
         self.whatsapp_qr = None;
         self.whatsapp_pair_code = None;
-        self.whatsapp_phone.clear();
+    }
+
+    /// A pairing payload belongs to the pairing that runs now.
+    #[cfg(feature = "whatsapp-web")]
+    fn current_pairing(&self, generation: u64) -> bool {
+        let current = self.pairing_generation == Some(generation);
+        if !current {
+            tracing::warn!("whatsapp pairing payload dropped: it is from an older pairing");
+        }
+        current
     }
 
     #[cfg(feature = "whatsapp-web")]
     pub fn cancel_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
         phone.clear();
         self.whatsapp_phone.clear();
-        self.whatsapp_qr = None;
-        self.whatsapp_pair_code = None;
+        self.end_pairing();
         self.whatsapp_started = false;
         self.whatsapp_risk_acknowledged = false;
         self.whatsapp_screen = WhatsAppScreen::Hidden;
@@ -5535,4 +5556,51 @@ mod tests {
     }
 
     // endregion: viewed chat
+
+    /// Plan item 12 (Codex #53): only the current pairing's payloads show.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn pairing_payloads_of_an_older_pairing_are_dropped() {
+        use thinwire_protocol::RedactedPairingSecret;
+
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        let begin = |snapshot: &mut Snapshot| {
+            snapshot.open_whatsapp_risk_gate();
+            snapshot.acknowledge_whatsapp_risk();
+            snapshot.begin_whatsapp_link(&phone);
+            snapshot
+                .take_commands()
+                .into_iter()
+                .find_map(|command| match command {
+                    AdapterCommand::WhatsAppBeginLink { generation } => Some(generation),
+                    _ => None,
+                })
+                .expect("begin")
+        };
+        let qr = |generation: u64, code: &str| AdapterEvent::WhatsAppQr {
+            code: RedactedPairingSecret::new(code),
+            generation,
+        };
+        let first = begin(&mut snapshot);
+        snapshot.cancel_whatsapp_link(&phone);
+        let second = begin(&mut snapshot);
+        assert!(second > first, "the generation rises with each begin");
+
+        snapshot.apply(qr(first, "old-qr"));
+        assert_eq!(
+            snapshot.whatsapp_qr, None,
+            "a late payload of the cancelled pairing"
+        );
+        snapshot.apply(qr(second, "new-qr"));
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("new-qr"));
+
+        snapshot.cancel_whatsapp_link(&phone);
+        snapshot.apply(AdapterEvent::WhatsAppPairCode {
+            code: RedactedPairingSecret::new("late-code"),
+            generation: second,
+        });
+        assert_eq!(snapshot.whatsapp_pair_code, None, "no pairing runs");
+        assert!(!format!("{snapshot:?}").contains("new-qr"));
+    }
 }
