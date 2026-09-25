@@ -5,7 +5,7 @@
 //! Upstream `presage` logs the provisioning URL at info; the binary filter
 //! keeps that target at error.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -191,11 +191,14 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
         return;
     }
     emit_account(&events, ProtocolId::Signal, AccountState::Linked);
-    if publish_chats(&manager, &events).await.is_err() {
-        fail(&events, SYNC_FAILED);
-        session.active.store(false, Ordering::SeqCst);
-        return;
-    }
+    let mut known = match publish_chats(&manager, &events).await {
+        Ok(known) => known,
+        Err(()) => {
+            fail(&events, SYNC_FAILED);
+            session.active.store(false, Ordering::SeqCst);
+            return;
+        }
+    };
     let mut names = contact_names(&manager).await;
     emit_status(
         &events,
@@ -259,7 +262,12 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
                         match receive.on_item(item.is_none(), session.is_current(token)) {
                             StreamPoll::Continue => {
                                 if let Some(Received::Content(content)) = item {
-                                    emit_content(&events, content.as_ref(), &names);
+                                    emit_incoming(
+                                        &events,
+                                        content.as_ref(),
+                                        &names,
+                                        &mut known,
+                                    );
                                 }
                             }
                             StreamPoll::Reconnect { after } => {
@@ -353,11 +361,14 @@ async fn contact_names(manager: &Manager<SledStore, Registered>) -> HashMap<Stri
 async fn publish_chats(
     manager: &Manager<SledStore, Registered>,
     events: &EventTx,
-) -> Result<(), ()> {
+) -> Result<HashSet<String>, ()> {
+    let mut known = HashSet::new();
     let names = contact_names(manager).await;
     let contacts = manager.store().contacts().await.map_err(|_| ())?;
     for contact in contacts.flatten() {
-        emit_conversation(events, conversation_from_contact(&contact));
+        let conversation = conversation_from_contact(&contact);
+        known.insert(conversation.id.clone());
+        emit_conversation(events, conversation);
         let thread = Thread::Contact(contact.uuid);
         let Ok(messages) = manager.store().messages(&thread, ..).await else {
             continue;
@@ -369,7 +380,9 @@ async fn publish_chats(
     let groups = manager.store().groups().await.map_err(|_| ())?;
     for group in groups.flatten() {
         let (key, group) = group;
-        emit_conversation(events, conversation_from_group(&key, &group));
+        let conversation = conversation_from_group(&key, &group);
+        known.insert(conversation.id.clone());
+        emit_conversation(events, conversation);
         let thread = Thread::Group(key);
         let Ok(messages) = manager.store().messages(&thread, ..).await else {
             continue;
@@ -378,7 +391,7 @@ async fn publish_chats(
             emit_content(events, &message, &names);
         }
     }
-    Ok(())
+    Ok(known)
 }
 
 fn conversation_from_contact(contact: &Contact) -> Conversation {
@@ -415,7 +428,32 @@ fn conversation_from_group(key: &[u8], group: &Group) -> Conversation {
     }
 }
 
+fn emit_incoming(
+    events: &EventTx,
+    content: &Content,
+    names: &HashMap<String, String>,
+    known: &mut HashSet<String>,
+) {
+    let Some((conversation, message)) = row_and_message(content, names) else {
+        return;
+    };
+    if known.insert(conversation.id.clone()) {
+        emit_conversation(events, conversation);
+    }
+    emit_message(events, message);
+}
+
 fn emit_content(events: &EventTx, content: &Content, names: &HashMap<String, String>) {
+    let Some((_, message)) = row_and_message(content, names) else {
+        return;
+    };
+    emit_message(events, message);
+}
+
+fn row_and_message(
+    content: &Content,
+    names: &HashMap<String, String>,
+) -> Option<(Conversation, ChatMessage)> {
     let incoming = match &content.body {
         ContentBody::DataMessage(DataMessage { body, .. }) => {
             super::message::Incoming::Data(body.as_deref())
@@ -429,36 +467,57 @@ fn emit_content(events: &EventTx, content: &Content, names: &HashMap<String, Str
         _ => super::message::Incoming::Other,
     };
     let Some(shown) = super::message::visible_text(incoming) else {
-        return;
+        return None;
     };
     let Ok(thread) = Thread::try_from(content) else {
-        return;
+        return None;
     };
     let uuid = content.metadata.sender.raw_uuid().to_string();
-    let (conversation_id, sender) = match thread {
-        Thread::Contact(id) => (id.to_string(), uuid),
+    let (conversation_id, sender, title, is_group) = match &thread {
+        Thread::Contact(id) => {
+            let conversation_id = id.to_string();
+            let title = names
+                .get(&conversation_id)
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .unwrap_or_else(|| conversation_id.clone());
+            (conversation_id, uuid, title, false)
+        }
         Thread::Group(key) => (
-            super::group::group_id(&key),
+            super::group::group_id(key),
             super::group::sender_name(&uuid, names),
+            super::group::group_chat(key, "").title,
+            true,
         ),
     };
-    emit_message(
-        events,
-        ChatMessage {
-            protocol: ProtocolId::Signal,
-            conversation_id,
-            id: content.metadata.timestamp.to_string(),
-            sender: if shown.outbound {
-                "me".to_string()
-            } else {
-                sender
-            },
-            body: shown.body.to_string(),
-            outbound: shown.outbound,
-            delivery: Delivery::Sent,
-            sent_at: super::time::sent_at_secs(content.metadata.timestamp),
+    let message = ChatMessage {
+        protocol: ProtocolId::Signal,
+        conversation_id: conversation_id.clone(),
+        id: content.metadata.timestamp.to_string(),
+        sender: if shown.outbound {
+            "me".to_string()
+        } else {
+            sender
         },
-    );
+        body: shown.body.to_string(),
+        outbound: shown.outbound,
+        delivery: Delivery::Sent,
+        sent_at: super::time::sent_at_secs(content.metadata.timestamp),
+    };
+    let conversation = Conversation {
+        protocol: ProtocolId::Signal,
+        id: conversation_id.clone(),
+        title,
+        participant: conversation_id,
+        preview: message.body.clone(),
+        unread: u32::from(!message.outbound),
+        order: 0,
+        last_at: message.sent_at,
+        is_group,
+        writable: true,
+        placeholder: false,
+    };
+    Some((conversation, message))
 }
 
 async fn send_text(
@@ -532,4 +591,100 @@ async fn wait_backoff(session: &Session, token: u64, delay: std::time::Duration)
 
 fn fail(events: &EventTx, detail: &str) {
     emit_status(events, ProtocolId::Signal, AdapterStatus::Error, detail);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use presage::libsignal_service::content::{Content, GroupContextV2, Metadata};
+    use presage::libsignal_service::prelude::Uuid;
+    use presage::libsignal_service::protocol::ServiceId;
+
+    use super::*;
+
+    fn envelope(sender: Uuid, body: DataMessage) -> Content {
+        Content::from_body(
+            body,
+            Metadata {
+                sender: ServiceId::Aci(sender.into()),
+                destination: ServiceId::Aci(Uuid::nil().into()),
+                sender_device: 1,
+                timestamp: 1_700_000_000_000,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+            },
+        )
+    }
+
+    fn events_for(content: &Content, names: &HashMap<String, String>) -> Vec<AdapterEvent> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut known = HashSet::new();
+        emit_incoming(&tx, content, names, &mut known);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    #[test]
+    fn an_unknown_direct_thread_gets_a_row_before_the_message() {
+        let contact = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+        let content = envelope(
+            contact,
+            DataMessage {
+                body: Some("hello from a new thread".into()),
+                ..Default::default()
+            },
+        );
+        let mut names = HashMap::new();
+        names.insert(contact.to_string(), "Ada".into());
+        let events = events_for(&content, &names);
+        assert!(matches!(
+            events.first(),
+            Some(AdapterEvent::ConversationUpsert { conversation })
+                if conversation.id == contact.to_string()
+                    && conversation.title == "Ada"
+                    && !conversation.is_group
+                    && !conversation.placeholder
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(AdapterEvent::MessageReceived { message })
+                if message.conversation_id == contact.to_string()
+                    && message.body == "hello from a new thread"
+        ));
+    }
+
+    #[test]
+    fn an_unknown_group_thread_gets_a_row_before_the_message() {
+        let sender = Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+        let key = vec![0x11; 32];
+        let content = envelope(
+            sender,
+            DataMessage {
+                body: Some("in the group".into()),
+                group_v2: Some(GroupContextV2 {
+                    master_key: Some(key.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let events = events_for(&content, &HashMap::new());
+        let id = super::super::group::group_id(&key);
+        assert!(matches!(
+            events.first(),
+            Some(AdapterEvent::ConversationUpsert { conversation })
+                if conversation.id == id && conversation.is_group && !conversation.placeholder
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(AdapterEvent::MessageReceived { message })
+                if message.conversation_id == id && message.body == "in the group"
+        ));
+    }
 }
