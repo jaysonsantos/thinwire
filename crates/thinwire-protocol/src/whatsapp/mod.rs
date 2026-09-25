@@ -282,8 +282,26 @@ impl WhatsAppAdapter {
         );
     }
 
+    /// The first chat-list page (connect, Refresh while connected).
     fn load_chats(&self, events: &EventTx) {
-        for event in self.session.with_inbox(|inbox| inbox.chat_page()) {
+        for event in self.session.with_inbox(inbox::Inbox::chat_page) {
+            let _ = events.send(event);
+        }
+    }
+
+    /// The next chat-list page (`LoadChats`: "load another page"). After the
+    /// last page it starts again at the first one, so a Refresh still sends
+    /// the newest chats.
+    fn load_more_chats(&self, events: &EventTx) {
+        let page = self.session.with_inbox(|inbox| {
+            let page = inbox.next_chat_page();
+            if page.is_empty() {
+                inbox.chat_page()
+            } else {
+                page
+            }
+        });
+        for event in page {
             let _ = events.send(event);
         }
     }
@@ -510,7 +528,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 protocol: ProtocolId::WhatsApp,
             } => {
                 match self.require_connected() {
-                    Ok(()) => self.load_chats(events),
+                    Ok(()) => self.load_more_chats(events),
                     Err(error) => command_failed(events, None, &error),
                 }
                 emit_chat_list_loaded(events, ProtocolId::WhatsApp);
@@ -1859,6 +1877,54 @@ mod tests {
             "{event:?}"
         );
         assert!(rx.try_recv().is_err(), "no Stopped after the error");
+    }
+
+    /// Codex r4103855629: LoadChats pages the chat list; after the last page
+    /// it starts again at the newest chats.
+    #[test]
+    fn load_chats_pages_then_starts_again() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut adapter = with_sender(Arc::new(FakeSender::default()));
+        let chats: Vec<inbox::HistoryChat> = (0..450)
+            .map(|n| inbox::HistoryChat {
+                jid: format!("{n}@s.whatsapp.net"),
+                name: None,
+                unread: 0,
+                timestamp: n,
+                messages: Vec::new(),
+            })
+            .collect();
+        adapter.session.apply(
+            LinkEvent::History {
+                chats,
+                push_names: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        drain(&mut rx);
+        let count = |events: &[AdapterEvent]| {
+            events
+                .iter()
+                .filter(|event| matches!(event, AdapterEvent::ConversationUpsert { .. }))
+                .count()
+        };
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        assert_eq!(count(&drain(&mut rx)), 200, "the first page on connect");
+        let mut load = |adapter: &mut WhatsAppAdapter| {
+            adapter
+                .handle(
+                    AdapterCommand::LoadChats {
+                        protocol: ProtocolId::WhatsApp,
+                    },
+                    &tx,
+                )
+                .expect("load chats");
+            count(&drain(&mut rx))
+        };
+        assert_eq!(load(&mut adapter), 200);
+        assert_eq!(load(&mut adapter), 50);
+        assert_eq!(load(&mut adapter), 200, "the newest chats again");
     }
 
     #[test]

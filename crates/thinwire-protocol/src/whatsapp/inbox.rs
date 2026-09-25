@@ -74,6 +74,8 @@ pub(super) struct Inbox {
     names: HashMap<String, String>,
     open: Option<String>,
     next_pending: u64,
+    /// Chats sent by the chat-list pages so far (newest first).
+    listed: usize,
 }
 
 impl Inbox {
@@ -166,17 +168,31 @@ impl Inbox {
     }
 
     /// Newest chats first, at most [`CHAT_PAGE`].
-    pub(super) fn chat_page(&self) -> Vec<AdapterEvent> {
+    /// The first page of the chat list: newest first, at most [`CHAT_PAGE`].
+    /// Starts the page cursor again.
+    pub(super) fn chat_page(&mut self) -> Vec<AdapterEvent> {
+        self.listed = 0;
+        self.next_chat_page()
+    }
+
+    /// The next page after the chats already sent (Codex r4103855629). Empty
+    /// after the last page. A chat that moved between pages can come twice;
+    /// an upsert is idempotent. New activity sends its own upsert anyway.
+    pub(super) fn next_chat_page(&mut self) -> Vec<AdapterEvent> {
         let mut jids: Vec<&String> = self.chats.keys().collect();
         jids.sort_by(|a, b| {
             let left = self.chats.get(*a).map_or(0, |row| row.timestamp);
             let right = self.chats.get(*b).map_or(0, |row| row.timestamp);
             right.cmp(&left).then_with(|| a.cmp(b))
         });
-        jids.into_iter()
+        let page: Vec<AdapterEvent> = jids
+            .into_iter()
+            .skip(self.listed)
             .take(CHAT_PAGE)
             .filter_map(|jid| self.upsert_event(jid))
-            .collect()
+            .collect();
+        self.listed += page.len();
+        page
     }
 
     /// Mark a chat open and read. Returns the upsert and the latest messages.
@@ -855,6 +871,41 @@ pub(super) mod tests {
         ]);
         assert!(events.is_empty());
         assert!(inbox.chat_page().is_empty());
+    }
+
+    /// Codex r4103855629: chats past the first page stay reachable.
+    #[test]
+    fn chat_list_pages_past_the_first_page() {
+        let mut inbox = Inbox::default();
+        let total = CHAT_PAGE * 2 + 50;
+        let chats: Vec<HistoryChat> = (0..total)
+            .map(|n| HistoryChat {
+                jid: format!("{n}@s.whatsapp.net"),
+                name: None,
+                unread: 0,
+                timestamp: i64::try_from(n).expect("small"),
+                messages: Vec::new(),
+            })
+            .collect();
+        inbox.apply_history(chats, Vec::new());
+        let mut seen = std::collections::HashSet::new();
+        let first = inbox.chat_page();
+        assert_eq!(first.len(), CHAT_PAGE);
+        assert_eq!(
+            upserts(&first)[0].id,
+            format!("whatsapp:{}@s.whatsapp.net", total - 1),
+            "newest first"
+        );
+        seen.extend(upserts(&first).iter().map(|row| row.id.clone()));
+        let second = inbox.next_chat_page();
+        assert_eq!(second.len(), CHAT_PAGE);
+        seen.extend(upserts(&second).iter().map(|row| row.id.clone()));
+        let third = inbox.next_chat_page();
+        assert_eq!(third.len(), 50);
+        seen.extend(upserts(&third).iter().map(|row| row.id.clone()));
+        assert_eq!(seen.len(), total, "every chat is listed once");
+        assert!(inbox.next_chat_page().is_empty(), "after the last page");
+        assert_eq!(inbox.chat_page().len(), CHAT_PAGE, "the first page again");
     }
 
     #[test]
