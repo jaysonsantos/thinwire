@@ -643,20 +643,18 @@ mod tests {
     async fn stored_bot_token_is_not_logged_and_does_not_mark_ready() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
         let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let reached = arrived.notified();
+        tokio::pin!(reached);
         api.state().hold_channels = Some(Arc::clone(&hold));
+        api.state().channels_at_barrier = Some(Arc::clone(&arrived));
         let (mut adapter, _vault) = fake_adapter(Arc::clone(&api), Some(FIXTURE_TOKEN));
         let (tx, mut rx) = unbounded_channel();
         adapter.start(tx);
-        let events = until(&mut rx, |event| {
-            matches!(
-                event,
-                AdapterEvent::Status {
-                    status: AdapterStatus::Connecting,
-                    ..
-                }
-            )
-        })
-        .await;
+        tokio::time::timeout(Duration::from_secs(2), reached)
+            .await
+            .expect("channel request reached the barrier");
+        let events = drain(&mut rx);
         let rendered = format!("{events:?} {adapter:?}");
         assert!(
             !rendered.contains(FIXTURE_TOKEN),

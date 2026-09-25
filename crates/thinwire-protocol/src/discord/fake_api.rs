@@ -36,6 +36,8 @@ pub(crate) struct FakeState {
     pub hold_load: Option<Arc<Notify>>,
     /// Pauses `channels` after the list is copied, so an older reload can finish late.
     pub hold_channels: Option<Arc<Notify>>,
+    /// Fired when `channels` is about to wait on `hold_channels`.
+    pub channels_at_barrier: Option<Arc<Notify>>,
     pub next_id: u64,
 }
 
@@ -195,7 +197,16 @@ impl DiscordApi for FakeDiscordApi {
                 .get(&guild_id)
                 .cloned()
                 .ok_or(DiscordApiError::NotFound)?;
-            let hold = self.state().hold_channels.clone();
+            let (hold, arrived) = {
+                let state = self.state();
+                (
+                    state.hold_channels.clone(),
+                    state.channels_at_barrier.clone(),
+                )
+            };
+            if let Some(arrived) = arrived {
+                arrived.notify_one();
+            }
             if let Some(hold) = hold {
                 hold.notified().await;
             }
