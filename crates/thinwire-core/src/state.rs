@@ -273,6 +273,17 @@ const KEYCHAIN_SLOW_AFTER: Duration = Duration::from_secs(1);
 /// The frontend also asks only when the view enters the top again (#61).
 pub const OLDER_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// Longest wait between tries of one anchor. Each try that brings nothing
+/// older doubles the wait, up to this (#67).
+pub const OLDER_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Wait before try `tries + 1` of an anchor that brought nothing `tries` times.
+fn older_wait(tries: u32) -> Duration {
+    OLDER_RETRY_DELAY
+        .saturating_mul(1 << tries.saturating_sub(1).min(16))
+        .min(OLDER_RETRY_MAX)
+}
+
 /// Center panel copy while a saved session reconnects.
 pub const RESUME_CONNECTING: &str = "Connecting to Telegram…";
 
@@ -379,7 +390,7 @@ pub struct Snapshot {
     /// Telegram chats whose last older request brought nothing older: the
     /// anchor it used and when it ended. That anchor waits
     /// `OLDER_RETRY_DELAY` (#61 review).
-    older_retry: HashMap<String, (String, Instant)>,
+    older_retry: HashMap<String, (String, Instant, u32)>,
     scroll_to_selected: bool,
     scroll_to_focused: bool,
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
@@ -666,8 +677,13 @@ impl Snapshot {
                         self.older_at_start.insert(conversation_id);
                     } else if oldest == Some(before_message_id.as_str()) {
                         // Nothing older came: do not ask this anchor at once.
+                        // A repeat on the same anchor waits longer (#67).
+                        let tries = match self.older_retry.get(&conversation_id) {
+                            Some((anchor, _, tries)) if *anchor == before_message_id => tries + 1,
+                            _ => 1,
+                        };
                         self.older_retry
-                            .insert(conversation_id, (before_message_id, Instant::now()));
+                            .insert(conversation_id, (before_message_id, Instant::now(), tries));
                     } else {
                         self.older_retry.remove(&conversation_id);
                     }
@@ -1227,35 +1243,49 @@ impl Snapshot {
     /// `load_older` with the clock as a parameter, for tests. An anchor that
     /// brought nothing older waits `OLDER_RETRY_DELAY` from `now`.
     fn load_older_at(&mut self, now: Instant) {
-        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
-            return;
-        }
-        let Some(id) = self.selected_conversation.clone() else {
+        let Some((id, oldest)) = self.older_anchor_at(now) else {
             return;
         };
-        if self
-            .history_loading
-            .contains(&(ProtocolId::Telegram, id.clone()))
-            || self.older_loading.contains(&id)
-            || self.older_at_start.contains(&id)
-        {
-            return;
-        }
-        let Some(oldest) = self.selected_messages().first().map(|row| row.id.clone()) else {
-            return;
-        };
-        if let Some((anchor, at)) = self.older_retry.get(&id)
-            && *anchor == oldest
-            && now.saturating_duration_since(*at) < OLDER_RETRY_DELAY
-        {
-            return;
-        }
         self.older_loading.insert(id.clone());
         self.pending.push(AdapterCommand::LoadOlderMessages {
             protocol: ProtocolId::Telegram,
             conversation_id: id,
             before_message_id: oldest,
         });
+    }
+
+    /// A request for older messages of the selected chat would go out now.
+    /// A frontend checks it before it sends the intent, so a thread that
+    /// cannot scroll asks again after the wait, and not on every repaint
+    /// (#67).
+    #[must_use]
+    pub fn older_can_ask(&self) -> bool {
+        self.older_anchor_at(Instant::now()).is_some()
+    }
+
+    /// The selected chat and its oldest message, when an older request may
+    /// go out at `now`.
+    fn older_anchor_at(&self, now: Instant) -> Option<(String, String)> {
+        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
+            return None;
+        }
+        let id = self.selected_conversation.clone()?;
+        if self
+            .history_loading
+            .contains(&(ProtocolId::Telegram, id.clone()))
+            || self.older_loading.contains(&id)
+            || self.older_at_start.contains(&id)
+        {
+            return None;
+        }
+        let oldest = self.selected_messages().first()?.id.clone();
+        if let Some((anchor, at, tries)) = self.older_retry.get(&id)
+            && *anchor == oldest
+            && now.saturating_duration_since(*at) < older_wait(*tries)
+        {
+            return None;
+        }
+        Some((id, oldest))
     }
 
     /// True once after the selected row moved in the sorted list.
@@ -2940,6 +2970,41 @@ mod tests {
         snapshot.apply(older_loaded(1, 50, true));
         snapshot.load_older_at(Instant::now());
         assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:40"]);
+    }
+
+    #[test]
+    fn a_short_thread_asks_again_after_the_wait_and_backs_off() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        // Anchor-only page: `more`, and nothing older came.
+        snapshot.load_older();
+        assert_eq!(older_requests(&mut snapshot).len(), 1);
+        snapshot.apply(older_loaded(1, 50, true));
+        let ended = Instant::now();
+        assert!(!snapshot.older_can_ask(), "no ask during the wait");
+        snapshot.load_older_at(ended + OLDER_RETRY_DELAY / 2);
+        assert!(older_requests(&mut snapshot).is_empty());
+        // After the wait: one more request, with no scroll gesture.
+        snapshot.load_older_at(ended + OLDER_RETRY_DELAY);
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:50"]);
+        snapshot.load_older_at(ended + OLDER_RETRY_DELAY);
+        assert!(older_requests(&mut snapshot).is_empty(), "one at a time");
+
+        // Nothing again: the wait doubles, so there is no fast loop.
+        snapshot.apply(older_loaded(1, 50, true));
+        let again = Instant::now();
+        snapshot.load_older_at(again + OLDER_RETRY_DELAY);
+        assert!(older_requests(&mut snapshot).is_empty());
+        snapshot.load_older_at(again + OLDER_RETRY_DELAY * 2);
+        assert_eq!(older_requests(&mut snapshot).len(), 1);
+        assert_eq!(older_wait(1), OLDER_RETRY_DELAY);
+        assert_eq!(older_wait(30), OLDER_RETRY_MAX, "capped");
+
+        // The start of the chat: no more asks.
+        snapshot.apply(older_loaded(1, 50, false));
+        assert!(!snapshot.older_can_ask());
+        snapshot.load_older_at(again + OLDER_RETRY_MAX * 2);
+        assert!(older_requests(&mut snapshot).is_empty());
     }
 
     #[test]
