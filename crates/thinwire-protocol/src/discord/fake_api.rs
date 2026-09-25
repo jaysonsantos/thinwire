@@ -35,6 +35,8 @@ pub(crate) struct FakeState {
     pub next_error: Option<DiscordApiError>,
     /// Pauses the next bot-id read until notified. A reconnect stays without a bot id.
     pub hold_load: Option<Arc<Notify>>,
+    /// Fired when `bot_user_id` is about to wait on `hold_load`.
+    pub hold_load_arrived: Option<Arc<Notify>>,
     /// Pauses `channels` after the list is copied, so an older reload can finish late.
     pub hold_channels: Option<Arc<Notify>>,
     /// Fired when `channels` is about to wait on `hold_channels`.
@@ -166,6 +168,9 @@ impl DiscordApi for FakeDiscordApi {
             self.check_token()?;
             let hold = self.state().hold_load.clone();
             if let Some(hold) = hold {
+                if let Some(arrived) = self.state().hold_load_arrived.clone() {
+                    arrived.notify_one();
+                }
                 hold.notified().await;
             }
             Ok(BOT_ID)

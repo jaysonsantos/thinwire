@@ -220,8 +220,10 @@ impl DiscordAdapter {
         let _ = events;
         #[cfg(any(test, feature = "discord-bot"))]
         {
+            if let Some(session) = self.session.take() {
+                session.retire();
+            }
             self.live.fetch_add(1, Ordering::SeqCst);
-            self.session = None;
         }
     }
 
@@ -1909,6 +1911,94 @@ mod tests {
                 )
             }),
             "a revoked session does not publish the channel list"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_reload_401_does_not_unlink_the_new_session() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().hold_load = Some(Arc::clone(&hold));
+        api.state().hold_load_arrived = Some(Arc::clone(&arrived));
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("reload reached the bot user");
+        // The first session is already inside the hold. The replacement must not wait there.
+        api.state().hold_load = None;
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Linked,
+                    ..
+                }
+            )
+        })
+        .await;
+        let _ = drain(&mut rx);
+        api.state().unauthorized = true;
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late.iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )
+            }),
+            "session 1's 401 does not unlink session 2"
+        );
+        api.state().unauthorized = false;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("session 2 stays linked");
+        let opened = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+            )
+        })
+        .await;
+        assert!(
+            !opened.iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )
+            }),
+            "session 2 stays linked after the old reload fails"
         );
     }
 

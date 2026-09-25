@@ -60,6 +60,10 @@ struct PendingLoad {
 /// - A task that observes `revoked`, or no longer finds its entry, queues nothing.
 /// - A channel-list reload publishes `Linked`, the rows, and `ChatListLoaded`
 ///   in this same step, and queues none of them if the session is already revoked.
+/// - `generation` is this session. Reload, send, and history results carry the
+///   value they started with. If it moved, the result is dropped in this step
+///   and does not unlink whatever session replaced it. Channel previews are
+///   part of the reload result on this path, not a second task.
 #[derive(Debug, Default)]
 struct Shared {
     bot_id: Option<u64>,
@@ -73,6 +77,9 @@ struct Shared {
     bodies: HashMap<String, String>,
     /// Latest `reload` in this session. An older list must not publish.
     reload_ticket: u64,
+    /// Bumped when a later connect replaces this session. In-flight results
+    /// captured the old value and are dropped when it no longer matches.
+    generation: u64,
     /// A 401 revoked the token. The adapter drops this session on the next command.
     revoked: bool,
     /// Send tasks still running. Shutdown waits until this is zero.
@@ -160,6 +167,7 @@ impl Session {
                 history,
                 bodies,
                 reload_ticket: 0,
+                generation,
                 revoked: false,
                 send_tasks: 0,
                 send_idle: Arc::new(Notify::new()),
@@ -196,33 +204,21 @@ impl Session {
         let api = Arc::clone(&self.api);
         let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
+        let generation = self.gate.generation;
         let events = events.clone();
         tokio::spawn(async move {
             let result = load_channels(api.as_ref()).await;
             match result {
                 Ok((bot_id, channels)) => {
-                    // Publication rechecks the gate, the ticket, and `revoked`
-                    // under the session lock. A 401 that won the race drops it.
-                    publish_channels(&shared, &gate, ticket, &events, bot_id, &channels);
+                    // Publication rechecks the generation, the gate, the ticket,
+                    // and `revoked` under the session lock.
+                    publish_channels(
+                        &shared, &gate, generation, ticket, &events, bot_id, &channels,
+                    );
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
-                    if error == DiscordApiError::Unauthorized {
-                        unlink_unauthorized(&shared, &gate, &events, error);
-                    } else {
-                        emit_command_failed(
-                            &events,
-                            ProtocolId::Discord,
-                            None,
-                            format!("Discord bot inbox did not load: {error}"),
-                        );
-                    }
-                    emit_status(
-                        &events,
-                        ProtocolId::Discord,
-                        AdapterStatus::Error,
-                        format!("Discord bot inbox did not load: {error}"),
-                    );
+                    finish_reload(&shared, &gate, generation, &events, error);
                 }
             }
         });
@@ -269,6 +265,7 @@ impl Session {
         let api = Arc::clone(&self.api);
         let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
+        let generation = self.gate.generation;
         let events = events.clone();
         tokio::spawn(async move {
             let result = api.history(access.channel_id, HISTORY_LIMIT).await;
@@ -291,7 +288,7 @@ impl Session {
                         emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                         return;
                     };
-                    if state.revoked || !gate.current() {
+                    if state.generation != generation || state.revoked || !gate.current() {
                         drop(state);
                         finish_replaced_load(&shared, &events, conversation_id);
                         return;
@@ -318,10 +315,6 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord history failed");
-                    if error == DiscordApiError::Unauthorized {
-                        unlink_unauthorized(&shared, &gate, &events, error);
-                        return;
-                    }
                     let Ok(mut state) = shared.lock() else {
                         drop_load(&shared, &conversation_id);
                         emit_command_failed(
@@ -333,6 +326,17 @@ impl Session {
                         emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                         return;
                     };
+                    if state.generation != generation {
+                        drop(state);
+                        finish_replaced_load(&shared, &events, conversation_id);
+                        return;
+                    }
+                    if error == DiscordApiError::Unauthorized {
+                        if !state.revoked {
+                            settle_unauthorized(&mut state, &gate, &events, error);
+                        }
+                        return;
+                    }
                     if state.revoked {
                         return;
                     }
@@ -504,6 +508,7 @@ impl Session {
         let api = Arc::clone(&self.api);
         let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
+        let generation = self.gate.generation;
         let events = events.clone();
         let guard = self.track_send();
         tokio::spawn(async move {
@@ -520,11 +525,19 @@ impl Session {
                     request,
                     bot_id,
                     row,
+                    generation,
                     result,
                 },
             )
             .await;
         });
+    }
+
+    /// Moves this session's generation so a result that already started is dropped.
+    pub(crate) fn retire(&self) {
+        if let Ok(mut state) = self.shared.lock() {
+            state.generation = state.generation.wrapping_add(1);
+        }
     }
 }
 
@@ -538,6 +551,7 @@ fn refused_channel() -> AdapterError {
 fn publish_channels(
     shared: &Mutex<Shared>,
     gate: &Gate,
+    generation: u64,
     ticket: u64,
     events: &EventTx,
     bot_id: u64,
@@ -558,7 +572,11 @@ fn publish_channels(
     let Ok(mut state) = shared.lock() else {
         return;
     };
-    if state.revoked || !gate.current() || state.reload_ticket != ticket {
+    if state.generation != generation
+        || state.revoked
+        || !gate.current()
+        || state.reload_ticket != ticket
+    {
         return;
     }
     let gone: Vec<String> = state
@@ -586,26 +604,41 @@ fn publish_channels(
     emit_chat_list_loaded(events, ProtocolId::Discord);
 }
 
-/// A 401 means the token is dead. Reject every send still in flight and
-/// finish every history load, then unlink. The result events are queued
-/// before the lock is released, so a send task cannot publish a second one
-/// after `Unlinked` (ADR 0010 drops those).
-fn unlink_unauthorized(
+/// Applies a finished channel-list reload under the session lock.
+///
+/// A 401 from this generation unlinks. A result whose generation already
+/// moved is dropped, so it cannot unlink the session that replaced it.
+fn finish_reload(
     shared: &Arc<Mutex<Shared>>,
     gate: &Gate,
+    generation: u64,
     events: &EventTx,
     error: DiscordApiError,
 ) {
     let Ok(mut state) = shared.lock() else {
-        emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
-        emit_notice(events, ProtocolId::Discord, error.reason());
-        gate.invalidate();
         return;
     };
-    if state.revoked {
+    if state.generation != generation {
         return;
     }
-    settle_unauthorized(&mut state, gate, events, error);
+    if error == DiscordApiError::Unauthorized {
+        if !state.revoked {
+            settle_unauthorized(&mut state, gate, events, error);
+        }
+    } else {
+        emit_command_failed(
+            events,
+            ProtocolId::Discord,
+            None,
+            format!("Discord bot inbox did not load: {error}"),
+        );
+    }
+    emit_status(
+        events,
+        ProtocolId::Discord,
+        AdapterStatus::Error,
+        format!("Discord bot inbox did not load: {error}"),
+    );
 }
 
 /// Caller holds the session lock. Queues every still-tracked result, then
@@ -666,6 +699,7 @@ struct ReturnedSend {
     request: u64,
     bot_id: u64,
     row: SendRow,
+    generation: u64,
     result: Result<MessageSummary, DiscordApiError>,
 }
 
@@ -726,6 +760,7 @@ fn queue_send_result(
         request,
         bot_id,
         row,
+        generation,
         result,
     } = returned;
     if state.revoked {
@@ -738,7 +773,7 @@ fn queue_send_result(
         state.inflight.insert(request, tracked);
         return false;
     }
-    if !gate.current() {
+    if state.generation != generation || !gate.current() {
         match row {
             SendRow::Pending => {
                 let _ = events.send(AdapterEvent::MessagesRemoved {
