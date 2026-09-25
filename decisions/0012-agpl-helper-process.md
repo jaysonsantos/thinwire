@@ -1,6 +1,6 @@
 # AGPL helper process for WhatsApp and Signal
 
-**Status:** proposed
+**Status:** accepted (2026-09-25)
 
 **Refs:** issue #38, issue #77, ADR [0004](0004-signal-out-of-v1.md), ADR [0010](0010-frontend-independent-core.md), ADR [0011](0011-agpl-protocols-local-only.md)
 
