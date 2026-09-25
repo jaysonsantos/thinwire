@@ -260,7 +260,18 @@ impl<B: LinkBackend> Owner<B> {
             generation,
             tx: self.callbacks.clone(),
         };
-        match self.backend.start(generation, phone, callbacks).await {
+        let result = self.backend.start(generation, phone, callbacks).await;
+        // The user can cancel while the start runs: the adapter reset the
+        // session and sent Unlinked. Then this start is over, with no late
+        // status (the Cancel message waits behind it in the queue).
+        if !self.session.is_link(generation) {
+            if let Ok(started) = result {
+                self.backend.stop(started.bot).await;
+            }
+            self.active.store(false, Ordering::SeqCst);
+            return;
+        }
+        match result {
             Ok(started) => {
                 self.bot = Some(started.bot);
                 self.session.attach_sender(generation, started.sender);
@@ -514,6 +525,40 @@ pub(super) mod tests {
             })
             .collect();
         assert_eq!(payloads, vec![(43, "new".to_string())]);
+    }
+
+    /// Codex r4093899824: a cancel during the start ends it with no late
+    /// "pairing is running" status and no late error.
+    #[tokio::test]
+    async fn cancel_during_start_sends_no_late_status() {
+        for start_error in [None, Some(StartError::Build)] {
+            let gate = Arc::new(Notify::new());
+            let (fake, handle, session, mut rx) = owner(Fake {
+                start_gate: Some(Arc::clone(&gate)),
+                start_error,
+                ..Fake::default()
+            });
+            handle.begin(None, 7);
+            while fake.0.callbacks.lock().expect("callbacks").is_empty() {
+                tokio::task::yield_now().await;
+            }
+            // The adapter's cancel: reset the session, then tell the owner.
+            let _ = session.reset();
+            handle.cancel();
+            drain(&mut rx);
+            gate.notify_one();
+            handle.flush().await;
+            let late = drain(&mut rx);
+            assert!(late.is_empty(), "late events after cancel: {late:?}");
+            let expected: Vec<&str> = if start_error.is_none() {
+                vec!["start 1", "stop 1"]
+            } else {
+                vec!["start 1"]
+            };
+            assert_eq!(fake.log(), expected);
+            assert!(!handle.is_active());
+            assert!(!session.is_connected());
+        }
     }
 
     /// r4093309818, r4093606395: a repair right after a logout runs after

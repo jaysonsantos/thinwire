@@ -221,6 +221,14 @@ impl Session {
         state.sender = None;
     }
 
+    /// The session still belongs to link `generation`: no cancel reset it
+    /// and no newer link began.
+    #[must_use]
+    pub(super) fn is_link(&self, generation: u64) -> bool {
+        let state = self.lock();
+        state.generation != NO_LINK && state.generation == generation
+    }
+
     /// The shell's id for the pairing that runs now (`WhatsAppBeginLink`).
     #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
     pub(super) fn set_pairing(&self, pairing: u64) {
