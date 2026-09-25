@@ -58,6 +58,11 @@ fn link_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
         "The worker stays idle until you start it. The provisioning URL is not placed on the command channel.",
     );
     ui.add_space(8.0);
+    ui.colored_label(
+        theme::palette(ui).warn,
+        "This build stores the Signal session in SQLite. A session saved by the previous sled store cannot be opened. Link this device again. The old files stay on disk.",
+    );
+    ui.add_space(8.0);
     if let Some(error) = &snapshot.error {
         ui.colored_label(theme::palette(ui).warn, &error.happened);
         ui.label(&error.why);

@@ -6,10 +6,25 @@
 
 use std::path::{Path, PathBuf};
 
+/// File name of the sqlite session inside [`session_dir`].
+pub(crate) const SQLITE_FILE: &str = "session.sqlite";
+
 #[must_use]
 #[cfg_attr(not(any(test, feature = "signal-local")), allow(dead_code))]
 pub(crate) fn session_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("thinwire").join("signal")
+}
+
+/// The sqlite database file. The previous build opened [`session_dir`] itself as a sled database.
+#[must_use]
+pub(crate) fn sqlite_store_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(SQLITE_FILE)
+}
+
+/// `true` when this directory still holds a sled database from the previous store.
+#[must_use]
+pub(crate) fn sled_session_present(session_dir: &Path) -> bool {
+    session_dir.join("db").is_file() || session_dir.join("conf").is_file()
 }
 
 #[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
