@@ -6,6 +6,7 @@
 //! commands and are not logged.
 
 mod device;
+mod group;
 mod path;
 mod reconnect;
 mod time;
@@ -345,6 +346,7 @@ impl SignalAdapter {
     }
 }
 
+#[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 struct SignalWorker {
     thread: std::thread::JoinHandle<()>,
     abort: tokio::task::AbortHandle,
@@ -352,6 +354,7 @@ struct SignalWorker {
 
 /// Join the worker. If it misses `limit`, abort its task and wait until the
 /// thread has ended. `Stopped` comes only after this returns.
+#[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 async fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
     let SignalWorker { thread, abort } = worker;
     let (tx, rx) = tokio::sync::oneshot::channel();
