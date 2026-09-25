@@ -38,6 +38,22 @@ Protocol agents add a variant to their own intent sub-enum and a field to the st
 
 Protocol agents also add their state fields to `Snapshot`. `View` shows them with no extra code.
 
+### Adapter contract for the shell
+
+The shell treats every protocol the same. Only the Telegram login and the first-run screen are Telegram-specific. An adapter follows these rules:
+
+1. Send `AdapterEvent::Account { Linked }` before the first inbox event. Send `Account { Unlinked }` when the session ends (logout, revoke, ban). Only this event changes the link state. The shell drops inbox events of an unlinked protocol.
+    - `Linking` after `Linked` is a reconnect. The session stays: rows, drafts, and open sends and retries. Inbox events and send answers still apply. New commands (open chat, Send, Retry, Refresh) wait for `Linked`.
+    - `Linking` with no session before is a first login. The shell drops inbox events until `Linked`.
+    - `Unlinked` from any other state ends the session. The shell drops that protocol's rows, messages, drafts, spinners, notes, and sends.
+2. Use `Status` for the session status line only. A `Status { Error }` never unlinks and never hides the inbox.
+3. Set `ProtocolCapabilities::sends_text` and `Conversation::writable`. The shell offers Send only for a linked protocol that sends text, in a writable chat.
+4. Answer each `SendText` and `ResendMessage` with `SendAccepted` or `SendRejected` for its `request`. Nothing else ends a send or a retry. Answer with `SendRejected` also after a reconnect that lost the request.
+5. Report a failed command that leaves the session up as `CommandFailed`. It stops that command's spinner and shows the error.
+6. Report information for the user as `Notice`. It is a note, not an error or a refusal.
+7. Override `ProtocolAdapter::view_chat` to track the chat the user looks at (`ViewChat`), for example for unread counts. The default ignores it.
+8. Put the generation of the begin command on every pairing payload: `WhatsAppBeginLink { generation }` for `WhatsAppQr` and `WhatsAppPairCode`, and the same for Signal (`SignalQr`, feature `signal-local`, #39) when it lands. The core assigns the generation. The shell shows only payloads of the current pairing and drops older ones.
+
 Rejected:
 
 - An actor core on a tokio task with owned view snapshots over a channel. Each key press in egui makes a round trip. An old snapshot can overwrite newer typed text. Each frame clones the full message list.

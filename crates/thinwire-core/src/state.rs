@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
-    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery,
+    AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery,
     DiscordAdapter, ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthError,
     TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, TelegramSecretVault, catalog,
-    parse_telegram_chat_id, telegram_api_available,
+    telegram_api_available,
 };
 
 use crate::secrets::{SecretKey, SecretStore};
+use crate::sends::{Pending, SendTracker};
 
 /// Shown until TDLib reports Ready. Feature-off builds stay on this copy.
 pub const TDLIB_UNAVAILABLE_BANNER: &str = "TDLib unavailable in this build. Enable feature telegram-tdlib after a local TDLib install. These screens do not open a live Telegram session.";
@@ -296,7 +297,17 @@ pub struct AccountRow {
     pub caps: ProtocolCapabilities,
     pub status: AdapterStatus,
     pub detail: String,
-    pub linked: bool,
+    /// Link state. Only `AdapterEvent::Account` (and the Telegram login,
+    /// which maps onto it) changes it. A `Status` never does.
+    pub state: AccountState,
+}
+
+impl AccountRow {
+    /// Signed in: the shell shows this protocol's chats.
+    #[must_use]
+    pub fn linked(&self) -> bool {
+        self.state == AccountState::Linked
+    }
 }
 
 /// Why `sync_focused_row` runs. A search change or a key move always scrolls.
@@ -345,8 +356,21 @@ pub struct Snapshot {
     keychain_failed: bool,
     /// The user asked to read the keychain again. The app runs it off the UI thread.
     keychain_retry: bool,
-    chat_list_loading: bool,
-    history_loading: HashSet<String>,
+    /// Protocols whose chat list is loading.
+    chat_list_loading: HashSet<ProtocolId>,
+    /// Chats whose history is loading, per protocol.
+    history_loading: HashSet<(ProtocolId, String)>,
+    /// The last note of each protocol (`AdapterEvent::Notice`). Never an error.
+    notices: HashMap<ProtocolId, String>,
+    /// The chat the adapters were last told the user looks at (`ViewChat`).
+    viewed: Option<(ProtocolId, String)>,
+    /// Protocols with a session: they reached `Linked` and did not end. A
+    /// `Linking` after `Linked` is a reconnect; the session stays (ADR 0010).
+    sessions: HashSet<ProtocolId>,
+    /// Test hook: protocols the shell shows even with their feature off, so
+    /// default CI can test the shell with more than Telegram.
+    #[cfg(test)]
+    visible_for_test: HashSet<ProtocolId>,
     /// Telegram chats with a request for older messages in flight (#30).
     /// One request at a time for each chat.
     older_loading: HashSet<String>,
@@ -361,17 +385,21 @@ pub struct Snapshot {
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
     seen_visible_ids: Vec<String>,
     /// Unsent compose text per chat. `compose` holds the selected chat's draft.
-    drafts: HashMap<String, String>,
+    drafts: HashMap<(ProtocolId, String), String>,
     focus_compose: bool,
     /// Protocols that answered `Shutdown` with `Stopped`.
     stopped: HashSet<ProtocolId>,
-    /// Sends the adapter has not accepted yet: chat id → (request id, text).
-    /// One per chat, so a send in one chat does not block Send in another.
-    /// The text stays until the pending row arrives; only a matching
-    /// `SendRejected` fails the send (PR #40 review).
-    sending: HashMap<String, (u64, String)>,
-    /// Local id for the next `SendText`.
-    next_send_request: u64,
+    /// Sends and retries in flight, one per (protocol, chat). The text stays
+    /// until the adapter accepts it; only the request's own `SendAccepted` /
+    /// `SendRejected` ends an entry (PR #40 review, shell plan items 4, 10).
+    sends: SendTracker,
+    /// The shell's id for the next WhatsApp pairing.
+    #[cfg(feature = "whatsapp-web")]
+    next_pairing_generation: u64,
+    /// The id of the pairing that runs now. A QR or pair code of any other
+    /// pairing is dropped (shell plan 12). `None`: no pairing runs.
+    #[cfg(feature = "whatsapp-web")]
+    pairing_generation: Option<u64>,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
     api_source: TelegramApiSource,
@@ -398,10 +426,10 @@ pub struct Snapshot {
 /// (PR #48 review). Only screens, flags, and counts are printed.
 impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let accounts: Vec<(ProtocolId, AdapterStatus, bool)> = self
+        let accounts: Vec<(ProtocolId, AdapterStatus, AccountState)> = self
             .accounts
             .iter()
-            .map(|row| (row.caps.id, row.status, row.linked))
+            .map(|row| (row.caps.id, row.status, row.state))
             .collect();
         let mut out = f.debug_struct("Snapshot");
         out.field("accounts", &accounts)
@@ -441,7 +469,7 @@ impl Snapshot {
                 caps,
                 status: AdapterStatus::Stubbed,
                 detail: caps.detail.to_string(),
-                linked: false,
+                state: AccountState::Unlinked,
             })
             .collect();
         Self {
@@ -472,19 +500,27 @@ impl Snapshot {
             keychain_wait_started: None,
             keychain_failed: false,
             keychain_retry: false,
-            chat_list_loading: false,
+            chat_list_loading: HashSet::new(),
             history_loading: HashSet::new(),
             older_loading: HashSet::new(),
             older_at_start: HashSet::new(),
             older_retry: HashMap::new(),
+            notices: HashMap::new(),
+            viewed: None,
+            sessions: HashSet::new(),
+            #[cfg(test)]
+            visible_for_test: HashSet::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
             focus_compose: false,
             stopped: HashSet::new(),
-            sending: HashMap::new(),
-            next_send_request: 1,
+            sends: SendTracker::default(),
+            #[cfg(feature = "whatsapp-web")]
+            next_pairing_generation: 1,
+            #[cfg(feature = "whatsapp-web")]
+            pairing_generation: None,
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
@@ -512,10 +548,13 @@ impl Snapshot {
     }
 
     pub fn apply(&mut self, event: AdapterEvent) {
-        // Telegram inbox events come only after Ready. One that arrives while
-        // Telegram is not linked is from a cancelled or ended client, for
-        // example queued before Cancel: drop it (PR #49 review).
-        if event.inbox_protocol() == Some(ProtocolId::Telegram) && !self.telegram_authorized {
+        // Inbox events come only while the account is linked. One that
+        // arrives while it is not is from a cancelled or ended client, for
+        // example queued before Cancel: drop it (PR #49 review). Adapters
+        // send `Account { Linked }` before their first inbox event.
+        if let Some(protocol) = event.inbox_protocol()
+            && !self.has_session(protocol)
+        {
             return;
         }
         match event {
@@ -524,12 +563,15 @@ impl Snapshot {
                 status,
                 detail,
             } => {
+                // The status line only. It never changes the link state: a
+                // recoverable error must not hide the inbox (shell plan 1, 11).
                 if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
                     row.status = status;
                     row.detail = detail.clone();
-                    if protocol == ProtocolId::Discord {
-                        row.linked = DiscordAdapter::inbox_account_linked(status, &detail);
-                    }
+                }
+                if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
+                    // A failed load does not send its end event. Stop the spinners.
+                    self.stop_spinners(protocol, None);
                 }
                 // Crate / feature jargon stays on the account row and in logs.
                 // Chrome surfaces Telegram errors and Ready operational copy only.
@@ -546,10 +588,6 @@ impl Snapshot {
                             self.auth_busy = false;
                         }
                         self.resume = Resume::Settled;
-                        // A failed load does not send its end event. Stop the spinners.
-                        self.chat_list_loading = false;
-                        self.history_loading.clear();
-                        self.older_loading.clear();
                     }
                 }
             }
@@ -589,22 +627,23 @@ impl Snapshot {
                 protocol,
                 conversation_id,
                 request,
-            } => {
-                if protocol == ProtocolId::Telegram {
-                    self.note_send_accepted(&conversation_id, request);
-                }
-            }
+            } => self.note_send_accepted(protocol, &conversation_id, request),
             AdapterEvent::SendRejected {
                 protocol,
                 conversation_id,
                 request,
-            } => {
-                if protocol == ProtocolId::Telegram {
-                    self.fail_unaccepted_send(&conversation_id, request);
-                }
-            }
+            } => self.fail_unaccepted_send(protocol, &conversation_id, request),
             AdapterEvent::Stopped { protocol } => {
                 self.stopped.insert(protocol);
+            }
+            AdapterEvent::Account { protocol, state } => self.set_account(protocol, state),
+            AdapterEvent::CommandFailed {
+                protocol,
+                conversation_id,
+                detail,
+            } => self.command_failed(protocol, conversation_id.as_deref(), &detail),
+            AdapterEvent::Notice { protocol, text } => {
+                self.notices.insert(protocol, text);
             }
             // Internal: the host unwraps stamped login events in poll_events.
             AdapterEvent::Login { .. } => {}
@@ -635,17 +674,13 @@ impl Snapshot {
                 }
             }
             AdapterEvent::ChatListLoaded { protocol } => {
-                if protocol == ProtocolId::Telegram {
-                    self.chat_list_loading = false;
-                }
+                self.chat_list_loading.remove(&protocol);
             }
             AdapterEvent::HistoryLoaded {
                 protocol,
                 conversation_id,
             } => {
-                if protocol == ProtocolId::Telegram {
-                    self.history_loading.remove(&conversation_id);
-                }
+                self.history_loading.remove(&(protocol, conversation_id));
             }
             AdapterEvent::ConversationRemoved { protocol, id } => {
                 self.remove_conversation(protocol, &id);
@@ -694,30 +729,24 @@ impl Snapshot {
             AdapterEvent::FlushSecrets => {
                 self.keychain_flush = true;
             }
-            AdapterEvent::WhatsAppQr {
-                code,
-                generation: _,
-            } => {
+            AdapterEvent::WhatsAppQr { code, generation } => {
                 #[cfg(feature = "whatsapp-web")]
-                {
+                if self.current_pairing(generation) {
                     self.whatsapp_qr = Some(code.reveal().to_string());
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
-                    let _ = code;
+                    let _ = (code, generation);
                 }
             }
-            AdapterEvent::WhatsAppPairCode {
-                code,
-                generation: _,
-            } => {
+            AdapterEvent::WhatsAppPairCode { code, generation } => {
                 #[cfg(feature = "whatsapp-web")]
-                {
+                if self.current_pairing(generation) {
                     self.whatsapp_pair_code = Some(code.reveal().to_string());
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
-                    let _ = code;
+                    let _ = (code, generation);
                 }
             }
         }
@@ -785,7 +814,8 @@ impl Snapshot {
         if self.auth != AuthScreen::Idle {
             return CenterView::Auth;
         }
-        if self.has_primary_account() {
+        // Any linked protocol shows the inbox, not only Telegram (shell plan 2).
+        if self.any_linked() {
             return CenterView::Thread;
         }
         if self.keychain_failed && !self.keychain_retry {
@@ -798,19 +828,42 @@ impl Snapshot {
         }
     }
 
+    /// A linked Telegram account. The Telegram login screens use it.
     pub fn has_primary_account(&self) -> bool {
+        self.protocol_linked(ProtocolId::Telegram)
+    }
+
+    /// At least one visible protocol has a session: the shell shows the
+    /// inbox. A reconnect (`Linking` after `Linked`) keeps it shown.
+    #[must_use]
+    pub fn any_linked(&self) -> bool {
         self.accounts
             .iter()
-            .any(|row| row.linked && matches!(row.caps.id, ProtocolId::Telegram))
+            .any(|row| self.has_session(row.caps.id) && self.account_surface_visible(row.caps.id))
+    }
+
+    /// This protocol has a session: `Linked` now, or reconnecting after
+    /// `Linked` (`Linking`). Its rows show and its inbox events and send
+    /// answers apply. New commands wait for `Linked` (`protocol_linked`).
+    #[must_use]
+    pub fn has_session(&self, protocol: ProtocolId) -> bool {
+        self.protocol_linked(protocol) || self.sessions.contains(&protocol)
+    }
+
+    /// The last note of this protocol, if any. It is not an error.
+    #[must_use]
+    pub fn notice(&self, protocol: ProtocolId) -> Option<&str> {
+        self.notices.get(&protocol).map(String::as_str)
     }
 
     pub fn select_protocol(&mut self, protocol: ProtocolId) {
         if !self.account_surface_visible(protocol) {
             return;
         }
+        // Park the draft under the old protocol before the protocol changes.
+        self.set_selected_conversation(None);
         self.selected_protocol = protocol;
         self.focused_row = None;
-        self.set_selected_conversation(None);
         self.ensure_conversation_selection();
     }
 
@@ -867,9 +920,9 @@ impl Snapshot {
         if self.is_selected_chat(protocol, chat) {
             self.compose = text;
         } else if text.is_empty() {
-            self.drafts.remove(chat);
+            self.drafts.remove(&(protocol, chat.to_owned()));
         } else {
-            self.drafts.insert(chat.to_owned(), text);
+            self.drafts.insert((protocol, chat.to_owned()), text);
         }
     }
 
@@ -881,10 +934,13 @@ impl Snapshot {
         if let Some(old) = self.selected_conversation.take()
             && !draft.is_empty()
         {
-            self.drafts.insert(old, draft);
+            self.drafts.insert((self.selected_protocol, old), draft);
         }
         if let Some(new) = id.as_ref() {
-            self.compose = self.drafts.remove(new).unwrap_or_default();
+            self.compose = self
+                .drafts
+                .remove(&(self.selected_protocol, new.clone()))
+                .unwrap_or_default();
         }
         self.selected_conversation = id;
     }
@@ -909,21 +965,21 @@ impl Snapshot {
         std::mem::take(&mut self.focus_compose)
     }
 
-    /// Send is possible: a Telegram chat is selected, Telegram is ready, text exists.
+    /// Send is possible (shell plan 5): the selected protocol is linked and
+    /// can send text, the selected chat is writable, text exists, and the
+    /// chat has no send or retry in flight.
     #[must_use]
     pub fn can_send(&self) -> bool {
-        self.selected_protocol == ProtocolId::Telegram
-            && self.telegram_authorized
+        let protocol = self.selected_protocol;
+        let sends_text = self
+            .accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.linked() && row.caps.sends_text);
+        sends_text
             && !self.compose.trim().is_empty()
             && self
-                .selected_conversation
-                .as_ref()
-                .is_none_or(|chat| !self.sending.contains_key(chat))
-            && self
-                .selected_conversation
-                .as_deref()
-                .and_then(parse_telegram_chat_id)
-                .is_some()
+                .selected_conversation_row()
+                .is_some_and(|row| row.writable && !self.sends.in_flight(protocol, &row.id))
     }
 
     /// Enter in compose. Plain Enter sends and returns `true`, so the UI eats
@@ -942,7 +998,16 @@ impl Snapshot {
             return;
         };
         let protocol = self.selected_protocol;
-        if protocol != ProtocolId::Telegram || !self.telegram_authorized {
+        // The same checks as Send (PR #68 review): the protocol is linked and
+        // sends text, and the chat is writable. The tracker checks in-flight.
+        let sends_text = self
+            .accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.linked() && row.caps.sends_text);
+        let writable = self
+            .selected_conversation_row()
+            .is_some_and(|row| row.writable);
+        if !sends_text || !writable {
             return;
         }
         let Some(message) = self
@@ -955,6 +1020,13 @@ impl Snapshot {
         if !message.outbound || message.delivery != Delivery::Failed {
             return;
         }
+        // One send or retry per chat. Only this retry's own answer ends it.
+        let Some(request) = self
+            .sends
+            .begin_retry(protocol, &conversation_id, message_id)
+        else {
+            return;
+        };
         message.delivery = Delivery::Pending;
         if self.compose == message.body {
             self.compose.clear();
@@ -965,6 +1037,7 @@ impl Snapshot {
             protocol,
             conversation_id,
             message_id: message_id.to_string(),
+            request,
         });
     }
 
@@ -1011,6 +1084,10 @@ impl Snapshot {
     /// when their cargo features are on.
     #[must_use]
     pub fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
+        #[cfg(test)]
+        if self.visible_for_test.contains(&protocol) {
+            return true;
+        }
         match protocol {
             ProtocolId::Discord => self.discord_inbox_visible(),
             other => protocol_chrome_enabled(other),
@@ -1024,7 +1101,7 @@ impl Snapshot {
 
     pub fn visible_conversations(&self) -> Vec<&Conversation> {
         if !self.account_surface_visible(self.selected_protocol)
-            || !self.protocol_linked(self.selected_protocol)
+            || !self.has_session(self.selected_protocol)
         {
             return Vec::new();
         }
@@ -1043,7 +1120,7 @@ impl Snapshot {
 
     #[must_use]
     pub fn unread_for(&self, protocol: ProtocolId) -> u32 {
-        if !self.protocol_linked(protocol) {
+        if !self.has_session(protocol) {
             return 0;
         }
         self.conversations
@@ -1055,7 +1132,7 @@ impl Snapshot {
     fn protocol_linked(&self, protocol: ProtocolId) -> bool {
         self.accounts
             .iter()
-            .any(|row| row.caps.id == protocol && row.linked)
+            .any(|row| row.caps.id == protocol && row.linked())
     }
 
     pub fn selected_conversation_row(&self) -> Option<&Conversation> {
@@ -1071,7 +1148,7 @@ impl Snapshot {
         if !self.visible_conversations().is_empty() {
             return InboxState::Rows;
         }
-        let has_rows = self.protocol_linked(self.selected_protocol)
+        let has_rows = self.has_session(self.selected_protocol)
             && self
                 .conversations
                 .get(&self.selected_protocol)
@@ -1079,9 +1156,8 @@ impl Snapshot {
         if has_rows {
             return InboxState::NoMatch;
         }
-        if self.chat_list_loading
-            && self.selected_protocol == ProtocolId::Telegram
-            && self.protocol_linked(ProtocolId::Telegram)
+        if self.chat_list_loading.contains(&self.selected_protocol)
+            && self.has_session(self.selected_protocol)
         {
             return InboxState::Loading;
         }
@@ -1101,7 +1177,9 @@ impl Snapshot {
     /// line such as "Loading recent messages." is not idle then (#64 review).
     #[must_use]
     pub fn is_loading(&self) -> bool {
-        self.chat_list_loading || !self.history_loading.is_empty() || !self.sending.is_empty()
+        !self.chat_list_loading.is_empty()
+            || !self.history_loading.is_empty()
+            || !self.sends.is_empty()
     }
 
     #[must_use]
@@ -1112,7 +1190,10 @@ impl Snapshot {
         if !self.selected_messages().is_empty() {
             return ThreadState::Rows;
         }
-        if self.selected_protocol == ProtocolId::Telegram && self.history_loading.contains(id) {
+        if self
+            .history_loading
+            .contains(&(self.selected_protocol, id.clone()))
+        {
             return ThreadState::Loading;
         }
         ThreadState::Empty
@@ -1152,7 +1233,9 @@ impl Snapshot {
         let Some(id) = self.selected_conversation.clone() else {
             return;
         };
-        if self.history_loading.contains(&id)
+        if self
+            .history_loading
+            .contains(&(ProtocolId::Telegram, id.clone()))
             || self.older_loading.contains(&id)
             || self.older_at_start.contains(&id)
         {
@@ -1213,8 +1296,8 @@ impl Snapshot {
             .filter(|id| self.filter.matches(*id) && self.account_surface_visible(*id))
             .collect();
         for protocol in protocols {
-            if protocol == ProtocolId::Telegram && self.telegram_authorized {
-                self.chat_list_loading = true;
+            if self.protocol_linked(protocol) {
+                self.chat_list_loading.insert(protocol);
                 self.pending.push(AdapterCommand::LoadChats { protocol });
             } else {
                 self.pending.push(AdapterCommand::Connect { protocol });
@@ -1369,38 +1452,40 @@ impl Snapshot {
     /// The adapter accepted this send (chat and request id match). Only now
     /// does the compose text (or the chat's draft) clear. A history message
     /// with the same text is not an acceptance (Codex 4091552898).
-    fn note_send_accepted(&mut self, chat: &str, request: u64) {
-        if self.sending.get(chat).map(|(id, _)| *id) != Some(request) {
-            return;
-        }
-        let Some((_, body)) = self.sending.remove(chat) else {
+    fn note_send_accepted(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
+        // An accepted retry needs nothing more: its delivery events move the row.
+        let Some(Pending::Send { body, .. }) = self.sends.settle(protocol, chat, request) else {
             return;
         };
-        let selected = self.selected_conversation.as_deref() == Some(chat);
+        let selected = self.is_selected_chat(protocol, chat);
         if selected && self.compose.trim() == body {
             self.compose.clear();
         } else if self
             .drafts
-            .get(chat)
+            .get(&(protocol, chat.to_owned()))
             .is_some_and(|draft| draft.trim() == body)
         {
-            self.drafts.remove(chat);
+            self.drafts.remove(&(protocol, chat.to_owned()));
         }
     }
 
     /// The adapter rejected this send (chat and request id match): it was
     /// not accepted. The text is still in its compose field or draft. Other
     /// errors (for example a history load error) never fail a send.
-    fn fail_unaccepted_send(&mut self, chat: &str, request: u64) {
-        if self.sending.get(chat).map(|(id, _)| *id) != Some(request) {
-            return;
+    fn fail_unaccepted_send(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
+        let why = format!("{} did not accept the message.", protocol.display_name());
+        match self.sends.settle(protocol, chat, request) {
+            Some(Pending::Send { .. }) => self.set_error(
+                "Message not sent.",
+                &why,
+                "The text is still in the compose field. Send it again.",
+            ),
+            Some(Pending::Retry { message_id, .. }) => {
+                self.set_delivery(protocol, chat, &message_id, Delivery::Failed);
+                self.set_error("Message not sent.", &why, "Press Retry to send it again.");
+            }
+            None => {}
         }
-        self.sending.remove(chat);
-        self.set_error(
-            "Message not sent.",
-            "Telegram did not accept the message.",
-            "The text is still in the compose field. Send it again.",
-        );
     }
 
     /// Enter submits the current login step. Escape cancels the login.
@@ -1458,13 +1543,13 @@ impl Snapshot {
         };
         let body = self.compose.trim().to_string();
         // Keep the text until the adapter accepts the send; see note_send_accepted.
-        let request = self.next_send_request;
-        self.next_send_request += 1;
-        self.sending
-            .insert(conversation_id.clone(), (request, body.clone()));
+        let protocol = self.selected_protocol;
+        let Some(request) = self.sends.begin_send(protocol, &conversation_id, &body) else {
+            return;
+        };
         self.error = None;
         self.pending.push(AdapterCommand::SendText {
-            protocol: ProtocolId::Telegram,
+            protocol,
             conversation_id,
             body,
             request,
@@ -1592,11 +1677,12 @@ impl Snapshot {
             .iter_mut()
             .find(|row| row.caps.id == ProtocolId::Telegram)
         {
-            row.linked = true;
+            row.state = AccountState::Linked;
         }
+        self.sessions.insert(ProtocolId::Telegram);
         self.telegram_authorized = true;
         // The worker loads the main list right after Ready.
-        self.chat_list_loading = true;
+        self.chat_list_loading.insert(ProtocolId::Telegram);
         self.select_protocol(ProtocolId::Telegram);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
@@ -1611,27 +1697,7 @@ impl Snapshot {
             return;
         }
         self.telegram_authorized = false;
-        if let Some(row) = self
-            .accounts
-            .iter_mut()
-            .find(|row| row.caps.id == ProtocolId::Telegram)
-        {
-            row.linked = false;
-        }
-        self.conversations.remove(&ProtocolId::Telegram);
-        self.messages
-            .retain(|(protocol, _), _| *protocol != ProtocolId::Telegram);
-        self.history_loading.clear();
-        self.older_loading.clear();
-        self.older_at_start.clear();
-        self.older_retry.clear();
-        self.chat_list_loading = false;
-        self.drafts.clear();
-        self.compose.clear();
-        self.sending.clear();
-        if self.selected_protocol == ProtocolId::Telegram {
-            self.selected_conversation = None;
-        }
+        self.end_session(ProtocolId::Telegram);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
         self.error = None;
@@ -1648,8 +1714,9 @@ impl Snapshot {
             .iter_mut()
             .find(|row| row.caps.id == ProtocolId::Telegram)
         {
-            row.linked = false;
+            row.state = AccountState::Unlinked;
         }
+        self.sessions.remove(&ProtocolId::Telegram);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
         self.telegram_authorized = false;
@@ -1726,30 +1793,191 @@ impl Snapshot {
         }
     }
 
+    /// Load the selected chat's history, for any linked protocol (shell
+    /// plan 3). The adapter checks its own id format; the core only needs the
+    /// row in the protocol's list.
     fn queue_open_chat(&mut self) {
-        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
+        let protocol = self.selected_protocol;
+        if !self.protocol_linked(protocol) {
             return;
         }
         let Some(id) = self.selected_conversation.clone() else {
             return;
         };
-        if parse_telegram_chat_id(&id).is_none() {
+        let listed = self
+            .conversations
+            .get(&protocol)
+            .is_some_and(|rows| rows.iter().any(|row| row.id == id));
+        if !listed {
             return;
         }
         let already = self.pending.iter().any(|command| {
             matches!(
                 command,
-                AdapterCommand::OpenChat { conversation_id, .. } if conversation_id == &id
+                AdapterCommand::OpenChat { protocol: owner, conversation_id }
+                    if *owner == protocol && conversation_id == &id
             )
         });
         if already {
             return;
         }
-        self.history_loading.insert(id.clone());
+        self.history_loading.insert((protocol, id.clone()));
         self.pending.push(AdapterCommand::OpenChat {
-            protocol: ProtocolId::Telegram,
+            protocol,
             conversation_id: id,
         });
+    }
+
+    /// Tell the adapters which chat shows now (shell plan 9). Sends only the
+    /// difference: `None` to the protocol the user left, then the new chat.
+    /// The core calls it after every dispatch and pump, so every path (a
+    /// click, an auto-select, a removed chat, a session end, a login form
+    /// over the thread) is covered.
+    pub(crate) fn sync_viewed(&mut self) {
+        let now = self.viewed_chat();
+        if now == self.viewed {
+            return;
+        }
+        let before = std::mem::replace(&mut self.viewed, now.clone());
+        let left_protocol = match (&before, &now) {
+            (Some((old, _)), Some((new, _))) => (old != new).then_some(*old),
+            (Some((old, _)), None) => Some(*old),
+            (None, _) => None,
+        };
+        if let Some(protocol) = left_protocol {
+            self.pending.push(AdapterCommand::ViewChat {
+                protocol,
+                conversation_id: None,
+            });
+        }
+        if let Some((protocol, id)) = now {
+            self.pending.push(AdapterCommand::ViewChat {
+                protocol,
+                conversation_id: Some(id),
+            });
+        }
+    }
+
+    /// The chat that shows in the thread now, if any.
+    fn viewed_chat(&self) -> Option<(ProtocolId, String)> {
+        if self.center_view() != CenterView::Thread {
+            return None;
+        }
+        let protocol = self.selected_protocol;
+        let id = self.selected_conversation.clone()?;
+        let listed = self.has_session(protocol)
+            && self.account_surface_visible(protocol)
+            && self
+                .conversations
+                .get(&protocol)
+                .is_some_and(|rows| rows.iter().any(|row| row.id == id));
+        listed.then_some((protocol, id))
+    }
+
+    /// New link state of one protocol (`AdapterEvent::Account`).
+    /// Rules (ADR 0010): `Linked` starts a session. `Linking` after `Linked`
+    /// is a reconnect: the session, its rows, and its open sends stay, and
+    /// send answers still apply; new commands wait for `Linked`. `Unlinked`
+    /// from any other state ends the session.
+    fn set_account(&mut self, protocol: ProtocolId, state: AccountState) {
+        let had_session = self.has_session(protocol);
+        let first_link = state == AccountState::Linked && !self.any_linked();
+        let mut before = AccountState::Unlinked;
+        if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
+            before = std::mem::replace(&mut row.state, state);
+        }
+        match state {
+            AccountState::Linked => {
+                self.sessions.insert(protocol);
+                // The first linked account, or the linked one while nothing
+                // useful is selected: show it (shell plan 2).
+                if first_link || !self.protocol_linked(self.selected_protocol) {
+                    self.select_protocol(protocol);
+                }
+                #[cfg(feature = "whatsapp-web")]
+                if protocol == ProtocolId::WhatsApp {
+                    self.finish_whatsapp_link();
+                }
+            }
+            AccountState::Unlinked if had_session || before != AccountState::Unlinked => {
+                self.end_session(protocol);
+            }
+            AccountState::Unlinked | AccountState::Linking => {}
+        }
+    }
+
+    /// The session of one protocol ended (shell plan 8): drop its rows,
+    /// messages, drafts, spinners, notes, and sends. Another linked protocol
+    /// takes the selection.
+    fn end_session(&mut self, protocol: ProtocolId) {
+        if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
+            row.state = AccountState::Unlinked;
+        }
+        self.sessions.remove(&protocol);
+        self.conversations.remove(&protocol);
+        // Only this protocol's drafts: the same chat id in another protocol
+        // keeps its draft (PR #68 review).
+        self.drafts.retain(|(owner, _), _| *owner != protocol);
+        self.messages.retain(|(owner, _), _| *owner != protocol);
+        self.history_loading.retain(|(owner, _)| *owner != protocol);
+        self.chat_list_loading.remove(&protocol);
+        self.notices.remove(&protocol);
+        self.sends.drop_protocol(protocol);
+        if protocol == ProtocolId::Telegram {
+            self.older_loading.clear();
+            self.older_at_start.clear();
+            self.older_retry.clear();
+        }
+        #[cfg(feature = "whatsapp-web")]
+        if protocol == ProtocolId::WhatsApp {
+            self.end_pairing();
+        }
+        if self.selected_protocol == protocol {
+            self.compose.clear();
+            self.selected_conversation = None;
+            if let Some(next) = self
+                .accounts
+                .iter()
+                .find(|row| {
+                    self.has_session(row.caps.id) && self.account_surface_visible(row.caps.id)
+                })
+                .map(|row| row.caps.id)
+            {
+                self.select_protocol(next);
+            }
+        }
+    }
+
+    /// One command failed; the session is still up (shell plan 7). Stop its
+    /// spinner and show the error. The rows, the selection, the link state,
+    /// and any send in flight stay.
+    fn command_failed(&mut self, protocol: ProtocolId, chat: Option<&str>, detail: &str) {
+        self.stop_spinners(protocol, chat);
+        let happened = format!(
+            "{}: the last action did not finish.",
+            protocol.display_name()
+        );
+        self.set_error(&happened, detail, "Try again. The inbox stays open.");
+    }
+
+    /// Stop the loading spinners of one protocol: one chat, or all of them.
+    /// Older-message paging is Telegram-only today (#61).
+    fn stop_spinners(&mut self, protocol: ProtocolId, chat: Option<&str>) {
+        match chat {
+            Some(chat) => {
+                self.history_loading.remove(&(protocol, chat.to_owned()));
+                if protocol == ProtocolId::Telegram {
+                    self.older_loading.remove(chat);
+                }
+            }
+            None => {
+                self.chat_list_loading.remove(&protocol);
+                self.history_loading.retain(|(owner, _)| *owner != protocol);
+                if protocol == ProtocolId::Telegram {
+                    self.older_loading.clear();
+                }
+            }
+        }
     }
 
     fn remove_conversation(&mut self, protocol: ProtocolId, id: &str) {
@@ -1759,7 +1987,7 @@ impl Snapshot {
         self.messages
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
         // Every removed chat loses its draft, selected or not (#43).
-        self.drafts.remove(id);
+        self.drafts.remove(&(protocol, id.to_owned()));
         if protocol == ProtocolId::Telegram {
             self.older_loading.remove(id);
             self.older_at_start.remove(id);
@@ -1873,7 +2101,7 @@ impl Snapshot {
             }
         } else {
             self.drafts
-                .entry(message.conversation_id.clone())
+                .entry((message.protocol, message.conversation_id.clone()))
                 .or_insert_with(|| message.body.clone());
         }
         self.set_error(
@@ -1962,8 +2190,7 @@ impl Snapshot {
             self.pending.push(AdapterCommand::WhatsAppCancelLink);
         }
         self.whatsapp_screen = WhatsAppScreen::RiskGate;
-        self.whatsapp_qr = None;
-        self.whatsapp_pair_code = None;
+        self.end_pairing();
         self.whatsapp_started = false;
         self.whatsapp_risk_acknowledged = false;
         self.whatsapp_phone.clear();
@@ -2015,15 +2242,50 @@ impl Snapshot {
         self.whatsapp_started = true;
         self.error = None;
         self.status_text = "WhatsApp pairing requested.".into();
-        self.pending.push(AdapterCommand::WhatsAppBeginLink);
+        let generation = self.next_pairing_generation;
+        self.next_pairing_generation += 1;
+        self.pairing_generation = Some(generation);
+        self.pending
+            .push(AdapterCommand::WhatsAppBeginLink { generation });
+    }
+
+    /// WhatsApp linked (`Account { Linked }`): close the pair screen the user
+    /// started and drop the pairing material. A reconnect also links; it
+    /// must not close a risk gate the user just opened.
+    #[cfg(feature = "whatsapp-web")]
+    fn finish_whatsapp_link(&mut self) {
+        if !self.whatsapp_started || self.whatsapp_screen != WhatsAppScreen::Pair {
+            return;
+        }
+        self.whatsapp_screen = WhatsAppScreen::Hidden;
+        self.end_pairing();
+        self.whatsapp_phone.clear();
+    }
+
+    /// No pairing runs any more: drop the shown QR and pair code, and every
+    /// later payload of the old pairing.
+    #[cfg(feature = "whatsapp-web")]
+    fn end_pairing(&mut self) {
+        self.pairing_generation = None;
+        self.whatsapp_qr = None;
+        self.whatsapp_pair_code = None;
+    }
+
+    /// A pairing payload belongs to the pairing that runs now.
+    #[cfg(feature = "whatsapp-web")]
+    fn current_pairing(&self, generation: u64) -> bool {
+        let current = self.pairing_generation == Some(generation);
+        if !current {
+            tracing::warn!("whatsapp pairing payload dropped: it is from an older pairing");
+        }
+        current
     }
 
     #[cfg(feature = "whatsapp-web")]
     pub fn cancel_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
         phone.clear();
         self.whatsapp_phone.clear();
-        self.whatsapp_qr = None;
-        self.whatsapp_pair_code = None;
+        self.end_pairing();
         self.whatsapp_started = false;
         self.whatsapp_risk_acknowledged = false;
         self.whatsapp_screen = WhatsAppScreen::Hidden;
@@ -2037,7 +2299,9 @@ fn sort_conversations(list: &mut [Conversation]) {
 }
 
 fn sort_messages(list: &mut [ChatMessage]) {
-    list.sort_by_key(|row| message_rank(&row.id));
+    // Send time first: some protocols (WhatsApp) use ids with no order.
+    // Numeric ids rank the rest when the time is unknown (zero).
+    list.sort_by_key(|row| (row.sent_at, message_rank(&row.id)));
 }
 
 fn message_rank(id: &str) -> i64 {
@@ -2114,6 +2378,19 @@ pub mod test_support {
             order,
             last_at: 0,
             is_group: false,
+            writable: true,
+        }
+    }
+
+    /// Telegram signed in, as after Ready: the flag and the linked row.
+    pub fn link_telegram(snapshot: &mut Snapshot) {
+        snapshot.telegram_authorized = true;
+        if let Some(row) = snapshot
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Telegram)
+        {
+            row.state = AccountState::Linked;
         }
     }
 
@@ -2544,6 +2821,7 @@ mod tests {
             conversation_id: format!("telegram:{chat}"),
             before_message_id: format!("telegram:{chat}:{before}"),
             more,
+            note: None,
         }
     }
 
@@ -2860,13 +3138,22 @@ mod tests {
         snapshot.compose = "draft for Ada".into();
         snapshot.select_conversation("telegram:2".into());
         snapshot.compose = "draft for Bob".into();
-        assert!(snapshot.drafts.contains_key("telegram:1"));
+        assert!(
+            snapshot
+                .drafts
+                .contains_key(&(ProtocolId::Telegram, "telegram:1".into()))
+        );
 
         snapshot.apply(AdapterEvent::ConversationRemoved {
             protocol: ProtocolId::Telegram,
             id: "telegram:1".into(),
         });
-        assert!(!snapshot.drafts.contains_key("telegram:1"), "draft gone");
+        assert!(
+            !snapshot
+                .drafts
+                .contains_key(&(ProtocolId::Telegram, "telegram:1".into())),
+            "draft gone"
+        );
         assert_eq!(
             snapshot.selected_conversation.as_deref(),
             Some("telegram:2"),
@@ -2925,7 +3212,7 @@ mod tests {
         assert_eq!(commands.len(), 1, "{commands:?}");
         assert!(matches!(
             &commands[0],
-            AdapterCommand::ResendMessage { protocol: ProtocolId::Telegram, conversation_id, message_id }
+            AdapterCommand::ResendMessage { protocol: ProtocolId::Telegram, conversation_id, message_id, .. }
                 if conversation_id == "telegram:1" && message_id == "telegram:1:101"
         ));
         assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
@@ -3528,6 +3815,7 @@ mod tests {
                 order: 0,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         };
         // A row before Ready is from a cancelled or ended client: dropped.
@@ -3789,7 +4077,10 @@ mod tests {
 
     /// The adapter accepts the in-flight send of `chat` (its own request id).
     fn accept(snapshot: &mut Snapshot, chat: &str) {
-        let request = snapshot.sending.get(chat).expect("a send in flight").0;
+        let request = snapshot
+            .sends
+            .request_of(ProtocolId::Telegram, chat)
+            .expect("a send in flight");
         snapshot.apply(AdapterEvent::SendAccepted {
             protocol: ProtocolId::Telegram,
             conversation_id: chat.into(),
@@ -3994,6 +4285,7 @@ mod tests {
             order: 0,
             last_at: 0,
             is_group: false,
+            writable: true,
         }
     }
 
@@ -4003,7 +4295,7 @@ mod tests {
             .iter()
             .find(|row| row.caps.id == ProtocolId::Discord)
             .expect("discord account")
-            .linked
+            .linked()
     }
 
     #[test]
@@ -4033,27 +4325,42 @@ mod tests {
             status: AdapterStatus::Stubbed,
             detail: "Discord bot inbox placeholder. bot token is in the OS keychain. Gateway is not started.".into(),
         });
+        assert!(
+            !discord_linked(&snapshot),
+            "a status never links (shell plan 1)"
+        );
+        // The adapter links the account, then publishes its rows.
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Discord,
+            state: AccountState::Linked,
+        });
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: discord_guild_placeholder(),
         });
-        assert_eq!(
-            discord_linked(&snapshot),
-            DiscordAdapter::bot_inbox_compiled()
-        );
-        snapshot.select_protocol(ProtocolId::Discord);
+        assert!(discord_linked(&snapshot));
         if DiscordAdapter::bot_inbox_compiled() {
-            assert_eq!(snapshot.selected_protocol, ProtocolId::Discord);
+            assert_eq!(
+                snapshot.selected_protocol,
+                ProtocolId::Discord,
+                "first link"
+            );
             assert_eq!(snapshot.visible_conversations().len(), 1);
             assert_eq!(snapshot.unread_for(ProtocolId::Discord), 1);
+            assert_eq!(snapshot.center_view(), CenterView::Thread);
         } else {
             assert_eq!(snapshot.selected_protocol, ProtocolId::Telegram);
             assert!(snapshot.visible_conversations().is_empty());
-            assert!(!discord_linked(&snapshot));
         }
+        // A refusal status keeps the link (shell plan 11). Only Account unlinks.
         snapshot.apply(AdapterEvent::Status {
             protocol: ProtocolId::Discord,
             status: AdapterStatus::Refused,
             detail: "Discord user-account tokens are refused.".into(),
+        });
+        assert!(discord_linked(&snapshot));
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Discord,
+            state: AccountState::Unlinked,
         });
         assert!(!discord_linked(&snapshot));
         assert_eq!(snapshot.unread_for(ProtocolId::Discord), 0);
@@ -4133,7 +4440,7 @@ mod tests {
     #[test]
     fn search_v1_matches_title_and_participant_only() {
         let mut snapshot = Snapshot::new();
-        snapshot.telegram_authorized = true;
+        link_telegram(&mut snapshot);
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: Conversation {
                 protocol: ProtocolId::Telegram,
@@ -4145,6 +4452,7 @@ mod tests {
                 order: 0,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         });
         snapshot
@@ -4152,7 +4460,7 @@ mod tests {
             .iter_mut()
             .find(|row| row.caps.id == ProtocolId::Telegram)
             .expect("telegram row")
-            .linked = true;
+            .state = AccountState::Linked;
         snapshot.search = "secret-preview-should-not-match-search".into();
         assert!(snapshot.visible_conversations().is_empty());
         snapshot.search = "you".into();
@@ -4174,7 +4482,7 @@ mod tests {
             .find(|row| row.caps.id == ProtocolId::WhatsApp)
             .expect("whatsapp");
         assert_ne!(row.status, AdapterStatus::Ready);
-        assert!(!row.linked);
+        assert!(!row.linked());
         assert!(!snapshot.status_text.contains("qr-do-not-log"));
         assert!(snapshot.take_commands().is_empty());
         snapshot.select_protocol(ProtocolId::WhatsApp);
@@ -4182,7 +4490,7 @@ mod tests {
             !snapshot
                 .take_commands()
                 .iter()
-                .any(|command| matches!(command, AdapterCommand::WhatsAppBeginLink))
+                .any(|command| matches!(command, AdapterCommand::WhatsAppBeginLink { .. }))
         );
     }
 
@@ -4247,7 +4555,11 @@ mod tests {
         let debug = format!("{commands:?}");
         assert!(!debug.contains("15559876"));
         assert!(commands.contains(&AdapterCommand::WhatsAppAcknowledgeRisk));
-        assert!(commands.contains(&AdapterCommand::WhatsAppBeginLink));
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::WhatsAppBeginLink { .. }))
+        );
         snapshot.apply(AdapterEvent::WhatsAppQr {
             code: thinwire_protocol::RedactedPairingSecret::new("second-secret"),
             generation: 1,
@@ -4259,7 +4571,7 @@ mod tests {
             .iter()
             .find(|row| row.caps.id == ProtocolId::WhatsApp)
             .expect("whatsapp");
-        assert!(!row.linked);
+        assert!(!row.linked());
         assert_ne!(row.status, AdapterStatus::Ready);
         snapshot.cancel_whatsapp_link(&phone);
         assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
@@ -4270,7 +4582,10 @@ mod tests {
     #[test]
     fn send_compose_queues_text_on_the_worker_without_a_local_stub() {
         let mut snapshot = Snapshot::new();
-        snapshot.telegram_authorized = true;
+        link_telegram(&mut snapshot);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(42, "Ada", 1),
+        });
         snapshot.selected_protocol = ProtocolId::Telegram;
         snapshot.selected_conversation = Some("telegram:42".into());
         snapshot.compose = " hello ".into();
@@ -4320,7 +4635,7 @@ mod tests {
             .iter_mut()
             .find(|row| row.caps.id == ProtocolId::Telegram)
             .expect("telegram")
-            .linked = true;
+            .state = AccountState::Linked;
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: Conversation {
                 protocol: ProtocolId::Telegram,
@@ -4332,6 +4647,7 @@ mod tests {
                 order: 10,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         });
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -4345,6 +4661,7 @@ mod tests {
                 order: 90,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         });
         let ids: Vec<_> = snapshot
@@ -4373,7 +4690,7 @@ mod tests {
     #[test]
     fn messages_upsert_replace_and_body_edits_keep_sender() {
         let mut snapshot = Snapshot::new();
-        snapshot.telegram_authorized = true;
+        link_telegram(&mut snapshot);
         snapshot.selected_protocol = ProtocolId::Telegram;
         snapshot.selected_conversation = Some("telegram:4".into());
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -4453,7 +4770,7 @@ mod tests {
     #[test]
     fn deleted_message_ids_leave_the_thread() {
         let mut snapshot = Snapshot::new();
-        snapshot.telegram_authorized = true;
+        link_telegram(&mut snapshot);
         snapshot.selected_protocol = ProtocolId::Telegram;
         snapshot.selected_conversation = Some("telegram:4".into());
         for (id, body) in [("telegram:4:1", "keep"), ("telegram:4:2", "drop")] {
@@ -4492,7 +4809,7 @@ mod tests {
             .iter_mut()
             .find(|row| row.caps.id == ProtocolId::Telegram)
             .expect("telegram")
-            .linked = true;
+            .state = AccountState::Linked;
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: Conversation {
                 protocol: ProtocolId::Telegram,
@@ -4504,6 +4821,7 @@ mod tests {
                 order: 5,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -4710,13 +5028,13 @@ mod tests {
         assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
         snapshot.begin_whatsapp_link(&phone);
         assert!(snapshot.whatsapp_started);
-        assert_eq!(
-            snapshot.take_commands(),
-            vec![
+        assert!(matches!(
+            snapshot.take_commands().as_slice(),
+            [
                 AdapterCommand::WhatsAppAcknowledgeRisk,
-                AdapterCommand::WhatsAppBeginLink
+                AdapterCommand::WhatsAppBeginLink { .. }
             ]
-        );
+        ));
 
         // Cancel drops the acknowledgement: a new link needs the gate again.
         snapshot.cancel_whatsapp_link(&phone);
@@ -4743,9 +5061,10 @@ mod tests {
         snapshot.telegram_2fa = "password-fixture-8d2".into();
         snapshot.compose = "draft-fixture-3b7".into();
         snapshot.search = "search-fixture-6e5".into();
-        snapshot
-            .drafts
-            .insert("telegram:2".into(), "other-draft-fixture-2a9".into());
+        snapshot.drafts.insert(
+            (ProtocolId::Telegram, "telegram:2".into()),
+            "other-draft-fixture-2a9".into(),
+        );
         #[cfg(feature = "whatsapp-web")]
         {
             snapshot.whatsapp_phone = "wa-phone-fixture-111".into();
@@ -4808,4 +5127,702 @@ mod tests {
         assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
         assert!(snapshot.take_commands().is_empty());
     }
+
+    /// A retry of a failed row, ready for tests: returns its request id.
+    fn retry_failed_row(snapshot: &mut Snapshot) -> u64 {
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 101, "hi", Delivery::Failed),
+        });
+        snapshot.error = None;
+        snapshot.retry_send("telegram:1:101");
+        let commands = snapshot.take_commands();
+        let request = commands
+            .iter()
+            .find_map(|command| match command {
+                AdapterCommand::ResendMessage { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("a ResendMessage");
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+        request
+    }
+
+    /// Shell plan item 10 (Codex #53): a retry stays pending across a
+    /// reconnect. Only its own answer ends it.
+    #[test]
+    fn a_retry_stays_pending_until_its_own_answer() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = retry_failed_row(&mut snapshot);
+        for status in [AdapterStatus::Connecting, AdapterStatus::Ready] {
+            snapshot.apply(AdapterEvent::Status {
+                protocol: ProtocolId::Telegram,
+                status,
+                detail: "reconnect".into(),
+            });
+        }
+        snapshot.compose = "next".into();
+        assert!(!snapshot.can_send(), "the chat still has a retry in flight");
+        snapshot.retry_send("telegram:1:101");
+        assert!(snapshot.take_commands().is_empty(), "no second retry");
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert!(snapshot.can_send(), "the retry ended");
+    }
+
+    /// A rejected retry sets its row back to Failed and shows the error. A
+    /// rejection with an old request id changes nothing.
+    #[test]
+    fn a_rejected_retry_fails_its_row_again() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = retry_failed_row(&mut snapshot);
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request: request + 100,
+        });
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+        assert!(snapshot.error.is_none());
+
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+        assert_eq!(
+            snapshot.error.as_ref().map(|error| error.happened.as_str()),
+            Some("Message not sent.")
+        );
+    }
+
+    // region: protocol-independent shell (plan items 1-8, 10, 11)
+
+    /// A Snapshot that shows Slack and Discord too, whatever the features.
+    fn shell_with(protocols: &[ProtocolId]) -> Snapshot {
+        let mut snapshot = Snapshot::new();
+        snapshot.visible_for_test.extend(protocols.iter().copied());
+        snapshot
+    }
+
+    fn link(snapshot: &mut Snapshot, protocol: ProtocolId) {
+        snapshot.apply(AdapterEvent::Account {
+            protocol,
+            state: AccountState::Linked,
+        });
+    }
+
+    fn chat(protocol: ProtocolId, id: &str, writable: bool) -> Conversation {
+        Conversation {
+            protocol,
+            id: id.into(),
+            title: id.into(),
+            participant: id.into(),
+            preview: String::new(),
+            unread: 0,
+            order: 1,
+            last_at: 0,
+            is_group: false,
+            writable,
+        }
+    }
+
+    fn allow_send(snapshot: &mut Snapshot, protocol: ProtocolId) {
+        let row = snapshot
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == protocol)
+            .expect("row");
+        row.caps.sends_text = true;
+    }
+
+    #[test]
+    fn a_first_non_telegram_account_shows_its_inbox() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+        link(&mut snapshot, ProtocolId::Slack);
+        assert_eq!(
+            snapshot.center_view(),
+            CenterView::Thread,
+            "no Telegram needed"
+        );
+        assert_eq!(snapshot.selected_protocol, ProtocolId::Slack);
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        assert_eq!(snapshot.selected_conversation.as_deref(), Some("slack:C1"));
+        assert!(
+            snapshot
+                .take_commands()
+                .contains(&AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Slack,
+                    conversation_id: "slack:C1".into(),
+                })
+        );
+        assert_eq!(snapshot.thread_state(), ThreadState::Loading);
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+        });
+        assert_eq!(snapshot.thread_state(), ThreadState::Empty);
+
+        snapshot.refresh_visible();
+        assert!(
+            snapshot
+                .take_commands()
+                .contains(&AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Slack
+                })
+        );
+        assert_eq!(snapshot.inbox_state(), InboxState::Rows);
+    }
+
+    #[test]
+    fn inbox_events_of_an_unlinked_protocol_are_dropped() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        assert!(snapshot.conversations.is_empty());
+    }
+
+    #[test]
+    fn can_send_checks_the_protocol_and_the_chat() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:RO", false),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:RW", true),
+        });
+        snapshot.compose = "hi".into();
+        snapshot.selected_conversation = Some("slack:RW".into());
+        assert!(
+            !snapshot.can_send(),
+            "Slack does not send text in this build"
+        );
+
+        allow_send(&mut snapshot, ProtocolId::Slack);
+        assert!(snapshot.can_send());
+        snapshot.selected_conversation = Some("slack:RO".into());
+        assert!(!snapshot.can_send(), "a read-only channel");
+
+        snapshot.selected_conversation = Some("slack:RW".into());
+        snapshot.take_commands();
+        snapshot.send_compose();
+        assert!(snapshot.take_commands().iter().any(|command| matches!(
+            command,
+            AdapterCommand::SendText { protocol: ProtocolId::Slack, conversation_id, .. }
+                if conversation_id == "slack:RW"
+        )));
+        assert!(!snapshot.can_send(), "one send in flight per chat");
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        assert!(!snapshot.can_send(), "unlinked");
+    }
+
+    #[test]
+    fn send_answers_work_per_protocol() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.visible_for_test.insert(ProtocolId::Discord);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        // The same chat id in two protocols.
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "telegram:1", true),
+        });
+        snapshot.select_protocol(ProtocolId::Discord);
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.compose = "to discord".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .sends
+            .request_of(ProtocolId::Discord, "telegram:1")
+            .expect("discord send");
+
+        // An answer for Telegram's chat with the same id changes nothing.
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(snapshot.compose, "to discord");
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Discord,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert!(snapshot.compose.is_empty(), "Discord accepted its own send");
+    }
+
+    #[test]
+    fn retry_works_for_any_linked_protocol() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:9", true),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Discord,
+                conversation_id: "discord:9".into(),
+                id: "discord:9:1".into(),
+                sender: "you".into(),
+                body: "hi".into(),
+                outbound: true,
+                delivery: Delivery::Failed,
+                sent_at: 1,
+            },
+        });
+        snapshot.take_commands();
+        // PR #68 review: Retry checks what Send checks.
+        snapshot.retry_send("discord:9:1");
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "Discord does not send text here"
+        );
+
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        snapshot.retry_send("discord:9:1");
+        assert!(snapshot.take_commands().iter().any(|command| matches!(
+            command,
+            AdapterCommand::ResendMessage { protocol: ProtocolId::Discord, message_id, .. }
+                if message_id == "discord:9:1"
+        )));
+    }
+
+    /// PR #68 review: no Retry in a read-only chat.
+    #[test]
+    fn retry_is_refused_in_a_read_only_chat() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:ro", false),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Discord,
+                conversation_id: "discord:ro".into(),
+                id: "discord:ro:1".into(),
+                sender: "you".into(),
+                body: "hi".into(),
+                outbound: true,
+                delivery: Delivery::Failed,
+                sent_at: 1,
+            },
+        });
+        snapshot.take_commands();
+        snapshot.retry_send("discord:ro:1");
+        assert!(snapshot.take_commands().is_empty());
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+    }
+
+    #[test]
+    fn a_failed_command_keeps_the_inbox_and_the_send() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        allow_send(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.compose = "hi".into();
+        snapshot.send_compose();
+        snapshot.refresh_visible();
+        assert_eq!(snapshot.thread_state(), ThreadState::Loading);
+
+        snapshot.apply(AdapterEvent::CommandFailed {
+            protocol: ProtocolId::Slack,
+            conversation_id: Some("slack:C1".into()),
+            detail: "rate limited".into(),
+        });
+        assert!(snapshot.protocol_linked(ProtocolId::Slack));
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+        assert_eq!(snapshot.selected_conversation.as_deref(), Some("slack:C1"));
+        assert_eq!(
+            snapshot.thread_state(),
+            ThreadState::Empty,
+            "spinner stopped"
+        );
+        assert!(snapshot.error.is_some());
+        assert!(
+            snapshot.sends.in_flight(ProtocolId::Slack, "slack:C1"),
+            "only SendRejected ends a send"
+        );
+    }
+
+    /// Codex #51: a notice is a note, not a refusal.
+    #[test]
+    fn a_notice_is_a_note_and_never_ends_a_send() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:9", true),
+        });
+        snapshot.compose = "hi".into();
+        snapshot.send_compose();
+        snapshot.apply(AdapterEvent::Notice {
+            protocol: ProtocolId::Discord,
+            text: "The bot cannot read this channel.".into(),
+        });
+        assert!(snapshot.error.is_none());
+        assert!(snapshot.sends.in_flight(ProtocolId::Discord, "discord:9"));
+        assert_eq!(
+            snapshot.notice(ProtocolId::Discord),
+            Some("The bot cannot read this channel.")
+        );
+        assert_eq!(snapshot.notice(ProtocolId::Telegram), None);
+    }
+
+    /// Plan item 11 (Codex #47): an error status never unlinks.
+    #[test]
+    fn an_error_status_never_unlinks() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        for protocol in [ProtocolId::Telegram, ProtocolId::Slack] {
+            snapshot.apply(AdapterEvent::Status {
+                protocol,
+                status: AdapterStatus::Error,
+                detail: "network down".into(),
+            });
+            assert!(snapshot.protocol_linked(protocol), "{protocol}");
+        }
+        assert_eq!(snapshot.center_view(), CenterView::Thread);
+        assert_eq!(
+            snapshot.visible_conversations().len(),
+            2,
+            "Telegram rows stay"
+        );
+    }
+
+    #[test]
+    fn unlinking_one_protocol_drops_only_its_state() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        link(&mut snapshot, ProtocolId::Slack);
+        allow_send(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_protocol(ProtocolId::Slack);
+        snapshot.compose = "slack text".into();
+        snapshot.send_compose();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        assert!(!snapshot.conversations.contains_key(&ProtocolId::Slack));
+        assert!(!snapshot.sends.in_flight(ProtocolId::Slack, "slack:C1"));
+        assert_eq!(
+            snapshot.selected_protocol,
+            ProtocolId::Telegram,
+            "the next linked protocol takes the selection"
+        );
+        assert_eq!(snapshot.visible_conversations().len(), 2);
+        assert!(snapshot.protocol_linked(ProtocolId::Telegram));
+    }
+
+    // endregion: protocol-independent shell
+
+    // region: viewed chat (plan item 9)
+
+    fn view_commands(snapshot: &mut Snapshot) -> Vec<(ProtocolId, Option<String>)> {
+        snapshot.sync_viewed();
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::ViewChat {
+                    protocol,
+                    conversation_id,
+                } => Some((protocol, conversation_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn view_chat_follows_the_selection_and_sends_only_changes() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, Some("telegram:1".into()))]
+        );
+        assert!(
+            view_commands(&mut snapshot).is_empty(),
+            "no change, no command"
+        );
+
+        snapshot.select_conversation("telegram:2".into());
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, Some("telegram:2".into()))]
+        );
+        snapshot.select_conversation("telegram:2".into());
+        assert!(
+            view_commands(&mut snapshot).is_empty(),
+            "the same chat again"
+        );
+
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_protocol(ProtocolId::Slack);
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![
+                (ProtocolId::Telegram, None),
+                (ProtocolId::Slack, Some("slack:C1".into()))
+            ],
+            "the old protocol hears None first"
+        );
+
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Slack,
+            id: "slack:C1".into(),
+        });
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Slack, None)]
+        );
+    }
+
+    #[test]
+    fn view_chat_clears_on_session_end_and_under_a_login_form() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        view_commands(&mut snapshot);
+        // Advanced opens a form over the thread (only while not signed in,
+        // so use the auth screen directly).
+        snapshot.auth = AuthScreen::TelegramApi;
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, None)]
+        );
+        snapshot.auth = AuthScreen::Idle;
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, Some("telegram:1".into()))]
+        );
+        snapshot.apply(AdapterEvent::TelegramSessionEnded);
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, None)]
+        );
+    }
+
+    // endregion: viewed chat
+
+    /// Plan item 12 (Codex #53): only the current pairing's payloads show.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn pairing_payloads_of_an_older_pairing_are_dropped() {
+        use thinwire_protocol::RedactedPairingSecret;
+
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        let begin = |snapshot: &mut Snapshot| {
+            snapshot.open_whatsapp_risk_gate();
+            snapshot.acknowledge_whatsapp_risk();
+            snapshot.begin_whatsapp_link(&phone);
+            snapshot
+                .take_commands()
+                .into_iter()
+                .find_map(|command| match command {
+                    AdapterCommand::WhatsAppBeginLink { generation } => Some(generation),
+                    _ => None,
+                })
+                .expect("begin")
+        };
+        let qr = |generation: u64, code: &str| AdapterEvent::WhatsAppQr {
+            code: RedactedPairingSecret::new(code),
+            generation,
+        };
+        let first = begin(&mut snapshot);
+        snapshot.cancel_whatsapp_link(&phone);
+        let second = begin(&mut snapshot);
+        assert!(second > first, "the generation rises with each begin");
+
+        snapshot.apply(qr(first, "old-qr"));
+        assert_eq!(
+            snapshot.whatsapp_qr, None,
+            "a late payload of the cancelled pairing"
+        );
+        snapshot.apply(qr(second, "new-qr"));
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("new-qr"));
+
+        snapshot.cancel_whatsapp_link(&phone);
+        snapshot.apply(AdapterEvent::WhatsAppPairCode {
+            code: RedactedPairingSecret::new("late-code"),
+            generation: second,
+        });
+        assert_eq!(snapshot.whatsapp_pair_code, None, "no pairing runs");
+        assert!(!format!("{snapshot:?}").contains("new-qr"));
+    }
+
+    // region: review fixes on #68 (qa M1, Codex P2)
+
+    /// qa M1: a reconnect (`Linked` then `Linking`) keeps the session, and
+    /// the answer of a send in flight still applies.
+    #[test]
+    fn a_reconnect_keeps_the_session_and_applies_send_answers() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        allow_send(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.compose = "hi".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .sends
+            .request_of(ProtocolId::Slack, "slack:C1")
+            .expect("send");
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert_eq!(snapshot.visible_conversations().len(), 1, "rows stay");
+        assert_eq!(snapshot.center_view(), CenterView::Thread);
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+            request,
+        });
+        assert!(
+            snapshot.compose.is_empty(),
+            "the answer applied while Linking"
+        );
+        assert!(!snapshot.sends.in_flight(ProtocolId::Slack, "slack:C1"));
+        snapshot.compose = "next".into();
+        assert!(!snapshot.can_send(), "new sends wait for Linked");
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linked,
+        });
+        assert!(snapshot.can_send());
+    }
+
+    /// qa M1: `Linking` then `Unlinked` ends the session: rows and sends go.
+    #[test]
+    fn unlinked_after_linking_ends_the_session() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        allow_send(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.compose = "hi".into();
+        snapshot.send_compose();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        assert!(!snapshot.conversations.contains_key(&ProtocolId::Slack));
+        assert!(!snapshot.sends.in_flight(ProtocolId::Slack, "slack:C1"));
+        assert!(!snapshot.has_session(ProtocolId::Slack));
+
+        // A first login (`Linking` with no session before) drops inbox events.
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C2", true),
+        });
+        assert!(!snapshot.conversations.contains_key(&ProtocolId::Slack));
+    }
+
+    /// Codex P2 (PR #68): unlinking one protocol keeps the draft of the same
+    /// chat id in another protocol.
+    #[test]
+    fn unlinking_one_protocol_keeps_another_protocols_draft() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "telegram:2", true),
+        });
+        snapshot.set_draft(ProtocolId::Telegram, "telegram:2", "telegram draft".into());
+        snapshot.set_draft(ProtocolId::Slack, "telegram:2", "slack draft".into());
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        snapshot.select_conversation("telegram:2".into());
+        assert_eq!(snapshot.compose, "telegram draft", "no data loss");
+    }
+
+    /// A draft stays with its protocol when the user switches protocols.
+    #[test]
+    fn a_protocol_switch_parks_the_draft_under_the_old_protocol() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_protocol(ProtocolId::Telegram);
+        snapshot.compose = "for telegram:1".into();
+        snapshot.select_protocol(ProtocolId::Slack);
+        assert!(snapshot.compose.is_empty());
+        snapshot.select_protocol(ProtocolId::Telegram);
+        assert_eq!(snapshot.compose, "for telegram:1");
+    }
+
+    /// Codex P2 (PR #68): the fake adapter links before its rows, so a
+    /// test or an example can seed a view with it.
+    #[test]
+    fn the_fake_adapter_seeds_a_view() {
+        use thinwire_protocol::{FakeAdapter, ProtocolAdapter};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut fake = FakeAdapter::new();
+        fake.start(tx.clone());
+        fake.handle(
+            AdapterCommand::Connect {
+                protocol: ProtocolId::Telegram,
+            },
+            &tx,
+        )
+        .expect("connect");
+        let mut snapshot = Snapshot::new();
+        while let Ok(event) = rx.try_recv() {
+            snapshot.apply(event);
+        }
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+        assert_eq!(snapshot.selected_messages().len(), 1);
+    }
+
+    // endregion: review fixes on #68
 }

@@ -44,6 +44,19 @@ async fn fake_adapter_pushes_events_from_worker_without_ui_apis() {
         other => panic!("expected status, got {other:?}"),
     }
 
+    // The account links before the first inbox event (ADR 0010).
+    let account = timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("account event should arrive")
+        .expect("channel open");
+    assert_eq!(
+        account,
+        AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: thinwire_protocol::AccountState::Linked,
+        }
+    );
+
     let conversation = timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("conversation event should arrive")

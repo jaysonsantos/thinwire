@@ -52,6 +52,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     detail: CAPABILITY_DETAIL,
     official_api: true,
     allows_user_account_automation: false,
+    sends_text: true,
 };
 
 /// Official Telegram path. Default builds report TDLib unavailable.
@@ -315,22 +316,30 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
                 message_id,
+                request,
             } => {
                 let owned = inbox::parse_message_id(&message_id)
                     .is_some_and(|(chat_id, _)| inbox::conversation_id(chat_id) == conversation_id);
-                if !owned {
-                    return Err(AdapterError::Unavailable {
+                let result = if owned {
+                    self.dispatch_live(
+                        events,
+                        LiveCall::Resend {
+                            conversation_id: conversation_id.clone(),
+                            message_id,
+                            request,
+                        },
+                    )
+                } else {
+                    Err(AdapterError::Unavailable {
                         protocol: ProtocolId::Telegram,
                         reason: "message id is not in this Telegram chat",
-                    });
+                    })
+                };
+                // Name this retry in the rejection, so the UI ends only it.
+                if result.is_err() {
+                    emit_send_rejected(events, ProtocolId::Telegram, conversation_id, request);
                 }
-                self.dispatch_live(
-                    events,
-                    LiveCall::Resend {
-                        conversation_id,
-                        message_id,
-                    },
-                )
+                result
             }
             AdapterCommand::SendText {
                 protocol: ProtocolId::Telegram,
@@ -414,6 +423,7 @@ enum LiveCall {
     Resend {
         conversation_id: String,
         message_id: String,
+        request: u64,
     },
     LoadOlder {
         conversation_id: String,
@@ -456,9 +466,16 @@ impl TelegramAdapter {
                 LiveCall::Resend {
                     conversation_id,
                     message_id,
+                    request,
                 } => {
-                    self.tdlib
-                        .resend(conversation_id, message_id, secrets, source, events);
+                    self.tdlib.resend(
+                        conversation_id,
+                        message_id,
+                        request,
+                        secrets,
+                        source,
+                        events,
+                    );
                 }
             }
             Ok(())
@@ -684,6 +701,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
                 message_id: "telegram:2:5".into(),
+                request: 1,
             },
             &tx,
         );
@@ -698,6 +716,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
                 message_id: "telegram:1:5".into(),
+                request: 1,
             },
             &tx,
         );

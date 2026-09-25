@@ -47,6 +47,7 @@ enum TdlibCommand {
     Resend {
         conversation_id: String,
         message_id: String,
+        request: u64,
     },
     LoadOlder {
         conversation_id: String,
@@ -255,6 +256,7 @@ impl TdlibRuntime {
         &mut self,
         conversation_id: String,
         message_id: String,
+        request: u64,
         secrets: Arc<dyn TelegramSecretVault>,
         source: TelegramApiSource,
         events: &EventTx,
@@ -263,6 +265,7 @@ impl TdlibRuntime {
             TdlibCommand::Resend {
                 conversation_id,
                 message_id,
+                request,
             },
             secrets,
             source,
@@ -486,8 +489,8 @@ fn spawn_tdlib_worker(
                         TdlibCommand::LoadOlder { conversation_id, before_message_id } => {
                             load_older(client_id, &conversation_id, &before_message_id, &mut live, &events).await;
                         }
-                        TdlibCommand::Resend { conversation_id, message_id } => {
-                            resend(client_id, &conversation_id, &message_id, &live, &events).await;
+                        TdlibCommand::Resend { conversation_id, message_id, request } => {
+                            resend(client_id, &conversation_id, &message_id, request, &live, &events).await;
                         }
                     }
                 }
@@ -1328,9 +1331,11 @@ async fn resend(
     client_id: i32,
     conversation_id: &str,
     message_id: &str,
+    request: u64,
     live: &LiveInbox,
     events: &EventTx,
 ) {
+    // Every failure names the request, so the shell ends only this retry.
     let failed = || {
         emit_message_delivery(
             events,
@@ -1339,6 +1344,7 @@ async fn resend(
             message_id,
             Delivery::Failed,
         );
+        emit_send_rejected(events, ProtocolId::Telegram, conversation_id, request);
     };
     if !live.linked() {
         failed();
@@ -1361,6 +1367,7 @@ async fn resend(
             match batch.messages.into_iter().flatten().next() {
                 Some(message) => {
                     emit_mapped_message(events, &message, live, Some(message_id.to_string()));
+                    emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request);
                 }
                 None => {
                     failed();

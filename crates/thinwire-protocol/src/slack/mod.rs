@@ -42,6 +42,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     detail: CAPABILITY_DETAIL,
     official_api: true,
     allows_user_account_automation: false,
+    sends_text: false,
 };
 
 /// Official Slack path. Workspace install UI is out of scope for this spike.
@@ -91,6 +92,7 @@ impl SlackAdapter {
                 order: 0,
                 last_at: 0,
                 is_group: false,
+                writable: false,
             },
         );
         emit_message(

@@ -181,6 +181,7 @@ impl Core {
             self.state.status_text = text;
         }
         self.state.poll_resume(&self.secrets);
+        self.state.sync_viewed();
         self.flush();
         applied
     }
@@ -240,6 +241,7 @@ impl Core {
                 });
             }
         }
+        self.state.sync_viewed();
         self.flush();
         self.notifier.notify();
     }
@@ -826,13 +828,13 @@ mod tests {
             got.push(command);
         }
         if cfg!(feature = "whatsapp-web") {
-            assert_eq!(
-                got,
-                vec![
+            assert!(matches!(
+                got.as_slice(),
+                [
                     AdapterCommand::WhatsAppAcknowledgeRisk,
-                    AdapterCommand::WhatsAppBeginLink
+                    AdapterCommand::WhatsAppBeginLink { .. }
                 ]
-            );
+            ));
         } else {
             assert!(got.is_empty(), "feature off: WhatsApp intents do nothing");
         }
@@ -1014,5 +1016,40 @@ mod tests {
             }
         }
         assert_eq!(sends, vec!["telegram:1".to_owned()]);
+    }
+
+    /// Plan item 9 through the core: a click sends `ViewChat`, and nothing
+    /// goes out after `Shutdown`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn view_chat_goes_out_on_selection_and_not_after_shutdown() {
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:2".into(),
+        });
+        let mut views = Vec::new();
+        while let Ok(command) = sent.try_recv() {
+            if let AdapterCommand::ViewChat {
+                conversation_id, ..
+            } = command
+            {
+                views.push(conversation_id);
+            }
+        }
+        assert_eq!(views, vec![Some("telegram:2".to_owned())]);
+
+        core.dispatch(Intent::Shutdown);
+        while sent.try_recv().is_ok() {}
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        assert!(
+            sent.try_recv().is_err(),
+            "no ViewChat while the clients close"
+        );
     }
 }

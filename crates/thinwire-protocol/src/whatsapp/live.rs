@@ -73,9 +73,13 @@ enum Session {
     Aborted,
 }
 
+/// `token` is the adapter's own link generation (stale-bot checks).
+/// `link_id` is the shell's pairing id: every QR and pair-code event carries
+/// it, so the shell can drop a payload of an older pairing.
 pub(super) async fn run_link(
     link: Arc<LiveLink>,
     token: u64,
+    link_id: u64,
     phone: Option<String>,
     events: EventTx,
 ) {
@@ -83,7 +87,7 @@ pub(super) async fn run_link(
         link.gate.set_inactive();
         return;
     }
-    match session(&link, token, phone, events).await {
+    match session(&link, token, link_id, phone, events).await {
         Session::Started => {}
         Session::Rejected(handle) => {
             handle.shutdown().await;
@@ -100,6 +104,7 @@ pub(super) async fn run_link(
 async fn session(
     link: &Arc<LiveLink>,
     token: u64,
+    link_id: u64,
     phone: Option<String>,
     events: EventTx,
 ) -> Session {
@@ -152,6 +157,7 @@ async fn session(
         events.clone(),
         Arc::clone(link),
         token,
+        link_id,
     )
     .await
     {
@@ -209,6 +215,7 @@ async fn build_bot(
     events: EventTx,
     link: Arc<LiveLink>,
     token: u64,
+    link_id: u64,
 ) -> Result<Bot, ()> {
     if let Some(phone_number) = phone_number {
         let events_qr = events.clone();
@@ -227,7 +234,7 @@ async fn build_bot(
                         &events_qr,
                         AdapterEvent::WhatsAppQr {
                             code: RedactedPairingSecret::new(code),
-                            generation: token,
+                            generation: link_id,
                         },
                     );
                 }
@@ -246,7 +253,7 @@ async fn build_bot(
                         &events_pair,
                         AdapterEvent::WhatsAppPairCode {
                             code: RedactedPairingSecret::new(code),
-                            generation: token,
+                            generation: link_id,
                         },
                     );
                 }
@@ -267,7 +274,7 @@ async fn build_bot(
                         &events,
                         AdapterEvent::WhatsAppQr {
                             code: RedactedPairingSecret::new(code),
-                            generation: token,
+                            generation: link_id,
                         },
                     );
                 }
