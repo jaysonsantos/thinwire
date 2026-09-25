@@ -218,21 +218,21 @@ mod tests {
 name = "thinwire-protocol"
 version = "0.1.0"
 dependencies = [
- "middle 1.0.0",
+    "middle 1.0.0",
 ]
 
 [[package]]
 name = "middle"
 version = "1.0.0"
 dependencies = [
- "wacore-libsignal 0.7.0",
+    "wacore-libsignal 0.7.0",
 ]
 
 [[package]]
 name = "middle"
 version = "2.0.0"
 dependencies = [
- "not-selected",
+    "not-selected",
 ]
 
 [[package]]
@@ -245,7 +245,7 @@ dependencies = [
 name = "wacore-libsignal"
 version = "9.9.9"
 dependencies = [
- "other-version",
+    "other-version",
 ]
 
 [[package]]
