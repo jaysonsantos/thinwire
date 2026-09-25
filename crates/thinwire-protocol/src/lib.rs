@@ -14,7 +14,7 @@ mod telegram;
 mod whatsapp;
 
 pub use adapter::{
-    AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage,
+    AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, Arrival, ChatMessage,
     Conversation, Delivery, DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities,
     ProtocolId, RedactedPairingSecret, SupportClass, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_account, emit_chat_list_loaded, emit_conversation,

@@ -130,6 +130,7 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             id: format!("telegram:1:{sent_at}"),
+            arrival: thinwire_protocol::Arrival::History,
             sender: sender.into(),
             body: "text".into(),
             outbound,

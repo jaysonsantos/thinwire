@@ -734,7 +734,7 @@ mod tests {
         let body = fn_body(src, "async fn resend");
         assert!(body.contains("functions::resend_messages"));
         assert!(body.contains("Delivery::Failed"));
-        let mapped = fn_body(src, "fn emit_mapped_message");
+        let mapped = fn_body(src, "fn emit_mapped_message_as");
         assert!(mapped.contains("MessageSendingState::Pending"));
         assert!(mapped.contains("MessageSendingState::Failed"));
     }
@@ -765,8 +765,23 @@ mod tests {
     #[test]
     fn live_tdlib_maps_message_dates_and_group_chats() {
         let src = include_str!("tdlib.rs");
-        let mapped = fn_body(src, "fn emit_mapped_message");
+        let mapped = fn_body(src, "fn emit_mapped_message_as");
         assert!(mapped.contains("sent_at: i64::from(message.date)"));
+        // Only `updateNewMessage` is a live message that can notify (#32).
+        assert!(mapped.contains("ChatMessage { arrival, ..mapped }"));
+        let updates = fn_body(src, "fn apply_chat_update");
+        let new_message = &updates[updates.find("Update::NewMessage").expect("new")..];
+        let new_message = &new_message[..new_message
+            .find("Update::MessageSendSucceeded")
+            .expect("next")];
+        assert!(new_message.contains("Arrival::Live"));
+        assert_eq!(
+            src.matches("Arrival::Live").count(),
+            1,
+            "no other live path"
+        );
+        assert!(updates.contains("Update::ChatNotificationSettings"));
+        assert!(updates.contains("Update::ScopeNotificationSettings"));
         let chat = fn_body(src, "fn note_chat");
         assert!(chat.contains("i64::from(message.date)"));
         assert!(chat.contains("ChatType::BasicGroup(_) => true"));

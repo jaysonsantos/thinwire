@@ -50,6 +50,34 @@ pub(super) enum ChatEffect {
     Remove(String),
 }
 
+/// TDLib notification scope of a chat. A chat that uses the default mute
+/// setting follows its scope (#32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(super) enum MuteScope {
+    #[default]
+    Private,
+    Group,
+    Channel,
+}
+
+/// The mute setting of one chat, from TDLib `chatNotificationSettings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChatMute {
+    /// Follow the scope setting.
+    pub use_default: bool,
+    /// Seconds left of the mute. Zero is not muted.
+    pub mute_for: i32,
+}
+
+impl Default for ChatMute {
+    fn default() -> Self {
+        Self {
+            use_default: true,
+            mute_for: 0,
+        }
+    }
+}
+
 /// Fields TDLib gives for a new chat.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ChatSeed<'a> {
@@ -60,6 +88,8 @@ pub(super) struct ChatSeed<'a> {
     pub participant: &'a str,
     pub last_at: i64,
     pub is_group: bool,
+    pub scope: MuteScope,
+    pub mute: ChatMute,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,19 +101,58 @@ struct ChatRecord {
     participant: String,
     last_at: i64,
     is_group: bool,
+    scope: MuteScope,
+    mute: ChatMute,
 }
 
 /// Main-list chats keyed by TDLib chat id. `order == 0` is not listed.
 #[derive(Debug, Default)]
 pub(super) struct ChatDirectory {
     chats: HashMap<i64, ChatRecord>,
+    /// Scopes that TDLib reports as muted (`updateScopeNotificationSettings`).
+    muted_scopes: HashMap<MuteScope, bool>,
 }
 
 impl ChatDirectory {
     pub(super) fn new() -> Self {
-        Self {
-            chats: HashMap::new(),
+        Self::default()
+    }
+
+    fn muted(&self, chat: &ChatRecord) -> bool {
+        if chat.mute.use_default {
+            self.muted_scopes.get(&chat.scope).copied().unwrap_or(false)
+        } else {
+            chat.mute.mute_for > 0
         }
+    }
+
+    fn row(&self, chat_id: i64, chat: &ChatRecord) -> Conversation {
+        conversation_from(chat_id, chat, self.muted(chat))
+    }
+
+    /// New mute setting of one chat (`updateChatNotificationSettings`).
+    pub(super) fn set_mute(&mut self, chat_id: i64, mute: ChatMute) -> Option<ChatEffect> {
+        let previous = self.ensure(chat_id).order;
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.mute = mute;
+        }
+        self.effect(chat_id, Some(previous))
+    }
+
+    /// New mute setting of a scope. Every listed chat of that scope that
+    /// follows the default gets a new row.
+    pub(super) fn set_scope_mute(&mut self, scope: MuteScope, muted: bool) -> Vec<ChatEffect> {
+        if self.muted_scopes.insert(scope, muted) == Some(muted) {
+            return Vec::new();
+        }
+        let mut rows: Vec<Conversation> = self
+            .chats
+            .iter()
+            .filter(|(_, chat)| chat.order > 0 && chat.scope == scope && chat.mute.use_default)
+            .map(|(chat_id, chat)| self.row(*chat_id, chat))
+            .collect();
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows.into_iter().map(ChatEffect::Upsert).collect()
     }
 
     pub(super) fn title(&self, chat_id: i64) -> Option<&str> {
@@ -97,7 +166,7 @@ impl ChatDirectory {
             .chats
             .iter()
             .filter(|(_, chat)| chat.order > 0)
-            .map(|(chat_id, chat)| conversation_from(*chat_id, chat))
+            .map(|(chat_id, chat)| self.row(*chat_id, chat))
             .collect();
         rows.sort_by_key(|row| (std::cmp::Reverse(row.order), row.id.clone()));
         rows
@@ -116,6 +185,8 @@ impl ChatDirectory {
                 participant: fallback_title(seed.participant),
                 last_at: seed.last_at,
                 is_group: seed.is_group,
+                scope: seed.scope,
+                mute: seed.mute,
             },
         );
         self.effect(chat_id, previous)
@@ -185,6 +256,8 @@ impl ChatDirectory {
             participant: "Chat".into(),
             last_at: 0,
             is_group: false,
+            scope: MuteScope::default(),
+            mute: ChatMute::default(),
         })
     }
 
@@ -192,7 +265,7 @@ impl ChatDirectory {
         let chat = self.chats.get(&chat_id)?;
         let was_listed = previous_order.is_some_and(|order| order > 0);
         if chat.order > 0 {
-            return Some(ChatEffect::Upsert(conversation_from(chat_id, chat)));
+            return Some(ChatEffect::Upsert(self.row(chat_id, chat)));
         }
         if was_listed {
             return Some(ChatEffect::Remove(conversation_id(chat_id)));
@@ -435,6 +508,7 @@ pub(super) fn to_chat_message(
         sender,
         body: message.body.clone(),
         sent_at: message.sent_at,
+        arrival: crate::Arrival::History,
         outbound: message.outgoing,
         delivery: if message.outgoing {
             message.delivery
@@ -444,7 +518,7 @@ pub(super) fn to_chat_message(
     }
 }
 
-fn conversation_from(chat_id: i64, chat: &ChatRecord) -> Conversation {
+fn conversation_from(chat_id: i64, chat: &ChatRecord, muted: bool) -> Conversation {
     Conversation {
         protocol: ProtocolId::Telegram,
         id: conversation_id(chat_id),
@@ -457,6 +531,7 @@ fn conversation_from(chat_id: i64, chat: &ChatRecord) -> Conversation {
         is_group: chat.is_group,
         writable: true,
         placeholder: false,
+        muted,
     }
 }
 
@@ -497,7 +572,61 @@ mod tests {
             participant: title,
             last_at: 0,
             is_group: false,
+            scope: MuteScope::Private,
+            mute: ChatMute::default(),
         }
+    }
+
+    fn muted_row(effect: Option<ChatEffect>) -> bool {
+        match effect {
+            Some(ChatEffect::Upsert(row)) => row.muted,
+            other => panic!("expected an upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_chat_is_muted_by_its_own_setting_or_by_its_scope() {
+        let mut directory = ChatDirectory::new();
+        assert!(!muted_row(directory.upsert(1, seed("Ada", 9, 0, ""))));
+        // Own setting wins over the scope.
+        let own = ChatMute {
+            use_default: false,
+            mute_for: 3600,
+        };
+        assert!(muted_row(directory.set_mute(1, own)));
+        // The private scope is muted: chat 2 follows it, chat 1 keeps its own.
+        directory.upsert(2, seed("Bob", 8, 0, ""));
+        directory.upsert(
+            3,
+            ChatSeed {
+                scope: MuteScope::Group,
+                ..seed("Team", 7, 0, "")
+            },
+        );
+        let changed = directory.set_scope_mute(MuteScope::Private, true);
+        let ids: Vec<String> = changed
+            .iter()
+            .map(|effect| match effect {
+                ChatEffect::Upsert(row) => {
+                    assert!(row.muted);
+                    row.id.clone()
+                }
+                ChatEffect::Remove(_) => panic!("no removal"),
+            })
+            .collect();
+        assert_eq!(ids, vec!["telegram:2"], "only chats that follow the scope");
+        assert!(
+            directory
+                .set_scope_mute(MuteScope::Private, true)
+                .is_empty()
+        );
+        assert!(!muted_row(directory.set_preview(3, "hi", 1)), "other scope");
+        // Unmute chat 1 with its own setting: 0 seconds left.
+        let unmuted = ChatMute {
+            use_default: false,
+            mute_for: 0,
+        };
+        assert!(!muted_row(directory.set_mute(1, unmuted)));
     }
 
     #[test]

@@ -54,6 +54,7 @@ impl InboxChannel {
                 .unwrap_or(0),
             is_group: true,
             writable: self.can_send,
+            muted: false,
             placeholder: false,
         }
     }
@@ -135,6 +136,7 @@ pub(crate) fn chat_message(
         outbound: message.author_id == bot_id,
         delivery: Delivery::Sent,
         sent_at: snowflake_unix_seconds(message.id),
+        arrival: crate::Arrival::History,
     }
 }
 
