@@ -177,7 +177,9 @@ impl WhatsAppAdapter {
         Ok(())
     }
 
-    fn begin_link(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+    /// `pairing` is the shell's id for this pairing. Every QR code and pair
+    /// code of it carries the same number (ADR 0010 rule 8).
+    fn begin_link(&mut self, pairing: u64, events: &EventTx) -> Result<(), AdapterError> {
         if !self.risk_acknowledged {
             return Err(AdapterError::Refused {
                 protocol: ProtocolId::WhatsApp,
@@ -198,7 +200,7 @@ impl WhatsAppAdapter {
                 reason: FEATURE_OFF,
             });
         };
-        link.begin(self.phone.phone());
+        link.begin(self.phone.phone(), pairing);
         emit_status(
             events,
             ProtocolId::WhatsApp,
@@ -495,7 +497,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
             }
             | AdapterCommand::WhatsAppCancelLink => self.cancel_link(events),
             AdapterCommand::WhatsAppAcknowledgeRisk => self.acknowledge(events),
-            AdapterCommand::WhatsAppBeginLink { generation: _ } => self.begin_link(events),
+            AdapterCommand::WhatsAppBeginLink { generation } => self.begin_link(generation, events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::WhatsApp,
                 reason: "command is not handled by the WhatsApp adapter",
@@ -705,6 +707,7 @@ mod tests {
     fn with_sender(sender: Arc<FakeSender>) -> WhatsAppAdapter {
         let adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
         adapter.session.begin(1);
+        adapter.session.set_pairing(1);
         assert!(adapter.session.attach_sender(1, sender));
         adapter
     }

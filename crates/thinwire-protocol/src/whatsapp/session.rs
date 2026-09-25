@@ -99,6 +99,8 @@ struct State {
     sender: Option<Arc<dyn WhatsAppSender>>,
     /// Link generation that may install a sender. Set by [`Session::begin`].
     generation: u64,
+    /// The shell's pairing id. QR codes and pair codes carry it.
+    pairing: u64,
     /// Status text of the event that stopped the link. Cleared on a new link.
     stopped: Option<&'static str>,
 }
@@ -219,6 +221,12 @@ impl Session {
         state.sender = None;
     }
 
+    /// The shell's id for the pairing that runs now (`WhatsAppBeginLink`).
+    #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+    pub(super) fn set_pairing(&self, pairing: u64) {
+        self.lock().pairing = pairing;
+    }
+
     pub(super) fn with_inbox<T>(&self, action: impl FnOnce(&mut Inbox) -> T) -> T {
         action(&mut self.lock().inbox)
     }
@@ -236,8 +244,14 @@ impl Session {
         }
         let stop = event.stop_detail();
         let out = match event {
-            LinkEvent::Qr(code) => vec![AdapterEvent::WhatsAppQr { code, generation }],
-            LinkEvent::PairCode(code) => vec![AdapterEvent::WhatsAppPairCode { code, generation }],
+            LinkEvent::Qr(code) => vec![AdapterEvent::WhatsAppQr {
+                code,
+                generation: state.pairing,
+            }],
+            LinkEvent::PairCode(code) => vec![AdapterEvent::WhatsAppPairCode {
+                code,
+                generation: state.pairing,
+            }],
             LinkEvent::PairFailed => {
                 status(events, AdapterStatus::Error, PAIR_FAILED);
                 Vec::new()

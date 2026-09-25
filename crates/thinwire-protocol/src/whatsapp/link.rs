@@ -83,6 +83,9 @@ pub(super) trait LinkBackend: Send + Sync + 'static {
 enum Msg {
     Begin {
         phone: Option<String>,
+        /// The shell's id for this pairing (`WhatsAppBeginLink`). Every QR
+        /// and pair code of it carries this number (ADR 0010 rule 8).
+        pairing: u64,
     },
     Client {
         generation: u64,
@@ -144,9 +147,9 @@ impl LinkHandle {
     }
 
     /// Start a new pairing. A running link stops first.
-    pub(super) fn begin(&self, phone: Option<String>) {
+    pub(super) fn begin(&self, phone: Option<String>, pairing: u64) {
         self.active.store(true, Ordering::SeqCst);
-        let _ = self.tx.send(Msg::Begin { phone });
+        let _ = self.tx.send(Msg::Begin { phone, pairing });
     }
 
     /// Stop the link. Later callbacks of the old generation are dropped.
@@ -200,7 +203,7 @@ impl<B: LinkBackend> Owner<B> {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Msg>) {
         while let Some(msg) = rx.recv().await {
             match msg {
-                Msg::Begin { phone } => self.begin(phone).await,
+                Msg::Begin { phone, pairing } => self.begin(phone, pairing).await,
                 Msg::Client { generation, event } => self.client(generation, event).await,
                 Msg::Cancel => self.stop().await,
                 Msg::Shutdown { done } => {
@@ -217,13 +220,14 @@ impl<B: LinkBackend> Owner<B> {
         self.stop().await;
     }
 
-    async fn begin(&mut self, phone: Option<String>) {
+    async fn begin(&mut self, phone: Option<String>, pairing: u64) {
         self.generation += 1;
         let generation = self.generation;
         if let Some(bot) = self.bot.take() {
             self.backend.stop(bot).await;
         }
         self.session.begin(generation);
+        self.session.set_pairing(pairing);
         // A first login: the shell drops inbox events until Linked.
         let _ = self.events.send(account(AccountState::Linking));
         if self.stale {
@@ -415,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn begin_starts_the_client() {
         let (fake, handle, _session, mut rx) = owner(Fake::default());
-        handle.begin(None);
+        handle.begin(None, 7);
         handle.flush().await;
         assert_eq!(fake.log(), vec!["start 1"]);
         let events = drain(&mut rx);
@@ -437,15 +441,54 @@ mod tests {
         assert!(handle.is_active());
     }
 
+    /// ADR 0010 rule 8: QR codes and pair codes carry the shell's pairing
+    /// id from `WhatsAppBeginLink`, not the owner's internal generation.
+    #[tokio::test]
+    async fn pairing_payloads_carry_the_shell_pairing_id() {
+        let (fake, handle, _session, mut rx) = owner(Fake::default());
+        handle.begin(None, 42);
+        handle.flush().await;
+        fake.callback(1).send(qr("first"));
+        fake.callback(1)
+            .send(LinkEvent::PairCode(RedactedPairingSecret::new("CODE")));
+        handle.flush().await;
+        let generations: Vec<u64> = drain(&mut rx)
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::WhatsAppQr { generation, .. }
+                | AdapterEvent::WhatsAppPairCode { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(generations, vec![42, 42]);
+
+        // A new pairing: its payloads carry the new id; the old ones drop.
+        handle.begin(None, 43);
+        handle.flush().await;
+        fake.callback(1).send(qr("old"));
+        fake.callback(2).send(qr("new"));
+        handle.flush().await;
+        let payloads: Vec<(u64, String)> = drain(&mut rx)
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::WhatsAppQr { generation, code } => {
+                    Some((*generation, code.reveal().to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(payloads, vec![(43, "new".to_string())]);
+    }
+
     /// r4093309818, r4093606395: a repair right after a logout runs after
     /// the delete, never on the revoked store.
     #[tokio::test]
     async fn logout_then_repair_deletes_before_the_new_start() {
         let (fake, handle, _session, _rx) = owner(Fake::default());
-        handle.begin(None);
+        handle.begin(None, 7);
         handle.flush().await;
         fake.callback(1).send(LinkEvent::LoggedOut);
-        handle.begin(None);
+        handle.begin(None, 7);
         handle.flush().await;
         assert_eq!(fake.log(), vec!["start 1", "stop 1", "delete", "start 3"]);
     }
@@ -455,9 +498,9 @@ mod tests {
     #[tokio::test]
     async fn late_callbacks_of_an_old_link_are_dropped() {
         let (fake, handle, session, mut rx) = owner(Fake::default());
-        handle.begin(None);
+        handle.begin(None, 7);
         handle.flush().await;
-        handle.begin(None);
+        handle.begin(None, 7);
         handle.flush().await;
         drain(&mut rx);
         let old = fake.callback(1);
@@ -485,7 +528,7 @@ mod tests {
             start_gate: Some(Arc::clone(&gate)),
             ..Fake::default()
         });
-        handle.begin(None);
+        handle.begin(None, 7);
         tokio::task::yield_now().await;
         handle.cancel();
         // The client of generation 1 reports late, after the cancel.
@@ -515,19 +558,19 @@ mod tests {
             delete_failures: AtomicUsize::new(2),
             ..Fake::default()
         });
-        handle.begin(None);
+        handle.begin(None, 7);
         handle.flush().await;
         fake.callback(1).send(LinkEvent::LoggedOut);
         handle.flush().await;
         drain(&mut rx);
-        handle.begin(None);
+        handle.begin(None, 7);
         handle.flush().await;
         assert!(drain(&mut rx).iter().any(|event| matches!(
             event,
             AdapterEvent::Status { status: AdapterStatus::Error, detail, .. } if detail == STORE_FAILED
         )));
         assert!(!handle.is_active());
-        handle.begin(None);
+        handle.begin(None, 7);
         handle.flush().await;
         assert_eq!(
             fake.log(),
@@ -553,7 +596,7 @@ mod tests {
                 start_error: Some(error),
                 ..Fake::default()
             });
-            handle.begin(None);
+            handle.begin(None, 7);
             handle.flush().await;
             let events = drain(&mut rx);
             assert!(events.iter().any(|event| matches!(
@@ -588,11 +631,11 @@ mod tests {
             LinkEvent::QrExhausted,
         ] {
             let (fake, handle, session, _rx) = owner(Fake::default());
-            handle.begin(None);
+            handle.begin(None, 7);
             handle.flush().await;
             fake.callback(1).send(event);
             handle.flush().await;
-            handle.begin(None);
+            handle.begin(None, 7);
             handle.flush().await;
             assert_eq!(fake.log(), vec!["start 1", "stop 1", "start 3"]);
             assert!(session.stopped().is_none(), "Begin clears the stop reason");
@@ -604,13 +647,13 @@ mod tests {
     #[tokio::test]
     async fn logout_cancel_repair_and_late_callbacks_interleave() {
         let (fake, handle, session, mut rx) = owner(Fake::default());
-        handle.begin(None); // generation 1
+        handle.begin(None, 7); // generation 1
         handle.flush().await;
         let first = fake.callback(1);
         first.send(LinkEvent::LoggedOut); // generation 2
         handle.cancel(); // generation 3
         first.send(LinkEvent::Connected);
-        handle.begin(None); // generation 4
+        handle.begin(None, 7); // generation 4
         first.send(qr("stale"));
         first.send(LinkEvent::LoggedOut);
         handle.flush().await;
@@ -628,7 +671,7 @@ mod tests {
         handle.flush().await;
         assert!(drain(&mut rx).iter().any(|event| matches!(
             event,
-            AdapterEvent::WhatsAppQr { generation: 4, code } if code.reveal() == "fresh"
+            AdapterEvent::WhatsAppQr { generation: 7, code } if code.reveal() == "fresh"
         )));
     }
 
@@ -640,7 +683,7 @@ mod tests {
             start_gate: Some(Arc::clone(&gate)),
             ..Fake::default()
         });
-        handle.begin(None);
+        handle.begin(None, 7);
         let shutdown = handle.shutdown();
         let mut shutdown = std::pin::pin!(shutdown);
         assert!(
@@ -662,7 +705,7 @@ mod tests {
             stop_hangs: true,
             ..Fake::default()
         });
-        handle.begin(None);
+        handle.begin(None, 7);
         handle.flush().await;
         let started = std::time::Instant::now();
         assert!(!handle.shutdown_within(Duration::from_millis(50)).await);
