@@ -215,6 +215,14 @@ impl Core {
                 }
             }
             Intent::Retry { message_id } => self.state.retry_send(&message_id),
+            Intent::LoadOlderMessages {
+                protocol,
+                conversation_id,
+            } => {
+                if self.state.is_selected_chat(protocol, &conversation_id) {
+                    self.state.load_older();
+                }
+            }
             Intent::RetryKeychain => self.state.retry_keychain(),
             Intent::SetTheme(theme) => self.settings.set_theme(theme),
             Intent::Shutdown => self.shutdown(),
