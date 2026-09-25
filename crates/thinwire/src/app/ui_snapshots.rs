@@ -5,7 +5,9 @@
 //! the process zone. Reference images live in `tests/snapshots/`. Update them
 //! with `scripts/update-snapshots.sh`.
 
+use egui::accesskit::Role;
 use egui_kittest::Harness;
+use egui_kittest::kittest::{By, Queryable};
 use thinwire_core::demo::Scenario;
 use thinwire_core::{Core, Intent, ThemeMode, ViewNow};
 use tokio::runtime::{Builder, Runtime};
@@ -140,6 +142,63 @@ shots! {
     login_code => LoginCode,
     login_2fa => Login2fa,
     login_error => LoginError,
+    empty_inbox => EmptyInbox,
+    long_chat_start_of_chat => LongChatStartOfChat,
+    pending_send => PendingSend,
+    keychain_try_again => KeychainTryAgain,
+    status_error => StatusError,
+    status_notice => StatusNotice,
+    several_protocols => SeveralProtocols,
+}
+
+#[test]
+fn inbox_row_text_stays_inside_the_click_rect() {
+    let (runtime, built) = scene(Scenario::LongChat, ThemeMode::Light);
+    let mut harness = Harness::builder()
+        .with_size([1100.0, 720.0])
+        .wgpu()
+        .build_ui_state(draw, built);
+    harness.run();
+    let view = harness.state().core.view();
+    let ViewNow::Fixed(now) = view.now() else {
+        panic!("demo clock");
+    };
+    let rows: Vec<(String, String, String, u32)> = view
+        .visible_conversations()
+        .iter()
+        .map(|row| {
+            (
+                row.title.clone(),
+                row.preview.clone(),
+                super::thread_layout::list_time(row.last_at, &now),
+                row.unread,
+            )
+        })
+        .collect();
+    for (title, preview, time, unread) in rows {
+        let click = harness.get_by_role_and_label(Role::Button, &title).rect();
+        assert_text_inside(&harness, click, &title);
+        assert_text_inside(&harness, click, &preview);
+        assert_text_inside(&harness, click, &time);
+        if unread > 0 {
+            assert_text_inside(&harness, click, &format!("unread {unread}"));
+        }
+    }
+    drop(harness);
+    drop(runtime);
+}
+
+fn assert_text_inside(harness: &Harness<'_, Scene>, click: egui::Rect, text: &str) {
+    let node = harness
+        .query_all(By::new().role(Role::Label).label(text).include_labels())
+        .find(|node| click.intersects(node.rect()))
+        .unwrap_or_else(|| panic!("missing inbox text {text}"));
+    assert!(
+        click.contains_rect(node.rect()),
+        "{text} {:?} is outside the row {:?}",
+        node.rect(),
+        click
+    );
 }
 
 #[test]

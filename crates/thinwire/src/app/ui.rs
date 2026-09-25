@@ -729,6 +729,21 @@ fn row_ends(
     });
 }
 
+/// Title line, preview line, and the padding around them.
+///
+/// Each line sits in a horizontal row, and that row is at least
+/// [`theme::MIN_TARGET`] tall (`interact_size`). The preview line is also
+/// at least as tall as the unread badge, which adds [`space::XS`] around
+/// the caption.
+fn inbox_row_height(ui: &egui::Ui) -> f32 {
+    let line = ui.spacing().interact_size.y;
+    let title = line.max(ui.text_style_height(&theme::row_title()));
+    let caption = ui.text_style_height(&egui::TextStyle::Small);
+    let preview = line.max(ui.text_style_height(&theme::secondary()));
+    let badge = caption + space::XS;
+    space::S + title + space::XS + preview.max(badge) + space::S
+}
+
 /// One inbox row. The whole rect is the click target, including the preview.
 fn inbox_row(
     ui: &mut egui::Ui,
@@ -741,7 +756,10 @@ fn inbox_row(
 ) -> egui::Response {
     let palette = theme::palette(ui);
     let width = laid_out_width(ui, "inbox-row-width");
-    let (rect, hover) = ui.allocate_exact_size(egui::vec2(width, 60.0), egui::Sense::hover());
+    let (rect, hover) = ui.allocate_exact_size(
+        egui::vec2(width, inbox_row_height(ui)),
+        egui::Sense::hover(),
+    );
     let fill = if selected {
         palette.selected_row
     } else if hover.hovered() {
