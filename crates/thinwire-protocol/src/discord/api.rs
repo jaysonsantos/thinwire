@@ -54,14 +54,20 @@ pub(crate) struct ChannelSummary {
     pub overwrites: Vec<Overwrite>,
 }
 
-/// A guild channel message.
+/// A guild channel message. Content is the REST field as Discord returned it.
+/// The Message Content intent fills `content` for other users' messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MessageSummary {
     pub id: u64,
     pub author_id: u64,
     pub author: String,
     pub content: String,
-    pub attachments: usize,
+    /// Image attachments. A message that is only these is labeled `[image]`.
+    pub images: usize,
+    /// Attachments that are not images.
+    pub files: usize,
+    pub embeds: usize,
+    pub stickers: usize,
 }
 
 /// Discord HTTP failure. Never carries a token or a response body.

@@ -39,6 +39,9 @@ pub(crate) struct FakeState {
     /// Fired when `channels` is about to wait on `hold_channels`.
     pub channels_at_barrier: Option<Arc<Notify>>,
     pub next_id: u64,
+    /// When set, a successful send echoes an empty `content` (Message Content
+    /// intent missing on the response). The posted body is still recorded.
+    pub echo_empty_content: bool,
 }
 
 /// Fake bot HTTP backend. `hold_history` pauses history until notified.
@@ -65,7 +68,10 @@ fn message(id: u64, author_id: u64, author: &str, content: &str) -> MessageSumma
         author_id,
         author: author.into(),
         content: content.into(),
-        attachments: 0,
+        images: 0,
+        files: 0,
+        embeds: 0,
+        stickers: 0,
     }
 }
 
@@ -244,7 +250,12 @@ impl DiscordApi for FakeDiscordApi {
             state.next_id += 1;
             let id = state.next_id;
             state.sent.push((channel_id, body.clone()));
-            Ok(message(id, BOT_ID, "thinwire-bot", &body))
+            let content = if state.echo_empty_content {
+                ""
+            } else {
+                body.as_str()
+            };
+            Ok(message(id, BOT_ID, "thinwire-bot", content))
         })
     }
 }

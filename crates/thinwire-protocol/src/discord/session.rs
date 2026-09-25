@@ -291,6 +291,16 @@ impl Session {
         request: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
+        if body.trim().is_empty() {
+            emit_send_rejected(
+                events,
+                ProtocolId::Discord,
+                conversation_id.as_str(),
+                request,
+            );
+            emit_notice(events, ProtocolId::Discord, "A message needs text.");
+            return Ok(());
+        }
         let Some((access, bot_id)) = self.noted_access(&conversation_id, events)? else {
             emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
             return Ok(());
@@ -337,6 +347,7 @@ impl Session {
         let guard = self.track_send();
         tokio::spawn(async move {
             let _guard = guard;
+            let posted = body.clone();
             let result = api.send(access.channel_id, body).await;
             if let Ok(mut state) = shared.lock() {
                 state
@@ -354,7 +365,10 @@ impl Session {
             }
             match result {
                 Ok(sent) => {
-                    let row = chat_message(&conversation_id, bot_id, &sent);
+                    let mut row = chat_message(&conversation_id, bot_id, &sent);
+                    if sent.content.is_empty() && !posted.trim().is_empty() {
+                        row.body = posted;
+                    }
                     if let Ok(mut state) = shared.lock() {
                         state.bodies.remove(&pending_id);
                         state
@@ -407,7 +421,7 @@ impl Session {
             .lock()
             .ok()
             .and_then(|state| state.bodies.get(&message_id).cloned());
-        let Some(body) = body else {
+        let Some(body) = body.filter(|text| !text.trim().is_empty()) else {
             emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
             return Ok(());
         };
@@ -418,6 +432,7 @@ impl Session {
         let guard = self.track_send();
         tokio::spawn(async move {
             let _guard = guard;
+            let posted = body.clone();
             let result = api.send(access.channel_id, body).await;
             if !gate.current() {
                 emit_message_delivery(
@@ -432,7 +447,10 @@ impl Session {
             }
             match result {
                 Ok(sent) => {
-                    let row = chat_message(&conversation_id, bot_id, &sent);
+                    let mut row = chat_message(&conversation_id, bot_id, &sent);
+                    if sent.content.is_empty() && !posted.trim().is_empty() {
+                        row.body = posted;
+                    }
                     if let Ok(mut state) = shared.lock() {
                         state.bodies.remove(&message_id);
                         state

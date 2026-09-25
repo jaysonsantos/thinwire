@@ -116,12 +116,28 @@ fn channel_summary(channel: Channel) -> ChannelSummary {
 
 fn message_summary(message: Message) -> MessageSummary {
     let author = message.author.global_name.unwrap_or(message.author.name);
+    let mut images = 0;
+    let mut files = 0;
+    for attachment in &message.attachments {
+        if attachment
+            .content_type
+            .as_deref()
+            .is_some_and(|kind| kind.starts_with("image/"))
+        {
+            images += 1;
+        } else {
+            files += 1;
+        }
+    }
     MessageSummary {
         id: message.id.get(),
         author_id: message.author.id.get(),
         author,
         content: message.content,
-        attachments: message.attachments.len(),
+        images,
+        files,
+        embeds: message.embeds.len(),
+        stickers: message.sticker_items.len(),
     }
 }
 

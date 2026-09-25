@@ -112,6 +112,34 @@ pub(crate) async fn load_channels(
     Ok((bot_id, list))
 }
 
+/// Visible text. Discord's REST `content` is kept as returned (the Message
+/// Content intent fills it for other people). A message with no content is
+/// labeled from what it does carry.
+#[must_use]
+pub(crate) fn message_body(message: &MessageSummary) -> String {
+    if !message.content.is_empty() {
+        return message.content.clone();
+    }
+    let mut labels = Vec::new();
+    if message.images > 0 {
+        labels.push("[image]");
+    }
+    if message.files > 0 {
+        labels.push("[attachment]");
+    }
+    if message.embeds > 0 {
+        labels.push("[embed]");
+    }
+    if message.stickers > 0 {
+        labels.push("[sticker]");
+    }
+    if labels.is_empty() {
+        "[no text]".into()
+    } else {
+        labels.join(" ")
+    }
+}
+
 /// Message row for the right pane. `outbound` marks the bot's own messages.
 #[must_use]
 pub(crate) fn chat_message(
@@ -119,19 +147,12 @@ pub(crate) fn chat_message(
     bot_id: u64,
     message: &MessageSummary,
 ) -> ChatMessage {
-    let body = if !message.content.is_empty() {
-        message.content.clone()
-    } else if message.attachments > 0 {
-        "[attachment]".into()
-    } else {
-        "[no text]".into()
-    };
     ChatMessage {
         protocol: ProtocolId::Discord,
         conversation_id: conversation_id.into(),
         id: format!("{CONVERSATION_PREFIX}{}", message.id),
         sender: message.author.clone(),
-        body,
+        body: message_body(message),
         outbound: message.author_id == bot_id,
         delivery: Delivery::Sent,
         sent_at: snowflake_unix_seconds(message.id),
@@ -166,9 +187,42 @@ mod tests {
                 author_id: 3,
                 author: "ada".into(),
                 content: "hi".into(),
-                attachments: 0,
+                images: 0,
+                files: 0,
+                embeds: 0,
+                stickers: 0,
             },
         );
         assert_eq!(row.sent_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn a_message_keeps_text_and_labels_media() {
+        use super::message_body;
+
+        let mut row = MessageSummary {
+            id: 1,
+            author_id: 2,
+            author: "ada".into(),
+            content: "hello".into(),
+            images: 1,
+            files: 0,
+            embeds: 0,
+            stickers: 0,
+        };
+        assert_eq!(message_body(&row), "hello");
+        row.content.clear();
+        assert_eq!(message_body(&row), "[image]");
+        row.images = 0;
+        row.files = 1;
+        assert_eq!(message_body(&row), "[attachment]");
+        row.files = 0;
+        row.embeds = 1;
+        assert_eq!(message_body(&row), "[embed]");
+        row.embeds = 0;
+        row.stickers = 1;
+        assert_eq!(message_body(&row), "[sticker]");
+        row.stickers = 0;
+        assert_eq!(message_body(&row), "[no text]");
     }
 }
