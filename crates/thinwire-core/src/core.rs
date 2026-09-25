@@ -171,6 +171,9 @@ impl Core {
     ///
     /// Frontend thread only. See [`Core`] "Threads".
     pub fn pump(&mut self) -> bool {
+        // Expire first, then apply the queued events. A late answer then meets
+        // an expired send, whatever the frontend's timing (PR #81 review).
+        let expired = self.state.expire_sends();
         let mut applied = false;
         while let Ok(event) = self.events.try_recv() {
             // The login epoch check runs here, on the thread that sends
@@ -186,7 +189,6 @@ impl Core {
             self.state.status_text = text;
         }
         self.state.poll_resume(&self.secrets);
-        let expired = self.state.expire_sends();
         self.state.sync_viewed();
         self.flush();
         applied || expired
@@ -1128,5 +1130,97 @@ mod tests {
         assert!(core.view().can_send(), "the chat is unlocked");
         assert_eq!(core.view().compose, "hello", "the text stays");
         assert!(core.send_wake.is_none(), "no send left, no wake");
+    }
+
+    /// Sends "hello" through a core with no adapter answers. Returns the
+    /// core, the adapter event sender, and the request id.
+    fn core_with_unanswered_send() -> (Core, tokio::sync::mpsc::UnboundedSender<AdapterEvent>, u64)
+    {
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        core.dispatch(Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            text: "hello".into(),
+        });
+        core.dispatch(Intent::SendDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+        });
+        let mut request = None;
+        while let Ok(command) = sent.try_recv() {
+            if let AdapterCommand::SendText { request: id, .. } = command {
+                request = Some(id);
+            }
+        }
+        (core, events_tx, request.expect("a SendText"))
+    }
+
+    fn answer(accepted: bool, request: u64) -> AdapterEvent {
+        let protocol = ProtocolId::Telegram;
+        let conversation_id = "telegram:1".to_owned();
+        if accepted {
+            AdapterEvent::SendAccepted {
+                protocol,
+                conversation_id,
+                request,
+            }
+        } else {
+            AdapterEvent::SendRejected {
+                protocol,
+                conversation_id,
+                request,
+            }
+        }
+    }
+
+    /// PR #81 review: an accept queued before the deadline and pumped after
+    /// it. `pump` expires first, then applies the accept as a late accept:
+    /// the sent text still leaves the compose field.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accept_queued_before_the_expiry_still_clears_the_text() {
+        let (mut core, events_tx, request) = core_with_unanswered_send();
+        events_tx.send(answer(true, request)).expect("queue");
+        core.state.age_sends_for_test(crate::sends::SEND_TIMEOUT);
+        assert!(core.pump());
+        assert_eq!(core.view().compose, "", "the sent text is cleared");
+        assert!(core.view().error.is_none(), "no timeout error stays");
+    }
+
+    /// PR #81 review: a reject queued before the deadline and pumped after
+    /// it changes nothing more than the expiry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reject_queued_before_the_expiry_keeps_the_text() {
+        let (mut core, events_tx, request) = core_with_unanswered_send();
+        events_tx.send(answer(false, request)).expect("queue");
+        core.state.age_sends_for_test(crate::sends::SEND_TIMEOUT);
+        assert!(core.pump());
+        assert_eq!(core.view().compose, "hello", "the text stays");
+        assert_eq!(
+            core.view().error.as_ref().map(|error| error.why.as_str()),
+            Some("Telegram did not answer in time.")
+        );
+        assert!(core.view().can_send());
+    }
+
+    /// An accept before the deadline settles the send the normal way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accept_before_the_deadline_clears_the_text() {
+        let (mut core, events_tx, request) = core_with_unanswered_send();
+        events_tx.send(answer(true, request)).expect("queue");
+        assert!(core.pump());
+        assert_eq!(core.view().compose, "");
+        assert!(core.view().error.is_none());
+        core.state.age_sends_for_test(crate::sends::SEND_TIMEOUT);
+        assert!(!core.state.expire_sends(), "nothing left to expire");
     }
 }

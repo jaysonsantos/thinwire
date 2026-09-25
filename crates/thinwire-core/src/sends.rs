@@ -47,6 +47,10 @@ pub(crate) struct SendTracker {
     /// The next request id. Unique for the whole app, never per protocol.
     next: u64,
     open: HashMap<(ProtocolId, String), Open>,
+    /// Entries that expired with no answer, by (protocol, chat, request). A
+    /// late answer finds them here (PR #81 review): a late accept still means
+    /// the message went out.
+    expired: HashMap<(ProtocolId, String, u64), Pending>,
 }
 
 impl Default for SendTracker {
@@ -54,6 +58,7 @@ impl Default for SendTracker {
         Self {
             next: 1,
             open: HashMap::new(),
+            expired: HashMap::new(),
         }
     }
 }
@@ -162,7 +167,7 @@ impl SendTracker {
     }
 
     /// Remove and return every entry with no answer after `SEND_TIMEOUT`
-    /// (#69). A late answer for one of them then changes nothing.
+    /// (#69). `settle_expired` then finds a late answer for one of them.
     pub(crate) fn expire(&mut self, now: Instant) -> Vec<(ProtocolId, String, Pending)> {
         let late: Vec<(ProtocolId, String)> = self
             .open
@@ -170,18 +175,38 @@ impl SendTracker {
             .filter(|(_, open)| now.saturating_duration_since(open.since) >= SEND_TIMEOUT)
             .map(|(key, _)| key.clone())
             .collect();
-        late.into_iter()
+        let expired: Vec<(ProtocolId, String, Pending)> = late
+            .into_iter()
             .filter_map(|key| {
                 self.open
                     .remove(&key)
                     .map(|open| (key.0, key.1, open.pending))
             })
-            .collect()
+            .collect();
+        for (protocol, chat, pending) in &expired {
+            self.expired.insert(
+                (*protocol, chat.clone(), pending.request()),
+                pending.clone(),
+            );
+        }
+        expired
+    }
+
+    /// A late answer for an entry that already expired. Returns and forgets
+    /// it; `None` when no expired entry has this request id.
+    pub(crate) fn settle_expired(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        request: u64,
+    ) -> Option<Pending> {
+        self.expired.remove(&(protocol, chat.to_owned(), request))
     }
 
     /// The protocol's session ended: its sends and retries are gone.
     pub(crate) fn drop_protocol(&mut self, protocol: ProtocolId) {
         self.open.retain(|(owner, _), _| *owner != protocol);
+        self.expired.retain(|(owner, _, _), _| *owner != protocol);
     }
 }
 
@@ -270,8 +295,8 @@ mod tests {
         assert!(sends.in_flight(ProtocolId::Telegram, "telegram:1"));
     }
 
-    /// #69: an entry with no answer expires after `SEND_TIMEOUT`; a late
-    /// answer then changes nothing.
+    /// #69: an entry with no answer expires after `SEND_TIMEOUT`. Only
+    /// `settle_expired` finds it after that, and only once.
     #[test]
     fn an_unanswered_send_expires() {
         let start = Instant::now();
@@ -291,6 +316,23 @@ mod tests {
         assert_eq!(
             sends.settle(ProtocolId::Telegram, "telegram:1", request),
             None
+        );
+        assert_eq!(
+            sends.settle_expired(ProtocolId::Telegram, "telegram:1", request + 1),
+            None,
+            "another request"
+        );
+        assert_eq!(
+            sends.settle_expired(ProtocolId::Telegram, "telegram:1", request),
+            Some(Pending::Send {
+                request,
+                body: "hi".into()
+            })
+        );
+        assert_eq!(
+            sends.settle_expired(ProtocolId::Telegram, "telegram:1", request),
+            None,
+            "only once"
         );
     }
 }
