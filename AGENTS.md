@@ -3,7 +3,7 @@
 ## Product lock (S2)
 
 - v1 protocols: Telegram, WhatsApp (experimental), Discord (bot/OAuth inbox only), Slack OAuth
-- Signal is out of v1 release builds. Planned feature `signal-local` (#39, ADR `0011-agpl-protocols-local-only`) will link Presage and libsignal
+- Signal is out of v1 release builds. Feature `signal-local` (#39, ADR `0011-agpl-protocols-local-only`) is available and local-only. It links Presage and libsignal
 - WhatsApp feature `whatsapp-web` is local-only. It can link AGPL `wacore-libsignal`. Release builds and OS zips never enable `whatsapp-web` or `signal-local` (`0011`)
 - Public CI can download AGPL source. Cargo fetches every git dependency in `Cargo.lock`, including optional ones. Public CI does not build that code. Public CI does not link that code. Releases do not contain it (`0011`, 2026-09-25)
 - Code that links an AGPL library moves into an AGPL-licensed crate folder in this repo (#77). The root license stays MIT
@@ -23,7 +23,7 @@
 - WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk. Experimental spike is feature `whatsapp-web` (`whatsapp-rust`, git rev pinned). The feature is local-only because it links AGPL `wacore-libsignal` (`0011`). Release builds and OS zips never enable it. Not the default UI. Default CI stays feature-off. Full-screen ToS/ban gate before any QR or pair UI. Session file stays in app-data. Never call it reliable.
 - Discord: bot/OAuth guild inbox only — no self-bots / personal DMs / user tokens. Feature `discord-bot` (twilight HTTP) lists guild channels the bot can read, loads history, and sends as the bot. It runs in parallel with Telegram and does not wait for Telegram messages (lock change 2026-09-23; the code gate that waited is removed, `adfbb8c`, PR #40). Tests use a fake `DiscordApi`. ADR `0009-discord-bot-inbox-spike`. Default CI stays feature-off.
 - Slack: official OAuth only — workspace app, not a personal desktop clone
-- Signal: out of v1 release builds (S2, amended by `0011`). Planned feature `signal-local` (#39) will link Presage and libsignal. Release builds and OS zips never enable it. Default CI stays feature-off.
+- Signal: out of v1 release builds (S2, amended by `0011`). Feature `signal-local` (#39) is available and local-only. The client is `crates/thinwire-signal` (AGPL-3.0-only). It links Presage and libsignal. `thinwire-protocol` does not depend on it. Release builds and OS zips never enable it. Default CI stays feature-off.
 - Secrets: `keyring` OS store for Telegram `api_id` / `api_hash` / session and the Discord bot token (`discord.bot_token`). Phone / code / 2FA stay in the memory vault only. UI thread is memory-only; OS I/O is `spawn_blocking`. `THINWIRE_KEYRING=memory` for CI/headless. Never log secrets. Never put secrets on `AdapterCommand`. Never commit a Discord token.
 - Telegram live client is feature `telegram-tdlib` (`tdlib-rs`). Default CI stays feature-off. Unauthorized banner drops only on TDLib Ready. ADR `0006-live-tdlib`.
 - Official `api_id` / `api_hash`: compile-time `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` inject, never in git or public fork-PR CI. Official main OS zips (`.github/workflows/os-zips.yml`) read those names from GitHub repository secrets; local builds export them before cargo; public `ci.yml` never sets them. Values live in GitHub secrets and in arcoiro under the thinwire path (SOPS + Terraform, not watchkeep), not in this tree. Optional Advanced keychain override wins and is not the primary login path. Dev without inject shows credentials missing (not my.telegram.org). ADR `0007-publisher-telegram-api-credentials`. End-user official UX is phone → code → optional 2FA.
@@ -35,10 +35,11 @@
 | --- | --- |
 | `crates/thinwire/` | Desktop binary: egui frontend. Draws the core view and sends intents |
 | `crates/thinwire-core/` | Frontend-independent core: state, `Intent`, view, change signal, secret store, settings, host wiring. No egui / eframe / winit (ADR `0010`) |
-| `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings, and the Telegram / Slack / WhatsApp / Discord adapters (`telegram/`, `slack/`, `whatsapp/`, `discord/`) |
+| `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings, and the Telegram / Slack / WhatsApp / Discord adapters. Signal here is a MIT stub |
+| `crates/thinwire-signal/` | AGPL-3.0-only Signal adapter. `thinwire` depends on it only with feature `signal-local`. `thinwire-protocol` does not depend on it |
 | `decisions/` | ADRs (0001 option B, 0002 glow, 0003 main-only artifacts, 0004 Signal out, 0005 system theme, `0006-live-tdlib`, `0007-publisher-telegram-api-credentials`, `0008-slack-oauth-workspace-spike`, `0009-discord-bot-inbox-spike`, `0010-frontend-independent-core`, `0011-agpl-protocols-local-only`, `0012-agpl-helper-process`) |
 | `ROADMAP.md` | Ordered product-council todo list (ADRs stay in `decisions/`) |
-| `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh`, `check-core-deps.sh` — CI calls the same scripts |
+| `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh`, `check-core-deps.sh`, `check-release-tree.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |
 | `.github/workflows/ci.yml` | Parallel lint/test/build plus the `check` guard |

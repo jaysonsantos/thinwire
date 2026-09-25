@@ -6,6 +6,7 @@ mod fake;
 mod host;
 mod risk;
 mod secrets;
+mod signal;
 mod slack;
 mod telegram;
 mod whatsapp;
@@ -14,7 +15,9 @@ pub use adapter::{
     AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage,
     Conversation, Delivery, DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities,
     ProtocolId, RedactedPairingSecret, SupportClass, TelegramAuthError, TelegramAuthPhase,
-    TelegramAuthStep, TelegramCodeVia,
+    TelegramAuthStep, TelegramCodeVia, emit_account, emit_chat_list_loaded, emit_conversation,
+    emit_history_loaded, emit_message, emit_send_accepted, emit_send_rejected, emit_status,
+    emit_stopped,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -32,6 +35,7 @@ pub use secrets::{
     TELEGRAM_SECRET_PHONE, TELEGRAM_SECRET_SERVICE, TELEGRAM_SECRET_SESSION, TelegramSecretKey,
     TelegramSecretVault,
 };
+pub use signal::SignalAdapter;
 pub use slack::{
     MemorySlackVault, SLACK_CONVERSATION_PREFIX, SLACK_OAUTH_CALLBACK_PATH,
     SLACK_OAUTH_LOOPBACK_PORT, SLACK_SECRET_SERVICE, SlackAdapter, SlackApiError, SlackApiOrigin,
@@ -50,13 +54,14 @@ pub use telegram::{
 };
 pub use whatsapp::{WhatsAppAdapter, WhatsAppPhoneVault};
 
-/// v1 protocols in shell display order (S2: four protocols, no Signal).
-pub fn catalog() -> [ProtocolCapabilities; 4] {
+/// Shell protocols in display order. Signal is local-only and hidden unless `signal-local` is on.
+pub fn catalog() -> [ProtocolCapabilities; 5] {
     [
         telegram::TelegramAdapter::capabilities(),
         whatsapp::WhatsAppAdapter::capabilities(),
         discord::DiscordAdapter::capabilities(),
         slack::SlackAdapter::capabilities(),
+        signal::SignalAdapter::capabilities(),
     ]
 }
 
@@ -66,8 +71,9 @@ pub(crate) fn registry(
     slack: std::sync::Arc<dyn SlackSecretVault>,
     whatsapp_phone: std::sync::Arc<WhatsAppPhoneVault>,
     login_epoch: adapter::LoginEpoch,
+    signal: Option<Box<dyn ProtocolAdapter>>,
 ) -> Vec<Box<dyn ProtocolAdapter>> {
-    vec![
+    let mut adapters: Vec<Box<dyn ProtocolAdapter>> = vec![
         Box::new(TelegramAdapter::with_login_epoch(
             secrets,
             crate::telegram::TelegramApiSource::from_build(),
@@ -76,7 +82,16 @@ pub(crate) fn registry(
         Box::new(WhatsAppAdapter::new(whatsapp_phone)),
         Box::new(DiscordAdapter::new(discord)),
         slack::registry_adapter(slack),
-    ]
+        Box::new(signal::SignalAdapter::new()),
+    ];
+    if let Some(signal) = signal
+        && let Some(slot) = adapters
+            .iter_mut()
+            .find(|adapter| adapter.id() == ProtocolId::Signal)
+    {
+        *slot = signal;
+    }
+    adapters
 }
 
 #[cfg(test)]
@@ -84,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_lists_v1_four_protocols_with_honest_support() {
+    fn catalog_lists_protocols_with_honest_support() {
         let caps = catalog();
         let ids: Vec<ProtocolId> = caps.iter().map(|c| c.id).collect();
         assert_eq!(
@@ -94,10 +109,11 @@ mod tests {
                 ProtocolId::WhatsApp,
                 ProtocolId::Discord,
                 ProtocolId::Slack,
+                ProtocolId::Signal,
             ]
         );
         assert_eq!(ProtocolId::ALL.as_slice(), ids.as_slice());
-        assert_eq!(caps.len(), 4);
+        assert_eq!(caps.len(), 5);
 
         let by_id = |id| caps.iter().find(|c| c.id == id).expect("protocol");
         assert_eq!(by_id(ProtocolId::Telegram).support, SupportClass::Supported);
@@ -114,9 +130,14 @@ mod tests {
             SupportClass::Constrained
         );
         assert!(!by_id(ProtocolId::Discord).allows_user_account_automation);
+        assert_eq!(
+            by_id(ProtocolId::Signal).support,
+            SupportClass::Experimental
+        );
+        assert!(!by_id(ProtocolId::Signal).official_api);
         assert!(
-            !ids.iter()
-                .any(|id| id.display_name().eq_ignore_ascii_case("signal"))
+            by_id(ProtocolId::Signal).detail.contains("signal-local")
+                || by_id(ProtocolId::Signal).detail.contains("presage")
         );
     }
 
@@ -126,7 +147,10 @@ mod tests {
             let short = caps.short_label;
             let detail = caps.detail;
             let blob = format!("{short} {detail}").to_ascii_lowercase();
-            if matches!(caps.id, ProtocolId::WhatsApp | ProtocolId::Discord) {
+            if matches!(
+                caps.id,
+                ProtocolId::WhatsApp | ProtocolId::Discord | ProtocolId::Signal
+            ) {
                 let name = caps.id.display_name();
                 assert!(!contains_word(&blob, "reliable"), "{name}");
                 assert!(!contains_word(&blob, "production"), "{name}");
@@ -136,64 +160,42 @@ mod tests {
     }
 
     #[test]
-    fn v1_does_not_depend_on_agpl_signal_client_or_presage() {
-        // Signal the messenger stays out of v1. Reject Presage and the AGPL
-        // Signal client crates. `wacore-libsignal` is AGPL source inside the
-        // optional whatsapp-rust linked-device stack, not a Signal account
-        // (ADR 0011). This test does not forbid that crate. `whatsapp-web`
-        // stays a local-only feature.
-        for manifest in [
-            include_str!("../Cargo.toml"),
-            include_str!("../../thinwire/Cargo.toml"),
-            include_str!("../../thinwire-core/Cargo.toml"),
-            include_str!("../../../Cargo.toml"),
-        ] {
-            let lower = manifest.to_ascii_lowercase();
+    fn agpl_clients_stay_behind_optional_features() {
+        let protocol = include_str!("../Cargo.toml");
+        let app = include_str!("../../thinwire/Cargo.toml");
+        let core = include_str!("../../thinwire-core/Cargo.toml");
+        let workspace = include_str!("../../../Cargo.toml");
+        for manifest in [protocol, app, core, workspace] {
             assert!(
-                !lower.contains("presage"),
-                "manifests must not name presage"
+                !manifest_default_enables(manifest, "signal-local"),
+                "signal-local must stay off the default feature set"
             );
             assert!(
-                !lower.contains("libsignal"),
-                "manifests must not name the Signal client crate"
+                !manifest_default_enables(manifest, "whatsapp-web"),
+                "whatsapp-web must stay off the default feature set"
             );
         }
-        let names = package_names_from_lock(include_str!("../../../Cargo.lock"));
-        for name in &names {
-            assert!(
-                !is_forbidden_signal_stack(name),
-                "v1 must not depend on {name}"
-            );
-        }
-        if names.contains(&"wacore-libsignal") {
-            assert!(
-                names.contains(&"whatsapp-rust"),
-                "bundled linked-device crypto is only allowed via whatsapp-rust"
-            );
-        }
-        assert!(is_forbidden_signal_stack("libsignal"));
-        assert!(is_forbidden_signal_stack("libsignal-protocol"));
-        assert!(is_forbidden_signal_stack("presage"));
-        assert!(is_forbidden_signal_stack("presage-store-sled"));
-        assert!(!is_forbidden_signal_stack("wacore-libsignal"));
-        assert!(!is_forbidden_signal_stack("whatsapp-rust"));
+        assert!(
+            !protocol.contains("presage"),
+            "thinwire-protocol must not depend on the AGPL Signal crate"
+        );
+        assert!(app.contains("thinwire-signal"));
+        assert!(app.contains("signal-local"));
+        assert!(core.contains("signal-local"));
+        let signal = include_str!("../../thinwire-signal/Cargo.toml");
+        assert!(signal.contains("AGPL-3.0-only"));
+        assert!(signal.contains("presage"));
+        let release = include_str!("../../../.github/workflows/os-zips.yml");
+        assert!(release.contains("--features telegram-tdlib"));
+        assert!(!release.contains("signal-local"));
+        assert!(!release.contains("whatsapp-web"));
     }
 
-    fn package_names_from_lock(lock: &str) -> Vec<&str> {
-        lock.lines()
-            .filter_map(|line| {
-                let rest = line.strip_prefix("name = \"")?;
-                rest.strip_suffix('"')
-            })
-            .collect()
-    }
-
-    fn is_forbidden_signal_stack(name: &str) -> bool {
-        let lower = name.to_ascii_lowercase();
-        lower == "presage"
-            || lower.starts_with("presage-")
-            || lower == "libsignal"
-            || lower.starts_with("libsignal-")
+    fn manifest_default_enables(manifest: &str, feature: &str) -> bool {
+        manifest.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("default") && trimmed.contains(feature) && !trimmed.contains('#')
+        })
     }
 
     fn contains_word(hay: &str, word: &str) -> bool {

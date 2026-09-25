@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 use thinwire_protocol::WhatsAppPhoneVault as PhoneVault;
 use thinwire_protocol::{
     AdapterCommand, AdapterEvent, AdapterHost, DiscordAdapter, DiscordSecretVault, HostSender,
-    ProtocolId, SlackAdapter, SlackSecretVault, TelegramSecretVault, WhatsAppPhoneVault, catalog,
+    ProtocolAdapter, ProtocolId, SlackAdapter, SlackSecretVault, TelegramSecretVault,
+    WhatsAppPhoneVault, catalog,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::intent::{
-    AuthField, DiscordIntent, Intent, SlackIntent, TelegramIntent, WhatsAppIntent,
+    AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
 };
 use crate::secrets::SecretStore;
 use crate::settings::Settings;
@@ -109,10 +110,44 @@ impl Core {
         } else {
             SecretStore::for_ui(runtime)
         };
-        Self::with_store(runtime, config, secrets)
+        Self::with_store(runtime, config, secrets, None)
     }
 
-    fn with_store(runtime: &Handle, config: CoreConfig, secrets: Arc<SecretStore>) -> Self {
+    /// Same as [`Self::new`], with the AGPL Signal adapter in place of the stub.
+    ///
+    /// Only a `signal-local` binary calls this. The core crate does not depend
+    /// on `thinwire-signal`.
+    #[must_use]
+    pub fn with_signal_adapter(
+        runtime: &Handle,
+        config: CoreConfig,
+        signal: Box<dyn ProtocolAdapter>,
+    ) -> Self {
+        let caps = signal.capabilities();
+        let secrets = if config.memory_secrets {
+            Arc::new(SecretStore::memory())
+        } else {
+            SecretStore::for_ui(runtime)
+        };
+        let mut core = Self::with_store(runtime, config, secrets, Some(signal));
+        if let Some(row) = core
+            .state
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+        {
+            row.detail = caps.detail.to_string();
+            row.caps = caps;
+        }
+        core
+    }
+
+    fn with_store(
+        runtime: &Handle,
+        config: CoreConfig,
+        secrets: Arc<SecretStore>,
+        signal: Option<Box<dyn ProtocolAdapter>>,
+    ) -> Self {
         let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
         let host = AdapterHost::spawn(
             runtime,
@@ -120,6 +155,7 @@ impl Core {
             Arc::clone(&secrets) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&secrets) as Arc<dyn SlackSecretVault>,
             Arc::clone(&whatsapp_phone),
+            signal,
         );
         // `for_ui` only schedules keychain attach. A start can run before
         // that blocking read finishes, so arm Discord and Slack again once
@@ -257,6 +293,7 @@ impl Core {
                     protocol: ProtocolId::Slack,
                 });
             }
+            Intent::Signal(intent) => self.signal_gate(intent),
         }
         self.state.sync_viewed();
         self.flush();
@@ -380,6 +417,24 @@ impl Core {
     #[cfg(not(feature = "whatsapp-web"))]
     fn whatsapp(&mut self, intent: WhatsAppIntent) {
         let _ = (intent, &self.whatsapp_phone);
+    }
+
+    /// Feature on: the notice gate lives in the state, not in the frontend.
+    #[cfg(feature = "signal-local")]
+    fn signal_gate(&mut self, intent: SignalIntent) {
+        match intent {
+            SignalIntent::OpenNotice => self.state.open_signal_notice(),
+            SignalIntent::CloseGate => self.state.close_signal_gate(),
+            SignalIntent::AcknowledgeNotice => self.state.acknowledge_signal_notice(),
+            SignalIntent::BeginLink => self.state.begin_signal_link(),
+            SignalIntent::CancelLink => self.state.cancel_signal_link(),
+        }
+    }
+
+    /// Feature off: the Signal screens do not exist, so nothing happens.
+    #[cfg(not(feature = "signal-local"))]
+    fn signal_gate(&mut self, intent: SignalIntent) {
+        let _ = intent;
     }
 
     fn flush(&mut self) {
@@ -663,6 +718,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&store) as Arc<dyn SlackSecretVault>,
             Arc::clone(&whatsapp_phone),
+            None,
         );
         bind_discord_after_hydrate(&store, &host);
 
@@ -718,6 +774,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&store) as Arc<dyn SlackSecretVault>,
             whatsapp_phone,
+            None,
         );
         for caps in catalog() {
             host.send(AdapterCommand::Shutdown { protocol: caps.id });
@@ -915,6 +972,47 @@ mod tests {
         }
     }
 
+    /// A frontend that skips the Signal notice cannot start linking.
+    /// Acknowledge only while the notice shows. Link only after that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signal_intents_without_the_notice_reach_no_adapter() {
+        let mut core = memory_core();
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+
+        core.dispatch(Intent::Signal(SignalIntent::AcknowledgeNotice));
+        core.dispatch(Intent::Signal(SignalIntent::BeginLink));
+        assert!(
+            sent.try_recv().is_err(),
+            "no link command without the notice"
+        );
+
+        core.dispatch(Intent::Signal(SignalIntent::OpenNotice));
+        core.dispatch(Intent::Signal(SignalIntent::BeginLink));
+        assert!(
+            sent.try_recv().is_err(),
+            "link stays blocked until the notice is accepted"
+        );
+
+        core.dispatch(Intent::Signal(SignalIntent::AcknowledgeNotice));
+        core.dispatch(Intent::Signal(SignalIntent::BeginLink));
+        let mut got = Vec::new();
+        while let Ok(command) = sent.try_recv() {
+            got.push(command);
+        }
+        if cfg!(feature = "signal-local") {
+            assert_eq!(
+                got,
+                vec![
+                    AdapterCommand::SignalAcknowledgeNotice,
+                    AdapterCommand::SignalBeginLink { generation: 1 }
+                ]
+            );
+        } else {
+            assert!(got.is_empty(), "feature off: Signal intents do nothing");
+        }
+    }
+
     /// PR #48 review: the keychain watch must not outlive the core. After a
     /// drop, the change signal ends (no task keeps a strong notifier).
     #[tokio::test(flavor = "multi_thread")]
@@ -925,6 +1023,7 @@ mod tests {
             &Handle::current(),
             CoreConfig::new(temp_settings()),
             Arc::clone(&store),
+            None,
         );
         let mut signal = core.signal();
         drop(core);
