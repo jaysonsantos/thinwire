@@ -6754,6 +6754,68 @@ mod tests {
         assert_ne!(snapshot.status_text, before);
     }
 
+    #[test]
+    fn a_discord_accept_keeps_telegram_sending_until_message_sent() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        link_telegram(&mut snapshot);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:1", true),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(7, "Ada", 1),
+        });
+        snapshot.history_loading.clear();
+
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some("telegram:7".into());
+        snapshot.compose = "from telegram".into();
+        snapshot.send_compose();
+        let telegram_request = send_request(&mut snapshot);
+        snapshot.selected_protocol = ProtocolId::Discord;
+        snapshot.selected_conversation = Some("discord:1".into());
+        snapshot.compose = "from discord".into();
+        snapshot.send_compose();
+        let discord_request = send_request(&mut snapshot);
+
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1".into(),
+            request: discord_request,
+        });
+        assert_eq!(
+            snapshot.status_line(),
+            format!("{}: {SENDING_STATUS}", ProtocolId::Telegram.display_name()),
+            "Discord accepted first; Telegram is still sending"
+        );
+
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:7".into(),
+            request: telegram_request,
+        });
+        snapshot.compose = "again".into();
+        snapshot.send_compose();
+        let later_discord = send_request(&mut snapshot);
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1".into(),
+            request: later_discord,
+        });
+        assert_eq!(
+            snapshot.status_line(),
+            format!("{}: {SENDING_STATUS}", ProtocolId::Telegram.display_name()),
+            "Telegram accepted, and its Message sent line has not arrived"
+        );
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Message sent.".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Message sent.");
+    }
+
     fn send_request(snapshot: &mut Snapshot) -> u64 {
         snapshot
             .take_commands()
