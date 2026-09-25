@@ -34,7 +34,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 ### Telegram
 
 1. **Telegram UX follow-ups**
-    - [ ] Remove jargon from the account row ("status: stubbed", "Supported · TDLib") and from worker status text ("TDLib <code>").
+    - [x] Remove jargon from the account row ("status: stubbed", "Supported · TDLib") and from worker status text ("TDLib <code>").
 
 ### Shared
 
