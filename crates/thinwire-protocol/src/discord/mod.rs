@@ -874,6 +874,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_send_uses_the_local_clock_so_it_sorts_after_history() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                    body: "still sending".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("pending");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReceived { .. })
+        })
+        .await;
+        let pending = messages(&events);
+        assert_eq!(pending.len(), 1);
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        assert!(
+            pending[0].sent_at >= before && pending[0].sent_at <= after,
+            "pending sent_at {} is the local clock",
+            pending[0].sent_at
+        );
+        let history_at = inbox::snowflake_unix_seconds(3);
+        assert!(
+            pending[0].sent_at > history_at,
+            "pending row sorts after channel history"
+        );
+        hold.notify_waiters();
+    }
+
+    #[tokio::test]
     async fn a_new_session_rejects_inflight_sends() {
         let hold = Arc::new(Notify::new());
         let mut fake = FakeDiscordApi::guild_fixture();

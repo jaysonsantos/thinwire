@@ -19,6 +19,15 @@ use crate::adapter::{
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
 
+/// Unix seconds on the local clock. A pending row uses this so it sorts after
+/// history until Discord's snowflake time replaces it.
+fn local_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChannelAccess {
     channel_id: u64,
@@ -263,7 +272,7 @@ impl Session {
                 body: body.clone(),
                 outbound: true,
                 delivery: crate::adapter::Delivery::Pending,
-                sent_at: 0,
+                sent_at: local_unix_seconds(),
             },
         );
         let api = Arc::clone(&self.api);
