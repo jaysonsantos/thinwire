@@ -217,8 +217,8 @@ fn theme_control(ui: &mut egui::Ui, current: ThemeMode, out: &mut Vec<Intent>) {
 fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let notice = keychain_notice(snapshot.persistence());
     let show_error = snapshot.auth == AuthScreen::Idle && snapshot.error.is_some();
-    let show_status =
-        public_status(&snapshot.status_text).is_some_and(|text| !is_idle_status(text));
+    let show_status = !snapshot.status_is_idle()
+        && public_status(&snapshot.status_text).is_some_and(|text| !is_idle_status(text));
     // Idle chrome with no notice and no error draws no panel, so the strip is 0 px.
     if !status_strip_visible(snapshot, notice) {
         return;
@@ -321,10 +321,10 @@ fn is_idle_status(text: &str) -> bool {
 }
 
 /// True when the status strip draws a panel.
-fn status_strip_visible(snapshot: &Snapshot, notice: Option<&str>) -> bool {
+pub(super) fn status_strip_visible(snapshot: &Snapshot, notice: Option<&str>) -> bool {
     let show_error = snapshot.auth == AuthScreen::Idle && snapshot.error.is_some();
-    let show_status =
-        public_status(&snapshot.status_text).is_some_and(|text| !is_idle_status(text));
+    let show_status = !snapshot.status_is_idle()
+        && public_status(&snapshot.status_text).is_some_and(|text| !is_idle_status(text));
     notice.is_some() || show_error || show_status
 }
 
@@ -1473,6 +1473,34 @@ mod tests {
             "a signed-in thread with a quiet status draws no strip"
         );
         snapshot.status_text = "Sending…".into();
+        assert!(status_strip_visible(&snapshot, None));
+    }
+
+    #[test]
+    fn a_ready_status_such_as_message_sent_is_idle() {
+        use super::status_strip_visible;
+        use thinwire_core::state::Snapshot;
+        use thinwire_protocol::{AdapterEvent, AdapterStatus, ProtocolId};
+
+        let mut snapshot = Snapshot::new();
+        snapshot.telegram_authorized = true;
+        let status = |status, detail: &str| AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status,
+            detail: detail.into(),
+        };
+        snapshot.apply(status(AdapterStatus::Ready, "Message sent."));
+        assert!(snapshot.status_is_idle(), "the kind comes from Ready");
+        assert!(!status_strip_visible(&snapshot, None), "no busy look");
+
+        // A local busy line replaces it: shown again.
+        snapshot.status_text = "Sending…".into();
+        assert!(!snapshot.status_is_idle());
+        assert!(status_strip_visible(&snapshot, None));
+
+        // The same text as an error stays on the strip.
+        snapshot.apply(status(AdapterStatus::Error, "Message sent."));
+        assert!(!snapshot.status_is_idle());
         assert!(status_strip_visible(&snapshot, None));
     }
 
