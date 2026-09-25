@@ -390,6 +390,11 @@ pub struct Snapshot {
     /// closed it, or another error came), the list starts again.
     timed_out: Vec<TimedOut>,
     timeout_error: Option<UserError>,
+
+    /// A chat the user opened while its protocol was not linked. Its history
+    /// did not load, so `Linked` loads it (#70). A normal reconnect with no
+    /// such chat sends no second `OpenChat`.
+    open_on_link: Option<(ProtocolId, String)>,
     /// Protocols with a session: they reached `Linked` and did not end. A
     /// `Linking` after `Linked` is a reconnect; the session stays (ADR 0010).
     sessions: HashSet<ProtocolId>,
@@ -535,6 +540,8 @@ impl Snapshot {
             viewed: None,
             timed_out: Vec::new(),
             timeout_error: None,
+
+            open_on_link: None,
             sessions: HashSet::new(),
             #[cfg(test)]
             visible_for_test: HashSet::new(),
@@ -2014,12 +2021,15 @@ impl Snapshot {
     /// row in the protocol's list.
     fn queue_open_chat(&mut self) {
         let protocol = self.selected_protocol;
-        if !self.protocol_linked(protocol) {
-            return;
-        }
         let Some(id) = self.selected_conversation.clone() else {
             return;
         };
+        if !self.protocol_linked(protocol) {
+            // Load it when the protocol links (#70).
+            self.open_on_link = Some((protocol, id));
+            return;
+        }
+        self.open_on_link = None;
         // Only a real chat loads history: never a placeholder row (#70).
         let listed = self
             .conversations
@@ -2087,7 +2097,7 @@ impl Snapshot {
             && self
                 .conversations
                 .get(&protocol)
-                .is_some_and(|rows| rows.iter().any(|row| row.id == id));
+                .is_some_and(|rows| rows.iter().any(|row| row.id == id && !row.placeholder));
         listed.then_some((protocol, id))
     }
 
@@ -2112,8 +2122,14 @@ impl Snapshot {
                     self.select_protocol(protocol);
                 }
                 // A chat opened while the account was Linking did not load:
-                // load it now (#70). A duplicate in the queue is skipped.
-                if self.selected_protocol == protocol {
+                // load it now (#70). A duplicate in the queue is skipped. A
+                // chat that loaded before the reconnect does not load again.
+                let waiting = self.open_on_link.as_ref().is_some_and(|(owner, id)| {
+                    *owner == protocol
+                        && self.selected_protocol == protocol
+                        && self.selected_conversation.as_ref() == Some(id)
+                });
+                if waiting {
                     self.queue_open_chat();
                 }
                 #[cfg(feature = "whatsapp-web")]
@@ -6160,8 +6176,11 @@ mod tests {
         );
         assert_eq!(snapshot.selected_conversation.as_deref(), Some("slack:C1"));
 
-        // With no other session selected, Telegram Ready selects Telegram.
+        // With no session in the selected protocol, Telegram Ready selects
+        // Telegram. Start on Slack, so the check needs the rule (qa L3).
         let mut fresh = shell_with(&[ProtocolId::Slack]);
+        fresh.selected_protocol = ProtocolId::Slack;
+        assert!(!fresh.has_session(ProtocolId::Slack));
         complete_telegram(&mut fresh, &store);
         assert_eq!(fresh.selected_protocol, ProtocolId::Telegram);
     }
@@ -6191,6 +6210,49 @@ mod tests {
         assert_eq!(
             open_chats(&mut snapshot),
             vec![(ProtocolId::Slack, "slack:C2".to_owned())]
+        );
+    }
+
+    /// qa L1 on #79: a normal reconnect of a chat that already loaded sends
+    /// no second `OpenChat`.
+    #[test]
+    fn a_reconnect_does_not_reload_a_loaded_chat() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Slack, "slack:C1".to_owned())]
+        );
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        link(&mut snapshot, ProtocolId::Slack);
+        assert!(open_chats(&mut snapshot).is_empty(), "no reload");
+    }
+
+    /// qa L2 on #79: a placeholder row never becomes the viewed chat.
+    #[test]
+    fn a_placeholder_is_never_the_viewed_chat() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: discord_guild_placeholder(),
+        });
+        snapshot.select_conversation("discord:guild-inbox:general".into());
+        snapshot.sync_viewed();
+        assert!(
+            !snapshot.take_commands().iter().any(|command| matches!(
+                command,
+                AdapterCommand::ViewChat {
+                    conversation_id: Some(_),
+                    ..
+                }
+            )),
+            "no ViewChat for a placeholder"
         );
     }
 
