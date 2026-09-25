@@ -23,10 +23,12 @@ use presage::model::groups::Group;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::store::{ContentsStore, StateStore, Thread};
-use presage_store_sled::{MigrationConflictStrategy, SledStore};
+use presage_store_sqlite::SqliteStore;
 use tokio::sync::{Mutex, mpsc};
 
-use super::path::{prepare_session_dir, signal_session_path};
+use super::path::{
+    prepare_session_dir, signal_session_path, sled_session_present, sqlite_store_path,
+};
 use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::AttemptCancel;
 use thinwire_protocol::{
@@ -38,6 +40,7 @@ const DATA_DIR_MISSING: &str =
     "Platform app-data directory is unavailable. Signal linking did not start.";
 const STORE_FAILED: &str =
     "Signal session store could not be opened under app-data. Nothing was logged.";
+const SLED_RELINK: &str = "This build stores the Signal session in SQLite. A session saved by the previous sled store cannot be opened. Link this device again. The old files stay on disk.";
 const LINK_FAILED: &str = "Signal linking failed. No provisioning URL was logged.";
 const SYNC_FAILED: &str = "Signal chat list could not be read. Message text was not logged.";
 const SEND_FAILED: &str = "Signal send failed. The message text was not logged.";
@@ -216,13 +219,12 @@ async fn run_linked(
         session.active.store(false, Ordering::SeqCst);
         return;
     };
-    let store = match SledStore::open(
-        &store_path,
-        MigrationConflictStrategy::Drop,
-        OnNewIdentity::Trust,
-    )
-    .await
-    {
+    let Some(store_url) = sqlite_store_path(&store_path).to_str().map(str::to_string) else {
+        fail(&events, STORE_FAILED);
+        session.active.store(false, Ordering::SeqCst);
+        return;
+    };
+    let store = match SqliteStore::open(&store_url, OnNewIdentity::Trust).await {
         Ok(store) => store,
         Err(_) => {
             fail(&events, STORE_FAILED);
@@ -230,6 +232,14 @@ async fn run_linked(
             return;
         }
     };
+    if sled_session_present(&store_path) && !store.is_registered().await {
+        emit_status(
+            &events,
+            ProtocolId::Signal,
+            AdapterStatus::Connecting,
+            SLED_RELINK,
+        );
+    }
     if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
         return;
@@ -417,8 +427,8 @@ async fn link_new(
     events: &EventTx,
     session: &Session,
     token: u64,
-    store: SledStore,
-) -> Result<Manager<SledStore, Registered>, ()> {
+    store: SqliteStore,
+) -> Result<Manager<SqliteStore, Registered>, ()> {
     let (prov_tx, prov_rx) = futures::channel::oneshot::channel();
     let linking = Manager::link_secondary_device(
         store,
@@ -443,7 +453,7 @@ async fn link_new(
     linked.map_err(|_| ())
 }
 
-async fn contact_names(manager: &Manager<SledStore, Registered>) -> HashMap<String, String> {
+async fn contact_names(manager: &Manager<SqliteStore, Registered>) -> HashMap<String, String> {
     let mut names = HashMap::new();
     let Ok(contacts) = manager.store().contacts().await else {
         return names;
@@ -457,7 +467,7 @@ async fn contact_names(manager: &Manager<SledStore, Registered>) -> HashMap<Stri
 }
 
 async fn publish_chats(
-    manager: &Manager<SledStore, Registered>,
+    manager: &Manager<SqliteStore, Registered>,
     session: &Session,
     events: &EventTx,
 ) -> Result<(HashSet<String>, HashMap<String, String>), ()> {
@@ -469,7 +479,7 @@ async fn publish_chats(
         let conversation = conversation_from_contact(&contact);
         known.insert(conversation.id.clone());
         emit_conversation(events, conversation);
-        let thread = Thread::Contact(contact.uuid);
+        let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
         let Ok(messages) = manager.store().messages(&thread, ..).await else {
             continue;
         };
@@ -512,7 +522,7 @@ fn last_page<T>(items: impl IntoIterator<Item = T>, page: usize) -> Vec<T> {
 }
 
 async fn load_older_page(
-    manager: &Manager<SledStore, Registered>,
+    manager: &Manager<SqliteStore, Registered>,
     session: &Session,
     events: &EventTx,
     names: &HashMap<String, String>,
@@ -544,7 +554,17 @@ fn thread_of(conversation_id: &str, group_key: Option<[u8; 32]>) -> Option<Threa
     if super::group::is_group_id(conversation_id) {
         return group_key.map(Thread::Group);
     }
-    Uuid::parse_str(conversation_id).ok().map(Thread::Contact)
+    Uuid::parse_str(conversation_id)
+        .ok()
+        .map(|uuid| Thread::Contact(ServiceId::Aci(uuid.into())))
+}
+
+fn sent_sync_body(sync: &presage::libsignal_service::proto::SyncMessage) -> Option<&str> {
+    use presage::libsignal_service::proto::sync_message::Content as SyncContent;
+    match sync.content.as_ref()? {
+        SyncContent::Sent(sent) => sent.message.as_ref()?.body.as_deref(),
+        _ => None,
+    }
 }
 
 fn last_page_more<T>(items: impl IntoIterator<Item = T>, page: usize) -> (Vec<T>, bool) {
@@ -564,7 +584,7 @@ fn last_page_more<T>(items: impl IntoIterator<Item = T>, page: usize) -> (Vec<T>
 }
 
 async fn remember_group_title(
-    manager: &Manager<SledStore, Registered>,
+    manager: &Manager<SqliteStore, Registered>,
     content: &Content,
     titles: &mut HashMap<String, String>,
 ) {
@@ -657,12 +677,9 @@ fn row_and_message(
         ContentBody::DataMessage(DataMessage { body, .. }) => {
             super::message::Incoming::Data(body.as_deref())
         }
-        ContentBody::SynchronizeMessage(sync) => super::message::Incoming::SentSync(
-            sync.sent
-                .as_ref()
-                .and_then(|sent| sent.message.as_ref())
-                .and_then(|message| message.body.as_deref()),
-        ),
+        ContentBody::SynchronizeMessage(sync) => {
+            super::message::Incoming::SentSync(sent_sync_body(sync))
+        }
         _ => super::message::Incoming::Other,
     };
     let shown = super::message::visible_text(incoming)?;
@@ -670,7 +687,7 @@ fn row_and_message(
     let uuid = content.metadata.sender.raw_uuid().to_string();
     let (conversation_id, sender, title, is_group) = match &thread {
         Thread::Contact(id) => {
-            let conversation_id = id.to_string();
+            let conversation_id = id.raw_uuid().to_string();
             let title = names
                 .get(&conversation_id)
                 .filter(|name| !name.is_empty())
@@ -692,10 +709,12 @@ fn row_and_message(
             )
         }
     };
+    let sent_millis =
+        u64::try_from(content.metadata.client_timestamp.timestamp_millis()).unwrap_or(0);
     let message = ChatMessage {
         protocol: ProtocolId::Signal,
         conversation_id: conversation_id.clone(),
-        id: content.metadata.timestamp.to_string(),
+        id: sent_millis.to_string(),
         sender: if shown.outbound {
             "me".to_string()
         } else {
@@ -704,7 +723,7 @@ fn row_and_message(
         body: shown.body.to_string(),
         outbound: shown.outbound,
         delivery: Delivery::Sent,
-        sent_at: super::time::sent_at_secs(content.metadata.timestamp),
+        sent_at: super::time::sent_at_secs(sent_millis),
     };
     let conversation = Conversation {
         protocol: ProtocolId::Signal,
@@ -723,7 +742,7 @@ fn row_and_message(
 }
 
 async fn send_text(
-    manager: &mut Manager<SledStore, Registered>,
+    manager: &mut Manager<SqliteStore, Registered>,
     session: &Session,
     outbound: &Outbound,
     events: &EventTx,
@@ -803,6 +822,7 @@ mod tests {
 
     use presage::libsignal_service::content::{Content, GroupContextV2, Metadata};
     use presage::libsignal_service::prelude::Uuid;
+    use presage::libsignal_service::protocol::DeviceId;
     use presage::libsignal_service::protocol::ServiceId;
 
     use super::*;
@@ -813,8 +833,12 @@ mod tests {
             Metadata {
                 sender: ServiceId::Aci(sender.into()),
                 destination: ServiceId::Aci(Uuid::nil().into()),
-                sender_device: 1,
-                timestamp: 1_700_000_000_000,
+                sender_device: DeviceId::new(1).expect("device"),
+                pni_verified: None,
+                client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                    .expect("time"),
+                server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                    .expect("time"),
                 needs_receipt: false,
                 unidentified_sender: false,
                 was_plaintext: false,

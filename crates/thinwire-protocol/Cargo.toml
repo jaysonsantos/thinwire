@@ -30,7 +30,10 @@ slack-oauth = [
 # Experimental WhatsApp Web / linked-device client (MIT, oxidezap).
 # Git revision matches ZapFast 0.14 so the spike builds on stable Rust.
 # Default CI does not enable this feature. Not a supported messenger.
-whatsapp-web = ["dep:whatsapp-rust"]
+# `sqlite-storage` (not `sqlite-storage-bundled`) so the lock can use
+# libsqlite3-sys 0.36. The 0.38 pin cannot share the graph with the
+# Signal sqlite store. The bundled build is the direct dependency below.
+whatsapp-web = ["dep:whatsapp-rust", "dep:libsqlite3-sys"]
 # Bot/OAuth guild inbox spike via twilight. Default CI stays feature-off.
 # No user-token client. Never put a Discord token in CI or the MIT tree.
 discord-bot = ["dep:twilight-http", "dep:twilight-model", "dep:rustls"]
@@ -43,11 +46,15 @@ tdlib-rs = { version = "1.4", optional = true, default-features = false, feature
 slack-morphism = { version = "2.29", optional = true, default-features = false }
 webbrowser = { version = "1", optional = true }
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "f7468ae2920a2b0aedbd0848cf121de56a07f93c", optional = true, default-features = false, features = [
-  "sqlite-storage-bundled",
+  "sqlite-storage",
   "tokio-transport",
   "tokio-runtime",
   "ureq-client",
   "tokio-native",
+] }
+# Same 0.36 line as the Signal sqlite store. `bundled` keeps WhatsApp off the system libsqlite.
+libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
+  "bundled",
 ] }
 twilight-http = { version = "0.17.1", optional = true }
 twilight-model = { version = "0.17.1", optional = true }
