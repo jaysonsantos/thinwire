@@ -530,6 +530,7 @@ impl Snapshot {
                     self.scroll_to_selected = true;
                 }
                 self.ensure_conversation_selection();
+                self.sync_focused_row();
             }
             AdapterEvent::MessageDelivery {
                 protocol,
@@ -910,6 +911,16 @@ impl Snapshot {
         {
             self.select_protocol(first);
         }
+        self.sync_focused_row();
+    }
+
+    /// New inbox search. A highlight that the query hides is cleared.
+    pub fn set_search(&mut self, text: String) {
+        if self.search == text {
+            return;
+        }
+        self.search = text;
+        self.sync_focused_row();
     }
 
     /// Discord inbox chrome when feature `discord-bot` is compiled.
@@ -1604,6 +1615,28 @@ impl Snapshot {
             self.selected_conversation = None;
             self.ensure_conversation_selection();
         }
+        self.sync_focused_row();
+    }
+
+    /// Drop the keyboard highlight when it is not in the visible rows.
+    fn sync_focused_row(&mut self) {
+        let visible = self
+            .focused_row
+            .as_ref()
+            .is_some_and(|id| self.visible_conversations().iter().any(|row| &row.id == id));
+        if !visible {
+            self.focused_row = None;
+        }
+    }
+
+    /// The highlight, when it is one of the rows on screen. Enter uses this.
+    #[must_use]
+    pub fn visible_focused_row(&self) -> Option<String> {
+        let id = self.focused_row.clone()?;
+        self.visible_conversations()
+            .iter()
+            .any(|row| row.id == id)
+            .then_some(id)
     }
 
     fn delivery_of(
@@ -2285,6 +2318,41 @@ mod tests {
                 .any(|command| matches!(command, AdapterCommand::OpenChat { .. })),
             "Enter opens the highlighted chat"
         );
+    }
+
+    #[test]
+    fn a_hidden_highlight_is_cleared_and_enter_opens_nothing() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.move_inbox_selection(1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        snapshot.set_search("Ada".into());
+        assert!(
+            snapshot.focused_row.is_none(),
+            "the hidden row is not highlighted"
+        );
+        assert!(snapshot.visible_focused_row().is_none());
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        assert!(snapshot.take_commands().is_empty());
+
+        snapshot.set_search(String::new());
+        snapshot.move_inbox_selection(1);
+        snapshot.set_search("Bob".into());
+        assert_eq!(
+            snapshot.visible_focused_row().as_deref(),
+            Some("telegram:2"),
+            "a row that still matches stays highlighted"
+        );
+
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Telegram,
+            id: "telegram:2".into(),
+        });
+        assert!(snapshot.focused_row.is_none());
+        assert!(snapshot.visible_focused_row().is_none());
     }
 
     #[test]

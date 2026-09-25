@@ -173,7 +173,7 @@ impl Core {
             Intent::SelectConversation { id } => self.state.select_conversation(id),
             Intent::MoveInbox { delta } => self.state.move_inbox_selection(delta),
             Intent::SetFilter(filter) => self.state.set_filter(filter),
-            Intent::SetSearch(text) => self.state.search = text.into_inner(),
+            Intent::SetSearch(text) => self.state.set_search(text.into_inner()),
             Intent::Refresh => self.state.refresh_visible(),
             Intent::DismissError => self.state.error = None,
             Intent::Key(key) => self.state.center_key(key, &self.secrets),

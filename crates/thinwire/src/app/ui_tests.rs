@@ -164,7 +164,9 @@ fn keys_are_read_once_in_the_center_panel() {
     assert!(inbox.contains("text_edit_focused()"));
     assert!(inbox.contains("CenterView::Thread"));
     assert!(inbox.contains("Intent::MoveInbox"));
+    assert!(inbox.contains("visible_focused_row()"));
     assert!(inbox.contains("Intent::SelectConversation"));
+    assert!(!inbox.contains("selected_conversation.clone()"));
 }
 
 #[test]

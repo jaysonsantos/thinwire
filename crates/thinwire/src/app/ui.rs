@@ -595,14 +595,8 @@ fn inbox_keys(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
         out.push(Intent::MoveInbox { delta: -1 });
     } else if down {
         out.push(Intent::MoveInbox { delta: 1 });
-    } else if enter {
-        let id = snapshot
-            .focused_row
-            .clone()
-            .or_else(|| snapshot.selected_conversation.clone());
-        if let Some(id) = id {
-            out.push(Intent::SelectConversation { id });
-        }
+    } else if enter && let Some(id) = snapshot.visible_focused_row() {
+        out.push(Intent::SelectConversation { id });
     }
 }
 
