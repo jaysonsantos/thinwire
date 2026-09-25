@@ -102,6 +102,10 @@ pub struct Core {
     state: Snapshot,
     settings: Settings,
     clock: Clock,
+    /// Commands sent to the host, and events read from it. The demo compares
+    /// them with its adapters' counts to know when it is idle (#120).
+    commands_sent: std::sync::atomic::AtomicU64,
+    events_read: u64,
     secrets: Arc<SecretStore>,
     whatsapp_phone: Arc<WhatsAppPhoneVault>,
     notifier: ChangeNotifier,
@@ -200,6 +204,8 @@ impl Core {
             state,
             settings: config.settings,
             clock: config.clock,
+            commands_sent: std::sync::atomic::AtomicU64::new(0),
+            events_read: 0,
             secrets,
             whatsapp_phone,
             notifier,
@@ -215,6 +221,14 @@ impl Core {
     #[must_use]
     pub fn signal(&self) -> ChangeSignal {
         self.notifier.subscribe()
+    }
+
+    /// Commands sent to the host and events read from it (#120).
+    pub(crate) fn work_counts(&self) -> (u64, u64) {
+        (
+            self.commands_sent.load(std::sync::atomic::Ordering::SeqCst),
+            self.events_read,
+        )
     }
 
     /// The state, for the demo scenarios (#120).
@@ -246,6 +260,7 @@ impl Core {
         let expired = self.state.expire_sends();
         let mut applied = false;
         while let Ok(event) = self.events.try_recv() {
+            self.events_read += 1;
             // The login epoch check runs here, on the thread that sends
             // Cancel, not in the forward task (issue #42, PR #49).
             if let Some(event) = self.commands.deliver(event) {
@@ -514,6 +529,8 @@ impl Core {
     }
 
     fn send(&self, command: AdapterCommand) {
+        self.commands_sent
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !self.commands.send(command) {
             tracing::warn!("adapter host command channel closed");
         }

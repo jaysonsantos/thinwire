@@ -16,7 +16,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use thinwire_protocol::demo::{DemoAdapter, DemoLogin, DemoOlder, DemoScript, DemoSend};
+use thinwire_protocol::demo::{
+    DemoAdapter, DemoCounters, DemoLogin, DemoOlder, DemoScript, DemoSend,
+};
 use thinwire_protocol::{
     AdapterEvent, AdapterHost, AdapterStatus, ChatMessage, Conversation, Delivery, ProtocolAdapter,
     ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthError, TelegramAuthPhase,
@@ -39,9 +41,9 @@ const LONG_CHAT_MESSAGES: usize = 120;
 const SHORT_HISTORY_MESSAGES: usize = 40;
 /// Messages in one history page of the demo adapters.
 const PAGE: usize = 30;
-/// A time with no change that ends a wait for answers.
-const QUIET: Duration = Duration::from_millis(100);
-/// The longest wait for all answers of one step.
+/// The longest wait on the change signal before the idle check runs again.
+const SETTLE_POLL: Duration = Duration::from_millis(20);
+/// The longest wait for all answers of one step. Reaching it is a bug.
 const SETTLE_LIMIT: Duration = Duration::from_secs(5);
 
 const ADA: &str = "telegram:demo-ada";
@@ -169,11 +171,16 @@ impl Scenario {
         } else {
             SecretStore::demo_saved()
         });
+        let counters = Arc::new(DemoCounters::default());
         let adapters: Vec<Box<dyn ProtocolAdapter>> = setup
             .scripts
             .into_iter()
-            .map(|script| Box::new(DemoAdapter::new(script)) as Box<dyn ProtocolAdapter>)
+            .map(|script| {
+                Box::new(DemoAdapter::with_counters(script, Arc::clone(&counters)))
+                    as Box<dyn ProtocolAdapter>
+            })
             .collect();
+        let adapters_count = u64::try_from(adapters.len()).unwrap_or(u64::MAX);
         let host = AdapterHost::spawn_adapters(runtime, adapters);
         let config = CoreConfig::new(Settings::in_memory())
             .with_memory_secrets()
@@ -190,10 +197,10 @@ impl Scenario {
             state.extra_visible.extend(setup.visible);
             state.set_api_source(TelegramApiSource::with_publisher("12345", "demo-api-hash"));
         }
-        settle(&mut core, runtime);
+        settle(&mut core, runtime, &counters, adapters_count);
         for intent in setup.intents {
             core.dispatch(intent);
-            settle(&mut core, runtime);
+            settle(&mut core, runtime, &counters, adapters_count);
         }
         core
     }
@@ -270,20 +277,80 @@ struct Setup {
     keychain_failed: bool,
 }
 
-/// Pump until no change comes for [`QUIET`], at most [`SETTLE_LIMIT`].
-fn settle(core: &mut Core, runtime: &Handle) {
+/// Pump until no work is left: every demo adapter started, the demo
+/// adapters handled every command the core sent, and the core read every
+/// event they sent (#120 qa). No timing
+/// guess: a slow machine only waits longer.
+///
+/// # Panics
+///
+/// After [`SETTLE_LIMIT`] with work left. That is a bug in a scenario.
+fn settle(core: &mut Core, runtime: &Handle, counters: &DemoCounters, adapters: u64) {
     let mut signal = core.signal();
     let started = std::time::Instant::now();
-    core.pump();
-    while started.elapsed() < SETTLE_LIMIT {
-        let changed =
-            runtime.block_on(async { tokio::time::timeout(QUIET, signal.changed()).await.is_ok() });
-        if !changed {
-            break;
-        }
+    loop {
         core.pump();
+        let (sent, read) = core.work_counts();
+        let all_started = counters.started() == adapters;
+        if all_started && counters.handled() == sent && counters.emitted() == read {
+            return;
+        }
+        assert!(
+            started.elapsed() < SETTLE_LIMIT,
+            "demo did not settle: sent {sent}, handled {}, emitted {}, read {read}",
+            counters.handled(),
+            counters.emitted()
+        );
+        runtime.block_on(async {
+            let _ = tokio::time::timeout(SETTLE_POLL, signal.changed()).await;
+        });
     }
-    core.pump();
+}
+
+/// The screen of a built scenario as text: the status line, the center
+/// view, the rows, the thread, the older state, and the error. Two builds of
+/// one scenario give the same text.
+#[must_use]
+pub fn summary(core: &Core) -> String {
+    use std::fmt::Write as _;
+
+    let view = core.view();
+    let mut text = String::new();
+    let _ = writeln!(text, "status: {}", view.status_line());
+    let _ = writeln!(
+        text,
+        "screen: {:?} auth: {:?}",
+        view.center_view(),
+        view.auth
+    );
+    for row in view.visible_conversations() {
+        let mark = if view.selected_conversation.as_deref() == Some(row.id.as_str()) {
+            '>'
+        } else {
+            ' '
+        };
+        let _ = writeln!(
+            text,
+            "{mark} {} | {} | {}",
+            row.title, row.preview, row.unread
+        );
+    }
+    for message in view.selected_messages() {
+        let _ = writeln!(
+            text,
+            "    {} {}: {} [{:?}]",
+            message.sent_at, message.sender, message.body, message.delivery
+        );
+    }
+    let _ = writeln!(text, "older: {:?}", view.older_state());
+    if let Some(error) = &view.error {
+        let _ = writeln!(
+            text,
+            "error: {} | {} | {}",
+            error.happened, error.why, error.next
+        );
+    }
+    text
 }
 
 fn caps(protocol: ProtocolId) -> ProtocolCapabilities {
@@ -566,6 +633,25 @@ mod tests {
                 scenario.name()
             );
         }
+    }
+
+    /// #120 qa: a scenario gives the same screen on each build.
+    #[test]
+    fn a_scenario_builds_the_same_screen_twice() {
+        let runtime = runtime();
+        for scenario in Scenario::ALL {
+            let first = summary(&scenario.build(runtime.handle()));
+            let second = summary(&scenario.build(runtime.handle()));
+            assert_eq!(first, second, "{}", scenario.name());
+        }
+    }
+
+    /// The view clock of a demo core is fixed at the scenario's now.
+    #[test]
+    fn a_demo_core_has_a_fixed_clock() {
+        let runtime = runtime();
+        let core = Scenario::LongChat.build(runtime.handle());
+        assert_eq!(core.view().now(), Clock::fixed_utc(NOW).now());
     }
 
     /// Each scenario reaches its screen. One runtime serves all of them.

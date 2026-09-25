@@ -92,25 +92,6 @@ fn run_demo(runtime: &tokio::runtime::Runtime, name: &str) {
 }
 
 fn print_demo(scenario: Scenario, core: &Core) {
-    let view = core.view();
     println!("== {}", scenario.name());
-    println!("status: {}", view.status_line());
-    println!("screen: {:?}", view.center_view());
-    for row in view.visible_conversations() {
-        let mark = if view.selected_conversation.as_deref() == Some(row.id.as_str()) {
-            ">"
-        } else {
-            " "
-        };
-        println!("{mark} {} | {}", row.title, row.preview);
-    }
-    for message in view.selected_messages().iter().rev().take(3).rev() {
-        println!(
-            "    {}: {} [{:?}]",
-            message.sender, message.body, message.delivery
-        );
-    }
-    if let Some(error) = &view.error {
-        println!("error: {} {} {}", error.happened, error.why, error.next);
-    }
+    print!("{}", thinwire_core::demo::summary(core));
 }

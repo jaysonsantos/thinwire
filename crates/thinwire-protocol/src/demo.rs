@@ -8,6 +8,8 @@
 //! example use the same scenarios.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage,
@@ -131,16 +133,59 @@ impl DemoScript {
     }
 }
 
+/// Work counts of the demo adapters of one host. A frontend compares them
+/// with the commands it sent and the events it read, so it knows when every
+/// answer is applied, with no timing guess (#120).
+#[derive(Debug, Default)]
+pub struct DemoCounters {
+    started: AtomicU64,
+    handled: AtomicU64,
+    emitted: AtomicU64,
+}
+
+impl DemoCounters {
+    /// Commands that the demo adapters handled, `ViewChat` and `Shutdown`
+    /// too.
+    #[must_use]
+    pub fn handled(&self) -> u64 {
+        self.handled.load(Ordering::SeqCst)
+    }
+
+    /// Demo adapters that ran `start` and sent their start events.
+    #[must_use]
+    pub fn started(&self) -> u64 {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    /// Events that the demo adapters sent.
+    #[must_use]
+    pub fn emitted(&self) -> u64 {
+        self.emitted.load(Ordering::SeqCst)
+    }
+}
+
 /// Plays one [`DemoScript`].
 #[derive(Debug)]
 pub struct DemoAdapter {
     script: DemoScript,
+    counters: Arc<DemoCounters>,
 }
 
 impl DemoAdapter {
     #[must_use]
-    pub const fn new(script: DemoScript) -> Self {
-        Self { script }
+    pub fn new(script: DemoScript) -> Self {
+        Self::with_counters(script, Arc::default())
+    }
+
+    /// A demo adapter that adds its work to shared counters.
+    #[must_use]
+    pub const fn with_counters(script: DemoScript, counters: Arc<DemoCounters>) -> Self {
+        Self { script, counters }
+    }
+
+    fn send(&self, events: &EventTx, event: AdapterEvent) {
+        self.counters.emitted.fetch_add(1, Ordering::SeqCst);
+        let _ = events.send(event);
     }
 
     fn protocol(&self) -> ProtocolId {
@@ -150,7 +195,7 @@ impl DemoAdapter {
     fn open_chat(&self, chat: String, events: &EventTx) {
         let protocol = self.protocol();
         let Some(history) = self.script.history.get(&chat) else {
-            send(
+            self.send(
                 events,
                 AdapterEvent::CommandFailed {
                     protocol,
@@ -162,14 +207,14 @@ impl DemoAdapter {
         };
         let from = history.len().saturating_sub(self.script.page);
         for message in &history[from..] {
-            send(
+            self.send(
                 events,
                 AdapterEvent::MessageReceived {
                     message: message.clone(),
                 },
             );
         }
-        send(
+        self.send(
             events,
             AdapterEvent::HistoryLoaded {
                 protocol,
@@ -194,14 +239,14 @@ impl DemoAdapter {
             .unwrap_or(0);
         let from = end.saturating_sub(self.script.page);
         for message in &history[from..end] {
-            send(
+            self.send(
                 events,
                 AdapterEvent::MessageReceived {
                     message: message.clone(),
                 },
             );
         }
-        send(
+        self.send(
             events,
             AdapterEvent::OlderHistoryLoaded {
                 protocol,
@@ -220,7 +265,7 @@ impl DemoAdapter {
             DemoSend::Reject => Delivery::Failed,
             DemoSend::Hold => Delivery::Pending,
         };
-        send(
+        self.send(
             events,
             AdapterEvent::MessageReceived {
                 message: ChatMessage {
@@ -248,7 +293,7 @@ impl DemoAdapter {
             },
             DemoSend::Hold => return,
         };
-        send(events, answer);
+        self.send(events, answer);
     }
 
     fn resend(&self, chat: String, message_id: String, request: u64, events: &EventTx) {
@@ -272,7 +317,7 @@ impl DemoAdapter {
                 },
             ),
         };
-        send(
+        self.send(
             events,
             AdapterEvent::MessageDelivery {
                 protocol,
@@ -281,7 +326,7 @@ impl DemoAdapter {
                 delivery,
             },
         );
-        send(events, answer);
+        self.send(events, answer);
     }
 
     fn login(&self, step: TelegramAuthStep, epoch: u64, events: &EventTx) {
@@ -292,7 +337,7 @@ impl DemoAdapter {
             DemoLogin::Phase(phase) => AdapterEvent::TelegramAuth { phase },
             DemoLogin::Reject(error) => AdapterEvent::TelegramAuthRejected { error },
         };
-        send(
+        self.send(
             events,
             AdapterEvent::Login {
                 epoch,
@@ -311,13 +356,34 @@ impl ProtocolAdapter for DemoAdapter {
         self.script.caps
     }
 
+    fn view_chat(&mut self, _conversation_id: Option<&str>, _events: &EventTx) {
+        self.counters.handled.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn shutdown(&mut self, events: &EventTx) {
+        let protocol = self.protocol();
+        self.send(events, AdapterEvent::Stopped { protocol });
+        self.counters.handled.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn start(&mut self, events: EventTx) {
         for event in &self.script.start {
-            send(&events, event.clone());
+            self.send(&events, event.clone());
         }
+        self.counters.started.fetch_add(1, Ordering::SeqCst);
     }
 
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
+        self.answer(command, events);
+        // Count the command only after its events: then "all handled" also
+        // means "all sent".
+        self.counters.handled.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl DemoAdapter {
+    fn answer(&self, command: AdapterCommand, events: &EventTx) {
         match command {
             AdapterCommand::OpenChat {
                 conversation_id, ..
@@ -328,7 +394,7 @@ impl ProtocolAdapter for DemoAdapter {
                 ..
             } => self.load_older(conversation_id, before_message_id, events),
             AdapterCommand::LoadChats { protocol } => {
-                send(events, AdapterEvent::ChatListLoaded { protocol });
+                self.send(events, AdapterEvent::ChatListLoaded { protocol });
             }
             AdapterCommand::SendText {
                 conversation_id,
@@ -343,7 +409,7 @@ impl ProtocolAdapter for DemoAdapter {
                 ..
             } => self.resend(conversation_id, message_id, request, events),
             AdapterCommand::TelegramAuth { step, epoch } => self.login(step, epoch, events),
-            AdapterCommand::Disconnect { protocol } => send(
+            AdapterCommand::Disconnect { protocol } => self.send(
                 events,
                 AdapterEvent::Account {
                     protocol,
@@ -353,12 +419,7 @@ impl ProtocolAdapter for DemoAdapter {
             // Connect and the pairing commands have no demo script.
             _ => {}
         }
-        Ok(())
     }
-}
-
-fn send(events: &EventTx, event: AdapterEvent) {
-    let _ = events.send(event);
 }
 
 #[cfg(test)]
