@@ -217,6 +217,20 @@ impl Inbox {
         (page, start > 0)
     }
 
+    /// The chat the user looks at now (`None`: no WhatsApp chat). Messages
+    /// in the viewed chat do not raise unread; a chat the user left counts
+    /// again. Viewing a known chat marks it read and returns its upsert.
+    pub(super) fn view(&mut self, jid: Option<&str>) -> Option<AdapterEvent> {
+        self.open = jid.map(str::to_string);
+        let jid = jid?;
+        let record = self.chats.get_mut(jid)?;
+        if record.unread == 0 {
+            return None;
+        }
+        record.unread = 0;
+        self.upsert_event(jid)
+    }
+
     #[must_use]
     pub(super) fn knows_chat(&self, jid: &str) -> bool {
         self.chats.contains_key(jid)
@@ -692,6 +706,30 @@ pub(super) mod tests {
             .filter(|event| matches!(event, AdapterEvent::MessageReceived { .. }))
             .count();
         assert_eq!(count, 1);
+    }
+
+    /// Codex r4093058047: a chat the user left counts unread again.
+    #[test]
+    fn leaving_a_chat_counts_its_messages_unread_again() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![message(chat, "a", "one", 1)]);
+        let read = inbox.view(Some(chat)).expect("marks the chat read");
+        assert!(matches!(
+            read,
+            AdapterEvent::ConversationUpsert { conversation } if conversation.unread == 0
+        ));
+        let events = inbox.apply_messages(vec![message(chat, "b", "two", 2)]);
+        assert_eq!(upserts(&events)[0].unread, 0, "the viewed chat stays read");
+
+        assert!(inbox.view(None).is_none());
+        let events = inbox.apply_messages(vec![message(chat, "c", "three", 3)]);
+        assert_eq!(upserts(&events)[0].unread, 1, "a left chat counts again");
+
+        // Viewing another chat also leaves this one.
+        inbox.view(Some("222@s.whatsapp.net"));
+        let events = inbox.apply_messages(vec![message(chat, "d", "four", 4)]);
+        assert_eq!(upserts(&events)[0].unread, 2);
     }
 
     /// Codex r4093606402: a later history chunk keeps the open chat read.

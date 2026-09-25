@@ -442,6 +442,14 @@ impl ProtocolAdapter for WhatsAppAdapter {
         });
     }
 
+    /// ADR 0010 rule 7. The viewed chat drives unread counts in the inbox.
+    fn view_chat(&mut self, conversation_id: Option<&str>, events: &EventTx) {
+        let jid = conversation_id.and_then(inbox::parse_conversation_id);
+        if let Some(upsert) = self.session.with_inbox(|inbox| inbox.view(jid)) {
+            let _ = events.send(upsert);
+        }
+    }
+
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         match command {
             AdapterCommand::Connect {
@@ -1611,6 +1619,31 @@ mod tests {
         let events = drain(&mut rx);
         assert_eq!(events.len(), 1);
         assert!(statuses(&events).is_empty());
+    }
+
+    /// ADR 0010 rule 7: ViewChat marks the viewed chat read, and leaving it
+    /// lets new messages count again.
+    #[test]
+    fn view_chat_drives_unread_counts() {
+        let (mut adapter, mut rx, tx) = connected(Arc::new(FakeSender::default()));
+        adapter.view_chat(Some("whatsapp:111@s.whatsapp.net"), &tx);
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation } if conversation.unread == 0
+        )));
+        adapter.view_chat(None, &tx);
+        adapter.session.apply(
+            LinkEvent::Messages(vec![message(CHAT, "late", "late", 50)]),
+            1,
+            &tx,
+        );
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation } if conversation.unread == 1
+        )));
+        // A placeholder or foreign id is ignored.
+        adapter.view_chat(Some(PLACEHOLDER_ID), &tx);
+        assert!(drain(&mut rx).is_empty());
     }
 
     #[test]
