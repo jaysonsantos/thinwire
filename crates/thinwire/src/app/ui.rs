@@ -856,11 +856,11 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         output.content_size.y,
     );
     if step.restore.is_some() {
-        // Older rows went in above: the next pass moves down by their height,
-        // so the row that was on screen stays there. Redo this pass, so the
-        // jump never shows (#30). If egui declines, the next frame moves it.
-        ui.ctx()
-            .request_discard("keep the thread position after older messages");
+        // Older rows went in above: the next frame moves down by their height,
+        // so the row that was on screen stays there (#30). No
+        // `request_discard`: the app dispatches the intents of each pass, and
+        // a second pass gets no input, so a redo could lose or repeat a typed
+        // change (PR #61 review). The cost is one frame at the old offset.
         ui.ctx().request_repaint();
     }
     ui.data_mut(|data| {
@@ -904,7 +904,7 @@ struct ThreadMemo {
     /// The oldest row that the last frame drew.
     first_id: Option<String>,
     content_height: f32,
-    /// Scroll offset for the next pass, after older rows went in above.
+    /// Scroll offset for the next frame, after older rows went in above.
     restore: Option<f32>,
     /// The last frame was in the top zone. A request goes out only when the
     /// view enters the zone, not on each repaint inside it (#61 review).
@@ -1372,7 +1372,20 @@ mod tests {
             "one request at a time"
         );
         assert!(thread.contains("vertical_scroll_offset(offset)"));
-        assert!(thread.contains("request_discard("));
+        assert!(thread.contains("ui.ctx().request_repaint()"));
+        // Each pass dispatches its intents once, so no pass may be redone:
+        // a typed character must reach the core exactly once (PR #61 review).
+        for src in [ui, include_str!("mod.rs")] {
+            assert!(!src.contains(concat!("request_", "discard(")));
+        }
+        let app = include_str!("mod.rs");
+        let pass = &app[app.find("fn ui(&mut self").expect("ui")..];
+        let pass = &pass[..pass.find("\n    }\n").expect("end")];
+        assert_eq!(
+            pass.matches("self.core.dispatch(intent)").count(),
+            1,
+            "one dispatch per pass"
+        );
     }
 
     #[test]
