@@ -76,8 +76,15 @@ pub(super) trait LinkBackend: Send + Sync + 'static {
     /// Stop a client and close its store.
     fn stop(&self, bot: Self::Bot) -> impl Future<Output = ()> + Send;
 
-    /// Delete the device store and its SQLite side files.
+    /// Delete the device store, its SQLite side files, and the revoked mark.
     fn delete_store(&self) -> impl Future<Output = Result<(), ()>> + Send;
+
+    /// Record on disk that the phone revoked the store. The mark survives a
+    /// restart; [`Self::delete_store`] removes it.
+    fn mark_revoked(&self) -> impl Future<Output = ()> + Send;
+
+    /// The store carries a revoked mark, maybe from an earlier run.
+    fn is_revoked(&self) -> impl Future<Output = bool> + Send;
 }
 
 enum Msg {
@@ -230,7 +237,8 @@ impl<B: LinkBackend> Owner<B> {
         self.session.set_pairing(pairing);
         // A first login: the shell drops inbox events until Linked.
         let _ = self.events.send(account(AccountState::Linking));
-        if self.stale {
+        // The mark on disk covers a delete that failed before a restart.
+        if self.stale || self.backend.is_revoked().await {
             if self.backend.delete_store().await.is_err() {
                 // The revoked store is still there. Do not open it; the next
                 // Begin tries the delete again.
@@ -268,6 +276,7 @@ impl<B: LinkBackend> Owner<B> {
         self.session.apply(event, generation, &self.events);
         if invalidate {
             self.stale = true;
+            self.backend.mark_revoked().await;
         }
         if let Some(bot) = self.bot.take() {
             self.backend.stop(bot).await;
@@ -298,7 +307,7 @@ impl<B: LinkBackend> Owner<B> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
@@ -312,21 +321,23 @@ mod tests {
 
     /// Records every backend call in order. The bot is its generation.
     #[derive(Default)]
-    struct Fake {
-        log: Mutex<Vec<String>>,
-        callbacks: Mutex<HashMap<u64, Callbacks>>,
+    pub(in crate::whatsapp) struct Fake {
+        pub log: Mutex<Vec<String>>,
+        pub callbacks: Mutex<HashMap<u64, Callbacks>>,
         /// When set, `start` waits for a notify before it returns.
-        start_gate: Option<Arc<Notify>>,
+        pub start_gate: Option<Arc<Notify>>,
         /// Number of `delete_store` calls that fail before one succeeds.
-        delete_failures: AtomicUsize,
+        pub delete_failures: AtomicUsize,
         /// `stop` never returns.
-        stop_hangs: bool,
+        pub stop_hangs: bool,
         /// `start` fails with this error.
-        start_error: Option<StartError>,
+        pub start_error: Option<StartError>,
+        /// The revoked mark "on disk". Survives a new owner (a restart).
+        pub revoked: AtomicBool,
     }
 
     #[derive(Clone, Default)]
-    struct Shared(Arc<Fake>);
+    pub(in crate::whatsapp) struct Shared(pub Arc<Fake>);
 
     impl LinkBackend for Shared {
         type Bot = u64;
@@ -376,16 +387,30 @@ mod tests {
                 .is_ok();
             let entry = if failed { "delete failed" } else { "delete" };
             self.0.log.lock().expect("log").push(entry.into());
-            if failed { Err(()) } else { Ok(()) }
+            if failed {
+                Err(())
+            } else {
+                self.0.revoked.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        async fn mark_revoked(&self) {
+            self.0.log.lock().expect("log").push("mark revoked".into());
+            self.0.revoked.store(true, Ordering::SeqCst);
+        }
+
+        async fn is_revoked(&self) -> bool {
+            self.0.revoked.load(Ordering::SeqCst)
         }
     }
 
     impl Shared {
-        fn log(&self) -> Vec<String> {
+        pub(in crate::whatsapp) fn log(&self) -> Vec<String> {
             self.0.log.lock().expect("log").clone()
         }
 
-        fn callback(&self, generation: u64) -> Callbacks {
+        pub(in crate::whatsapp) fn callback(&self, generation: u64) -> Callbacks {
             self.0
                 .callbacks
                 .lock()
@@ -396,7 +421,9 @@ mod tests {
         }
     }
 
-    fn owner(fake: Fake) -> (Shared, LinkHandle, Session, UnboundedReceiver<AdapterEvent>) {
+    pub(in crate::whatsapp) fn owner(
+        fake: Fake,
+    ) -> (Shared, LinkHandle, Session, UnboundedReceiver<AdapterEvent>) {
         let shared = Shared(Arc::new(fake));
         let (tx, rx) = unbounded_channel();
         let session = Session::default();
@@ -490,7 +517,10 @@ mod tests {
         fake.callback(1).send(LinkEvent::LoggedOut);
         handle.begin(None, 7);
         handle.flush().await;
-        assert_eq!(fake.log(), vec!["start 1", "stop 1", "delete", "start 3"]);
+        assert_eq!(
+            fake.log(),
+            vec!["start 1", "mark revoked", "stop 1", "delete", "start 3"]
+        );
     }
 
     /// r4093192847, r4093309814, r4093726770: callbacks of an old link after
@@ -576,6 +606,7 @@ mod tests {
             fake.log(),
             vec![
                 "start 1",
+                "mark revoked",
                 "stop 1",
                 "delete failed",
                 "delete failed",
@@ -664,7 +695,10 @@ mod tests {
                 .any(|event| matches!(event, AdapterEvent::WhatsAppQr { .. })),
             "a QR of a canceled link must not reach the shell"
         );
-        assert_eq!(fake.log(), vec!["start 1", "stop 1", "delete", "start 4"]);
+        assert_eq!(
+            fake.log(),
+            vec!["start 1", "mark revoked", "stop 1", "delete", "start 4"]
+        );
         assert!(!session.is_connected());
 
         fake.callback(4).send(qr("fresh"));
@@ -673,6 +707,54 @@ mod tests {
             event,
             AdapterEvent::WhatsAppQr { generation: 7, code } if code.reveal() == "fresh"
         )));
+    }
+
+    /// Codex r4093899843: a failed delete of a revoked store survives a
+    /// restart. The next start after the restart deletes it first.
+    #[tokio::test]
+    async fn revoked_mark_survives_a_restart() {
+        let (fake, handle, _session, _rx) = owner(Fake {
+            delete_failures: AtomicUsize::new(1),
+            ..Fake::default()
+        });
+        handle.begin(None, 7);
+        handle.flush().await;
+        fake.callback(1).send(LinkEvent::LoggedOut);
+        handle.flush().await;
+        drop(handle);
+
+        // A restart: a new owner with no memory, on the same "disk".
+        let (tx, _rx) = unbounded_channel();
+        let restarted = LinkHandle::spawn(fake.clone(), Session::default(), tx);
+        restarted.begin(None, 8);
+        restarted.flush().await;
+        assert_eq!(
+            fake.log(),
+            vec![
+                "start 1",
+                "mark revoked",
+                "stop 1",
+                "delete failed",
+                "delete",
+                "start 1"
+            ]
+        );
+        assert!(
+            !fake.0.revoked.load(Ordering::SeqCst),
+            "a delete clears the mark"
+        );
+
+        // Without a mark, a start does not delete anything.
+        restarted.begin(None, 9);
+        restarted.flush().await;
+        assert_eq!(fake.log().last().map(String::as_str), Some("start 2"));
+        assert!(
+            !fake
+                .log()
+                .iter()
+                .skip(6)
+                .any(|entry| entry.starts_with("delete"))
+        );
     }
 
     /// #44: shutdown waits for a pending start, then stops that client.

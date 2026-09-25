@@ -1792,6 +1792,7 @@ mod tests {
             "device.sqlite",
             "device.sqlite-wal",
             "device.sqlite-shm",
+            "device.sqlite-revoked",
             "other.txt",
         ] {
             std::fs::write(dir.join(name), b"x").expect("write");
@@ -1800,6 +1801,10 @@ mod tests {
         assert!(!store.exists());
         assert!(!dir.join("device.sqlite-wal").exists());
         assert!(!dir.join("device.sqlite-shm").exists());
+        assert!(
+            !path::revoked_marker(&store).exists(),
+            "a successful delete clears the revoked mark"
+        );
         assert!(dir.join("other.txt").exists());
         path::remove_device_store(&store).expect("missing files are fine");
         let _ = std::fs::remove_dir_all(&dir);

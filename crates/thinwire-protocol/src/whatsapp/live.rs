@@ -19,7 +19,8 @@ use whatsapp_rust::{Client, ClientError, Jid};
 use super::inbox::{HistoryChat, WaMessage};
 use super::link::{Callbacks, LinkBackend, StartError, Started};
 use super::path::{
-    prepare_session_dir, remove_device_store, restrict_store_file, whatsapp_device_store_path,
+    prepare_session_dir, remove_device_store, restrict_store_file, revoked_marker,
+    whatsapp_device_store_path,
 };
 use super::session::{LinkEvent, SendFailure, SendFuture, WhatsAppSender};
 use crate::adapter::RedactedPairingSecret;
@@ -69,6 +70,24 @@ impl LinkBackend for LiveBackend {
             .await
             .map_err(|_| ())?
             .map_err(|_| ())
+    }
+
+    async fn mark_revoked(&self) {
+        let Ok(path) = whatsapp_device_store_path() else {
+            return;
+        };
+        let marker = revoked_marker(&path);
+        let _ = tokio::task::spawn_blocking(move || std::fs::write(marker, b"")).await;
+    }
+
+    async fn is_revoked(&self) -> bool {
+        let Ok(path) = whatsapp_device_store_path() else {
+            return false;
+        };
+        let marker = revoked_marker(&path);
+        tokio::task::spawn_blocking(move || marker.exists())
+            .await
+            .unwrap_or(false)
     }
 }
 

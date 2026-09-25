@@ -31,9 +31,23 @@ pub(crate) fn prepare_session_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// SQLite side files next to the device store.
+/// Marker file next to the store: the phone revoked this device. It survives
+/// a restart, so the next start deletes the revoked store first.
 #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
-const STORE_SIDE_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+const REVOKED_SUFFIX: &str = "-revoked";
+
+/// Files next to the device store: SQLite side files, then the revoked
+/// marker. The marker goes last, so a failed delete keeps it.
+#[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+const STORE_SIDE_SUFFIXES: [&str; 4] = ["-wal", "-shm", "-journal", REVOKED_SUFFIX];
+
+/// Path of the revoked marker of `store`.
+#[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+pub(crate) fn revoked_marker(store: &Path) -> PathBuf {
+    let mut marker = store.as_os_str().to_owned();
+    marker.push(REVOKED_SUFFIX);
+    PathBuf::from(marker)
+}
 
 /// Delete the device store and its SQLite side files. Missing files are fine.
 #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
