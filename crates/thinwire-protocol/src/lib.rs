@@ -3,6 +3,7 @@
 mod adapter;
 #[cfg(test)]
 mod contract;
+pub mod demo;
 mod discord;
 mod fake;
 mod host;

@@ -424,10 +424,9 @@ pub struct Snapshot {
     /// Protocols with a session: they reached `Linked` and did not end. A
     /// `Linking` after `Linked` is a reconnect; the session stays (ADR 0010).
     sessions: HashSet<ProtocolId>,
-    /// Test hook: protocols the shell shows even with their feature off, so
-    /// default CI can test the shell with more than Telegram.
-    #[cfg(test)]
-    visible_for_test: HashSet<ProtocolId>,
+    /// Protocols the shell shows even with their feature off: the demo
+    /// adapters (#120), and tests of the shell with more than Telegram.
+    pub(crate) extra_visible: HashSet<ProtocolId>,
     /// Telegram chats with a request for older messages in flight (#30).
     /// One request at a time for each chat.
     older_loading: HashSet<String>,
@@ -587,8 +586,7 @@ impl Snapshot {
 
             open_on_link: None,
             sessions: HashSet::new(),
-            #[cfg(test)]
-            visible_for_test: HashSet::new(),
+            extra_visible: HashSet::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
@@ -626,6 +624,12 @@ impl Snapshot {
             #[cfg(feature = "signal-local")]
             signal_notice_acknowledged: false,
         }
+    }
+
+    /// Use these Telegram API credentials, for example the invented ones of
+    /// the demo (#120).
+    pub(crate) fn set_api_source(&mut self, source: TelegramApiSource) {
+        self.api_source = source;
     }
 
     #[cfg(test)]
@@ -1209,8 +1213,7 @@ impl Snapshot {
     /// when their cargo features are on.
     #[must_use]
     pub fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
-        #[cfg(test)]
-        if self.visible_for_test.contains(&protocol) {
+        if self.extra_visible.contains(&protocol) {
             return true;
         }
         match protocol {
@@ -5600,7 +5603,7 @@ mod tests {
     #[test]
     fn refresh_does_not_start_an_unlinked_slack_install() {
         let mut snapshot = Snapshot::new();
-        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
         snapshot.refresh_visible();
         assert!(
             snapshot.take_commands().iter().all(|command| !matches!(
@@ -5999,7 +6002,7 @@ mod tests {
     /// A Snapshot that shows Slack and Discord too, whatever the features.
     fn shell_with(protocols: &[ProtocolId]) -> Snapshot {
         let mut snapshot = Snapshot::new();
-        snapshot.visible_for_test.extend(protocols.iter().copied());
+        snapshot.extra_visible.extend(protocols.iter().copied());
         snapshot
     }
 
@@ -6123,7 +6126,7 @@ mod tests {
     fn send_answers_work_per_protocol() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.visible_for_test.insert(ProtocolId::Discord);
+        snapshot.extra_visible.insert(ProtocolId::Discord);
         link(&mut snapshot, ProtocolId::Discord);
         allow_send(&mut snapshot, ProtocolId::Discord);
         // The same chat id in two protocols.
@@ -6283,7 +6286,7 @@ mod tests {
     fn an_error_status_never_unlinks() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
         link(&mut snapshot, ProtocolId::Slack);
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
@@ -6308,7 +6311,7 @@ mod tests {
     fn unlinking_one_protocol_drops_only_its_state() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
         link(&mut snapshot, ProtocolId::Slack);
         allow_send(&mut snapshot, ProtocolId::Slack);
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -6355,7 +6358,7 @@ mod tests {
     fn view_chat_follows_the_selection_and_sends_only_changes() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
         assert_eq!(
             view_commands(&mut snapshot),
             vec![(ProtocolId::Telegram, Some("telegram:1".into()))]
@@ -6775,7 +6778,7 @@ mod tests {
     fn unlinking_one_protocol_keeps_another_protocols_draft() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
         link(&mut snapshot, ProtocolId::Slack);
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "telegram:2", true),
@@ -6795,7 +6798,7 @@ mod tests {
     fn a_protocol_switch_parks_the_draft_under_the_old_protocol() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
         link(&mut snapshot, ProtocolId::Slack);
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "slack:C1", true),
@@ -7268,7 +7271,7 @@ mod tests {
     fn a_running_load_line_wins_over_a_finished_ready_line() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
         snapshot.apply(AdapterEvent::ChatListLoaded {
             protocol: ProtocolId::Telegram,
         });

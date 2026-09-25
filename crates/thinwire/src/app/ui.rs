@@ -2,8 +2,8 @@
 
 use std::time::Instant;
 
-use chrono::Local;
 use eframe::egui::{self, RichText};
+use thinwire_core::ViewNow;
 use thinwire_protocol::{AdapterStatus, Delivery, ProtocolId};
 
 use super::auth;
@@ -525,6 +525,14 @@ fn show_no_chats(snapshot: &Snapshot) -> bool {
         .any(|row| row.caps.id == snapshot.selected_protocol && row.linked())
 }
 
+/// The chat-list time of `at`, in the zone of the view's clock (#120).
+fn view_list_time(at: i64, now: ViewNow) -> String {
+    match now {
+        ViewNow::Local(now) => list_time(at, &now),
+        ViewNow::Fixed(now) => list_time(at, &now),
+    }
+}
+
 fn inbox(
     ui: &mut egui::Ui,
     snapshot: &View<'_>,
@@ -532,7 +540,7 @@ fn inbox(
     inbox_list_id: egui::Id,
     out: &mut Vec<Intent>,
 ) {
-    let now = Local::now();
+    let now = snapshot.now();
     let rows: Vec<(String, String, String, u32, String)> = snapshot
         .visible_conversations()
         .iter()
@@ -542,7 +550,7 @@ fn inbox(
                 row.title.clone(),
                 row.preview.clone(),
                 row.unread,
-                list_time(row.last_at, &now),
+                view_list_time(row.last_at, now),
             )
         })
         .collect();
@@ -1008,7 +1016,10 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     let is_group = snapshot
         .selected_conversation_row()
         .is_some_and(|row| row.is_group);
-    let layout = thread_rows(snapshot.selected_messages(), is_group, &Local::now());
+    let layout = match snapshot.now() {
+        ViewNow::Local(now) => thread_rows(snapshot.selected_messages(), is_group, &now),
+        ViewNow::Fixed(now) => thread_rows(snapshot.selected_messages(), is_group, &now),
+    };
     let messages: Vec<Bubble> = snapshot
         .selected_messages()
         .iter()

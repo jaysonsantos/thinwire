@@ -104,7 +104,9 @@ fn thread_draws_bubbles_by_side_with_times_and_day_breaks() {
         "colors come from the theme"
     );
     assert!(ui.contains("thread_rows(snapshot.selected_messages(), is_group"));
-    assert!(ui.contains("list_time(row.last_at, &now)"));
+    assert!(ui.contains("view_list_time(row.last_at, now)"));
+    // Times come from the view's clock only (#120), never the system clock.
+    assert!(!ui.contains("Local::now"));
 }
 
 #[test]

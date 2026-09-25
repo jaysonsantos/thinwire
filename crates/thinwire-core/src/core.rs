@@ -18,6 +18,7 @@ use thinwire_protocol::{
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+use crate::clock::Clock;
 use crate::intent::{
     AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
 };
@@ -42,6 +43,7 @@ const SECRET_STORE_STATUS_PREFIX: &str = "Sign in with Telegram to get started."
 pub struct CoreConfig {
     settings: Settings,
     memory_secrets: bool,
+    clock: Clock,
 }
 
 impl CoreConfig {
@@ -57,7 +59,16 @@ impl CoreConfig {
         Self {
             settings,
             memory_secrets: false,
+            clock: Clock::System,
         }
+    }
+
+    /// The clock of the view. The app keeps [`Clock::System`]; the demo and
+    /// tests use a fixed clock (#120).
+    #[must_use]
+    pub const fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Keep every secret in memory, as `THINWIRE_KEYRING=memory` does.
@@ -90,6 +101,11 @@ pub struct Core {
     events: UnboundedReceiver<AdapterEvent>,
     state: Snapshot,
     settings: Settings,
+    clock: Clock,
+    /// Commands sent to the host, and events read from it. The demo compares
+    /// them with its adapters' counts to know when it is idle (#120).
+    commands_sent: std::sync::atomic::AtomicU64,
+    events_read: u64,
     secrets: Arc<SecretStore>,
     whatsapp_phone: Arc<WhatsAppPhoneVault>,
     notifier: ChangeNotifier,
@@ -157,6 +173,18 @@ impl Core {
             Arc::clone(&whatsapp_phone),
             signal,
         );
+        Self::with_host(runtime, config, secrets, whatsapp_phone, host)
+    }
+
+    /// A core over a host that the caller spawned, for example with the demo
+    /// adapters (#120).
+    pub(crate) fn with_host(
+        runtime: &Handle,
+        config: CoreConfig,
+        secrets: Arc<SecretStore>,
+        whatsapp_phone: Arc<WhatsAppPhoneVault>,
+        host: AdapterHost,
+    ) -> Self {
         // `for_ui` only schedules keychain attach. A start can run before
         // that blocking read finishes, so arm Discord and Slack again once
         // a token is in memory. The hook sends a command; it does not touch
@@ -175,6 +203,9 @@ impl Core {
             events,
             state,
             settings: config.settings,
+            clock: config.clock,
+            commands_sent: std::sync::atomic::AtomicU64::new(0),
+            events_read: 0,
             secrets,
             whatsapp_phone,
             notifier,
@@ -192,6 +223,19 @@ impl Core {
         self.notifier.subscribe()
     }
 
+    /// Commands sent to the host and events read from it (#120).
+    pub(crate) fn work_counts(&self) -> (u64, u64) {
+        (
+            self.commands_sent.load(std::sync::atomic::Ordering::SeqCst),
+            self.events_read,
+        )
+    }
+
+    /// The state, for the demo scenarios (#120).
+    pub(crate) const fn state_mut(&mut self) -> &mut Snapshot {
+        &mut self.state
+    }
+
     /// The state for this redraw.
     ///
     /// Frontend thread only. See [`Core`] "Threads".
@@ -201,6 +245,7 @@ impl Core {
             state: &self.state,
             secrets: &self.secrets,
             settings: &self.settings,
+            clock: self.clock,
         }
     }
 
@@ -215,6 +260,7 @@ impl Core {
         let expired = self.state.expire_sends();
         let mut applied = false;
         while let Ok(event) = self.events.try_recv() {
+            self.events_read += 1;
             // The login epoch check runs here, on the thread that sends
             // Cancel, not in the forward task (issue #42, PR #49).
             if let Some(event) = self.commands.deliver(event) {
@@ -483,6 +529,8 @@ impl Core {
     }
 
     fn send(&self, command: AdapterCommand) {
+        self.commands_sent
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !self.commands.send(command) {
             tracing::warn!("adapter host command channel closed");
         }
