@@ -13,6 +13,7 @@ use thinwire_protocol::{
 };
 
 use crate::secrets::{SecretKey, SecretStore};
+use crate::sends::{Pending, SendTracker};
 
 /// Shown until TDLib reports Ready. Feature-off builds stay on this copy.
 pub const TDLIB_UNAVAILABLE_BANNER: &str = "TDLib unavailable in this build. Enable feature telegram-tdlib after a local TDLib install. These screens do not open a live Telegram session.";
@@ -365,13 +366,13 @@ pub struct Snapshot {
     focus_compose: bool,
     /// Protocols that answered `Shutdown` with `Stopped`.
     stopped: HashSet<ProtocolId>,
-    /// Sends the adapter has not accepted yet: chat id → (request id, text).
-    /// One per chat, so a send in one chat does not block Send in another.
-    /// The text stays until the pending row arrives; only a matching
-    /// `SendRejected` fails the send (PR #40 review).
-    sending: HashMap<String, (u64, String)>,
-    /// Local id for the next `SendText`.
-    next_send_request: u64,
+    /// Sends and retries in flight, one per (protocol, chat). The text stays
+    /// until the adapter accepts it; only the request's own `SendAccepted` /
+    /// `SendRejected` ends an entry (PR #40 review, shell plan items 4, 10).
+    sends: SendTracker,
+    /// The shell's id for the next WhatsApp pairing.
+    #[cfg(feature = "whatsapp-web")]
+    next_pairing_generation: u64,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
     api_source: TelegramApiSource,
@@ -483,8 +484,9 @@ impl Snapshot {
             drafts: HashMap::new(),
             focus_compose: false,
             stopped: HashSet::new(),
-            sending: HashMap::new(),
-            next_send_request: 1,
+            sends: SendTracker::default(),
+            #[cfg(feature = "whatsapp-web")]
+            next_pairing_generation: 1,
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
@@ -589,20 +591,12 @@ impl Snapshot {
                 protocol,
                 conversation_id,
                 request,
-            } => {
-                if protocol == ProtocolId::Telegram {
-                    self.note_send_accepted(&conversation_id, request);
-                }
-            }
+            } => self.note_send_accepted(protocol, &conversation_id, request),
             AdapterEvent::SendRejected {
                 protocol,
                 conversation_id,
                 request,
-            } => {
-                if protocol == ProtocolId::Telegram {
-                    self.fail_unaccepted_send(&conversation_id, request);
-                }
-            }
+            } => self.fail_unaccepted_send(protocol, &conversation_id, request),
             AdapterEvent::Stopped { protocol } => {
                 self.stopped.insert(protocol);
             }
@@ -922,7 +916,7 @@ impl Snapshot {
             && self
                 .selected_conversation
                 .as_ref()
-                .is_none_or(|chat| !self.sending.contains_key(chat))
+                .is_none_or(|chat| !self.sends.in_flight(self.selected_protocol, chat))
             && self
                 .selected_conversation
                 .as_deref()
@@ -959,14 +953,19 @@ impl Snapshot {
         if !message.outbound || message.delivery != Delivery::Failed {
             return;
         }
+        // One send or retry per chat. Only this retry's own answer ends it.
+        let Some(request) = self
+            .sends
+            .begin_retry(protocol, &conversation_id, message_id)
+        else {
+            return;
+        };
         message.delivery = Delivery::Pending;
         if self.compose == message.body {
             self.compose.clear();
         }
         self.error = None;
         self.status_text = "Sending…".into();
-        let request = self.next_send_request;
-        self.next_send_request += 1;
         self.pending.push(AdapterCommand::ResendMessage {
             protocol,
             conversation_id,
@@ -1108,7 +1107,7 @@ impl Snapshot {
     /// line such as "Loading recent messages." is not idle then (#64 review).
     #[must_use]
     pub fn is_loading(&self) -> bool {
-        self.chat_list_loading || !self.history_loading.is_empty() || !self.sending.is_empty()
+        self.chat_list_loading || !self.history_loading.is_empty() || !self.sends.is_empty()
     }
 
     #[must_use]
@@ -1376,14 +1375,12 @@ impl Snapshot {
     /// The adapter accepted this send (chat and request id match). Only now
     /// does the compose text (or the chat's draft) clear. A history message
     /// with the same text is not an acceptance (Codex 4091552898).
-    fn note_send_accepted(&mut self, chat: &str, request: u64) {
-        if self.sending.get(chat).map(|(id, _)| *id) != Some(request) {
-            return;
-        }
-        let Some((_, body)) = self.sending.remove(chat) else {
+    fn note_send_accepted(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
+        // An accepted retry needs nothing more: its delivery events move the row.
+        let Some(Pending::Send { body, .. }) = self.sends.settle(protocol, chat, request) else {
             return;
         };
-        let selected = self.selected_conversation.as_deref() == Some(chat);
+        let selected = self.is_selected_chat(protocol, chat);
         if selected && self.compose.trim() == body {
             self.compose.clear();
         } else if self
@@ -1398,16 +1395,20 @@ impl Snapshot {
     /// The adapter rejected this send (chat and request id match): it was
     /// not accepted. The text is still in its compose field or draft. Other
     /// errors (for example a history load error) never fail a send.
-    fn fail_unaccepted_send(&mut self, chat: &str, request: u64) {
-        if self.sending.get(chat).map(|(id, _)| *id) != Some(request) {
-            return;
+    fn fail_unaccepted_send(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
+        let why = format!("{} did not accept the message.", protocol.display_name());
+        match self.sends.settle(protocol, chat, request) {
+            Some(Pending::Send { .. }) => self.set_error(
+                "Message not sent.",
+                &why,
+                "The text is still in the compose field. Send it again.",
+            ),
+            Some(Pending::Retry { message_id, .. }) => {
+                self.set_delivery(protocol, chat, &message_id, Delivery::Failed);
+                self.set_error("Message not sent.", &why, "Press Retry to send it again.");
+            }
+            None => {}
         }
-        self.sending.remove(chat);
-        self.set_error(
-            "Message not sent.",
-            "Telegram did not accept the message.",
-            "The text is still in the compose field. Send it again.",
-        );
     }
 
     /// Enter submits the current login step. Escape cancels the login.
@@ -1465,10 +1466,12 @@ impl Snapshot {
         };
         let body = self.compose.trim().to_string();
         // Keep the text until the adapter accepts the send; see note_send_accepted.
-        let request = self.next_send_request;
-        self.next_send_request += 1;
-        self.sending
-            .insert(conversation_id.clone(), (request, body.clone()));
+        let Some(request) = self
+            .sends
+            .begin_send(ProtocolId::Telegram, &conversation_id, &body)
+        else {
+            return;
+        };
         self.error = None;
         self.pending.push(AdapterCommand::SendText {
             protocol: ProtocolId::Telegram,
@@ -1635,7 +1638,7 @@ impl Snapshot {
         self.chat_list_loading = false;
         self.drafts.clear();
         self.compose.clear();
-        self.sending.clear();
+        self.sends.drop_protocol(ProtocolId::Telegram);
         if self.selected_protocol == ProtocolId::Telegram {
             self.selected_conversation = None;
         }
@@ -2022,8 +2025,8 @@ impl Snapshot {
         self.whatsapp_started = true;
         self.error = None;
         self.status_text = "WhatsApp pairing requested.".into();
-        let generation = self.next_send_request;
-        self.next_send_request += 1;
+        let generation = self.next_pairing_generation;
+        self.next_pairing_generation += 1;
         self.pending
             .push(AdapterCommand::WhatsAppBeginLink { generation });
     }
@@ -3802,7 +3805,10 @@ mod tests {
 
     /// The adapter accepts the in-flight send of `chat` (its own request id).
     fn accept(snapshot: &mut Snapshot, chat: &str) {
-        let request = snapshot.sending.get(chat).expect("a send in flight").0;
+        let request = snapshot
+            .sends
+            .request_of(ProtocolId::Telegram, chat)
+            .expect("a send in flight");
         snapshot.apply(AdapterEvent::SendAccepted {
             protocol: ProtocolId::Telegram,
             conversation_id: chat.into(),
@@ -4829,5 +4835,79 @@ mod tests {
         snapshot.close_whatsapp_gate(&phone);
         assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
         assert!(snapshot.take_commands().is_empty());
+    }
+
+    /// A retry of a failed row, ready for tests: returns its request id.
+    fn retry_failed_row(snapshot: &mut Snapshot) -> u64 {
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 101, "hi", Delivery::Failed),
+        });
+        snapshot.error = None;
+        snapshot.retry_send("telegram:1:101");
+        let commands = snapshot.take_commands();
+        let request = commands
+            .iter()
+            .find_map(|command| match command {
+                AdapterCommand::ResendMessage { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("a ResendMessage");
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+        request
+    }
+
+    /// Shell plan item 10 (Codex #53): a retry stays pending across a
+    /// reconnect. Only its own answer ends it.
+    #[test]
+    fn a_retry_stays_pending_until_its_own_answer() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = retry_failed_row(&mut snapshot);
+        for status in [AdapterStatus::Connecting, AdapterStatus::Ready] {
+            snapshot.apply(AdapterEvent::Status {
+                protocol: ProtocolId::Telegram,
+                status,
+                detail: "reconnect".into(),
+            });
+        }
+        snapshot.compose = "next".into();
+        assert!(!snapshot.can_send(), "the chat still has a retry in flight");
+        snapshot.retry_send("telegram:1:101");
+        assert!(snapshot.take_commands().is_empty(), "no second retry");
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert!(snapshot.can_send(), "the retry ended");
+    }
+
+    /// A rejected retry sets its row back to Failed and shows the error. A
+    /// rejection with an old request id changes nothing.
+    #[test]
+    fn a_rejected_retry_fails_its_row_again() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let request = retry_failed_row(&mut snapshot);
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request: request + 100,
+        });
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+        assert!(snapshot.error.is_none());
+
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+        assert_eq!(
+            snapshot.error.as_ref().map(|error| error.happened.as_str()),
+            Some("Message not sent.")
+        );
     }
 }

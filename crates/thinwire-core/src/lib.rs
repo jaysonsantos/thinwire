@@ -9,6 +9,7 @@ mod core;
 mod intent;
 mod secret_text;
 pub mod secrets;
+mod sends;
 pub mod settings;
 mod signal;
 pub mod state;
