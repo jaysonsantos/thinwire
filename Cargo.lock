@@ -6373,6 +6373,7 @@ dependencies = [
  "egui_kittest",
  "qrcode",
  "thinwire-core",
+ "thinwire-notify",
  "thinwire-protocol",
  "thinwire-signal",
  "tokio",

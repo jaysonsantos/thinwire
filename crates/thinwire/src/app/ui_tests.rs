@@ -475,3 +475,41 @@ fn a_ready_loading_line_stays_busy_until_the_history_loads() {
     snapshot.apply(status(AdapterStatus::Ready, "Message sent."));
     assert!(snapshot.status_is_idle(), "a finished send is idle");
 }
+
+#[test]
+fn notifications_reach_the_os_thread_and_the_title_counts_unread() {
+    use super::window_title;
+    assert_eq!(window_title(0), "thinwire");
+    assert_eq!(window_title(3), "thinwire (3)");
+
+    let app = include_str!("mod.rs");
+    let pass = &app[app.find("fn ui(&mut self").expect("ui")..];
+    let pass = &pass[..pass.find("\n    }\n").expect("end")];
+    let intents = pass
+        .find("self.notification_intents(")
+        .expect("focus and clicks");
+    let dispatch = pass.find("self.core.dispatch(intent)").expect("dispatch");
+    let send = pass
+        .find("self.notifier.send(self.core.take_notify())")
+        .expect("to the OS thread");
+    assert!(
+        intents < dispatch && dispatch < send,
+        "intents, then dispatch, then show"
+    );
+    assert!(pass.contains("self.update_title("));
+    assert!(app.contains("Intent::WindowFocus(focused)"));
+    assert!(
+        app.contains("ViewportCommand::Focus"),
+        "a click raises the window"
+    );
+
+    let ui = include_str!("ui.rs");
+    let control = &ui[ui.find("fn notification_control(").expect("switches")..];
+    let control = &control[..control.find("\nfn ").expect("next")];
+    assert!(control.contains("Intent::SetNotifications("));
+    assert!(control.contains("Intent::SetNotificationPreview("));
+    assert!(
+        control.contains("add_enabled(on"),
+        "the preview switch needs notifications on"
+    );
+}

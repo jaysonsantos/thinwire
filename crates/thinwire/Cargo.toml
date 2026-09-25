@@ -32,6 +32,7 @@ chrono.workspace = true
 eframe.workspace = true
 egui.workspace = true
 thinwire-core.workspace = true
+thinwire-notify.workspace = true
 thinwire-protocol.workspace = true
 thinwire-signal = { workspace = true, optional = true }
 winit.workspace = true

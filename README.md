@@ -128,7 +128,15 @@ Set `THINWIRE_KEYRING=memory` to skip the OS keychain (CI and local headless). T
 
 While the keychain opens, the app shows "Opening the keychain…". After 1 second it shows "Waiting for the keychain. Unlock it to continue." A locked wallet can put its unlock prompt behind the window.
 
-Theme preference is `System` (follow the OS, including live `ThemeChanged` updates), `Light`, or `Dark`. A missing `settings.toml` means System. The file lives under the platform config dir (`~/.config/thinwire/settings.toml` on Linux) and stores only the mode enum.
+Theme preference is `System` (follow the OS, including live `ThemeChanged` updates), `Light`, or `Dark`. A missing `settings.toml` means System. The file lives under the platform config dir (`~/.config/thinwire/settings.toml` on Linux). It stores the theme mode and the two notification switches.
+
+Desktop notifications (#32) show a new message when you do not look at its chat. They are on by default. The "⋯" menu has two switches: "Show notifications" and "Hide message text".
+
+- The rules are the same for each protocol. A muted chat, your own message (also from another device), an open chat in a focused window, and a message older than 5 minutes do not notify.
+- One notification shows for each chat, with the count of new messages.
+- The window title shows the unread count of chats that are not muted, for example "thinwire (3)".
+- Privacy: a notification sends the chat title, the sender in a group, and up to 120 characters of the message to the OS notification service. "Hide message text" sends "New message" only. thinwire never writes message text to its log.
+- Linux uses the freedesktop notification service over D-Bus. A click opens the chat. macOS and Windows show notifications, but a click does not open the chat yet.
 
 There is no distroless GUI container. This is a desktop egui app.
 
