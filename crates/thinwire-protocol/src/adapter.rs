@@ -14,17 +14,24 @@ pub type EventTx = UnboundedSender<AdapterEvent>;
 /// the value it started with. The host drops stale ones (issue #42).
 pub(crate) type LoginEpoch = std::sync::Arc<std::sync::atomic::AtomicU64>;
 
-/// v1 protocol identifiers (S2: Signal is out of v1).
+/// Protocol identifiers. Signal is local-only (`signal-local`) and stays out of release builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolId {
     Telegram,
     WhatsApp,
     Discord,
     Slack,
+    Signal,
 }
 
 impl ProtocolId {
-    pub const ALL: [Self; 4] = [Self::Telegram, Self::WhatsApp, Self::Discord, Self::Slack];
+    pub const ALL: [Self; 5] = [
+        Self::Telegram,
+        Self::WhatsApp,
+        Self::Discord,
+        Self::Slack,
+        Self::Signal,
+    ];
 
     #[must_use]
     pub const fn display_name(self) -> &'static str {
@@ -33,6 +40,7 @@ impl ProtocolId {
             Self::WhatsApp => "WhatsApp",
             Self::Discord => "Discord",
             Self::Slack => "Slack",
+            Self::Signal => "Signal",
         }
     }
 }
@@ -292,6 +300,17 @@ pub enum AdapterCommand {
     },
     /// Stops experimental pairing and clears the in-memory risk acknowledgement.
     WhatsAppCancelLink,
+    /// Records that the full-screen Signal local-build notice was accepted.
+    /// Carries no secrets and does not open a network session.
+    SignalAcknowledgeNotice,
+    /// Asks the worker to start local-only secondary-device linking.
+    /// The provisioning URL is not a field. It leaves later as a redacted event.
+    /// `generation` is the pairing the core assigned. The QR carries the same value.
+    SignalBeginLink {
+        generation: u64,
+    },
+    /// Stops local-only linking and clears the in-memory notice acknowledgement.
+    SignalCancelLink,
 }
 
 impl AdapterCommand {
@@ -312,6 +331,9 @@ impl AdapterCommand {
             Self::WhatsAppAcknowledgeRisk
             | Self::WhatsAppBeginLink { .. }
             | Self::WhatsAppCancelLink => ProtocolId::WhatsApp,
+            Self::SignalAcknowledgeNotice
+            | Self::SignalBeginLink { .. }
+            | Self::SignalCancelLink => ProtocolId::Signal,
         }
     }
 }
@@ -469,6 +491,13 @@ pub enum AdapterEvent {
         /// Link generation that produced this payload. Stale generations are dropped.
         generation: u64,
     },
+    /// Local-only Signal provisioning URL. Debug output is redacted.
+    /// Never log [`RedactedPairingSecret::reveal`].
+    SignalQr {
+        code: RedactedPairingSecret,
+        /// Link generation that produced this payload. Stale generations are dropped.
+        generation: u64,
+    },
 }
 
 impl AdapterEvent {
@@ -621,7 +650,7 @@ pub trait ProtocolAdapter: Send {
     }
 }
 
-pub(crate) fn emit_status(
+pub fn emit_status(
     events: &EventTx,
     protocol: ProtocolId,
     status: AdapterStatus,
@@ -634,11 +663,11 @@ pub(crate) fn emit_status(
     });
 }
 
-pub(crate) fn emit_conversation(events: &EventTx, conversation: Conversation) {
+pub fn emit_conversation(events: &EventTx, conversation: Conversation) {
     let _ = events.send(AdapterEvent::ConversationUpsert { conversation });
 }
 
-pub(crate) fn emit_message(events: &EventTx, message: ChatMessage) {
+pub fn emit_message(events: &EventTx, message: ChatMessage) {
     let _ = events.send(AdapterEvent::MessageReceived { message });
 }
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
@@ -728,7 +757,7 @@ pub(crate) fn emit_message_delivery(
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_send_accepted(
+pub fn emit_send_accepted(
     events: &EventTx,
     protocol: ProtocolId,
     conversation_id: impl Into<String>,
@@ -741,7 +770,7 @@ pub(crate) fn emit_send_accepted(
     });
 }
 
-pub(crate) fn emit_send_rejected(
+pub fn emit_send_rejected(
     events: &EventTx,
     protocol: ProtocolId,
     conversation_id: impl Into<String>,
@@ -754,7 +783,7 @@ pub(crate) fn emit_send_rejected(
     });
 }
 
-pub(crate) fn emit_account(events: &EventTx, protocol: ProtocolId, state: AccountState) {
+pub fn emit_account(events: &EventTx, protocol: ProtocolId, state: AccountState) {
     let _ = events.send(AdapterEvent::Account { protocol, state });
 }
 
@@ -778,7 +807,7 @@ pub(crate) fn emit_notice(events: &EventTx, protocol: ProtocolId, text: impl Int
     });
 }
 
-pub(crate) fn emit_stopped(events: &EventTx, protocol: ProtocolId) {
+pub fn emit_stopped(events: &EventTx, protocol: ProtocolId) {
     let _ = events.send(AdapterEvent::Stopped { protocol });
 }
 
@@ -800,12 +829,12 @@ pub(crate) fn emit_older_history_loaded(
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_chat_list_loaded(events: &EventTx, protocol: ProtocolId) {
+pub fn emit_chat_list_loaded(events: &EventTx, protocol: ProtocolId) {
     let _ = events.send(AdapterEvent::ChatListLoaded { protocol });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-pub(crate) fn emit_history_loaded(
+pub fn emit_history_loaded(
     events: &EventTx,
     protocol: ProtocolId,
     conversation_id: impl Into<String>,

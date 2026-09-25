@@ -3,6 +3,8 @@
 mod auth;
 #[cfg(test)]
 mod inbox_keys;
+#[cfg(feature = "signal-local")]
+mod signal_gate;
 mod theme;
 mod theme_mode;
 mod thread_layout;
@@ -196,7 +198,15 @@ impl ThinwireApp {
     #[must_use]
     pub fn new(settings: Settings, ctx: &egui::Context) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime for protocol adapters");
-        let core = Core::new(runtime.handle(), CoreConfig::new(settings));
+        let config = CoreConfig::new(settings);
+        #[cfg(feature = "signal-local")]
+        let core = Core::with_signal_adapter(
+            runtime.handle(),
+            config,
+            Box::new(thinwire_signal::SignalAdapter::new()),
+        );
+        #[cfg(not(feature = "signal-local"))]
+        let core = Core::new(runtime.handle(), config);
         repaint_on_change(&runtime, &core, ctx.clone());
         close_on_stop_signal(runtime.handle(), ctx.clone());
         Self {

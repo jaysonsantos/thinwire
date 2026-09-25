@@ -18,6 +18,8 @@ slack-oauth = ["thinwire-protocol/slack-oauth"]
 # Experimental spike. Default CI and the default UI stay feature-off.
 whatsapp-web = ["thinwire-protocol/whatsapp-web"]
 discord-bot = ["thinwire-protocol/discord-bot"]
+# Local-only Signal chrome. The AGPL client is `thinwire-signal`, not this crate.
+signal-local = []
 # Test hooks on `SecretStore` for other workspace crates. Never in a release.
 test-support = []
 

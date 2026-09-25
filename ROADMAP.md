@@ -54,7 +54,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 `0011` (2026-09-24). Release builds and OS zips never enable these features.
 
 - [ ] #38 — research an AGPL helper process for WhatsApp and Signal. The output is an ADR with go, no-go, or later.
-- [ ] #39 — Signal inbox behind feature `signal-local` (Presage / libsignal). Off by default. A full-screen notice comes before link. The notice says experimental, local build only, and AGPL.
+- [x] #39 — Signal inbox behind feature `signal-local` (Presage / libsignal). Off by default. A full-screen notice comes before link. The notice says experimental, local build only, and AGPL. Available and local-only.
 - [ ] #77 — move the WhatsApp and Signal adapters into AGPL-licensed crate folders. The root license stays MIT.
 
 ## Spike (scaffold, not the default UI)

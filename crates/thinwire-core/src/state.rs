@@ -102,6 +102,7 @@ pub const fn protocol_chrome_enabled(protocol: ProtocolId) -> bool {
         ProtocolId::Slack => cfg!(feature = "slack-oauth"),
         ProtocolId::WhatsApp => cfg!(feature = "whatsapp-web"),
         ProtocolId::Discord => cfg!(feature = "discord-bot"),
+        ProtocolId::Signal => cfg!(feature = "signal-local"),
     }
 }
 
@@ -313,6 +314,15 @@ struct TimedOut {
     retry: bool,
 }
 
+/// Local-only Signal screens. Only the `signal-local` build can enter them.
+#[cfg(feature = "signal-local")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalScreen {
+    Hidden,
+    Notice,
+    Link,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserError {
     pub happened: String,
@@ -434,12 +444,12 @@ pub struct Snapshot {
     /// until the adapter accepts it; only the request's own `SendAccepted` /
     /// `SendRejected` ends an entry (PR #40 review, shell plan items 4, 10).
     sends: SendTracker,
-    /// The shell's id for the next WhatsApp pairing.
-    #[cfg(feature = "whatsapp-web")]
+    /// The shell's id for the next pairing (WhatsApp or Signal).
+    #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
     next_pairing_generation: u64,
     /// The id of the pairing that runs now. A QR or pair code of any other
     /// pairing is dropped (shell plan 12). `None`: no pairing runs.
-    #[cfg(feature = "whatsapp-web")]
+    #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
     pairing_generation: Option<u64>,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
@@ -460,11 +470,22 @@ pub struct Snapshot {
     /// needs it; showing the gate again or cancelling clears it.
     #[cfg(feature = "whatsapp-web")]
     whatsapp_risk_acknowledged: bool,
+    #[cfg(feature = "signal-local")]
+    pub signal_screen: SignalScreen,
+    #[cfg(feature = "signal-local")]
+    pub signal_qr: Option<String>,
+    #[cfg(feature = "signal-local")]
+    pub signal_started: bool,
+    /// The user accepted the full-screen local-build notice in this session.
+    /// Linking needs it; showing the notice again or cancelling clears it.
+    #[cfg(feature = "signal-local")]
+    signal_notice_acknowledged: bool,
 }
 
-/// Redacted: login fields, the WhatsApp phone and pairing material, compose,
-/// drafts, search, chat titles, and message bodies never reach `Debug`
-/// (PR #48 review). Only screens, flags, and counts are printed.
+/// Redacted: login fields, the WhatsApp phone and pairing material, the
+/// Signal provisioning URL, compose, drafts, search, chat titles, and
+/// message bodies never reach `Debug` (PR #48 review). Only screens, flags,
+/// and counts are printed.
 impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let accounts: Vec<(ProtocolId, AdapterStatus, AccountState)> = self
@@ -492,6 +513,9 @@ impl std::fmt::Debug for Snapshot {
         #[cfg(feature = "whatsapp-web")]
         out.field("whatsapp_screen", &self.whatsapp_screen)
             .field("whatsapp_started", &self.whatsapp_started);
+        #[cfg(feature = "signal-local")]
+        out.field("signal_screen", &self.signal_screen)
+            .field("signal_started", &self.signal_started);
         out.finish_non_exhaustive()
     }
 }
@@ -563,9 +587,9 @@ impl Snapshot {
             focus_compose: false,
             stopped: HashSet::new(),
             sends: SendTracker::default(),
-            #[cfg(feature = "whatsapp-web")]
+            #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
             next_pairing_generation: 1,
-            #[cfg(feature = "whatsapp-web")]
+            #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
             pairing_generation: None,
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
@@ -583,6 +607,14 @@ impl Snapshot {
             whatsapp_started: false,
             #[cfg(feature = "whatsapp-web")]
             whatsapp_risk_acknowledged: false,
+            #[cfg(feature = "signal-local")]
+            signal_screen: SignalScreen::Hidden,
+            #[cfg(feature = "signal-local")]
+            signal_qr: None,
+            #[cfg(feature = "signal-local")]
+            signal_started: false,
+            #[cfg(feature = "signal-local")]
+            signal_notice_acknowledged: false,
         }
     }
 
@@ -618,6 +650,13 @@ impl Snapshot {
                 if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                     // A failed load does not send its end event. Stop the spinners.
                     self.stop_spinners(protocol, None);
+                    #[cfg(feature = "signal-local")]
+                    if protocol == ProtocolId::Signal
+                        && self.signal_started
+                        && !self.protocol_linked(ProtocolId::Signal)
+                    {
+                        self.set_error("Signal linking failed.", &detail, "Start linking again.");
+                    }
                 }
                 // Crate / feature jargon stays on the account row and in logs.
                 // Chrome surfaces Telegram errors and Ready operational copy only.
@@ -700,7 +739,7 @@ impl Snapshot {
                 more,
                 ..
             } => {
-                if protocol == ProtocolId::Telegram {
+                if matches!(protocol, ProtocolId::Telegram | ProtocolId::Signal) {
                     self.older_loading.remove(&conversation_id);
                     let oldest = self
                         .messages
@@ -796,6 +835,16 @@ impl Snapshot {
                     self.whatsapp_pair_code = Some(code.reveal().to_string());
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    let _ = (code, generation);
+                }
+            }
+            AdapterEvent::SignalQr { code, generation } => {
+                #[cfg(feature = "signal-local")]
+                if self.current_pairing(generation) {
+                    self.signal_qr = Some(code.reveal().to_string());
+                }
+                #[cfg(not(feature = "signal-local"))]
                 {
                     let _ = (code, generation);
                 }
@@ -1195,6 +1244,15 @@ impl Snapshot {
             .unwrap_or(0)
     }
 
+    /// Telegram after Ready, and Signal after the account is linked.
+    fn pages_older(&self) -> bool {
+        match self.selected_protocol {
+            ProtocolId::Telegram => self.telegram_authorized,
+            ProtocolId::Signal => self.protocol_linked(ProtocolId::Signal),
+            _ => false,
+        }
+    }
+
     fn protocol_linked(&self, protocol: ProtocolId) -> bool {
         self.accounts
             .iter()
@@ -1313,7 +1371,7 @@ impl Snapshot {
         let Some(id) = self.selected_conversation.as_ref() else {
             return OlderState::Idle;
         };
-        if self.selected_protocol != ProtocolId::Telegram {
+        if !self.pages_older() {
             return OlderState::Idle;
         }
         if self.older_loading.contains(id) {
@@ -1326,8 +1384,9 @@ impl Snapshot {
     }
 
     /// Ask for the page before the oldest loaded message of the selected
-    /// chat. Only Telegram answers `LoadOlderMessages` today. Nothing goes out
-    /// while a request runs, the first page loads, or the start is loaded.
+    /// chat. Telegram and a linked Signal account answer `LoadOlderMessages`.
+    /// Nothing goes out while a request runs, the first page loads, or the
+    /// start is loaded.
     pub(crate) fn load_older(&mut self) {
         self.load_older_at(Instant::now());
     }
@@ -1338,9 +1397,10 @@ impl Snapshot {
         let Some((id, oldest)) = self.older_anchor_at(now) else {
             return;
         };
+        let protocol = self.selected_protocol;
         self.older_loading.insert(id.clone());
         self.pending.push(AdapterCommand::LoadOlderMessages {
-            protocol: ProtocolId::Telegram,
+            protocol,
             conversation_id: id,
             before_message_id: oldest,
         });
@@ -1358,13 +1418,12 @@ impl Snapshot {
     /// The selected chat and its oldest message, when an older request may
     /// go out at `now`.
     fn older_anchor_at(&self, now: Instant) -> Option<(String, String)> {
-        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
+        if !self.pages_older() {
             return None;
         }
+        let protocol = self.selected_protocol;
         let id = self.selected_conversation.clone()?;
-        if self
-            .history_loading
-            .contains(&(ProtocolId::Telegram, id.clone()))
+        if self.history_loading.contains(&(protocol, id.clone()))
             || self.older_loading.contains(&id)
             || self.older_at_start.contains(&id)
         {
@@ -2217,11 +2276,23 @@ impl Snapshot {
                 if protocol == ProtocolId::WhatsApp {
                     self.finish_whatsapp_link();
                 }
+                #[cfg(feature = "signal-local")]
+                if protocol == ProtocolId::Signal {
+                    self.finish_signal_link();
+                }
             }
             AccountState::Unlinked if had_session || before != AccountState::Unlinked => {
                 self.end_session(protocol);
             }
-            AccountState::Unlinked | AccountState::Linking => {}
+            AccountState::Unlinked =>
+            {
+                #[cfg(feature = "signal-local")]
+                if protocol == ProtocolId::Signal && self.signal_started {
+                    self.signal_started = false;
+                    self.signal_qr = None;
+                }
+            }
+            AccountState::Linking => {}
         }
     }
 
@@ -2608,11 +2679,11 @@ impl Snapshot {
     }
 
     /// A pairing payload belongs to the pairing that runs now.
-    #[cfg(feature = "whatsapp-web")]
+    #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
     fn current_pairing(&self, generation: u64) -> bool {
         let current = self.pairing_generation == Some(generation);
         if !current {
-            tracing::warn!("whatsapp pairing payload dropped: it is from an older pairing");
+            tracing::warn!("pairing payload dropped: it is from an older pairing");
         }
         current
     }
@@ -2627,6 +2698,120 @@ impl Snapshot {
         self.whatsapp_screen = WhatsAppScreen::Hidden;
         self.status_text = "WhatsApp pairing cancelled.".into();
         self.pending.push(AdapterCommand::WhatsAppCancelLink);
+    }
+
+    /// Signal linking chrome when feature `signal-local` is compiled.
+    ///
+    /// The default build leaves the feature off, so first-run chrome stays
+    /// Telegram-only.
+    #[cfg(feature = "signal-local")]
+    #[must_use]
+    pub fn signal_linking_available(&self) -> bool {
+        protocol_chrome_enabled(ProtocolId::Signal)
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[must_use]
+    pub fn signal_gate_open(&self) -> bool {
+        self.signal_linking_available() && !matches!(self.signal_screen, SignalScreen::Hidden)
+    }
+
+    #[cfg(feature = "signal-local")]
+    pub fn open_signal_notice(&mut self) {
+        if !self.signal_linking_available() {
+            return;
+        }
+        if self.protocol_linked(ProtocolId::Signal) {
+            self.signal_screen = SignalScreen::Notice;
+            self.signal_qr = None;
+            return;
+        }
+        if self.signal_started {
+            self.pending.push(AdapterCommand::SignalCancelLink);
+        }
+        self.signal_screen = SignalScreen::Notice;
+        self.signal_qr = None;
+        self.signal_started = false;
+        self.signal_notice_acknowledged = false;
+    }
+
+    #[cfg(feature = "signal-local")]
+    /// Leave the notice or the link screen. After the notice was accepted
+    /// this is Cancel: linking stops and the acknowledgement resets. From
+    /// the notice alone it only hides the screen.
+    pub fn close_signal_gate(&mut self) {
+        if self.protocol_linked(ProtocolId::Signal) {
+            self.signal_screen = SignalScreen::Hidden;
+            self.signal_qr = None;
+            return;
+        }
+        if self.signal_screen == SignalScreen::Link
+            || self.signal_notice_acknowledged
+            || self.signal_started
+        {
+            self.cancel_signal_link();
+            return;
+        }
+        self.signal_screen = SignalScreen::Hidden;
+    }
+
+    #[cfg(feature = "signal-local")]
+    pub fn acknowledge_signal_notice(&mut self) {
+        // The notice must be on screen: a frontend cannot skip it.
+        if self.signal_screen != SignalScreen::Notice {
+            tracing::warn!("signal notice acknowledgement dropped: the notice is not shown");
+            return;
+        }
+        self.signal_notice_acknowledged = true;
+        self.signal_screen = SignalScreen::Link;
+        self.error = None;
+        self.status_text = "Signal local-build notice accepted. Linking has not started.".into();
+        self.pending.push(AdapterCommand::SignalAcknowledgeNotice);
+    }
+
+    #[cfg(feature = "signal-local")]
+    pub fn begin_signal_link(&mut self) {
+        // Linking starts only from the link screen, after the notice was accepted.
+        if self.signal_screen != SignalScreen::Link || !self.signal_notice_acknowledged {
+            tracing::warn!("signal linking dropped: the local-build notice was not accepted");
+            return;
+        }
+        if self.signal_started {
+            return;
+        }
+        self.signal_started = true;
+        self.error = None;
+        self.status_text = "Signal linking requested.".into();
+        let generation = self.next_pairing_generation;
+        self.next_pairing_generation += 1;
+        self.pairing_generation = Some(generation);
+        self.pending
+            .push(AdapterCommand::SignalBeginLink { generation });
+    }
+
+    /// Leave the link screen after `Account { Linked }`. The worker stays up.
+    /// This does not send `SignalCancelLink`.
+    #[cfg(feature = "signal-local")]
+    pub fn finish_signal_link(&mut self) {
+        if self.signal_screen == SignalScreen::Hidden {
+            return;
+        }
+        self.signal_screen = SignalScreen::Hidden;
+        self.pairing_generation = None;
+        self.signal_qr = None;
+        self.status_text = "Signal is linked on this local build.".into();
+        self.select_protocol(ProtocolId::Signal);
+    }
+
+    #[cfg(feature = "signal-local")]
+    pub fn cancel_signal_link(&mut self) {
+        self.pairing_generation = None;
+        self.signal_qr = None;
+        self.signal_started = false;
+        self.signal_notice_acknowledged = false;
+        self.signal_screen = SignalScreen::Hidden;
+        self.status_text = "Signal linking cancelled.".into();
+        self.pending.push(AdapterCommand::SignalCancelLink);
     }
 }
 
@@ -4009,6 +4194,10 @@ mod tests {
             protocol_chrome_enabled(ProtocolId::Discord),
             cfg!(feature = "discord-bot")
         );
+        assert_eq!(
+            protocol_chrome_enabled(ProtocolId::Signal),
+            cfg!(feature = "signal-local")
+        );
         let filters = InboxFilter::chrome_filters();
         assert!(filters.contains(&InboxFilter::All));
         assert!(filters.contains(&InboxFilter::Telegram));
@@ -4035,6 +4224,127 @@ mod tests {
             snapshot.shows_in_switcher(ProtocolId::Slack),
             cfg!(feature = "slack-oauth")
         );
+        assert_eq!(
+            snapshot.shows_in_switcher(ProtocolId::Signal),
+            cfg!(feature = "signal-local")
+        );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn linked_closes_the_signal_gate_without_cancelling_the_session() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Link);
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+        assert!(!snapshot.signal_gate_open());
+        assert!(snapshot.signal_qr.is_none());
+        assert_eq!(snapshot.selected_protocol, ProtocolId::Signal);
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .any(|row| row.caps.id == ProtocolId::Signal && row.linked())
+        );
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::SignalCancelLink)
+        );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_failed_link_can_start_again() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        assert!(snapshot.signal_started);
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: "Signal linking failed. No provisioning URL was logged.".into(),
+        });
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        assert!(!snapshot.signal_started);
+        let error = snapshot.error.clone().expect("error");
+        assert_eq!(error.happened, "Signal linking failed.");
+        assert!(error.why.contains("No provisioning URL"));
+        assert!(error.next.contains("Start linking again"));
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn reviewing_the_notice_keeps_a_linked_session() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.open_signal_notice();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Notice);
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::SignalCancelLink)
+        );
+        snapshot.close_signal_gate();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::SignalCancelLink)
+        );
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .any(|row| row.caps.id == ProtocolId::Signal && row.linked())
+        );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn an_older_signal_qr_is_dropped() {
+        use thinwire_protocol::RedactedPairingSecret;
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let AdapterCommand::SignalBeginLink { generation } = snapshot
+            .take_commands()
+            .into_iter()
+            .find(|command| matches!(command, AdapterCommand::SignalBeginLink { .. }))
+            .expect("begin")
+        else {
+            panic!("begin link");
+        };
+        snapshot.apply(AdapterEvent::SignalQr {
+            code: RedactedPairingSecret::new("sgnl://old"),
+            generation: generation.saturating_sub(1),
+        });
+        assert!(snapshot.signal_qr.is_none());
+        snapshot.apply(AdapterEvent::SignalQr {
+            code: RedactedPairingSecret::new("sgnl://current"),
+            generation,
+        });
+        assert_eq!(snapshot.signal_qr.as_deref(), Some("sgnl://current"));
     }
 
     #[test]
@@ -4523,7 +4833,12 @@ mod tests {
             !snapshot.all_stopped(),
             "Telegram alone is not enough (Codex 4091477244)"
         );
-        for protocol in [ProtocolId::WhatsApp, ProtocolId::Discord, ProtocolId::Slack] {
+        for protocol in [
+            ProtocolId::WhatsApp,
+            ProtocolId::Discord,
+            ProtocolId::Slack,
+            ProtocolId::Signal,
+        ] {
             snapshot.apply(AdapterEvent::Stopped { protocol });
         }
         assert!(snapshot.all_stopped());
@@ -4800,6 +5115,10 @@ mod tests {
             assert_eq!(
                 view.shows_in_switcher(ProtocolId::Slack),
                 cfg!(feature = "slack-oauth") && filter.matches(ProtocolId::Slack)
+            );
+            assert_eq!(
+                view.shows_in_switcher(ProtocolId::Signal),
+                cfg!(feature = "signal-local") && filter.matches(ProtocolId::Signal)
             );
             assert_eq!(
                 view.shows_in_switcher(ProtocolId::Telegram),

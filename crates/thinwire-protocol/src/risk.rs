@@ -25,7 +25,7 @@ pub const fn requires_experimental_gate(protocol: ProtocolId) -> bool {
 pub const fn critic_bullets_for(protocol: ProtocolId) -> &'static [&'static str] {
     match protocol {
         ProtocolId::WhatsApp | ProtocolId::Discord => CRITIC_RISK_BULLETS.as_slice(),
-        ProtocolId::Telegram | ProtocolId::Slack => &[],
+        ProtocolId::Telegram | ProtocolId::Slack | ProtocolId::Signal => &[],
     }
 }
 

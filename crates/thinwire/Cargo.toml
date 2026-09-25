@@ -19,6 +19,13 @@ slack-oauth = ["thinwire-core/slack-oauth", "thinwire-protocol/slack-oauth"]
 # Experimental spike. Default CI and the default UI stay feature-off.
 whatsapp-web = ["thinwire-core/whatsapp-web", "thinwire-protocol/whatsapp-web"]
 discord-bot = ["thinwire-core/discord-bot", "thinwire-protocol/discord-bot"]
+# Local-only AGPL Signal client. Release builds and OS zips leave this off.
+signal-local = [
+  "dep:qrcode",
+  "dep:thinwire-signal",
+  "thinwire-signal/signal-local",
+  "thinwire-core/signal-local",
+]
 
 [dependencies]
 chrono.workspace = true
@@ -26,10 +33,13 @@ eframe.workspace = true
 egui.workspace = true
 thinwire-core.workspace = true
 thinwire-protocol.workspace = true
+thinwire-signal = { workspace = true, optional = true }
 winit.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# QR for the Signal provisioning URI. Feature `signal-local` only.
+qrcode = { version = "0.14", optional = true, default-features = false }
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", default-features = false }
