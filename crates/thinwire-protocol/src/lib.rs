@@ -33,10 +33,14 @@ pub use secrets::{
     TelegramSecretVault,
 };
 pub use slack::{
-    MemorySlackVault, SLACK_OAUTH_CALLBACK_PATH, SLACK_OAUTH_LOOPBACK_PORT, SLACK_SECRET_SERVICE,
-    SlackAdapter, SlackApiOrigin, SlackApiSource, SlackCallbackError, SlackInstalledWorkspace,
-    SlackSecretKey, SlackSecretVault, WORKSPACE_BOT_SCOPES, authorize_url, loopback_redirect_uri,
-    new_oauth_state, parse_loopback_callback, resolve_slack_app_token, resolve_slack_client,
+    MemorySlackVault, SLACK_CONVERSATION_PREFIX, SLACK_OAUTH_CALLBACK_PATH,
+    SLACK_OAUTH_LOOPBACK_PORT, SLACK_SECRET_SERVICE, SlackAdapter, SlackApiError, SlackApiOrigin,
+    SlackApiSource, SlackAppToken, SlackBotToken, SlackBrowser, SlackCallbackError, SlackChannel,
+    SlackChannelKind, SlackChannelPage, SlackCodeExchange, SlackDeps, SlackEventSource,
+    SlackEventStream, SlackInbound, SlackInbox, SlackInstallGrant, SlackInstalledWorkspace,
+    SlackLoopback, SlackPost, SlackSecretKey, SlackSecretVault, SlackWebApi, WORKSPACE_BOT_SCOPES,
+    authorize_url, loopback_redirect_uri, new_oauth_state, parse_loopback_callback,
+    resolve_slack_app_token, resolve_slack_client,
 };
 #[cfg(feature = "slack-oauth")]
 pub use slack::{oauth_v2_access_request, socket_mode_config, workspace_bot_token};
@@ -59,6 +63,7 @@ pub fn catalog() -> [ProtocolCapabilities; 4] {
 pub(crate) fn registry(
     secrets: std::sync::Arc<dyn TelegramSecretVault>,
     discord: std::sync::Arc<dyn DiscordSecretVault>,
+    slack: std::sync::Arc<dyn SlackSecretVault>,
     whatsapp_phone: std::sync::Arc<WhatsAppPhoneVault>,
     login_epoch: adapter::LoginEpoch,
 ) -> Vec<Box<dyn ProtocolAdapter>> {
@@ -70,7 +75,7 @@ pub(crate) fn registry(
         )),
         Box::new(WhatsAppAdapter::new(whatsapp_phone)),
         Box::new(DiscordAdapter::new(discord)),
-        Box::new(SlackAdapter),
+        slack::registry_adapter(slack),
     ]
 }
 

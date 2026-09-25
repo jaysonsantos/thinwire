@@ -99,6 +99,7 @@ impl SlackInstalledWorkspace {
     pub fn remember(&self, vault: &dyn SlackSecretVault, bot_token: &str) {
         vault.set_secret(SlackSecretKey::BotToken, bot_token);
         vault.set_secret(SlackSecretKey::TeamId, &self.team_id);
+        vault.set_secret(SlackSecretKey::AppId, &self.app_id);
         vault.set_secret(SlackSecretKey::OAuthCode, "");
         vault.set_secret(SlackSecretKey::OAuthState, "");
     }
@@ -156,16 +157,17 @@ pub fn authorize_url(client_id: &str, state: &str) -> String {
 /// the code is returned to the caller, which should put it in
 /// [`SlackSecretKey::OAuthCode`] and exchange it off the UI thread.
 ///
-/// `state` is checked before a decline is accepted. An `error` parameter
-/// whose `state` is missing or different from `expected_state` is not a
-/// decline of this install.
+/// `state` is checked before a decline or a missing code is accepted.
+/// An empty query is a missing state. It is not a finished callback.
+/// An `error` parameter whose `state` is missing or different from
+/// `expected_state` is not a decline of this install.
 pub fn parse_loopback_callback(
     raw_query: &str,
     expected_state: &str,
 ) -> Result<String, SlackCallbackError> {
     let query = raw_query.trim().trim_start_matches('?');
     if query.is_empty() {
-        return Err(SlackCallbackError::MissingCode);
+        return Err(SlackCallbackError::MissingState);
     }
     let mut code = None;
     let mut state = None;
@@ -303,6 +305,26 @@ mod tests {
     }
 
     #[test]
+    fn empty_callback_is_missing_state() {
+        assert_eq!(
+            parse_loopback_callback("", "state-test"),
+            Err(SlackCallbackError::MissingState)
+        );
+        assert_eq!(
+            parse_loopback_callback("?", "state-test"),
+            Err(SlackCallbackError::MissingState)
+        );
+        assert_eq!(
+            parse_loopback_callback("code=oauth-code-test", "state-test"),
+            Err(SlackCallbackError::MissingState)
+        );
+        assert_eq!(
+            parse_loopback_callback("state=state-test", "state-test"),
+            Err(SlackCallbackError::MissingCode)
+        );
+    }
+
+    #[test]
     fn forged_decline_without_matching_state_is_not_accepted() {
         let missing = parse_loopback_callback("?error=access_denied", "state-test")
             .expect_err("unbound decline");
@@ -333,6 +355,10 @@ mod tests {
         assert_eq!(
             vault.get_secret(SlackSecretKey::TeamId).as_deref(),
             Some("T-test")
+        );
+        assert_eq!(
+            vault.get_secret(SlackSecretKey::AppId).as_deref(),
+            Some("A-test")
         );
         assert_eq!(vault.get_secret(SlackSecretKey::OAuthCode), None);
         assert_eq!(vault.get_secret(SlackSecretKey::OAuthState), None);

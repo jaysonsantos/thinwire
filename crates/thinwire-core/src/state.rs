@@ -1361,7 +1361,9 @@ impl Snapshot {
             if self.protocol_linked(protocol) {
                 self.chat_list_loading.insert(protocol);
                 self.pending.push(AdapterCommand::LoadChats { protocol });
-            } else {
+            } else if protocol != ProtocolId::Slack {
+                // Slack Connect with no token opens the browser. Only the
+                // Add Slack workspace button starts that install.
                 self.pending.push(AdapterCommand::Connect { protocol });
             }
         }
@@ -5117,6 +5119,22 @@ mod tests {
     }
 
     #[test]
+    fn refresh_does_not_start_an_unlinked_slack_install() {
+        let mut snapshot = Snapshot::new();
+        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.refresh_visible();
+        assert!(
+            snapshot.take_commands().iter().all(|command| !matches!(
+                command,
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Slack,
+                }
+            )),
+            "Refresh must not open the Slack install"
+        );
+    }
+
+    #[test]
     fn a_slow_keychain_read_asks_the_user_to_unlock() {
         let store = SecretStore::detached_for_test();
         let mut snapshot = Snapshot::new();
@@ -5570,13 +5588,7 @@ mod tests {
         });
         snapshot.compose = "hi".into();
         snapshot.selected_conversation = Some("slack:RW".into());
-        assert!(
-            !snapshot.can_send(),
-            "Slack does not send text in this build"
-        );
-
-        allow_send(&mut snapshot, ProtocolId::Slack);
-        assert!(snapshot.can_send());
+        assert!(snapshot.can_send(), "a linked writable Slack channel");
         snapshot.selected_conversation = Some("slack:RO".into());
         assert!(!snapshot.can_send(), "a read-only channel");
 

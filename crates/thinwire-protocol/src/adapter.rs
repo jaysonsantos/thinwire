@@ -758,6 +758,26 @@ pub(crate) fn emit_account(events: &EventTx, protocol: ProtocolId, state: Accoun
     let _ = events.send(AdapterEvent::Account { protocol, state });
 }
 
+pub(crate) fn emit_command_failed(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: Option<String>,
+    detail: impl Into<String>,
+) {
+    let _ = events.send(AdapterEvent::CommandFailed {
+        protocol,
+        conversation_id,
+        detail: detail.into(),
+    });
+}
+
+pub(crate) fn emit_notice(events: &EventTx, protocol: ProtocolId, text: impl Into<String>) {
+    let _ = events.send(AdapterEvent::Notice {
+        protocol,
+        text: text.into(),
+    });
+}
+
 pub(crate) fn emit_stopped(events: &EventTx, protocol: ProtocolId) {
     let _ = events.send(AdapterEvent::Stopped { protocol });
 }

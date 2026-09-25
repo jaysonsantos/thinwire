@@ -10,6 +10,8 @@ use super::auth;
 use super::theme::{self, radius, size, space};
 use super::theme_mode::ThemeModeEgui;
 use super::thread_layout::{RowLayout, list_time, thread_rows};
+#[cfg(feature = "slack-oauth")]
+use thinwire_core::SlackIntent;
 use thinwire_core::secrets::Persistence;
 use thinwire_core::state::{
     AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
@@ -161,6 +163,7 @@ fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
             if snapshot.can_add_account() && ui.button("Add account").clicked() {
                 out.push(Intent::Telegram(TelegramIntent::AddAccount));
             }
+            add_slack_workspace(ui, snapshot, out);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button("⋯", |ui| {
                     if ui.button("Refresh").clicked() {
@@ -466,13 +469,14 @@ fn account_chip(
             ui.colored_label(palette.support(caps.support), caps.short_label);
             ui.label(format!("status: {}", account.status.as_str()));
         });
+    let slack_sign_in = caps.id == ProtocolId::Slack && cfg!(feature = "slack-oauth");
     if caps.id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web") {
         ui.label(
             RichText::new("experimental spike — ban risk")
                 .small()
                 .weak(),
         );
-    } else if !matches!(caps.id, ProtocolId::Telegram) {
+    } else if !matches!(caps.id, ProtocolId::Telegram) && !slack_sign_in {
         ui.label(
             RichText::new("not ready — no login UI this beat")
                 .small()
@@ -898,11 +902,37 @@ fn first_run(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                 {
                     out.push(Intent::Telegram(TelegramIntent::AddAccount));
                 }
+                add_slack_workspace(ui, snapshot, out);
             });
         })
         .response;
     ui.data_mut(|data| data.insert_temp(id, response.rect.height()));
 }
+
+/// Slack sign-in. Compiled only with `slack-oauth`. The empty twin keeps
+/// the call sites in the default build.
+#[cfg(feature = "slack-oauth")]
+fn add_slack_workspace(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    let slack = snapshot
+        .accounts
+        .iter()
+        .find(|row| row.caps.id == ProtocolId::Slack);
+    if slack.is_some_and(|row| row.status == AdapterStatus::Connecting) {
+        if ui.button("Cancel").clicked() {
+            out.push(Intent::Slack(SlackIntent::Cancel));
+        }
+        return;
+    }
+    if slack.is_some_and(|row| row.linked()) {
+        return;
+    }
+    if ui.button("Add Slack workspace").clicked() {
+        out.push(Intent::Slack(SlackIntent::Connect));
+    }
+}
+
+#[cfg(not(feature = "slack-oauth"))]
+fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<Intent>) {}
 
 fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     thread_header(ui, snapshot);

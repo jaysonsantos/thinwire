@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use super::adapter::LoginEpoch;
 use super::{
     AdapterCommand, AdapterEvent, DiscordSecretVault, ProtocolAdapter, ProtocolId,
-    TelegramSecretVault, WhatsAppPhoneVault, registry,
+    SlackSecretVault, TelegramSecretVault, WhatsAppPhoneVault, registry,
 };
 
 /// Bridge between the UI thread and protocol workers.
@@ -27,6 +27,7 @@ impl AdapterHost {
         handle: &Handle,
         secrets: Arc<dyn TelegramSecretVault>,
         discord: Arc<dyn DiscordSecretVault>,
+        slack: Arc<dyn SlackSecretVault>,
         whatsapp_phone: Arc<WhatsAppPhoneVault>,
     ) -> Self {
         let (event_tx, event_rx) = unbounded_channel();
@@ -35,7 +36,7 @@ impl AdapterHost {
         let adapter_epoch = Arc::clone(&login_epoch);
 
         handle.spawn(async move {
-            let mut adapters = registry(secrets, discord, whatsapp_phone, adapter_epoch);
+            let mut adapters = registry(secrets, discord, slack, whatsapp_phone, adapter_epoch);
             for adapter in &mut adapters {
                 adapter.start(event_tx.clone());
             }
@@ -334,6 +335,7 @@ mod tests {
             &Handle::current(),
             Arc::clone(&vault) as Arc<dyn TelegramSecretVault>,
             Arc::new(crate::MemoryDiscordVault::new()) as Arc<dyn DiscordSecretVault>,
+            Arc::new(crate::MemorySlackVault::new()) as Arc<dyn SlackSecretVault>,
             Arc::new(WhatsAppPhoneVault::new()),
         );
         assert_eq!(host.login_epoch.load(Ordering::SeqCst), 0);
