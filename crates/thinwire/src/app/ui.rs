@@ -384,10 +384,11 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
             ui.add_space(space::S);
             section_header(ui, "Inbox");
             ui.separator();
+            let inbox_list_id = ui.make_persistent_id("inbox");
             egui::ScrollArea::vertical()
                 .id_salt("inbox")
                 .auto_shrink([false, false])
-                .show(ui, |ui| inbox(ui, snapshot, hints, out));
+                .show(ui, |ui| inbox(ui, snapshot, hints, inbox_list_id, out));
         });
 }
 
@@ -490,7 +491,13 @@ fn show_no_chats(snapshot: &Snapshot) -> bool {
     snapshot.telegram_ready() || snapshot.selected_protocol != ProtocolId::Telegram
 }
 
-fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
+fn inbox(
+    ui: &mut egui::Ui,
+    snapshot: &View<'_>,
+    hints: &mut Hints,
+    inbox_list_id: egui::Id,
+    out: &mut Vec<Intent>,
+) {
     let now = Local::now();
     let rows: Vec<(String, String, String, u32, String)> = snapshot
         .visible_conversations()
@@ -569,19 +576,36 @@ fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Ve
     if let Some(id) = clicked {
         out.push(Intent::SelectConversation { id });
     }
-    inbox_keys(ui, snapshot, out);
+    inbox_keys(ui, snapshot, inbox_list_id, out);
 }
 
 /// Arrow keys move the highlight. Enter opens that chat.
-/// A focused text field keeps the keys. Login keeps Enter.
-fn inbox_keys(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
+/// Keys apply when nothing has keyboard focus, or the inbox list has it.
+/// A thread control such as Retry keeps Enter. Login keeps Enter.
+fn inbox_keys(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    inbox_list_id: egui::Id,
+    out: &mut Vec<Intent>,
+) {
     if snapshot.inbox_state() != InboxState::Rows {
         return;
     }
     if snapshot.center_view() != CenterView::Thread {
         return;
     }
-    if ui.ctx().text_edit_focused() {
+    let row_ids: Vec<egui::Id> = snapshot
+        .visible_conversations()
+        .iter()
+        .map(|row| ui.id().with(("inbox-row", &row.id)))
+        .collect();
+    let keys_here = ui.ctx().memory(|m| m.focused()).is_none()
+        || ui.ctx().memory(|memory| {
+            memory
+                .focused()
+                .is_some_and(|id| id == inbox_list_id || row_ids.contains(&id))
+        });
+    if !keys_here {
         return;
     }
     let (up, down, enter) = ui.input(|input| {

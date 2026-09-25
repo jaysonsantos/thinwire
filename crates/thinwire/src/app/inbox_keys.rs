@@ -17,6 +17,8 @@ struct InboxUi {
     store: SecretStore,
     settings: Settings,
     hints: Hints,
+    /// When set, a thread Retry control takes keyboard focus.
+    focus_retry: bool,
 }
 
 impl InboxUi {
@@ -45,6 +47,7 @@ impl InboxUi {
             store,
             settings,
             hints: Hints::default(),
+            focus_retry: false,
         }
     }
 }
@@ -67,6 +70,14 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::MoveInbox { delta } => state.snapshot.move_inbox_selection(delta),
             _ => {}
         }
+    }
+    if state.focus_retry {
+        ui.interact(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(8.0, 8.0)),
+            egui::Id::new("thread-retry"),
+            egui::Sense::click(),
+        )
+        .request_focus();
     }
 }
 
@@ -116,6 +127,20 @@ fn arrows_move_the_highlight_and_enter_opens_it() {
         harness.state_mut().snapshot.take_commands().is_empty(),
         "an arrow does not open the chat"
     );
+    harness.state_mut().focus_retry = true;
+    harness.step();
+    harness.key_press(egui::Key::Enter);
+    harness.step();
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:1"),
+        "Enter on a thread control does not open the highlighted chat"
+    );
+    harness.state_mut().focus_retry = false;
+    harness
+        .ctx
+        .memory_mut(|memory| memory.surrender_focus(egui::Id::new("thread-retry")));
+    harness.step();
     harness.key_press(egui::Key::Enter);
     harness.step();
     assert!(harness.state().snapshot.wants_focus_compose());
