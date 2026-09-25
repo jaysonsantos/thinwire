@@ -1,15 +1,18 @@
 //! Test double used to prove workers push events without calling UI APIs.
 
 use super::adapter::{
-    AccountState, AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery,
-    EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_account,
-    emit_conversation, emit_message, emit_status,
+    AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage,
+    Conversation, Delivery, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
+    SupportClass, emit_account, emit_conversation, emit_message, emit_status,
 };
+
+/// The one chat of the fake adapter.
+const FAKE_CHAT: &str = "fake:chat";
 
 /// Fixed send time for fake messages: 2026-01-02 03:04:05 UTC.
 const FAKE_SENT_AT: i64 = 1_767_323_045;
 
-const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
+pub(crate) const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Telegram,
     support: SupportClass::Supported,
     short_label: "fake adapter",
@@ -68,7 +71,7 @@ impl ProtocolAdapter for FakeAdapter {
                     events,
                     Conversation {
                         protocol: ProtocolId::Telegram,
-                        id: "fake:chat".into(),
+                        id: FAKE_CHAT.into(),
                         title: "Fake chat".into(),
                         participant: "worker".into(),
                         preview: "Pushed from the worker.".into(),
@@ -84,7 +87,7 @@ impl ProtocolAdapter for FakeAdapter {
                     events,
                     ChatMessage {
                         protocol: ProtocolId::Telegram,
-                        conversation_id: "fake:chat".into(),
+                        conversation_id: FAKE_CHAT.into(),
                         id: "fake:chat:1".into(),
                         sender: "worker".into(),
                         body: "event from tokio worker".into(),
@@ -105,6 +108,54 @@ impl ProtocolAdapter for FakeAdapter {
                     "fake adapter disconnected",
                 );
                 emit_account(events, ProtocolId::Telegram, AccountState::Unlinked);
+                Ok(())
+            }
+            // The adapter contract (ADR 0010): a load ends with its history
+            // or a failure, and each send or retry gets an answer.
+            AdapterCommand::OpenChat {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+            } => {
+                let event = if conversation_id == FAKE_CHAT {
+                    AdapterEvent::HistoryLoaded {
+                        protocol: ProtocolId::Telegram,
+                        conversation_id,
+                    }
+                } else {
+                    AdapterEvent::CommandFailed {
+                        protocol: ProtocolId::Telegram,
+                        conversation_id: Some(conversation_id),
+                        detail: "The fake adapter has no such chat.".into(),
+                    }
+                };
+                let _ = events.send(event);
+                Ok(())
+            }
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                request,
+                ..
+            } => {
+                let _ = events.send(AdapterEvent::SendAccepted {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id,
+                    request,
+                });
+                Ok(())
+            }
+            // The fake keeps no failed messages, so a retry has nothing to send.
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                request,
+                ..
+            } => {
+                let _ = events.send(AdapterEvent::SendRejected {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id,
+                    request,
+                });
                 Ok(())
             }
             _ => Err(AdapterError::Unavailable {
