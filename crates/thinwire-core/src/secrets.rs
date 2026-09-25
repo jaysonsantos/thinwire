@@ -690,14 +690,16 @@ impl SecretStore {
                 .map(|key| (key, inner.slack.get(&key).cloned()))
                 .collect::<Vec<_>>()
         };
-        for (key, value) in snapshot {
-            let write = match &value {
-                Some(value) => slack_os_set(key, value),
-                None => slack_os_delete(key),
+        for (index, (key, value)) in snapshot.iter().enumerate() {
+            let write = match value {
+                Some(value) => slack_os_set(*key, value),
+                None => slack_os_delete(*key),
             };
             if let Err(error) = write {
                 if let Ok(mut inner) = self.lock() {
-                    inner.slack_dirty.insert(key);
+                    let pending: Vec<SlackSecretKey> =
+                        snapshot[index..].iter().map(|(key, _)| *key).collect();
+                    requeue_slack(&mut inner.slack_dirty, &pending);
                 }
                 return Err(error);
             }
@@ -1073,6 +1075,12 @@ fn slack_os_get(key: SlackSecretKey) -> Result<Option<String>, SecretError> {
     }
 }
 
+fn requeue_slack(dirty: &mut HashSet<SlackSecretKey>, pending: &[SlackSecretKey]) {
+    for key in pending {
+        dirty.insert(*key);
+    }
+}
+
 fn slack_os_set(key: SlackSecretKey, value: &str) -> Result<(), SecretError> {
     slack_os_entry(key)?
         .set_password(value)
@@ -1317,6 +1325,20 @@ mod tests {
         assert!(!SlackSecretKey::OAuthState.persist_to_os());
         assert!(SlackSecretKey::BotToken.persist_to_os());
         assert_eq!(store.request_flush(), FlushAction::Ignore);
+    }
+
+    #[test]
+    fn a_failed_slack_flush_requeues_every_unwritten_key() {
+        let mut dirty = HashSet::new();
+        let pending = [
+            SlackSecretKey::BotToken,
+            SlackSecretKey::TeamId,
+            SlackSecretKey::ClientId,
+        ];
+        requeue_slack(&mut dirty, &pending);
+        assert!(dirty.contains(&SlackSecretKey::BotToken));
+        assert!(dirty.contains(&SlackSecretKey::TeamId));
+        assert!(dirty.contains(&SlackSecretKey::ClientId));
     }
 
     #[test]
