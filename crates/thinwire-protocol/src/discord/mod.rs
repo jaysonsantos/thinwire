@@ -699,10 +699,10 @@ mod tests {
         assert_eq!(general.protocol, ProtocolId::Discord);
         assert_eq!(general.title, "#general");
         assert_eq!(general.participant, "Test guild");
-        assert!(general.preview.contains("read and send"));
+        assert_eq!(general.preview, "reply from the bot");
         assert!(general.writable);
         assert!(!rows[1].writable);
-        assert!(rows[1].preview.contains("read only"));
+        assert!(rows[1].preview.is_empty());
 
         let ready_at = events
             .iter()

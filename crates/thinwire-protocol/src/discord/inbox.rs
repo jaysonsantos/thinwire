@@ -21,6 +21,8 @@ pub(crate) struct InboxChannel {
     pub name: String,
     pub last_message_id: Option<u64>,
     pub can_send: bool,
+    /// Latest message text, or empty when the channel has no visible message.
+    pub preview: String,
 }
 
 impl InboxChannel {
@@ -31,17 +33,12 @@ impl InboxChannel {
 
     #[must_use]
     pub(crate) fn conversation(&self) -> Conversation {
-        let preview = if self.can_send {
-            "Guild channel. The bot can read and send."
-        } else {
-            "Guild channel. The bot can read only."
-        };
         Conversation {
             protocol: ProtocolId::Discord,
             id: self.conversation_id(),
             title: format!("#{}", self.name),
             participant: self.guild_name.clone(),
-            preview: preview.into(),
+            preview: self.preview.clone(),
             unread: 0,
             // Snowflakes grow with time, so the newest channel sorts first.
             order: self
@@ -99,6 +96,15 @@ pub(crate) async fn load_channels(
             if !can_read(perms) {
                 continue;
             }
+            let preview = match api.history(channel.id, 1).await {
+                Ok(latest) => latest
+                    .first()
+                    .map(message_body)
+                    .filter(|text| text != "[no text]")
+                    .unwrap_or_default(),
+                Err(DiscordApiError::Forbidden | DiscordApiError::NotFound) => String::new(),
+                Err(error) => return Err(error),
+            };
             list.push(InboxChannel {
                 guild_id: guild.id,
                 guild_name: guild.name.clone(),
@@ -106,6 +112,7 @@ pub(crate) async fn load_channels(
                 name: channel.name,
                 last_message_id: channel.last_message_id,
                 can_send: can_send(perms),
+                preview,
             });
         }
     }
