@@ -277,6 +277,7 @@ impl DemoAdapter {
                     outbound: true,
                     delivery,
                     sent_at: self.script.now,
+                    arrival: crate::Arrival::History,
                 },
             },
         );
@@ -440,6 +441,7 @@ mod tests {
             last_at: NOW,
             is_group: false,
             writable: true,
+            muted: false,
             placeholder: false,
         }
     }
@@ -454,6 +456,7 @@ mod tests {
             outbound: false,
             delivery: Delivery::Sent,
             sent_at: NOW + i64::try_from(index).unwrap_or_default(),
+            arrival: crate::Arrival::History,
         }
     }
 
