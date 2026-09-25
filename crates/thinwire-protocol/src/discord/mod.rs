@@ -1200,6 +1200,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_revoked_token_on_send_unlinks_the_account() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().unauthorized = true;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                    body: "too late".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Notice { .. })
+        })
+        .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Unlinked,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::SendRejected { request: 1, .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Notice { text, .. } if text.contains("Replace discord.bot_token")
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Ready,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
     async fn read_only_and_unknown_channels_refuse_send() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;

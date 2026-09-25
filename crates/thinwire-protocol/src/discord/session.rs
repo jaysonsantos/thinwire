@@ -359,15 +359,7 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord send failed");
-                    emit_message_delivery(
-                        &events,
-                        ProtocolId::Discord,
-                        conversation_id.clone(),
-                        pending_id,
-                        Delivery::Failed,
-                    );
-                    emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
-                    emit_ready(&events, &format!("Send failed: {error}."));
+                    fail_send(&events, &conversation_id, &pending_id, request, error);
                 }
             }
         });
@@ -443,14 +435,7 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord resend failed");
-                    emit_message_delivery(
-                        &events,
-                        ProtocolId::Discord,
-                        conversation_id.clone(),
-                        message_id,
-                        Delivery::Failed,
-                    );
-                    emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
+                    fail_send(&events, &conversation_id, &message_id, request, error);
                 }
             }
         });
@@ -536,6 +521,31 @@ fn publish_channels(
     for channel in channels {
         emit_conversation(events, channel.conversation());
     }
+}
+
+/// A send or retry failed. A revoked token unlinks the account. Other
+/// errors leave the session up and say the send failed.
+fn fail_send(
+    events: &EventTx,
+    conversation_id: &str,
+    message_id: &str,
+    request: u64,
+    error: DiscordApiError,
+) {
+    emit_message_delivery(
+        events,
+        ProtocolId::Discord,
+        conversation_id.to_owned(),
+        message_id.to_owned(),
+        Delivery::Failed,
+    );
+    emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
+    if error == DiscordApiError::Unauthorized {
+        emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
+        emit_notice(events, ProtocolId::Discord, error.reason());
+        return;
+    }
+    emit_ready(events, &format!("Send failed: {error}."));
 }
 
 fn emit_ready(events: &EventTx, note: &str) {
