@@ -24,6 +24,7 @@ signal-local = []
 test-support = []
 
 [dependencies]
+chrono.workspace = true
 dirs.workspace = true
 keyring-core.workspace = true
 thinwire-protocol.workspace = true

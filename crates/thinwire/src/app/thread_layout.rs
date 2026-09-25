@@ -173,6 +173,32 @@ mod tests {
         assert_eq!(rows[5].time, "", "unknown time shows nothing");
     }
 
+    /// Codex on #121 (DST): a zone with daylight saving time converts each
+    /// message with the offset of its own date, not the offset of now. The
+    /// app's view zone (`ViewNow::Local`, `chrono::Local`) works this way.
+    #[test]
+    fn each_message_uses_the_offset_of_its_own_date() {
+        use chrono_tz::Europe::Berlin;
+
+        /// 2026-01-15 12:00 UTC: winter, UTC+1 in Berlin.
+        const WINTER_NOW: i64 = 1_768_478_400;
+        /// 2025-07-15 10:00 UTC: summer, UTC+2 in Berlin.
+        const JULY: i64 = 1_752_573_600;
+        /// 2026-01-14 10:00 UTC: winter, UTC+1 in Berlin.
+        const JANUARY: i64 = 1_768_384_800;
+
+        let now = Berlin.timestamp_opt(WINTER_NOW, 0).single().expect("now");
+        let rows = thread_rows(
+            &[message("Ada", false, JULY), message("Ada", false, JANUARY)],
+            false,
+            &now,
+        );
+        assert_eq!(rows[0].time, "12:00", "July is UTC+2");
+        assert_eq!(rows[1].time, "11:00", "January is UTC+1");
+        assert_eq!(list_time(JANUARY, &now), "Yesterday");
+        assert_eq!(list_time(JULY, &now), "15 Jul 2025");
+    }
+
     #[test]
     fn local_offset_moves_the_day_and_the_clock() {
         // 23:30 UTC yesterday is 01:30 today at UTC+2.

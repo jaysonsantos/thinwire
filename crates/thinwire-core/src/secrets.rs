@@ -133,6 +133,12 @@ struct Inner {
     os_backend: Option<OsBackend>,
     discord_hydrate: DiscordHydrate,
     slack_hydrate: SlackHydrate,
+    /// Demo store (#120): report `Saved`, so the demo screens show no
+    /// keychain notice. It changes nothing else: the store stays in memory.
+    reports_saved: bool,
+    /// Demo store (#120): never read or write the OS keychain, also on Try
+    /// again.
+    no_os: bool,
 }
 
 /// Memory-first store. OS keychain attach/flush is worker-only.
@@ -164,6 +170,8 @@ impl SecretStore {
                 } else {
                     SlackHydrate::Waiting { hook: None }
                 },
+                reports_saved: false,
+                no_os: false,
             }),
         }
     }
@@ -172,6 +180,30 @@ impl SecretStore {
     #[must_use]
     pub fn memory() -> Self {
         Self::blank(AttachPhase::MemoryOnly)
+    }
+
+    /// A memory store for the demo (#120) that reports [`Persistence::Saved`].
+    /// It never talks to the OS keychain.
+    #[must_use]
+    pub(crate) fn demo_saved() -> Self {
+        let store = Self::memory();
+        if let Ok(mut inner) = store.lock() {
+            inner.reports_saved = true;
+            inner.no_os = true;
+        }
+        store
+    }
+
+    /// A store for the demo (#120) whose keychain read failed, so the UI
+    /// offers Try again. It never talks to the OS keychain: Try again reads
+    /// nothing.
+    #[must_use]
+    pub(crate) fn demo_read_failed() -> Self {
+        let store = Self::blank(AttachPhase::ReadFailed);
+        if let Ok(mut inner) = store.lock() {
+            inner.no_os = true;
+        }
+        store
     }
 
     /// UI constructor plus a worker that attaches the OS keychain if available.
@@ -228,6 +260,9 @@ impl SecretStore {
         let Ok(inner) = self.lock() else {
             return Persistence::ThisSession;
         };
+        if inner.reports_saved {
+            return Persistence::Saved;
+        }
         match (inner.phase, inner.os_backend) {
             (AttachPhase::Detached | AttachPhase::Attaching | AttachPhase::ReadFailed, _) => {
                 Persistence::Loading
@@ -329,8 +364,11 @@ impl SecretStore {
 
     /// `ReadFailed` → `Attaching`, under the lock, before any worker runs.
     fn leave_read_failed(&self) {
+        // A demo store never reads the OS keychain, so it stays ReadFailed:
+        // Try again shows again, not an endless wait (PR #122 review).
         if let Ok(mut inner) = self.lock()
             && inner.phase == AttachPhase::ReadFailed
+            && !inner.no_os
         {
             inner.phase = AttachPhase::Attaching;
         }
@@ -386,6 +424,9 @@ impl SecretStore {
             let Ok(mut inner) = self.lock() else {
                 return;
             };
+            if inner.no_os {
+                return;
+            }
             match inner.phase {
                 AttachPhase::Ready | AttachPhase::MemoryOnly => return,
                 AttachPhase::Detached | AttachPhase::Attaching | AttachPhase::ReadFailed => {
@@ -1930,6 +1971,27 @@ mod tests {
         store.leave_read_failed();
         assert!(!store.read_failed(), "a new watch does not stop at once");
         assert!(!store.attach_settled());
+        assert_eq!(store.persistence(), Persistence::Loading);
+    }
+}
+
+#[cfg(test)]
+mod demo_store_tests {
+    use super::*;
+
+    /// PR #122 review: Try again on the demo store reads nothing and keeps
+    /// the store in `ReadFailed`, so the screen offers Try again again.
+    #[test]
+    fn a_retry_keeps_the_demo_store_read_failed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store = Arc::new(SecretStore::demo_read_failed());
+        assert!(store.read_failed());
+        store.spawn_os_retry(runtime.handle());
+        runtime.block_on(tokio::task::yield_now());
+        assert!(store.read_failed(), "still ReadFailed after Try again");
         assert_eq!(store.persistence(), Persistence::Loading);
     }
 }

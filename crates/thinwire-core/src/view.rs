@@ -3,6 +3,7 @@
 use std::ops::Deref;
 
 use crate::ThemeMode;
+use crate::clock::{Clock, ViewNow};
 use crate::secrets::{Persistence, SecretStore};
 use crate::settings::Settings;
 use crate::state::Snapshot;
@@ -15,6 +16,7 @@ pub struct View<'a> {
     pub(crate) state: &'a Snapshot,
     pub(crate) secrets: &'a SecretStore,
     pub(crate) settings: &'a Settings,
+    pub(crate) clock: Clock,
 }
 
 impl View<'_> {
@@ -28,6 +30,13 @@ impl View<'_> {
     #[must_use]
     pub fn persistence(&self) -> Persistence {
         self.secrets.persistence()
+    }
+
+    /// Now, in the zone of the core's clock (#120). Format every time from
+    /// this value, never from the system clock directly.
+    #[must_use]
+    pub fn now(&self) -> ViewNow {
+        self.clock.now()
     }
 
     /// The stored light/dark preference.
@@ -51,7 +60,15 @@ impl<'a> View<'a> {
             state,
             secrets,
             settings,
+            clock: Clock::System,
         }
+    }
+
+    /// The same view with another clock.
+    #[must_use]
+    pub const fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 }
 
