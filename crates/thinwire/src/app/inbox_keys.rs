@@ -208,3 +208,30 @@ fn accesskit_selected_is_the_open_chat() {
         "the highlight is not selected"
     );
 }
+
+#[test]
+fn arrow_down_twice_keeps_the_highlight_on_row_3() {
+    let mut state = InboxUi::ready();
+    let mut conversation = telegram_chat(3, "Cara", 1);
+    conversation.preview = "seen from Cara".into();
+    state
+        .snapshot
+        .apply(AdapterEvent::ConversationUpsert { conversation });
+    let mut harness = harness(state);
+    harness.run();
+    harness.key_press(egui::Key::ArrowDown);
+    harness.step();
+    harness.key_press(egui::Key::ArrowDown);
+    harness.step();
+    assert_eq!(
+        harness.state().snapshot.focused_row.as_deref(),
+        Some("telegram:3")
+    );
+    harness.step();
+    harness.step();
+    assert_eq!(
+        harness.state().snapshot.focused_row.as_deref(),
+        Some("telegram:3"),
+        "the highlight stays on row 3"
+    );
+}

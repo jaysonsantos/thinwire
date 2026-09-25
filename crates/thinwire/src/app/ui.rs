@@ -573,9 +573,6 @@ fn inbox(
         if row_scrolls(selected, focused, scroll_to_selected, scroll_to_focused) {
             response.scroll_to_me(None);
         }
-        if focused && scroll_to_focused {
-            response.request_focus();
-        }
         if widget_focus == Some(response.id) && !focused {
             focus_from_widget = Some(id.clone());
         }
@@ -583,12 +580,23 @@ fn inbox(
             clicked = Some(id);
         }
     }
+    inbox_keys(ui, snapshot, inbox_list_id, out);
+    let key_moved = out
+        .iter()
+        .any(|intent| matches!(intent, Intent::MoveInbox { .. }));
     if let Some(id) = clicked {
         out.push(Intent::SelectConversation { id });
-    } else if let Some(id) = focus_from_widget {
+    } else if !key_moved && let Some(id) = focus_from_widget {
         out.push(Intent::FocusInbox { id });
     }
-    inbox_keys(ui, snapshot, inbox_list_id, out);
+    if let Some(Intent::MoveInbox { delta }) = out
+        .iter()
+        .find(|intent| matches!(intent, Intent::MoveInbox { .. }))
+        && let Some(id) = snapshot.inbox_move_target(*delta)
+    {
+        let row_id = ui.id().with(("inbox-row", id));
+        ui.memory_mut(|memory| memory.request_focus(row_id));
+    }
 }
 
 /// The highlight scroll wins when both requests exist. It is the Enter target.
