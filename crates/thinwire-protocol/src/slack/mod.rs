@@ -140,6 +140,7 @@ impl SlackAdapter {
                 is_group: false,
                 writable: false,
                 placeholder: true,
+                muted: false,
             },
         );
         emit_message(
@@ -153,6 +154,7 @@ impl SlackAdapter {
                 outbound: false,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: crate::Arrival::History,
             },
         );
     }

@@ -711,6 +711,7 @@ where
                     last_at: 0,
                     is_group: is_group(channel.kind),
                     writable: true,
+                    muted: false,
                     placeholder: false,
                 };
                 if let Some(existing) = self.channels.get(&channel.id) {
@@ -984,6 +985,7 @@ where
                 last_at: sent_at,
                 is_group: !channel.starts_with('D'),
                 writable: true,
+                muted: false,
                 placeholder: false,
             };
             // The title is only the id. A later LoadChats walks the list again
@@ -1100,6 +1102,7 @@ where
             outbound,
             delivery: Delivery::Sent,
             sent_at: ts_order(&post.ts),
+            arrival: crate::Arrival::History,
         }
     }
 }
