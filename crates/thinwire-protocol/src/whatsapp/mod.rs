@@ -15,10 +15,10 @@ mod live;
 use std::sync::Arc;
 
 use super::adapter::{
-    AccountState, AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery,
-    EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
-    emit_history_loaded, emit_message, emit_older_history_loaded, emit_send_accepted,
-    emit_send_rejected, emit_status,
+    AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage,
+    Conversation, Delivery, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
+    SupportClass, emit_chat_list_loaded, emit_conversation, emit_history_loaded, emit_message,
+    emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status,
 };
 
 #[cfg(not(feature = "whatsapp-web"))]
@@ -399,6 +399,18 @@ pub fn parse_whatsapp_chat_id(conversation_id: &str) -> Option<&str> {
     inbox::parse_conversation_id(conversation_id)
 }
 
+/// Report one failed command. The reason is a fixed text: no JID, no body.
+fn command_failed(events: &EventTx, conversation_id: Option<&str>, error: &AdapterError) {
+    let detail = match error {
+        AdapterError::Refused { reason, .. } | AdapterError::Unavailable { reason, .. } => *reason,
+    };
+    let _ = events.send(AdapterEvent::CommandFailed {
+        protocol: ProtocolId::WhatsApp,
+        conversation_id: conversation_id.map(str::to_string),
+        detail: detail.to_string(),
+    });
+}
+
 const fn unavailable(reason: &'static str) -> AdapterError {
     AdapterError::Unavailable {
         protocol: ProtocolId::WhatsApp,
@@ -461,21 +473,28 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 self.connect(events);
                 Ok(())
             }
+            // ADR 0010 rule 5: a failed command keeps the session up. It ends
+            // with CommandFailed, never an adapter error, and always ends the
+            // shell's spinner (ChatListLoaded / HistoryLoaded).
             AdapterCommand::LoadChats {
                 protocol: ProtocolId::WhatsApp,
             } => {
-                self.require_connected()?;
-                self.load_chats(events);
+                match self.require_connected() {
+                    Ok(()) => self.load_chats(events),
+                    Err(error) => command_failed(events, None, &error),
+                }
+                emit_chat_list_loaded(events, ProtocolId::WhatsApp);
                 Ok(())
             }
             AdapterCommand::OpenChat {
                 protocol: ProtocolId::WhatsApp,
                 conversation_id,
             } => {
-                let result = self.open_chat(&conversation_id, events);
-                // The UI shows a loading row until this, also after an error.
+                if let Err(error) = self.open_chat(&conversation_id, events) {
+                    command_failed(events, Some(&conversation_id), &error);
+                }
                 emit_history_loaded(events, ProtocolId::WhatsApp, conversation_id);
-                result
+                Ok(())
             }
             AdapterCommand::SendText {
                 protocol: ProtocolId::WhatsApp,
@@ -812,6 +831,13 @@ mod tests {
             )
             .expect("load chats");
         let events = drain(&mut rx);
+        assert_eq!(
+            events.last(),
+            Some(&AdapterEvent::ChatListLoaded {
+                protocol: ProtocolId::WhatsApp
+            }),
+            "the list load ends the shell spinner"
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AdapterEvent::ConversationUpsert { conversation }
@@ -877,24 +903,38 @@ mod tests {
                 request: 1,
             },
         ] {
-            let is_send = matches!(command, AdapterCommand::SendText { .. });
-            let result = adapter.handle(command, &tx);
-            if is_send {
-                assert!(result.is_ok(), "a rejected send is not an adapter error");
-            } else {
-                assert!(matches!(result, Err(AdapterError::Unavailable { .. })));
-            }
+            // ADR 0010 rule 5: no adapter error; the session stays up.
+            assert!(adapter.handle(command, &tx).is_ok());
         }
         let events = drain(&mut rx);
-        assert!(events.iter().all(|event| matches!(
-            event,
-            AdapterEvent::HistoryLoaded { .. } | AdapterEvent::SendRejected { request: 1, .. }
-        )));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, AdapterEvent::SendRejected { .. }))
+        assert_eq!(
+            events,
+            vec![
+                AdapterEvent::CommandFailed {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: None,
+                    detail: NOT_CONNECTED.into(),
+                },
+                AdapterEvent::ChatListLoaded {
+                    protocol: ProtocolId::WhatsApp
+                },
+                AdapterEvent::CommandFailed {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: Some("whatsapp:111@s.whatsapp.net".into()),
+                    detail: NOT_CONNECTED.into(),
+                },
+                AdapterEvent::HistoryLoaded {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                },
+                AdapterEvent::SendRejected {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    request: 1,
+                },
+            ]
         );
+        assert!(statuses(&events).is_empty(), "no Error status");
     }
 
     #[tokio::test]
@@ -1388,15 +1428,25 @@ mod tests {
             .handle(send_hi(), &tx)
             .expect("a rejected send is not an adapter error");
         assert!(only_send_rejected(&drain(&mut rx)));
-        let error = adapter
+        adapter
             .handle(
                 AdapterCommand::LoadChats {
                     protocol: ProtocolId::WhatsApp,
                 },
                 &tx,
             )
-            .expect_err("banned");
-        assert!(matches!(error, AdapterError::Unavailable { .. }));
+            .expect("a failed load is not an adapter error");
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::CommandFailed { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::ChatListLoaded { .. }))
+        );
     }
 
     /// QA section 7 Low: a rejected send must not turn into an Error status.
