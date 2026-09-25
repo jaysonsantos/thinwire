@@ -5,6 +5,8 @@
 - v1 protocols: Telegram, WhatsApp (experimental), Discord (bot/OAuth inbox only), Slack OAuth
 - Signal is out of v1 release builds. Planned feature `signal-local` (#39, ADR `0011-agpl-protocols-local-only`) will link Presage and libsignal
 - WhatsApp feature `whatsapp-web` is local-only. It can link AGPL `wacore-libsignal`. Release builds and OS zips never enable `whatsapp-web` or `signal-local` (`0011`)
+- Public CI can download AGPL source. Cargo fetches every git dependency in `Cargo.lock`, including optional ones. Public CI does not build that code. Public CI does not link that code. Releases do not contain it (`0011`, 2026-09-25)
+- Code that links an AGPL library moves into an AGPL-licensed crate folder in this repo (#77). The root license stays MIT
 - README must keep the three risk bullets
 - Never claim WhatsApp or Discord personal clients are “reliable”
 - Discord: no self-bots / user-account automation
