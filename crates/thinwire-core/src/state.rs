@@ -2131,17 +2131,24 @@ impl Snapshot {
     }
 
     /// The session of one protocol ended (shell plan 8): drop its rows,
-    /// messages, drafts, spinners, notes, and sends. Another linked protocol
-    /// takes the selection.
+    /// messages, spinners, notes, and sends. Unsent text stays in that
+    /// protocol's drafts so a rejected send can be posted again after the
+    /// next link. Another linked protocol takes the selection.
     fn end_session(&mut self, protocol: ProtocolId) {
         if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
             row.state = AccountState::Unlinked;
         }
         self.sessions.remove(&protocol);
         self.conversations.remove(&protocol);
-        // Only this protocol's drafts: the same chat id in another protocol
-        // keeps its draft (PR #68 review).
-        self.drafts.retain(|(owner, _), _| *owner != protocol);
+        // The open compose field is this protocol's draft. Park it before the
+        // selection goes, or a 401 that unlinks would drop the rejected text.
+        if self.selected_protocol == protocol
+            && let Some(id) = self.selected_conversation.clone()
+            && !self.compose.is_empty()
+        {
+            self.drafts
+                .insert((protocol, id), std::mem::take(&mut self.compose));
+        }
         self.messages.retain(|(owner, _), _| *owner != protocol);
         self.history_loading.retain(|(owner, _)| *owner != protocol);
         self.chat_list_loading.remove(&protocol);
@@ -6040,6 +6047,44 @@ mod tests {
             conversation: chat(ProtocolId::Slack, "slack:C2", true),
         });
         assert!(!snapshot.conversations.contains_key(&ProtocolId::Slack));
+    }
+
+    /// A 401 rejects the send and then unlinks. The text stays in the chat
+    /// draft so the user can send it again after replacing the token.
+    #[test]
+    fn a_rejected_send_keeps_its_text_after_unlink() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:1:2", true),
+        });
+        snapshot.selected_conversation = Some("discord:1:2".into());
+        snapshot.compose = "keep me".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("send");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1:2".into(),
+            request,
+        });
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Discord,
+            state: AccountState::Unlinked,
+        });
+        link(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:1:2", true),
+        });
+        snapshot.select_conversation("discord:1:2".into());
+        assert_eq!(snapshot.compose, "keep me");
     }
 
     /// Codex P2 (PR #68): unlinking one protocol keeps the draft of the same
