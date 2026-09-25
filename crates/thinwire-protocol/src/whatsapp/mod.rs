@@ -319,11 +319,15 @@ impl WhatsAppAdapter {
             emit_send_rejected(events, ProtocolId::WhatsApp, conversation_id, request);
             return;
         };
-        let (pending, shown) = self
+        let (pending, shown, upsert) = self
             .session
             .with_inbox(|inbox| inbox.begin_send(&jid, &body, unix_now()));
         let _ = events.send(shown);
         emit_send_accepted(events, ProtocolId::WhatsApp, conversation_id, request);
+        // The sidebar preview and order come from the chat upsert.
+        if let Some(upsert) = upsert {
+            let _ = events.send(upsert);
+        }
         self.spawn_send(sender, jid, pending, body, events);
     }
 
@@ -1010,6 +1014,10 @@ mod tests {
             rx.recv().await.expect("accepted"),
             AdapterEvent::SendAccepted { request: 1, .. }
         ));
+        assert!(matches!(
+            rx.recv().await.expect("chat row"),
+            AdapterEvent::ConversationUpsert { .. }
+        ));
         let replaced = rx.recv().await.expect("replaced");
         assert!(matches!(
             replaced,
@@ -1055,6 +1063,10 @@ mod tests {
         assert!(matches!(
             rx.recv().await.expect("accepted"),
             AdapterEvent::SendAccepted { request: 1, .. }
+        ));
+        assert!(matches!(
+            rx.recv().await.expect("chat row"),
+            AdapterEvent::ConversationUpsert { .. }
         ));
         let status = rx.recv().await.expect("status");
         match status {
@@ -1246,6 +1258,10 @@ mod tests {
         assert!(matches!(
             rx.recv().await.expect("accepted"),
             AdapterEvent::SendAccepted { request: 1, .. }
+        ));
+        assert!(matches!(
+            rx.recv().await.expect("chat row"),
+            AdapterEvent::ConversationUpsert { .. }
         ));
         pending
     }

@@ -115,7 +115,12 @@ impl Inbox {
             }
             // The user reads the open chat, so a later chunk keeps it read.
             let is_open = self.open.as_deref() == Some(chat.jid.as_str());
-            record.unread = if is_open { 0 } else { chat.unread };
+            // Keep live increments: a later chunk can carry an older count.
+            record.unread = if is_open {
+                0
+            } else {
+                record.unread.max(chat.unread)
+            };
             record.timestamp = record.timestamp.max(chat.timestamp);
             for message in chat.messages {
                 remember_name(&mut self.names, &message);
@@ -239,7 +244,14 @@ impl Inbox {
     /// Show an outgoing message at once under a local id. The send result
     /// replaces it with [`Self::confirm_send`] or marks it failed with
     /// [`Self::fail_send`].
-    pub(super) fn begin_send(&mut self, jid: &str, body: &str, now: i64) -> (String, AdapterEvent) {
+    /// Returns the local id, the pending row, and the chat upsert. The shell
+    /// takes the sidebar preview and order from the upsert.
+    pub(super) fn begin_send(
+        &mut self,
+        jid: &str,
+        body: &str,
+        now: i64,
+    ) -> (String, AdapterEvent, Option<AdapterEvent>) {
         self.next_pending += 1;
         let pending = format!("{PENDING_PREFIX}{}", self.next_pending);
         let message = WaMessage {
@@ -259,6 +271,7 @@ impl Inbox {
             AdapterEvent::MessageReceived {
                 message: self.chat_message(&message),
             },
+            self.upsert_event(jid),
         )
     }
 
@@ -641,7 +654,14 @@ pub(super) mod tests {
     fn send_pending_is_replaced_or_removed() {
         let mut inbox = Inbox::default();
         let chat = "111@s.whatsapp.net";
-        let (pending, shown) = inbox.begin_send(chat, "hello", 50);
+        let (pending, shown, upsert) = inbox.begin_send(chat, "hello", 50);
+        match upsert {
+            Some(AdapterEvent::ConversationUpsert { conversation }) => {
+                assert_eq!(conversation.preview, "hello");
+                assert_eq!(conversation.order, 50);
+            }
+            other => panic!("the send must update the chat row: {other:?}"),
+        }
         match shown {
             AdapterEvent::MessageReceived { message } => {
                 assert!(message.outbound);
@@ -657,7 +677,7 @@ pub(super) mod tests {
                 if old_id == &pending && message.id == "SRV1"
         )));
 
-        let (failed, _) = inbox.begin_send(chat, "again", 60);
+        let (failed, _, _) = inbox.begin_send(chat, "again", 60);
         let events = inbox.fail_send(chat, &failed);
         assert_eq!(
             events,
@@ -695,7 +715,7 @@ pub(super) mod tests {
     fn confirm_after_echo_keeps_one_copy() {
         let mut inbox = Inbox::default();
         let chat = "111@s.whatsapp.net";
-        let (pending, _) = inbox.begin_send(chat, "hello", 50);
+        let (pending, _, _) = inbox.begin_send(chat, "hello", 50);
         let mut echo = message(chat, "SRV1", "hello", 50);
         echo.from_me = true;
         inbox.apply_messages(vec![echo]);
@@ -732,6 +752,30 @@ pub(super) mod tests {
         assert_eq!(upserts(&events)[0].unread, 2);
     }
 
+    /// Codex r4103183211: a later history chunk keeps live unread increments.
+    #[test]
+    fn later_history_chunk_keeps_live_unread() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let chunk = |unread: u32| HistoryChat {
+            jid: chat.into(),
+            name: None,
+            unread,
+            timestamp: 1,
+            messages: Vec::new(),
+        };
+        inbox.apply_history(vec![chunk(0)], Vec::new());
+        inbox.apply_messages(vec![message(chat, "live", "hi", 5)]);
+        let events = inbox.apply_history(vec![chunk(0)], Vec::new());
+        assert_eq!(
+            upserts(&events)[0].unread,
+            1,
+            "the live message stays unread"
+        );
+        let events = inbox.apply_history(vec![chunk(4)], Vec::new());
+        assert_eq!(upserts(&events)[0].unread, 4, "a higher server count wins");
+    }
+
     /// Codex r4093606402: a later history chunk keeps the open chat read.
     #[test]
     fn later_history_chunk_keeps_the_open_chat_read() {
@@ -764,8 +808,8 @@ pub(super) mod tests {
     fn history_trim_keeps_pending_and_failed_sends() {
         let mut inbox = Inbox::default();
         let chat = "111@s.whatsapp.net";
-        let (pending, _) = inbox.begin_send(chat, "in flight", 1);
-        let (failed, _) = inbox.begin_send(chat, "failed", 2);
+        let (pending, _, _) = inbox.begin_send(chat, "in flight", 1);
+        let (failed, _, _) = inbox.begin_send(chat, "failed", 2);
         inbox.fail_send(chat, &failed);
         let flood: Vec<WaMessage> = (0..(MESSAGES_PER_CHAT as i64 + 50))
             .map(|n| message(chat, &format!("m{n:04}"), "busy", 10 + n))
