@@ -513,8 +513,14 @@ impl Snapshot {
                 let selected = (self.selected_protocol == protocol)
                     .then(|| self.selected_conversation.clone())
                     .flatten();
+                let focused = (self.selected_protocol == protocol)
+                    .then(|| self.focused_row.clone())
+                    .flatten();
                 let list = self.conversations.entry(protocol).or_default();
                 let before = selected
+                    .as_ref()
+                    .and_then(|id| list.iter().position(|row| row.id == *id));
+                let focus_before = focused
                     .as_ref()
                     .and_then(|id| list.iter().position(|row| row.id == *id));
                 if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
@@ -528,6 +534,12 @@ impl Snapshot {
                     .and_then(|id| list.iter().position(|row| row.id == *id));
                 if before.is_some() && before != after {
                     self.scroll_to_selected = true;
+                }
+                let focus_after = focused
+                    .as_ref()
+                    .and_then(|id| list.iter().position(|row| row.id == *id));
+                if focus_before.is_some() && focus_before != focus_after {
+                    self.scroll_to_focused = true;
                 }
                 self.ensure_conversation_selection();
                 self.sync_focused_row();
@@ -2213,6 +2225,36 @@ mod tests {
         });
         assert!(snapshot.take_scroll_to_selected());
         assert!(!snapshot.take_scroll_to_selected(), "one request per move");
+    }
+
+    #[test]
+    fn a_resort_scrolls_the_highlighted_row_only_when_it_moves() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, &store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 10),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 5),
+        });
+        snapshot.move_inbox_selection(1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert!(snapshot.take_scroll_to_focused());
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 11),
+        });
+        assert!(
+            !snapshot.wants_scroll_to_focused(),
+            "the highlighted row did not move"
+        );
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(3, "Cy", 7),
+        });
+        assert!(snapshot.take_scroll_to_focused());
+        assert!(!snapshot.wants_scroll_to_focused(), "one request per move");
     }
 
     fn outgoing(chat: i64, id: i64, body: &str, delivery: Delivery) -> ChatMessage {
