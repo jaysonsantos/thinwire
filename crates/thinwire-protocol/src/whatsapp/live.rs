@@ -1,195 +1,75 @@
-//! Linked-device client. Compiled only with `whatsapp-web`.
+//! Live backend of the WhatsApp link. Compiled only with `whatsapp-web`.
 //!
-//! `Bot` runs on a tokio task. The egui thread never calls into this module.
-//! QR payloads and pair codes are events, not command fields, and are not logged.
-//!
-//! Registration and shutdown share [`super::gate::LinkGate`]. A close that
-//! lands after `spawn` and before `publish` waits. It does not report the
-//! link idle and then let this task install the bot.
+//! The link owner ([`super::link`]) calls [`LiveBackend`] one step at a time.
+//! This module holds no lifecycle state. `Bot` runs on a tokio task; the egui
+//! thread never calls into this module. QR payloads and pair codes are
+//! events, not command fields, and are not logged.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use whatsapp_rust::bot::Bot;
+use whatsapp_rust::bot::{Bot, BotHandle};
 use whatsapp_rust::pair_code::PairCodeOptions;
+use whatsapp_rust::send::SendError;
 use whatsapp_rust::store::SqliteStore;
+use whatsapp_rust::types::events::{Event, EventKind};
+use whatsapp_rust::wacore::proto_helpers::{MessageBuilderExt, MessageExt};
+use whatsapp_rust::waproto::whatsapp as wa;
+use whatsapp_rust::{Client, ClientError, Jid};
 
-use super::path::{prepare_session_dir, restrict_store_file, whatsapp_device_store_path};
-use crate::adapter::{
-    AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret, emit_status,
+use super::inbox::{HistoryChat, WaMessage};
+use super::link::{Callbacks, LinkBackend, StartError, Started};
+use super::path::{
+    prepare_session_dir, remove_device_store, restrict_store_file, whatsapp_device_store_path,
 };
+use super::session::{LinkEvent, SendFailure, SendFuture, WhatsAppSender};
+use crate::adapter::RedactedPairingSecret;
 
-const DATA_DIR_MISSING: &str =
-    "Platform app-data directory is unavailable. WhatsApp pairing did not start.";
-const STORE_FAILED: &str =
-    "WhatsApp device store could not be opened under app-data. Nothing was logged.";
-const BUILD_FAILED: &str =
-    "WhatsApp pairing client could not be built. No session material was logged.";
+/// whatsapp-rust client work for the link owner. No state of its own.
+pub(super) struct LiveBackend;
 
-pub(super) struct LiveLink {
-    gate: super::gate::LinkGate<whatsapp_rust::bot::BotHandle>,
-}
+impl LinkBackend for LiveBackend {
+    type Bot = BotHandle;
 
-impl LiveLink {
-    pub(super) fn new() -> Self {
-        Self {
-            gate: super::gate::LinkGate::new(),
-        }
+    async fn start(
+        &self,
+        _generation: u64,
+        phone: Option<String>,
+        callbacks: Callbacks,
+    ) -> Result<Started<BotHandle>, StartError> {
+        let path = whatsapp_device_store_path().map_err(|()| StartError::DataDir)?;
+        let parent = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or(StartError::DataDir)?;
+        tokio::task::spawn_blocking(move || prepare_session_dir(&parent))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or(StartError::Store)?;
+        let db = path.to_str().ok_or(StartError::Store)?;
+        let backend = SqliteStore::new(db).await.map_err(|_| StartError::Store)?;
+        let _ = restrict_store_file(&path);
+        let bot = build_bot(backend, digits_only(phone), callbacks)
+            .await
+            .map_err(|()| StartError::Build)?;
+        let client = bot.client();
+        Ok(Started {
+            bot: bot.spawn(),
+            sender: Arc::new(LiveSender { client }),
+        })
     }
 
-    pub(super) fn next_generation(&self) -> u64 {
-        self.gate.next_generation()
+    async fn stop(&self, bot: BotHandle) {
+        bot.shutdown().await;
     }
 
-    pub(super) fn mark_active(&self) {
-        self.gate.mark_active();
+    async fn delete_store(&self) -> Result<(), ()> {
+        let path = whatsapp_device_store_path()?;
+        tokio::task::spawn_blocking(move || remove_device_store(&path))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())
     }
-
-    pub(super) fn is_active(&self) -> bool {
-        self.gate.is_active()
-    }
-
-    fn is_current(&self, token: u64) -> bool {
-        self.gate.is_current(token)
-    }
-
-    /// Close the bot from an older generation, if one is still stored.
-    ///
-    /// Starts newer than the closing generation stay installed.
-    pub(super) async fn shutdown(&self) {
-        if let Some(handle) = self.gate.shutdown().await {
-            handle.shutdown().await;
-        }
-    }
-}
-
-enum Session {
-    /// Bot is stored. The flight is already over.
-    Started,
-    /// Bot was spawned after this generation closed. Still in flight until
-    /// the caller shuts it down and leaves.
-    Rejected(whatsapp_rust::bot::BotHandle),
-    /// No bot. Still in flight until the caller leaves.
-    Aborted,
-}
-
-/// `token` is the adapter's own link generation (stale-bot checks).
-/// `link_id` is the shell's pairing id: every QR and pair-code event carries
-/// it, so the shell can drop a payload of an older pairing.
-pub(super) async fn run_link(
-    link: Arc<LiveLink>,
-    token: u64,
-    link_id: u64,
-    phone: Option<String>,
-    events: EventTx,
-) {
-    if !link.gate.enter(token).await {
-        link.gate.set_inactive();
-        return;
-    }
-    match session(&link, token, link_id, phone, events).await {
-        Session::Started => {}
-        Session::Rejected(handle) => {
-            handle.shutdown().await;
-            link.gate.leave(token).await;
-            link.gate.set_inactive();
-        }
-        Session::Aborted => {
-            link.gate.leave(token).await;
-            link.gate.set_inactive();
-        }
-    }
-}
-
-async fn session(
-    link: &Arc<LiveLink>,
-    token: u64,
-    link_id: u64,
-    phone: Option<String>,
-    events: EventTx,
-) -> Session {
-    if let Some(previous) = link.gate.take_older(token).await {
-        previous.shutdown().await;
-    }
-    if !link.is_current(token) {
-        return Session::Aborted;
-    }
-
-    let Ok(path) = whatsapp_device_store_path() else {
-        fail(&events, DATA_DIR_MISSING);
-        return Session::Aborted;
-    };
-    let Some(parent) = path.parent().map(std::path::Path::to_path_buf) else {
-        fail(&events, DATA_DIR_MISSING);
-        return Session::Aborted;
-    };
-    let prepared = tokio::task::spawn_blocking(move || prepare_session_dir(&parent))
-        .await
-        .ok()
-        .and_then(Result::ok);
-    if prepared.is_none() {
-        fail(&events, STORE_FAILED);
-        return Session::Aborted;
-    }
-    let Some(db) = path.to_str() else {
-        fail(&events, STORE_FAILED);
-        return Session::Aborted;
-    };
-    if !link.is_current(token) {
-        return Session::Aborted;
-    }
-
-    let backend = match SqliteStore::new(db).await {
-        Ok(backend) => backend,
-        Err(_) => {
-            fail(&events, STORE_FAILED);
-            return Session::Aborted;
-        }
-    };
-    let _ = restrict_store_file(&path);
-    if !link.is_current(token) {
-        return Session::Aborted;
-    }
-
-    let bot = match build_bot(
-        backend,
-        digits_only(phone),
-        events.clone(),
-        Arc::clone(link),
-        token,
-        link_id,
-    )
-    .await
-    {
-        Ok(bot) => bot,
-        Err(()) => {
-            fail(&events, BUILD_FAILED);
-            return Session::Aborted;
-        }
-    };
-
-    let handle = bot.spawn();
-    match link.gate.publish(token, handle).await {
-        Ok(previous) => {
-            if let Some(previous) = previous {
-                previous.shutdown().await;
-            }
-            if link.is_current(token) {
-                emit_status(
-                    &events,
-                    ProtocolId::WhatsApp,
-                    AdapterStatus::Connecting,
-                    "Experimental WhatsApp pairing is running on the worker. This is not a supported messenger.",
-                );
-            }
-            Session::Started
-        }
-        Err(handle) => Session::Rejected(handle),
-    }
-}
-
-fn fail(events: &EventTx, detail: &str) {
-    emit_status(events, ProtocolId::WhatsApp, AdapterStatus::Error, detail);
 }
 
 fn digits_only(phone: Option<String>) -> Option<String> {
@@ -202,152 +82,244 @@ fn digits_only(phone: Option<String>) -> Option<String> {
     }
 }
 
-fn emit_if_current(link: &LiveLink, token: u64, events: &EventTx, event: AdapterEvent) {
-    if !link.is_current(token) {
-        return;
-    }
-    let _ = events.send(event);
-}
+/// Event kinds the inbox reads. Everything else is skipped by the bus.
+const INBOX_EVENTS: &[EventKind] = &[
+    EventKind::PairingQrCode,
+    EventKind::PairingCode,
+    EventKind::PairingCodeError,
+    EventKind::PairingQrCodesExhausted,
+    EventKind::PairSuccess,
+    EventKind::PairError,
+    EventKind::Connected,
+    EventKind::Disconnected,
+    EventKind::LoggedOut,
+    EventKind::TemporaryBan,
+    EventKind::HistorySync,
+    EventKind::Messages,
+];
 
 async fn build_bot(
     backend: SqliteStore,
     phone_number: Option<String>,
-    events: EventTx,
-    link: Arc<LiveLink>,
-    token: u64,
-    link_id: u64,
+    callbacks: Callbacks,
 ) -> Result<Bot, ()> {
+    let mut builder =
+        Bot::builder()
+            .with_backend(backend)
+            .on_event_for(INBOX_EVENTS, move |event, _client| {
+                let callbacks = callbacks.clone();
+                async move {
+                    if let Some(link_event) = map_event(&event) {
+                        callbacks.send(link_event);
+                    }
+                }
+            });
     if let Some(phone_number) = phone_number {
-        let events_qr = events.clone();
-        let events_pair = events;
-        let link_qr = Arc::clone(&link);
-        let link_pair = link;
-        Bot::builder()
-            .with_backend(backend)
-            .on_qr_code(move |code, _timeout: Duration| {
-                let events_qr = events_qr.clone();
-                let link_qr = Arc::clone(&link_qr);
-                async move {
-                    emit_if_current(
-                        &link_qr,
-                        token,
-                        &events_qr,
-                        AdapterEvent::WhatsAppQr {
-                            code: RedactedPairingSecret::new(code),
-                            generation: link_id,
-                        },
-                    );
-                }
-            })
-            .with_pair_code(PairCodeOptions {
-                phone_number,
-                ..Default::default()
-            })
-            .on_pair_code(move |code, _timeout: Duration| {
-                let events_pair = events_pair.clone();
-                let link_pair = Arc::clone(&link_pair);
-                async move {
-                    emit_if_current(
-                        &link_pair,
-                        token,
-                        &events_pair,
-                        AdapterEvent::WhatsAppPairCode {
-                            code: RedactedPairingSecret::new(code),
-                            generation: link_id,
-                        },
-                    );
-                }
-            })
-            .build()
-            .await
-            .map_err(|_| ())
+        builder = builder.with_pair_code(PairCodeOptions {
+            phone_number,
+            ..Default::default()
+        });
+    }
+    builder.build().await.map_err(|_| ())
+}
+
+fn map_event(event: &Event) -> Option<LinkEvent> {
+    Some(match event {
+        Event::PairingQrCode(qr) => LinkEvent::Qr(RedactedPairingSecret::new(qr.code.clone())),
+        Event::PairingCode(code) => {
+            LinkEvent::PairCode(RedactedPairingSecret::new(code.code.clone()))
+        }
+        Event::PairingCodeError(error)
+            if error
+                .rejection
+                .is_some_and(|rejection| rejection.is_throttled()) =>
+        {
+            LinkEvent::PairThrottled
+        }
+        Event::PairingCodeError(_) | Event::PairError(_) => LinkEvent::PairFailed,
+        Event::PairingQrCodesExhausted(_) => LinkEvent::QrExhausted,
+        Event::PairSuccess(_) => LinkEvent::Paired,
+        Event::Connected(_) => LinkEvent::Connected,
+        Event::Disconnected(_) => LinkEvent::Disconnected,
+        Event::LoggedOut(_) => LinkEvent::LoggedOut,
+        Event::TemporaryBan(_) => LinkEvent::TemporaryBan,
+        Event::HistorySync(sync) => map_history(sync.get()?),
+        Event::Messages(batch) => LinkEvent::Messages(
+            batch
+                .iter()
+                .filter_map(|inbound| {
+                    let info = &inbound.info;
+                    Some(WaMessage {
+                        chat_jid: info.source.chat.to_string(),
+                        id: info.id.to_string(),
+                        from_me: info.source.is_from_me,
+                        sender_name: non_empty(info.push_name.as_str()),
+                        sender_jid: Some(info.source.sender.to_non_ad().to_string()),
+                        body: body_of(&inbound.message)?,
+                        timestamp: info.timestamp.timestamp(),
+                    })
+                })
+                .collect(),
+        ),
+        _ => return None,
+    })
+}
+
+fn map_history(sync: &wa::HistorySync) -> LinkEvent {
+    let chats = sync
+        .conversations
+        .iter()
+        .map(|conversation| {
+            let jid = conversation.id.clone();
+            let messages = conversation
+                .messages
+                .iter()
+                .filter_map(|row| map_history_message(&jid, &row.message))
+                .collect();
+            HistoryChat {
+                name: conversation
+                    .name
+                    .as_deref()
+                    .or(conversation.display_name.as_deref())
+                    .and_then(non_empty),
+                unread: conversation.unread_count.unwrap_or(0),
+                timestamp: conversation
+                    .conversation_timestamp
+                    .or(conversation.last_msg_timestamp)
+                    .and_then(|ts| i64::try_from(ts).ok())
+                    .unwrap_or(0),
+                jid,
+                messages,
+            }
+        })
+        .collect();
+    let push_names = sync
+        .pushnames
+        .iter()
+        .filter_map(|row| Some((row.id.clone()?, row.pushname.clone()?)))
+        .collect();
+    LinkEvent::History { chats, push_names }
+}
+
+fn map_history_message(chat_jid: &str, info: &wa::WebMessageInfo) -> Option<WaMessage> {
+    let key = &info.key;
+    let from_me = key.from_me.unwrap_or(false);
+    let sender_jid = key
+        .participant
+        .clone()
+        .or_else(|| info.participant.clone())
+        .or_else(|| (!from_me).then(|| chat_jid.to_string()));
+    Some(WaMessage {
+        chat_jid: chat_jid.to_string(),
+        id: key.id.clone()?,
+        from_me,
+        sender_name: info.push_name.as_deref().and_then(non_empty),
+        sender_jid,
+        body: body_of(info.message.as_option()?)?,
+        timestamp: info
+            .message_timestamp
+            .and_then(|ts| i64::try_from(ts).ok())
+            .unwrap_or(0),
+    })
+}
+
+/// Plain text, a media caption, or a short media label. Protocol-only
+/// messages (reactions, key distribution, receipts) return `None`.
+fn body_of(message: &wa::Message) -> Option<String> {
+    let base = message.get_base_message();
+    if let Some(text) = base.text_content().or_else(|| base.get_caption()) {
+        return non_empty(text);
+    }
+    let label = if base.image_message.is_set() {
+        "[photo]"
+    } else if base.video_message.is_set() {
+        "[video]"
+    } else if base.audio_message.is_set() {
+        "[audio]"
+    } else if base.document_message.is_set() {
+        "[document]"
+    } else if base.sticker_message.is_set() {
+        "[sticker]"
+    } else if base.contact_message.is_set() {
+        "[contact]"
+    } else if base.location_message.is_set() {
+        "[location]"
     } else {
-        Bot::builder()
-            .with_backend(backend)
-            .on_qr_code(move |code, _timeout: Duration| {
-                let events = events.clone();
-                let link = Arc::clone(&link);
-                async move {
-                    emit_if_current(
-                        &link,
-                        token,
-                        &events,
-                        AdapterEvent::WhatsAppQr {
-                            code: RedactedPairingSecret::new(code),
-                            generation: link_id,
-                        },
-                    );
-                }
-            })
-            .build()
-            .await
-            .map_err(|_| ())
+        return None;
+    };
+    Some(label.to_string())
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Class of a send error. The error text is dropped: it can hold JIDs.
+fn classify_send_error(error: &SendError) -> SendFailure {
+    match error {
+        SendError::NotLoggedIn | SendError::Client(ClientError::NotLoggedIn) => {
+            SendFailure::Unlinked
+        }
+        SendError::Client(_) | SendError::Iq(_) => SendFailure::Network,
+        _ => SendFailure::Rejected,
+    }
+}
+
+/// Sends plain text through the linked-device client.
+struct LiveSender {
+    client: Arc<Client>,
+}
+
+impl WhatsAppSender for LiveSender {
+    fn send_text<'a>(&'a self, chat_jid: &'a str, body: &'a str) -> SendFuture<'a> {
+        Box::pin(async move {
+            let jid: Jid = chat_jid.parse().map_err(|_| SendFailure::Rejected)?;
+            self.client
+                .send_message(jid, wa::Message::text(body))
+                .await
+                .map(|sent| sent.message_id)
+                .map_err(|error| classify_send_error(&error))
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
-    fn stale_pairing_events_are_discarded() {
-        let link = LiveLink::new();
-        let stale = link.next_generation();
-        let current = link.next_generation();
-        let (tx, mut rx) = unbounded_channel();
+    fn send_errors_map_to_failure_classes_without_text() {
+        assert_eq!(
+            classify_send_error(&SendError::Client(ClientError::NotConnected)),
+            SendFailure::Network
+        );
+        assert_eq!(
+            classify_send_error(&SendError::NotLoggedIn),
+            SendFailure::Unlinked
+        );
+        assert_eq!(
+            classify_send_error(&SendError::Client(ClientError::NotLoggedIn)),
+            SendFailure::Unlinked
+        );
+        assert_eq!(
+            classify_send_error(&SendError::InvalidRequest("111@s.whatsapp.net".into())),
+            SendFailure::Rejected
+        );
+        let debug = format!("{:?}", SendFailure::Rejected);
+        assert!(!debug.contains("111"));
+    }
 
-        emit_if_current(
-            &link,
-            stale,
-            &tx,
-            AdapterEvent::WhatsAppQr {
-                code: RedactedPairingSecret::new("old-qr"),
-                generation: stale,
-            },
-        );
-        emit_if_current(
-            &link,
-            stale,
-            &tx,
-            AdapterEvent::WhatsAppPairCode {
-                code: RedactedPairingSecret::new("old-pair"),
-                generation: stale,
-            },
-        );
-        assert!(rx.try_recv().is_err());
-
-        emit_if_current(
-            &link,
-            current,
-            &tx,
-            AdapterEvent::WhatsAppQr {
-                code: RedactedPairingSecret::new("new-qr"),
-                generation: current,
-            },
-        );
-        match rx.try_recv() {
-            Ok(AdapterEvent::WhatsAppQr { generation, code }) => {
-                assert_eq!(generation, current);
-                assert_eq!(code.reveal(), "new-qr");
-            }
-            other => panic!("expected current qr, got {other:?}"),
-        }
-        emit_if_current(
-            &link,
-            current,
-            &tx,
-            AdapterEvent::WhatsAppPairCode {
-                code: RedactedPairingSecret::new("new-pair"),
-                generation: current,
-            },
-        );
-        match rx.try_recv() {
-            Ok(AdapterEvent::WhatsAppPairCode { generation, code }) => {
-                assert_eq!(generation, current);
-                assert_eq!(code.reveal(), "new-pair");
-            }
-            other => panic!("expected current pair code, got {other:?}"),
-        }
+    #[test]
+    fn body_uses_text_caption_or_media_label() {
+        assert_eq!(body_of(&wa::Message::text("  hi ")).as_deref(), Some("hi"));
+        let image = wa::Message {
+            image_message: whatsapp_rust::waproto::buffa::MessageField::some(
+                wa::message::ImageMessage::default(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(body_of(&image).as_deref(), Some("[photo]"));
+        assert_eq!(body_of(&wa::Message::default()), None);
     }
 }

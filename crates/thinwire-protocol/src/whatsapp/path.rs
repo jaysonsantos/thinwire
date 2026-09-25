@@ -31,6 +31,29 @@ pub(crate) fn prepare_session_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// SQLite side files next to the device store.
+#[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+const STORE_SIDE_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// Delete the device store and its SQLite side files. Missing files are fine.
+#[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+pub(crate) fn remove_device_store(path: &Path) -> std::io::Result<()> {
+    let mut targets = vec![path.to_path_buf()];
+    for suffix in STORE_SIDE_SUFFIXES {
+        let mut side = path.as_os_str().to_owned();
+        side.push(suffix);
+        targets.push(PathBuf::from(side));
+    }
+    for target in targets {
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(not(feature = "whatsapp-web"), allow(dead_code))]
 pub(crate) fn restrict_store_file(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
