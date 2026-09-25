@@ -23,6 +23,15 @@ Hard constraints:
 - Tokens prefixed `User `, `Bearer `, or `mfa.` are refused, including a `Bot ` wrapper around those payloads. OAuth install scope is `bot` only. Gateway intents are guild inbox bits. Direct-message intents are not set. A missing-token placeholder does not mark the Discord account linked.
 - README keeps the three Critic risk bullets and does not market a personal Discord client.
 
+## Update: HTTP guild inbox (issue #35)
+
+- Discord runs in parallel with Telegram. The UI shows Discord when feature `discord-bot` is compiled. It does not wait for Telegram messages.
+- The adapter uses a `DiscordApi` trait. The live backend is twilight HTTP. Tests use a fake, so they run in default CI with the feature off.
+- Connect lists guild text and announcement channels. A channel shows only when the bot has View Channel and Read Message History after permission overwrites.
+- Open loads the last 50 messages. Send posts as the bot, only to a listed channel with Send Messages. Other conversation ids are refused, so direct messages cannot open.
+- The install URL adds Send Messages. Scope stays `bot`.
+- No gateway yet. New messages show when the channel opens again.
+
 ## Consequences
 A later beat can attach a gateway on the tokio worker without revisiting the crate choice or the user-token refusal. The shell shows this inbox when feature `discord-bot` is on (see the amendment below).
 
