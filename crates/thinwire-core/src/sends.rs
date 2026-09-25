@@ -2,10 +2,12 @@
 //!
 //! A chat has at most one send or retry in flight. Only the adapter's
 //! `SendAccepted` / `SendRejected` for the same request id ends it. A status
-//! (`Connecting`, `Error`), a command failure, or a notice never does. Only
-//! the end of a protocol's session drops its entries.
+//! (`Connecting`, `Error`), a command failure, or a notice never does. The
+//! end of a protocol's session drops its entries, and an entry with no answer
+//! after [`SEND_TIMEOUT`] expires (#69).
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use thinwire_protocol::ProtocolId;
 
@@ -20,11 +22,34 @@ pub(crate) enum Pending {
 }
 
 impl Pending {
-    const fn request(&self) -> u64 {
+    pub(crate) const fn request(&self) -> u64 {
         match self {
             Self::Send { request, .. } | Self::Retry { request, .. } => *request,
         }
     }
+}
+
+/// Longest wait for the adapter's answer to a send or retry. After it, the
+/// chat unlocks and the send counts as failed (#69). An adapter answers far
+/// sooner: this is a safety net for a lost answer, not the normal path.
+pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an expired entry waits for a late answer. After it, the entry and
+/// its text are gone, so the tracker never grows without end (PR #81 review).
+pub(crate) const EXPIRED_KEEP: Duration = Duration::from_secs(5 * 60);
+
+/// An entry that expired, and when.
+#[derive(Debug)]
+struct Expired {
+    pending: Pending,
+    at: Instant,
+}
+
+/// One entry: what is in flight, and since when.
+#[derive(Debug)]
+struct Open {
+    pending: Pending,
+    since: Instant,
 }
 
 /// Sends and retries in flight, keyed by (protocol, chat).
@@ -32,7 +57,11 @@ impl Pending {
 pub(crate) struct SendTracker {
     /// The next request id. Unique for the whole app, never per protocol.
     next: u64,
-    open: HashMap<(ProtocolId, String), Pending>,
+    open: HashMap<(ProtocolId, String), Open>,
+    /// Entries that expired with no answer, by (protocol, chat, request). A
+    /// late answer finds them here (PR #81 review): a late accept still means
+    /// the message went out. Kept for `EXPIRED_KEEP` only.
+    expired: HashMap<(ProtocolId, String, u64), Expired>,
 }
 
 impl Default for SendTracker {
@@ -40,6 +69,7 @@ impl Default for SendTracker {
         Self {
             next: 1,
             open: HashMap::new(),
+            expired: HashMap::new(),
         }
     }
 }
@@ -50,7 +80,7 @@ impl SendTracker {
     pub(crate) fn request_of(&self, protocol: ProtocolId, chat: &str) -> Option<u64> {
         self.open
             .get(&(protocol, chat.to_owned()))
-            .map(Pending::request)
+            .map(|open| open.pending.request())
     }
 
     /// Start a send. `None` while this chat already has a send or a retry.
@@ -59,8 +89,9 @@ impl SendTracker {
         protocol: ProtocolId,
         chat: &str,
         body: &str,
+        now: Instant,
     ) -> Option<u64> {
-        self.begin(protocol, chat, |request| Pending::Send {
+        self.begin(protocol, chat, now, |request| Pending::Send {
             request,
             body: body.to_owned(),
         })
@@ -72,8 +103,9 @@ impl SendTracker {
         protocol: ProtocolId,
         chat: &str,
         message_id: &str,
+        now: Instant,
     ) -> Option<u64> {
-        self.begin(protocol, chat, |request| Pending::Retry {
+        self.begin(protocol, chat, now, |request| Pending::Retry {
             request,
             message_id: message_id.to_owned(),
         })
@@ -83,6 +115,7 @@ impl SendTracker {
         &mut self,
         protocol: ProtocolId,
         chat: &str,
+        now: Instant,
         pending: impl FnOnce(u64) -> Pending,
     ) -> Option<u64> {
         let key = (protocol, chat.to_owned());
@@ -91,7 +124,13 @@ impl SendTracker {
         }
         let request = self.next;
         self.next += 1;
-        self.open.insert(key, pending(request));
+        self.open.insert(
+            key,
+            Open {
+                pending: pending(request),
+                since: now,
+            },
+        );
         Some(request)
     }
 
@@ -114,15 +153,91 @@ impl SendTracker {
         request: u64,
     ) -> Option<Pending> {
         let key = (protocol, chat.to_owned());
-        if self.open.get(&key).map(Pending::request) != Some(request) {
+        if self.open.get(&key).map(|open| open.pending.request()) != Some(request) {
             return None;
         }
-        self.open.remove(&key)
+        self.open.remove(&key).map(|open| open.pending)
+    }
+
+    /// When the oldest entry expires, if any entry is in flight. The core
+    /// arms a wake for it, so a frontend that waits on the change signal
+    /// pumps at the deadline (PR #81 review).
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.open
+            .values()
+            .map(|open| open.since + SEND_TIMEOUT)
+            .min()
+    }
+
+    /// Test hook: move every entry's start back by `by`.
+    #[cfg(test)]
+    pub(crate) fn age_for_test(&mut self, by: Duration) {
+        for open in self.open.values_mut() {
+            open.since -= by;
+        }
+    }
+
+    /// Remove and return every entry with no answer after `SEND_TIMEOUT`
+    /// (#69). `settle_expired` then finds a late answer for one of them.
+    pub(crate) fn expire(&mut self, now: Instant) -> Vec<(ProtocolId, String, Pending)> {
+        self.expired
+            .retain(|_, expired| now.saturating_duration_since(expired.at) < EXPIRED_KEEP);
+        let late: Vec<(ProtocolId, String)> = self
+            .open
+            .iter()
+            .filter(|(_, open)| now.saturating_duration_since(open.since) >= SEND_TIMEOUT)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let expired: Vec<(ProtocolId, String, Pending)> = late
+            .into_iter()
+            .filter_map(|key| {
+                self.open
+                    .remove(&key)
+                    .map(|open| (key.0, key.1, open.pending))
+            })
+            .collect();
+        for (protocol, chat, pending) in &expired {
+            self.expired.insert(
+                (*protocol, chat.clone(), pending.request()),
+                Expired {
+                    pending: pending.clone(),
+                    at: now,
+                },
+            );
+        }
+        expired
+    }
+
+    /// A late answer for an entry that already expired. Returns and forgets
+    /// it; `None` when no expired entry has this request id.
+    pub(crate) fn settle_expired(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        request: u64,
+    ) -> Option<Pending> {
+        self.expired
+            .remove(&(protocol, chat.to_owned(), request))
+            .map(|expired| expired.pending)
+    }
+
+    /// Stop tracking this chat's retry of `message_id`, if one is in flight.
+    /// A late accept of an older retry already sent the message, so a later
+    /// answer to the new retry must not move the row (PR #81 review).
+    pub(crate) fn drop_retry_of(&mut self, protocol: ProtocolId, chat: &str, message_id: &str) {
+        let key = (protocol, chat.to_owned());
+        let same = self.open.get(&key).is_some_and(|open| {
+            matches!(&open.pending, Pending::Retry { message_id: id, .. } if id == message_id)
+        });
+        if same {
+            self.open.remove(&key);
+        }
     }
 
     /// The protocol's session ended: its sends and retries are gone.
     pub(crate) fn drop_protocol(&mut self, protocol: ProtocolId) {
         self.open.retain(|(owner, _), _| *owner != protocol);
+        self.expired.retain(|(owner, _, _), _| *owner != protocol);
     }
 }
 
@@ -134,12 +249,20 @@ mod tests {
     fn one_send_per_chat_and_the_same_chat_id_in_two_protocols_does_not_block() {
         let mut sends = SendTracker::default();
         let first = sends
-            .begin_send(ProtocolId::Slack, "c1", "hi")
+            .begin_send(ProtocolId::Slack, "c1", "hi", Instant::now())
             .expect("first");
-        assert!(sends.begin_send(ProtocolId::Slack, "c1", "again").is_none());
-        assert!(sends.begin_retry(ProtocolId::Slack, "c1", "m1").is_none());
+        assert!(
+            sends
+                .begin_send(ProtocolId::Slack, "c1", "again", Instant::now())
+                .is_none()
+        );
+        assert!(
+            sends
+                .begin_retry(ProtocolId::Slack, "c1", "m1", Instant::now())
+                .is_none()
+        );
         let other = sends
-            .begin_send(ProtocolId::Discord, "c1", "hi")
+            .begin_send(ProtocolId::Discord, "c1", "hi", Instant::now())
             .expect("another protocol");
         assert_ne!(first, other, "request ids are unique for the app");
         assert!(sends.in_flight(ProtocolId::Slack, "c1"));
@@ -150,7 +273,7 @@ mod tests {
     fn only_the_matching_request_settles() {
         let mut sends = SendTracker::default();
         let request = sends
-            .begin_send(ProtocolId::Telegram, "telegram:1", "hi")
+            .begin_send(ProtocolId::Telegram, "telegram:1", "hi", Instant::now())
             .expect("send");
         assert_eq!(
             sends.settle(ProtocolId::Telegram, "telegram:1", request + 7),
@@ -175,11 +298,11 @@ mod tests {
     fn a_retry_is_tracked_like_a_send() {
         let mut sends = SendTracker::default();
         let request = sends
-            .begin_retry(ProtocolId::WhatsApp, "wa:1", "wa:1:9")
+            .begin_retry(ProtocolId::WhatsApp, "wa:1", "wa:1:9", Instant::now())
             .expect("retry");
         assert!(
             sends
-                .begin_send(ProtocolId::WhatsApp, "wa:1", "new")
+                .begin_send(ProtocolId::WhatsApp, "wa:1", "new", Instant::now())
                 .is_none()
         );
         assert_eq!(
@@ -194,12 +317,97 @@ mod tests {
     #[test]
     fn drop_protocol_clears_only_that_protocol() {
         let mut sends = SendTracker::default();
-        sends.begin_send(ProtocolId::Slack, "c1", "a");
-        sends.begin_retry(ProtocolId::Slack, "c2", "m");
-        sends.begin_send(ProtocolId::Telegram, "telegram:1", "b");
+        sends.begin_send(ProtocolId::Slack, "c1", "a", Instant::now());
+        sends.begin_retry(ProtocolId::Slack, "c2", "m", Instant::now());
+        sends.begin_send(ProtocolId::Telegram, "telegram:1", "b", Instant::now());
         sends.drop_protocol(ProtocolId::Slack);
         assert!(!sends.in_flight(ProtocolId::Slack, "c1"));
         assert!(!sends.in_flight(ProtocolId::Slack, "c2"));
         assert!(sends.in_flight(ProtocolId::Telegram, "telegram:1"));
+    }
+
+    /// #69: an entry with no answer expires after `SEND_TIMEOUT`. Only
+    /// `settle_expired` finds it after that, and only once.
+    #[test]
+    fn an_unanswered_send_expires() {
+        let start = Instant::now();
+        let mut sends = SendTracker::default();
+        let request = sends
+            .begin_send(ProtocolId::Telegram, "telegram:1", "hi", start)
+            .expect("send");
+        sends
+            .begin_retry(ProtocolId::Slack, "c1", "m1", start + SEND_TIMEOUT / 2)
+            .expect("retry");
+        assert!(sends.expire(start + SEND_TIMEOUT / 2).is_empty(), "not yet");
+        let late = sends.expire(start + SEND_TIMEOUT);
+        assert_eq!(late.len(), 1, "only the older one: {late:?}");
+        assert_eq!(late[0].0, ProtocolId::Telegram);
+        assert!(!sends.in_flight(ProtocolId::Telegram, "telegram:1"));
+        assert!(sends.in_flight(ProtocolId::Slack, "c1"));
+        assert_eq!(
+            sends.settle(ProtocolId::Telegram, "telegram:1", request),
+            None
+        );
+        assert_eq!(
+            sends.settle_expired(ProtocolId::Telegram, "telegram:1", request + 1),
+            None,
+            "another request"
+        );
+        assert_eq!(
+            sends.settle_expired(ProtocolId::Telegram, "telegram:1", request),
+            Some(Pending::Send {
+                request,
+                body: "hi".into()
+            })
+        );
+        assert_eq!(
+            sends.settle_expired(ProtocolId::Telegram, "telegram:1", request),
+            None,
+            "only once"
+        );
+    }
+
+    /// PR #81 review: an expired entry waits `EXPIRED_KEEP` for a late
+    /// answer, then it and its text are gone.
+    #[test]
+    fn an_expired_entry_is_dropped_after_the_keep_window() {
+        let start = Instant::now();
+        let mut sends = SendTracker::default();
+        let request = sends
+            .begin_send(ProtocolId::Telegram, "telegram:1", "hi", start)
+            .expect("send");
+        let expired_at = start + SEND_TIMEOUT;
+        assert_eq!(sends.expire(expired_at).len(), 1);
+        assert!(sends.expire(expired_at + EXPIRED_KEEP / 2).is_empty());
+        assert_eq!(sends.expired.len(), 1, "still in the window");
+        assert!(sends.expire(expired_at + EXPIRED_KEEP).is_empty());
+        assert!(sends.expired.is_empty(), "the text is gone");
+        assert_eq!(
+            sends.settle_expired(ProtocolId::Telegram, "telegram:1", request),
+            None
+        );
+    }
+
+    /// PR #81 review: `drop_retry_of` drops only a retry of that message.
+    #[test]
+    fn drop_retry_of_drops_only_that_retry() {
+        let now = Instant::now();
+        let mut sends = SendTracker::default();
+        sends
+            .begin_retry(ProtocolId::Telegram, "telegram:1", "m1", now)
+            .expect("retry");
+        sends.drop_retry_of(ProtocolId::Telegram, "telegram:1", "m2");
+        assert!(sends.in_flight(ProtocolId::Telegram, "telegram:1"));
+        sends.drop_retry_of(ProtocolId::Telegram, "telegram:1", "m1");
+        assert!(!sends.in_flight(ProtocolId::Telegram, "telegram:1"));
+
+        sends
+            .begin_send(ProtocolId::Telegram, "telegram:1", "m1", now)
+            .expect("send");
+        sends.drop_retry_of(ProtocolId::Telegram, "telegram:1", "m1");
+        assert!(
+            sends.in_flight(ProtocolId::Telegram, "telegram:1"),
+            "a send is not a retry"
+        );
     }
 }
