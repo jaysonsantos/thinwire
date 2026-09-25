@@ -58,6 +58,8 @@ struct PendingLoad {
 /// - A 401 step queues one result for every send still in the map, finishes
 ///   every load in `loads`, then queues `Unlinked`, before the lock is released.
 /// - A task that observes `revoked`, or no longer finds its entry, queues nothing.
+/// - A channel-list reload publishes `Linked`, the rows, and `ChatListLoaded`
+///   in this same step, and queues none of them if the session is already revoked.
 #[derive(Debug, Default)]
 struct Shared {
     bot_id: Option<u64>,
@@ -197,19 +199,11 @@ impl Session {
         let events = events.clone();
         tokio::spawn(async move {
             let result = load_channels(api.as_ref()).await;
-            if !gate.current() {
-                return;
-            }
-            let current = shared.lock().map(|state| state.reload_ticket).unwrap_or(0);
-            if current != ticket {
-                return;
-            }
             match result {
                 Ok((bot_id, channels)) => {
-                    publish_channels(&shared, &events, bot_id, &channels);
-                    // The shell stops the chat-list spinner on this event
-                    // (adapter contract rule 9, ADR 0010).
-                    emit_chat_list_loaded(&events, ProtocolId::Discord);
+                    // Publication rechecks the gate, the ticket, and `revoked`
+                    // under the session lock. A 401 that won the race drops it.
+                    publish_channels(&shared, &gate, ticket, &events, bot_id, &channels);
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
@@ -543,6 +537,8 @@ fn refused_channel() -> AdapterError {
 
 fn publish_channels(
     shared: &Mutex<Shared>,
+    gate: &Gate,
+    ticket: u64,
     events: &EventTx,
     bot_id: u64,
     channels: &[InboxChannel],
@@ -562,7 +558,7 @@ fn publish_channels(
     let Ok(mut state) = shared.lock() else {
         return;
     };
-    if state.revoked {
+    if state.revoked || !gate.current() || state.reload_ticket != ticket {
         return;
     }
     let gone: Vec<String> = state
@@ -585,6 +581,9 @@ fn publish_channels(
     for channel in channels {
         emit_conversation(events, channel.conversation());
     }
+    // The shell stops the chat-list spinner on this event
+    // (adapter contract rule 9, ADR 0010).
+    emit_chat_list_loaded(events, ProtocolId::Discord);
 }
 
 /// A 401 means the token is dead. Reject every send still in flight and

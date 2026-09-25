@@ -1861,6 +1861,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_revoked_session_drops_a_channel_list_that_finishes_later() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().hold_channels = Some(Arc::clone(&hold));
+        api.state().channels_at_barrier = Some(Arc::clone(&arrived));
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("reload reached the channel list");
+        api.state().unauthorized = true;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                },
+                &tx,
+            )
+            .expect("open");
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Notice { .. })
+        })
+        .await;
+        hold.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late.iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Linked,
+                        ..
+                    } | AdapterEvent::ConversationUpsert { .. }
+                        | AdapterEvent::ChatListLoaded { .. }
+                )
+            }),
+            "a revoked session does not publish the channel list"
+        );
+    }
+
+    #[tokio::test]
     async fn reload_removes_channels_that_left_the_list() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
