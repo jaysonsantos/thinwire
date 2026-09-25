@@ -253,6 +253,11 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         if let Some(notice) = notice {
             ui.colored_label(palette.warn, notice);
         }
+        // A protocol note (`AdapterEvent::Notice`) for the selected protocol.
+        // Information, not an error.
+        if let Some(note) = snapshot.notice(snapshot.selected_protocol) {
+            ui.label(RichText::new(note).color(palette.text2));
+        }
         if show_error && let Some(error) = &snapshot.error {
             let happened = error.happened.clone();
             let why = error.why.clone();
@@ -339,7 +344,8 @@ pub(super) fn status_strip_visible(snapshot: &Snapshot, notice: Option<&str>) ->
     let show_error = snapshot.auth == AuthScreen::Idle && snapshot.error.is_some();
     let show_status = !snapshot.status_is_idle()
         && public_status(&snapshot.status_text).is_some_and(|text| !is_idle_status(text));
-    notice.is_some() || show_error || show_status
+    let note = snapshot.notice(snapshot.selected_protocol).is_some();
+    notice.is_some() || show_error || show_status || note
 }
 
 fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
@@ -485,10 +491,14 @@ fn section_header(ui: &mut egui::Ui, title: &str) {
     );
 }
 
-/// "No chats." is a finished load with zero rows. Before sign-in the list stays blank.
+/// "No chats." is a finished load with zero rows. Before the selected
+/// protocol is linked the list stays blank.
 #[must_use]
 fn show_no_chats(snapshot: &Snapshot) -> bool {
-    snapshot.telegram_ready() || snapshot.selected_protocol != ProtocolId::Telegram
+    snapshot
+        .accounts
+        .iter()
+        .any(|row| row.caps.id == snapshot.selected_protocol && row.linked())
 }
 
 fn inbox(
@@ -738,6 +748,14 @@ fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
         && !session_moving
     {
         "Not signed in"
+    } else if account.linked()
+        && matches!(
+            account.status,
+            AdapterStatus::Error | AdapterStatus::Refused
+        )
+    {
+        // Still signed in: an error status never unlinks (shell plan 11).
+        "Connection problem"
     } else {
         account_label(account.status)
     }
@@ -1748,6 +1766,25 @@ mod tests {
         assert_eq!(chip_label(&snapshot, account), "Connecting…");
     }
 
+    /// Shell plan 11: a linked account with an error is not "Not signed in".
+    #[test]
+    fn chip_keeps_a_linked_account_signed_in_on_an_error() {
+        use super::chip_label;
+        use thinwire_core::state::Snapshot;
+        use thinwire_protocol::{AccountState, ProtocolId};
+
+        let mut snapshot = Snapshot::new();
+        let row = snapshot
+            .accounts
+            .iter_mut()
+            .find(|account| account.caps.id == ProtocolId::Telegram)
+            .expect("telegram");
+        row.state = AccountState::Linked;
+        row.status = AdapterStatus::Error;
+        let account = snapshot.accounts[0].clone();
+        assert_eq!(chip_label(&snapshot, &account), "Connection problem");
+    }
+
     #[test]
     fn inbox_stays_blank_before_sign_in() {
         use super::show_no_chats;
@@ -1755,8 +1792,11 @@ mod tests {
 
         let mut snapshot = Snapshot::new();
         assert!(!show_no_chats(&snapshot));
-        snapshot.telegram_authorized = true;
-        assert!(show_no_chats(&snapshot));
+        snapshot.apply(thinwire_protocol::AdapterEvent::Account {
+            protocol: thinwire_protocol::ProtocolId::Telegram,
+            state: thinwire_protocol::AccountState::Linked,
+        });
+        assert!(show_no_chats(&snapshot), "the selected protocol is linked");
     }
 
     #[test]
@@ -1794,6 +1834,14 @@ mod tests {
             "a signed-in thread with a quiet status draws no strip"
         );
         snapshot.status_text = "Sending…".into();
+        assert!(status_strip_visible(&snapshot, None));
+
+        // A note of the selected protocol shows the strip too.
+        snapshot.status_text = "Recent messages loaded.".into();
+        snapshot.apply(thinwire_protocol::AdapterEvent::Notice {
+            protocol: snapshot.selected_protocol,
+            text: "Read-only channel.".into(),
+        });
         assert!(status_strip_visible(&snapshot, None));
     }
 
