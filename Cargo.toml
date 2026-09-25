@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/thinwire",
   "crates/thinwire-core",
+  "crates/thinwire-notify",
   "crates/thinwire-protocol",
   "crates/thinwire-signal",
 ]
@@ -42,6 +43,7 @@ chrono = { version = "0.4", default-features = false, features = [
 ] }
 winit = "0.30"
 thinwire-core = { path = "crates/thinwire-core" }
+thinwire-notify = { path = "crates/thinwire-notify" }
 thinwire-protocol = { path = "crates/thinwire-protocol" }
 thinwire-signal = { path = "crates/thinwire-signal" }
 tokio = { version = "1", features = [
