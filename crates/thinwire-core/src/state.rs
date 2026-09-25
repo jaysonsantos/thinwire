@@ -387,6 +387,9 @@ pub struct Snapshot {
     /// The last Telegram status line that came as `AdapterStatus::Ready`: a
     /// finished success such as "Message sent." (#56).
     ready_status: Option<String>,
+    /// Status line replaced while a send is in flight. Restored when the
+    /// last send settles, so "Sending…" does not stay after it finishes.
+    status_before_send: Option<String>,
     pub compose: String,
     pub auth_busy: bool,
     /// One line above the active login form. Never holds a secret.
@@ -564,6 +567,7 @@ impl Snapshot {
             error: None,
             status_text: "Sign in with Telegram to get started.".into(),
             ready_status: None,
+            status_before_send: None,
             compose: String::new(),
             auth_busy: false,
             auth_notice: None,
@@ -1161,7 +1165,7 @@ impl Snapshot {
             self.compose.clear();
         }
         self.error = None;
-        self.status_text = "Sending…".into();
+        self.note_sending();
         self.pending.push(AdapterCommand::ResendMessage {
             protocol,
             conversation_id,
@@ -1658,6 +1662,7 @@ impl Snapshot {
             Some(Pending::Retry { .. }) => self.drop_rejected_body(protocol, chat),
             None => self.note_late_accept(protocol, chat, request),
         }
+        self.finish_sending_line();
     }
 
     /// A `SendAccepted` after the send expired (PR #81 review). The message
@@ -1685,6 +1690,7 @@ impl Snapshot {
         if shown {
             self.show_timeouts();
         }
+        self.finish_sending_line();
     }
 
     /// Set the timeout error from `timed_out`: one line per expired send, or
@@ -1805,6 +1811,7 @@ impl Snapshot {
         }
         // Every expired send shows, not only the last one (qa on #81).
         self.show_timeouts();
+        self.finish_sending_line();
         true
     }
 
@@ -1846,6 +1853,7 @@ impl Snapshot {
             }
             None => {}
         }
+        self.finish_sending_line();
     }
 
     /// Forget a rejected send for this chat. An accepted send, a removed
@@ -1959,7 +1967,23 @@ impl Snapshot {
             body,
             request,
         });
-        self.status_text = "Sending…".into();
+        self.note_sending();
+    }
+
+    /// Remember the current status and show Sending… until the last send settles.
+    fn note_sending(&mut self) {
+        if self.status_text != SENDING_STATUS {
+            self.status_before_send = Some(std::mem::take(&mut self.status_text));
+        }
+        self.status_text = SENDING_STATUS.into();
+    }
+
+    /// Put the previous status back once nothing is still sending.
+    fn finish_sending_line(&mut self) {
+        if !self.sends.is_empty() || self.status_text != SENDING_STATUS {
+            return;
+        }
+        self.status_text = self.status_before_send.take().unwrap_or_default();
     }
 
     pub fn open_telegram(&mut self, store: &SecretStore) {
@@ -6120,6 +6144,37 @@ mod tests {
             state: AccountState::Unlinked,
         });
         assert!(!snapshot.can_send(), "unlinked");
+    }
+
+    #[test]
+    fn a_finished_send_clears_the_sending_line() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.selected_protocol = ProtocolId::Slack;
+        snapshot.selected_conversation = Some("slack:C1".into());
+        snapshot.history_loading.clear();
+        let before = snapshot.status_text.clone();
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            });
+        let request = request.expect("send");
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+            request,
+        });
+        assert_ne!(snapshot.status_line(), SENDING_STATUS);
+        assert_eq!(snapshot.status_text, before);
     }
 
     #[test]
