@@ -31,20 +31,38 @@ impl AdapterHost {
         whatsapp_phone: Arc<WhatsAppPhoneVault>,
         signal: Option<Box<dyn ProtocolAdapter>>,
     ) -> Self {
-        let (event_tx, event_rx) = unbounded_channel();
-        let (command_tx, mut command_rx) = unbounded_channel();
         let login_epoch: LoginEpoch = Arc::new(AtomicU64::new(0));
         let adapter_epoch = Arc::clone(&login_epoch);
-
-        handle.spawn(async move {
-            let mut adapters = registry(
+        Self::spawn_inner(handle, login_epoch, move || {
+            registry(
                 secrets,
                 discord,
                 slack,
                 whatsapp_phone,
                 adapter_epoch,
                 signal,
-            );
+            )
+        })
+    }
+
+    /// Spawn the worker with these adapters in place of the app's registry.
+    /// For the demo adapters (#120) and tests. The routing, the login epoch,
+    /// and the error handling are the same as in [`Self::spawn`].
+    #[must_use]
+    pub fn spawn_adapters(handle: &Handle, adapters: Vec<Box<dyn ProtocolAdapter>>) -> Self {
+        Self::spawn_inner(handle, Arc::new(AtomicU64::new(0)), move || adapters)
+    }
+
+    fn spawn_inner(
+        handle: &Handle,
+        login_epoch: LoginEpoch,
+        adapters: impl FnOnce() -> Vec<Box<dyn ProtocolAdapter>> + Send + 'static,
+    ) -> Self {
+        let (event_tx, event_rx) = unbounded_channel();
+        let (command_tx, mut command_rx) = unbounded_channel();
+
+        handle.spawn(async move {
+            let mut adapters = adapters();
             for adapter in &mut adapters {
                 adapter.start(event_tx.clone());
             }
