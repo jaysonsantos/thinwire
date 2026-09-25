@@ -870,6 +870,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
                 first_id: first_id.clone(),
                 content_height: output.content_size.y,
                 restore: step.restore,
+                in_zone: step.in_zone,
             },
         );
     });
@@ -905,13 +906,18 @@ struct ThreadMemo {
     content_height: f32,
     /// Scroll offset for the next pass, after older rows went in above.
     restore: Option<f32>,
+    /// The last frame was in the top zone. A request goes out only when the
+    /// view enters the zone, not on each repaint inside it (#61 review).
+    in_zone: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct OlderStep {
-    /// The view reached the top of rows that did not change since the last
-    /// frame: ask for older messages.
+    /// The view entered the top zone of rows that did not change since the
+    /// last frame: ask for older messages. Once, not on each repaint.
     at_top: bool,
+    /// Remember for the next frame: the view is in the top zone.
+    in_zone: bool,
     /// Older rows went in above the rows of the last frame: the offset that
     /// keeps the old top row in place.
     restore: Option<f32>,
@@ -919,7 +925,10 @@ struct OlderStep {
 
 /// Pure frame logic for older-message paging. A chat that just opened (no
 /// rows last frame) never asks: `stick_to_bottom` moves it to the newest
-/// message first.
+/// message first. The ask is edge-triggered: the view must enter the zone.
+/// New rows above count as a new entry, so a short chat keeps filling. A
+/// page that brought nothing leaves the rows as they are: no new ask until
+/// the view leaves the zone and comes back (the core also waits).
 fn older_step(
     memo: &ThreadMemo,
     first_id: Option<&str>,
@@ -927,25 +936,26 @@ fn older_step(
     offset: f32,
     content_height: f32,
 ) -> OlderStep {
-    let Some(first) = first_id else {
-        return OlderStep {
-            at_top: false,
-            restore: None,
-        };
+    let idle = OlderStep {
+        at_top: false,
+        restore: None,
+        in_zone: false,
     };
+    let Some(first) = first_id else {
+        return idle;
+    };
+    let zone = offset <= OLDER_TRIGGER;
     match memo.first_id.as_deref() {
         Some(old) if old == first => OlderStep {
-            at_top: memo.restore.is_none() && offset <= OLDER_TRIGGER,
+            at_top: memo.restore.is_none() && zone && !memo.in_zone,
             restore: None,
+            in_zone: zone,
         },
         Some(old) if memo.restore.is_none() && has_row(old) => OlderStep {
-            at_top: false,
             restore: Some((offset + content_height - memo.content_height).max(0.0)),
+            ..idle
         },
-        _ => OlderStep {
-            at_top: false,
-            restore: None,
-        },
+        _ => idle,
     }
 }
 
@@ -1283,14 +1293,16 @@ mod tests {
             older_step(&fresh, Some("t:1:50"), has, 0.0, 800.0),
             OlderStep {
                 at_top: false,
-                restore: None
+                restore: None,
+                in_zone: false,
             }
         );
-        // Same rows as the last frame, near the top: ask.
+        // Same rows as the last frame, the view enters the top: ask.
         let seen = ThreadMemo {
             first_id: Some("t:1:50".into()),
             content_height: 800.0,
             restore: None,
+            in_zone: false,
         };
         assert!(older_step(&seen, Some("t:1:50"), has, OLDER_TRIGGER, 800.0).at_top);
         assert!(!older_step(&seen, Some("t:1:50"), has, OLDER_TRIGGER + 1.0, 800.0).at_top);
@@ -1300,7 +1312,8 @@ mod tests {
             step,
             OlderStep {
                 at_top: false,
-                restore: Some(304.0)
+                restore: Some(304.0),
+                in_zone: false,
             }
         );
         // The pass that applies the offset does not ask again.
@@ -1308,6 +1321,7 @@ mod tests {
             first_id: Some("t:1:40".into()),
             content_height: 1100.0,
             restore: Some(304.0),
+            in_zone: false,
         };
         assert!(!older_step(&restoring, Some("t:1:40"), has, 304.0, 1100.0).at_top);
         // Another chat's rows (the old top row is gone): no offset change.
@@ -1317,6 +1331,32 @@ mod tests {
         );
         // No rows: nothing.
         assert!(!older_step(&seen, None, has, 0.0, 0.0).at_top);
+    }
+
+    #[test]
+    fn repaints_at_the_top_ask_once_and_a_new_ask_needs_leave_and_return() {
+        use super::{ThreadMemo, older_step};
+
+        let has = |id: &str| id == "t:1:50";
+        let mut memo = ThreadMemo {
+            first_id: Some("t:1:50".into()),
+            content_height: 800.0,
+            restore: None,
+            in_zone: false,
+        };
+        let frame = |memo: &mut ThreadMemo, offset: f32| {
+            let step = older_step(memo, Some("t:1:50"), has, offset, 800.0);
+            memo.in_zone = step.in_zone;
+            memo.restore = step.restore;
+            step.at_top
+        };
+        // 30 repaints at the top, and the page brought nothing: one ask.
+        let asks = (0..30).filter(|_| frame(&mut memo, 0.0)).count();
+        assert_eq!(asks, 1, "no request loop (#61 review)");
+        // Leave the zone, then come back: one more ask.
+        assert!(!frame(&mut memo, 200.0));
+        assert!(frame(&mut memo, 0.0));
+        assert!(!frame(&mut memo, 0.0));
     }
 
     #[test]

@@ -267,6 +267,11 @@ pub const KEYCHAIN_WAITING: &str = "Waiting for the keychain. Unlock it to conti
 /// After this long, the keychain copy asks the user to unlock it.
 const KEYCHAIN_SLOW_AFTER: Duration = Duration::from_secs(1);
 
+/// Shortest wait before the same older-message anchor is asked again, after
+/// a request that brought nothing older (a failure or an anchor-only page).
+/// The frontend also asks only when the view enters the top again (#61).
+pub const OLDER_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 /// Center panel copy while a saved session reconnects.
 pub const RESUME_CONNECTING: &str = "Connecting to Telegram…";
 
@@ -334,6 +339,10 @@ pub struct Snapshot {
     older_loading: HashSet<String>,
     /// Telegram chats whose start is loaded. No more older requests (#30).
     older_at_start: HashSet<String>,
+    /// Telegram chats whose last older request brought nothing older: the
+    /// anchor it used and when it ended. That anchor waits
+    /// `OLDER_RETRY_DELAY` (#61 review).
+    older_retry: HashMap<String, (String, Instant)>,
     scroll_to_selected: bool,
     /// Unsent compose text per chat. `compose` holds the selected chat's draft.
     drafts: HashMap<String, String>,
@@ -449,6 +458,7 @@ impl Snapshot {
             history_loading: HashSet::new(),
             older_loading: HashSet::new(),
             older_at_start: HashSet::new(),
+            older_retry: HashMap::new(),
             scroll_to_selected: false,
             drafts: HashMap::new(),
             focus_compose: false,
@@ -577,13 +587,26 @@ impl Snapshot {
             AdapterEvent::OlderHistoryLoaded {
                 protocol,
                 conversation_id,
+                before_message_id,
                 more,
                 ..
             } => {
                 if protocol == ProtocolId::Telegram {
                     self.older_loading.remove(&conversation_id);
+                    let oldest = self
+                        .messages
+                        .get(&(protocol, conversation_id.clone()))
+                        .and_then(|list| list.first())
+                        .map(|row| row.id.as_str());
                     if !more {
+                        self.older_retry.remove(&conversation_id);
                         self.older_at_start.insert(conversation_id);
+                    } else if oldest == Some(before_message_id.as_str()) {
+                        // Nothing older came: do not ask this anchor at once.
+                        self.older_retry
+                            .insert(conversation_id, (before_message_id, Instant::now()));
+                    } else {
+                        self.older_retry.remove(&conversation_id);
                     }
                 }
             }
@@ -1030,6 +1053,12 @@ impl Snapshot {
     /// chat. Only Telegram answers `LoadOlderMessages` today. Nothing goes out
     /// while a request runs, the first page loads, or the start is loaded.
     pub(crate) fn load_older(&mut self) {
+        self.load_older_at(Instant::now());
+    }
+
+    /// `load_older` with the clock as a parameter, for tests. An anchor that
+    /// brought nothing older waits `OLDER_RETRY_DELAY` from `now`.
+    fn load_older_at(&mut self, now: Instant) {
         if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
             return;
         }
@@ -1045,6 +1074,12 @@ impl Snapshot {
         let Some(oldest) = self.selected_messages().first().map(|row| row.id.clone()) else {
             return;
         };
+        if let Some((anchor, at)) = self.older_retry.get(&id)
+            && *anchor == oldest
+            && now.saturating_duration_since(*at) < OLDER_RETRY_DELAY
+        {
+            return;
+        }
         self.older_loading.insert(id.clone());
         self.pending.push(AdapterCommand::LoadOlderMessages {
             protocol: ProtocolId::Telegram,
@@ -1492,6 +1527,7 @@ impl Snapshot {
         self.history_loading.clear();
         self.older_loading.clear();
         self.older_at_start.clear();
+        self.older_retry.clear();
         self.chat_list_loading = false;
         self.drafts.clear();
         self.compose.clear();
@@ -1630,6 +1666,7 @@ impl Snapshot {
         if protocol == ProtocolId::Telegram {
             self.older_loading.remove(id);
             self.older_at_start.remove(id);
+            self.older_retry.remove(id);
         }
         if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
             self.compose.clear();
@@ -2330,6 +2367,40 @@ mod tests {
         assert_eq!(snapshot.older_state(), OlderState::Idle);
         snapshot.load_older();
         assert_eq!(older_requests(&mut snapshot), vec!["telegram:2:9"]);
+    }
+
+    #[test]
+    fn an_older_request_that_brought_nothing_waits_before_the_same_anchor() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        let start = Instant::now();
+        snapshot.load_older_at(start);
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:50"]);
+        // A failure or an anchor-only page: `more`, but nothing older came.
+        snapshot.apply(older_loaded(1, 50, true));
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+
+        let ended = Instant::now();
+        snapshot.load_older_at(ended);
+        snapshot.load_older_at(ended + OLDER_RETRY_DELAY / 2);
+        assert!(
+            older_requests(&mut snapshot).is_empty(),
+            "no loop on the same anchor"
+        );
+        snapshot.load_older_at(ended + OLDER_RETRY_DELAY);
+        assert_eq!(
+            older_requests(&mut snapshot),
+            vec!["telegram:1:50"],
+            "after the delay, one more try"
+        );
+
+        // A page that brought older rows clears the wait.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 40, "older", Delivery::Sent),
+        });
+        snapshot.apply(older_loaded(1, 50, true));
+        snapshot.load_older_at(Instant::now());
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:40"]);
     }
 
     #[test]
