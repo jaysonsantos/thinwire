@@ -27,17 +27,17 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// `slack_morphism` logs the one-time Socket Mode URL. A more specific
-/// `RUST_LOG` directive wins over `slack_morphism=off` on an `EnvFilter`, so
-/// this layer drops that target on its own.
+/// `slack_morphism` logs the one-time Socket Mode URL. Presage and libsignal
+/// log the provisioning URL. A more specific `RUST_LOG` directive wins over
+/// an `EnvFilter` level, so this layer drops those targets on its own.
 fn init_tracing() {
     use tracing_subscriber::filter::FilterExt;
     let layer = tracing_subscriber::fmt::layer()
-        .with_filter(tracing_subscriber::EnvFilter::from_default_env().and(slack_log_filter()));
+        .with_filter(tracing_subscriber::EnvFilter::from_default_env().and(quiet_log_filter()));
     tracing_subscriber::registry().with(layer).init();
 }
 
-fn slack_log_filter()
+fn quiet_log_filter()
 -> tracing_subscriber::filter::FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool> {
     tracing_subscriber::filter::filter_fn(|metadata: &tracing::Metadata<'_>| {
         let target = metadata.target();
@@ -54,7 +54,7 @@ mod tests {
 
     use tracing_subscriber::prelude::*;
 
-    use super::slack_log_filter;
+    use super::quiet_log_filter;
 
     #[derive(Clone)]
     struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -80,7 +80,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .with_filter(
                 tracing_subscriber::EnvFilter::new("info,slack_morphism::socket_mode=debug")
-                    .and(slack_log_filter()),
+                    .and(quiet_log_filter()),
             );
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
@@ -89,6 +89,31 @@ mod tests {
         });
         let output = String::from_utf8(bytes.lock().expect("log buffer").clone()).expect("utf8");
         assert!(!output.contains("wss://"), "{output}");
+        assert!(output.contains("shell is up"), "{output}");
+    }
+
+    #[test]
+    fn a_specific_rust_log_does_not_log_the_provisioning_url() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Buf(Arc::clone(&bytes));
+        use tracing_subscriber::filter::FilterExt;
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .with_filter(
+                tracing_subscriber::EnvFilter::new(
+                    "info,presage::manager=debug,libsignal::protocol=debug",
+                )
+                .and(quiet_log_filter()),
+            );
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "presage::manager", "sgnl://provision-do-not-log");
+            tracing::debug!(target: "libsignal::protocol", "sgnl://provision-do-not-log");
+            tracing::info!(target: "thinwire", "shell is up");
+        });
+        let output = String::from_utf8(bytes.lock().expect("log buffer").clone()).expect("utf8");
+        assert!(!output.contains("sgnl://"), "{output}");
         assert!(output.contains("shell is up"), "{output}");
     }
 }
