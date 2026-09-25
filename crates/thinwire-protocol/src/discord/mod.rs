@@ -919,28 +919,137 @@ mod tests {
             )
             .expect("open");
         let events = until(&mut rx, |event| {
-            matches!(event, AdapterEvent::HistoryLoaded { .. })
+            matches!(event, AdapterEvent::Notice { .. })
         })
         .await;
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AdapterEvent::Account {
-                state: AccountState::Unlinked,
-                ..
-            }
-        )));
+        let failed = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::CommandFailed { .. }))
+            .expect("command failed");
+        let loaded = events
+            .iter()
+            .position(|event| {
+                matches!(event, AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id)
+            })
+            .expect("history loaded");
+        let unlinked = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )
+            })
+            .expect("unlinked");
+        assert!(failed < loaded && loaded < unlinked);
         assert!(events.iter().any(|event| matches!(
             event,
             AdapterEvent::Notice { text, .. } if text.contains("Replace discord.bot_token")
         )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
-        )));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_token_settles_a_pending_send_and_load_before_unlink() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "keep me".into(),
+                    request: 7,
+                },
+                &tx,
+            )
+            .expect("send");
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReceived { .. })
+        })
+        .await;
+        api.state().unauthorized = true;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Notice { .. })
+        })
+        .await;
+        let rejected = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::SendRejected { request: 7, .. }))
+            .expect("send rejected");
+        let failed = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::CommandFailed { conversation_id, .. }
+                        if conversation_id.as_deref() == Some(id.as_str())
+                )
+            })
+            .expect("load failed");
+        let loaded = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+                )
+            })
+            .expect("history loaded");
+        let unlinked = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )
+            })
+            .expect("unlinked");
         assert!(
-            !events
+            rejected < unlinked && failed < unlinked && loaded < unlinked,
+            "settle the send and the load before Unlinked"
+        );
+        assert_eq!(
+            events
                 .iter()
-                .any(|event| matches!(event, AdapterEvent::CommandFailed { .. }))
+                .filter(|event| matches!(event, AdapterEvent::SendRejected { request: 7, .. }))
+                .count(),
+            1
+        );
+        hold.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let rest = drain(&mut rx);
+        assert!(
+            !rest.iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::SendRejected { .. }
+                        | AdapterEvent::HistoryLoaded { .. }
+                        | AdapterEvent::CommandFailed { .. }
+                        | AdapterEvent::MessageReceived { .. }
+                        | AdapterEvent::MessageReplaced { .. }
+                        | AdapterEvent::MessagesRemoved { .. }
+                )
+            }),
+            "the old session publishes nothing after Unlinked"
         );
     }
 

@@ -42,11 +42,18 @@ struct Inflight {
     request: u64,
 }
 
+#[derive(Debug)]
+struct PendingLoad {
+    conversation_id: String,
+}
+
 #[derive(Debug, Default)]
 struct Shared {
     bot_id: Option<u64>,
     channels: HashMap<String, ChannelAccess>,
     inflight: Vec<Inflight>,
+    /// History loads still running. A 401 finishes them before `Unlinked`.
+    loads: Vec<PendingLoad>,
     /// Message ids from the last history page for each channel.
     history: HashMap<String, Vec<String>>,
     /// Body of each outgoing row, so a retry can post it again.
@@ -70,6 +77,11 @@ struct Gate {
 impl Gate {
     fn current(&self) -> bool {
         self.live.load(Ordering::SeqCst) == self.generation
+    }
+
+    /// Later tasks from this session must not publish inbox events.
+    fn invalidate(&self) {
+        self.live.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -131,6 +143,7 @@ impl Session {
                 bot_id: None,
                 channels: carried,
                 inflight: Vec::new(),
+                loads: Vec::new(),
                 history,
                 bodies,
                 reload_ticket: 0,
@@ -186,8 +199,8 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
-                    if note_unauthorized(&shared, error) {
-                        emit_account(&events, ProtocolId::Discord, AccountState::Unlinked);
+                    if error == DiscordApiError::Unauthorized {
+                        unlink_unauthorized(&shared, &gate, &events, error);
                     } else {
                         emit_command_failed(
                             &events,
@@ -227,12 +240,17 @@ impl Session {
         let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
         let events = events.clone();
+        if let Ok(mut state) = self.shared.lock() {
+            state.loads.push(PendingLoad {
+                conversation_id: conversation_id.clone(),
+            });
+        }
         tokio::spawn(async move {
             let result = api.history(access.channel_id, HISTORY_LIMIT).await;
             // A newer connect replaced this load. Finish it so the shell drops
-            // the spinner. The new session's own open emits its own event.
+            // the spinner. A 401 already settled this load before Unlinked.
             if !gate.current() {
-                emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
+                finish_replaced_load(&shared, &events, conversation_id);
                 return;
             }
             match result {
@@ -245,13 +263,16 @@ impl Session {
                     let new_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
                     let gone = {
                         let Ok(mut state) = shared.lock() else {
+                            drop_load(&shared, &conversation_id);
                             emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                             return;
                         };
                         if !gate.current() {
-                            emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
+                            drop(state);
+                            finish_replaced_load(&shared, &events, conversation_id);
                             return;
                         }
+                        drop_load_locked(&mut state, &conversation_id);
                         let previous = state.history.entry(conversation_id.clone()).or_default();
                         let gone: Vec<String> = previous
                             .iter()
@@ -275,17 +296,17 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord history failed");
-                    if note_unauthorized(&shared, error) {
-                        emit_account(&events, ProtocolId::Discord, AccountState::Unlinked);
-                        emit_notice(&events, ProtocolId::Discord, error.reason());
-                    } else {
-                        emit_command_failed(
-                            &events,
-                            ProtocolId::Discord,
-                            Some(conversation_id.clone()),
-                            format!("History did not load: {error}."),
-                        );
+                    if error == DiscordApiError::Unauthorized {
+                        unlink_unauthorized(&shared, &gate, &events, error);
+                        return;
                     }
+                    drop_load(&shared, &conversation_id);
+                    emit_command_failed(
+                        &events,
+                        ProtocolId::Discord,
+                        Some(conversation_id.clone()),
+                        format!("History did not load: {error}."),
+                    );
                     emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                 }
             }
@@ -351,19 +372,18 @@ impl Session {
         tokio::spawn(async move {
             let _guard = guard;
             let result = api.send(access.channel_id, body).await;
-            if let Ok(mut state) = shared.lock() {
-                state
-                    .inflight
-                    .retain(|row| row.request != request || row.conversation_id != conversation_id);
-            }
-            if !gate.current() {
-                let _ = events.send(AdapterEvent::MessagesRemoved {
-                    protocol: ProtocolId::Discord,
-                    conversation_id: conversation_id.clone(),
-                    message_ids: vec![pending_id],
-                });
-                emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
-                return;
+            match claim_inflight(&shared, &gate, &conversation_id, request) {
+                Claim::Quiet => return,
+                Claim::RejectHere => {
+                    let _ = events.send(AdapterEvent::MessagesRemoved {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: conversation_id.clone(),
+                        message_ids: vec![pending_id],
+                    });
+                    emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
+                    return;
+                }
+                Claim::Handle => {}
             }
             match result {
                 Ok(sent) => {
@@ -386,8 +406,15 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord send failed");
-                    note_unauthorized(&shared, error);
-                    fail_send(&events, &conversation_id, &pending_id, request, error);
+                    fail_send(
+                        &shared,
+                        &gate,
+                        &events,
+                        &conversation_id,
+                        &pending_id,
+                        request,
+                        error,
+                    );
                 }
             }
         });
@@ -425,6 +452,12 @@ impl Session {
             emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
             return Ok(());
         };
+        if let Ok(mut state) = self.shared.lock() {
+            state.inflight.push(Inflight {
+                conversation_id: conversation_id.clone(),
+                request,
+            });
+        }
         let api = Arc::clone(&self.api);
         let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
@@ -433,16 +466,20 @@ impl Session {
         tokio::spawn(async move {
             let _guard = guard;
             let result = api.send(access.channel_id, body).await;
-            if !gate.current() {
-                emit_message_delivery(
-                    &events,
-                    ProtocolId::Discord,
-                    conversation_id.clone(),
-                    message_id,
-                    Delivery::Failed,
-                );
-                emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
-                return;
+            match claim_inflight(&shared, &gate, &conversation_id, request) {
+                Claim::Quiet => return,
+                Claim::RejectHere => {
+                    emit_message_delivery(
+                        &events,
+                        ProtocolId::Discord,
+                        conversation_id.clone(),
+                        message_id,
+                        Delivery::Failed,
+                    );
+                    emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
+                    return;
+                }
+                Claim::Handle => {}
             }
             match result {
                 Ok(sent) => {
@@ -465,8 +502,15 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord resend failed");
-                    note_unauthorized(&shared, error);
-                    fail_send(&events, &conversation_id, &message_id, request, error);
+                    fail_send(
+                        &shared,
+                        &gate,
+                        &events,
+                        &conversation_id,
+                        &message_id,
+                        request,
+                        error,
+                    );
                 }
             }
         });
@@ -554,20 +598,118 @@ fn publish_channels(
     }
 }
 
-/// A 401 means the token is dead. Remember it so the adapter drops this session.
-fn note_unauthorized(shared: &Arc<Mutex<Shared>>, error: DiscordApiError) -> bool {
-    if error != DiscordApiError::Unauthorized {
-        return false;
-    }
-    if let Ok(mut state) = shared.lock() {
+/// A 401 means the token is dead. Reject every send still in flight and
+/// finish every history load, then unlink. Inbox events after `Unlinked`
+/// are dropped by the shell (ADR 0010), so this order is the one that keeps
+/// a rejected send's text.
+fn unlink_unauthorized(
+    shared: &Arc<Mutex<Shared>>,
+    gate: &Gate,
+    events: &EventTx,
+    error: DiscordApiError,
+) {
+    let (sends, loads) = {
+        let Ok(mut state) = shared.lock() else {
+            emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
+            emit_notice(events, ProtocolId::Discord, error.reason());
+            gate.invalidate();
+            return;
+        };
         state.revoked = true;
+        (
+            std::mem::take(&mut state.inflight),
+            std::mem::take(&mut state.loads),
+        )
+    };
+    for send in sends {
+        emit_send_rejected(
+            events,
+            ProtocolId::Discord,
+            &send.conversation_id,
+            send.request,
+        );
     }
-    true
+    let detail = format!("History did not load: {error}.");
+    for load in loads {
+        emit_command_failed(
+            events,
+            ProtocolId::Discord,
+            Some(load.conversation_id.clone()),
+            detail.clone(),
+        );
+        emit_history_loaded(events, ProtocolId::Discord, load.conversation_id);
+    }
+    emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
+    emit_notice(events, ProtocolId::Discord, error.reason());
+    gate.invalidate();
 }
 
-/// A send or retry failed. A revoked token unlinks the account. Other
-/// errors leave the session up and say the send failed.
+fn session_revoked(shared: &Arc<Mutex<Shared>>) -> bool {
+    shared.lock().map(|state| state.revoked).unwrap_or(true)
+}
+
+enum Claim {
+    /// A 401 already answered this send, or the lock is gone.
+    Quiet,
+    /// A new connect replaced the session. This task still owes `SendRejected`.
+    RejectHere,
+    /// This task handles the HTTP result.
+    Handle,
+}
+
+/// Decide who answers a send that just returned, while holding the session lock.
+fn claim_inflight(
+    shared: &Arc<Mutex<Shared>>,
+    gate: &Gate,
+    conversation_id: &str,
+    request: u64,
+) -> Claim {
+    let Ok(mut state) = shared.lock() else {
+        return Claim::Quiet;
+    };
+    let mine = |row: &Inflight| row.request == request && row.conversation_id == conversation_id;
+    if state.revoked {
+        return Claim::Quiet;
+    }
+    if !gate.current() {
+        let still = state.inflight.iter().any(mine);
+        state.inflight.retain(|row| !mine(row));
+        return if still {
+            Claim::RejectHere
+        } else {
+            Claim::Quiet
+        };
+    }
+    state.inflight.retain(|row| !mine(row));
+    Claim::Handle
+}
+
+fn drop_load(shared: &Arc<Mutex<Shared>>, conversation_id: &str) {
+    if let Ok(mut state) = shared.lock() {
+        drop_load_locked(&mut state, conversation_id);
+    }
+}
+
+fn drop_load_locked(state: &mut Shared, conversation_id: &str) {
+    state
+        .loads
+        .retain(|load| load.conversation_id != conversation_id);
+}
+
+/// A replaced load still ends the spinner. A revoked session already did.
+fn finish_replaced_load(shared: &Arc<Mutex<Shared>>, events: &EventTx, conversation_id: String) {
+    drop_load(shared, &conversation_id);
+    if session_revoked(shared) {
+        return;
+    }
+    emit_history_loaded(events, ProtocolId::Discord, conversation_id);
+}
+
+/// A send or retry failed. A revoked token unlinks the account after the
+/// other in-flight work is settled. Other errors leave the session up.
 fn fail_send(
+    shared: &Arc<Mutex<Shared>>,
+    gate: &Gate,
     events: &EventTx,
     conversation_id: &str,
     message_id: &str,
@@ -583,8 +725,7 @@ fn fail_send(
     );
     emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
     if error == DiscordApiError::Unauthorized {
-        emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
-        emit_notice(events, ProtocolId::Discord, error.reason());
+        unlink_unauthorized(shared, gate, events, error);
         return;
     }
     emit_ready(events, &format!("Send failed: {error}."));
