@@ -21,6 +21,11 @@ Rule: an ADR accepted is not Done until the matching change is on `main`.
   - Message time, sender, and date separators.
   - Live-test fixes: TDLib closes at exit, a keychain-missing notice, and libc++ / mesa in the Nix dev shell.
   - The phone step names the kept data folder once.
+- Visual design pass — on `main` via #47.
+- Load older messages when you scroll up in a chat — #30, on `main` via #61.
+- Open a chat from a click anywhere on its inbox row — #31, on `main` via #60.
+- Frontend-independent core (`crates/thinwire-core`, ADR `0010`) — #33, on `main` via #48.
+- Protocol-independent shell — on `main` via #68.
 
 ## Next (parallel tracks)
 
@@ -29,18 +34,18 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 ### Telegram
 
 1. **Telegram UX follow-ups**
-    - [ ] #30 — load older messages when you scroll up in a chat.
-    - [ ] #31 — open a chat from a click anywhere on its inbox row.
-    - [ ] Follow-up: remove jargon from the account row ("status: stubbed", "Supported · TDLib") and from worker status text ("TDLib <code>").
+    - [ ] Remove jargon from the account row ("status: stubbed", "Supported · TDLib") and from worker status text ("TDLib <code>").
 
 ### Shared
 
 - [ ] #32 — desktop notifications for new messages.
-- [ ] #33 — move app state into a frontend-independent core library (`crates/thinwire-core`, no egui / eframe / winit). ADR `0010-frontend-independent-core` records the boundary. The egui binary becomes one frontend. In progress on branch `refactor/thinwire-core`.
+- [ ] #69 — a send with no answer keeps its chat locked.
+- [ ] #80 — the status strip restores a stale Ready line while another protocol still loads.
 
 ### Other protocols (parallel with Telegram)
 
 - [ ] #34 — WhatsApp experimental linked-device inbox (feature `whatsapp-web`, `0001`). Local-only AGPL (`0011`). Release builds and OS zips never enable it. Honest ToS labels. Full-screen ToS/ban gate before QR or pair. Never call it reliable.
+- [ ] #44 — close during WhatsApp startup reports Stopped before the bot handle exists.
 - [ ] #35 — Discord bot/OAuth guild inbox (feature `discord-bot`, `0009`). No self-bots, no user tokens, no personal DMs. Not a personal client. The Telegram wait is gone on `main` (#40).
 - [ ] #36 — Slack workspace-app OAuth inbox (feature `slack-oauth`, `0008`). Official OAuth v2 only. Not a personal desktop clone.
 
@@ -50,6 +55,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 
 - [ ] #38 — research an AGPL helper process for WhatsApp and Signal. The output is an ADR with go, no-go, or later.
 - [ ] #39 — Signal inbox behind feature `signal-local` (Presage / libsignal). Off by default. A full-screen notice comes before link. The notice says experimental, local build only, and AGPL.
+- [ ] #77 — move the WhatsApp and Signal adapters into AGPL-licensed crate folders. The root license stays MIT.
 
 ## Spike (scaffold, not the default UI)
 
