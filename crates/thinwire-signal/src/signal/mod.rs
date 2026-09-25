@@ -923,6 +923,29 @@ mod tests {
     }
 
     #[test]
+    fn a_sled_directory_is_not_the_sqlite_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "thinwire-signal-sled-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert!(!path::sled_session_present(&dir));
+        std::fs::write(dir.join("db"), b"sled").expect("db");
+        assert!(path::sled_session_present(&dir));
+        let sqlite = path::sqlite_store_path(&dir);
+        assert_eq!(
+            sqlite.file_name().and_then(|name| name.to_str()),
+            Some(path::SQLITE_FILE)
+        );
+        assert_ne!(sqlite, dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn session_file_is_under_app_data_not_the_crate() {
         let path = path::session_dir(std::path::Path::new("/var/lib/thinwire-test"));
         assert_eq!(

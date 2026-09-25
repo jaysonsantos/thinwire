@@ -6,6 +6,12 @@
     {
       "matchUpdateTypes": ["minor", "patch"],
       "groupName": "all non-major updates"
+    },
+    {
+      "description": "whisperfish/presage crates share one git revision. A store-only bump has no package to resolve.",
+      "matchDatasources": ["git-refs"],
+      "matchSourceUrls": ["https://github.com/whisperfish/presage"],
+      "groupName": "whisperfish/presage"
     }
   ]
 }
