@@ -1340,12 +1340,16 @@ fn bubble(
                         let body_rect = ui
                             .vertical(|ui| {
                                 ui.set_max_width(text_width);
-                                ui.add(
+                                let response = ui.add(
                                     egui::Label::new(RichText::new(&message.body).color(body))
                                         .selectable(true)
                                         .wrap()
                                         .halign(egui::Align::LEFT),
                                 );
+                                // The pane already names this text.
+                                ui.ctx().accesskit_node_builder(response.id, |node| {
+                                    node.set_hidden();
+                                });
                             })
                             .response
                             .rect;
@@ -1451,10 +1455,11 @@ fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery) -> f32 {
     width
 }
 
-/// AccessKit name of a bubble.
+/// AccessKit name of a bubble. A screen reader reads this once.
 ///
 /// A group row names the sender and the time on every message. A private
-/// row names the message. The visual sender header stays on the first row
+/// row names the message. The painted body label is hidden, so it does
+/// not repeat this name. The visual sender header stays on the first row
 /// of a run.
 fn bubble_access_label(message: &Bubble) -> String {
     if message.group {
