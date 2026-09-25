@@ -239,6 +239,15 @@ impl SendTracker {
         }
     }
 
+    /// The sends and retries in flight of one protocol, by chat.
+    pub(crate) fn open_of(&self, protocol: ProtocolId) -> Vec<(String, Pending)> {
+        self.open
+            .iter()
+            .filter(|((owner, _), _)| *owner == protocol)
+            .map(|((_, chat), open)| (chat.clone(), open.pending.clone()))
+            .collect()
+    }
+
     /// The protocol's session ended: its sends and retries are gone.
     pub(crate) fn drop_protocol(&mut self, protocol: ProtocolId) {
         self.open.retain(|(owner, _), _| *owner != protocol);
