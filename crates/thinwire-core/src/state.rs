@@ -739,7 +739,7 @@ impl Snapshot {
                 more,
                 ..
             } => {
-                if protocol == ProtocolId::Telegram {
+                if matches!(protocol, ProtocolId::Telegram | ProtocolId::Signal) {
                     self.older_loading.remove(&conversation_id);
                     let oldest = self
                         .messages
@@ -1244,6 +1244,15 @@ impl Snapshot {
             .unwrap_or(0)
     }
 
+    /// Telegram after Ready, and Signal after the account is linked.
+    fn pages_older(&self) -> bool {
+        match self.selected_protocol {
+            ProtocolId::Telegram => self.telegram_authorized,
+            ProtocolId::Signal => self.protocol_linked(ProtocolId::Signal),
+            _ => false,
+        }
+    }
+
     fn protocol_linked(&self, protocol: ProtocolId) -> bool {
         self.accounts
             .iter()
@@ -1362,7 +1371,7 @@ impl Snapshot {
         let Some(id) = self.selected_conversation.as_ref() else {
             return OlderState::Idle;
         };
-        if self.selected_protocol != ProtocolId::Telegram {
+        if !self.pages_older() {
             return OlderState::Idle;
         }
         if self.older_loading.contains(id) {
@@ -1375,8 +1384,9 @@ impl Snapshot {
     }
 
     /// Ask for the page before the oldest loaded message of the selected
-    /// chat. Only Telegram answers `LoadOlderMessages` today. Nothing goes out
-    /// while a request runs, the first page loads, or the start is loaded.
+    /// chat. Telegram and a linked Signal account answer `LoadOlderMessages`.
+    /// Nothing goes out while a request runs, the first page loads, or the
+    /// start is loaded.
     pub(crate) fn load_older(&mut self) {
         self.load_older_at(Instant::now());
     }
@@ -1387,9 +1397,10 @@ impl Snapshot {
         let Some((id, oldest)) = self.older_anchor_at(now) else {
             return;
         };
+        let protocol = self.selected_protocol;
         self.older_loading.insert(id.clone());
         self.pending.push(AdapterCommand::LoadOlderMessages {
-            protocol: ProtocolId::Telegram,
+            protocol,
             conversation_id: id,
             before_message_id: oldest,
         });
@@ -1407,13 +1418,12 @@ impl Snapshot {
     /// The selected chat and its oldest message, when an older request may
     /// go out at `now`.
     fn older_anchor_at(&self, now: Instant) -> Option<(String, String)> {
-        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
+        if !self.pages_older() {
             return None;
         }
+        let protocol = self.selected_protocol;
         let id = self.selected_conversation.clone()?;
-        if self
-            .history_loading
-            .contains(&(ProtocolId::Telegram, id.clone()))
+        if self.history_loading.contains(&(protocol, id.clone()))
             || self.older_loading.contains(&id)
             || self.older_at_start.contains(&id)
         {

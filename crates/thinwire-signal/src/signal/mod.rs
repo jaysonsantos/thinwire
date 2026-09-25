@@ -289,6 +289,45 @@ impl SignalAdapter {
         }
     }
 
+    fn load_older(
+        &mut self,
+        conversation_id: &str,
+        before_message_id: &str,
+        events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        #[cfg(feature = "signal-local")]
+        if let Engine::Live(session) = &self.engine {
+            let session = Arc::clone(session);
+            let conversation_id = conversation_id.to_string();
+            let before_message_id = before_message_id.to_string();
+            let task_events = events.clone();
+            tokio::spawn(async move {
+                let queued = session
+                    .request_older(conversation_id.clone(), before_message_id.clone())
+                    .await;
+                if !queued {
+                    let _ = task_events.send(AdapterEvent::OlderHistoryLoaded {
+                        protocol: ProtocolId::Signal,
+                        conversation_id,
+                        before_message_id,
+                        more: false,
+                        note: Some("Signal is not linked".to_string()),
+                    });
+                }
+            });
+            return Ok(());
+        }
+        let _ = (conversation_id, before_message_id);
+        let _ = events.send(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: conversation_id.to_string(),
+            before_message_id: before_message_id.to_string(),
+            more: false,
+            note: None,
+        });
+        Ok(())
+    }
+
     fn open_chat(&mut self, conversation_id: &str, events: &EventTx) -> Result<(), AdapterError> {
         match &mut self.engine {
             Engine::Sync(device) => {
@@ -555,6 +594,11 @@ impl ProtocolAdapter for SignalAdapter {
                 protocol: ProtocolId::Signal,
                 conversation_id,
             } => self.open_chat(&conversation_id, events),
+            AdapterCommand::LoadOlderMessages {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+                before_message_id,
+            } => self.load_older(&conversation_id, &before_message_id, events),
             AdapterCommand::SendText {
                 protocol: ProtocolId::Signal,
                 conversation_id,

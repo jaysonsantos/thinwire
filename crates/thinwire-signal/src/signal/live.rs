@@ -49,10 +49,21 @@ pub(super) struct Outbound {
     pub(super) request: u64,
 }
 
+/// One page of stored history. The same size as the Telegram older page.
+const HISTORY_PAGE: usize = 50;
+
+pub(super) enum WorkerJob {
+    Send(Outbound),
+    Older {
+        conversation_id: String,
+        before_message_id: String,
+    },
+}
+
 pub(super) struct Session {
     generation: AtomicU64,
     active: AtomicBool,
-    outbound: Mutex<Option<mpsc::UnboundedSender<Outbound>>>,
+    outbound: Mutex<Option<mpsc::UnboundedSender<WorkerJob>>>,
     cancel: CancelWake,
     pairing: AtomicU64,
     sent: Mutex<std::collections::HashMap<String, String>>,
@@ -122,8 +133,24 @@ impl Session {
     }
 
     pub(super) async fn submit(&self, message: Outbound) -> bool {
+        self.enqueue(WorkerJob::Send(message)).await
+    }
+
+    pub(super) async fn request_older(
+        &self,
+        conversation_id: String,
+        before_message_id: String,
+    ) -> bool {
+        self.enqueue(WorkerJob::Older {
+            conversation_id,
+            before_message_id,
+        })
+        .await
+    }
+
+    async fn enqueue(&self, job: WorkerJob) -> bool {
         let guard = self.outbound.lock().await;
-        guard.as_ref().is_some_and(|tx| tx.send(message).is_ok())
+        guard.as_ref().is_some_and(|tx| tx.send(job).is_ok())
     }
 
     pub(super) async fn shutdown(&self) {
@@ -255,7 +282,7 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
                 "Signal is linked on this local build. This binary is not a release.",
             );
         }
-        let mut pending: Option<Outbound> = None;
+        let mut pending: Option<WorkerJob> = None;
         let mut reconnect_after = None;
         {
             let mut incoming = std::pin::pin!(stream);
@@ -315,21 +342,38 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
             relink.note_end();
             continue;
         }
-        if let Some(outbound) = pending {
-            let request = outbound.request;
-            let conversation_id = outbound.conversation_id.clone();
-            if send_text(&mut manager, &session, &outbound, &events)
-                .await
-                .is_err()
-            {
-                thinwire_protocol::emit_send_rejected(
-                    &events,
-                    ProtocolId::Signal,
-                    conversation_id,
-                    request,
-                );
-                fail(&events, SEND_FAILED);
+        match pending {
+            Some(WorkerJob::Send(outbound)) => {
+                let request = outbound.request;
+                let conversation_id = outbound.conversation_id.clone();
+                if send_text(&mut manager, &session, &outbound, &events)
+                    .await
+                    .is_err()
+                {
+                    thinwire_protocol::emit_send_rejected(
+                        &events,
+                        ProtocolId::Signal,
+                        conversation_id,
+                        request,
+                    );
+                    fail(&events, SEND_FAILED);
+                }
             }
+            Some(WorkerJob::Older {
+                conversation_id,
+                before_message_id,
+            }) => {
+                load_older_page(
+                    &manager,
+                    &events,
+                    &names,
+                    &group_titles,
+                    &conversation_id,
+                    &before_message_id,
+                )
+                .await;
+            }
+            None => {}
         }
     }
     session.active.store(false, Ordering::SeqCst);
@@ -395,7 +439,7 @@ async fn publish_chats(
         let Ok(messages) = manager.store().messages(&thread, ..).await else {
             continue;
         };
-        for message in messages.flatten() {
+        for message in last_page(messages.flatten(), HISTORY_PAGE) {
             emit_content(events, &message, &names, &group_titles);
         }
     }
@@ -410,11 +454,79 @@ async fn publish_chats(
         let Ok(messages) = manager.store().messages(&thread, ..).await else {
             continue;
         };
-        for message in messages.flatten() {
+        for message in last_page(messages.flatten(), HISTORY_PAGE) {
             emit_content(events, &message, &names, &group_titles);
         }
     }
     Ok((known, group_titles))
+}
+
+/// Keep the newest `page` items. `more` is true when older items were dropped.
+fn last_page<T>(items: impl IntoIterator<Item = T>, page: usize) -> Vec<T> {
+    let mut kept = std::collections::VecDeque::new();
+    for item in items {
+        if page == 0 {
+            return Vec::new();
+        }
+        if kept.len() == page {
+            kept.pop_front();
+        }
+        kept.push_back(item);
+    }
+    kept.into_iter().collect()
+}
+
+async fn load_older_page(
+    manager: &Manager<SledStore, Registered>,
+    events: &EventTx,
+    names: &HashMap<String, String>,
+    group_titles: &HashMap<String, String>,
+    conversation_id: &str,
+    before_message_id: &str,
+) {
+    let loaded = async {
+        let before = before_message_id.parse::<u64>().ok()?;
+        let thread = thread_of(conversation_id)?;
+        let messages = manager.store().messages(&thread, ..before).await.ok()?;
+        Some(last_page_more(messages.flatten(), HISTORY_PAGE))
+    }
+    .await;
+    let (page, more) = loaded.unwrap_or_else(|| (Vec::new(), false));
+    for message in page {
+        emit_content(events, &message, names, group_titles);
+    }
+    let _ = events.send(AdapterEvent::OlderHistoryLoaded {
+        protocol: ProtocolId::Signal,
+        conversation_id: conversation_id.to_string(),
+        before_message_id: before_message_id.to_string(),
+        more,
+        note: None,
+    });
+}
+
+fn thread_of(conversation_id: &str) -> Option<Thread> {
+    match super::group::outbound_target(conversation_id).ok()? {
+        super::group::OutboundTarget::Group(key) => Some(Thread::Group(key)),
+        super::group::OutboundTarget::Contact => {
+            Uuid::parse_str(conversation_id).ok().map(Thread::Contact)
+        }
+    }
+}
+
+fn last_page_more<T>(items: impl IntoIterator<Item = T>, page: usize) -> (Vec<T>, bool) {
+    let mut kept = std::collections::VecDeque::new();
+    let mut more = false;
+    for item in items {
+        if page == 0 {
+            return (Vec::new(), true);
+        }
+        if kept.len() == page {
+            kept.pop_front();
+            more = true;
+        }
+        kept.push_back(item);
+    }
+    (kept.into_iter().collect(), more)
 }
 
 async fn remember_group_title(
@@ -802,6 +914,17 @@ mod tests {
             Some(AdapterEvent::MessageReceived { message })
                 if message.body == "second line"
         ));
+    }
+
+    #[test]
+    fn a_history_page_keeps_only_the_newest_messages() {
+        let (page, more) = last_page_more(1..=60, 50);
+        assert!(more);
+        assert_eq!(page.first().copied(), Some(11));
+        assert_eq!(page.last().copied(), Some(60));
+        let (short, more) = last_page_more(1..=10, 50);
+        assert!(!more);
+        assert_eq!(short.len(), 10);
     }
 
     #[test]

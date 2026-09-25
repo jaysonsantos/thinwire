@@ -22,7 +22,7 @@ impl CancelWake {
     /// Drop a permit that no waiter consumed. The next `cancelled` waits again.
     pub(crate) fn clear(&self) {
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
         let mut pending = std::pin::pin!(self.notify.notified());
         let _ = pending.as_mut().poll(&mut cx);
     }
