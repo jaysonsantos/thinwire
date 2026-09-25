@@ -1740,6 +1740,16 @@ impl Snapshot {
         self.timeout_error = error;
     }
 
+    /// Build the shown timeout error again, so its hint names where the
+    /// text is now (#90 item 6): the compose field of the chat that shows,
+    /// or a draft after a chat switch. The core calls it after every
+    /// dispatch and pump. Another error, or no error, stays as it is.
+    pub(crate) fn sync_timeout_hint(&mut self) {
+        if self.error.is_some() && self.error == self.timeout_error && !self.timed_out.is_empty() {
+            self.show_timeouts();
+        }
+    }
+
     /// Where the unsent text is, and what to do (qa on #81): the compose
     /// field of the chat that shows, or the draft of another chat.
     fn resend_hint(&self, protocol: ProtocolId, chat: &str, retry: bool) -> String {
@@ -7319,6 +7329,37 @@ mod tests {
         snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
         let error = snapshot.error.clone().expect("Slack's timeout");
         assert_eq!(error.why, "Slack did not answer in time.");
+    }
+
+    /// #90 item 6: the timeout hint follows a chat switch.
+    #[test]
+    fn the_timeout_hint_follows_a_chat_switch() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        expired_send(&mut snapshot);
+        let next = |snapshot: &Snapshot| snapshot.error.as_ref().map(|error| error.next.clone());
+        assert_eq!(
+            next(&snapshot).as_deref(),
+            Some("The text is still in the compose field. Send it again.")
+        );
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.sync_timeout_hint();
+        assert_eq!(
+            next(&snapshot).as_deref(),
+            Some("The text is in the draft of Ada. Send it again.")
+        );
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.sync_timeout_hint();
+        assert_eq!(
+            next(&snapshot).as_deref(),
+            Some("The text is still in the compose field. Send it again.")
+        );
+
+        // Another error stays as it is.
+        snapshot.set_error("Chat not loaded.", "Why.", "Next.");
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.sync_timeout_hint();
+        assert_eq!(next(&snapshot).as_deref(), Some("Next."));
     }
 
     /// #90 item 5: the line shows "Sending…" only while a send is in flight.

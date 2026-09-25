@@ -275,6 +275,7 @@ impl Core {
         }
         self.state.poll_resume(&self.secrets);
         self.state.sync_viewed();
+        self.state.sync_timeout_hint();
         self.flush();
         applied || expired
     }
@@ -342,6 +343,7 @@ impl Core {
             Intent::Signal(intent) => self.signal_gate(intent),
         }
         self.state.sync_viewed();
+        self.state.sync_timeout_hint();
         self.flush();
         self.notifier.notify();
     }
