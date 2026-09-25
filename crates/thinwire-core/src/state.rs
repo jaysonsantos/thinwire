@@ -2952,6 +2952,7 @@ pub mod test_support {
             is_group: false,
             writable: true,
             placeholder: false,
+            muted: false,
         }
     }
 
@@ -3152,6 +3153,7 @@ mod tests {
             outbound: false,
             delivery: Delivery::Sent,
             sent_at: 0,
+            arrival: thinwire_protocol::Arrival::History,
         }
     }
 
@@ -3372,6 +3374,7 @@ mod tests {
             outbound: true,
             delivery,
             sent_at: 0,
+            arrival: thinwire_protocol::Arrival::History,
         }
     }
 
@@ -4550,6 +4553,7 @@ mod tests {
                 is_group: false,
                 writable: true,
                 placeholder: false,
+                muted: false,
             },
         };
         // A row before Ready is from a cancelled or ended client: dropped.
@@ -5026,6 +5030,7 @@ mod tests {
             is_group: false,
             writable: true,
             placeholder: true,
+            muted: false,
         }
     }
 
@@ -5136,6 +5141,7 @@ mod tests {
                 outbound: false,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         assert_eq!(
@@ -5198,6 +5204,7 @@ mod tests {
                 is_group: false,
                 writable: true,
                 placeholder: false,
+                muted: false,
             },
         });
         snapshot
@@ -5394,6 +5401,7 @@ mod tests {
                 is_group: false,
                 writable: true,
                 placeholder: false,
+                muted: false,
             },
         });
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -5409,6 +5417,7 @@ mod tests {
                 is_group: false,
                 writable: true,
                 placeholder: false,
+                muted: false,
             },
         });
         let ids: Vec<_> = snapshot
@@ -5450,6 +5459,7 @@ mod tests {
                 outbound: false,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -5462,6 +5472,7 @@ mod tests {
                 outbound: false,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -5474,6 +5485,7 @@ mod tests {
                 outbound: false,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -5495,6 +5507,7 @@ mod tests {
                 outbound: true,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -5531,6 +5544,7 @@ mod tests {
                     outbound: false,
                     delivery: Delivery::Sent,
                     sent_at: 0,
+                    arrival: thinwire_protocol::Arrival::History,
                 },
             });
         }
@@ -5570,6 +5584,7 @@ mod tests {
                 is_group: false,
                 writable: true,
                 placeholder: false,
+                muted: false,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -5582,6 +5597,7 @@ mod tests {
                 outbound: false,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         let _ = snapshot.take_commands();
@@ -5760,6 +5776,7 @@ mod tests {
                 outbound: false,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -6026,6 +6043,7 @@ mod tests {
             is_group: false,
             writable,
             placeholder: false,
+            muted: false,
         }
     }
 
@@ -6174,6 +6192,7 @@ mod tests {
                 outbound: true,
                 delivery: Delivery::Failed,
                 sent_at: 1,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         snapshot.take_commands();
@@ -6216,6 +6235,7 @@ mod tests {
                 outbound: true,
                 delivery: Delivery::Failed,
                 sent_at: 1,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         snapshot.take_commands();
@@ -6679,6 +6699,7 @@ mod tests {
                 outbound: true,
                 delivery: Delivery::Failed,
                 sent_at: 1,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         snapshot.retry_send("discord:pending:2:1");
@@ -6744,6 +6765,7 @@ mod tests {
                 outbound: true,
                 delivery: Delivery::Failed,
                 sent_at: 1,
+                arrival: thinwire_protocol::Arrival::History,
             },
         });
         snapshot.retry_send("discord:row-b");

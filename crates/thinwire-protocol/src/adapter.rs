@@ -574,6 +574,9 @@ pub struct Conversation {
     /// gateway yet). The shell never auto-selects it and never sends
     /// `OpenChat` for it.
     pub placeholder: bool,
+    /// The user muted this chat in the protocol (for example TDLib
+    /// notification settings). A muted chat never notifies (#32).
+    pub muted: bool,
 }
 
 /// Delivery of an outgoing message. Incoming messages are always `Sent`.
@@ -599,6 +602,19 @@ pub struct ChatMessage {
     pub delivery: Delivery,
     /// Unix seconds when the message was sent. Zero when unknown.
     pub sent_at: i64,
+    /// A new message that just arrived, or a row of a history load. Only a
+    /// `Live` message can notify (#32).
+    pub arrival: Arrival,
+}
+
+/// How a message reached the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Arrival {
+    /// A history page, a chat-list load, or a refresh of a known message.
+    #[default]
+    History,
+    /// A new message that the protocol pushed just now.
+    Live,
 }
 
 /// Recoverable adapter failure. Never includes secrets.

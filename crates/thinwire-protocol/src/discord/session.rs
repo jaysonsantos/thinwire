@@ -328,6 +328,7 @@ impl Session {
                 outbound: true,
                 delivery: crate::adapter::Delivery::Pending,
                 sent_at: local_unix_seconds(),
+                arrival: crate::Arrival::History,
             },
         );
         let api = Arc::clone(&self.api);

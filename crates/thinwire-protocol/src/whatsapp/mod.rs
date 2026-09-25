@@ -137,6 +137,7 @@ impl WhatsAppAdapter {
                 is_group: false,
                 writable: false,
                 placeholder: true,
+                muted: false,
             },
         );
         emit_message(
@@ -150,6 +151,7 @@ impl WhatsAppAdapter {
                 outbound: false,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: crate::Arrival::History,
             },
         );
     }
