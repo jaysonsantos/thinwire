@@ -13,6 +13,11 @@ td.binlog
 **/td.binlog
 *.binlog
 
+# egui_kittest writes these beside the checked-in images when a snapshot fails
+crates/thinwire/tests/snapshots/**/*.new.png
+crates/thinwire/tests/snapshots/**/*.diff.png
+crates/thinwire/tests/snapshots/**/*.old.png
+
 # WhatsApp linked-device store (app-data only; never the repo)
 device.sqlite
 device.sqlite-*

@@ -63,10 +63,66 @@ jobs:
       - name: Release cargo tree excludes AGPL Signal and wacore-libsignal
         run: nix develop --command scripts/check-release-tree.sh
 
+  ui-snapshots:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Snapshot tests
+        run: nix develop --command cargo test -p thinwire --features ui-snapshots ui_snapshots -- --test-threads=1
+      - name: Upload snapshot images
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ui-snapshots
+          path: crates/thinwire/tests/snapshots/**/*.png
+          retention-days: 14
+          if-no-files-found: ignore
+
+  ui-snapshot-comment:
+    needs: ui-snapshots
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (needs.ui-snapshots.result == 'success' || needs.ui-snapshots.result == 'failure')
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.ui-snapshots.result == 'failure'
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.ui-snapshots.result == 'failure'
+        with:
+          name: ui-snapshots
+          path: snapshots
+      - name: Write the comment
+        if: needs.ui-snapshots.result == 'failure'
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: scripts/snapshot-comment.sh snapshots "$RUN_ID" comment.md
+      - name: Post one sticky comment
+        if: needs.ui-snapshots.result == 'failure'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: thinwire-ui-snapshots
+          path: comment.md
+      - name: Clear the sticky comment
+        if: needs.ui-snapshots.result == 'success'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        with:
+          header: thinwire-ui-snapshots
+          delete: true
+
   check:
     name: check
     if: always()
-    needs: [lint, test, build, release-tree]
+    needs: [lint, test, build, release-tree, ui-snapshots]
     runs-on: ubuntu-26.04
     permissions:
       contents: read
