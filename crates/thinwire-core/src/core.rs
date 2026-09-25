@@ -194,6 +194,7 @@ impl Core {
             Intent::SelectProtocol(protocol) => self.state.select_protocol(protocol),
             Intent::SelectConversation { id } => self.state.select_conversation(id),
             Intent::MoveInbox { delta } => self.state.move_inbox_selection(delta),
+            Intent::FocusInbox { id } => self.state.focus_inbox_row(id),
             Intent::SetFilter(filter) => self.state.set_filter(filter),
             Intent::SetSearch(text) => self.state.set_search(text.into_inner()),
             Intent::Refresh => self.state.refresh_visible(),

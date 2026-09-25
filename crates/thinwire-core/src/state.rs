@@ -892,9 +892,11 @@ impl Snapshot {
 
     /// Move the keyboard highlight among the visible inbox rows.
     /// The open chat, its draft, and its messages stay as they are.
-    pub fn move_inbox_selection(&mut self, delta: i32) {
+    /// The row an arrow would highlight. `None` when the highlight would not change.
+    #[must_use]
+    pub fn inbox_move_target(&self, delta: i32) -> Option<String> {
         if delta == 0 {
-            return;
+            return None;
         }
         let ids: Vec<String> = self
             .visible_conversations()
@@ -902,7 +904,7 @@ impl Snapshot {
             .map(|row| row.id.clone())
             .collect();
         if ids.is_empty() {
-            return;
+            return None;
         }
         let current = self
             .focused_row
@@ -915,11 +917,24 @@ impl Snapshot {
             None => 0,
         };
         let id = ids[next].clone();
-        if self.focused_row.as_deref() == Some(id.as_str()) {
+        (self.focused_row.as_deref() != Some(id.as_str())).then_some(id)
+    }
+
+    pub fn move_inbox_selection(&mut self, delta: i32) {
+        let Some(id) = self.inbox_move_target(delta) else {
             return;
-        }
+        };
         self.focused_row = Some(id);
         self.sync_focused_row(FocusFollow::Moved);
+    }
+
+    /// Point the highlight at a row that already has keyboard focus.
+    /// The open chat stays as it is. The row is already on screen, so this does not scroll.
+    pub fn focus_inbox_row(&mut self, id: String) {
+        let visible = self.visible_conversations().iter().any(|row| row.id == id);
+        if visible {
+            self.focused_row = Some(id);
+        }
     }
 
     /// Change the selected chat. The compose text stays with the chat it was typed in.
