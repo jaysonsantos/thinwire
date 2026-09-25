@@ -1728,7 +1728,12 @@ impl Snapshot {
         self.telegram_authorized = true;
         // The worker loads the main list right after Ready.
         self.chat_list_loading.insert(ProtocolId::Telegram);
-        self.select_protocol(ProtocolId::Telegram);
+        // Keep a selection the user made in another linked protocol (#70).
+        let keep = self.selected_protocol != ProtocolId::Telegram
+            && self.has_session(self.selected_protocol);
+        if !keep {
+            self.select_protocol(ProtocolId::Telegram);
+        }
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
         self.error = None;
@@ -1828,10 +1833,11 @@ impl Snapshot {
         if self.selected_conversation.is_some() {
             return;
         }
+        // A placeholder row is not a chat: never auto-select it (#70).
         if let Some(first) = self
             .conversations
             .get(&self.selected_protocol)
-            .and_then(|rows| rows.first())
+            .and_then(|rows| rows.iter().find(|row| !row.placeholder))
         {
             self.set_selected_conversation(Some(first.id.clone()));
             self.queue_open_chat();
@@ -1849,10 +1855,11 @@ impl Snapshot {
         let Some(id) = self.selected_conversation.clone() else {
             return;
         };
+        // Only a real chat loads history: never a placeholder row (#70).
         let listed = self
             .conversations
             .get(&protocol)
-            .is_some_and(|rows| rows.iter().any(|row| row.id == id));
+            .is_some_and(|rows| rows.iter().any(|row| row.id == id && !row.placeholder));
         if !listed {
             return;
         }
@@ -1938,6 +1945,11 @@ impl Snapshot {
                 // useful is selected: show it (shell plan 2).
                 if first_link || !self.protocol_linked(self.selected_protocol) {
                     self.select_protocol(protocol);
+                }
+                // A chat opened while the account was Linking did not load:
+                // load it now (#70). A duplicate in the queue is skipped.
+                if self.selected_protocol == protocol {
+                    self.queue_open_chat();
                 }
                 #[cfg(feature = "whatsapp-web")]
                 if protocol == ProtocolId::WhatsApp {
@@ -2424,6 +2436,7 @@ pub mod test_support {
             last_at: 0,
             is_group: false,
             writable: true,
+            placeholder: false,
         }
     }
 
@@ -3896,6 +3909,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         };
         // A row before Ready is from a cancelled or ended client: dropped.
@@ -4366,6 +4380,7 @@ mod tests {
             last_at: 0,
             is_group: false,
             writable: true,
+            placeholder: true,
         }
     }
 
@@ -4533,6 +4548,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         });
         snapshot
@@ -4728,6 +4744,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         });
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -4742,6 +4759,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         });
         let ids: Vec<_> = snapshot
@@ -4902,6 +4920,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -5310,6 +5329,7 @@ mod tests {
             last_at: 0,
             is_group: false,
             writable,
+            placeholder: false,
         }
     }
 
@@ -5905,4 +5925,109 @@ mod tests {
     }
 
     // endregion: review fixes on #68
+
+    // region: #70 selection and open-chat gaps with two protocols
+
+    fn open_chats(snapshot: &mut Snapshot) -> Vec<(ProtocolId, String)> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::OpenChat {
+                    protocol,
+                    conversation_id,
+                } => Some((protocol, conversation_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #70 case 1: auto-select skips a placeholder row; `OpenChat` goes only
+    /// to real chats.
+    #[test]
+    fn auto_select_skips_a_placeholder_row() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: discord_guild_placeholder(),
+        });
+        assert_eq!(snapshot.selected_conversation, None);
+        assert!(
+            open_chats(&mut snapshot).is_empty(),
+            "no OpenChat for a placeholder"
+        );
+        snapshot.select_conversation("discord:guild-inbox:general".into());
+        assert!(
+            open_chats(&mut snapshot).is_empty(),
+            "not on a click either"
+        );
+
+        snapshot.selected_conversation = None;
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:real", true),
+        });
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("discord:real")
+        );
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Discord, "discord:real".to_owned())]
+        );
+    }
+
+    /// #70 case 2: Telegram Ready keeps a selection in another linked protocol.
+    #[test]
+    fn telegram_ready_keeps_another_protocols_selection() {
+        let store = SecretStore::memory();
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        assert_eq!(snapshot.selected_protocol, ProtocolId::Slack);
+        complete_telegram(&mut snapshot, &store);
+        assert!(snapshot.telegram_ready());
+        assert_eq!(
+            snapshot.selected_protocol,
+            ProtocolId::Slack,
+            "the user's choice stays"
+        );
+        assert_eq!(snapshot.selected_conversation.as_deref(), Some("slack:C1"));
+
+        // With no other session selected, Telegram Ready selects Telegram.
+        let mut fresh = shell_with(&[ProtocolId::Slack]);
+        complete_telegram(&mut fresh, &store);
+        assert_eq!(fresh.selected_protocol, ProtocolId::Telegram);
+    }
+
+    /// #70 case 3: a chat opened while Linking loads when Linked arrives.
+    #[test]
+    fn linked_loads_a_chat_opened_while_linking() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C2", true),
+        });
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        snapshot.select_conversation("slack:C2".into());
+        assert!(
+            open_chats(&mut snapshot).is_empty(),
+            "commands wait for Linked"
+        );
+        link(&mut snapshot, ProtocolId::Slack);
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Slack, "slack:C2".to_owned())]
+        );
+    }
+
+    // endregion: #70
 }
