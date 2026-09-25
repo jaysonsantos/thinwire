@@ -1,6 +1,7 @@
 //! In-memory [`DiscordApi`] for adapter tests. No network.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
@@ -47,6 +48,8 @@ pub(crate) struct FakeDiscordApi {
     pub state: Mutex<FakeState>,
     pub hold_history: Option<Arc<Notify>>,
     pub hold_send: Option<Arc<Notify>>,
+    /// Sends currently blocked in `hold_send`.
+    pub sends_at_hold: AtomicUsize,
     /// When set, a finished send waits after its result event is queued.
     pub send_result_pause: Option<Arc<SendResultPause>>,
 }
@@ -136,6 +139,7 @@ impl FakeDiscordApi {
             state: Mutex::new(state),
             hold_history: None,
             hold_send: None,
+            sends_at_hold: AtomicUsize::new(0),
             send_result_pause: None,
         }
     }
@@ -242,7 +246,9 @@ impl DiscordApi for FakeDiscordApi {
         Box::pin(async move {
             self.check_token()?;
             if let Some(hold) = &self.hold_send {
+                self.sends_at_hold.fetch_add(1, Ordering::SeqCst);
                 hold.notified().await;
+                self.sends_at_hold.fetch_sub(1, Ordering::SeqCst);
             }
             let mut state = self.state();
             if let Some(error) = state.send_error {

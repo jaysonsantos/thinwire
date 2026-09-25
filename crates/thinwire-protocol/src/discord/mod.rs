@@ -392,7 +392,20 @@ impl ProtocolAdapter for DiscordAdapter {
     }
 
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
-        self.drop_if_revoked(events);
+        // A send checks revocation under the session lock and rejects in that
+        // step. Dropping the session first would skip `SendRejected`.
+        if !matches!(
+            command,
+            AdapterCommand::SendText {
+                protocol: ProtocolId::Discord,
+                ..
+            } | AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Discord,
+                ..
+            }
+        ) {
+            self.drop_if_revoked(events);
+        }
         match command {
             AdapterCommand::ConnectDiscord {
                 mode: DiscordAuthMode::UserAccount,
@@ -1135,6 +1148,124 @@ mod tests {
             }),
             "the send task does not queue a second result after the 401"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_sends_beside_a_401_each_get_one_result() {
+        use std::sync::atomic::Ordering;
+
+        const IN_FLIGHT: u64 = 16;
+        const RACING: u64 = 8;
+        const AFTER: u64 = 8;
+
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        for request in 0..IN_FLIGHT {
+            adapter
+                .handle(
+                    AdapterCommand::SendText {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: id.clone(),
+                        body: format!("m{request}"),
+                        request,
+                    },
+                    &tx,
+                )
+                .expect("send");
+        }
+        for _ in 0..50 {
+            if api.sends_at_hold.load(Ordering::SeqCst) == usize::try_from(IN_FLIGHT).unwrap_or(0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            api.sends_at_hold.load(Ordering::SeqCst),
+            usize::try_from(IN_FLIGHT).unwrap_or(0),
+            "the in-flight sends are waiting"
+        );
+        api.state().unauthorized = true;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        for request in IN_FLIGHT..IN_FLIGHT + RACING {
+            adapter
+                .handle(
+                    AdapterCommand::SendText {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: id.clone(),
+                        body: format!("m{request}"),
+                        request,
+                    },
+                    &tx,
+                )
+                .expect("racing send");
+        }
+        let mut events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Notice { .. })
+        })
+        .await;
+        hold.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        events.extend(drain(&mut rx));
+        for request in IN_FLIGHT + RACING..IN_FLIGHT + RACING + AFTER {
+            adapter
+                .handle(
+                    AdapterCommand::SendText {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: id.clone(),
+                        body: format!("m{request}"),
+                        request,
+                    },
+                    &tx,
+                )
+                .expect("send after unlink");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        events.extend(drain(&mut rx));
+
+        let unlinked = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )
+            })
+            .expect("unlinked");
+        let mut counts = std::collections::HashMap::<u64, usize>::new();
+        for (index, event) in events.iter().enumerate() {
+            let request = match event {
+                AdapterEvent::SendAccepted { request, .. } => {
+                    assert!(index < unlinked, "send {request} accepted after Unlinked");
+                    *request
+                }
+                AdapterEvent::SendRejected { request, .. } => *request,
+                _ => continue,
+            };
+            *counts.entry(request).or_default() += 1;
+        }
+        let total = IN_FLIGHT + RACING + AFTER;
+        for request in 0..total {
+            assert_eq!(
+                counts.get(&request).copied().unwrap_or(0),
+                1,
+                "send {request} has one result"
+            );
+        }
     }
 
     #[tokio::test]
