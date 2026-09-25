@@ -1,7 +1,7 @@
 //! Inbox keyboard and AccessKit. A click on the preview opens that chat.
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::{NodeT, Queryable};
+use egui_kittest::kittest::{By, NodeT, Queryable};
 use thinwire_core::state::Snapshot;
 use thinwire_core::state::test_support::{ready_with_chats, telegram_chat};
 use thinwire_core::{Intent, View};
@@ -276,15 +276,15 @@ fn older_rows_keep_message_text_inside_the_bubble() {
     for (body, id) in [
         (
             "Hello from the latest row in this chat",
-            "bubble telegram:1:new",
+            "Hello from the latest row in this chat",
         ),
         (
             "Older line that must stay wide inside the bubble",
-            "bubble telegram:1:old",
+            "Older line that must stay wide inside the bubble",
         ),
     ] {
-        let text = harness.get_by_label(body);
-        let bubble = harness.get_by_label(id);
+        let text = harness.get_by_role_and_label(egui::accesskit::Role::Label, body);
+        let bubble = harness.get_by_role_and_label(egui::accesskit::Role::Pane, id);
         let text_rect = text.rect();
         let bubble_rect = bubble.rect();
         assert!(
@@ -296,6 +296,29 @@ fn older_rows_keep_message_text_inside_the_bubble() {
             "{body} wraps wider than one letter"
         );
     }
+}
+
+#[test]
+fn a_wrapped_message_keeps_the_time_on_the_bottom() {
+    let body = "Can you also bring the small stove? Ours has a broken valve, and the shop only has the big one until next week, which does not fit in the car.";
+    let mut state = InboxUi::ready();
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: chat_message("telegram:1:wrap", body, 1_790_300_000),
+    });
+    let mut harness = harness(state);
+    harness.run();
+    let text = harness.get_by_role_and_label(egui::accesskit::Role::Label, body);
+    let time = harness
+        .query_all(By::new().role(egui::accesskit::Role::Label))
+        .filter(|node| node.rect().left() >= text.rect().right() - 2.0)
+        .min_by(|left, right| {
+            (left.rect().bottom() - text.rect().bottom())
+                .abs()
+                .total_cmp(&(right.rect().bottom() - text.rect().bottom()).abs())
+        })
+        .expect("time beside the message");
+    let gap = (time.rect().bottom() - text.rect().bottom()).abs();
+    assert!(gap < 6.0, "the time sits on the last line, gap {gap}");
 }
 
 #[test]
