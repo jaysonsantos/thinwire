@@ -20,8 +20,8 @@ use super::loopback::tests::get;
 use super::secrets::{MemorySlackVault, SlackSecretKey, SlackSecretVault};
 use super::session::{MAX_CHANNEL_PAGES, SlackDeps, SlackInbox};
 use crate::adapter::{
-    AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, ProtocolAdapter,
-    ProtocolId,
+    AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation,
+    ProtocolAdapter, ProtocolId,
 };
 
 const BOT_TOKEN: &str = "xoxb-fake-bot-token";
@@ -526,10 +526,6 @@ async fn channel_list_pages_skip_non_member_channels_and_name_dms() {
     let group = h.conversation("slack:G1").await;
     assert_eq!(group.title, "ana, bo");
 
-    // Connect already walked every page. Another LoadChats does not call Slack.
-    h.send(AdapterCommand::LoadChats {
-        protocol: ProtocolId::Slack,
-    });
     h.send(AdapterCommand::OpenChat {
         protocol: ProtocolId::Slack,
         conversation_id: "slack:C1".into(),
@@ -573,7 +569,7 @@ async fn refresh_reloads_the_channel_list_and_sends_the_diff() {
             .push(channel("C3", "quiet", SlackChannelKind::Public, true));
         state.pages[1].channels.retain(|row| row.id != "G1");
     });
-    h.send(AdapterCommand::Connect {
+    h.send(AdapterCommand::LoadChats {
         protocol: ProtocolId::Slack,
     });
     let added = h.conversation("slack:C3").await;
@@ -975,6 +971,87 @@ async fn send_without_socket_mode_updates_the_conversation_row() {
     };
     assert_eq!(conversation.order, 1_700_000_101_000_100);
     assert_eq!(conversation.last_at, 1_700_000_101);
+    assert!(conversation.writable);
+}
+
+#[tokio::test]
+async fn a_ready_workspace_is_linked_before_its_channels() {
+    let mut h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    let linked = h.seen.iter().position(|event| {
+        matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Linked,
+                ..
+            }
+        )
+    });
+    let row = h
+        .seen
+        .iter()
+        .position(|event| matches!(event, AdapterEvent::ConversationUpsert { .. }));
+    assert!(linked.is_some() && linked < row);
+}
+
+#[tokio::test]
+async fn an_open_channel_stays_read_when_a_message_arrives() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.adapter.view_chat(Some("slack:C1"), &h.tx);
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000200.000100",
+        "U1",
+        "while open",
+    )));
+    h.message("while open").await;
+    let row = h
+        .until("read row", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C1" && conversation.preview == "while open"
+            )
+        })
+        .await;
+    let AdapterEvent::ConversationUpsert { conversation } = row else {
+        unreachable!();
+    };
+    assert_eq!(conversation.unread, 0);
+}
+
+#[tokio::test]
+async fn resend_posts_the_same_text_again() {
+    let mut h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.send(AdapterCommand::SendText {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        body: "hello from thinwire".into(),
+        request: 1,
+    });
+    let sent = h.message("hello from thinwire").await;
+    h.send(AdapterCommand::ResendMessage {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        message_id: sent.id,
+        request: 2,
+    });
+    let again = h
+        .until("resent", |event| {
+            matches!(event, AdapterEvent::SendAccepted { request: 2, .. })
+        })
+        .await;
+    assert!(matches!(again, AdapterEvent::SendAccepted { .. }));
+    assert_eq!(h.api.with(|state| state.posted.len()), 2);
 }
 
 #[tokio::test]
@@ -1182,7 +1259,14 @@ async fn network_error_on_channel_list_keeps_the_install() {
     api.with(|state| state.list_error = Some(SlackApiError::Network));
     let mut h = Harness::new(api, installed_vault(), true);
     h.start();
-    let detail = h.status(AdapterStatus::Error).await;
+    let failed = h
+        .until("list failed", |event| {
+            matches!(event, AdapterEvent::CommandFailed { .. })
+        })
+        .await;
+    let AdapterEvent::CommandFailed { detail, .. } = failed else {
+        unreachable!();
+    };
     assert!(detail.contains("could not reach Slack"));
     assert_eq!(
         h.vault.get_secret(SlackSecretKey::BotToken).as_deref(),
@@ -1218,7 +1302,14 @@ async fn rate_limit_on_send_keeps_the_install() {
         body: "not sent".into(),
         request: 1,
     });
-    let detail = h.status(AdapterStatus::Error).await;
+    let failed = h
+        .until("send failed", |event| {
+            matches!(event, AdapterEvent::CommandFailed { .. })
+        })
+        .await;
+    let AdapterEvent::CommandFailed { detail, .. } = failed else {
+        unreachable!();
+    };
     assert!(detail.contains("rate limit"));
     assert!(h.api.with(|state| state.posted.is_empty()));
     assert!(!h.seen.iter().any(|event| {
@@ -1347,7 +1438,15 @@ async fn not_in_channel_asks_to_add_the_app() {
         protocol: ProtocolId::Slack,
         conversation_id: "slack:C1".into(),
     });
-    assert!(h.status(AdapterStatus::Error).await.contains("Add the app"));
+    let note = h
+        .until("not in channel", |event| {
+            matches!(event, AdapterEvent::Notice { .. })
+        })
+        .await;
+    let AdapterEvent::Notice { text, .. } = note else {
+        unreachable!();
+    };
+    assert!(text.contains("Add the app"));
     assert_eq!(
         h.vault.get_secret(SlackSecretKey::BotToken).as_deref(),
         Some(BOT_TOKEN)

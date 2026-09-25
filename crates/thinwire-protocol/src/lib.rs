@@ -63,6 +63,7 @@ pub fn catalog() -> [ProtocolCapabilities; 4] {
 pub(crate) fn registry(
     secrets: std::sync::Arc<dyn TelegramSecretVault>,
     discord: std::sync::Arc<dyn DiscordSecretVault>,
+    slack: std::sync::Arc<dyn SlackSecretVault>,
     whatsapp_phone: std::sync::Arc<WhatsAppPhoneVault>,
     login_epoch: adapter::LoginEpoch,
 ) -> Vec<Box<dyn ProtocolAdapter>> {
@@ -74,7 +75,7 @@ pub(crate) fn registry(
         )),
         Box::new(WhatsAppAdapter::new(whatsapp_phone)),
         Box::new(DiscordAdapter::new(discord)),
-        slack::registry_adapter(),
+        slack::registry_adapter(slack),
     ]
 }
 

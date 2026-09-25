@@ -42,8 +42,10 @@ pub use secrets::{MemorySlackVault, SLACK_SECRET_SERVICE, SlackSecretKey, SlackS
 pub use session::{SlackDeps, SlackInbox};
 
 /// Adapter the host registers. Feature on: the live workspace-app inbox.
-/// The Slack vault is memory-only until the core owns a Slack keychain entry.
-pub(crate) fn registry_adapter() -> Box<dyn ProtocolAdapter> {
+/// The vault is the core secret store, so an install survives a restart.
+pub(crate) fn registry_adapter(
+    vault: std::sync::Arc<dyn SlackSecretVault>,
+) -> Box<dyn ProtocolAdapter> {
     #[cfg(feature = "slack-oauth")]
     {
         match live::hyper_client() {
@@ -52,13 +54,15 @@ pub(crate) fn registry_adapter() -> Box<dyn ProtocolAdapter> {
                     live::MorphismWebApi::new(std::sync::Arc::clone(&client)),
                     live::MorphismSocket::new(client),
                     live::SystemBrowser,
-                    std::sync::Arc::new(MemorySlackVault::new()),
+                    vault,
                     SlackApiSource::from_build(),
                 )));
             }
             Err(error) => tracing::warn!(%error, "slack https client did not start"),
         }
     }
+    #[cfg(not(feature = "slack-oauth"))]
+    let _ = vault;
     Box::new(SlackAdapter)
 }
 
@@ -84,7 +88,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     detail: CAPABILITY_DETAIL,
     official_api: true,
     allows_user_account_automation: false,
-    sends_text: false,
+    sends_text: true,
 };
 
 /// Official Slack path. Workspace install UI is out of scope for this spike.

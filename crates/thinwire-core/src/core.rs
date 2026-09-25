@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use thinwire_protocol::WhatsAppPhoneVault as PhoneVault;
 use thinwire_protocol::{
     AdapterCommand, AdapterEvent, AdapterHost, DiscordAdapter, DiscordSecretVault, HostSender,
-    ProtocolId, TelegramSecretVault, WhatsAppPhoneVault, catalog,
+    ProtocolId, SlackAdapter, SlackSecretVault, TelegramSecretVault, WhatsAppPhoneVault, catalog,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -115,12 +115,15 @@ impl Core {
             runtime,
             Arc::clone(&secrets) as Arc<dyn TelegramSecretVault>,
             Arc::clone(&secrets) as Arc<dyn DiscordSecretVault>,
+            Arc::clone(&secrets) as Arc<dyn SlackSecretVault>,
             Arc::clone(&whatsapp_phone),
         );
-        // `for_ui` only schedules keychain attach. Discord's start can run
-        // before that blocking read finishes, so arm it again once a token
-        // is in memory. The hook sends a command; it does not touch the OS store.
+        // `for_ui` only schedules keychain attach. A start can run before
+        // that blocking read finishes, so arm Discord and Slack again once
+        // a token is in memory. The hook sends a command; it does not touch
+        // the OS store.
         bind_discord_after_hydrate(&secrets, &host);
+        bind_slack_after_hydrate(&secrets, &host);
         let (notifier, _) = change_channel();
         let (commands, host_events) = host.into_parts();
         let events = forward_events(runtime, host_events, notifier.downgrade());
@@ -440,6 +443,18 @@ async fn watch_until(done: impl Fn() -> bool, notifier: WeakNotifier, step: Dura
     }
 }
 
+fn bind_slack_after_hydrate(secrets: &SecretStore, host: &AdapterHost) {
+    if !SlackAdapter::slack_oauth_compiled() {
+        return;
+    }
+    let commands = host.command_sender();
+    secrets.on_slack_token_hydrated(move || {
+        let _ = commands.send(AdapterCommand::Connect {
+            protocol: ProtocolId::Slack,
+        });
+    });
+}
+
 fn bind_discord_after_hydrate(secrets: &SecretStore, host: &AdapterHost) {
     if !DiscordAdapter::bot_inbox_compiled() {
         return;
@@ -609,6 +624,7 @@ mod tests {
             &Handle::current(),
             Arc::clone(&store) as Arc<dyn TelegramSecretVault>,
             Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
+            Arc::clone(&store) as Arc<dyn SlackSecretVault>,
             Arc::clone(&whatsapp_phone),
         );
         bind_discord_after_hydrate(&store, &host);
@@ -663,6 +679,7 @@ mod tests {
             &Handle::current(),
             Arc::clone(&store) as Arc<dyn TelegramSecretVault>,
             Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
+            Arc::clone(&store) as Arc<dyn SlackSecretVault>,
             whatsapp_phone,
         );
         for caps in catalog() {

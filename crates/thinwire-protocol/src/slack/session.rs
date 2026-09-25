@@ -27,10 +27,12 @@ use super::loopback::SlackLoopback;
 use super::secrets::{SlackSecretKey, SlackSecretVault};
 use super::{CAPABILITIES, SLACK_CONVERSATION_PREFIX};
 use crate::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolAdapter, ProtocolCapabilities, ProtocolId, emit_conversation,
-    emit_conversation_removed, emit_message, emit_message_body, emit_messages_removed,
-    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
+    AccountState, AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery,
+    EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, emit_account,
+    emit_chat_list_loaded, emit_command_failed, emit_conversation, emit_conversation_removed,
+    emit_flush_secrets, emit_history_loaded, emit_message, emit_message_body,
+    emit_messages_removed, emit_notice, emit_send_accepted, emit_send_rejected, emit_status,
+    emit_stopped,
 };
 
 /// Messages loaded when a channel opens.
@@ -106,6 +108,8 @@ impl<A, S, B> SlackDeps<A, S, B> {
 
 enum Job {
     Command(AdapterCommand),
+    /// The chat the shell says the user is looking at. `None` leaves them all.
+    View(Option<String>),
     Inbound(SlackInbound),
     Installed {
         attempt: u64,
@@ -187,6 +191,7 @@ where
                 AdapterStatus::Stubbed,
                 DETAIL_NOT_CONNECTED,
             );
+            emit_account(&events, ProtocolId::Slack, AccountState::Unlinked);
         }
         let session = Session::new(deps, events, jobs_tx.clone());
         tokio::spawn(session.run(jobs_rx));
@@ -226,6 +231,13 @@ where
             emit_stopped(events, ProtocolId::Slack);
         }
     }
+
+    fn view_chat(&mut self, conversation_id: Option<&str>, _events: &EventTx) {
+        let Some(jobs) = &self.jobs else {
+            return;
+        };
+        let _ = jobs.send(Job::View(conversation_id.map(str::to_string)));
+    }
 }
 
 struct Live<T> {
@@ -252,6 +264,8 @@ where
     attempts: u64,
     channels: HashMap<String, Conversation>,
     names: HashMap<String, String>,
+    /// Channel the user is looking at. Inbound messages there stay read.
+    viewing: Option<String>,
     /// Texts this session has shown, newest kept, so a delete can move the preview.
     shown: HashMap<String, Vec<(String, String)>>,
 }
@@ -272,6 +286,7 @@ where
             attempts: 0,
             channels: HashMap::new(),
             names: HashMap::new(),
+            viewing: None,
             shown: HashMap::new(),
         }
     }
@@ -280,6 +295,7 @@ where
         while let Some(job) = jobs.recv().await {
             match job {
                 Job::Command(command) => self.command(command).await,
+                Job::View(conversation_id) => self.set_view(conversation_id),
                 Job::Inbound(SlackInbound::Message(post)) => self.inbound(post).await,
                 Job::Inbound(SlackInbound::Edited { channel, ts, text }) => {
                     self.edit_message(&channel, &ts, &text);
@@ -299,6 +315,10 @@ where
         emit_status(&self.events, ProtocolId::Slack, status, detail);
     }
 
+    fn account(&self, state: AccountState) {
+        emit_account(&self.events, ProtocolId::Slack, state);
+    }
+
     async fn command(&mut self, command: AdapterCommand) {
         match command {
             AdapterCommand::Connect {
@@ -309,12 +329,18 @@ where
             } => {
                 self.cancel_install();
                 self.stop_live().await;
+                self.account(AccountState::Unlinked);
                 self.status(AdapterStatus::Stubbed, DETAIL_DISCONNECTED);
             }
             AdapterCommand::LoadChats {
                 protocol: ProtocolId::Slack,
             } => {
-                let _ = self.load_channels().await;
+                if self.live.as_ref().is_some_and(|live| live.list_done) {
+                    self.refresh_channels().await;
+                } else {
+                    let _ = self.load_channels().await;
+                }
+                emit_chat_list_loaded(&self.events, ProtocolId::Slack);
             }
             AdapterCommand::OpenChat {
                 protocol: ProtocolId::Slack,
@@ -326,6 +352,12 @@ where
                 body,
                 request,
             } => self.send(&conversation_id, &body, request).await,
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Slack,
+                conversation_id,
+                message_id,
+                request,
+            } => self.resend(&conversation_id, &message_id, request).await,
             AdapterCommand::Shutdown {
                 protocol: ProtocolId::Slack,
             } => {
@@ -341,10 +373,13 @@ where
     }
 
     async fn connect(&mut self) {
-        if self.live.is_some() {
-            self.refresh_channels().await;
+        if let Some(live) = &self.live {
+            let detail = ready_detail(&live.team_name, live.stream.is_some());
+            self.account(AccountState::Linked);
+            self.status(AdapterStatus::Ready, detail);
             return;
         }
+        self.account(AccountState::Linking);
         if self.install.is_some() {
             self.status(AdapterStatus::Connecting, DETAIL_WAITING);
             return;
@@ -425,20 +460,27 @@ where
                 grant
                     .workspace
                     .remember(self.deps.vault.as_ref(), grant.bot_token.reveal());
+                emit_flush_secrets(&self.events);
                 tracing::info!(
                     team_id = grant.workspace.team_id(),
                     "slack workspace app installed"
                 );
                 self.go_live(grant.bot_token).await;
             }
-            Err(InstallFailure::TimedOut) => self.status(AdapterStatus::Error, DETAIL_TIMED_OUT),
+            Err(InstallFailure::TimedOut) => {
+                self.account(AccountState::Unlinked);
+                self.status(AdapterStatus::Error, DETAIL_TIMED_OUT);
+            }
             Err(InstallFailure::Callback(SlackCallbackError::Declined)) => {
+                self.account(AccountState::Unlinked);
                 self.status(AdapterStatus::Error, DETAIL_DECLINED);
             }
             Err(InstallFailure::Callback(error)) => {
+                self.account(AccountState::Unlinked);
                 self.status(AdapterStatus::Error, error.to_string());
             }
             Err(InstallFailure::Exchange(error)) => {
+                self.account(AccountState::Unlinked);
                 self.status(
                     AdapterStatus::Error,
                     format!("Slack install failed: {error}."),
@@ -456,6 +498,9 @@ where
             Ok(identity) => identity,
             Err(error) => {
                 self.api_failed(&error).await;
+                if self.live.is_none() {
+                    self.account(AccountState::Unlinked);
+                }
                 return;
             }
         };
@@ -480,6 +525,8 @@ where
             next_cursor: None,
             list_done: false,
         });
+        // Linked before any inbox row. A later Linking is only a reconnect.
+        self.account(AccountState::Linked);
         self.start_events().await;
         let live_events = self.live.as_ref().is_some_and(|live| live.stream.is_some());
         self.status(
@@ -597,6 +644,8 @@ where
         self.deps.vault.set_secret(SlackSecretKey::BotToken, "");
         self.deps.vault.set_secret(SlackSecretKey::TeamId, "");
         self.deps.vault.set_secret(SlackSecretKey::AppId, "");
+        emit_flush_secrets(&self.events);
+        self.account(AccountState::Unlinked);
         self.status(AdapterStatus::Error, DETAIL_ENDED);
     }
 
@@ -608,16 +657,16 @@ where
             return;
         }
         if matches!(error, SlackApiError::Api(code) if code == "not_in_channel") {
-            self.status(AdapterStatus::Error, DETAIL_NOT_IN_CHANNEL);
+            emit_notice(&self.events, ProtocolId::Slack, DETAIL_NOT_IN_CHANNEL);
             return;
         }
-        self.status(AdapterStatus::Error, format!("{error}."));
+        emit_command_failed(&self.events, ProtocolId::Slack, None, format!("{error}."));
     }
 
     async fn load_channels(&mut self) -> HashSet<String> {
         let mut seen = HashSet::new();
         let Some(live) = &self.live else {
-            self.status(AdapterStatus::Error, DETAIL_NOT_READY);
+            emit_command_failed(&self.events, ProtocolId::Slack, None, DETAIL_NOT_READY);
             return seen;
         };
         if live.list_done {
@@ -657,6 +706,7 @@ where
                     order: 0,
                     last_at: 0,
                     is_group: is_group(channel.kind),
+                    writable: true,
                 };
                 if let Some(existing) = self.channels.get(&channel.id) {
                     // Keep live preview, unread, order, and time from Socket Mode.
@@ -720,11 +770,21 @@ where
 
     async fn open_channel(&mut self, conversation: &str) {
         let Some(channel) = channel_id(conversation) else {
-            self.status(AdapterStatus::Error, "Unknown Slack conversation.");
+            emit_command_failed(
+                &self.events,
+                ProtocolId::Slack,
+                Some(conversation.to_string()),
+                "Unknown Slack conversation.",
+            );
             return;
         };
         let Some(live) = &self.live else {
-            self.status(AdapterStatus::Error, DETAIL_NOT_READY);
+            emit_command_failed(
+                &self.events,
+                ProtocolId::Slack,
+                Some(conversation.to_string()),
+                DETAIL_NOT_READY,
+            );
             return;
         };
         let token = live.token.clone();
@@ -732,6 +792,7 @@ where
             Ok(posts) => posts,
             Err(error) => {
                 self.api_failed(&error).await;
+                emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
                 return;
             }
         };
@@ -745,6 +806,42 @@ where
             row.unread = 0;
             emit_conversation(&self.events, row.clone());
         }
+        emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
+    }
+
+    fn set_view(&mut self, conversation_id: Option<String>) {
+        let channel = conversation_id
+            .as_deref()
+            .and_then(channel_id)
+            .map(str::to_string);
+        self.viewing.clone_from(&channel);
+        let Some(channel) = channel else {
+            return;
+        };
+        let Some(row) = self.channels.get(&channel) else {
+            return;
+        };
+        if row.unread == 0 {
+            return;
+        }
+        let mut row = row.clone();
+        row.unread = 0;
+        self.upsert(channel, row);
+    }
+
+    async fn resend(&mut self, conversation: &str, message_id: &str, request: u64) {
+        let text = channel_id(conversation).and_then(|channel| {
+            self.shown.get(channel).and_then(|rows| {
+                rows.iter().find_map(|(ts, text)| {
+                    (message_id == message_id_of(channel, ts)).then(|| text.clone())
+                })
+            })
+        });
+        let Some(text) = text else {
+            emit_send_rejected(&self.events, ProtocolId::Slack, conversation, request);
+            return;
+        };
+        self.send(conversation, &text, request).await;
     }
 
     async fn send(&mut self, conversation: &str, body: &str, request: u64) {
@@ -788,7 +885,7 @@ where
             &self.events,
             ProtocolId::Slack,
             conversation_id(channel),
-            message_id(channel, ts),
+            message_id_of(channel, ts),
             text,
         );
         if let Some(rows) = self.shown.get_mut(channel)
@@ -812,7 +909,7 @@ where
             &self.events,
             ProtocolId::Slack,
             conversation_id(channel),
-            vec![message_id(channel, ts)],
+            vec![message_id_of(channel, ts)],
         );
         if let Some(rows) = self.shown.get_mut(channel) {
             rows.retain(|(seen, _)| seen != ts);
@@ -871,10 +968,11 @@ where
                 title,
                 participant: "workspace".into(),
                 preview,
-                unread: u32::from(!outbound),
+                unread: u32::from(!outbound && self.viewing.as_deref() != Some(channel.as_str())),
                 order,
                 last_at: sent_at,
                 is_group: !channel.starts_with('D'),
+                writable: true,
             };
             // The title is only the id. A later LoadChats walks the list again
             // and replaces it with the channel name.
@@ -889,7 +987,7 @@ where
         row.preview = preview;
         row.order = row.order.max(order);
         row.last_at = row.last_at.max(sent_at);
-        if !outbound {
+        if !outbound && self.viewing.as_deref() != Some(channel.as_str()) {
             row.unread = row.unread.saturating_add(1);
         }
         self.upsert(channel, row);
@@ -923,7 +1021,7 @@ where
         ChatMessage {
             protocol: ProtocolId::Slack,
             conversation_id: conversation_id(&post.channel),
-            id: message_id(&post.channel, &post.ts),
+            id: message_id_of(&post.channel, &post.ts),
             sender,
             body: post.text,
             outbound,
@@ -949,7 +1047,7 @@ fn conversation_id(channel: &str) -> String {
 }
 
 /// `slack:<channel>:<rank>`. The shell parses the last segment as `i64`.
-fn message_id(channel: &str, ts: &str) -> String {
+fn message_id_of(channel: &str, ts: &str) -> String {
     format!("{SLACK_CONVERSATION_PREFIX}{channel}:{}", ts_rank(ts))
 }
 
@@ -1036,7 +1134,7 @@ mod tests {
         assert_eq!(ts_rank("1700000200.000100"), 1_700_000_200_000_100);
         assert!(ts_rank("1700000001.000100") < ts_rank("1700000200.000100"));
         assert_eq!(
-            message_id("C1", "1700000001.000100"),
+            message_id_of("C1", "1700000001.000100"),
             "slack:C1:1700000001000100"
         );
         assert_eq!(ts_rank("bad"), 0);

@@ -5305,13 +5305,7 @@ mod tests {
         });
         snapshot.compose = "hi".into();
         snapshot.selected_conversation = Some("slack:RW".into());
-        assert!(
-            !snapshot.can_send(),
-            "Slack does not send text in this build"
-        );
-
-        allow_send(&mut snapshot, ProtocolId::Slack);
-        assert!(snapshot.can_send());
+        assert!(snapshot.can_send(), "a linked writable Slack channel");
         snapshot.selected_conversation = Some("slack:RO".into());
         assert!(!snapshot.can_send(), "a read-only channel");
 
