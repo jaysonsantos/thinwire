@@ -1188,15 +1188,17 @@ async fn load_older(
     live: &mut LiveInbox,
     events: &EventTx,
 ) {
-    let done = |more: bool| {
+    let end = |more: bool, note: Option<String>| {
         emit_older_history_loaded(
             events,
             ProtocolId::Telegram,
             conversation_id,
             before_message_id,
             more,
+            note,
         );
     };
+    let done = |more: bool| end(more, None);
     let Some((chat_id, before)) = inbox::parse_message_id(before_message_id) else {
         done(false);
         return;
@@ -1224,18 +1226,13 @@ async fn load_older(
                 emit_mapped_message(events, message, live, None);
             }
             let more = live.older.finish(chat_id, before, outcome);
-            done(more);
+            let (more, note) = inbox::older_end(Ok(more));
+            end(more, note);
         }
         Err(error) => {
             log_tdlib_error("getChatHistory (older)", &error);
-            emit_status(
-                events,
-                ProtocolId::Telegram,
-                AdapterStatus::Error,
-                format!("Could not load older messages (TDLib {}).", error.code),
-            );
-            // Not the start of the chat: a later scroll can try again.
-            done(true);
+            let (more, note) = inbox::older_end(Err(error.code));
+            end(more, note);
         }
     }
 }

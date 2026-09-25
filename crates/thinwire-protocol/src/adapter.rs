@@ -394,6 +394,9 @@ pub enum AdapterEvent {
         conversation_id: String,
         before_message_id: String,
         more: bool,
+        /// Why this page did not load, for this chat only. Not an account
+        /// error. `None` on success, so a later success clears it (#57).
+        note: Option<String>,
     },
     /// A history load for one chat ended. The UI stops "Loading messages…".
     HistoryLoaded {
@@ -696,12 +699,14 @@ pub(crate) fn emit_older_history_loaded(
     conversation_id: impl Into<String>,
     before_message_id: impl Into<String>,
     more: bool,
+    note: Option<String>,
 ) {
     let _ = events.send(AdapterEvent::OlderHistoryLoaded {
         protocol,
         conversation_id: conversation_id.into(),
         before_message_id: before_message_id.into(),
         more,
+        note,
     });
 }
 
