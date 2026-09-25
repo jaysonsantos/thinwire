@@ -961,7 +961,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         |id| messages.iter().any(|message| message.id == id),
         output.state.offset.y,
         output.content_size.y,
-        output.content_size.y <= output.inner_rect.height(),
+        cannot_leave_zone(output.content_size.y, output.inner_rect.height()),
     );
     if step.restore.is_some() {
         // Older rows went in above: the next frame moves down by their height,
@@ -1010,6 +1010,13 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
 /// messages.
 const OLDER_TRIGGER: f32 = 24.0;
 
+/// The view cannot scroll out of the top zone: its largest scroll offset is
+/// not more than `OLDER_TRIGGER`. A thread that fits, or is only a little
+/// taller than the view, is such a thread (#74 review).
+fn cannot_leave_zone(content_height: f32, view_height: f32) -> bool {
+    content_height - view_height <= OLDER_TRIGGER
+}
+
 /// What the thread remembers between frames for older-message paging (#30).
 #[derive(Debug, Clone, Default)]
 struct ThreadMemo {
@@ -1047,7 +1054,7 @@ fn older_step(
     has_row: impl Fn(&str) -> bool,
     offset: f32,
     content_height: f32,
-    fits: bool,
+    stuck: bool,
 ) -> OlderStep {
     let idle = OlderStep {
         at_top: false,
@@ -1060,9 +1067,9 @@ fn older_step(
     let zone = offset <= OLDER_TRIGGER;
     match memo.first_id.as_deref() {
         Some(old) if old == first => OlderStep {
-            // A thread that fits the view cannot leave the zone: it asks
+            // A thread that cannot leave the zone (`cannot_leave_zone`) asks
             // while it stays there, and the core paces it (#67).
-            at_top: memo.restore.is_none() && zone && (!memo.in_zone || fits),
+            at_top: memo.restore.is_none() && zone && (!memo.in_zone || stuck),
             restore: None,
             in_zone: zone,
         },
@@ -1459,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_that_fits_the_view_keeps_asking_at_the_top() {
+    fn a_thread_that_cannot_leave_the_zone_keeps_asking_at_the_top() {
         use super::{ThreadMemo, older_step};
 
         let has = |id: &str| id == "t:1:50";
@@ -1471,7 +1478,16 @@ mod tests {
         };
         // It cannot scroll, so it never leaves the zone: still asks (#67).
         assert!(older_step(&memo, Some("t:1:50"), has, 0.0, 300.0, true).at_top);
-        // A thread that can scroll waits for leave and return.
+        // 10 pt taller than the view: the largest offset is 10 pt, inside
+        // the zone, so it gets the timed retry too.
+        use super::{OLDER_TRIGGER, cannot_leave_zone};
+        assert!(cannot_leave_zone(300.0, 300.0));
+        assert!(cannot_leave_zone(310.0, 300.0));
+        assert!(cannot_leave_zone(300.0 + OLDER_TRIGGER, 300.0));
+        assert!(!cannot_leave_zone(301.0 + OLDER_TRIGGER, 300.0));
+        let taller = cannot_leave_zone(310.0, 300.0);
+        assert!(older_step(&memo, Some("t:1:50"), has, 10.0, 310.0, taller).at_top);
+        // A thread that can scroll out waits for leave and return.
         assert!(!older_step(&memo, Some("t:1:50"), has, 0.0, 300.0, false).at_top);
         let ui = include_str!("ui.rs");
         let thread = &ui[ui.find("fn thread(").expect("thread")..];
