@@ -174,7 +174,10 @@ impl Session {
         let events = events.clone();
         tokio::spawn(async move {
             let result = api.history(access.channel_id, HISTORY_LIMIT).await;
+            // A newer connect replaced this load. Finish it so the shell drops
+            // the spinner. The new session's own open emits its own event.
             if !gate.current() {
+                emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                 return;
             }
             match result {
@@ -187,9 +190,11 @@ impl Session {
                     let new_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
                     let gone = {
                         let Ok(mut state) = shared.lock() else {
+                            emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                             return;
                         };
                         if !gate.current() {
+                            emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
                             return;
                         }
                         let previous = state.history.entry(conversation_id.clone()).or_default();

@@ -1306,6 +1306,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_replaced_history_load_still_finishes() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_history = Some(Arc::clone(&hold));
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        hold.notify_waiters();
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+            )
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let rest = drain(&mut rx);
+        let loaded = events
+            .iter()
+            .chain(rest.iter())
+            .filter(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+                )
+            })
+            .count();
+        assert_eq!(loaded, 1, "the replaced open ends once");
+        assert!(
+            messages(&events).is_empty() && messages(&rest).is_empty(),
+            "a replaced load does not publish rows"
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_drops_history_from_the_old_session() {
         let hold = Arc::new(Notify::new());
         let mut fake = FakeDiscordApi::guild_fixture();
