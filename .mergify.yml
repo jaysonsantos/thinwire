@@ -6,7 +6,14 @@
 
 queue_rules:
   - name: default
+    # Queue a pull request by itself when it has the label and CI is green.
+    # `main` requires 0 approvals, so the label is the merge gate. Without
+    # it, any green pull request from any contributor would merge itself.
+    # (merge_protections_settings.auto_merge_conditions did not queue by
+    # itself, and Mergify rejects it next to autoqueue.)
+    autoqueue: true
     queue_conditions:
+      - label = ready-to-merge
       - check-success = check
     merge_conditions:
       - check-success = check
@@ -20,9 +27,3 @@ queue_rules:
     batch_size: 20
     batch_max_wait_time: 5 min
     checks_timeout: 30 min
-
-merge_protections_settings:
-  # `main` requires 0 approvals, so an explicit label is the merge gate.
-  # Without it, any green pull request from any contributor merges itself.
-  auto_merge_conditions:
-    - label = ready-to-merge
