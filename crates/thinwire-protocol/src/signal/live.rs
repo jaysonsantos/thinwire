@@ -88,9 +88,17 @@ impl Session {
         self.sent.lock().await.get(message_id).cloned()
     }
 
-    pub(super) fn next_generation(&self) -> u64 {
+    /// Advance the generation. This does not wake `CancelWake`.
+    /// Startup calls it before any task waits, so a stored permit cannot
+    /// cancel the new receive loop.
+    pub(super) fn bump_generation(&self) -> u64 {
         self.active.store(false, Ordering::SeqCst);
-        let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Advance the generation and wake a worker that is already in `select`.
+    pub(super) fn next_generation(&self) -> u64 {
+        let next = self.bump_generation();
         self.cancel.wake();
         next
     }
@@ -592,6 +600,7 @@ fn fail(events: &EventTx, detail: &str) {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use presage::libsignal_service::content::{Content, GroupContextV2, Metadata};
     use presage::libsignal_service::prelude::Uuid;
@@ -624,6 +633,32 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    #[tokio::test]
+    async fn a_startup_bump_does_not_wake_cancel() {
+        let session = Session::new();
+        let _token = session.bump_generation();
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            session.cancel.cancelled(),
+        )
+        .await;
+        assert!(pending.is_err(), "startup must not store a cancel permit");
+    }
+
+    #[tokio::test]
+    async fn invalidation_wakes_a_waiting_worker() {
+        let session = Arc::new(Session::new());
+        let waiting = Arc::clone(&session);
+        let handle = tokio::spawn(async move {
+            waiting.cancel.cancelled().await;
+        });
+        session.next_generation();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("woke")
+            .expect("task");
     }
 
     #[test]

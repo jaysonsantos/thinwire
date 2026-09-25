@@ -183,7 +183,7 @@ impl SignalAdapter {
         let Engine::Live(session) = &self.engine else {
             return None;
         };
-        let token = session.next_generation();
+        let token = session.bump_generation();
         session.mark_active();
         let session = Arc::clone(session);
         let task_events = events.clone();
