@@ -468,11 +468,31 @@ fn event_matches_install(event_team: &str, event_app: &str, scope: &SlackSocketS
     scope.app_id.is_empty() || event_app == scope.app_id
 }
 
+/// Slack acks a callback error when this returns success. A foreign install
+/// must not ack, or the owning desktop never sees the envelope.
+fn ack_callback_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error.downcast_ref::<ForeignInstall>().is_none()
+}
+
+#[derive(Debug)]
+struct ForeignInstall;
+
+impl std::fmt::Display for ForeignInstall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("slack socket event is for another install")
+    }
+}
+
+impl std::error::Error for ForeignInstall {}
+
 fn on_error(
-    _error: Box<dyn std::error::Error + Send + Sync + 'static>,
+    error: Box<dyn std::error::Error + Send + Sync + 'static>,
     _client: Arc<SlackHyperClient>,
     _state: SlackClientEventsUserState,
 ) -> HttpStatusCode {
+    if !ack_callback_error(error.as_ref()) {
+        return HttpStatusCode::SERVICE_UNAVAILABLE;
+    }
     // The error can carry a payload. Log only that it happened.
     tracing::warn!("slack socket mode listener error");
     HttpStatusCode::OK
@@ -489,7 +509,8 @@ async fn on_push(
             return Ok(());
         };
         if !event_matches_install(event.team_id.value(), event.api_app_id.value(), &slot.scope) {
-            return Ok(());
+            // No ack. Slack can deliver the envelope to the install that owns it.
+            return Err(Box::new(ForeignInstall));
         }
         slot.sink.clone()
     };
@@ -538,6 +559,15 @@ mod tests {
         };
         assert!(event_matches_install("T1", "A9", &team_only));
         assert!(!event_matches_install("T2", "A9", &team_only));
+    }
+
+    #[test]
+    fn a_foreign_install_is_not_acknowledged() {
+        let foreign: Box<dyn std::error::Error + Send + Sync> = Box::new(ForeignInstall);
+        assert!(!ack_callback_error(foreign.as_ref()));
+        let other: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("listener"));
+        assert!(ack_callback_error(other.as_ref()));
     }
 
     #[test]
