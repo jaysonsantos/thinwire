@@ -38,3 +38,17 @@ ADR 0004 still blocks AGPL code in the release binary. This ADR is the exception
 - The same guard covers `whatsapp-web`.
 - Default CI stays feature-off.
 - The helper process, if any, comes from the #38 ADR. It is not this decision.
+
+## Amendment (2026-09-25)
+
+Public CI can download AGPL source.
+Cargo fetches every git dependency in `Cargo.lock`.
+That fetch includes optional dependencies.
+Public CI does not build AGPL code.
+Public CI does not link AGPL code.
+A release build does not contain AGPL code.
+An OS zip does not contain AGPL code.
+
+Issue #77 moves code that links an AGPL library into an AGPL-licensed crate folder in this repo.
+The root `LICENSE` stays MIT.
+After that move, MIT crates do not depend on those AGPL crates.
