@@ -6600,6 +6600,37 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_send_clears_the_sending_line() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.selected_protocol = ProtocolId::Slack;
+        snapshot.selected_conversation = Some("slack:C1".into());
+        snapshot.history_loading.clear();
+        let before = snapshot.status_text.clone();
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            });
+        let request = request.expect("send");
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+            request,
+        });
+        assert_ne!(snapshot.status_line(), SENDING_STATUS);
+        assert_eq!(snapshot.status_text, before);
+    }
+
+    #[test]
     fn send_answers_work_per_protocol() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
