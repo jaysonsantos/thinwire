@@ -1835,3 +1835,12 @@ async fn missing_client_credentials_or_browser_fail_without_waiting() {
         Some(AccountState::Unlinked)
     );
 }
+
+/// The workspace inbox follows the adapter contract of the shell (ADR 0010).
+#[tokio::test]
+async fn the_workspace_inbox_follows_the_adapter_contract() {
+    let h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    let mut kit = crate::contract::Contract::new(Box::new(h.adapter));
+    kit.linked().await;
+    kit.run_all().await;
+}
