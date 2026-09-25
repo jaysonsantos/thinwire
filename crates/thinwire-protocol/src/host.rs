@@ -204,6 +204,15 @@ fn dispatch(
         adapter.shutdown(events);
         return;
     }
+    // The viewed chat is a hint to the adapter, not a request: route it to
+    // the trait method, so an adapter with no read state needs no arm.
+    if let AdapterCommand::ViewChat {
+        conversation_id, ..
+    } = &command
+    {
+        adapter.view_chat(conversation_id.as_deref(), events);
+        return;
+    }
     let auth_epoch = match command {
         AdapterCommand::TelegramAuth { epoch, .. } => Some(epoch),
         _ => None,
@@ -363,5 +372,26 @@ mod tests {
             rx.try_recv().expect("step"),
             AdapterCommand::TelegramAuth { epoch: 1, .. }
         ));
+    }
+
+    #[test]
+    fn view_chat_reaches_the_default_method_and_emits_nothing() {
+        let mut adapters: Vec<Box<dyn ProtocolAdapter>> =
+            vec![Box::new(crate::FakeAdapter::default())];
+        let (tx, mut rx) = unbounded_channel();
+        for conversation_id in [Some("telegram:1".to_owned()), None] {
+            dispatch(
+                &mut adapters,
+                AdapterCommand::ViewChat {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id,
+                },
+                &tx,
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no status, no error for a viewed-chat hint"
+        );
     }
 }

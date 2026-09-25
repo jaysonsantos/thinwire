@@ -826,13 +826,13 @@ mod tests {
             got.push(command);
         }
         if cfg!(feature = "whatsapp-web") {
-            assert_eq!(
-                got,
-                vec![
+            assert!(matches!(
+                got.as_slice(),
+                [
                     AdapterCommand::WhatsAppAcknowledgeRisk,
-                    AdapterCommand::WhatsAppBeginLink
+                    AdapterCommand::WhatsAppBeginLink { .. }
                 ]
-            );
+            ));
         } else {
             assert!(got.is_empty(), "feature off: WhatsApp intents do nothing");
         }

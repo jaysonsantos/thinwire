@@ -33,6 +33,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     detail: CAPABILITY_DETAIL,
     official_api: false,
     allows_user_account_automation: false,
+    sends_text: false,
 };
 
 const RISK_GATE_REQUIRED: &str =
@@ -134,6 +135,7 @@ impl WhatsAppAdapter {
                 order: 0,
                 last_at: 0,
                 is_group: false,
+                writable: false,
             },
         );
         emit_message(
@@ -162,7 +164,7 @@ impl WhatsAppAdapter {
         Ok(())
     }
 
-    fn begin_link(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+    fn begin_link(&mut self, link_id: u64, events: &EventTx) -> Result<(), AdapterError> {
         if !self.risk_acknowledged {
             return Err(AdapterError::Refused {
                 protocol: ProtocolId::WhatsApp,
@@ -171,7 +173,7 @@ impl WhatsAppAdapter {
         }
         #[cfg(not(feature = "whatsapp-web"))]
         {
-            let _ = events;
+            let _ = (events, link_id);
             Err(AdapterError::Unavailable {
                 protocol: ProtocolId::WhatsApp,
                 reason: FEATURE_OFF,
@@ -185,7 +187,7 @@ impl WhatsAppAdapter {
             let phone = self.phone.phone();
             let task_events = events.clone();
             tokio::spawn(async move {
-                live::run_link(link, token, phone, task_events).await;
+                live::run_link(link, token, link_id, phone, task_events).await;
             });
             emit_status(
                 events,
@@ -271,7 +273,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
             }
             | AdapterCommand::WhatsAppCancelLink => self.cancel_link(events),
             AdapterCommand::WhatsAppAcknowledgeRisk => self.acknowledge(events),
-            AdapterCommand::WhatsAppBeginLink => self.begin_link(events),
+            AdapterCommand::WhatsAppBeginLink { generation } => self.begin_link(generation, events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::WhatsApp,
                 reason: "command is not handled by the WhatsApp adapter",
@@ -394,7 +396,7 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let mut adapter = WhatsAppAdapter::new(phone);
         let error = adapter
-            .handle(AdapterCommand::WhatsAppBeginLink, &tx)
+            .handle(AdapterCommand::WhatsAppBeginLink { generation: 1 }, &tx)
             .expect_err("gate");
         assert!(matches!(error, AdapterError::Refused { .. }));
         let debug = format!("{error:?} {:?}", drain(&mut rx));
@@ -433,7 +435,7 @@ mod tests {
             .handle(AdapterCommand::WhatsAppAcknowledgeRisk, &tx)
             .expect("ack");
         let error = adapter
-            .handle(AdapterCommand::WhatsAppBeginLink, &tx)
+            .handle(AdapterCommand::WhatsAppBeginLink { generation: 1 }, &tx)
             .expect_err("feature off");
         assert!(matches!(error, AdapterError::Unavailable { .. }));
         let events = drain(&mut rx);
@@ -468,8 +470,8 @@ mod tests {
     #[test]
     fn commands_carry_no_pairing_material() {
         assert_eq!(
-            format!("{:?}", AdapterCommand::WhatsAppBeginLink),
-            "WhatsAppBeginLink"
+            format!("{:?}", AdapterCommand::WhatsAppBeginLink { generation: 1 }),
+            "WhatsAppBeginLink { generation: 1 }"
         );
         assert_eq!(
             format!("{:?}", AdapterCommand::WhatsAppAcknowledgeRisk),

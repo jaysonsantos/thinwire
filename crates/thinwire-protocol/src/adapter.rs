@@ -74,6 +74,22 @@ pub struct ProtocolCapabilities {
     pub detail: &'static str,
     pub official_api: bool,
     pub allows_user_account_automation: bool,
+    /// The shell may offer Send for this protocol. A chat can still be
+    /// read-only (`Conversation::writable`).
+    pub sends_text: bool,
+}
+
+/// Link state of the account of one protocol. Only
+/// [`AdapterEvent::Account`] changes it; a `Status` never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccountState {
+    /// No account, or the account ended. The shell shows no rows for it.
+    #[default]
+    Unlinked,
+    /// A login or pairing runs. Not usable yet.
+    Linking,
+    /// Signed in. The shell shows its chats.
+    Linked,
 }
 
 /// Live adapter state reported to the UI over the event channel.
@@ -240,11 +256,21 @@ pub enum AdapterCommand {
         conversation_id: String,
         before_message_id: String,
     },
-    /// Send a failed outgoing message again. Ids are not secrets.
+    /// Send a failed outgoing message again. Ids are not secrets. `request`
+    /// is a local id: the adapter answers `SendAccepted` or `SendRejected`
+    /// with it, as for `SendText`.
     ResendMessage {
         protocol: ProtocolId,
         conversation_id: String,
         message_id: String,
+        request: u64,
+    },
+    /// The chat the user now looks at in this protocol. `None`: the user left
+    /// every chat of this protocol. Not a load request (`OpenChat` is). The
+    /// host routes it to [`ProtocolAdapter::view_chat`].
+    ViewChat {
+        protocol: ProtocolId,
+        conversation_id: Option<String>,
     },
     /// Send plain text. The body is the user's message, never a credential.
     /// `request` is a local id; a rejection names it in `SendRejected`.
@@ -258,8 +284,12 @@ pub enum AdapterCommand {
     /// Carries no secrets and does not open a network session.
     WhatsAppAcknowledgeRisk,
     /// Asks the worker to start experimental linked-device pairing.
-    /// Phone digits, if any, stay in the memory vault. This variant has no fields.
-    WhatsAppBeginLink,
+    /// Phone digits, if any, stay in the memory vault. `generation` is the
+    /// shell's id for this pairing: every QR and pair-code event of it
+    /// carries the same number. It is not a secret.
+    WhatsAppBeginLink {
+        generation: u64,
+    },
     /// Stops experimental pairing and clears the in-memory risk acknowledgement.
     WhatsAppCancelLink,
 }
@@ -275,12 +305,13 @@ impl AdapterCommand {
             | Self::Shutdown { protocol }
             | Self::LoadOlderMessages { protocol, .. }
             | Self::SendText { protocol, .. }
-            | Self::ResendMessage { protocol, .. } => protocol,
+            | Self::ResendMessage { protocol, .. }
+            | Self::ViewChat { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
-            Self::WhatsAppAcknowledgeRisk | Self::WhatsAppBeginLink | Self::WhatsAppCancelLink => {
-                ProtocolId::WhatsApp
-            }
+            Self::WhatsAppAcknowledgeRisk
+            | Self::WhatsAppBeginLink { .. }
+            | Self::WhatsAppCancelLink => ProtocolId::WhatsApp,
         }
     }
 }
@@ -373,6 +404,27 @@ pub enum AdapterEvent {
     /// Every client of this protocol closed after `Shutdown`. The app may exit.
     Stopped {
         protocol: ProtocolId,
+    },
+    /// New link state of this protocol's account. The only event that
+    /// changes it: a `Status` (also `Error`) never unlinks.
+    Account {
+        protocol: ProtocolId,
+        state: AccountState,
+    },
+    /// One command failed; the session is still up. The shell stops that
+    /// command's spinner and shows the error. It never ends a send (only
+    /// `SendRejected` does) and never changes the link state.
+    CommandFailed {
+        protocol: ProtocolId,
+        /// The chat of the command, if it had one.
+        conversation_id: Option<String>,
+        detail: String,
+    },
+    /// Information for the user, for example "the bot cannot read this
+    /// channel". Shown as a note. Never a refusal, never an error.
+    Notice {
+        protocol: ProtocolId,
+        text: String,
     },
     /// New delivery state for a message already in the thread.
     MessageDelivery {
@@ -487,6 +539,8 @@ pub struct Conversation {
     pub last_at: i64,
     /// Group chat: the thread names each run of senders.
     pub is_group: bool,
+    /// The account may post in this chat. A read-only channel is `false`.
+    pub writable: bool,
 }
 
 /// Delivery of an outgoing message. Incoming messages are always `Sent`.
@@ -553,6 +607,13 @@ pub trait ProtocolAdapter: Send {
     /// once. The default is for an adapter with nothing running.
     fn shutdown(&mut self, events: &EventTx) {
         emit_stopped(events, self.id());
+    }
+
+    /// The user now looks at this chat (`None`: left every chat of this
+    /// protocol). Default: ignore. An adapter that tracks read state or
+    /// unread counts overrides it.
+    fn view_chat(&mut self, conversation_id: Option<&str>, events: &EventTx) {
+        let _ = (conversation_id, events);
     }
 }
 
@@ -687,6 +748,10 @@ pub(crate) fn emit_send_rejected(
         conversation_id: conversation_id.into(),
         request,
     });
+}
+
+pub(crate) fn emit_account(events: &EventTx, protocol: ProtocolId, state: AccountState) {
+    let _ = events.send(AdapterEvent::Account { protocol, state });
 }
 
 pub(crate) fn emit_stopped(events: &EventTx, protocol: ProtocolId) {

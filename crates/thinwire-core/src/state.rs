@@ -606,6 +606,10 @@ impl Snapshot {
             AdapterEvent::Stopped { protocol } => {
                 self.stopped.insert(protocol);
             }
+            // The shell rules for these land in the next commits.
+            AdapterEvent::Account { .. }
+            | AdapterEvent::CommandFailed { .. }
+            | AdapterEvent::Notice { .. } => {}
             // Internal: the host unwraps stamped login events in poll_events.
             AdapterEvent::Login { .. } => {}
             AdapterEvent::OlderHistoryLoaded {
@@ -961,10 +965,13 @@ impl Snapshot {
         }
         self.error = None;
         self.status_text = "Sending…".into();
+        let request = self.next_send_request;
+        self.next_send_request += 1;
         self.pending.push(AdapterCommand::ResendMessage {
             protocol,
             conversation_id,
             message_id: message_id.to_string(),
+            request,
         });
     }
 
@@ -2015,7 +2022,10 @@ impl Snapshot {
         self.whatsapp_started = true;
         self.error = None;
         self.status_text = "WhatsApp pairing requested.".into();
-        self.pending.push(AdapterCommand::WhatsAppBeginLink);
+        let generation = self.next_send_request;
+        self.next_send_request += 1;
+        self.pending
+            .push(AdapterCommand::WhatsAppBeginLink { generation });
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -2114,6 +2124,7 @@ pub mod test_support {
             order,
             last_at: 0,
             is_group: false,
+            writable: true,
         }
     }
 
@@ -2926,7 +2937,7 @@ mod tests {
         assert_eq!(commands.len(), 1, "{commands:?}");
         assert!(matches!(
             &commands[0],
-            AdapterCommand::ResendMessage { protocol: ProtocolId::Telegram, conversation_id, message_id }
+            AdapterCommand::ResendMessage { protocol: ProtocolId::Telegram, conversation_id, message_id, .. }
                 if conversation_id == "telegram:1" && message_id == "telegram:1:101"
         ));
         assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
@@ -3529,6 +3540,7 @@ mod tests {
                 order: 0,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         };
         // A row before Ready is from a cancelled or ended client: dropped.
@@ -3995,6 +4007,7 @@ mod tests {
             order: 0,
             last_at: 0,
             is_group: false,
+            writable: true,
         }
     }
 
@@ -4146,6 +4159,7 @@ mod tests {
                 order: 0,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         });
         snapshot
@@ -4183,7 +4197,7 @@ mod tests {
             !snapshot
                 .take_commands()
                 .iter()
-                .any(|command| matches!(command, AdapterCommand::WhatsAppBeginLink))
+                .any(|command| matches!(command, AdapterCommand::WhatsAppBeginLink { .. }))
         );
     }
 
@@ -4248,7 +4262,11 @@ mod tests {
         let debug = format!("{commands:?}");
         assert!(!debug.contains("15559876"));
         assert!(commands.contains(&AdapterCommand::WhatsAppAcknowledgeRisk));
-        assert!(commands.contains(&AdapterCommand::WhatsAppBeginLink));
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::WhatsAppBeginLink { .. }))
+        );
         snapshot.apply(AdapterEvent::WhatsAppQr {
             code: thinwire_protocol::RedactedPairingSecret::new("second-secret"),
             generation: 1,
@@ -4333,6 +4351,7 @@ mod tests {
                 order: 10,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         });
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -4346,6 +4365,7 @@ mod tests {
                 order: 90,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         });
         let ids: Vec<_> = snapshot
@@ -4505,6 +4525,7 @@ mod tests {
                 order: 5,
                 last_at: 0,
                 is_group: false,
+                writable: true,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -4711,13 +4732,13 @@ mod tests {
         assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
         snapshot.begin_whatsapp_link(&phone);
         assert!(snapshot.whatsapp_started);
-        assert_eq!(
-            snapshot.take_commands(),
-            vec![
+        assert!(matches!(
+            snapshot.take_commands().as_slice(),
+            [
                 AdapterCommand::WhatsAppAcknowledgeRisk,
-                AdapterCommand::WhatsAppBeginLink
+                AdapterCommand::WhatsAppBeginLink { .. }
             ]
-        );
+        ));
 
         // Cancel drops the acknowledgement: a new link needs the gate again.
         snapshot.cancel_whatsapp_link(&phone);

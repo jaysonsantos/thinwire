@@ -16,6 +16,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     detail: "In-process test double. Pushes channel events only.",
     official_api: true,
     allows_user_account_automation: false,
+    sends_text: true,
 };
 
 /// Worker-side fake. Deliberately has no egui/eframe imports.
@@ -72,6 +73,7 @@ impl ProtocolAdapter for FakeAdapter {
                         order: 0,
                         last_at: FAKE_SENT_AT,
                         is_group: false,
+                        writable: true,
                     },
                 );
                 emit_message(

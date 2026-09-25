@@ -12,8 +12,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use super::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, DiscordAuthMode, EventTx, ProtocolAdapter,
-    ProtocolCapabilities, ProtocolId, SupportClass, emit_status,
+    AccountState, AdapterCommand, AdapterError, AdapterStatus, DiscordAuthMode, EventTx,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_account, emit_status,
 };
 #[cfg(feature = "discord-bot")]
 use super::adapter::{ChatMessage, Conversation, Delivery, emit_conversation, emit_message};
@@ -49,6 +49,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     detail: CAPABILITY_DETAIL,
     official_api: true,
     allows_user_account_automation: false,
+    sends_text: false,
 };
 
 #[cfg(feature = "discord-bot")]
@@ -206,6 +207,13 @@ impl DiscordAdapter {
             "Discord bot inbox placeholder. {token_state}. Gateway is not started. Not a personal Discord client."
         );
         emit_status(events, ProtocolId::Discord, AdapterStatus::Stubbed, detail);
+        // Only this event links the account (the shell no longer reads the
+        // detail text). A missing token keeps it unlinked.
+        let state = match gate {
+            TokenGate::Missing => AccountState::Unlinked,
+            TokenGate::Accepted => AccountState::Linked,
+        };
+        emit_account(events, ProtocolId::Discord, state);
         emit_conversation(
             events,
             Conversation {
@@ -218,6 +226,7 @@ impl DiscordAdapter {
                 order: 0,
                 last_at: 0,
                 is_group: false,
+                writable: false,
             },
         );
         emit_message(
@@ -266,6 +275,7 @@ impl ProtocolAdapter for DiscordAdapter {
                 AdapterStatus::Refused,
                 error.to_string(),
             );
+            emit_account(&events, ProtocolId::Discord, AccountState::Unlinked);
         }
     }
 
@@ -290,6 +300,7 @@ impl ProtocolAdapter for DiscordAdapter {
                     NOT_READY_DETAIL
                 };
                 emit_status(events, ProtocolId::Discord, AdapterStatus::Stubbed, detail);
+                emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
                 Ok(())
             }
             _ => Err(AdapterError::Unavailable {
