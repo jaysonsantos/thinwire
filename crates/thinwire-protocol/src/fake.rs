@@ -1,9 +1,9 @@
 //! Test double used to prove workers push events without calling UI APIs.
 
 use super::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
-    emit_message, emit_status,
+    AccountState, AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery,
+    EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_account,
+    emit_conversation, emit_message, emit_status,
 };
 
 /// Fixed send time for fake messages: 2026-01-02 03:04:05 UTC.
@@ -54,6 +54,9 @@ impl ProtocolAdapter for FakeAdapter {
             AdapterStatus::Ready,
             "fake adapter ready",
         );
+        // The shell drops inbox events of an unlinked protocol (ADR 0010):
+        // link before the first row, so tests and examples can seed a view.
+        emit_account(&events, ProtocolId::Telegram, AccountState::Linked);
     }
 
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
@@ -100,6 +103,7 @@ impl ProtocolAdapter for FakeAdapter {
                     AdapterStatus::Stubbed,
                     "fake adapter disconnected",
                 );
+                emit_account(events, ProtocolId::Telegram, AccountState::Unlinked);
                 Ok(())
             }
             _ => Err(AdapterError::Unavailable {

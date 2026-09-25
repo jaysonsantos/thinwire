@@ -43,6 +43,9 @@ Protocol agents also add their state fields to `Snapshot`. `View` shows them wit
 The shell treats every protocol the same. Only the Telegram login and the first-run screen are Telegram-specific. An adapter follows these rules:
 
 1. Send `AdapterEvent::Account { Linked }` before the first inbox event. Send `Account { Unlinked }` when the session ends (logout, revoke, ban). Only this event changes the link state. The shell drops inbox events of an unlinked protocol.
+    - `Linking` after `Linked` is a reconnect. The session stays: rows, drafts, and open sends and retries. Inbox events and send answers still apply. New commands (open chat, Send, Retry, Refresh) wait for `Linked`.
+    - `Linking` with no session before is a first login. The shell drops inbox events until `Linked`.
+    - `Unlinked` from any other state ends the session. The shell drops that protocol's rows, messages, drafts, spinners, notes, and sends.
 2. Use `Status` for the session status line only. A `Status { Error }` never unlinks and never hides the inbox.
 3. Set `ProtocolCapabilities::sends_text` and `Conversation::writable`. The shell offers Send only for a linked protocol that sends text, in a writable chat.
 4. Answer each `SendText` and `ResendMessage` with `SendAccepted` or `SendRejected` for its `request`. Nothing else ends a send or a retry. Answer with `SendRejected` also after a reconnect that lost the request.
