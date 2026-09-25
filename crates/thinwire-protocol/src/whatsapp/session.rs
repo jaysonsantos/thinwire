@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::inbox::{HistoryChat, Inbox, WaMessage};
 use crate::adapter::{
-    AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret, emit_status,
+    AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret,
+    emit_status,
 };
 
 pub(super) const PAIRED: &str =
@@ -256,17 +257,20 @@ impl Session {
             LinkEvent::Connected => {
                 state.connected = true;
                 status(events, AdapterStatus::Ready, CONNECTED);
-                let mut out = vec![AdapterEvent::ConversationRemoved {
+                // ADR 0010 rule 1: Linked comes before the first inbox event.
+                let mut out = vec![account(AccountState::Linked)];
+                out.push(AdapterEvent::ConversationRemoved {
                     protocol: ProtocolId::WhatsApp,
                     id: super::PLACEHOLDER_ID.into(),
-                }];
+                });
                 out.extend(state.inbox.chat_page());
                 out
             }
             LinkEvent::Disconnected => {
                 state.connected = false;
                 status(events, AdapterStatus::Connecting, DISCONNECTED);
-                Vec::new()
+                // A reconnect: the shell keeps the session and its rows.
+                vec![account(AccountState::Linking)]
             }
             LinkEvent::LoggedOut => {
                 let removed = Self::reset_state(&mut state);
@@ -283,9 +287,12 @@ impl Session {
             }
             LinkEvent::Messages(messages) => state.inbox.apply_messages(messages),
         };
+        let mut out = out;
         if let Some(detail) = stop {
             state.connected = false;
             state.stopped = Some(detail);
+            // Logout, ban, or a dead pairing ends the session.
+            out.push(account(AccountState::Unlinked));
         }
         for event in out {
             let _ = events.send(event);
@@ -315,6 +322,7 @@ impl Session {
                 let mut out = state.inbox.fail_send(jid, pending);
                 if failure == SendFailure::Unlinked {
                     out.extend(Self::reset_state(&mut state));
+                    out.push(account(AccountState::Unlinked));
                 }
                 out
             }
@@ -322,6 +330,15 @@ impl Session {
         for event in out {
             let _ = events.send(event);
         }
+    }
+}
+
+/// The link state of the WhatsApp account. Only this event changes it in the
+/// shell (ADR 0010 rule 1); a `Status` never does.
+pub(super) const fn account(state: AccountState) -> AdapterEvent {
+    AdapterEvent::Account {
+        protocol: ProtocolId::WhatsApp,
+        state,
     }
 }
 

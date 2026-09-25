@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::session::{LinkEvent, Session, WhatsAppSender};
-use crate::adapter::{AdapterStatus, EventTx, ProtocolId, emit_status};
+use super::session::{LinkEvent, Session, WhatsAppSender, account};
+use crate::adapter::{AccountState, AdapterStatus, EventTx, ProtocolId, emit_status};
 
 /// Longest wait of [`LinkHandle::shutdown`]. Below the 5 s close limit of
 /// the app, so `Stopped` still fits (#44).
@@ -224,6 +224,8 @@ impl<B: LinkBackend> Owner<B> {
             self.backend.stop(bot).await;
         }
         self.session.begin(generation);
+        // A first login: the shell drops inbox events until Linked.
+        let _ = self.events.send(account(AccountState::Linking));
         if self.stale {
             if self.backend.delete_store().await.is_err() {
                 // The revoked store is still there. Do not open it; the next
@@ -283,6 +285,7 @@ impl<B: LinkBackend> Owner<B> {
     fn fail(&self, error: StartError) {
         self.active.store(false, Ordering::SeqCst);
         self.status(AdapterStatus::Error, error.detail());
+        let _ = self.events.send(account(AccountState::Unlinked));
     }
 
     fn status(&self, status: AdapterStatus, detail: &str) {
@@ -423,6 +426,14 @@ mod tests {
                 ..
             }
         )));
+        assert_eq!(
+            events.first(),
+            Some(&AdapterEvent::Account {
+                protocol: ProtocolId::WhatsApp,
+                state: AccountState::Linking,
+            }),
+            "a pairing is Linking until the client connects"
+        );
         assert!(handle.is_active());
     }
 
@@ -544,10 +555,20 @@ mod tests {
             });
             handle.begin(None);
             handle.flush().await;
-            assert!(drain(&mut rx).iter().any(|event| matches!(
+            let events = drain(&mut rx);
+            assert!(events.iter().any(|event| matches!(
                 event,
                 AdapterEvent::Status { status: AdapterStatus::Error, detail: text, .. } if text == detail
             )));
+            // A failed start ends the pairing: Linking, then Unlinked.
+            let states: Vec<AccountState> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AdapterEvent::Account { state, .. } => Some(*state),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(states, vec![AccountState::Linking, AccountState::Unlinked]);
             assert!(!handle.is_active());
             // A late callback of the failed start does nothing.
             fake.callback(1).send(LinkEvent::Connected);

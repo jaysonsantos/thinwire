@@ -15,8 +15,8 @@ mod live;
 use std::sync::Arc;
 
 use super::adapter::{
-    AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
+    AccountState, AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery,
+    EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_conversation,
     emit_history_loaded, emit_message, emit_older_history_loaded, emit_send_accepted,
     emit_send_rejected, emit_status,
 };
@@ -218,6 +218,7 @@ impl WhatsAppAdapter {
         for event in self.session.reset() {
             let _ = events.send(event);
         }
+        let _ = events.send(session::account(AccountState::Unlinked));
         emit_status(
             events,
             ProtocolId::WhatsApp,
@@ -237,6 +238,7 @@ impl WhatsAppAdapter {
                 AdapterStatus::Ready,
                 session::CONNECTED,
             );
+            let _ = events.send(session::account(AccountState::Linked));
             self.load_chats(events);
             return;
         }
@@ -1264,11 +1266,15 @@ mod tests {
         let events = drain(&mut rx);
         let details: Vec<&str> = events
             .iter()
-            .map(|event| match event {
+            .filter_map(|event| match event {
                 AdapterEvent::Status { status, detail, .. } => {
                     assert_eq!(*status, AdapterStatus::Error);
-                    detail.as_str()
+                    Some(detail.as_str())
                 }
+                AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                } => None,
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
@@ -1281,6 +1287,72 @@ mod tests {
             ]
         );
         assert!(!adapter.session.is_connected());
+    }
+
+    fn accounts(events: &[AdapterEvent]) -> Vec<AccountState> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Account { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// ADR 0010 rule 1: Linked before the first inbox event, Linking on a
+    /// reconnect, Unlinked when the session ends.
+    #[tokio::test]
+    async fn account_events_follow_the_link_state() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut adapter = with_sender(Arc::new(FakeSender::default()));
+        adapter.session.apply(history(), 1, &tx);
+        drain(&mut rx);
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        let events = drain(&mut rx);
+        let linked = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Linked,
+                        ..
+                    }
+                )
+            })
+            .expect("Linked");
+        let first_row = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::ConversationUpsert { .. }))
+            .expect("rows");
+        assert!(linked < first_row, "Linked comes before the inbox rows");
+
+        adapter.session.apply(LinkEvent::Disconnected, 1, &tx);
+        assert_eq!(accounts(&drain(&mut rx)), vec![AccountState::Linking]);
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        assert_eq!(accounts(&drain(&mut rx)), vec![AccountState::Linked]);
+
+        // Refresh while linked repeats Linked.
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::WhatsApp,
+                },
+                &tx,
+            )
+            .expect("connect");
+        assert_eq!(accounts(&drain(&mut rx)), vec![AccountState::Linked]);
+
+        adapter
+            .handle(AdapterCommand::WhatsAppCancelLink, &tx)
+            .expect("cancel");
+        assert_eq!(accounts(&drain(&mut rx)), vec![AccountState::Unlinked]);
+
+        for event in [LinkEvent::LoggedOut, LinkEvent::TemporaryBan] {
+            let (adapter, mut rx, tx) = connected(Arc::new(FakeSender::default()));
+            adapter.session.apply(event, 1, &tx);
+            assert_eq!(accounts(&drain(&mut rx)), vec![AccountState::Unlinked]);
+        }
     }
 
     #[test]
