@@ -26,6 +26,8 @@ signal-local = [
   "thinwire-signal/signal-local",
   "thinwire-core/signal-local",
 ]
+# Pixel snapshots. Off in the default test job. The ui-snapshots CI job turns it on.
+ui-snapshots = ["egui_kittest/snapshot", "egui_kittest/wgpu"]
 
 [dependencies]
 chrono.workspace = true

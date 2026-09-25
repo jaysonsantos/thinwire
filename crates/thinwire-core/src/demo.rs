@@ -10,8 +10,8 @@
 //!
 //! - Invented names and texts only. No real chat, account, or secret.
 //! - No network, no OS keychain, no settings file.
-//! - Fixed UTC times. The day breaks and the clock times depend on the
-//!   local time zone, so a snapshot run sets `TZ=UTC`.
+//! - Fixed UTC times. `Clock::fixed_utc` formats day breaks, so the
+//!   process time zone does not change a screen.
 
 use std::sync::Arc;
 use std::time::Duration;
