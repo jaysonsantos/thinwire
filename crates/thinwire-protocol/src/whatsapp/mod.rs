@@ -377,11 +377,15 @@ impl WhatsAppAdapter {
     /// request always ends with `OlderHistoryLoaded`, never with an error:
     /// an adapter error would mark the account Error and hide the inbox.
     fn load_older(&self, conversation_id: &str, before: &str, events: &EventTx) {
+        // The retained history stays in memory while the link reconnects, so
+        // an offline page still answers with real rows and a real `more`.
+        // `more == false` never comes from a short drop (Codex r4103931208).
+        // After a logout the inbox is empty: an unknown chat ends paging.
         let (page, more) = match inbox::parse_conversation_id(conversation_id) {
-            Some(jid) if self.session.is_connected() => self
+            Some(jid) => self
                 .session
                 .with_inbox(|inbox| inbox.older_page(jid, before, inbox::OPEN_CHAT_MESSAGES)),
-            _ => (Vec::new(), false),
+            None => (Vec::new(), false),
         };
         for event in page {
             let _ = events.send(event);
@@ -1739,7 +1743,7 @@ mod tests {
             Some(AdapterEvent::OlderHistoryLoaded { more: false, .. })
         ));
 
-        // Unknown id and offline: no rows, no error, `more == false`.
+        // An unknown id: no rows, no error, `more == false`.
         older(&mut adapter, "nope");
         assert_eq!(
             drain(&mut rx),
@@ -1751,12 +1755,32 @@ mod tests {
                 note: None,
             }]
         );
+        // Codex r4103931208: a short drop does not end paging. The retained
+        // rows still page, with the real `more`.
         adapter.session.apply(LinkEvent::Disconnected, 1, &tx);
         drain(&mut rx);
         older(&mut adapter, "m070");
         let events = drain(&mut rx);
-        assert_eq!(events.len(), 1);
+        let rows = events
+            .iter()
+            .filter(|event| matches!(event, AdapterEvent::MessageReceived { .. }))
+            .count();
+        assert_eq!(rows, inbox::OPEN_CHAT_MESSAGES);
+        assert!(matches!(
+            events.last(),
+            Some(AdapterEvent::OlderHistoryLoaded { more: true, .. })
+        ));
         assert!(statuses(&events).is_empty());
+
+        // After a logout the inbox is empty: paging ends.
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        adapter.session.apply(LinkEvent::LoggedOut, 1, &tx);
+        drain(&mut rx);
+        older(&mut adapter, "m070");
+        assert!(matches!(
+            drain(&mut rx).last(),
+            Some(AdapterEvent::OlderHistoryLoaded { more: false, .. })
+        ));
     }
 
     /// ADR 0010 rule 7: ViewChat marks the viewed chat read, and leaving it
