@@ -100,6 +100,16 @@ impl DemoScript {
         }
     }
 
+    /// A protocol with no account and no start event. It still answers
+    /// `Shutdown`, so a frontend that waits for every adapter to stop does
+    /// not wait for its timeout (PR #122 review).
+    #[must_use]
+    pub fn silent(caps: ProtocolCapabilities, now: i64) -> Self {
+        let mut script = Self::unlinked(caps, now);
+        script.start.clear();
+        script
+    }
+
     /// A protocol with no account: it only reports that it is not set up.
     #[must_use]
     pub fn unlinked(caps: ProtocolCapabilities, now: i64) -> Self {

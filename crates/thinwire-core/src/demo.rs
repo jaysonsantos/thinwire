@@ -246,6 +246,13 @@ impl Scenario {
             }
         }
         setup.scripts.insert(0, telegram);
+        // Every catalog protocol has an adapter, so Shutdown gets a Stopped
+        // from each one (PR #122 review).
+        for caps in thinwire_protocol::catalog() {
+            if !setup.scripts.iter().any(|script| script.caps.id == caps.id) {
+                setup.scripts.push(DemoScript::silent(caps, NOW));
+            }
+        }
         setup
     }
 }
@@ -541,6 +548,21 @@ mod tests {
         assert_eq!(names.len(), Scenario::ALL.len());
         for scenario in Scenario::ALL {
             assert_eq!(Scenario::from_name(scenario.name()), Some(scenario));
+        }
+    }
+
+    /// PR #122 review: every catalog protocol has a demo adapter, so a
+    /// frontend that waits for all adapters to stop does not time out.
+    #[test]
+    fn a_demo_core_stops_every_adapter() {
+        let runtime = runtime();
+        for scenario in [Scenario::FirstRun, Scenario::SeveralProtocols] {
+            let mut core = scenario.build(runtime.handle());
+            assert!(
+                core.block_until_stopped(Duration::from_secs(2)),
+                "{}: every adapter stops",
+                scenario.name()
+            );
         }
     }
 

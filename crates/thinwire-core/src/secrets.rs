@@ -364,8 +364,11 @@ impl SecretStore {
 
     /// `ReadFailed` → `Attaching`, under the lock, before any worker runs.
     fn leave_read_failed(&self) {
+        // A demo store never reads the OS keychain, so it stays ReadFailed:
+        // Try again shows again, not an endless wait (PR #122 review).
         if let Ok(mut inner) = self.lock()
             && inner.phase == AttachPhase::ReadFailed
+            && !inner.no_os
         {
             inner.phase = AttachPhase::Attaching;
         }
@@ -1968,6 +1971,27 @@ mod tests {
         store.leave_read_failed();
         assert!(!store.read_failed(), "a new watch does not stop at once");
         assert!(!store.attach_settled());
+        assert_eq!(store.persistence(), Persistence::Loading);
+    }
+}
+
+#[cfg(test)]
+mod demo_store_tests {
+    use super::*;
+
+    /// PR #122 review: Try again on the demo store reads nothing and keeps
+    /// the store in `ReadFailed`, so the screen offers Try again again.
+    #[test]
+    fn a_retry_keeps_the_demo_store_read_failed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store = Arc::new(SecretStore::demo_read_failed());
+        assert!(store.read_failed());
+        store.spawn_os_retry(runtime.handle());
+        runtime.block_on(tokio::task::yield_now());
+        assert!(store.read_failed(), "still ReadFailed after Try again");
         assert_eq!(store.persistence(), Persistence::Loading);
     }
 }
