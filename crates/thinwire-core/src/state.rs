@@ -2562,9 +2562,13 @@ impl Snapshot {
                 .entry((message.protocol, message.conversation_id.clone()))
                 .or_insert_with(|| message.body.clone());
         }
+        let why = format!(
+            "{} did not accept the message.",
+            message.protocol.display_name()
+        );
         self.set_error(
             "Message not sent.",
-            "Telegram did not accept the message.",
+            &why,
             "Press Retry on the message, or edit the text and send it again.",
         );
     }
@@ -6004,6 +6008,37 @@ mod tests {
         let mut snapshot = Snapshot::new();
         snapshot.extra_visible.extend(protocols.iter().copied());
         snapshot
+    }
+
+    /// Codex r4103183222 on #53: a failed WhatsApp send names WhatsApp.
+    #[test]
+    fn failed_delivery_names_the_protocol_of_the_message() {
+        let mut snapshot = shell_with(&[ProtocolId::WhatsApp]);
+        link(&mut snapshot, ProtocolId::WhatsApp);
+        let id = "whatsapp:111@s.whatsapp.net";
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::WhatsApp, id, true),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::WhatsApp,
+                conversation_id: id.into(),
+                id: "pending:1".into(),
+                sender: "You".into(),
+                body: "hi".into(),
+                outbound: true,
+                delivery: Delivery::Pending,
+                sent_at: 1,
+            },
+        });
+        snapshot.apply(AdapterEvent::MessageDelivery {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: id.into(),
+            message_id: "pending:1".into(),
+            delivery: Delivery::Failed,
+        });
+        let error = snapshot.error.clone().expect("error block");
+        assert_eq!(error.why, "WhatsApp did not accept the message.");
     }
 
     fn link(snapshot: &mut Snapshot, protocol: ProtocolId) {
