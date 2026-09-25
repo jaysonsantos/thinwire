@@ -2696,6 +2696,11 @@ impl Snapshot {
         if !self.signal_linking_available() {
             return;
         }
+        if self.protocol_linked(ProtocolId::Signal) {
+            self.signal_screen = SignalScreen::Notice;
+            self.signal_qr = None;
+            return;
+        }
         if self.signal_started {
             self.pending.push(AdapterCommand::SignalCancelLink);
         }
@@ -2710,6 +2715,11 @@ impl Snapshot {
     /// this is Cancel: linking stops and the acknowledgement resets. From
     /// the notice alone it only hides the screen.
     pub fn close_signal_gate(&mut self) {
+        if self.protocol_linked(ProtocolId::Signal) {
+            self.signal_screen = SignalScreen::Hidden;
+            self.signal_qr = None;
+            return;
+        }
         if self.signal_screen == SignalScreen::Link
             || self.signal_notice_acknowledged
             || self.signal_started
@@ -4222,6 +4232,40 @@ mod tests {
             !snapshot
                 .take_commands()
                 .contains(&AdapterCommand::SignalCancelLink)
+        );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn reviewing_the_notice_keeps_a_linked_session() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.open_signal_notice();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Notice);
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::SignalCancelLink)
+        );
+        snapshot.close_signal_gate();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::SignalCancelLink)
+        );
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .any(|row| row.caps.id == ProtocolId::Signal && row.linked())
         );
     }
 
