@@ -435,12 +435,22 @@ fn tab_then_two_arrows_land_on_row_3_and_enter_opens_it() {
     for _ in 0..40 {
         harness.key_press(egui::Key::Tab);
         harness.step();
-        if harness.state().snapshot.focused_row.is_some() {
+        if harness.state().snapshot.focused_row.as_deref() == Some("telegram:1") {
             tabbed = true;
             break;
         }
     }
-    assert!(tabbed, "Tab reaches an inbox row");
+    assert!(tabbed, "Tab reaches Ada");
+    let ada = harness.get_by_role_and_label(egui::accesskit::Role::Button, "Ada");
+    assert!(
+        ada.accesskit_node().is_focused(),
+        "widget focus is on the Tab row"
+    );
+    assert_eq!(
+        harness.state().snapshot.focused_row.as_deref(),
+        Some("telegram:1"),
+        "the highlight is on the Tab row"
+    );
     harness.key_press(egui::Key::ArrowDown);
     harness.step();
     harness.key_press(egui::Key::ArrowDown);
