@@ -561,9 +561,7 @@ async fn apply_step(
     let login = LoginEvents::new(events, closing);
     match step {
         TelegramAuthStep::ApiCredentials => {
-            emit_status(
-                events,
-                ProtocolId::Telegram,
+            login.status(
                 AdapterStatus::Connecting,
                 "TDLib client started. Waiting for authorization state.",
             );
@@ -571,9 +569,7 @@ async fn apply_step(
         TelegramAuthStep::Phone => {
             let Some(phone) = secrets.get_secret(TelegramSecretKey::Phone) else {
                 login.phase(TelegramAuthPhase::Failed);
-                emit_status(
-                    events,
-                    ProtocolId::Telegram,
+                login.status(
                     AdapterStatus::Error,
                     "Phone number is missing from the secret store.",
                 );
@@ -583,9 +579,7 @@ async fn apply_step(
                 tdlib_rs::functions::set_authentication_phone_number(phone, None, client_id).await
             {
                 reject_step(&login, &error);
-                emit_status(
-                    events,
-                    ProtocolId::Telegram,
+                login.status(
                     AdapterStatus::Error,
                     "Telegram rejected the phone number. Check the number or Cancel.",
                 );
@@ -606,9 +600,7 @@ async fn apply_step(
         TelegramAuthStep::Code => {
             let Some(code) = secrets.get_secret(TelegramSecretKey::Code) else {
                 login.phase(TelegramAuthPhase::Failed);
-                emit_status(
-                    events,
-                    ProtocolId::Telegram,
+                login.status(
                     AdapterStatus::Error,
                     "Login code is missing from the secret store.",
                 );
@@ -618,9 +610,7 @@ async fn apply_step(
                 tdlib_rs::functions::check_authentication_code(code, client_id).await
             {
                 reject_step(&login, &error);
-                emit_status(
-                    events,
-                    ProtocolId::Telegram,
+                login.status(
                     AdapterStatus::Error,
                     "Telegram rejected the login code. Try again or Cancel.",
                 );
@@ -637,9 +627,7 @@ async fn apply_step(
                 tdlib_rs::functions::check_authentication_password(password, client_id).await
             {
                 reject_step(&login, &error);
-                emit_status(
-                    events,
-                    ProtocolId::Telegram,
+                login.status(
                     AdapterStatus::Error,
                     "Telegram rejected the 2FA password. Try again or Cancel.",
                 );
