@@ -2262,6 +2262,10 @@ impl Snapshot {
                 if protocol == ProtocolId::WhatsApp {
                     self.finish_whatsapp_link();
                 }
+                #[cfg(feature = "signal-local")]
+                if protocol == ProtocolId::Signal {
+                    self.finish_signal_link();
+                }
             }
             AccountState::Unlinked if had_session || before != AccountState::Unlinked => {
                 self.end_session(protocol);
@@ -2747,6 +2751,19 @@ impl Snapshot {
         self.error = None;
         self.status_text = "Signal linking requested.".into();
         self.pending.push(AdapterCommand::SignalBeginLink);
+    }
+
+    /// Leave the link screen after `Account { Linked }`. The worker stays up.
+    /// This does not send `SignalCancelLink`.
+    #[cfg(feature = "signal-local")]
+    pub fn finish_signal_link(&mut self) {
+        if self.signal_screen == SignalScreen::Hidden {
+            return;
+        }
+        self.signal_screen = SignalScreen::Hidden;
+        self.signal_qr = None;
+        self.status_text = "Signal is linked on this local build.".into();
+        self.select_protocol(ProtocolId::Signal);
     }
 
     #[cfg(feature = "signal-local")]
@@ -4172,6 +4189,36 @@ mod tests {
         assert_eq!(
             snapshot.shows_in_switcher(ProtocolId::Signal),
             cfg!(feature = "signal-local")
+        );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn linked_closes_the_signal_gate_without_cancelling_the_session() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Link);
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+        assert!(!snapshot.signal_gate_open());
+        assert!(snapshot.signal_qr.is_none());
+        assert_eq!(snapshot.selected_protocol, ProtocolId::Signal);
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .any(|row| row.caps.id == ProtocolId::Signal && row.linked())
+        );
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::SignalCancelLink)
         );
     }
 
