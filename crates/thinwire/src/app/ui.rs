@@ -551,8 +551,9 @@ fn inbox(
 
     let scroll_to_selected = hints.take_scroll_to_selected();
     let scroll_to_focused = hints.take_scroll_to_focused();
-    let keyboard = snapshot.focused_row.is_some();
+    let widget_focus = ui.ctx().memory(|memory| memory.focused());
     let mut clicked: Option<String> = None;
+    let mut focus_from_widget: Option<String> = None;
     for (id, title, preview, unread, time) in rows {
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
         let focused = snapshot.focused_row.as_deref() == Some(id.as_str());
@@ -565,19 +566,18 @@ fn inbox(
                 egui::StrokeKind::Inside,
             );
         }
+        // AccessKit `selected` is the open chat. The highlight is keyboard focus.
         response.widget_info(|| {
-            egui::WidgetInfo::selected(
-                egui::WidgetType::Button,
-                true,
-                if keyboard { focused } else { selected },
-                &title,
-            )
+            egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, &title)
         });
-        if selected && scroll_to_selected {
+        if row_scrolls(selected, focused, scroll_to_selected, scroll_to_focused) {
             response.scroll_to_me(None);
         }
         if focused && scroll_to_focused {
-            response.scroll_to_me(None);
+            response.request_focus();
+        }
+        if widget_focus == Some(response.id) && !focused {
+            focus_from_widget = Some(id.clone());
         }
         if response.clicked() {
             clicked = Some(id);
@@ -585,8 +585,19 @@ fn inbox(
     }
     if let Some(id) = clicked {
         out.push(Intent::SelectConversation { id });
+    } else if let Some(id) = focus_from_widget {
+        out.push(Intent::FocusInbox { id });
     }
     inbox_keys(ui, snapshot, inbox_list_id, out);
+}
+
+/// The highlight scroll wins when both requests exist. It is the Enter target.
+fn row_scrolls(selected: bool, focused: bool, scroll_selected: bool, scroll_focused: bool) -> bool {
+    if scroll_focused {
+        focused
+    } else {
+        selected && scroll_selected
+    }
 }
 
 /// Arrow keys move the highlight. Enter opens that chat.
@@ -625,11 +636,18 @@ fn inbox_keys(
             input.key_pressed(egui::Key::Enter),
         )
     });
+    let row_focused = ui
+        .ctx()
+        .memory(|memory| memory.focused().is_some_and(|id| row_ids.contains(&id)));
     if up {
         out.push(Intent::MoveInbox { delta: -1 });
     } else if down {
         out.push(Intent::MoveInbox { delta: 1 });
-    } else if enter && let Some(id) = snapshot.visible_focused_row() {
+    } else if enter
+        && !row_focused
+        && let Some(id) = snapshot.visible_focused_row()
+    {
+        // A focused row already emits one click for Enter. Do not send a second one.
         out.push(Intent::SelectConversation { id });
     }
 }
@@ -1385,7 +1403,15 @@ fn send_label(can_send: bool, palette: &theme::Palette) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{account_label, badge_text};
+    use super::{account_label, badge_text, row_scrolls};
+
+    #[test]
+    fn both_scroll_requests_scroll_the_highlight() {
+        assert!(row_scrolls(false, true, true, true));
+        assert!(!row_scrolls(true, false, true, true));
+        assert!(row_scrolls(true, false, true, false));
+        assert!(!row_scrolls(false, true, true, false));
+    }
     use thinwire_protocol::AdapterStatus;
 
     #[test]

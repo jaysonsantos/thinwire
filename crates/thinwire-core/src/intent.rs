@@ -21,6 +21,9 @@ pub enum Intent {
     /// Move the inbox highlight by `delta` rows. Down is positive.
     /// This does not open the chat and does not focus the compose field.
     MoveInbox { delta: i32 },
+    /// Move the inbox highlight to the row that has keyboard focus.
+    /// This does not open the chat.
+    FocusInbox { id: String },
     /// Limit the inbox to one protocol tab, or show All.
     SetFilter(InboxFilter),
     /// Inbox search text. Matches chat title and participant only.

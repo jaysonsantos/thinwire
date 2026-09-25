@@ -906,6 +906,15 @@ impl Snapshot {
         self.sync_focused_row(FocusFollow::Moved);
     }
 
+    /// Point the highlight at a row that already has keyboard focus.
+    /// The open chat stays as it is. The row is already on screen, so this does not scroll.
+    pub fn focus_inbox_row(&mut self, id: String) {
+        let visible = self.visible_conversations().iter().any(|row| row.id == id);
+        if visible {
+            self.focused_row = Some(id);
+        }
+    }
+
     /// Change the selected chat. The compose text stays with the chat it was typed in.
     /// True when this chat of this protocol is the selected one.
     #[must_use]

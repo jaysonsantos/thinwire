@@ -1,7 +1,7 @@
 //! Inbox keyboard and AccessKit. A click on the preview opens that chat.
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use thinwire_core::state::Snapshot;
 use thinwire_core::state::test_support::{ready_with_chats, telegram_chat};
 use thinwire_core::{Intent, View};
@@ -19,6 +19,7 @@ struct InboxUi {
     hints: Hints,
     /// When set, a thread Retry control takes keyboard focus.
     focus_retry: bool,
+    selects: u32,
 }
 
 impl InboxUi {
@@ -48,6 +49,7 @@ impl InboxUi {
             settings,
             hints: Hints::default(),
             focus_retry: false,
+            selects: 0,
         }
     }
 }
@@ -66,8 +68,12 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
     }
     for intent in out {
         match intent {
-            Intent::SelectConversation { id } => state.snapshot.select_conversation(id),
+            Intent::SelectConversation { id } => {
+                state.selects += 1;
+                state.snapshot.select_conversation(id);
+            }
             Intent::MoveInbox { delta } => state.snapshot.move_inbox_selection(delta),
+            Intent::FocusInbox { id } => state.snapshot.focus_inbox_row(id),
             _ => {}
         }
     }
@@ -151,5 +157,54 @@ fn arrows_move_the_highlight_and_enter_opens_it() {
             .take_commands()
             .iter()
             .any(|command| matches!(command, thinwire_protocol::AdapterCommand::OpenChat { .. }))
+    );
+}
+
+#[test]
+fn tab_to_a_row_then_enter_opens_it() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    let mut landed = false;
+    for _ in 0..40 {
+        harness.key_press(egui::Key::Tab);
+        harness.step();
+        if harness.state().snapshot.focused_row.as_deref() == Some("telegram:2") {
+            landed = true;
+            break;
+        }
+    }
+    assert!(landed, "Tab reaches Bob and moves the highlight");
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:1"),
+        "Tab does not open the chat"
+    );
+    harness.state_mut().selects = 0;
+    harness.key_press(egui::Key::Enter);
+    harness.step();
+    assert_eq!(harness.state().selects, 1, "Enter sends one open");
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:2")
+    );
+}
+
+#[test]
+fn accesskit_selected_is_the_open_chat() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    harness.key_press(egui::Key::ArrowDown);
+    harness.step();
+    let ada = harness.get_by_role_and_label(egui::accesskit::Role::Button, "Ada");
+    let bob = harness.get_by_role_and_label(egui::accesskit::Role::Button, "Bob");
+    assert_eq!(
+        ada.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True),
+        "the open chat stays selected"
+    );
+    assert_eq!(
+        bob.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False),
+        "the highlight is not selected"
     );
 }
