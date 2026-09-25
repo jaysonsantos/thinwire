@@ -34,6 +34,8 @@ pub(crate) struct FakeState {
     pub next_error: Option<DiscordApiError>,
     /// Pauses the next bot-id read until notified. A reconnect stays without a bot id.
     pub hold_load: Option<Arc<Notify>>,
+    /// Pauses `channels` after the list is copied, so an older reload can finish late.
+    pub hold_channels: Option<Arc<Notify>>,
     pub next_id: u64,
 }
 
@@ -187,11 +189,17 @@ impl DiscordApi for FakeDiscordApi {
     fn channels(&self, guild_id: u64) -> ApiFuture<'_, Vec<ChannelSummary>> {
         Box::pin(async move {
             self.check_token()?;
-            self.state()
+            let channels = self
+                .state()
                 .channels
                 .get(&guild_id)
                 .cloned()
-                .ok_or(DiscordApiError::NotFound)
+                .ok_or(DiscordApiError::NotFound)?;
+            let hold = self.state().hold_channels.clone();
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
+            Ok(channels)
         })
     }
 

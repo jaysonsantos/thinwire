@@ -201,10 +201,9 @@ impl DiscordAdapter {
                 }
                 Some(token) => {
                     let api = factory(token);
-                    self.session =
-                        Some(session::Session::start(
-                            api, &self.live, events, carried, history, bodies,
-                        ));
+                    self.session = Some(session::Session::start(
+                        api, &self.live, events, carried, history, bodies,
+                    ));
                 }
             }
             return Ok(());
@@ -1001,10 +1000,7 @@ mod tests {
             })
             .flatten()
             .collect();
-        assert_eq!(
-            pending,
-            vec!["discord:pending:2:1", "discord:pending:2:2"]
-        );
+        assert_eq!(pending, vec!["discord:pending:2:1", "discord:pending:2:2"]);
         assert_eq!(removed, pending);
         assert!(!events.iter().any(|event| matches!(
             event,
@@ -1205,6 +1201,51 @@ mod tests {
             }
         )));
         assert!(api.state().sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_older_channel_list_does_not_overwrite_a_newer_one() {
+        let hold = Arc::new(Notify::new());
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().hold_channels = Some(Arc::clone(&hold));
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("slow reload");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        api.state()
+            .channels
+            .get_mut(&GUILD)
+            .expect("guild")
+            .retain(|channel| channel.id != NEWS);
+        api.state().hold_channels = None;
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("fast reload");
+        let events = inbox_loaded(&mut rx).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if *id == conversation_id(GUILD, NEWS)
+        )));
+        hold.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !conversations(&late)
+                .iter()
+                .any(|row| row.id == conversation_id(GUILD, NEWS)),
+            "the slower list must not put the channel back"
+        );
     }
 
     #[tokio::test]

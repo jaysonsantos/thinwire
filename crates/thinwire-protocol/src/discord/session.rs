@@ -49,6 +49,8 @@ struct Shared {
     history: HashMap<String, Vec<String>>,
     /// Body of each outgoing row, so a retry can post it again.
     bodies: HashMap<String, String>,
+    /// Latest `reload` in this session. An older list must not publish.
+    reload_ticket: u64,
 }
 
 /// Drops events from a replaced session.
@@ -119,6 +121,7 @@ impl Session {
                 inflight: Vec::new(),
                 history,
                 bodies,
+                reload_ticket: 0,
             })),
             gate: Gate {
                 live: Arc::clone(live),
@@ -139,6 +142,13 @@ impl Session {
 
     /// Loads the guild channel list again. Channels that left the list are removed.
     pub(crate) fn reload(&self, events: &EventTx) {
+        let ticket = {
+            let Ok(mut state) = self.shared.lock() else {
+                return;
+            };
+            state.reload_ticket = state.reload_ticket.wrapping_add(1);
+            state.reload_ticket
+        };
         let api = Arc::clone(&self.api);
         let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
@@ -146,6 +156,10 @@ impl Session {
         tokio::spawn(async move {
             let result = load_channels(api.as_ref()).await;
             if !gate.current() {
+                return;
+            }
+            let current = shared.lock().map(|state| state.reload_ticket).unwrap_or(0);
+            if current != ticket {
                 return;
             }
             match result {
