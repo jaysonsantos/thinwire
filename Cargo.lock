@@ -5960,6 +5960,7 @@ dependencies = [
  "futures",
  "presage",
  "presage-store-sled",
+ "sha2 0.10.9",
  "thinwire-protocol",
  "tokio",
  "tracing",

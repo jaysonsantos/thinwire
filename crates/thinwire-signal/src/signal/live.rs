@@ -67,6 +67,7 @@ pub(super) struct Session {
     cancel: CancelWake,
     pairing: AtomicU64,
     sent: Mutex<std::collections::HashMap<String, String>>,
+    groups: Mutex<super::group::GroupKeys>,
 }
 
 impl Session {
@@ -78,6 +79,7 @@ impl Session {
             cancel: CancelWake::new(),
             pairing: AtomicU64::new(0),
             sent: Mutex::new(std::collections::HashMap::new()),
+            groups: Mutex::new(super::group::GroupKeys::default()),
         }
     }
 
@@ -98,6 +100,14 @@ impl Session {
 
     pub(super) async fn recall(&self, message_id: &str) -> Option<String> {
         self.sent.lock().await.get(message_id).cloned()
+    }
+
+    pub(super) async fn remember_group(&self, master_key: &[u8]) -> String {
+        self.groups.lock().await.remember(master_key)
+    }
+
+    pub(super) async fn group_key(&self, id: &str) -> Option<[u8; 32]> {
+        self.groups.lock().await.key(id)
     }
 
     /// Drop a cancel permit left by a worker that was not waiting.
@@ -232,14 +242,15 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
         return;
     }
     emit_account(&events, ProtocolId::Signal, AccountState::Linked);
-    let (mut known, mut group_titles) = match publish_chats(&manager, &events).await {
-        Ok(published) => published,
-        Err(()) => {
-            fail(&events, SYNC_FAILED);
-            session.active.store(false, Ordering::SeqCst);
-            return;
-        }
-    };
+    let (mut known, mut group_titles) =
+        match publish_chats(&manager, session.as_ref(), &events).await {
+            Ok(published) => published,
+            Err(()) => {
+                fail(&events, SYNC_FAILED);
+                session.active.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
     let mut names = contact_names(&manager).await;
     emit_status(
         &events,
@@ -303,6 +314,10 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
                         match receive.on_item(item.is_none(), session.is_current(token)) {
                             StreamPoll::Continue => {
                                 if let Some(Received::Content(content)) = item {
+                                    if let Ok(Thread::Group(key)) = Thread::try_from(content.as_ref())
+                                    {
+                                        session.remember_group(&key).await;
+                                    }
                                     remember_group_title(
                                         &manager,
                                         content.as_ref(),
@@ -365,6 +380,7 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
             }) => {
                 load_older_page(
                     &manager,
+                    session.as_ref(),
                     &events,
                     &names,
                     &group_titles,
@@ -425,6 +441,7 @@ async fn contact_names(manager: &Manager<SledStore, Registered>) -> HashMap<Stri
 
 async fn publish_chats(
     manager: &Manager<SledStore, Registered>,
+    session: &Session,
     events: &EventTx,
 ) -> Result<(HashSet<String>, HashMap<String, String>), ()> {
     let mut known = HashSet::new();
@@ -447,6 +464,7 @@ async fn publish_chats(
     for group in groups.flatten() {
         let (key, group) = group;
         let conversation = conversation_from_group(&key, &group);
+        session.remember_group(&key).await;
         group_titles.insert(conversation.id.clone(), conversation.title.clone());
         known.insert(conversation.id.clone());
         emit_conversation(events, conversation);
@@ -478,6 +496,7 @@ fn last_page<T>(items: impl IntoIterator<Item = T>, page: usize) -> Vec<T> {
 
 async fn load_older_page(
     manager: &Manager<SledStore, Registered>,
+    session: &Session,
     events: &EventTx,
     names: &HashMap<String, String>,
     group_titles: &HashMap<String, String>,
@@ -486,7 +505,7 @@ async fn load_older_page(
 ) {
     let loaded = async {
         let before = before_message_id.parse::<u64>().ok()?;
-        let thread = thread_of(conversation_id)?;
+        let thread = thread_of(conversation_id, session.group_key(conversation_id).await)?;
         let messages = manager.store().messages(&thread, ..before).await.ok()?;
         Some(last_page_more(messages.flatten(), HISTORY_PAGE))
     }
@@ -504,13 +523,11 @@ async fn load_older_page(
     });
 }
 
-fn thread_of(conversation_id: &str) -> Option<Thread> {
-    match super::group::outbound_target(conversation_id).ok()? {
-        super::group::OutboundTarget::Group(key) => Some(Thread::Group(key)),
-        super::group::OutboundTarget::Contact => {
-            Uuid::parse_str(conversation_id).ok().map(Thread::Contact)
-        }
+fn thread_of(conversation_id: &str, group_key: Option<[u8; 32]>) -> Option<Thread> {
+    if super::group::is_group_id(conversation_id) {
+        return group_key.map(Thread::Group);
     }
+    Uuid::parse_str(conversation_id).ok().map(Thread::Contact)
 }
 
 fn last_page_more<T>(items: impl IntoIterator<Item = T>, page: usize) -> (Vec<T>, bool) {
@@ -703,21 +720,22 @@ async fn send_text(
         timestamp: Some(timestamp),
         ..Default::default()
     };
-    match super::group::outbound_target(&outbound.conversation_id)? {
-        super::group::OutboundTarget::Group(master_key) => {
-            manager
-                .send_message_to_group(&master_key, data_message, timestamp)
-                .await
-                .map_err(|_| ())?;
-        }
-        super::group::OutboundTarget::Contact => {
-            let uuid = Uuid::parse_str(&outbound.conversation_id).map_err(|_| ())?;
-            let service_id = ServiceId::Aci(uuid.into());
-            manager
-                .send_message(service_id, data_message, timestamp)
-                .await
-                .map_err(|_| ())?;
-        }
+    if super::group::is_group_id(&outbound.conversation_id) {
+        let master_key = session
+            .group_key(&outbound.conversation_id)
+            .await
+            .ok_or(())?;
+        manager
+            .send_message_to_group(&master_key, data_message, timestamp)
+            .await
+            .map_err(|_| ())?;
+    } else {
+        let uuid = Uuid::parse_str(&outbound.conversation_id).map_err(|_| ())?;
+        let service_id = ServiceId::Aci(uuid.into());
+        manager
+            .send_message(service_id, data_message, timestamp)
+            .await
+            .map_err(|_| ())?;
     }
     thinwire_protocol::emit_send_accepted(
         events,
