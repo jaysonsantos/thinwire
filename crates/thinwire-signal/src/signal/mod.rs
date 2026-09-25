@@ -485,8 +485,8 @@ struct SignalWorker {
     abort: tokio::task::AbortHandle,
 }
 
-/// Join the worker. If it misses `limit`, abort its task and wait until the
-/// thread has ended. The sled store drops with that task.
+/// Join the worker inside `limit`. That bound is 4 seconds, under the 5 second
+/// close deadline. The caller runs this on `spawn_blocking`, not the host thread.
 #[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
     let SignalWorker { thread, abort } = worker;
@@ -495,9 +495,13 @@ fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
         let _ = thread.join();
         let _ = tx.send(());
     });
-    if rx.recv_timeout(limit).is_err() {
+    let started = std::time::Instant::now();
+    let grace = limit / 4;
+    let first = limit.saturating_sub(grace);
+    if rx.recv_timeout(first).is_err() {
         abort.abort();
-        let _ = rx.recv_timeout(limit);
+        let left = limit.saturating_sub(started.elapsed());
+        let _ = rx.recv_timeout(left);
     }
 }
 
