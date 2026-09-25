@@ -292,17 +292,28 @@ impl SignalAdapter {
         &mut self,
         conversation_id: &str,
         body: &str,
+        request: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
         match &mut self.engine {
             Engine::Sync(device) => {
-                let message = device.send(conversation_id, body).map_err(|reason| {
-                    AdapterError::Unavailable {
-                        protocol: ProtocolId::Signal,
-                        reason,
+                match device.send(conversation_id, body) {
+                    Ok(message) => {
+                        emit_message(events, message);
+                        crate::adapter::emit_send_accepted(
+                            events,
+                            ProtocolId::Signal,
+                            conversation_id,
+                            request,
+                        );
                     }
-                })?;
-                emit_message(events, message);
+                    Err(_) => crate::adapter::emit_send_rejected(
+                        events,
+                        ProtocolId::Signal,
+                        conversation_id,
+                        request,
+                    ),
+                }
                 Ok(())
             }
             #[cfg(feature = "signal-local")]
@@ -314,16 +325,17 @@ impl SignalAdapter {
                 tokio::spawn(async move {
                     let queued = session
                         .submit(live::Outbound {
-                            conversation_id,
+                            conversation_id: conversation_id.clone(),
                             body,
+                            request,
                         })
                         .await;
                     if !queued {
-                        emit_status(
+                        crate::adapter::emit_send_rejected(
                             &task_events,
                             ProtocolId::Signal,
-                            AdapterStatus::Error,
-                            "Signal send was refused because no linked session is running.",
+                            conversation_id,
+                            request,
                         );
                     }
                 });
@@ -441,8 +453,8 @@ impl ProtocolAdapter for SignalAdapter {
                 protocol: ProtocolId::Signal,
                 conversation_id,
                 body,
-                request: _,
-            } => self.send_text(&conversation_id, &body, events),
+                request,
+            } => self.send_text(&conversation_id, &body, request, events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Signal,
                 reason: "command is not handled by the Signal adapter",
@@ -625,6 +637,53 @@ mod tests {
             event,
             AdapterEvent::MessageReceived { message } if message.outbound && message.body == "fixture reply"
         )));
+        assert_eq!(
+            sent.iter()
+                .filter(|event| matches!(
+                    event,
+                    AdapterEvent::SendAccepted { request: 1, .. }
+                        | AdapterEvent::SendRejected { request: 1, .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(sent.iter().any(|event| matches!(
+            event,
+            AdapterEvent::SendAccepted {
+                request: 1,
+                conversation_id,
+                ..
+            } if conversation_id == "chat-1"
+        )));
+
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Signal,
+                    conversation_id: "missing".into(),
+                    body: "nope".into(),
+                    request: 2,
+                },
+                &tx,
+            )
+            .expect("rejected send still resolves");
+        let rejected = drain(&mut rx);
+        assert_eq!(
+            rejected
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AdapterEvent::SendAccepted { request: 2, .. }
+                        | AdapterEvent::SendRejected { request: 2, .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            rejected
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 2, .. }))
+        );
         let command_debug = format!("{:?}", AdapterCommand::SignalBeginLink);
         assert_eq!(command_debug, "SignalBeginLink");
         assert!(!command_debug.contains("fixture reply"));

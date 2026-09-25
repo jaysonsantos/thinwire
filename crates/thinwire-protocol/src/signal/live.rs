@@ -42,6 +42,7 @@ const DISCONNECTED: &str = "Signal disconnected. The receive stream ended.";
 pub(super) struct Outbound {
     pub(super) conversation_id: String,
     pub(super) body: String,
+    pub(super) request: u64,
 }
 
 pub(super) struct Session {
@@ -217,10 +218,18 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
             }
             continue;
         }
-        if let Some(outbound) = pending
-            && send_text(&mut manager, &outbound, &events).await.is_err()
-        {
-            fail(&events, SEND_FAILED);
+        if let Some(outbound) = pending {
+            let request = outbound.request;
+            let conversation_id = outbound.conversation_id.clone();
+            if send_text(&mut manager, &outbound, &events).await.is_err() {
+                crate::adapter::emit_send_rejected(
+                    &events,
+                    ProtocolId::Signal,
+                    conversation_id,
+                    request,
+                );
+                fail(&events, SEND_FAILED);
+            }
         }
     }
     session.active.store(false, Ordering::SeqCst);
@@ -336,6 +345,12 @@ async fn send_text(
         .send_message(service_id, data_message, timestamp)
         .await
         .map_err(|_| ())?;
+    crate::adapter::emit_send_accepted(
+        events,
+        ProtocolId::Signal,
+        &outbound.conversation_id,
+        outbound.request,
+    );
     emit_message(
         events,
         ChatMessage {
