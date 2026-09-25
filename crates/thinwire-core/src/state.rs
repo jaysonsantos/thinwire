@@ -650,6 +650,13 @@ impl Snapshot {
                 if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                     // A failed load does not send its end event. Stop the spinners.
                     self.stop_spinners(protocol, None);
+                    #[cfg(feature = "signal-local")]
+                    if protocol == ProtocolId::Signal
+                        && self.signal_started
+                        && !self.protocol_linked(ProtocolId::Signal)
+                    {
+                        self.set_error("Signal linking failed.", &detail, "Start linking again.");
+                    }
                 }
                 // Crate / feature jargon stays on the account row and in logs.
                 // Chrome surfaces Telegram errors and Ready operational copy only.
@@ -2267,7 +2274,15 @@ impl Snapshot {
             AccountState::Unlinked if had_session || before != AccountState::Unlinked => {
                 self.end_session(protocol);
             }
-            AccountState::Unlinked | AccountState::Linking => {}
+            AccountState::Unlinked =>
+            {
+                #[cfg(feature = "signal-local")]
+                if protocol == ProtocolId::Signal && self.signal_started {
+                    self.signal_started = false;
+                    self.signal_qr = None;
+                }
+            }
+            AccountState::Linking => {}
         }
     }
 
@@ -4233,6 +4248,31 @@ mod tests {
                 .take_commands()
                 .contains(&AdapterCommand::SignalCancelLink)
         );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_failed_link_can_start_again() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        assert!(snapshot.signal_started);
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: "Signal linking failed. No provisioning URL was logged.".into(),
+        });
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        assert!(!snapshot.signal_started);
+        let error = snapshot.error.clone().expect("error");
+        assert_eq!(error.happened, "Signal linking failed.");
+        assert!(error.why.contains("No provisioning URL"));
+        assert!(error.next.contains("Start linking again"));
     }
 
     #[cfg(feature = "signal-local")]

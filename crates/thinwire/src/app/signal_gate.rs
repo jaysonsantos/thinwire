@@ -58,6 +58,12 @@ fn link_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
         "The worker stays idle until you start it. The provisioning URL is not placed on the command channel.",
     );
     ui.add_space(8.0);
+    if let Some(error) = &snapshot.error {
+        ui.colored_label(theme::palette(ui).warn, &error.happened);
+        ui.label(&error.why);
+        ui.label(&error.next);
+        ui.add_space(8.0);
+    }
     if ui
         .add_enabled(
             !snapshot.signal_started,
