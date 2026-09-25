@@ -668,6 +668,43 @@ fn inbox_keys(
     }
 }
 
+/// Last finite width for this key. A frame with no width yet keeps the previous one.
+///
+/// #61 applies the thread scroll offset on the next frame. That frame can
+/// report a width of 0. A wrap at 0 draws one letter per line.
+fn laid_out_width(ui: &egui::Ui, key: &str) -> f32 {
+    let id = ui.id().with(key);
+    let raw = ui.available_width();
+    if raw.is_finite() && raw >= 48.0 {
+        ui.data_mut(|data| data.insert_temp(id, raw));
+        raw
+    } else {
+        ui.data(|data| data.get_temp(id)).unwrap_or(360.0)
+    }
+}
+
+fn bubble_cap(available: f32) -> f32 {
+    (available * BUBBLE_WIDTH).clamp(48.0, BUBBLE_MAX)
+}
+
+/// Left widget, then the right widget at the end of the row.
+fn row_ends(
+    ui: &mut egui::Ui,
+    left: impl FnOnce(&mut egui::Ui),
+    right: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        let gap = 72.0;
+        ui.scope(|ui| {
+            ui.set_max_width((ui.available_width() - gap).max(24.0));
+            left(ui);
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            right(ui);
+        });
+    });
+}
+
 /// One inbox row. The whole rect is the click target, including the preview.
 fn inbox_row(
     ui: &mut egui::Ui,
@@ -679,7 +716,7 @@ fn inbox_row(
     selected: bool,
 ) -> egui::Response {
     let palette = theme::palette(ui);
-    let width = ui.available_width();
+    let width = laid_out_width(ui, "inbox-row-width");
     let (rect, hover) = ui.allocate_exact_size(egui::vec2(width, 60.0), egui::Sense::hover());
     let fill = if selected {
         palette.selected_row
@@ -709,9 +746,9 @@ fn inbox_row(
     } else {
         theme::medium()
     };
-    child.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(time).small().color(palette.text3));
+    row_ends(
+        &mut child,
+        |ui| {
             ui.add(
                 egui::Label::new(
                     RichText::new(title)
@@ -719,25 +756,33 @@ fn inbox_row(
                         .family(title_font)
                         .color(palette.text),
                 )
-                .truncate(),
+                .truncate()
+                .halign(egui::Align::LEFT),
             );
-        });
-    });
-    child.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some(text) = badge_text(unread) {
-                unread_badge(ui, &text);
-            }
+        },
+        |ui| {
+            ui.label(RichText::new(time).small().color(palette.text3));
+        },
+    );
+    row_ends(
+        &mut child,
+        |ui| {
             ui.add(
                 egui::Label::new(
                     RichText::new(preview)
                         .text_style(theme::secondary())
                         .color(palette.text2),
                 )
-                .truncate(),
+                .truncate()
+                .halign(egui::Align::LEFT),
             );
-        });
-    });
+        },
+        |ui| {
+            if let Some(text) = badge_text(unread) {
+                unread_badge(ui, &text);
+            }
+        },
+    );
     ui.interact(rect, ui.id().with(("inbox-row", id)), egui::Sense::click())
 }
 
@@ -750,7 +795,10 @@ fn unread_badge(ui: &mut egui::Ui, text: &str) {
         .layout_no_wrap(text.to_owned(), font, palette.on_badge);
     let width = (galley.size().x + space::XS * 2.0).max(20.0);
     let height = galley.size().y + space::XS;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("unread {text}"))
+    });
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(radius::PILL), palette.badge);
     let pos = egui::pos2(
@@ -1210,7 +1258,7 @@ fn bubble(
     } else if let Some(ended) = previous_run_ended {
         ui.add_space(if ended { NEXT_RUN_GAP } else { SAME_RUN_GAP });
     }
-    let max_width = (ui.available_width() * BUBBLE_WIDTH).min(BUBBLE_MAX);
+    let max_width = bubble_cap(laid_out_width(ui, "thread-width"));
     let (align, fill, body, meta) = if message.outbound {
         (
             egui::Align::Max,
@@ -1233,17 +1281,26 @@ fn bubble(
             .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
             .show(ui, |ui| {
                 ui.set_max_width(max_width);
+                let text_width = (max_width - space::M * 2.0 - 72.0).max(32.0);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     if message.layout.show_sender {
                         ui.label(RichText::new(&message.sender).small().color(palette.text));
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_max_width(text_width);
+                            ui.add(
+                                egui::Label::new(RichText::new(&message.body).color(body))
+                                    .selectable(true)
+                                    .wrap()
+                                    .halign(egui::Align::LEFT),
+                            );
+                        });
                         ui.vertical(|ui| {
                             if !message.layout.time.is_empty() {
                                 ui.label(RichText::new(&message.layout.time).small().color(meta));
                             }
                             match message.delivery {
-                                Delivery::Sent => {}
                                 Delivery::Pending => {
                                     ui.label(RichText::new("Sending…").small().color(meta));
                                 }
@@ -1264,15 +1321,19 @@ fn bubble(
                                         *retry = Some(message.id.clone());
                                     }
                                 }
+                                Delivery::Sent => {}
                             }
                         });
-                        ui.add(
-                            egui::Label::new(RichText::new(&message.body).color(body))
-                                .selectable(true)
-                                .wrap(),
-                        );
                     });
                 });
+            })
+            .response
+            .widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Panel,
+                    true,
+                    format!("bubble {}", message.id),
+                )
             });
     });
 }
