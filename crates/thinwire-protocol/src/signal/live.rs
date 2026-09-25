@@ -311,7 +311,7 @@ fn emit_content(events: &EventTx, content: &Content) {
             body: body.clone(),
             outbound: false,
             delivery: Delivery::Sent,
-            sent_at: 0,
+            sent_at: super::time::sent_at_secs(content.metadata.timestamp),
         },
     );
 }
@@ -346,7 +346,7 @@ async fn send_text(
             body: outbound.body.clone(),
             outbound: true,
             delivery: Delivery::Sent,
-            sent_at: 0,
+            sent_at: super::time::sent_at_secs(timestamp),
         },
     );
     Ok(())
