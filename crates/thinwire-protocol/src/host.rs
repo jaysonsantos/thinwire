@@ -37,8 +37,14 @@ impl AdapterHost {
         let adapter_epoch = Arc::clone(&login_epoch);
 
         handle.spawn(async move {
-            let mut adapters =
-                registry(secrets, discord, slack, whatsapp_phone, adapter_epoch, signal);
+            let mut adapters = registry(
+                secrets,
+                discord,
+                slack,
+                whatsapp_phone,
+                adapter_epoch,
+                signal,
+            );
             for adapter in &mut adapters {
                 adapter.start(event_tx.clone());
             }
