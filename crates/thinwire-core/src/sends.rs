@@ -139,6 +139,11 @@ impl SendTracker {
         self.open.is_empty()
     }
 
+    /// A send or retry of this protocol is in flight, in any chat.
+    pub(crate) fn any_for(&self, protocol: ProtocolId) -> bool {
+        self.open.keys().any(|(owner, _)| *owner == protocol)
+    }
+
     /// A send or retry of this chat is in flight.
     pub(crate) fn in_flight(&self, protocol: ProtocolId, chat: &str) -> bool {
         self.open.contains_key(&(protocol, chat.to_owned()))
