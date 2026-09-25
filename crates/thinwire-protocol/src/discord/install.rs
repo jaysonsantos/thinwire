@@ -1,9 +1,9 @@
 //! Bot OAuth install shape for a guild inbox. Scope is `bot` only.
 
-/// Guild inbox permission bits: `VIEW_CHANNEL` | `READ_MESSAGE_HISTORY`.
+/// Guild inbox permission bits: `VIEW_CHANNEL` | `SEND_MESSAGES` | `READ_MESSAGE_HISTORY`.
 ///
-/// Send, manage, and administrator bits are absent. This is an inbox spike.
-pub const INBOX_PERMISSION_BITS: u64 = (1 << 10) | (1 << 16);
+/// The bot sends as itself. Manage and administrator bits are absent.
+pub const INBOX_PERMISSION_BITS: u64 = (1 << 10) | (1 << 11) | (1 << 16);
 
 /// Gateway intents for a guild inbox: `GUILDS` | `GUILD_MESSAGES` | `MESSAGE_CONTENT`.
 pub const INBOX_INTENT_BITS: u64 = 1 | (1 << 9) | (1 << 15);
@@ -57,13 +57,15 @@ impl DiscordOAuthInstall {
     }
 }
 
-#[cfg(feature = "discord-bot")]
+/// Twilight view of the intent mask. The HTTP inbox opens no gateway yet, so
+/// only tests read it today.
+#[cfg(all(test, feature = "discord-bot"))]
 #[must_use]
 pub fn inbox_intents() -> twilight_model::gateway::Intents {
     twilight_model::gateway::Intents::from_bits_truncate(INBOX_INTENT_BITS)
 }
 
-#[cfg(feature = "discord-bot")]
+#[cfg(all(test, feature = "discord-bot"))]
 #[must_use]
 pub fn inbox_permissions() -> twilight_model::guild::Permissions {
     twilight_model::guild::Permissions::from_bits_truncate(INBOX_PERMISSION_BITS)
@@ -112,7 +114,8 @@ mod tests {
         assert_eq!(permissions.bits(), INBOX_PERMISSION_BITS);
         assert!(permissions.contains(Permissions::VIEW_CHANNEL));
         assert!(permissions.contains(Permissions::READ_MESSAGE_HISTORY));
-        assert!(!permissions.contains(Permissions::SEND_MESSAGES));
+        assert!(permissions.contains(Permissions::SEND_MESSAGES));
+        assert!(!permissions.contains(Permissions::MANAGE_MESSAGES));
         assert!(!permissions.contains(Permissions::ADMINISTRATOR));
     }
 }

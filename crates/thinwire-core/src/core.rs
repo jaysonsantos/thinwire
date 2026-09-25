@@ -693,7 +693,7 @@ mod tests {
             for event in host.poll_events() {
                 if let AdapterEvent::Status { status, detail, .. } = &event {
                     assert!(!detail.contains("fixture-bot-token"));
-                    if *status == AdapterStatus::Stubbed
+                    if *status == AdapterStatus::Connecting
                         && detail.contains("bot token is in the OS keychain")
                         && !detail.contains("not in the OS keychain")
                     {
