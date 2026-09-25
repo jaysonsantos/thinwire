@@ -5,8 +5,11 @@
 //! It keeps secrets in memory, prints the account status lines while the
 //! adapters start, then shuts the clients down. It prints no secret and no
 //! adapter detail text.
+//!
+//! Threads: every `Core` call runs on the `main` thread, outside
+//! `block_on`. `block_on` waits only for the change signal (#55).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thinwire_core::{Core, CoreConfig};
 
@@ -19,19 +22,25 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let mut core = Core::new(runtime.handle(), CoreConfig::load().with_memory_secrets());
     let mut signal = core.signal();
-    runtime.block_on(async {
-        let deadline = tokio::time::sleep(RUN_FOR);
-        tokio::pin!(deadline);
-        loop {
-            if core.pump() {
-                print_view(&core);
-            }
-            tokio::select! {
-                () = &mut deadline => break,
-                alive = signal.changed() => if !alive { break },
-            }
+    let deadline = Instant::now() + RUN_FOR;
+    loop {
+        if core.pump() {
+            print_view(&core);
         }
-    });
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        // Wait for a change on the runtime; `Core` stays off it.
+        let changed = runtime.block_on(async {
+            tokio::time::timeout(left, signal.changed())
+                .await
+                .unwrap_or(true)
+        });
+        if !changed {
+            break;
+        }
+    }
     let stopped = core.block_until_stopped(STOP_TIMEOUT);
     println!("clients stopped: {stopped}");
 }

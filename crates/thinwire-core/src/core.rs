@@ -69,6 +69,19 @@ impl CoreConfig {
 }
 
 /// Frontend-independent app core (ADR 0010).
+///
+/// # Threads
+///
+/// Call every method from the frontend thread (for example the egui UI
+/// thread, or the `main` loop of a headless frontend). Do not call a method
+/// from a task on the adapter runtime (the `runtime` given to
+/// [`Core::new`]), and not inside `Runtime::block_on`. The methods are
+/// synchronous and never yield: [`Core::block_until_stopped`] sleeps until
+/// the adapters stop. On the adapter runtime, such a call holds a worker
+/// thread that the adapters need, and it can wait for itself (#55).
+///
+/// To wait for a change, `block_on` only [`ChangeSignal::changed`], then call
+/// [`Core::pump`] after `block_on` returns. The headless example does this.
 pub struct Core {
     runtime: Handle,
     /// Command side of the host. It also delivers stamped login events.
@@ -129,12 +142,16 @@ impl Core {
 
     /// A new change signal. It fires after adapter events, keychain progress,
     /// and each [`Self::dispatch`].
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
     #[must_use]
     pub fn signal(&self) -> ChangeSignal {
         self.notifier.subscribe()
     }
 
     /// The state for this redraw.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
     #[must_use]
     pub fn view(&self) -> View<'_> {
         View {
@@ -146,6 +163,8 @@ impl Core {
 
     /// Apply the adapter events that arrived and run time-based checks.
     /// Returns true when at least one event was applied.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
     pub fn pump(&mut self) -> bool {
         let mut applied = false;
         while let Ok(event) = self.events.try_recv() {
@@ -167,6 +186,8 @@ impl Core {
     }
 
     /// Apply one user action, then queue its commands for the worker.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
     pub fn dispatch(&mut self, intent: Intent) {
         match intent {
             Intent::SelectProtocol(protocol) => self.state.select_protocol(protocol),
@@ -215,22 +236,30 @@ impl Core {
     }
 
     /// Chat to focus the compose field on, once.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
     pub fn take_focus_compose(&mut self) -> bool {
         self.state.take_focus_compose()
     }
 
     /// The selected row moved; scroll it into view, once.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
     pub fn take_scroll_to_selected(&mut self) -> bool {
         self.state.take_scroll_to_selected()
     }
 
     /// Start a keychain flush of the persistent keys on the runtime. The
     /// caller does not wait. The app calls it last at exit.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
     pub fn flush_keychain(&self) {
         self.secrets.spawn_os_flush(&self.runtime);
     }
 
     /// Every adapter answered [`Intent::Shutdown`] with `Stopped`.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
     #[must_use]
     pub fn stopped(&self) -> bool {
         self.state.all_stopped()
@@ -238,7 +267,11 @@ impl Core {
 
     /// Shut down and wait up to `timeout` for the clients to close.
     ///
-    /// Blocks the caller. Use it only after the window is gone.
+    /// Blocks the caller. Use it only after the window is gone. Never call
+    /// it on the adapter runtime: it waits for tasks that run there. A
+    /// `spawn_blocking` thread is fine.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
     pub fn block_until_stopped(&mut self, timeout: Duration) -> bool {
         self.shutdown();
         let deadline = Instant::now() + timeout;
@@ -458,6 +491,26 @@ mod tests {
         })
         .await;
         assert!(result.is_ok(), "core did not reach the state in time");
+    }
+
+    #[test]
+    fn the_headless_example_calls_core_off_the_runtime() {
+        let example = include_str!("../examples/headless.rs");
+        let wait = &example[example.find("runtime.block_on(").expect("block_on")..];
+        let wait = &wait[..wait.find("});").expect("end of block_on")];
+        assert!(
+            !wait.contains("core."),
+            "no Core call inside block_on (#55)"
+        );
+        assert!(wait.contains("signal.changed()"));
+        let core = include_str!("core.rs");
+        let doc = &core[core.find("/// # Threads").expect("threads doc")..];
+        let doc = &doc[..doc.find("pub struct Core").expect("struct")];
+        assert!(doc.contains("not inside `Runtime::block_on`"));
+        let methods = core[core.find("impl Core {").expect("impl")..]
+            .matches("Frontend thread only. See [`Core`] \"Threads\".")
+            .count();
+        assert!(methods >= 9, "each sync method states the rule: {methods}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
