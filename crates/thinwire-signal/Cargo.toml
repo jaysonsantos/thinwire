@@ -16,7 +16,7 @@ signal-local = ["dep:presage", "dep:presage-store-sqlite", "dep:futures"]
 
 [dependencies]
 dirs.workspace = true
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 thinwire-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
