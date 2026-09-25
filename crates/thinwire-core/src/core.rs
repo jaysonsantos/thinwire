@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault as PhoneVault;
 use thinwire_protocol::{
-    AdapterCommand, AdapterEvent, AdapterHost, DiscordAdapter, DiscordSecretVault, HostSender,
-    ProtocolAdapter, ProtocolId, SlackAdapter, SlackSecretVault, TelegramSecretVault,
-    WhatsAppPhoneVault, catalog,
+    AdapterCommand, AdapterEvent, AdapterHost, Arrival, ChatMessage, DiscordAdapter,
+    DiscordSecretVault, HostSender, ProtocolAdapter, ProtocolId, SlackAdapter, SlackSecretVault,
+    TelegramSecretVault, WhatsAppPhoneVault, catalog,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -22,6 +22,7 @@ use crate::clock::Clock;
 use crate::intent::{
     AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
 };
+use crate::notify::{Notifications, NotifyCommand, NotifyContext};
 use crate::secrets::SecretStore;
 use crate::settings::Settings;
 use crate::signal::{ChangeNotifier, ChangeSignal, WeakNotifier, change_channel};
@@ -113,6 +114,8 @@ pub struct Core {
     /// A wake at the earliest send deadline, so a frontend that waits on the
     /// change signal pumps then and the chat unlocks (PR #81 review).
     send_wake: Option<(Instant, tokio::task::JoinHandle<()>)>,
+    /// Desktop notification rules and queue (#32).
+    notify: Notifications,
 }
 
 impl Core {
@@ -211,6 +214,7 @@ impl Core {
             notifier,
             closing: false,
             send_wake: None,
+            notify: Notifications::new(),
         }
     }
 
@@ -264,7 +268,18 @@ impl Core {
             // The login epoch check runs here, on the thread that sends
             // Cancel, not in the forward task (issue #42, PR #49).
             if let Some(event) = self.commands.deliver(event) {
+                let live = match &event {
+                    AdapterEvent::MessageReceived { message }
+                        if message.arrival == Arrival::Live =>
+                    {
+                        Some(message.clone())
+                    }
+                    _ => None,
+                };
                 self.state.apply(event);
+                if let Some(message) = live {
+                    self.notify_message(&message);
+                }
                 applied = true;
             }
         }
@@ -275,8 +290,41 @@ impl Core {
         }
         self.state.poll_resume(&self.secrets);
         self.state.sync_viewed();
+        self.sync_notifications();
         self.flush();
         applied || expired
+    }
+
+    /// Notifications for the frontend to show or remove, oldest first
+    /// (#32). A frontend that shows none can skip this call.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
+    pub fn take_notify(&mut self) -> Vec<NotifyCommand> {
+        self.notify.take()
+    }
+
+    fn notify_message(&mut self, message: &ChatMessage) {
+        let ctx = NotifyContext {
+            enabled: self.settings.notifications(),
+            preview: self.settings.notification_preview(),
+            window_focused: self.notify.window_focused(),
+            viewed: self.state.viewed(),
+            has_session: self.state.has_session(message.protocol),
+            now: unix_now(),
+        };
+        let chat = self
+            .state
+            .conversation(message.protocol, &message.conversation_id);
+        if let Err(reason) = self.notify.on_message(message, chat, &ctx) {
+            // The reason only: never the chat, the sender, or the text.
+            tracing::trace!(?reason, "no notification");
+        }
+    }
+
+    fn sync_notifications(&mut self) {
+        let state = &self.state;
+        self.notify
+            .sync(state.viewed(), |protocol| state.has_session(protocol));
     }
 
     /// Apply one user action, then queue its commands for the worker.
@@ -322,6 +370,14 @@ impl Core {
             Intent::RetryKeychain => self.state.retry_keychain(),
             Intent::SetTheme(theme) => self.settings.set_theme(theme),
             Intent::Shutdown => self.shutdown(),
+            Intent::WindowFocus(focused) => self.notify.set_focus(focused),
+            Intent::OpenFromNotification(key) => {
+                self.state.select_protocol(key.protocol);
+                self.state.select_conversation(key.conversation_id.clone());
+                self.notify.dismiss(&key);
+            }
+            Intent::SetNotifications(on) => self.settings.set_notifications(on),
+            Intent::SetNotificationPreview(on) => self.settings.set_notification_preview(on),
             Intent::Telegram(intent) => self.telegram(intent),
             Intent::WhatsApp(intent) => self.whatsapp(intent),
             Intent::Discord(DiscordIntent::Connect) => {
@@ -342,6 +398,7 @@ impl Core {
             Intent::Signal(intent) => self.signal_gate(intent),
         }
         self.state.sync_viewed();
+        self.sync_notifications();
         self.flush();
         self.notifier.notify();
     }
@@ -409,6 +466,7 @@ impl Core {
             return;
         }
         self.closing = true;
+        self.notify.close();
         // Every adapter closes its sessions (TDLib, the WhatsApp session,
         // Discord, Slack) and answers `Stopped`. `stopped` waits for all.
         for caps in catalog() {
@@ -618,6 +676,15 @@ fn refreshed_secret_store_status(current: &str, backend: &str) -> Option<String>
     }
     let next = secret_store_status_text(backend);
     (current != next).then_some(next)
+}
+
+/// Unix seconds now. Zero if the clock is before 1970.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]
@@ -1147,6 +1214,69 @@ mod tests {
             .expect("queue");
         core.pump();
         assert!(core.view().telegram_authorized);
+    }
+
+    /// #32: a live message in a chat that the user does not look at queues a
+    /// notification. A click opens that chat and dismisses it. The switch
+    /// turns it off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_message_notifies_and_a_click_opens_its_chat() {
+        use crate::notify::{NotifyCommand, NotifyKey};
+        use crate::state::test_support::ready_with_chats;
+        use thinwire_protocol::Delivery;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        let live = |chat: i64, body: &str| ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: format!("telegram:{chat}"),
+            id: format!("telegram:{chat}:9"),
+            sender: "Bob".into(),
+            body: body.into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+        };
+        // Chat 1 is open and the window has focus: nothing.
+        core.notify_message(&live(1, "seen"));
+        assert!(core.take_notify().is_empty());
+        // Chat 2 is not open.
+        core.notify_message(&live(2, "hello"));
+        let key = NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+        };
+        let shown = core.take_notify();
+        assert!(
+            matches!(&shown[..], [NotifyCommand::Show(note)] if note.key == key && note.title == "Bob"),
+            "{shown:?}"
+        );
+        // Without focus, the open chat notifies too.
+        core.dispatch(Intent::WindowFocus(false));
+        core.notify_message(&live(1, "while away"));
+        assert_eq!(core.take_notify().len(), 1);
+        // Focus again with chat 1 open: its notification goes.
+        core.dispatch(Intent::WindowFocus(true));
+        assert!(matches!(
+            &core.take_notify()[..],
+            [NotifyCommand::Dismiss(_)]
+        ));
+
+        core.dispatch(Intent::OpenFromNotification(key.clone()));
+        assert!(
+            core.view()
+                .is_selected_chat(ProtocolId::Telegram, "telegram:2")
+        );
+        assert_eq!(core.take_notify(), vec![NotifyCommand::Dismiss(key)]);
+
+        core.dispatch(Intent::SetNotifications(false));
+        assert!(!core.view().notifications());
+        core.notify_message(&live(1, "off"));
+        assert!(core.take_notify().is_empty(), "the switch is off");
     }
 
     /// PR #48 review (P1): one frame with a click on chat B and an edit of

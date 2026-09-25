@@ -44,6 +44,18 @@ impl View<'_> {
     pub fn theme(&self) -> ThemeMode {
         self.settings.theme()
     }
+
+    /// Settings switch: desktop notifications on (#32).
+    #[must_use]
+    pub fn notifications(&self) -> bool {
+        self.settings.notifications()
+    }
+
+    /// Settings switch: notifications show the sender and the text (#32).
+    #[must_use]
+    pub fn notification_preview(&self) -> bool {
+        self.settings.notification_preview()
+    }
 }
 
 /// Test hook: a view over parts that a test owns.
