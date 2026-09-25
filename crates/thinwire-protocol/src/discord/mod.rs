@@ -1938,4 +1938,51 @@ mod tests {
         assert!(!lock.contains(concat!("seren", "ity")));
         assert!(lock.contains("name = \"twilight-http\""));
     }
+
+    /// Refresh ends with `ChatListLoaded`, so the shell stops the chat-list
+    /// spinner (contract kit finding, ADR 0010 rule 9).
+    #[tokio::test]
+    async fn refresh_ends_with_chat_list_loaded() {
+        let (mut adapter, tx, mut rx, _) =
+            connected(Arc::new(FakeDiscordApi::guild_fixture())).await;
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("refresh");
+        until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::ChatListLoaded {
+                    protocol: ProtocolId::Discord
+                }
+            )
+        })
+        .await;
+    }
+
+    /// The bot inbox follows the adapter contract of the shell (ADR 0010).
+    #[tokio::test]
+    async fn the_bot_inbox_follows_the_adapter_contract() {
+        let (adapter, _vault) = fake_adapter(
+            Arc::new(FakeDiscordApi::guild_fixture()),
+            Some(FIXTURE_TOKEN),
+        );
+        // The test build compiles the inbox without feature `discord-bot`,
+        // so check against the capabilities of the feature build.
+        let mut kit = crate::contract::Contract::new(Box::new(adapter)).with_capabilities(
+            ProtocolCapabilities {
+                sends_text: true,
+                ..CAPABILITIES
+            },
+        );
+        kit.send(AdapterCommand::ConnectDiscord {
+            mode: DiscordAuthMode::Bot,
+        });
+        kit.linked().await;
+        kit.run_all().await;
+    }
 }

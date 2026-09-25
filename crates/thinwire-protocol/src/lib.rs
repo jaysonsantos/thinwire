@@ -1,6 +1,8 @@
 //! Protocol adapters, capability metadata, and the tokio host.
 
 mod adapter;
+#[cfg(test)]
+mod contract;
 mod discord;
 mod fake;
 mod host;

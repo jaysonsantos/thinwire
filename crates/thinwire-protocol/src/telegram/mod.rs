@@ -776,6 +776,18 @@ mod tests {
         assert!(updates.contains("i64::from(update.message.date)"));
     }
 
+    /// The default-build stub follows the parts of the adapter contract that
+    /// need no session (ADR 0010). There is no offline TDLib fake yet, so the
+    /// kit cannot link Telegram.
+    #[cfg(not(feature = "telegram-tdlib"))]
+    #[tokio::test]
+    async fn the_stub_follows_the_adapter_contract() {
+        let mut kit = crate::contract::Contract::new(Box::new(TelegramAdapter::memory()));
+        kit.settle().await;
+        kit.check_shutdown().await;
+        kit.check_stream();
+    }
+
     #[test]
     fn shutdown_reports_stopped_and_workers_close_tdlib_first() {
         let mut adapter = TelegramAdapter::memory();
