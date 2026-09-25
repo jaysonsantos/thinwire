@@ -2400,6 +2400,12 @@ impl Snapshot {
         self.chat_list_loading.remove(&protocol);
         self.notices.remove(&protocol);
         self.sends.drop_protocol(protocol);
+        // Its timed-out sends leave the timeout error too (#90).
+        let shown = self.error.is_some() && self.error == self.timeout_error;
+        self.timed_out.retain(|entry| entry.protocol != protocol);
+        if shown {
+            self.show_timeouts();
+        }
         if protocol == ProtocolId::Telegram {
             self.older_loading.clear();
             self.older_at_start.clear();
@@ -7279,6 +7285,40 @@ mod tests {
             snapshot.error.as_ref().map(|error| error.next.as_str()),
             Some("The text is in the draft of Ada. Send it again.")
         );
+    }
+
+    /// #90 item 4: a session end removes its timed-out sends from the
+    /// timeout error. A later timeout of another protocol does not list them.
+    #[test]
+    fn a_session_end_drops_its_timed_out_sends() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_protocol(ProtocolId::Telegram);
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.compose = "to ada".into();
+        snapshot.send_compose();
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert!(snapshot.error.is_some());
+
+        snapshot.select_protocol(ProtocolId::Slack);
+        snapshot.select_conversation("slack:C1".into());
+        snapshot.compose = "to slack".into();
+        snapshot.send_compose();
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Unlinked,
+        });
+        assert!(snapshot.error.is_none(), "Telegram's timeout left with it");
+
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        let error = snapshot.error.clone().expect("Slack's timeout");
+        assert_eq!(error.why, "Slack did not answer in time.");
     }
 
     /// #90 item 5: the line shows "Sending…" only while a send is in flight.
