@@ -300,6 +300,9 @@ pub struct Snapshot {
     pub telegram_2fa: String,
     pub error: Option<UserError>,
     pub status_text: String,
+    /// The last Telegram status line that came as `AdapterStatus::Ready`: a
+    /// finished success such as "Message sent." (#56).
+    ready_status: Option<String>,
     pub compose: String,
     pub auth_busy: bool,
     /// One line above the active login form. Never holds a secret.
@@ -419,6 +422,7 @@ impl Snapshot {
             telegram_2fa: String::new(),
             error: None,
             status_text: "Sign in with Telegram to get started.".into(),
+            ready_status: None,
             compose: String::new(),
             auth_busy: false,
             auth_notice: None,
@@ -491,6 +495,7 @@ impl Snapshot {
                         AdapterStatus::Error | AdapterStatus::Refused | AdapterStatus::Ready
                     )
                 {
+                    self.ready_status = (status == AdapterStatus::Ready).then(|| detail.clone());
                     self.status_text = detail;
                     if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                         if self.auth != AuthScreen::Idle {
@@ -963,6 +968,14 @@ impl Snapshot {
             return InboxState::Loading;
         }
         InboxState::Empty
+    }
+
+    /// The status line is a finished success: the adapter sent it with
+    /// `AdapterStatus::Ready`, and nothing replaced it since. The kind comes
+    /// from the adapter status, not from the text (#56).
+    #[must_use]
+    pub fn status_is_idle(&self) -> bool {
+        self.ready_status.as_deref() == Some(self.status_text.as_str())
     }
 
     #[must_use]
