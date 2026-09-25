@@ -1523,8 +1523,11 @@ impl Snapshot {
     fn note_send_accepted(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
         match self.sends.settle(protocol, chat, request) {
             // An accepted retry needs nothing more: its delivery events move the row.
-            Some(Pending::Send { body, .. }) => self.clear_sent_text(protocol, chat, &body),
-            Some(Pending::Retry { .. }) => {}
+            Some(Pending::Send { body, .. }) => {
+                self.drop_rejected_body(protocol, chat);
+                self.clear_sent_text(protocol, chat, &body);
+            }
+            Some(Pending::Retry { .. }) => self.drop_rejected_body(protocol, chat),
             None => self.note_late_accept(protocol, chat, request),
         }
     }
@@ -1537,6 +1540,7 @@ impl Snapshot {
         let Some(pending) = self.sends.settle_expired(protocol, chat, request) else {
             return;
         };
+        self.drop_rejected_body(protocol, chat);
         match pending {
             Pending::Send { body, .. } => self.clear_sent_text(protocol, chat, &body),
             Pending::Retry { message_id, .. } => {
@@ -1702,6 +1706,24 @@ impl Snapshot {
                 self.set_error("Message not sent.", &why, &next);
             }
             None => {}
+        }
+    }
+
+    /// Forget a rejected send for this chat. An accepted send, a removed
+    /// chat, or a session end that no longer shows the text all use this.
+    fn drop_rejected_body(&mut self, protocol: ProtocolId, chat: &str) {
+        self.rejected_bodies.remove(&(protocol, chat.to_owned()));
+    }
+
+    /// The rejected text is still what the user would send: the open compose
+    /// field, or that chat's draft.
+    fn holds_rejected_body(&self, protocol: ProtocolId, chat: &str, body: &str) -> bool {
+        if self.is_selected_chat(protocol, chat) {
+            self.compose.trim() == body
+        } else {
+            self.drafts
+                .get(&(protocol, chat.to_owned()))
+                .is_some_and(|draft| draft.trim() == body)
         }
     }
 
@@ -2140,9 +2162,9 @@ impl Snapshot {
 
     /// The session of one protocol ended (shell plan 8): drop its rows,
     /// messages, spinners, notes, and sends. Another linked protocol takes
-    /// the selection. Drafts of this protocol go too, except the body of a
-    /// send this session rejected. A Telegram session end drops those as
-    /// well: the next account on this machine must not see them.
+    /// the selection. Drafts of this protocol go too, except a rejected send
+    /// whose text is still in that chat. A Telegram session end drops those
+    /// as well: the next account on this machine must not see them.
     fn end_session(&mut self, protocol: ProtocolId) {
         if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
             row.state = AccountState::Unlinked;
@@ -2154,7 +2176,9 @@ impl Snapshot {
         } else {
             self.rejected_bodies
                 .iter()
-                .filter(|((owner, _), _)| *owner == protocol)
+                .filter(|((owner, chat), body)| {
+                    *owner == protocol && self.holds_rejected_body(protocol, chat, body)
+                })
                 .map(|((_, chat), body)| (chat.clone(), body.clone()))
                 .collect()
         };
@@ -2234,6 +2258,7 @@ impl Snapshot {
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
         // Every removed chat loses its draft, selected or not (#43).
         self.drafts.remove(&(protocol, id.to_owned()));
+        self.drop_rejected_body(protocol, id);
         if protocol == ProtocolId::Telegram {
             self.older_loading.remove(id);
             self.older_at_start.remove(id);
@@ -6145,6 +6170,57 @@ mod tests {
         });
         snapshot.select_conversation("discord:1:2".into());
         assert_eq!(snapshot.compose, "keep me");
+    }
+
+    /// A later accepted send of the same text must not come back on unlink.
+    #[test]
+    fn an_accepted_resend_drops_the_rejected_body() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:1:2", true),
+        });
+        snapshot.selected_conversation = Some("discord:1:2".into());
+        snapshot.compose = "keep me".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("send");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1:2".into(),
+            request,
+        });
+        snapshot.send_compose();
+        let again = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("resend");
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1:2".into(),
+            request: again,
+        });
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Discord,
+            state: AccountState::Unlinked,
+        });
+        link(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:1:2", true),
+        });
+        snapshot.select_conversation("discord:1:2".into());
+        assert!(snapshot.compose.is_empty());
     }
 
     /// Codex P2 (PR #68): unlinking one protocol keeps the draft of the same
