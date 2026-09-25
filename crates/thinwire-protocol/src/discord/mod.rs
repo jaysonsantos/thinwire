@@ -767,11 +767,37 @@ mod tests {
                 stickers: 0,
             }],
         );
+        // A 500 is `Rejected`, not Forbidden or NotFound.
         api.state()
             .preview_failures
-            .insert(GENERAL, super::api::DiscordApiError::Transport);
-        let (_adapter, _tx, _rx, events) = connected(Arc::clone(&api)).await;
-        let rows = conversations(&events);
+            .insert(GENERAL, super::api::DiscordApiError::Rejected);
+        let (mut adapter, tx, mut rx, events) = connected(Arc::clone(&api)).await;
+        assert_preview_failure_keeps_channels(&events);
+        api.state()
+            .preview_failures
+            .insert(GENERAL, super::api::DiscordApiError::Rejected);
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        let reloaded = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::ChatListLoaded {
+                    protocol: ProtocolId::Discord
+                }
+            )
+        })
+        .await;
+        assert_preview_failure_keeps_channels(&reloaded);
+    }
+
+    fn assert_preview_failure_keeps_channels(events: &[AdapterEvent]) {
+        let rows = conversations(events);
         assert_eq!(rows.len(), 2, "one preview failure does not drop the list");
         let general = rows
             .iter()
@@ -787,6 +813,14 @@ mod tests {
                 state: AccountState::Linked,
                 ..
             }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::CommandFailed { .. }
+                | AdapterEvent::Status {
+                    status: AdapterStatus::Error,
+                    ..
+                }
         )));
         assert!(events.iter().any(|event| matches!(
             event,
