@@ -7,6 +7,7 @@
 
 mod device;
 mod path;
+mod reconnect;
 
 #[cfg(feature = "signal-local")]
 mod live;

@@ -24,6 +24,7 @@ use presage_store_sled::{MigrationConflictStrategy, SledStore};
 use tokio::sync::{Mutex, mpsc};
 
 use super::path::{prepare_session_dir, signal_session_path};
+use super::reconnect::{ReceiveLoop, StreamPoll};
 use crate::adapter::{
     AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx, ProtocolId,
     RedactedPairingSecret, emit_conversation, emit_message, emit_status,
@@ -36,6 +37,7 @@ const STORE_FAILED: &str =
 const LINK_FAILED: &str = "Signal linking failed. No provisioning URL was logged.";
 const SYNC_FAILED: &str = "Signal chat list could not be read. Message text was not logged.";
 const SEND_FAILED: &str = "Signal send failed. The message text was not logged.";
+const DISCONNECTED: &str = "Signal disconnected. The receive stream ended.";
 
 pub(super) struct Outbound {
     pub(super) conversation_id: String,
@@ -166,12 +168,14 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     *session.outbound.lock().await = Some(tx);
+    let mut receive = ReceiveLoop::new();
     while session.is_current(token) {
         let Ok(stream) = manager.receive_messages().await else {
             fail(&events, SYNC_FAILED);
             break;
         };
         let mut pending: Option<Outbound> = None;
+        let mut reconnect_after = None;
         {
             let mut incoming = std::pin::pin!(stream);
             loop {
@@ -185,12 +189,33 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
                         break;
                     }
                     item = incoming.next() => {
-                        if let Some(Received::Content(content)) = item {
-                            emit_content(&events, content.as_ref());
+                        match receive.on_item(item.is_none(), session.is_current(token)) {
+                            StreamPoll::Continue => {
+                                if let Some(Received::Content(content)) = item {
+                                    emit_content(&events, content.as_ref());
+                                }
+                            }
+                            StreamPoll::Reconnect { after } => {
+                                reconnect_after = Some(after);
+                                break;
+                            }
+                            StreamPoll::Stop => break,
                         }
                     }
                 }
             }
+        }
+        if let Some(after) = reconnect_after {
+            emit_status(
+                &events,
+                ProtocolId::Signal,
+                AdapterStatus::Connecting,
+                DISCONNECTED,
+            );
+            if !wait_backoff(session.as_ref(), token, after).await {
+                break;
+            }
+            continue;
         }
         if let Some(outbound) = pending
             && send_text(&mut manager, &outbound, &events).await.is_err()
@@ -325,6 +350,20 @@ async fn send_text(
         },
     );
     Ok(())
+}
+
+/// `true` when this generation is still current after the wait.
+async fn wait_backoff(session: &Session, token: u64, delay: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    while session.is_current(token) {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let slice = (deadline - now).min(super::reconnect::RECONNECT_POLL);
+        tokio::time::sleep(slice).await;
+    }
+    false
 }
 
 fn fail(events: &EventTx, detail: &str) {
