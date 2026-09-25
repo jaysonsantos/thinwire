@@ -23,8 +23,8 @@ use std::sync::Arc;
 use crate::adapter::{AccountState, emit_account};
 use crate::adapter::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
-    ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, emit_conversation,
-    emit_history_loaded, emit_message, emit_status, emit_stopped,
+    ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, emit_chat_list_loaded,
+    emit_conversation, emit_history_loaded, emit_message, emit_status, emit_stopped,
 };
 
 #[cfg(not(feature = "signal-local"))]
@@ -252,6 +252,7 @@ impl SignalAdapter {
                 for chat in chats {
                     emit_conversation(events, chat);
                 }
+                emit_chat_list_loaded(events, ProtocolId::Signal);
                 Ok(())
             }
             #[cfg(feature = "signal-local")]
@@ -268,6 +269,7 @@ impl SignalAdapter {
                     AdapterStatus::Ready,
                     "Signal chat list is kept by the linked session.",
                 );
+                emit_chat_list_loaded(events, ProtocolId::Signal);
                 Ok(())
             }
         }
@@ -661,6 +663,32 @@ mod tests {
 
     #[cfg(feature = "signal-local")]
     #[test]
+    fn live_load_chats_emits_chat_list_loaded() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut adapter = SignalAdapter::new();
+        let Engine::Live(session) = &adapter.engine else {
+            panic!("live engine");
+        };
+        session.mark_active();
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Signal,
+                },
+                &tx,
+            )
+            .expect("chats");
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ChatListLoaded {
+                protocol: ProtocolId::Signal,
+            }
+        )));
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
     fn live_open_chat_emits_history_loaded() {
         let (tx, mut rx) = unbounded_channel();
         let mut adapter = SignalAdapter::new();
@@ -736,6 +764,12 @@ mod tests {
         assert!(chats.iter().any(|event| matches!(
             event,
             AdapterEvent::ConversationUpsert { conversation } if conversation.title == "Ada"
+        )));
+        assert!(chats.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ChatListLoaded {
+                protocol: ProtocolId::Signal,
+            }
         )));
 
         adapter
