@@ -444,12 +444,12 @@ pub struct Snapshot {
     /// until the adapter accepts it; only the request's own `SendAccepted` /
     /// `SendRejected` ends an entry (PR #40 review, shell plan items 4, 10).
     sends: SendTracker,
-    /// The shell's id for the next WhatsApp pairing.
-    #[cfg(feature = "whatsapp-web")]
+    /// The shell's id for the next pairing (WhatsApp or Signal).
+    #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
     next_pairing_generation: u64,
     /// The id of the pairing that runs now. A QR or pair code of any other
     /// pairing is dropped (shell plan 12). `None`: no pairing runs.
-    #[cfg(feature = "whatsapp-web")]
+    #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
     pairing_generation: Option<u64>,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
@@ -587,9 +587,9 @@ impl Snapshot {
             focus_compose: false,
             stopped: HashSet::new(),
             sends: SendTracker::default(),
-            #[cfg(feature = "whatsapp-web")]
+            #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
             next_pairing_generation: 1,
-            #[cfg(feature = "whatsapp-web")]
+            #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
             pairing_generation: None,
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
@@ -832,17 +832,14 @@ impl Snapshot {
                     let _ = (code, generation);
                 }
             }
-            AdapterEvent::SignalQr {
-                code,
-                generation: _,
-            } => {
+            AdapterEvent::SignalQr { code, generation } => {
                 #[cfg(feature = "signal-local")]
-                {
+                if self.current_pairing(generation) {
                     self.signal_qr = Some(code.reveal().to_string());
                 }
                 #[cfg(not(feature = "signal-local"))]
                 {
-                    let _ = code;
+                    let _ = (code, generation);
                 }
             }
         }
@@ -2657,11 +2654,11 @@ impl Snapshot {
     }
 
     /// A pairing payload belongs to the pairing that runs now.
-    #[cfg(feature = "whatsapp-web")]
+    #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
     fn current_pairing(&self, generation: u64) -> bool {
         let current = self.pairing_generation == Some(generation);
         if !current {
-            tracing::warn!("whatsapp pairing payload dropped: it is from an older pairing");
+            tracing::warn!("pairing payload dropped: it is from an older pairing");
         }
         current
     }
@@ -2750,7 +2747,11 @@ impl Snapshot {
         self.signal_started = true;
         self.error = None;
         self.status_text = "Signal linking requested.".into();
-        self.pending.push(AdapterCommand::SignalBeginLink);
+        let generation = self.next_pairing_generation;
+        self.next_pairing_generation += 1;
+        self.pairing_generation = Some(generation);
+        self.pending
+            .push(AdapterCommand::SignalBeginLink { generation });
     }
 
     /// Leave the link screen after `Account { Linked }`. The worker stays up.
@@ -2761,6 +2762,7 @@ impl Snapshot {
             return;
         }
         self.signal_screen = SignalScreen::Hidden;
+        self.pairing_generation = None;
         self.signal_qr = None;
         self.status_text = "Signal is linked on this local build.".into();
         self.select_protocol(ProtocolId::Signal);
@@ -2768,6 +2770,7 @@ impl Snapshot {
 
     #[cfg(feature = "signal-local")]
     pub fn cancel_signal_link(&mut self) {
+        self.pairing_generation = None;
         self.signal_qr = None;
         self.signal_started = false;
         self.signal_notice_acknowledged = false;
@@ -4220,6 +4223,34 @@ mod tests {
                 .take_commands()
                 .contains(&AdapterCommand::SignalCancelLink)
         );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn an_older_signal_qr_is_dropped() {
+        use thinwire_protocol::RedactedPairingSecret;
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let AdapterCommand::SignalBeginLink { generation } = snapshot
+            .take_commands()
+            .into_iter()
+            .find(|command| matches!(command, AdapterCommand::SignalBeginLink { .. }))
+            .expect("begin")
+        else {
+            panic!("begin link");
+        };
+        snapshot.apply(AdapterEvent::SignalQr {
+            code: RedactedPairingSecret::new("sgnl://old"),
+            generation: generation.saturating_sub(1),
+        });
+        assert!(snapshot.signal_qr.is_none());
+        snapshot.apply(AdapterEvent::SignalQr {
+            code: RedactedPairingSecret::new("sgnl://current"),
+            generation,
+        });
+        assert_eq!(snapshot.signal_qr.as_deref(), Some("sgnl://current"));
     }
 
     #[test]

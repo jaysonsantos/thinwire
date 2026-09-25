@@ -24,6 +24,8 @@ use crate::adapter::{
     ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, emit_conversation,
     emit_message, emit_status, emit_stopped,
 };
+#[cfg(feature = "signal-local")]
+use crate::adapter::{AccountState, emit_account};
 
 #[cfg(not(feature = "signal-local"))]
 use device::FeatureOff;
@@ -69,6 +71,8 @@ enum Engine {
 pub struct SignalAdapter {
     notice_accepted: bool,
     engine: Engine,
+    /// Chat the user is looking at. `ViewChat` sets it.
+    viewed: Option<String>,
     #[cfg(feature = "signal-local")]
     worker: Option<SignalWorker>,
 }
@@ -82,6 +86,7 @@ impl SignalAdapter {
             engine: Engine::Live(Arc::new(live::Session::new())),
             #[cfg(not(feature = "signal-local"))]
             engine: Engine::Sync(Box::new(FeatureOff)),
+            viewed: None,
             #[cfg(feature = "signal-local")]
             worker: None,
         }
@@ -92,6 +97,7 @@ impl SignalAdapter {
         Self {
             notice_accepted: false,
             engine: Engine::Sync(Box::new(device)),
+            viewed: None,
             #[cfg(feature = "signal-local")]
             worker: None,
         }
@@ -113,7 +119,7 @@ impl SignalAdapter {
         Ok(())
     }
 
-    fn begin_link(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+    fn begin_link(&mut self, events: &EventTx, generation: u64) -> Result<(), AdapterError> {
         if !self.notice_accepted {
             return Err(AdapterError::Refused {
                 protocol: ProtocolId::Signal,
@@ -122,6 +128,9 @@ impl SignalAdapter {
         }
         #[cfg(feature = "signal-local")]
         if matches!(self.engine, Engine::Live(_)) {
+            if let Engine::Live(session) = &self.engine {
+                session.set_pairing(generation);
+            }
             self.worker = self.spawn_worker(events);
             emit_status(
                 events,
@@ -136,7 +145,7 @@ impl SignalAdapter {
                 Ok(Some(url)) => {
                     let _ = events.send(AdapterEvent::SignalQr {
                         code: RedactedPairingSecret::new(url),
-                        generation: 1,
+                        generation,
                     });
                     emit_status(
                         events,
@@ -222,6 +231,7 @@ impl SignalAdapter {
             tokio::spawn(async move {
                 session.shutdown().await;
             });
+            emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
         }
         emit_status(
             events,
@@ -346,6 +356,71 @@ impl SignalAdapter {
             }
         }
     }
+
+    fn resend(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+        request: u64,
+        events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        match &mut self.engine {
+            Engine::Sync(device) => {
+                match device.resend(conversation_id, message_id) {
+                    Ok(message) => {
+                        emit_message(events, message);
+                        crate::adapter::emit_send_accepted(
+                            events,
+                            ProtocolId::Signal,
+                            conversation_id,
+                            request,
+                        );
+                    }
+                    Err(_) => crate::adapter::emit_send_rejected(
+                        events,
+                        ProtocolId::Signal,
+                        conversation_id,
+                        request,
+                    ),
+                }
+                Ok(())
+            }
+            #[cfg(feature = "signal-local")]
+            Engine::Live(session) => {
+                let session = Arc::clone(session);
+                let conversation_id = conversation_id.to_string();
+                let message_id = message_id.to_string();
+                let task_events = events.clone();
+                tokio::spawn(async move {
+                    let Some(body) = session.recall(&message_id).await else {
+                        crate::adapter::emit_send_rejected(
+                            &task_events,
+                            ProtocolId::Signal,
+                            conversation_id,
+                            request,
+                        );
+                        return;
+                    };
+                    let queued = session
+                        .submit(live::Outbound {
+                            conversation_id: conversation_id.clone(),
+                            body,
+                            request,
+                        })
+                        .await;
+                    if !queued {
+                        crate::adapter::emit_send_rejected(
+                            &task_events,
+                            ProtocolId::Signal,
+                            conversation_id,
+                            request,
+                        );
+                    }
+                });
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
@@ -417,6 +492,7 @@ impl ProtocolAdapter for SignalAdapter {
                     if let Some(worker) = worker {
                         finish_worker(worker, SHUTDOWN_LIMIT);
                     }
+                    emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
                     emit_stopped(&events, ProtocolId::Signal);
                 });
             } else {
@@ -445,7 +521,13 @@ impl ProtocolAdapter for SignalAdapter {
             }
             | AdapterCommand::SignalCancelLink => self.cancel_link(events),
             AdapterCommand::SignalAcknowledgeNotice => self.acknowledge(events),
-            AdapterCommand::SignalBeginLink => self.begin_link(events),
+            AdapterCommand::SignalBeginLink { generation } => self.begin_link(events, generation),
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+                message_id,
+                request,
+            } => self.resend(&conversation_id, &message_id, request, events),
             AdapterCommand::LoadChats {
                 protocol: ProtocolId::Signal,
             } => self.load_chats(events),
@@ -465,6 +547,10 @@ impl ProtocolAdapter for SignalAdapter {
             }),
         }
     }
+
+    fn view_chat(&mut self, conversation_id: Option<&str>, _events: &EventTx) {
+        self.viewed = conversation_id.map(str::to_string);
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +559,7 @@ mod tests {
 
     use super::*;
     use crate::adapter::AdapterEvent;
+    use crate::adapter::ProtocolAdapter;
     use crate::adapter::{ChatMessage, Conversation};
     use device::FakeDevice;
     use tokio::sync::mpsc::unbounded_channel;
@@ -488,6 +575,7 @@ mod tests {
             order: 1,
             last_at: 0,
             is_group: false,
+            writable: true,
         }
     }
 
@@ -523,11 +611,21 @@ mod tests {
     }
 
     #[test]
+    fn view_chat_records_the_open_thread() {
+        let mut adapter = SignalAdapter::new();
+        let (tx, _rx) = unbounded_channel();
+        adapter.view_chat(Some("chat-1"), &tx);
+        assert_eq!(adapter.viewed.as_deref(), Some("chat-1"));
+        adapter.view_chat(None, &tx);
+        assert!(adapter.viewed.is_none());
+    }
+
+    #[test]
     fn begin_link_without_notice_is_refused() {
         let (tx, mut rx) = unbounded_channel();
         let mut adapter = fake();
         let error = adapter
-            .handle(AdapterCommand::SignalBeginLink, &tx)
+            .handle(AdapterCommand::SignalBeginLink { generation: 1 }, &tx)
             .expect_err("notice");
         assert!(matches!(error, AdapterError::Refused { .. }));
         let debug = format!("{error:?} {:?}", drain(&mut rx));
@@ -568,7 +666,7 @@ mod tests {
             .handle(AdapterCommand::SignalAcknowledgeNotice, &tx)
             .expect("ack");
         let error = adapter
-            .handle(AdapterCommand::SignalBeginLink, &tx)
+            .handle(AdapterCommand::SignalBeginLink { generation: 1 }, &tx)
             .expect_err("feature off");
         assert!(matches!(error, AdapterError::Unavailable { .. }));
         let debug = format!("{error:?} {:?}", drain(&mut rx));
@@ -583,7 +681,7 @@ mod tests {
             .handle(AdapterCommand::SignalAcknowledgeNotice, &tx)
             .expect("ack");
         adapter
-            .handle(AdapterCommand::SignalBeginLink, &tx)
+            .handle(AdapterCommand::SignalBeginLink { generation: 1 }, &tx)
             .expect("link");
         let linked = drain(&mut rx);
         let qr = linked.iter().find_map(|event| match event {
@@ -688,16 +786,16 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AdapterEvent::SendRejected { request: 2, .. }))
         );
-        let command_debug = format!("{:?}", AdapterCommand::SignalBeginLink);
-        assert_eq!(command_debug, "SignalBeginLink");
+        let command_debug = format!("{:?}", AdapterCommand::SignalBeginLink { generation: 1 });
+        assert_eq!(command_debug, "SignalBeginLink { generation: 1 }");
         assert!(!command_debug.contains("fixture reply"));
     }
 
     #[test]
     fn commands_carry_no_provisioning_material() {
         assert_eq!(
-            format!("{:?}", AdapterCommand::SignalBeginLink),
-            "SignalBeginLink"
+            format!("{:?}", AdapterCommand::SignalBeginLink { generation: 1 }),
+            "SignalBeginLink { generation: 1 }"
         );
         assert_eq!(
             format!("{:?}", AdapterCommand::SignalAcknowledgeNotice),

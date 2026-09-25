@@ -967,7 +967,7 @@ mod tests {
                 got,
                 vec![
                     AdapterCommand::SignalAcknowledgeNotice,
-                    AdapterCommand::SignalBeginLink
+                    AdapterCommand::SignalBeginLink { generation: 1 }
                 ]
             );
         } else {

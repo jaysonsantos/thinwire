@@ -305,7 +305,10 @@ pub enum AdapterCommand {
     SignalAcknowledgeNotice,
     /// Asks the worker to start local-only secondary-device linking.
     /// The provisioning URL is not a field. It leaves later as a redacted event.
-    SignalBeginLink,
+    /// `generation` is the pairing the core assigned. The QR carries the same value.
+    SignalBeginLink {
+        generation: u64,
+    },
     /// Stops local-only linking and clears the in-memory notice acknowledgement.
     SignalCancelLink,
 }
@@ -328,9 +331,9 @@ impl AdapterCommand {
             Self::WhatsAppAcknowledgeRisk
             | Self::WhatsAppBeginLink { .. }
             | Self::WhatsAppCancelLink => ProtocolId::WhatsApp,
-            Self::SignalAcknowledgeNotice | Self::SignalBeginLink | Self::SignalCancelLink => {
-                ProtocolId::Signal
-            }
+            Self::SignalAcknowledgeNotice
+            | Self::SignalBeginLink { .. }
+            | Self::SignalCancelLink => ProtocolId::Signal,
         }
     }
 }

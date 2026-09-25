@@ -29,8 +29,8 @@ use super::path::{prepare_session_dir, signal_session_path};
 use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::CancelWake;
 use crate::adapter::{
-    AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx, ProtocolId,
-    RedactedPairingSecret, emit_conversation, emit_message, emit_status,
+    AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
+    ProtocolId, RedactedPairingSecret, emit_account, emit_conversation, emit_message, emit_status,
 };
 
 const DATA_DIR_MISSING: &str =
@@ -53,6 +53,8 @@ pub(super) struct Session {
     active: AtomicBool,
     outbound: Mutex<Option<mpsc::UnboundedSender<Outbound>>>,
     cancel: CancelWake,
+    pairing: AtomicU64,
+    sent: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Session {
@@ -62,7 +64,28 @@ impl Session {
             active: AtomicBool::new(false),
             outbound: Mutex::new(None),
             cancel: CancelWake::new(),
+            pairing: AtomicU64::new(0),
+            sent: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    pub(super) fn set_pairing(&self, generation: u64) {
+        self.pairing.store(generation, Ordering::SeqCst);
+    }
+
+    fn pairing(&self) -> u64 {
+        self.pairing.load(Ordering::SeqCst)
+    }
+
+    pub(super) async fn remember(&self, message_id: &str, body: &str) {
+        self.sent
+            .lock()
+            .await
+            .insert(message_id.to_string(), body.to_string());
+    }
+
+    pub(super) async fn recall(&self, message_id: &str) -> Option<String> {
+        self.sent.lock().await.get(message_id).cloned()
     }
 
     pub(super) fn next_generation(&self) -> u64 {
@@ -96,6 +119,11 @@ impl Session {
 }
 
 pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
+    run_linked(Arc::clone(&session), token, events.clone()).await;
+    emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
+}
+
+async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
     if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
         return;
@@ -162,6 +190,7 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
         session.active.store(false, Ordering::SeqCst);
         return;
     }
+    emit_account(&events, ProtocolId::Signal, AccountState::Linked);
     if publish_chats(&manager, &events).await.is_err() {
         fail(&events, SYNC_FAILED);
         session.active.store(false, Ordering::SeqCst);
@@ -184,6 +213,7 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
             if let StreamPoll::Reconnect { after } =
                 receive.on_open_failed(session.is_current(token))
             {
+                emit_account(&events, ProtocolId::Signal, AccountState::Linking);
                 emit_status(
                     &events,
                     ProtocolId::Signal,
@@ -200,6 +230,7 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
         };
         if relink.on_stream() {
             names = contact_names(&manager).await;
+            emit_account(&events, ProtocolId::Signal, AccountState::Linked);
             emit_status(
                 &events,
                 ProtocolId::Signal,
@@ -242,6 +273,7 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
             }
         }
         if let Some(after) = reconnect_after {
+            emit_account(&events, ProtocolId::Signal, AccountState::Linking);
             emit_status(
                 &events,
                 ProtocolId::Signal,
@@ -257,7 +289,10 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
         if let Some(outbound) = pending {
             let request = outbound.request;
             let conversation_id = outbound.conversation_id.clone();
-            if send_text(&mut manager, &outbound, &events).await.is_err() {
+            if send_text(&mut manager, &session, &outbound, &events)
+                .await
+                .is_err()
+            {
                 crate::adapter::emit_send_rejected(
                     &events,
                     ProtocolId::Signal,
@@ -290,7 +325,7 @@ async fn link_new(
             Ok(url) if session.is_current(token) => {
                 let _ = events.send(AdapterEvent::SignalQr {
                     code: RedactedPairingSecret::new(url.to_string()),
-                    generation: token,
+                    generation: session.pairing(),
                 });
                 Ok(())
             }
@@ -358,6 +393,7 @@ fn conversation_from_contact(contact: &Contact) -> Conversation {
         order: i64::from(contact.inbox_position),
         last_at: 0,
         is_group: false,
+        writable: true,
     }
 }
 
@@ -373,6 +409,7 @@ fn conversation_from_group(key: &[u8], group: &Group) -> Conversation {
         order: 0,
         last_at: 0,
         is_group: chat.is_group,
+        writable: true,
     }
 }
 
@@ -424,6 +461,7 @@ fn emit_content(events: &EventTx, content: &Content, names: &HashMap<String, Str
 
 async fn send_text(
     manager: &mut Manager<SledStore, Registered>,
+    session: &Session,
     outbound: &Outbound,
     events: &EventTx,
 ) -> Result<(), ()> {
@@ -471,6 +509,8 @@ async fn send_text(
             sent_at: super::time::sent_at_secs(timestamp),
         },
     );
+    let id = format!("signal:out:{timestamp}");
+    session.remember(&id, &outbound.body).await;
     Ok(())
 }
 

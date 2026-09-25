@@ -17,6 +17,11 @@ pub(crate) trait SignalDevice: Send {
     fn chats(&mut self) -> Result<Vec<Conversation>, &'static str>;
     fn history(&mut self, conversation_id: &str) -> Result<Vec<ChatMessage>, &'static str>;
     fn send(&mut self, conversation_id: &str, body: &str) -> Result<ChatMessage, &'static str>;
+    fn resend(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<ChatMessage, &'static str>;
 }
 
 #[cfg(not(feature = "signal-local"))]
@@ -37,6 +42,14 @@ impl SignalDevice for FeatureOff {
     }
 
     fn send(&mut self, _conversation_id: &str, _body: &str) -> Result<ChatMessage, &'static str> {
+        Err(super::FEATURE_OFF)
+    }
+
+    fn resend(
+        &mut self,
+        _conversation_id: &str,
+        _message_id: &str,
+    ) -> Result<ChatMessage, &'static str> {
         Err(super::FEATURE_OFF)
     }
 }
@@ -114,5 +127,21 @@ impl SignalDevice for FakeDevice {
             .or_default()
             .push(message.clone());
         Ok(message)
+    }
+
+    fn resend(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<ChatMessage, &'static str> {
+        let body = self
+            .history
+            .get(conversation_id)
+            .and_then(|rows| rows.iter().find(|row| row.id == message_id))
+            .map(|row| row.body.clone());
+        let Some(body) = body else {
+            return Err("Signal message was not found");
+        };
+        self.send(conversation_id, &body)
     }
 }
