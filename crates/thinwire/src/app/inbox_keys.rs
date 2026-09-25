@@ -5,7 +5,7 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use thinwire_core::state::Snapshot;
 use thinwire_core::state::test_support::{ready_with_chats, telegram_chat};
 use thinwire_core::{Intent, View};
-use thinwire_protocol::AdapterEvent;
+use thinwire_protocol::{AdapterEvent, ChatMessage, Delivery, ProtocolId};
 
 use super::theme;
 use super::ui::{self, Hints};
@@ -233,5 +233,103 @@ fn arrow_down_twice_keeps_the_highlight_on_row_3() {
         harness.state().snapshot.focused_row.as_deref(),
         Some("telegram:3"),
         "the highlight stays on row 3"
+    );
+}
+
+fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
+    ChatMessage {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+        id: id.into(),
+        sender: "Ada".into(),
+        body: body.into(),
+        outbound: false,
+        delivery: Delivery::Sent,
+        sent_at,
+    }
+}
+
+#[test]
+fn older_rows_keep_message_text_inside_the_bubble() {
+    let mut state = InboxUi::ready();
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: chat_message(
+            "telegram:1:new",
+            "Hello from the latest row in this chat",
+            1_790_300_000,
+        ),
+    });
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::MessageReceived {
+            message: chat_message(
+                "telegram:1:old",
+                "Older line that must stay wide inside the bubble",
+                1_790_200_000,
+            ),
+        });
+    harness.step();
+    harness.step();
+    for (body, id) in [
+        (
+            "Hello from the latest row in this chat",
+            "bubble telegram:1:new",
+        ),
+        (
+            "Older line that must stay wide inside the bubble",
+            "bubble telegram:1:old",
+        ),
+    ] {
+        let text = harness.get_by_label(body);
+        let bubble = harness.get_by_label(id);
+        let text_rect = text.rect();
+        let bubble_rect = bubble.rect();
+        assert!(
+            bubble_rect.contains_rect(text_rect),
+            "{body} sits outside its bubble"
+        );
+        assert!(
+            text_rect.width() > 24.0,
+            "{body} wraps wider than one letter"
+        );
+    }
+}
+
+#[test]
+fn inbox_row_puts_the_title_left_and_the_badge_right() {
+    let mut state = InboxUi::ready();
+    let mut conversation = telegram_chat(1, "Zelda Title", 30);
+    conversation.preview = "zelda preview line".into();
+    conversation.unread = 4;
+    conversation.last_at = 1_790_300_000;
+    state
+        .snapshot
+        .apply(AdapterEvent::ConversationUpsert { conversation });
+    let mut harness = harness(state);
+    harness.run();
+    let title = harness
+        .get_all_by_role_and_label(egui::accesskit::Role::Label, "Zelda Title")
+        .min_by(|left, right| left.rect().left().total_cmp(&right.rect().left()))
+        .expect("inbox title");
+    let preview = harness.get_by_role_and_label(egui::accesskit::Role::Label, "zelda preview line");
+    let badge = harness
+        .get_all_by_label("unread 4")
+        .filter(|node| (node.rect().center().y - preview.rect().center().y).abs() < 24.0)
+        .max_by(|left, right| left.rect().left().total_cmp(&right.rect().left()))
+        .expect("unread badge");
+    assert!(
+        title.rect().left() <= preview.rect().left() + 2.0,
+        "the title starts with the preview"
+    );
+    assert!(
+        preview.rect().right() < badge.rect().left(),
+        "the badge sits at the right of the preview"
+    );
+    assert!(
+        title.rect().left() < badge.rect().left(),
+        "the title stays left of the badge"
     );
 }
