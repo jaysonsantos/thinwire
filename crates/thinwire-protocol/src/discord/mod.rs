@@ -882,6 +882,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_successful_send_drops_the_retry_body() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "posted once".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        let sent = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReplaced { .. })
+        })
+        .await;
+        let pending = sent
+            .iter()
+            .find_map(|event| match event {
+                AdapterEvent::MessageReplaced { old_id, .. } => Some(old_id.clone()),
+                _ => None,
+            })
+            .expect("pending id");
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = inbox_loaded(&mut rx).await;
+        adapter
+            .handle(
+                AdapterCommand::ResendMessage {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                    message_id: pending,
+                    request: 2,
+                },
+                &tx,
+            )
+            .expect("retry");
+        let retried = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 2, .. })
+        })
+        .await;
+        assert!(!retried.iter().any(|event| matches!(
+            event,
+            AdapterEvent::SendAccepted { .. } | AdapterEvent::MessageReplaced { .. }
+        )));
+        assert_eq!(api.state().sent.len(), 1);
+    }
+
+    #[tokio::test]
     async fn pending_send_uses_the_local_clock_so_it_sorts_after_history() {
         let hold = Arc::new(Notify::new());
         let mut fake = FakeDiscordApi::guild_fixture();

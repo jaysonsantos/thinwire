@@ -342,6 +342,7 @@ impl Session {
                 Ok(sent) => {
                     let row = chat_message(&conversation_id, bot_id, &sent);
                     if let Ok(mut state) = shared.lock() {
+                        state.bodies.remove(&pending_id);
                         state
                             .history
                             .entry(conversation_id.clone())
@@ -425,6 +426,7 @@ impl Session {
                 Ok(sent) => {
                     let row = chat_message(&conversation_id, bot_id, &sent);
                     if let Ok(mut state) = shared.lock() {
+                        state.bodies.remove(&message_id);
                         state
                             .history
                             .entry(conversation_id.clone())
