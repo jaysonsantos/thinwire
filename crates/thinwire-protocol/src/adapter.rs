@@ -541,6 +541,10 @@ pub struct Conversation {
     pub is_group: bool,
     /// The account may post in this chat. A read-only channel is `false`.
     pub writable: bool,
+    /// A stand-in row, not a real chat (for example a bot inbox with no
+    /// gateway yet). The shell never auto-selects it and never sends
+    /// `OpenChat` for it.
+    pub placeholder: bool,
 }
 
 /// Delivery of an outgoing message. Incoming messages are always `Sent`.

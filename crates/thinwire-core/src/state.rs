@@ -273,6 +273,17 @@ const KEYCHAIN_SLOW_AFTER: Duration = Duration::from_secs(1);
 /// The frontend also asks only when the view enters the top again (#61).
 pub const OLDER_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// Longest wait between tries of one anchor. Each try that brings nothing
+/// older doubles the wait, up to this (#67).
+pub const OLDER_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Wait before try `tries + 1` of an anchor that brought nothing `tries` times.
+fn older_wait(tries: u32) -> Duration {
+    OLDER_RETRY_DELAY
+        .saturating_mul(1 << tries.saturating_sub(1).min(16))
+        .min(OLDER_RETRY_MAX)
+}
+
 /// Center panel copy while a saved session reconnects.
 pub const RESUME_CONNECTING: &str = "Connecting to Telegram…";
 
@@ -379,7 +390,7 @@ pub struct Snapshot {
     /// Telegram chats whose last older request brought nothing older: the
     /// anchor it used and when it ended. That anchor waits
     /// `OLDER_RETRY_DELAY` (#61 review).
-    older_retry: HashMap<String, (String, Instant)>,
+    older_retry: HashMap<String, (String, Instant, u32)>,
     scroll_to_selected: bool,
     scroll_to_focused: bool,
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
@@ -666,8 +677,13 @@ impl Snapshot {
                         self.older_at_start.insert(conversation_id);
                     } else if oldest == Some(before_message_id.as_str()) {
                         // Nothing older came: do not ask this anchor at once.
+                        // A repeat on the same anchor waits longer (#67).
+                        let tries = match self.older_retry.get(&conversation_id) {
+                            Some((anchor, _, tries)) if *anchor == before_message_id => tries + 1,
+                            _ => 1,
+                        };
                         self.older_retry
-                            .insert(conversation_id, (before_message_id, Instant::now()));
+                            .insert(conversation_id, (before_message_id, Instant::now(), tries));
                     } else {
                         self.older_retry.remove(&conversation_id);
                     }
@@ -876,9 +892,11 @@ impl Snapshot {
 
     /// Move the keyboard highlight among the visible inbox rows.
     /// The open chat, its draft, and its messages stay as they are.
-    pub fn move_inbox_selection(&mut self, delta: i32) {
+    /// The row an arrow would highlight. `None` when the highlight would not change.
+    #[must_use]
+    pub fn inbox_move_target(&self, delta: i32) -> Option<String> {
         if delta == 0 {
-            return;
+            return None;
         }
         let ids: Vec<String> = self
             .visible_conversations()
@@ -886,7 +904,7 @@ impl Snapshot {
             .map(|row| row.id.clone())
             .collect();
         if ids.is_empty() {
-            return;
+            return None;
         }
         let current = self
             .focused_row
@@ -899,11 +917,24 @@ impl Snapshot {
             None => 0,
         };
         let id = ids[next].clone();
-        if self.focused_row.as_deref() == Some(id.as_str()) {
+        (self.focused_row.as_deref() != Some(id.as_str())).then_some(id)
+    }
+
+    pub fn move_inbox_selection(&mut self, delta: i32) {
+        let Some(id) = self.inbox_move_target(delta) else {
             return;
-        }
+        };
         self.focused_row = Some(id);
         self.sync_focused_row(FocusFollow::Moved);
+    }
+
+    /// Point the highlight at a row that already has keyboard focus.
+    /// The open chat stays as it is. The row is already on screen, so this does not scroll.
+    pub fn focus_inbox_row(&mut self, id: String) {
+        let visible = self.visible_conversations().iter().any(|row| row.id == id);
+        if visible {
+            self.focused_row = Some(id);
+        }
     }
 
     /// Change the selected chat. The compose text stays with the chat it was typed in.
@@ -1227,35 +1258,49 @@ impl Snapshot {
     /// `load_older` with the clock as a parameter, for tests. An anchor that
     /// brought nothing older waits `OLDER_RETRY_DELAY` from `now`.
     fn load_older_at(&mut self, now: Instant) {
-        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
-            return;
-        }
-        let Some(id) = self.selected_conversation.clone() else {
+        let Some((id, oldest)) = self.older_anchor_at(now) else {
             return;
         };
-        if self
-            .history_loading
-            .contains(&(ProtocolId::Telegram, id.clone()))
-            || self.older_loading.contains(&id)
-            || self.older_at_start.contains(&id)
-        {
-            return;
-        }
-        let Some(oldest) = self.selected_messages().first().map(|row| row.id.clone()) else {
-            return;
-        };
-        if let Some((anchor, at)) = self.older_retry.get(&id)
-            && *anchor == oldest
-            && now.saturating_duration_since(*at) < OLDER_RETRY_DELAY
-        {
-            return;
-        }
         self.older_loading.insert(id.clone());
         self.pending.push(AdapterCommand::LoadOlderMessages {
             protocol: ProtocolId::Telegram,
             conversation_id: id,
             before_message_id: oldest,
         });
+    }
+
+    /// A request for older messages of the selected chat would go out now.
+    /// A frontend checks it before it sends the intent, so a thread that
+    /// cannot scroll asks again after the wait, and not on every repaint
+    /// (#67).
+    #[must_use]
+    pub fn older_can_ask(&self) -> bool {
+        self.older_anchor_at(Instant::now()).is_some()
+    }
+
+    /// The selected chat and its oldest message, when an older request may
+    /// go out at `now`.
+    fn older_anchor_at(&self, now: Instant) -> Option<(String, String)> {
+        if self.selected_protocol != ProtocolId::Telegram || !self.telegram_authorized {
+            return None;
+        }
+        let id = self.selected_conversation.clone()?;
+        if self
+            .history_loading
+            .contains(&(ProtocolId::Telegram, id.clone()))
+            || self.older_loading.contains(&id)
+            || self.older_at_start.contains(&id)
+        {
+            return None;
+        }
+        let oldest = self.selected_messages().first()?.id.clone();
+        if let Some((anchor, at, tries)) = self.older_retry.get(&id)
+            && *anchor == oldest
+            && now.saturating_duration_since(*at) < older_wait(*tries)
+        {
+            return None;
+        }
+        Some((id, oldest))
     }
 
     /// True once after the selected row moved in the sorted list.
@@ -1685,7 +1730,12 @@ impl Snapshot {
         self.telegram_authorized = true;
         // The worker loads the main list right after Ready.
         self.chat_list_loading.insert(ProtocolId::Telegram);
-        self.select_protocol(ProtocolId::Telegram);
+        // Keep a selection the user made in another linked protocol (#70).
+        let keep = self.selected_protocol != ProtocolId::Telegram
+            && self.has_session(self.selected_protocol);
+        if !keep {
+            self.select_protocol(ProtocolId::Telegram);
+        }
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
         self.error = None;
@@ -1785,10 +1835,11 @@ impl Snapshot {
         if self.selected_conversation.is_some() {
             return;
         }
+        // A placeholder row is not a chat: never auto-select it (#70).
         if let Some(first) = self
             .conversations
             .get(&self.selected_protocol)
-            .and_then(|rows| rows.first())
+            .and_then(|rows| rows.iter().find(|row| !row.placeholder))
         {
             self.set_selected_conversation(Some(first.id.clone()));
             self.queue_open_chat();
@@ -1806,10 +1857,11 @@ impl Snapshot {
         let Some(id) = self.selected_conversation.clone() else {
             return;
         };
+        // Only a real chat loads history: never a placeholder row (#70).
         let listed = self
             .conversations
             .get(&protocol)
-            .is_some_and(|rows| rows.iter().any(|row| row.id == id));
+            .is_some_and(|rows| rows.iter().any(|row| row.id == id && !row.placeholder));
         if !listed {
             return;
         }
@@ -1895,6 +1947,11 @@ impl Snapshot {
                 // useful is selected: show it (shell plan 2).
                 if first_link || !self.protocol_linked(self.selected_protocol) {
                     self.select_protocol(protocol);
+                }
+                // A chat opened while the account was Linking did not load:
+                // load it now (#70). A duplicate in the queue is skipped.
+                if self.selected_protocol == protocol {
+                    self.queue_open_chat();
                 }
                 #[cfg(feature = "whatsapp-web")]
                 if protocol == ProtocolId::WhatsApp {
@@ -2381,6 +2438,7 @@ pub mod test_support {
             last_at: 0,
             is_group: false,
             writable: true,
+            placeholder: false,
         }
     }
 
@@ -2942,6 +3000,41 @@ mod tests {
         snapshot.apply(older_loaded(1, 50, true));
         snapshot.load_older_at(Instant::now());
         assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:40"]);
+    }
+
+    #[test]
+    fn a_short_thread_asks_again_after_the_wait_and_backs_off() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        // Anchor-only page: `more`, and nothing older came.
+        snapshot.load_older();
+        assert_eq!(older_requests(&mut snapshot).len(), 1);
+        snapshot.apply(older_loaded(1, 50, true));
+        let ended = Instant::now();
+        assert!(!snapshot.older_can_ask(), "no ask during the wait");
+        snapshot.load_older_at(ended + OLDER_RETRY_DELAY / 2);
+        assert!(older_requests(&mut snapshot).is_empty());
+        // After the wait: one more request, with no scroll gesture.
+        snapshot.load_older_at(ended + OLDER_RETRY_DELAY);
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:50"]);
+        snapshot.load_older_at(ended + OLDER_RETRY_DELAY);
+        assert!(older_requests(&mut snapshot).is_empty(), "one at a time");
+
+        // Nothing again: the wait doubles, so there is no fast loop.
+        snapshot.apply(older_loaded(1, 50, true));
+        let again = Instant::now();
+        snapshot.load_older_at(again + OLDER_RETRY_DELAY);
+        assert!(older_requests(&mut snapshot).is_empty());
+        snapshot.load_older_at(again + OLDER_RETRY_DELAY * 2);
+        assert_eq!(older_requests(&mut snapshot).len(), 1);
+        assert_eq!(older_wait(1), OLDER_RETRY_DELAY);
+        assert_eq!(older_wait(30), OLDER_RETRY_MAX, "capped");
+
+        // The start of the chat: no more asks.
+        snapshot.apply(older_loaded(1, 50, false));
+        assert!(!snapshot.older_can_ask());
+        snapshot.load_older_at(again + OLDER_RETRY_MAX * 2);
+        assert!(older_requests(&mut snapshot).is_empty());
     }
 
     #[test]
@@ -3818,6 +3911,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         };
         // A row before Ready is from a cancelled or ended client: dropped.
@@ -4288,6 +4382,7 @@ mod tests {
             last_at: 0,
             is_group: false,
             writable: true,
+            placeholder: true,
         }
     }
 
@@ -4455,6 +4550,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         });
         snapshot
@@ -4650,6 +4746,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         });
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -4664,6 +4761,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         });
         let ids: Vec<_> = snapshot
@@ -4824,6 +4922,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable: true,
+                placeholder: false,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -5248,6 +5347,7 @@ mod tests {
             last_at: 0,
             is_group: false,
             writable,
+            placeholder: false,
         }
     }
 
@@ -5837,4 +5937,109 @@ mod tests {
     }
 
     // endregion: review fixes on #68
+
+    // region: #70 selection and open-chat gaps with two protocols
+
+    fn open_chats(snapshot: &mut Snapshot) -> Vec<(ProtocolId, String)> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::OpenChat {
+                    protocol,
+                    conversation_id,
+                } => Some((protocol, conversation_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #70 case 1: auto-select skips a placeholder row; `OpenChat` goes only
+    /// to real chats.
+    #[test]
+    fn auto_select_skips_a_placeholder_row() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: discord_guild_placeholder(),
+        });
+        assert_eq!(snapshot.selected_conversation, None);
+        assert!(
+            open_chats(&mut snapshot).is_empty(),
+            "no OpenChat for a placeholder"
+        );
+        snapshot.select_conversation("discord:guild-inbox:general".into());
+        assert!(
+            open_chats(&mut snapshot).is_empty(),
+            "not on a click either"
+        );
+
+        snapshot.selected_conversation = None;
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:real", true),
+        });
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("discord:real")
+        );
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Discord, "discord:real".to_owned())]
+        );
+    }
+
+    /// #70 case 2: Telegram Ready keeps a selection in another linked protocol.
+    #[test]
+    fn telegram_ready_keeps_another_protocols_selection() {
+        let store = SecretStore::memory();
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        assert_eq!(snapshot.selected_protocol, ProtocolId::Slack);
+        complete_telegram(&mut snapshot, &store);
+        assert!(snapshot.telegram_ready());
+        assert_eq!(
+            snapshot.selected_protocol,
+            ProtocolId::Slack,
+            "the user's choice stays"
+        );
+        assert_eq!(snapshot.selected_conversation.as_deref(), Some("slack:C1"));
+
+        // With no other session selected, Telegram Ready selects Telegram.
+        let mut fresh = shell_with(&[ProtocolId::Slack]);
+        complete_telegram(&mut fresh, &store);
+        assert_eq!(fresh.selected_protocol, ProtocolId::Telegram);
+    }
+
+    /// #70 case 3: a chat opened while Linking loads when Linked arrives.
+    #[test]
+    fn linked_loads_a_chat_opened_while_linking() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C2", true),
+        });
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        snapshot.select_conversation("slack:C2".into());
+        assert!(
+            open_chats(&mut snapshot).is_empty(),
+            "commands wait for Linked"
+        );
+        link(&mut snapshot, ProtocolId::Slack);
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Slack, "slack:C2".to_owned())]
+        );
+    }
+
+    // endregion: #70
 }
