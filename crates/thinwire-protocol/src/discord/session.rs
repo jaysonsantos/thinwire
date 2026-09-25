@@ -7,13 +7,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::api::DiscordApi;
+use super::api::{DiscordApi, DiscordApiError};
 use super::inbox::{HISTORY_LIMIT, InboxChannel, chat_message, load_channels};
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
 use crate::adapter::{
-    AdapterError, AdapterEvent, AdapterStatus, ChatMessage, EventTx, ProtocolId, emit_conversation,
-    emit_conversation_removed, emit_history_loaded, emit_message, emit_message_replaced,
-    emit_notice, emit_send_accepted, emit_send_rejected, emit_status,
+    AccountState, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Delivery, EventTx,
+    ProtocolId, emit_account, emit_command_failed, emit_conversation, emit_conversation_removed,
+    emit_history_loaded, emit_message, emit_message_delivery, emit_message_replaced, emit_notice,
+    emit_send_accepted, emit_send_rejected, emit_status,
 };
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
@@ -37,6 +38,8 @@ struct Shared {
     inflight: Vec<Inflight>,
     /// Message ids from the last history page for each channel.
     history: HashMap<String, Vec<String>>,
+    /// Body of each outgoing row, so a retry can post it again.
+    bodies: HashMap<String, String>,
 }
 
 /// Drops events from a replaced session.
@@ -85,6 +88,7 @@ impl Session {
                 channels: carried,
                 inflight: Vec::new(),
                 history: HashMap::new(),
+                bodies: HashMap::new(),
             })),
             gate: Gate {
                 live: Arc::clone(live),
@@ -92,6 +96,7 @@ impl Session {
             },
             next_pending: 0,
         };
+        emit_account(events, ProtocolId::Discord, AccountState::Linking);
         emit_status(
             events,
             ProtocolId::Discord,
@@ -117,6 +122,16 @@ impl Session {
                 Ok((bot_id, channels)) => publish_channels(&shared, &events, bot_id, &channels),
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
+                    if error == DiscordApiError::Unauthorized {
+                        emit_account(&events, ProtocolId::Discord, AccountState::Unlinked);
+                    } else {
+                        emit_command_failed(
+                            &events,
+                            ProtocolId::Discord,
+                            None,
+                            format!("Discord bot inbox did not load: {error}"),
+                        );
+                    }
                     emit_status(
                         &events,
                         ProtocolId::Discord,
@@ -135,6 +150,13 @@ impl Session {
         events: &EventTx,
     ) -> Result<(), AdapterError> {
         let Some((access, bot_id)) = self.noted_access(&conversation_id, events)? else {
+            emit_command_failed(
+                events,
+                ProtocolId::Discord,
+                Some(conversation_id.clone()),
+                UNKNOWN_CHANNEL_REFUSAL,
+            );
+            emit_history_loaded(events, ProtocolId::Discord, conversation_id);
             return Ok(());
         };
         let api = Arc::clone(&self.api);
@@ -184,9 +206,10 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord history failed");
-                    emit_notice(
+                    emit_command_failed(
                         &events,
                         ProtocolId::Discord,
+                        Some(conversation_id.clone()),
                         format!("History did not load: {error}."),
                     );
                     emit_history_loaded(&events, ProtocolId::Discord, conversation_id);
@@ -228,6 +251,7 @@ impl Session {
                 conversation_id: conversation_id.clone(),
                 request,
             });
+            state.bodies.insert(pending_id.clone(), body.clone());
         }
         emit_message(
             events,
@@ -278,13 +302,92 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord send failed");
-                    let _ = events.send(AdapterEvent::MessagesRemoved {
-                        protocol: ProtocolId::Discord,
-                        conversation_id: conversation_id.clone(),
-                        message_ids: vec![pending_id],
-                    });
+                    emit_message_delivery(
+                        &events,
+                        ProtocolId::Discord,
+                        conversation_id.clone(),
+                        pending_id,
+                        Delivery::Failed,
+                    );
                     emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
                     emit_ready(&events, &format!("Send failed: {error}."));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Posts a failed outgoing row again. The shell names that row and a new request.
+    pub(crate) fn resend(
+        &mut self,
+        conversation_id: String,
+        message_id: String,
+        request: u64,
+        events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        let Some((access, bot_id)) = self.noted_access(&conversation_id, events)? else {
+            emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
+            return Ok(());
+        };
+        if !access.can_send {
+            emit_send_rejected(
+                events,
+                ProtocolId::Discord,
+                conversation_id.as_str(),
+                request,
+            );
+            emit_notice(events, ProtocolId::Discord, READ_ONLY_REFUSAL);
+            return Ok(());
+        }
+        let body = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|state| state.bodies.get(&message_id).cloned());
+        let Some(body) = body else {
+            emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
+            return Ok(());
+        };
+        let api = Arc::clone(&self.api);
+        let gate = self.gate.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            let result = api.send(access.channel_id, body).await;
+            if !gate.current() {
+                emit_message_delivery(
+                    &events,
+                    ProtocolId::Discord,
+                    conversation_id.clone(),
+                    message_id,
+                    Delivery::Failed,
+                );
+                emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
+                return;
+            }
+            match result {
+                Ok(sent) => {
+                    emit_send_accepted(
+                        &events,
+                        ProtocolId::Discord,
+                        conversation_id.as_str(),
+                        request,
+                    );
+                    emit_message_replaced(
+                        &events,
+                        message_id,
+                        chat_message(&conversation_id, bot_id, &sent),
+                    );
+                }
+                Err(error) => {
+                    tracing::info!(%error, "discord resend failed");
+                    emit_message_delivery(
+                        &events,
+                        ProtocolId::Discord,
+                        conversation_id.clone(),
+                        message_id,
+                        Delivery::Failed,
+                    );
+                    emit_send_rejected(&events, ProtocolId::Discord, conversation_id, request);
                 }
             }
         });
@@ -358,15 +461,15 @@ fn publish_channels(
         state.channels = next;
         gone
     };
-    for id in gone {
-        emit_conversation_removed(events, ProtocolId::Discord, id);
-    }
-    // Ready before the rows. The shell auto-selects the first channel on
-    // upsert and opens it only once Discord is linked.
+    emit_account(events, ProtocolId::Discord, AccountState::Linked);
+    // Ready before the rows. The shell opens a chat only once the account is linked.
     emit_ready(
         events,
         &format!("{} guild channels the bot can read.", channels.len()),
     );
+    for id in gone {
+        emit_conversation_removed(events, ProtocolId::Discord, id);
+    }
     for channel in channels {
         emit_conversation(events, channel.conversation());
     }

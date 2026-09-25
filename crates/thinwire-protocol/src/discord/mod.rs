@@ -72,7 +72,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     detail: CAPABILITY_DETAIL,
     official_api: true,
     allows_user_account_automation: false,
-    sends_text: false,
+    sends_text: cfg!(feature = "discord-bot"),
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.
@@ -89,6 +89,8 @@ pub struct DiscordAdapter {
     /// Session generation. A bump makes running tasks drop their results.
     #[cfg(any(test, feature = "discord-bot"))]
     live: Arc<AtomicU64>,
+    /// The chat `ViewChat` last named. `None` means the user left Discord.
+    viewed: Option<String>,
 }
 
 impl DiscordAdapter {
@@ -106,6 +108,7 @@ impl DiscordAdapter {
             session: None,
             #[cfg(any(test, feature = "discord-bot"))]
             live: Arc::new(AtomicU64::new(0)),
+            viewed: None,
         }
     }
 
@@ -175,14 +178,17 @@ impl DiscordAdapter {
         #[cfg(any(test, feature = "discord-bot"))]
         if let Some(factory) = &self.backend {
             match prepared {
-                None => emit_status(
-                    events,
-                    ProtocolId::Discord,
-                    AdapterStatus::Stubbed,
-                    format!(
-                        "Discord bot inbox. {BOT_TOKEN_MISSING}. Store a bot token to load guild channels. Not a personal Discord client."
-                    ),
-                ),
+                None => {
+                    emit_status(
+                        events,
+                        ProtocolId::Discord,
+                        AdapterStatus::Stubbed,
+                        format!(
+                            "Discord bot inbox. {BOT_TOKEN_MISSING}. Store a bot token to load guild channels. Not a personal Discord client."
+                        ),
+                    );
+                    emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
+                }
                 Some(token) => {
                     let api = factory(token);
                     self.session = Some(session::Session::start(api, &self.live, events, carried));
@@ -197,6 +203,7 @@ impl DiscordAdapter {
             AdapterStatus::Stubbed,
             NOT_READY_DETAIL,
         );
+        emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
         Ok(())
     }
 
@@ -244,6 +251,18 @@ impl DiscordAdapter {
             .send(conversation_id, body, request, events)
     }
 
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn resend(
+        &mut self,
+        conversation_id: String,
+        message_id: String,
+        request: u64,
+        events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        self.session_mut()?
+            .resend(conversation_id, message_id, request, events)
+    }
+
     #[cfg(not(any(test, feature = "discord-bot")))]
     fn load_chats(&mut self, _events: &EventTx) -> Result<(), AdapterError> {
         Err(not_ready())
@@ -263,6 +282,17 @@ impl DiscordAdapter {
         &mut self,
         _conversation_id: String,
         _body: String,
+        _request: u64,
+        _events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        Err(not_ready())
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn resend(
+        &mut self,
+        _conversation_id: String,
+        _message_id: String,
         _request: u64,
         _events: &EventTx,
     ) -> Result<(), AdapterError> {
@@ -317,11 +347,19 @@ impl ProtocolAdapter for DiscordAdapter {
         super::adapter::emit_stopped(events, ProtocolId::Discord);
     }
 
+    fn view_chat(&mut self, conversation_id: Option<&str>, events: &EventTx) {
+        let _ = events;
+        self.viewed = conversation_id.map(str::to_owned);
+    }
+
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         match command {
             AdapterCommand::ConnectDiscord {
                 mode: DiscordAuthMode::UserAccount,
-            } => Self::connect_user_account(),
+            } => {
+                emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
+                Self::connect_user_account()
+            }
             AdapterCommand::ConnectDiscord {
                 mode: DiscordAuthMode::Bot | DiscordAuthMode::OAuth,
             }
@@ -354,6 +392,12 @@ impl ProtocolAdapter for DiscordAdapter {
                 body,
                 request,
             } => self.send_text(conversation_id, body, request, events),
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Discord,
+                conversation_id,
+                message_id,
+                request,
+            } => self.resend(conversation_id, message_id, request, events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Discord,
                 reason: "command is not handled by the Discord adapter",
@@ -489,6 +533,7 @@ mod tests {
         let caps = DiscordAdapter::capabilities();
         assert_eq!(caps.support, SupportClass::Constrained);
         assert!(!caps.allows_user_account_automation);
+        assert_eq!(caps.sends_text, DiscordAdapter::bot_inbox_compiled());
         assert!(caps.short_label.contains("bot/OAuth"));
         assert!(!caps.detail.to_ascii_lowercase().contains("reliable"));
         assert!(caps.detail.contains("No user-account self-bots"));
@@ -498,6 +543,16 @@ mod tests {
         } else {
             assert!(caps.detail.to_ascii_lowercase().contains("not ready"));
         }
+    }
+
+    #[test]
+    fn view_chat_remembers_the_channel_the_user_looks_at() {
+        let (mut adapter, _vault) = fake_adapter(Arc::new(FakeDiscordApi::guild_fixture()), None);
+        let (tx, _rx) = unbounded_channel();
+        adapter.view_chat(Some("discord:1:2"), &tx);
+        assert_eq!(adapter.viewed.as_deref(), Some("discord:1:2"));
+        adapter.view_chat(None, &tx);
+        assert!(adapter.viewed.is_none());
     }
 
     #[test]
@@ -582,8 +637,8 @@ mod tests {
         assert_eq!(general.title, "#general");
         assert_eq!(general.participant, "Test guild");
         assert!(general.preview.contains("read and send"));
-        assert!(general.is_group);
-        assert!(rows[1].is_group);
+        assert!(general.writable);
+        assert!(!rows[1].writable);
         assert!(rows[1].preview.contains("read only"));
 
         let ready_at = events
@@ -604,6 +659,19 @@ mod tests {
             .position(|event| matches!(event, AdapterEvent::ConversationUpsert { .. }))
             .expect("channel row");
         assert!(ready_at < first_row, "ready before the inbox");
+        let linked_at = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Linked,
+                        ..
+                    }
+                )
+            })
+            .expect("linked");
+        assert!(linked_at < first_row, "linked before the inbox");
         let AdapterEvent::Status { status, detail, .. } = &events[ready_at] else {
             panic!("ready status");
         };
@@ -738,7 +806,9 @@ mod tests {
         .await;
         assert!(events.iter().any(|event| matches!(
             event,
-            AdapterEvent::Notice { detail, .. } if detail.contains("network error")
+            AdapterEvent::CommandFailed { detail, conversation_id, .. }
+                if conversation_id.as_deref() == Some(id.as_str())
+                    && detail.contains("network error")
         )));
         assert!(events.iter().any(|event| matches!(
             event,
@@ -882,15 +952,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_send_removes_the_pending_row() {
+    async fn failed_send_marks_the_row_and_a_retry_posts_it_again() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
         api.state().send_error = Some(api::DiscordApiError::Forbidden);
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let conversation_id = conversation_id(GUILD, GENERAL);
         adapter
             .handle(
                 AdapterCommand::SendText {
                     protocol: ProtocolId::Discord,
-                    conversation_id: conversation_id(GUILD, GENERAL),
+                    conversation_id: conversation_id.clone(),
                     body: "blocked".into(),
                     request: 0,
                 },
@@ -901,17 +972,44 @@ mod tests {
         let pending = messages(&events)[0].id.clone();
         assert!(events.iter().any(|event| matches!(
             event,
-            AdapterEvent::MessagesRemoved { message_ids, .. } if message_ids == &vec![pending.clone()]
+            AdapterEvent::MessageDelivery {
+                message_id,
+                delivery: crate::Delivery::Failed,
+                ..
+            } if message_id == &pending
         )));
         assert!(
             events
                 .iter()
                 .any(|event| matches!(event, AdapterEvent::SendRejected { request: 0, .. }))
         );
-        assert!(matches!(
-            events.last(),
-            Some(AdapterEvent::Status { detail, .. }) if detail.contains("Send failed")
-        ));
+        api.state().send_error = None;
+        adapter
+            .handle(
+                AdapterCommand::ResendMessage {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id.clone(),
+                    message_id: pending.clone(),
+                    request: 3,
+                },
+                &tx,
+            )
+            .expect("retry");
+        let retried = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReplaced { .. })
+        })
+        .await;
+        assert!(
+            retried
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendAccepted { request: 3, .. }))
+        );
+        assert!(retried.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageReplaced { old_id, message, .. }
+                if old_id == &pending && message.body == "blocked"
+        )));
+        assert_eq!(api.state().sent, vec![(GENERAL, "blocked".to_string())]);
     }
 
     #[tokio::test]
@@ -1328,10 +1426,14 @@ mod tests {
                 ..
             }
         ));
-        assert!(
-            rx.try_recv().is_err(),
-            "refusal must not emit a connect event"
-        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AdapterEvent::Account {
+                protocol: ProtocolId::Discord,
+                state: AccountState::Unlinked,
+            })
+        ));
+        assert!(rx.try_recv().is_err(), "refusal does not start a session");
     }
 
     #[test]
