@@ -267,8 +267,8 @@ where
     /// Channel the user is looking at. Inbound messages there stay read.
     viewing: Option<String>,
     /// Texts this session has shown, newest kept, so a delete can move the preview.
-    /// The flag is true when that post increased `unread`.
-    shown: HashMap<String, Vec<(String, String, bool)>>,
+    /// `counted` is true when that post increased `unread`.
+    shown: HashMap<String, Vec<Shown>>,
 }
 
 impl<A, S, B> Session<A, S, B>
@@ -814,12 +814,7 @@ where
         if let Some((order, sent_at, preview)) = newest {
             self.note_latest(channel, order, sent_at, &preview);
         }
-        if let Some(row) = self.channels.get_mut(channel)
-            && row.unread != 0
-        {
-            row.unread = 0;
-            emit_conversation(&self.events, row.clone());
-        }
+        self.mark_channel_read(channel);
         emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
     }
 
@@ -832,22 +827,14 @@ where
         let Some(channel) = channel else {
             return;
         };
-        let Some(row) = self.channels.get(&channel) else {
-            return;
-        };
-        if row.unread == 0 {
-            return;
-        }
-        let mut row = row.clone();
-        row.unread = 0;
-        self.upsert(channel, row);
+        self.mark_channel_read(&channel);
     }
 
     async fn resend(&mut self, conversation: &str, message_id: &str, request: u64) {
         let text = channel_id(conversation).and_then(|channel| {
             self.shown.get(channel).and_then(|rows| {
-                rows.iter().find_map(|(ts, text, _)| {
-                    (message_id == message_id_of(channel, ts)).then(|| text.clone())
+                rows.iter().find_map(|row| {
+                    (message_id == message_id_of(channel, &row.ts)).then(|| row.text.clone())
                 })
             })
         });
@@ -903,9 +890,9 @@ where
             text,
         );
         if let Some(rows) = self.shown.get_mut(channel)
-            && let Some(row) = rows.iter_mut().find(|(seen, _, _)| seen == ts)
+            && let Some(row) = rows.iter_mut().find(|row| row.ts == ts)
         {
-            row.1 = text.to_string();
+            row.text = text.to_string();
         }
         let Some(row) = self.channels.get(channel) else {
             return;
@@ -935,8 +922,8 @@ where
         }
         let next = self.shown.get(channel).and_then(|rows| {
             rows.iter()
-                .max_by_key(|(seen, _, _)| ts_rank(seen))
-                .map(|(seen, text, _)| (seen.clone(), text.clone()))
+                .max_by_key(|row| ts_rank(&row.ts))
+                .map(|row| (row.ts.clone(), row.text.clone()))
         });
         let mut row = row.clone();
         if counted {
@@ -968,6 +955,7 @@ where
         let token = live.token.clone();
         let channel = post.channel.clone();
         let post_ts = post.ts.clone();
+        let duplicate = self.already_seen(&post);
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
         let message = self.chat_message(&token, post).await;
@@ -989,7 +977,9 @@ where
                 title,
                 participant: "workspace".into(),
                 preview,
-                unread: u32::from(!outbound && self.viewing.as_deref() != Some(channel.as_str())),
+                unread: u32::from(
+                    !duplicate && !outbound && self.viewing.as_deref() != Some(channel.as_str()),
+                ),
                 order,
                 last_at: sent_at,
                 is_group: !channel.starts_with('D'),
@@ -1014,7 +1004,7 @@ where
             row.order = order;
             row.last_at = sent_at;
         }
-        if !outbound && self.viewing.as_deref() != Some(channel.as_str()) {
+        if !duplicate && !outbound && self.viewing.as_deref() != Some(channel.as_str()) {
             row.unread = row.unread.saturating_add(1);
             self.count_unread(&channel, &post_ts);
         }
@@ -1025,26 +1015,64 @@ where
         let Some(rows) = self.shown.get_mut(channel) else {
             return false;
         };
-        let counted = rows.iter().any(|(seen, _, unread)| seen == ts && *unread);
-        rows.retain(|(seen, _, _)| seen != ts);
+        let counted = rows.iter().any(|row| row.ts == ts && row.counted);
+        rows.retain(|row| row.ts != ts);
         counted
     }
 
     fn count_unread(&mut self, channel: &str, ts: &str) {
         if let Some(rows) = self.shown.get_mut(channel)
-            && let Some(row) = rows.iter_mut().find(|(seen, _, _)| seen == ts)
+            && let Some(row) = rows.iter_mut().find(|row| row.ts == ts)
         {
-            row.2 = true;
+            row.counted = true;
         }
+    }
+
+    fn mark_channel_read(&mut self, channel: &str) {
+        if let Some(rows) = self.shown.get_mut(channel) {
+            for row in rows {
+                row.counted = false;
+            }
+        }
+        let Some(row) = self.channels.get(channel) else {
+            return;
+        };
+        if row.unread == 0 {
+            return;
+        }
+        let mut row = row.clone();
+        row.unread = 0;
+        self.upsert(channel.to_string(), row);
+    }
+
+    fn already_seen(&self, post: &SlackPost) -> bool {
+        let Some(rows) = self.shown.get(&post.channel) else {
+            return false;
+        };
+        rows.iter().any(|row| {
+            row.ts == post.ts
+                || same_client_msg(row.client_msg_id.as_deref(), post.client_msg_id.as_deref())
+        })
     }
 
     fn remember(&mut self, post: &SlackPost) {
         let rows = self.shown.entry(post.channel.clone()).or_default();
-        if let Some(row) = rows.iter_mut().find(|(ts, _, _)| ts == &post.ts) {
-            row.1.clone_from(&post.text);
+        if let Some(row) = rows.iter_mut().find(|row| {
+            row.ts == post.ts
+                || same_client_msg(row.client_msg_id.as_deref(), post.client_msg_id.as_deref())
+        }) {
+            row.text.clone_from(&post.text);
+            if row.client_msg_id.is_none() {
+                row.client_msg_id.clone_from(&post.client_msg_id);
+            }
             return;
         }
-        rows.push((post.ts.clone(), post.text.clone(), false));
+        rows.push(Shown {
+            ts: post.ts.clone(),
+            text: post.text.clone(),
+            counted: false,
+            client_msg_id: post.client_msg_id.clone(),
+        });
         let cap = usize::from(HISTORY_LIMIT);
         if rows.len() > cap {
             let extra = rows.len() - cap;
@@ -1073,6 +1101,20 @@ where
             delivery: Delivery::Sent,
             sent_at: ts_order(&post.ts),
         }
+    }
+}
+
+struct Shown {
+    ts: String,
+    text: String,
+    counted: bool,
+    client_msg_id: Option<String>,
+}
+
+fn same_client_msg(stored: Option<&str>, incoming: Option<&str>) -> bool {
+    match (stored, incoming) {
+        (Some(stored), Some(incoming)) => !stored.is_empty() && stored == incoming,
+        _ => false,
     }
 }
 

@@ -117,6 +117,8 @@ pub struct SlackPost {
     /// Display name Slack sent with the message (bots, integrations).
     pub username: Option<String>,
     pub text: String,
+    /// Sender id Slack uses to collapse a redelivery of the same post.
+    pub client_msg_id: Option<String>,
 }
 
 /// Recoverable Slack failure. Display never includes tokens or message text.

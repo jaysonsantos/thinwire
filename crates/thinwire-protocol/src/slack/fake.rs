@@ -117,7 +117,14 @@ fn post(channel: &str, ts: &str, user: &str, text: &str) -> SlackPost {
         user: Some(user.into()),
         username: None,
         text: text.into(),
+        client_msg_id: None,
     }
+}
+
+fn post_id(channel: &str, ts: &str, user: &str, text: &str, client_msg_id: &str) -> SlackPost {
+    let mut post = post(channel, ts, user, text);
+    post.client_msg_id = Some(client_msg_id.into());
+    post
 }
 
 impl SlackWebApi for FakeApi {
@@ -1135,6 +1142,107 @@ async fn an_older_socket_event_does_not_replace_the_preview() {
     assert_eq!(message.body, "older");
     let row = h.conversation("slack:C1").await;
     assert_eq!(row.preview, "newer");
+}
+
+#[tokio::test]
+async fn opening_a_channel_clears_unread_marks() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000500.000100",
+        "U1",
+        "read me",
+    )));
+    h.until("badge", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.unread == 1
+        )
+    })
+    .await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.until("read", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.unread == 0
+        )
+    })
+    .await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000501.000100",
+        "U1",
+        "later",
+    )));
+    h.until("later badge", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.unread == 1 && conversation.preview == "later"
+        )
+    })
+    .await;
+    h.socket.push(SlackInbound::Deleted {
+        channel: "C1".into(),
+        ts: "1700000500.000100".into(),
+    });
+    h.until("deleted", |event| {
+        matches!(
+            event,
+            AdapterEvent::MessagesRemoved { message_ids, .. }
+                if message_ids.iter().any(|id| id.contains("1700000500"))
+        )
+    })
+    .await;
+    let unread = h.seen.iter().rev().find_map(|event| match event {
+        AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C1" => {
+            Some(conversation.unread)
+        }
+        _ => None,
+    });
+    assert_eq!(unread, Some(1));
+}
+
+#[tokio::test]
+async fn a_redelivered_slack_event_does_not_raise_unread_again() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    let first = post_id("C1", "1700000600.000100", "U1", "once", "client-1");
+    h.socket.push(SlackInbound::Message(first.clone()));
+    h.until("one", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.unread == 1
+        )
+    })
+    .await;
+    h.socket.push(SlackInbound::Message(first));
+    h.message("once").await;
+    let again = post_id("C1", "1700000601.000100", "U1", "same id", "client-1");
+    h.socket.push(SlackInbound::Message(again));
+    h.message("same id").await;
+    let unread = h.seen.iter().rev().find_map(|event| match event {
+        AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C1" => {
+            Some(conversation.unread)
+        }
+        _ => None,
+    });
+    assert_eq!(unread, Some(1));
 }
 
 #[tokio::test]

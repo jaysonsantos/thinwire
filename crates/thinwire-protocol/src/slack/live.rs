@@ -277,6 +277,7 @@ impl SlackWebApi for MorphismWebApi {
                 user: message.sender.user.map(|user| user.to_string()),
                 username: message.sender.username,
                 text: body(message.content.text),
+                client_msg_id: client_msg_id(&message.origin),
             })
             .collect())
     }
@@ -309,6 +310,7 @@ impl SlackWebApi for MorphismWebApi {
                 .or_else(|| self.bot_user()),
             username: None,
             text: text.to_string(),
+            client_msg_id: None,
         })
     }
 
@@ -366,6 +368,14 @@ fn edit_or_delete(message: &SlackMessageEvent) -> Option<SlackInbound> {
 
 /// Channel view: allow-listed subtypes, including a thread reply that was also
 /// sent to the channel. A reply that stays in the thread is dropped.
+fn client_msg_id(origin: &SlackMessageOrigin) -> Option<String> {
+    origin
+        .client_msg_id
+        .as_ref()
+        .map(|id| id.0.clone())
+        .filter(|id| !id.is_empty())
+}
+
 fn shown_in_channel(subtype: Option<&SlackMessageEventType>, origin: &SlackMessageOrigin) -> bool {
     matches!(subtype, Some(SlackMessageEventType::ThreadBroadcast))
         || (shown_subtype(subtype) && !is_thread_reply(origin))
@@ -530,6 +540,7 @@ async fn on_push(
                     user: message.sender.user.map(|user| user.to_string()),
                     username: message.sender.username,
                     text: body(message.content.and_then(|content| content.text)),
+                    client_msg_id: client_msg_id(&message.origin),
                 })
             }
         }

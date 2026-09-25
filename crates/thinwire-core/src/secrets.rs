@@ -551,15 +551,23 @@ impl SecretStore {
     }
 
     fn flush_os(&self) -> Result<(), SecretError> {
-        self.flush_loop(|snapshot| {
-            for (key, value) in snapshot {
-                match value {
-                    Some(value) => os_set(*key, value)?,
-                    None => os_delete(*key)?,
-                }
+        self.flush_loop(|snapshot| self.write_keychain(snapshot))
+    }
+
+    /// Telegram, Discord, and Slack writes share one in-flight guard. A second
+    /// flush stays deferred until this snapshot, including Slack, has finished.
+    fn write_keychain(&self, snapshot: &FlushSnapshot) -> Result<(), SecretError> {
+        let probing = flush_probe_installed();
+        run_flush_probe();
+        if probing {
+            return Ok(());
+        }
+        for (key, value) in snapshot {
+            match value {
+                Some(value) => os_set(*key, value)?,
+                None => os_delete(*key)?,
             }
-            Ok(())
-        })?;
+        }
         self.flush_discord_token()?;
         self.flush_slack()
     }
@@ -776,6 +784,30 @@ impl SecretStore {
 }
 
 type FlushSnapshot = [(SecretKey, Option<String>); 4];
+
+#[cfg(test)]
+fn flush_probe_installed() -> bool {
+    FLUSH_PROBE.lock().expect("flush probe").is_some()
+}
+
+#[cfg(not(test))]
+fn flush_probe_installed() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn run_flush_probe() {
+    let probe = FLUSH_PROBE.lock().expect("flush probe").clone();
+    if let Some(probe) = probe {
+        probe();
+    }
+}
+
+#[cfg(not(test))]
+fn run_flush_probe() {}
+
+#[cfg(test)]
+static FLUSH_PROBE: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
 
 impl SlackSecretVault for SecretStore {
     fn get_secret(&self, key: SlackSecretKey) -> Option<String> {
@@ -1740,6 +1772,37 @@ mod tests {
         assert_eq!(store.request_flush(), FlushAction::Defer);
         store.finish_in_flight_flush_for_test();
         assert_eq!(store.request_flush(), FlushAction::Spawn);
+    }
+
+    #[test]
+    fn a_second_flush_waits_until_slack_keychain_writes_finish() {
+        let store = Arc::new(SecretStore::blank(AttachPhase::Ready));
+        store.set(SecretKey::ApiId, "11111").expect("set");
+        SlackSecretVault::set_secret(store.as_ref(), SlackSecretKey::BotToken, "xoxb-fixture");
+        assert_eq!(store.request_flush(), FlushAction::Spawn);
+
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let started_probe = Arc::clone(&started);
+        let release_probe = Arc::clone(&release);
+        let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked_probe = Arc::clone(&parked);
+        *FLUSH_PROBE.lock().expect("probe") = Some(Arc::new(move || {
+            if parked_probe.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            started_probe.wait();
+            release_probe.wait();
+        }));
+
+        let worker_store = Arc::clone(&store);
+        let worker = std::thread::spawn(move || worker_store.flush_os());
+        started.wait();
+        SlackSecretVault::set_secret(store.as_ref(), SlackSecretKey::BotToken, "");
+        assert_eq!(store.request_flush(), FlushAction::Defer);
+        release.wait();
+        let _ = worker.join().expect("flush worker");
+        *FLUSH_PROBE.lock().expect("probe") = None;
     }
 
     #[test]
