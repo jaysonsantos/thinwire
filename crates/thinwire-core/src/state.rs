@@ -412,6 +412,9 @@ pub struct Snapshot {
     seen_visible_ids: Vec<String>,
     /// Unsent compose text per chat. `compose` holds the selected chat's draft.
     drafts: HashMap<(ProtocolId, String), String>,
+    /// Body of a send the adapter rejected, until that protocol's session ends.
+    /// An unlink keeps only these. A Telegram session end drops them.
+    rejected_bodies: HashMap<(ProtocolId, String), String>,
     focus_compose: bool,
     /// Protocols that answered `Shutdown` with `Stopped`.
     stopped: HashSet<ProtocolId>,
@@ -542,6 +545,7 @@ impl Snapshot {
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
+            rejected_bodies: HashMap::new(),
             focus_compose: false,
             stopped: HashSet::new(),
             sends: SendTracker::default(),
@@ -1684,7 +1688,11 @@ impl Snapshot {
             let _ = self.sends.settle_expired(protocol, chat, request);
         }
         match settled {
-            Some(Pending::Send { .. }) => {
+            Some(Pending::Send { body, .. }) => {
+                if !body.is_empty() {
+                    self.rejected_bodies
+                        .insert((protocol, chat.to_owned()), body);
+                }
                 let next = self.resend_hint(protocol, chat, false);
                 self.set_error("Message not sent.", &why, &next);
             }
@@ -2131,23 +2139,30 @@ impl Snapshot {
     }
 
     /// The session of one protocol ended (shell plan 8): drop its rows,
-    /// messages, spinners, notes, and sends. Unsent text stays in that
-    /// protocol's drafts so a rejected send can be posted again after the
-    /// next link. Another linked protocol takes the selection.
+    /// messages, spinners, notes, and sends. Another linked protocol takes
+    /// the selection. Drafts of this protocol go too, except the body of a
+    /// send this session rejected. A Telegram session end drops those as
+    /// well: the next account on this machine must not see them.
     fn end_session(&mut self, protocol: ProtocolId) {
         if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
             row.state = AccountState::Unlinked;
         }
         self.sessions.remove(&protocol);
         self.conversations.remove(&protocol);
-        // The open compose field is this protocol's draft. Park it before the
-        // selection goes, or a 401 that unlinks would drop the rejected text.
-        if self.selected_protocol == protocol
-            && let Some(id) = self.selected_conversation.clone()
-            && !self.compose.is_empty()
-        {
-            self.drafts
-                .insert((protocol, id), std::mem::take(&mut self.compose));
+        let keep: Vec<(String, String)> = if protocol == ProtocolId::Telegram {
+            Vec::new()
+        } else {
+            self.rejected_bodies
+                .iter()
+                .filter(|((owner, _), _)| *owner == protocol)
+                .map(|((_, chat), body)| (chat.clone(), body.clone()))
+                .collect()
+        };
+        self.rejected_bodies
+            .retain(|(owner, _), _| *owner != protocol);
+        self.drafts.retain(|(owner, _), _| *owner != protocol);
+        for (chat, body) in keep {
+            self.drafts.insert((protocol, chat), body);
         }
         self.messages.retain(|(owner, _), _| *owner != protocol);
         self.history_loading.retain(|(owner, _)| *owner != protocol);
@@ -5179,6 +5194,10 @@ mod tests {
         );
         assert!(snapshot.selected_messages().is_empty());
         assert!(snapshot.compose.is_empty());
+        assert!(
+            snapshot.drafts.is_empty(),
+            "a remote logout drops every draft"
+        );
         assert!(snapshot.can_add_account(), "Add account is back");
         assert_eq!(snapshot.status_text, SESSION_ENDED_NOTICE);
         assert_eq!(
@@ -5201,6 +5220,33 @@ mod tests {
             snapshot.take_commands().is_empty(),
             "a second end does nothing"
         );
+    }
+
+    /// The next Telegram account on this machine must not see the previous
+    /// account's unsent text, even for the same chat id.
+    #[test]
+    fn a_relink_after_telegram_logout_shows_an_empty_compose() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "old account".into();
+        snapshot.set_draft(ProtocolId::Telegram, "telegram:2", "other chat".into());
+        snapshot.apply(AdapterEvent::TelegramSessionEnded);
+        assert!(snapshot.drafts.is_empty());
+        assert!(snapshot.compose.is_empty());
+
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 10),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 5),
+        });
+        snapshot.select_conversation("telegram:1".into());
+        assert!(snapshot.compose.is_empty());
+        snapshot.select_conversation("telegram:2".into());
+        assert!(snapshot.compose.is_empty());
     }
 
     #[test]
@@ -6061,6 +6107,7 @@ mod tests {
         });
         snapshot.selected_conversation = Some("discord:1:2".into());
         snapshot.compose = "keep me".into();
+        snapshot.set_draft(ProtocolId::Discord, "discord:9:9", "other chat".into());
         snapshot.send_compose();
         let request = snapshot
             .take_commands()
@@ -6079,6 +6126,19 @@ mod tests {
             protocol: ProtocolId::Discord,
             state: AccountState::Unlinked,
         });
+        assert_eq!(
+            snapshot
+                .drafts
+                .get(&(ProtocolId::Discord, "discord:1:2".into()))
+                .map(String::as_str),
+            Some("keep me"),
+        );
+        assert!(
+            !snapshot
+                .drafts
+                .contains_key(&(ProtocolId::Discord, "discord:9:9".into())),
+            "only the rejected send stays"
+        );
         link(&mut snapshot, ProtocolId::Discord);
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Discord, "discord:1:2", true),
