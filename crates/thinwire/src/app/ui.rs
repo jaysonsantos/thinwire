@@ -473,35 +473,13 @@ fn account_chip(
         child.add_space(space::S);
         unread_badge(&mut child, &text);
     }
-    let response = ui
-        .interact(
-            rect,
-            ui.id().with(("account-chip", caps.id)),
-            egui::Sense::click(),
-        )
-        .on_hover_ui(|ui| {
-            ui.colored_label(palette.support(caps.support), caps.short_label);
-            ui.label(format!("status: {}", account.status.as_str()));
-        });
-    let slack_sign_in = caps.id == ProtocolId::Slack && cfg!(feature = "slack-oauth");
-    if caps.id == ProtocolId::Signal && cfg!(feature = "signal-local") {
-        ui.label(
-            RichText::new("local build only — not in releases")
-                .small()
-                .weak(),
-        );
-    } else if caps.id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web") {
-        ui.label(
-            RichText::new("experimental spike — ban risk")
-                .small()
-                .weak(),
-        );
-    } else if !matches!(caps.id, ProtocolId::Telegram) && !slack_sign_in {
-        ui.label(
-            RichText::new("not ready — no login UI this beat")
-                .small()
-                .weak(),
-        );
+    let response = ui.interact(
+        rect,
+        ui.id().with(("account-chip", caps.id)),
+        egui::Sense::click(),
+    );
+    if let Some(note) = account_footnote(caps.id, account.linked()) {
+        ui.label(RichText::new(note).small().weak());
     }
     response.clicked()
 }
@@ -857,6 +835,25 @@ fn badge_text(unread: u32) -> Option<String> {
         0 => None,
         1..=99 => Some(unread.to_string()),
         _ => Some("99+".to_owned()),
+    }
+}
+
+/// Line under an account chip. A linked account has no "not ready" note.
+/// Signal and WhatsApp keep their risk lines. The chip itself shows the
+/// status, so a hover popup is not drawn over the next account.
+#[must_use]
+fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
+    if id == ProtocolId::Signal && cfg!(feature = "signal-local") {
+        return Some("local build only — not in releases");
+    }
+    if id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web") {
+        return Some("experimental spike — ban risk");
+    }
+    let slack_sign_in = id == ProtocolId::Slack && cfg!(feature = "slack-oauth");
+    if linked || id == ProtocolId::Telegram || slack_sign_in {
+        None
+    } else {
+        Some("not ready — no login UI this beat")
     }
 }
 
@@ -2136,6 +2133,24 @@ mod tests {
         row.status = AdapterStatus::Error;
         let account = snapshot.accounts[0].clone();
         assert_eq!(chip_label(&snapshot, &account), "Connection problem");
+    }
+
+    #[test]
+    fn a_linked_account_has_no_not_ready_line() {
+        use super::account_footnote;
+        use thinwire_protocol::ProtocolId;
+
+        assert_eq!(
+            account_footnote(ProtocolId::Discord, true),
+            None,
+            "a linked Discord bot is not 'not ready'"
+        );
+        assert_eq!(
+            account_footnote(ProtocolId::Discord, false),
+            Some("not ready — no login UI this beat")
+        );
+        assert_eq!(account_footnote(ProtocolId::Telegram, false), None);
+        assert_eq!(account_footnote(ProtocolId::Slack, true), None);
     }
 
     #[test]
