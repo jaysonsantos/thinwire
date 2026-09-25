@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use super::path::{prepare_session_dir, signal_session_path};
 use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
-use super::wake::CancelWake;
+use super::wake::AttemptCancel;
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
     ProtocolId, RedactedPairingSecret, emit_account, emit_conversation, emit_message, emit_status,
@@ -64,7 +64,7 @@ pub(super) struct Session {
     generation: AtomicU64,
     active: AtomicBool,
     outbound: Mutex<Option<mpsc::UnboundedSender<WorkerJob>>>,
-    cancel: CancelWake,
+    cancel: std::sync::Mutex<AttemptCancel>,
     pairing: AtomicU64,
     sent: Mutex<std::collections::HashMap<String, String>>,
     groups: Mutex<super::group::GroupKeys>,
@@ -76,7 +76,7 @@ impl Session {
             generation: AtomicU64::new(0),
             active: AtomicBool::new(false),
             outbound: Mutex::new(None),
-            cancel: CancelWake::new(),
+            cancel: std::sync::Mutex::new(AttemptCancel::new()),
             pairing: AtomicU64::new(0),
             sent: Mutex::new(std::collections::HashMap::new()),
             groups: Mutex::new(super::group::GroupKeys::default()),
@@ -110,23 +110,24 @@ impl Session {
         self.groups.lock().await.key(id)
     }
 
-    /// Drop a cancel permit left by a worker that was not waiting.
-    pub(super) fn clear_cancel(&self) {
-        self.cancel.clear();
-    }
-
-    /// Advance the generation. This does not wake `CancelWake`.
-    /// Startup calls it before any task waits, so a stored permit cannot
-    /// cancel the new receive loop.
-    pub(super) fn bump_generation(&self) -> u64 {
+    fn bump_generation(&self) -> u64 {
         self.active.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Advance the generation and wake a worker that is already in `select`.
-    pub(super) fn next_generation(&self) -> u64 {
+    /// Install a new cancel token and return it with this attempt's generation.
+    pub(super) fn begin_attempt(&self) -> (u64, Arc<tokio::sync::Notify>) {
+        let attempt = AttemptCancel::new();
+        let wake = attempt.handle();
+        *self.cancel.lock().expect("cancel") = attempt;
+        let token = self.bump_generation();
+        (token, wake)
+    }
+
+    /// Cancel only the token of the current attempt.
+    pub(super) fn cancel_attempt(&self) -> u64 {
         let next = self.bump_generation();
-        self.cancel.wake();
+        self.cancel.lock().expect("cancel").cancel();
         next
     }
 
@@ -169,12 +170,22 @@ impl Session {
     }
 }
 
-pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
-    run_linked(Arc::clone(&session), token, events.clone()).await;
+pub(super) async fn run(
+    session: Arc<Session>,
+    token: u64,
+    wake: Arc<tokio::sync::Notify>,
+    events: EventTx,
+) {
+    run_linked(Arc::clone(&session), token, wake, events.clone()).await;
     emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
 }
 
-async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
+async fn run_linked(
+    session: Arc<Session>,
+    token: u64,
+    wake: Arc<tokio::sync::Notify>,
+    events: EventTx,
+) {
     if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
         return;
@@ -303,7 +314,7 @@ async fn run_linked(session: Arc<Session>, token: u64, events: EventTx) {
                 }
                 tokio::select! {
                     biased;
-                    _ = session.cancel.cancelled() => {
+                    _ = wake.notified() => {
                         break;
                     }
                     command = rx.recv() => {
@@ -818,58 +829,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_startup_bump_does_not_wake_cancel() {
+    async fn a_retry_after_cancel_keeps_running() {
         let session = Session::new();
-        let _token = session.bump_generation();
-        let pending = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            session.cancel.cancelled(),
-        )
-        .await;
-        assert!(pending.is_err(), "startup must not store a cancel permit");
+        let (first, first_wake) = session.begin_attempt();
+        session.cancel_attempt();
+        assert!(!session.is_current(first));
+        let (retry, retry_wake) = session.begin_attempt();
+        first_wake.notify_one();
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(50), retry_wake.notified()).await;
+        assert!(pending.is_err(), "the retry must not see the old cancel");
+        assert!(session.is_current(retry));
     }
 
     #[tokio::test]
-    async fn a_start_after_cancel_stays_running() {
+    async fn cancel_during_start_stops_only_that_attempt() {
         let session = Session::new();
-        let first = session.bump_generation();
-        session.mark_active();
-        session.next_generation();
-        assert!(
-            !session.is_current(first),
-            "cancel ends the previous worker"
-        );
-
-        session.clear_cancel();
-        let token = session.bump_generation();
-        session.mark_active();
-        assert!(session.is_current(token));
-        assert!(session.is_active());
-        let pending = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            session.cancel.cancelled(),
-        )
-        .await;
-        assert!(
-            pending.is_err(),
-            "a new link must not see the previous cancel"
-        );
-        assert!(session.is_current(token));
-        assert!(session.is_active());
-    }
-
-    #[tokio::test]
-    async fn invalidation_wakes_a_waiting_worker() {
-        let session = Arc::new(Session::new());
-        let waiting = Arc::clone(&session);
+        let (first, first_wake) = session.begin_attempt();
+        let waiting = Arc::clone(&first_wake);
         let handle = tokio::spawn(async move {
-            waiting.cancel.cancelled().await;
+            waiting.notified().await;
         });
-        session.next_generation();
+        session.cancel_attempt();
         tokio::time::timeout(std::time::Duration::from_secs(2), handle)
             .await
-            .expect("woke")
+            .expect("that attempt stops")
             .expect("task");
+        assert!(!session.is_current(first));
+        let (second, second_wake) = session.begin_attempt();
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(50), second_wake.notified())
+                .await;
+        assert!(pending.is_err(), "the next attempt stays up");
+        assert!(session.is_current(second));
     }
 
     #[test]

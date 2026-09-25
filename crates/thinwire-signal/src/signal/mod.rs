@@ -184,8 +184,7 @@ impl SignalAdapter {
         let Engine::Live(session) = &self.engine else {
             return None;
         };
-        session.clear_cancel();
-        let token = session.bump_generation();
+        let (token, wake) = session.begin_attempt();
         session.mark_active();
         let session = Arc::clone(session);
         let task_events = events.clone();
@@ -209,7 +208,8 @@ impl SignalAdapter {
                 };
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&runtime, async move {
-                    let task = tokio::task::spawn_local(live::run(session, token, task_events));
+                    let task =
+                        tokio::task::spawn_local(live::run(session, token, wake, task_events));
                     let _ = abort_tx.send(task.abort_handle());
                     let _ = task.await;
                 });
@@ -225,7 +225,7 @@ impl SignalAdapter {
         self.notice_accepted = false;
         #[cfg(feature = "signal-local")]
         if let Engine::Live(session) = &self.engine {
-            session.next_generation();
+            session.cancel_attempt();
             let session = Arc::clone(session);
             let worker = self.worker.take();
             let events = events.clone();
@@ -539,7 +539,7 @@ impl ProtocolAdapter for SignalAdapter {
         #[cfg(feature = "signal-local")]
         {
             if let Engine::Live(session) = &self.engine {
-                session.next_generation();
+                session.cancel_attempt();
                 let session = Arc::clone(session);
                 let worker = self.worker.take();
                 let events = events.clone();
