@@ -93,6 +93,9 @@ pub struct Core {
     whatsapp_phone: Arc<WhatsAppPhoneVault>,
     notifier: ChangeNotifier,
     closing: bool,
+    /// A wake at the earliest send deadline, so a frontend that waits on the
+    /// change signal pumps then and the chat unlocks (PR #81 review).
+    send_wake: Option<(Instant, tokio::task::JoinHandle<()>)>,
 }
 
 impl Core {
@@ -137,6 +140,7 @@ impl Core {
             whatsapp_phone,
             notifier,
             closing: false,
+            send_wake: None,
         }
     }
 
@@ -162,7 +166,8 @@ impl Core {
     }
 
     /// Apply the adapter events that arrived and run time-based checks.
-    /// Returns true when at least one event was applied.
+    /// Returns true when the state changed: an event was applied, or a send
+    /// with no answer expired.
     ///
     /// Frontend thread only. See [`Core`] "Threads".
     pub fn pump(&mut self) -> bool {
@@ -181,10 +186,10 @@ impl Core {
             self.state.status_text = text;
         }
         self.state.poll_resume(&self.secrets);
-        self.state.expire_sends();
+        let expired = self.state.expire_sends();
         self.state.sync_viewed();
         self.flush();
-        applied
+        applied || expired
     }
 
     /// Apply one user action, then queue its commands for the worker.
@@ -387,6 +392,29 @@ impl Core {
         if let Some(job) = self.settings.take_persist_job() {
             self.runtime.spawn_blocking(move || job.run());
         }
+        self.arm_send_wake();
+    }
+
+    /// Keep one wake at the earliest send deadline: re-arm when it moves,
+    /// cancel when no send is in flight. The wake only fires the change
+    /// signal; the frontend's next `pump` expires the send.
+    fn arm_send_wake(&mut self) {
+        let deadline = self.state.next_send_deadline();
+        if self.send_wake.as_ref().map(|(at, _)| *at) == deadline {
+            return;
+        }
+        if let Some((_, task)) = self.send_wake.take() {
+            task.abort();
+        }
+        let Some(deadline) = deadline else {
+            return;
+        };
+        let notifier = self.notifier.downgrade();
+        let task = self.runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            notifier.notify();
+        });
+        self.send_wake = Some((deadline, task));
     }
 
     fn send(&self, command: AdapterCommand) {
@@ -1053,5 +1081,49 @@ mod tests {
             sent.try_recv().is_err(),
             "no ViewChat while the clients close"
         );
+    }
+
+    /// PR #81 review: a frontend that only waits on the change signal gets a
+    /// wake at the send deadline, and `pump()` reports the expiry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unanswered_send_wakes_the_core_and_unlocks_at_the_deadline() {
+        use crate::sends::SEND_TIMEOUT;
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        // No adapter answers: commands go to a probe.
+        let (probe, _sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        core.dispatch(Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            text: "hello".into(),
+        });
+        core.dispatch(Intent::SendDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+        });
+        assert!(core.send_wake.is_some(), "a wake is armed for the deadline");
+        assert!(
+            !core.view().can_send(),
+            "locked while the send is in flight"
+        );
+        assert!(!core.pump(), "nothing changed yet");
+
+        // The deadline passes with no traffic at all.
+        let mut signal = core.signal();
+        signal.mark_seen();
+        core.state.age_sends_for_test(SEND_TIMEOUT);
+        core.arm_send_wake();
+        let woke = tokio::time::timeout(WAIT, signal.changed()).await;
+        assert_eq!(woke.ok(), Some(true), "the wake fired the change signal");
+        assert!(core.pump(), "pump reports the expiry");
+        assert!(core.view().can_send(), "the chat is unlocked");
+        assert_eq!(core.view().compose, "hello", "the text stays");
+        assert!(core.send_wake.is_none(), "no send left, no wake");
     }
 }

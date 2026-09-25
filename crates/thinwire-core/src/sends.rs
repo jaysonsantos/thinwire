@@ -143,6 +143,24 @@ impl SendTracker {
         self.open.remove(&key).map(|open| open.pending)
     }
 
+    /// When the oldest entry expires, if any entry is in flight. The core
+    /// arms a wake for it, so a frontend that waits on the change signal
+    /// pumps at the deadline (PR #81 review).
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.open
+            .values()
+            .map(|open| open.since + SEND_TIMEOUT)
+            .min()
+    }
+
+    /// Test hook: move every entry's start back by `by`.
+    #[cfg(test)]
+    pub(crate) fn age_for_test(&mut self, by: Duration) {
+        for open in self.open.values_mut() {
+            open.since -= by;
+        }
+    }
+
     /// Remove and return every entry with no answer after `SEND_TIMEOUT`
     /// (#69). A late answer for one of them then changes nothing.
     pub(crate) fn expire(&mut self, now: Instant) -> Vec<(ProtocolId, String, Pending)> {

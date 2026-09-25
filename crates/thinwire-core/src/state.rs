@@ -1516,14 +1516,28 @@ impl Snapshot {
 
     /// Expire sends and retries with no answer after `SEND_TIMEOUT` (#69).
     /// The core calls it on every pump.
-    pub(crate) fn expire_sends(&mut self) {
-        self.expire_sends_at(Instant::now());
+    /// Returns true when an entry expired, so the state changed.
+    pub(crate) fn expire_sends(&mut self) -> bool {
+        self.expire_sends_at(Instant::now())
+    }
+
+    /// When the next send or retry expires, if one is in flight.
+    pub(crate) fn next_send_deadline(&self) -> Option<Instant> {
+        self.sends.next_deadline()
+    }
+
+    /// Test hook: age every tracked send by `by`.
+    #[cfg(test)]
+    pub(crate) fn age_sends_for_test(&mut self, by: Duration) {
+        self.sends.age_for_test(by);
     }
 
     /// `expire_sends` with the clock as a parameter, for tests. An expired
     /// send keeps its text; an expired retry sets its row back to `Failed`.
-    fn expire_sends_at(&mut self, now: Instant) {
-        for (protocol, chat, pending) in self.sends.expire(now) {
+    fn expire_sends_at(&mut self, now: Instant) -> bool {
+        let expired = self.sends.expire(now);
+        let changed = !expired.is_empty();
+        for (protocol, chat, pending) in expired {
             let why = format!("{} did not answer in time.", protocol.display_name());
             match pending {
                 Pending::Send { .. } => self.set_error(
@@ -1537,6 +1551,7 @@ impl Snapshot {
                 }
             }
         }
+        changed
     }
 
     /// The adapter rejected this send (chat and request id match): it was
