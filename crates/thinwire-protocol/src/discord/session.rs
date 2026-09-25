@@ -2,6 +2,10 @@
 //!
 //! A generation counter drops results from a session that a later connect or a
 //! disconnect replaced. Only channels from the last list may open or send.
+//!
+//! After any await, re-check that generation under the session lock before
+//! queuing an event or changing session state. The value captured before the
+//! await is not enough.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -236,13 +240,9 @@ impl Session {
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
                     if finish_reload(&shared, generation, ticket, &events, error) {
-                        seal_unlink(api.as_ref(), &shared, &gate, generation, &events).await;
-                        emit_status(
-                            &events,
-                            ProtocolId::Discord,
-                            AdapterStatus::Error,
-                            format!("Discord bot inbox did not load: {error}"),
-                        );
+                        let sealed = seal_unlink(api.as_ref(), generation).await;
+                        publish_unlink(&shared, &gate, sealed, &events);
+                        note_reload_error(&shared, sealed, &events, error);
                     }
                 }
             }
@@ -294,9 +294,8 @@ impl Session {
         let events = events.clone();
         tokio::spawn(async move {
             let result = api.history(access.channel_id, HISTORY_LIMIT).await;
-            // A newer connect replaced this load. Finish it so the shell drops
-            // the spinner. A 401 already settled this load before Unlinked.
-            if !gate.current() {
+            // The await released the lock. A newer connect may own the generation.
+            if !same_generation(&shared, generation) {
                 finish_replaced_load(&shared, &events, conversation_id);
                 return;
             }
@@ -377,7 +376,8 @@ impl Session {
                         }
                     };
                     if unauthorized {
-                        seal_unlink(api.as_ref(), &shared, &gate, generation, &events).await;
+                        let sealed = seal_unlink(api.as_ref(), generation).await;
+                        publish_unlink(&shared, &gate, sealed, &events);
                     }
                 }
             }
@@ -451,9 +451,12 @@ impl Session {
         };
         if state.revoked {
             // This generation is already revoked. Reject here and do not insert.
-            // When `Unlinked` is still pending, it is queued after this rejection.
+            // `Unlinked` is queued after this rejection, unless a reconnect
+            // moved the generation before `publish_unlink` re-takes the lock.
+            let generation = self.gate.generation;
             emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
-            publish_unlink(&mut state, &self.gate, self.gate.generation, events);
+            drop(state);
+            publish_unlink(&self.shared, &self.gate, generation, events);
             return Ok(None);
         }
         let (access, bot_id) = match (state.channels.get(conversation_id), state.bot_id) {
@@ -718,10 +721,12 @@ fn settle_unauthorized(state: &mut Shared, events: &EventTx, error: DiscordApiEr
     }
 }
 
-/// Queues `Unlinked` for this generation. A no-op once it has been queued,
-/// and a no-op when a later connect already moved the generation. The live
-/// counter moves here, under the same lock as that check.
-fn publish_unlink(state: &mut Shared, gate: &Gate, generation: u64, events: &EventTx) {
+/// Queues `Unlinked` for `generation`. Takes the session lock itself and
+/// drops the unlink when that generation is no longer current.
+fn publish_unlink(shared: &Arc<Mutex<Shared>>, gate: &Gate, generation: u64, events: &EventTx) {
+    let Ok(mut state) = shared.lock() else {
+        return;
+    };
     if state.generation != generation {
         state.pending_unlink = None;
         return;
@@ -734,22 +739,42 @@ fn publish_unlink(state: &mut Shared, gate: &Gate, generation: u64, events: &Eve
     gate.invalidate();
 }
 
-/// Lets a send blocked on the session lock reject itself, then queues `Unlinked`
-/// if that send did not and this generation is still current.
-async fn seal_unlink(
-    api: &dyn DiscordApi,
-    shared: &Arc<Mutex<Shared>>,
-    gate: &Gate,
-    generation: u64,
-    events: &EventTx,
-) {
+/// Waits out the 401 seal. Returns the generation that was current when the
+/// wait started. The caller passes it to [`publish_unlink`], which checks it
+/// again under the lock.
+async fn seal_unlink(api: &dyn DiscordApi, generation: u64) -> u64 {
     tokio::task::yield_now().await;
     if let Some(hold) = api.unlink_pause() {
         hold.notified().await;
     }
-    if let Ok(mut state) = shared.lock() {
-        publish_unlink(&mut state, gate, generation, events);
+    generation
+}
+
+fn same_generation(shared: &Arc<Mutex<Shared>>, generation: u64) -> bool {
+    shared
+        .lock()
+        .is_ok_and(|state| state.generation == generation)
+}
+
+/// Error status for a list 401, only while `generation` is still current.
+fn note_reload_error(
+    shared: &Arc<Mutex<Shared>>,
+    generation: u64,
+    events: &EventTx,
+    error: DiscordApiError,
+) {
+    let Ok(state) = shared.lock() else {
+        return;
+    };
+    if state.generation != generation {
+        return;
     }
+    emit_status(
+        events,
+        ProtocolId::Discord,
+        AdapterStatus::Error,
+        format!("Discord bot inbox did not load: {error}"),
+    );
 }
 
 fn session_revoked(shared: &Arc<Mutex<Shared>>) -> bool {
@@ -822,10 +847,12 @@ async fn finish_send(
         .lock()
         .is_ok_and(|state| state.pending_unlink.is_some());
     if needs_seal {
-        seal_unlink(api, shared, gate, generation, events).await;
+        let sealed = seal_unlink(api, generation).await;
+        publish_unlink(shared, gate, sealed, events);
     }
     if queued {
         // The result is already on the channel. A test can run a 401 here.
+        // The wait publishes nothing after it returns.
         if let Some(pause) = api.send_result_pause() {
             pause.arrived.notify_one();
             pause.release.notified().await;
