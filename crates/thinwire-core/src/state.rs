@@ -2376,8 +2376,30 @@ impl Snapshot {
                     self.signal_qr = None;
                 }
             }
+            AccountState::Linking if had_session => self.hold_opens_for_reconnect(protocol),
             AccountState::Linking => {}
         }
+    }
+
+    /// A reconnect starts (`Linking` after `Linked`). An `OpenChat` of this
+    /// protocol that is still queued waits for `Linked`, and one in flight
+    /// can be lost (#90 items 2 and 7). Mark the selected chat to load on
+    /// `Linked`, and drop the queued opens: new commands wait for `Linked`.
+    fn hold_opens_for_reconnect(&mut self, protocol: ProtocolId) {
+        let is_open = |command: &AdapterCommand| matches!(command, AdapterCommand::OpenChat { protocol: owner, .. } if *owner == protocol);
+        if self.selected_protocol == protocol
+            && let Some(id) = self.selected_conversation.clone()
+        {
+            let queued = self.pending.iter().any(|command| {
+                is_open(command)
+                    && matches!(command, AdapterCommand::OpenChat { conversation_id, .. } if *conversation_id == id)
+            });
+            let in_flight = self.history_loading.contains(&(protocol, id.clone()));
+            if queued || in_flight {
+                self.open_on_link = Some((protocol, id));
+            }
+        }
+        self.pending.retain(|command| !is_open(command));
     }
 
     /// The session of one protocol ended (shell plan 8): drop its rows,
@@ -6998,12 +7020,60 @@ mod tests {
             open_chats(&mut snapshot),
             vec![(ProtocolId::Slack, "slack:C1".to_owned())]
         );
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+        });
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Slack,
             state: AccountState::Linking,
         });
         link(&mut snapshot, ProtocolId::Slack);
         assert!(open_chats(&mut snapshot).is_empty(), "no reload");
+    }
+
+    /// #90 item 2 (Codex on #86): an `OpenChat` queued in the same pump as a
+    /// later `Linking` waits for `Linked`. It is not sent during the
+    /// reconnect, and `Linked` sends it.
+    #[test]
+    fn an_open_queued_before_linking_waits_for_linked() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        // The auto-select queued an OpenChat; the flush has not run yet.
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert!(open_chats(&mut snapshot).is_empty(), "held for Linked");
+        link(&mut snapshot, ProtocolId::Slack);
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Slack, "slack:C1".to_owned())]
+        );
+    }
+
+    /// #90 item 7 (qa on #86): an `OpenChat` in flight when a reconnect
+    /// starts can be lost. `Linked` sends it again.
+    #[test]
+    fn an_open_in_flight_at_linking_loads_again_on_linked() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        assert_eq!(open_chats(&mut snapshot).len(), 1, "sent, no answer yet");
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        link(&mut snapshot, ProtocolId::Slack);
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Slack, "slack:C1".to_owned())]
+        );
     }
 
     /// qa L2 on #79: a placeholder row never becomes the viewed chat.
