@@ -1357,17 +1357,10 @@ fn bubble(
                                         galley.text(),
                                     )
                                 });
-                                egui::text_selection::LabelSelectionState::label_text_selection(
-                                    ui,
-                                    &response,
-                                    galley_pos,
-                                    galley.clone(),
-                                    body,
-                                    egui::Stroke::NONE,
-                                );
-                                // The pane already names this text.
+                                // The pane already names this text. Selection is bound
+                                // to the pane id below, with the text runs.
                                 hide_from_accesskit(ui, response.id);
-                                body_galley = Some((galley_pos, galley));
+                                body_galley = Some((galley_pos, galley, response));
                             })
                             .response
                             .rect;
@@ -1441,27 +1434,23 @@ fn bubble(
                 });
             })
             .response;
+        if let Some((galley_pos, galley, mut response)) = body_galley {
+            // The text runs and the selection handler share the pane id.
+            // A selection action from assistive tech targets that id.
+            response.id = frame.id;
+            egui::text_selection::LabelSelectionState::label_text_selection(
+                ui,
+                &response,
+                galley_pos,
+                galley,
+                body,
+                egui::Stroke::NONE,
+            );
+        }
+        // Restore the pane after selection, which sets a label role.
         frame.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Panel, true, bubble_access_label(message))
         });
-        if let Some((galley_pos, galley)) = body_galley {
-            // Text runs on the pane let assistive tech select part of the
-            // message. The painted label stays hidden, so the name is spoken once.
-            let global_from_layer = ui
-                .ctx()
-                .layer_transform_to_global(ui.layer_id())
-                .unwrap_or_default();
-            let layer_from_galley =
-                egui::emath::TSTransform::from_translation(galley_pos.to_vec2());
-            egui::text_selection::accesskit_text::update_accesskit_for_text_widget(
-                ui.ctx(),
-                frame.id,
-                None,
-                egui::accesskit::Role::Pane,
-                global_from_layer * layer_from_galley,
-                &galley,
-            );
-        }
     });
 }
 

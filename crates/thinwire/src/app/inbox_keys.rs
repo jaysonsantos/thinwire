@@ -439,6 +439,73 @@ fn a_group_run_names_the_sender_on_every_message() {
 }
 
 #[test]
+fn an_accesskit_selection_reaches_the_bubble() {
+    let body = "Hello from the selectable bubble";
+    let mut state = InboxUi::ready();
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: chat_message("telegram:1:select", body, 1_790_300_000),
+    });
+    let mut harness = harness(state);
+    harness.run();
+    let run = harness
+        .query_all(By::new().role(egui::accesskit::Role::TextRun))
+        .find(|node| {
+            !node.accesskit_node().is_hidden()
+                && node
+                    .value()
+                    .is_some_and(|value| !value.is_empty() && body.contains(value.as_str()))
+        })
+        .expect("text run");
+    run.click();
+    harness.step();
+    let pane = harness.get(By::new().role(egui::accesskit::Role::Pane).predicate({
+        let body = body.to_owned();
+        move |node| !node.is_hidden() && node.label().is_some_and(|label| label.contains(&body))
+    }));
+    let run = harness
+        .query_all(By::new().role(egui::accesskit::Role::TextRun))
+        .find(|node| {
+            !node.accesskit_node().is_hidden()
+                && node
+                    .value()
+                    .is_some_and(|value| !value.is_empty() && body.contains(value.as_str()))
+        })
+        .expect("text run");
+    let (target_node, target_tree) = pane.accesskit_node().locate();
+    let (run_node, _) = run.accesskit_node().locate();
+    harness.event(egui::Event::AccessKitActionRequest(
+        egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::SetTextSelection,
+            target_node,
+            target_tree,
+            data: Some(egui::accesskit::ActionData::SetTextSelection(
+                egui::accesskit::TextSelection {
+                    anchor: egui::accesskit::TextPosition {
+                        node: run_node,
+                        character_index: 0,
+                    },
+                    focus: egui::accesskit::TextPosition {
+                        node: run_node,
+                        character_index: 5,
+                    },
+                },
+            )),
+        },
+    ));
+    harness.step();
+    let pane = harness.get(By::new().role(egui::accesskit::Role::Pane).predicate({
+        let body = body.to_owned();
+        move |node| !node.is_hidden() && node.label().is_some_and(|label| label.contains(&body))
+    }));
+    let node = pane.accesskit_node();
+    let selection = node
+        .raw_text_selection()
+        .expect("the pane reports a selection");
+    assert_eq!(selection.anchor.character_index, 0);
+    assert_eq!(selection.focus.character_index, 5);
+}
+
+#[test]
 fn a_bubble_names_the_message_once() {
     let body = "Hello from the only name on this bubble";
     let mut state = InboxUi::ready();
