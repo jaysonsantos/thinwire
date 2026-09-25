@@ -198,7 +198,7 @@ fn deliver(event: AdapterEvent, current_epoch: u64) -> Option<AdapterEvent> {
     }
 }
 
-fn dispatch(
+pub(crate) fn dispatch(
     adapters: &mut [Box<dyn ProtocolAdapter>],
     command: AdapterCommand,
     events: &super::EventTx,
