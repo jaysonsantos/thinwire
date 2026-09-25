@@ -409,6 +409,19 @@ impl Harness {
     fn calls(&self) -> Vec<String> {
         self.api.with(|state| state.calls.clone())
     }
+
+    fn account_states(&self) -> Vec<AccountState> {
+        self.seen
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Account {
+                    protocol: ProtocolId::Slack,
+                    state,
+                } => Some(*state),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 fn free_loopback() -> SocketAddr {
@@ -648,6 +661,28 @@ async fn history_is_oldest_first_with_names_and_the_app_as_outbound() {
     let second = h.message("second, from the app").await;
     assert!(second.outbound);
     assert_eq!(second.conversation_id, "slack:C1");
+    let row = h
+        .until("history preview", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C1"
+                        && conversation.preview == "second, from the app"
+            )
+        })
+        .await;
+    let AdapterEvent::ConversationUpsert { conversation } = row else {
+        unreachable!();
+    };
+    assert_eq!(conversation.order, 1_700_000_002_000_200);
+    assert_eq!(conversation.last_at, 1_700_000_002);
+    h.until("history loaded", |event| {
+        matches!(
+            event,
+            AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == "slack:C1"
+        )
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -671,6 +706,20 @@ async fn a_live_message_ranks_after_older_history() {
     let first = h.message("first").await;
     let ranks = [shell_rank(&first.id), shell_rank(&live.id)];
     assert!(ranks[0] > 0 && ranks[0] < ranks[1]);
+    h.until("history loaded", |event| {
+        matches!(
+            event,
+            AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == "slack:C1"
+        )
+    })
+    .await;
+    let preview = h.seen.iter().rev().find_map(|event| match event {
+        AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C1" => {
+            Some(conversation.preview.as_str())
+        }
+        _ => None,
+    });
+    assert_eq!(preview, Some("live hello"));
 }
 
 #[tokio::test]
@@ -1648,6 +1697,11 @@ async fn missing_client_credentials_or_browser_fail_without_waiting() {
             .contains("credentials are missing")
     );
     assert!(h.browser.last().is_none());
+    assert_eq!(
+        h.account_states().last().copied(),
+        Some(AccountState::Unlinked)
+    );
+    assert!(h.account_states().contains(&AccountState::Linking));
 
     let mut h = Harness::new(FakeApi::workspace(), client_vault(), false);
     h.start();
@@ -1656,4 +1710,20 @@ async fn missing_client_credentials_or_browser_fail_without_waiting() {
     });
     assert!(h.status(AdapterStatus::Error).await.contains("browser"));
     assert_eq!(h.vault.get_secret(SlackSecretKey::OAuthState), None);
+    assert_eq!(
+        h.account_states().last().copied(),
+        Some(AccountState::Unlinked)
+    );
+
+    let mut h = Harness::new(FakeApi::workspace(), client_vault(), true);
+    let _hold = std::net::TcpListener::bind(h.callback).expect("hold the install port");
+    h.start();
+    h.send(AdapterCommand::Connect {
+        protocol: ProtocolId::Slack,
+    });
+    assert!(h.status(AdapterStatus::Error).await.contains("listen"));
+    assert_eq!(
+        h.account_states().last().copied(),
+        Some(AccountState::Unlinked)
+    );
 }

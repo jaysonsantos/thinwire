@@ -415,25 +415,12 @@ impl SecretStore {
         };
         match probed {
             Ok(backend) => {
-                let discord_token = read_discord_os_token();
-                let slack_install = read_slack_os();
-                let should_flush = match read_os_snapshot() {
-                    Ok(os_values) => self.settle_after_probe(backend, os_values, None),
-                    Err(error) => self.settle_after_probe(backend, HashMap::new(), Some(error)),
-                };
-                self.store_hydrated_discord_token(discord_token);
-                self.store_hydrated_slack(slack_install);
-                if self.phase() == AttachPhase::Ready {
-                    tracing::info!(?backend, "using the OS keychain for Telegram secrets");
-                }
-                if should_flush && let Err(error) = self.flush_os() {
-                    tracing::warn!(
-                        error = %error,
-                        "OS keychain flush after attach failed; secrets stay in memory"
-                    );
-                }
-                self.signal_discord_hydrated();
-                self.signal_slack_hydrated();
+                self.store_probed_secrets(
+                    backend,
+                    read_os_snapshot(),
+                    read_discord_os_token(),
+                    read_slack_os(),
+                );
             }
             Err(error) => {
                 tracing::warn!(
@@ -445,6 +432,43 @@ impl SecretStore {
                 self.signal_slack_hydrated();
             }
         }
+    }
+
+    /// Apply one OS probe. A Slack read error leaves attach unsettled, the
+    /// same as a Telegram hydrate error: no `Ready`, and the Slack reconnect
+    /// hook stays waiting for Try again.
+    fn store_probed_secrets(
+        &self,
+        backend: OsBackend,
+        telegram: Result<HashMap<SecretKey, String>, SecretError>,
+        discord_token: Result<Option<String>, SecretError>,
+        slack_install: Result<Vec<(SlackSecretKey, String)>, SecretError>,
+    ) {
+        if let Err(error) = &slack_install {
+            tracing::warn!(
+                error = %error,
+                "slack install hydrate failed; attach stays unsettled"
+            );
+            self.finish_read_failed();
+            return;
+        }
+        let should_flush = match telegram {
+            Ok(os_values) => self.settle_after_probe(backend, os_values, None),
+            Err(error) => self.settle_after_probe(backend, HashMap::new(), Some(error)),
+        };
+        self.store_hydrated_discord_token(discord_token);
+        self.store_hydrated_slack(slack_install);
+        if self.phase() == AttachPhase::Ready {
+            tracing::info!(?backend, "using the OS keychain for Telegram secrets");
+        }
+        if should_flush && let Err(error) = self.flush_os() {
+            tracing::warn!(
+                error = %error,
+                "OS keychain flush after attach failed; secrets stay in memory"
+            );
+        }
+        self.signal_discord_hydrated();
+        self.signal_slack_hydrated();
     }
 
     /// Unsettled after a failed read: keys unknown, the UI offers Try again.
@@ -1339,6 +1363,48 @@ mod tests {
         assert!(dirty.contains(&SlackSecretKey::BotToken));
         assert!(dirty.contains(&SlackSecretKey::TeamId));
         assert!(dirty.contains(&SlackSecretKey::ClientId));
+    }
+
+    #[test]
+    fn a_failed_slack_keychain_read_leaves_attach_unsettled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = SecretStore::blank(AttachPhase::Attaching);
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        store.on_slack_token_hydrated(move || flag.store(true, Ordering::Relaxed));
+        let mut telegram = HashMap::new();
+        telegram.insert(SecretKey::Session, "saved-session".to_string());
+        store.store_probed_secrets(
+            OsBackend::SecretService,
+            Ok(telegram),
+            Ok(None),
+            Err(SecretError::new("OS keychain: platform failure")),
+        );
+        assert_eq!(store.phase(), AttachPhase::ReadFailed);
+        assert!(store.read_failed());
+        assert!(!store.attach_settled());
+        assert!(!fired.load(Ordering::Relaxed));
+        assert_eq!(
+            SlackSecretVault::get_secret(&store, SlackSecretKey::BotToken),
+            None
+        );
+        assert_eq!(store.get(SecretKey::Session).expect("get"), None);
+
+        let mut telegram = HashMap::new();
+        telegram.insert(SecretKey::Session, "saved-session".to_string());
+        store.store_probed_secrets(
+            OsBackend::SecretService,
+            Ok(telegram),
+            Ok(None),
+            Ok(vec![(SlackSecretKey::BotToken, "xoxb-fixture".to_string())]),
+        );
+        assert!(store.attach_settled());
+        assert!(fired.load(Ordering::Relaxed));
+        assert_eq!(
+            SlackSecretVault::get_secret(&store, SlackSecretKey::BotToken).as_deref(),
+            Some("xoxb-fixture")
+        );
     }
 
     #[test]

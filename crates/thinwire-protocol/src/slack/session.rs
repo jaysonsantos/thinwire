@@ -395,14 +395,11 @@ where
         let Some((client_id, client_secret, _)) =
             resolve_slack_client(self.deps.vault.as_ref(), &self.deps.source)
         else {
-            self.status(
-                AdapterStatus::Error,
-                "Slack app credentials are missing in this build.",
-            );
+            self.fail_install_start("Slack app credentials are missing in this build.");
             return;
         };
         let Ok(listener) = SlackLoopback::bind(self.deps.callback_addr).await else {
-            self.status(AdapterStatus::Error, DETAIL_PORT_BUSY);
+            self.fail_install_start(DETAIL_PORT_BUSY);
             return;
         };
         let state = new_oauth_state();
@@ -411,7 +408,7 @@ where
             .set_secret(SlackSecretKey::OAuthState, &state);
         if !self.deps.browser.open(&authorize_url(&client_id, &state)) {
             self.deps.vault.set_secret(SlackSecretKey::OAuthState, "");
-            self.status(AdapterStatus::Error, DETAIL_NO_BROWSER);
+            self.fail_install_start(DETAIL_NO_BROWSER);
             return;
         }
         self.attempts += 1;
@@ -439,6 +436,11 @@ where
         });
         self.install = Some((attempt, task.abort_handle()));
         self.status(AdapterStatus::Connecting, DETAIL_WAITING);
+    }
+
+    fn fail_install_start(&mut self, detail: &str) {
+        self.account(AccountState::Unlinked);
+        self.status(AdapterStatus::Error, detail);
     }
 
     fn cancel_install(&mut self) {
@@ -799,9 +801,18 @@ where
                 return;
             }
         };
+        // `conversations.history` is newest-first. A channel with no Socket
+        // Mode event still needs that post on the inbox row.
+        let newest = posts
+            .iter()
+            .max_by_key(|post| ts_rank(&post.ts))
+            .map(|post| (ts_rank(&post.ts), ts_order(&post.ts), post.text.clone()));
         for post in posts.into_iter().rev() {
             let message = self.chat_message(&token, post).await;
             emit_message(&self.events, message);
+        }
+        if let Some((order, sent_at, preview)) = newest {
+            self.note_latest(channel, order, sent_at, &preview);
         }
         if let Some(row) = self.channels.get_mut(channel)
             && row.unread != 0
