@@ -168,20 +168,16 @@ impl DiscordAdapter {
 
     fn connect_bot_inbox(&mut self, events: &EventTx) -> Result<(), AdapterError> {
         #[cfg(any(test, feature = "discord-bot"))]
-        let carried = self
+        let (carried, history, bodies) = self
             .session
             .as_ref()
-            .map(session::Session::carried_channels)
-            .unwrap_or_default();
-        let history = self
-            .session
-            .as_ref()
-            .map(session::Session::carried_history)
-            .unwrap_or_default();
-        let bodies = self
-            .session
-            .as_ref()
-            .map(session::Session::carried_bodies)
+            .map(|session| {
+                (
+                    session.carried_channels(),
+                    session.carried_history(),
+                    session.carried_bodies(),
+                )
+            })
             .unwrap_or_default();
         self.stop_session(events);
         let prepared = self.prepared_token()?;
