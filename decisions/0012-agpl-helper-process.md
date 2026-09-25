@@ -170,6 +170,13 @@ Start the "go" work when all of these are true:
 3. `whatsapp-web` passes live tests on Linux, macOS, and Windows.
 4. A maintainer accepts to own the AGPL helper crate and its releases.
 
+## Open questions for the go work
+
+This ADR recommends "later". These items stay open until the go work starts. New review items go here.
+
+- One helper process for several protocols: which part starts and stops it, and how to prevent a second spawn on the same session stores ([review](https://github.com/jaysonsantos/thinwire/pull/75#discussion_r4102999483)).
+- A helper restart must also end lost `LoadChats` and `OpenChat` requests and clear their loading markers, not only the sends ([review](https://github.com/jaysonsantos/thinwire/pull/75#discussion_r4102999488)).
+
 ## Consequences
 
 - ADR 0011 stays in force. Release builds and OS zips never enable `whatsapp-web` or `signal-local`.
