@@ -14,8 +14,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::adapter::{
-    AdapterEvent, EventTx, LoginEpoch, TelegramAuthError, TelegramAuthPhase, TelegramCodeVia,
-    emit_telegram_data_reset,
+    AdapterEvent, AdapterStatus, EventTx, LoginEpoch, ProtocolId, TelegramAuthError,
+    TelegramAuthPhase, TelegramCodeVia, emit_telegram_data_reset,
 };
 
 /// One client's identity for login events: its login epoch, and a flag the
@@ -98,6 +98,16 @@ impl<'a> LoginEvents<'a> {
 
     pub(super) fn code_sent(&self, via: TelegramCodeVia) {
         self.send(AdapterEvent::TelegramCodeSent { via });
+    }
+
+    /// A status line of a login step, for example a refused code. It carries
+    /// the epoch too, so a late RPC result never shows on a newer login (#54).
+    pub(super) fn status(&self, status: AdapterStatus, detail: &str) {
+        self.send(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status,
+            detail: detail.into(),
+        });
     }
 
     /// Not a login step: a folder already moved on disk. It goes out even
@@ -337,6 +347,47 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a result after Cancel is dropped at the source"
+        );
+    }
+
+    #[test]
+    fn a_late_rpc_failure_of_a_cancelled_login_never_reaches_the_next_login() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared: LoginEpoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Login A sends its phone. The RPC is still pending.
+        let closing_a = ClosingFlag::new(Arc::clone(&shared));
+        let login_a = LoginEvents::new(&tx, &closing_a);
+        login_a.status(AdapterStatus::Connecting, "step sent");
+        let Some(AdapterEvent::Login { epoch: 0, event }) = rx.try_recv().ok() else {
+            panic!("a login status carries its epoch");
+        };
+        assert!(matches!(*event, AdapterEvent::Status { .. }));
+
+        // Cancel, then login B starts on epoch 1.
+        shared.fetch_add(1, Ordering::SeqCst);
+        closing_a.mark();
+        let closing_b = ClosingFlag::new(Arc::clone(&shared));
+        let login_b = LoginEvents::new(&tx, &closing_b);
+
+        // Login A's RPC fails now: no rejection, no phase, no error status.
+        login_a.rejected(TelegramAuthError::PhoneInvalid);
+        login_a.phase(TelegramAuthPhase::Failed);
+        login_a.status(AdapterStatus::Error, "Telegram rejected the phone number.");
+        assert!(rx.try_recv().is_err(), "login B sees nothing from login A");
+
+        login_b.status(AdapterStatus::Error, "Telegram rejected the login code.");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AdapterEvent::Login { epoch: 1, .. })
+        ));
+        // Every status of a login step goes through `LoginEvents::status`.
+        let src = include_str!("tdlib.rs");
+        let step = &src[src.find("async fn apply_step(").expect("apply_step")..];
+        let step = &step[..step.find("\n}\n").expect("end")];
+        assert!(!step.contains("emit_status("), "no unstamped step status");
+        assert!(
+            step.matches("login.status(").count() >= 5,
+            "each error status"
         );
     }
 
