@@ -900,6 +900,13 @@ impl Snapshot {
         }
     }
 
+    /// Test hook: start the saved-session resume as a `telegram-tdlib` build
+    /// does, also in a default test build.
+    #[cfg(test)]
+    pub(crate) fn resume_for_test(&mut self, store: &SecretStore) {
+        self.try_resume(store, true);
+    }
+
     fn try_resume(&mut self, store: &SecretStore, live: bool) {
         if self.resume != Resume::Waiting || !store.attach_settled() {
             return;

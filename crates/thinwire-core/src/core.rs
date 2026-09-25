@@ -269,10 +269,8 @@ impl Core {
         let chat = self
             .state
             .conversation(message.protocol, &message.conversation_id);
-        if let Err(reason) = self.notify.on_message(message, chat, &ctx) {
-            // The reason only: never the chat, the sender, or the text.
-            tracing::trace!(?reason, "no notification");
-        }
+        // `on_message` logs the result: never the chat, the sender, or the text.
+        let _ = self.notify.on_message(message, chat, &ctx);
     }
 
     fn sync_notifications(&mut self) {
@@ -1166,6 +1164,59 @@ mod tests {
             .expect("queue");
         core.pump();
         assert!(core.view().telegram_authorized);
+    }
+
+    /// L6 live test: a resumed Telegram session (no login form) notifies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_telegram_session_notifies() {
+        use crate::notify::NotifyCommand;
+        use crate::secrets::SecretKey;
+        use crate::state::CenterView;
+        use crate::state::test_support::{seed_override, telegram_chat};
+        use thinwire_protocol::{Delivery, TelegramAuthPhase};
+
+        // A saved session: the app resumes with no login form (L6 live test).
+        let mut core = memory_core();
+        seed_override(&core.secrets);
+        core.secrets
+            .set(SecretKey::Session, "tdlib-ready")
+            .expect("session marker");
+        core.state.resume_for_test(&core.secrets);
+        assert_eq!(
+            core.view().center_view(),
+            CenterView::Resuming { connecting: true }
+        );
+        core.state.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        assert!(
+            core.view().has_session(ProtocolId::Telegram),
+            "Ready starts the session"
+        );
+        for (id, title) in [(1, "Ada"), (2, "Bob")] {
+            core.state.apply(AdapterEvent::ConversationUpsert {
+                conversation: telegram_chat(id, title, 10 - id),
+            });
+        }
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        let _ = core.take_notify();
+        core.notify_message(&ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+            id: "telegram:2:5".into(),
+            sender: "Bob".into(),
+            body: "hi".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+        });
+        assert!(
+            matches!(&core.take_notify()[..], [NotifyCommand::Show(note)] if note.title == "Bob"),
+            "a resumed session notifies"
+        );
     }
 
     /// #32: a live message in a chat that the user does not look at queues a
