@@ -7,6 +7,7 @@
 
 mod core;
 mod intent;
+pub mod notify;
 mod secret_text;
 pub mod secrets;
 mod sends;

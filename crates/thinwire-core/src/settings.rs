@@ -66,6 +66,10 @@ impl PersistJob {
 #[derive(Debug, Clone)]
 pub struct Settings {
     theme: ThemeMode,
+    /// Desktop notifications for new messages (#32). Default on.
+    notifications: bool,
+    /// Show the sender and the message text in a notification. Default on.
+    notification_preview: bool,
     path: PathBuf,
     persist_pending: bool,
     persist_epoch: u64,
@@ -85,6 +89,8 @@ impl Settings {
         let theme = read_theme(&path).unwrap_or(ThemeMode::System);
         Self {
             theme,
+            notifications: read_bool(&path, "notifications").unwrap_or(true),
+            notification_preview: read_bool(&path, "notification_preview").unwrap_or(true),
             path,
             persist_pending: false,
             persist_epoch: 0,
@@ -105,6 +111,32 @@ impl Settings {
         }
         self.theme = theme;
         self.persist_pending = true;
+    }
+
+    #[must_use]
+    pub const fn notifications(&self) -> bool {
+        self.notifications
+    }
+
+    #[must_use]
+    pub const fn notification_preview(&self) -> bool {
+        self.notification_preview
+    }
+
+    /// Turn desktop notifications on or off. Disk persist is queued.
+    pub fn set_notifications(&mut self, on: bool) {
+        if self.notifications != on {
+            self.notifications = on;
+            self.persist_pending = true;
+        }
+    }
+
+    /// Show or hide the message text in notifications. Disk persist is queued.
+    pub fn set_notification_preview(&mut self, on: bool) {
+        if self.notification_preview != on {
+            self.notification_preview = on;
+            self.persist_pending = true;
+        }
     }
 
     /// Take the latest queued write. The UI thread must `spawn_blocking` this.
@@ -136,8 +168,10 @@ impl Settings {
 
     fn render(&self) -> String {
         format!(
-            "# thinwire appearance. Missing file means System.\ntheme = {}\n",
-            self.theme.as_str()
+            "# thinwire settings. Missing file means System theme, notifications on.\ntheme = {}\nnotifications = {}\nnotification_preview = {}\n",
+            self.theme.as_str(),
+            self.notifications,
+            self.notification_preview,
         )
     }
 }
@@ -147,6 +181,22 @@ fn default_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("thinwire")
         .join("settings.toml")
+}
+
+/// A `key = true|false` line. Anything else is `None`.
+fn read_bool(path: &std::path::Path, wanted: &str) -> Option<bool> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        if key.trim() != wanted {
+            return None;
+        }
+        match value.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    })
 }
 
 fn read_theme(path: &std::path::Path) -> Option<ThemeMode> {
@@ -209,6 +259,27 @@ mod tests {
         settings.set_theme(ThemeMode::System);
         settings.persist_now().expect("save system");
         assert_eq!(Settings::load_from(path).theme(), ThemeMode::System);
+    }
+
+    #[test]
+    fn notification_switches_persist_and_default_on() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.notifications());
+        assert!(settings.notification_preview());
+        settings.set_notifications(false);
+        settings.set_notification_preview(false);
+        settings.set_theme(ThemeMode::Dark);
+        settings.persist_now().expect("save");
+        let loaded = Settings::load_from(path.clone());
+        assert!(!loaded.notifications());
+        assert!(!loaded.notification_preview());
+        assert_eq!(loaded.theme(), ThemeMode::Dark, "the theme still reads");
+        fs::write(&path, "theme = light\nnotifications = maybe\n").expect("write");
+        assert!(
+            Settings::load_from(path).notifications(),
+            "a bad value is on"
+        );
     }
 
     #[test]

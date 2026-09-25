@@ -2270,6 +2270,36 @@ impl Snapshot {
         }
     }
 
+    /// The chat the user looks at, as last synced by `sync_viewed`.
+    #[must_use]
+    pub fn viewed(&self) -> Option<(ProtocolId, &str)> {
+        self.viewed
+            .as_ref()
+            .map(|(protocol, id)| (*protocol, id.as_str()))
+    }
+
+    /// One chat row of one protocol.
+    #[must_use]
+    pub fn conversation(&self, protocol: ProtocolId, id: &str) -> Option<&Conversation> {
+        self.conversations
+            .get(&protocol)?
+            .iter()
+            .find(|row| row.id == id)
+    }
+
+    /// Unread messages of every chat that is not muted, in every protocol
+    /// with a session. For the window title and a taskbar badge (#32).
+    #[must_use]
+    pub fn unread_total(&self) -> u32 {
+        self.conversations
+            .iter()
+            .filter(|(protocol, _)| self.has_session(**protocol))
+            .flat_map(|(_, rows)| rows.iter())
+            .filter(|row| !row.muted)
+            .map(|row| row.unread)
+            .fold(0, u32::saturating_add)
+    }
+
     /// The chat that shows in the thread now, if any.
     fn viewed_chat(&self) -> Option<(ProtocolId, String)> {
         if self.center_view() != CenterView::Thread {
@@ -3416,6 +3446,31 @@ mod tests {
         });
         snapshot.take_commands();
         snapshot
+    }
+
+    #[test]
+    fn unread_total_skips_muted_chats_and_protocols_without_a_session() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let chat = |id: i64, unread: u32, muted: bool| Conversation {
+            unread,
+            muted,
+            ..telegram_chat(id, "Chat", 10 - id)
+        };
+        for row in [chat(1, 3, false), chat(2, 4, true), chat(3, 5, false)] {
+            snapshot.apply(AdapterEvent::ConversationUpsert { conversation: row });
+        }
+        assert_eq!(snapshot.unread_total(), 8, "the muted chat does not count");
+        assert!(
+            snapshot
+                .conversation(ProtocolId::Telegram, "telegram:2")
+                .is_some_and(|row| row.muted)
+        );
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Unlinked,
+        });
+        assert_eq!(snapshot.unread_total(), 0, "no session, no count");
     }
 
     #[test]
