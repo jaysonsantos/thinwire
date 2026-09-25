@@ -1,7 +1,7 @@
 //! Inbox keyboard and AccessKit. A click on the preview opens that chat.
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::{NodeT, Queryable};
+use egui_kittest::kittest::{By, NodeT, Queryable};
 use thinwire_core::state::Snapshot;
 use thinwire_core::state::test_support::{ready_with_chats, telegram_chat};
 use thinwire_core::{Intent, View};
@@ -276,15 +276,15 @@ fn older_rows_keep_message_text_inside_the_bubble() {
     for (body, id) in [
         (
             "Hello from the latest row in this chat",
-            "bubble telegram:1:new",
+            "Hello from the latest row in this chat",
         ),
         (
             "Older line that must stay wide inside the bubble",
-            "bubble telegram:1:old",
+            "Older line that must stay wide inside the bubble",
         ),
     ] {
-        let text = harness.get_by_label(body);
-        let bubble = harness.get_by_label(id);
+        let text = harness.get_by_role_and_label(egui::accesskit::Role::Label, body);
+        let bubble = harness.get_by_role_and_label(egui::accesskit::Role::Pane, id);
         let text_rect = text.rect();
         let bubble_rect = bubble.rect();
         assert!(
@@ -295,6 +295,93 @@ fn older_rows_keep_message_text_inside_the_bubble() {
             text_rect.width() > 24.0,
             "{body} wraps wider than one letter"
         );
+    }
+}
+
+#[test]
+fn a_wrapped_message_keeps_the_time_on_the_bottom() {
+    let body = "Can you also bring the small stove? Ours has a broken valve, and the shop only has the big one until next week, which does not fit in the car.";
+    let mut state = InboxUi::ready();
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: chat_message("telegram:1:wrap", body, 1_790_300_000),
+    });
+    let mut harness = harness(state);
+    harness.run();
+    let text = harness.get_by_role_and_label(egui::accesskit::Role::Label, body);
+    let time = harness
+        .query_all(By::new().role(egui::accesskit::Role::Label))
+        .filter(|node| node.rect().left() >= text.rect().right() - 2.0)
+        .min_by(|left, right| {
+            (left.rect().bottom() - text.rect().bottom())
+                .abs()
+                .total_cmp(&(right.rect().bottom() - text.rect().bottom()).abs())
+        })
+        .expect("time beside the message");
+    let gap = (time.rect().bottom() - text.rect().bottom()).abs();
+    assert!(gap < 6.0, "the time sits on the last line, gap {gap}");
+}
+
+#[test]
+fn a_pending_message_keeps_the_time_on_the_last_line() {
+    let body = "On my way with the long note that wraps onto another line in this thread.";
+    let mut message = chat_message("telegram:1:pend", body, 1_790_300_000);
+    message.outbound = true;
+    message.delivery = Delivery::Pending;
+    let mut state = InboxUi::ready();
+    state
+        .snapshot
+        .apply(AdapterEvent::MessageReceived { message });
+    let mut harness = harness(state);
+    harness.run();
+    let text = harness.get_by_role_and_label(egui::accesskit::Role::Label, body);
+    let time = harness
+        .query_all(By::new().role(egui::accesskit::Role::Label))
+        .filter(|node| node.rect().left() >= text.rect().right() - 2.0)
+        .min_by(|left, right| {
+            (left.rect().bottom() - text.rect().bottom())
+                .abs()
+                .total_cmp(&(right.rect().bottom() - text.rect().bottom()).abs())
+        })
+        .expect("time beside the message");
+    let gap = (time.rect().bottom() - text.rect().bottom()).abs();
+    assert!(gap < 6.0, "the time stays on the last line, gap {gap}");
+    let sending = harness.get_by_role_and_label(egui::accesskit::Role::Label, "Sending…");
+    assert!(
+        sending.rect().top() + 2.0 >= time.rect().bottom(),
+        "Sending… sits under the time"
+    );
+}
+
+#[test]
+fn a_group_run_names_the_sender_on_every_message() {
+    let mut state = InboxUi::ready();
+    let mut conversation = telegram_chat(1, "Book club", 10);
+    conversation.is_group = true;
+    state
+        .snapshot
+        .apply(AdapterEvent::ConversationUpsert { conversation });
+    for (id, body) in [
+        ("telegram:1:a", "First line from Nora"),
+        ("telegram:1:b", "Second line from Nora"),
+    ] {
+        let mut message = chat_message(id, body, 1_790_300_000);
+        message.sender = "Nora".into();
+        state
+            .snapshot
+            .apply(AdapterEvent::MessageReceived { message });
+    }
+    let mut harness = harness(state);
+    harness.run();
+    for body in ["First line from Nora", "Second line from Nora"] {
+        harness.get(By::new().role(egui::accesskit::Role::Pane).predicate({
+            let body = body.to_owned();
+            move |node| {
+                let Some(label) = node.label() else {
+                    return false;
+                };
+                label.contains("Nora") && label.contains(&body)
+            }
+        }));
     }
 }
 

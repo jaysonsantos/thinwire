@@ -1048,6 +1048,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
             sender: message.sender.clone(),
             body: message.body.clone(),
             delivery: message.delivery,
+            group: is_group,
             layout,
         })
         .collect();
@@ -1241,6 +1242,8 @@ struct Bubble {
     sender: String,
     body: String,
     delivery: Delivery,
+    /// Group chat. The AccessKit name keeps the sender on every row.
+    group: bool,
     layout: RowLayout,
 }
 
@@ -1326,49 +1329,88 @@ fn bubble(
             .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
             .show(ui, |ui| {
                 ui.set_max_width(max_width);
-                let text_width = (max_width - space::M * 2.0 - 72.0).max(32.0);
+                let meta_width = meta_column_width(ui, &message.layout.time, message.delivery);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     if message.layout.show_sender {
                         ui.label(RichText::new(&message.sender).small().color(palette.text));
                     }
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_max_width(text_width);
-                            ui.add(
-                                egui::Label::new(RichText::new(&message.body).color(body))
-                                    .selectable(true)
-                                    .wrap()
-                                    .halign(egui::Align::LEFT),
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        let gap = ui.spacing().item_spacing.x;
+                        let text_width = (ui.available_width() - meta_width - gap).max(32.0);
+                        let body_rect = ui
+                            .vertical(|ui| {
+                                ui.set_max_width(text_width);
+                                ui.add(
+                                    egui::Label::new(RichText::new(&message.body).color(body))
+                                        .selectable(true)
+                                        .wrap()
+                                        .halign(egui::Align::LEFT),
+                                );
+                            })
+                            .response
+                            .rect;
+                        let line = ui.text_style_height(&egui::TextStyle::Small);
+                        let has_time = !message.layout.time.is_empty();
+                        let extra = match message.delivery {
+                            Delivery::Pending => 1,
+                            Delivery::Failed => 2,
+                            Delivery::Sent => 0,
+                        };
+                        if has_time || extra > 0 {
+                            let gap_y = ui.spacing().item_spacing.y;
+                            let time_h = if has_time { line } else { 0.0 };
+                            // The time shares the last body line. Status rows continue below it.
+                            let extra_h = if extra == 0 {
+                                0.0
+                            } else {
+                                gap_y + line * extra as f32 + gap_y * (extra - 1) as f32
+                            };
+                            let meta_top = if has_time {
+                                body_rect.bottom() - time_h
+                            } else {
+                                body_rect.bottom() + gap_y
+                            };
+                            let meta_rect = egui::Rect::from_min_size(
+                                egui::pos2(body_rect.right() + gap, meta_top),
+                                egui::vec2(meta_width.max(1.0), time_h + extra_h),
                             );
-                        });
-                        ui.vertical(|ui| {
-                            if !message.layout.time.is_empty() {
-                                ui.label(RichText::new(&message.layout.time).small().color(meta));
-                            }
-                            match message.delivery {
-                                Delivery::Pending => {
-                                    ui.label(RichText::new("Sending…").small().color(meta));
-                                }
-                                Delivery::Failed => {
-                                    ui.colored_label(
-                                        palette.out_error,
-                                        RichText::new("Not sent").small(),
-                                    );
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new("Retry").color(palette.accent),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .clicked()
-                                    {
-                                        *retry = Some(message.id.clone());
+                            ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .max_rect(meta_rect)
+                                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                                |ui| {
+                                    if !message.layout.time.is_empty() {
+                                        ui.label(
+                                            RichText::new(&message.layout.time).small().color(meta),
+                                        );
                                     }
-                                }
-                                Delivery::Sent => {}
-                            }
-                        });
+                                    match message.delivery {
+                                        Delivery::Pending => {
+                                            ui.label(RichText::new("Sending…").small().color(meta));
+                                        }
+                                        Delivery::Failed => {
+                                            ui.colored_label(
+                                                palette.out_error,
+                                                RichText::new("Not sent").small(),
+                                            );
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("Retry")
+                                                            .color(palette.accent),
+                                                    )
+                                                    .frame(false),
+                                                )
+                                                .clicked()
+                                            {
+                                                *retry = Some(message.id.clone());
+                                            }
+                                        }
+                                        Delivery::Sent => {}
+                                    }
+                                },
+                            );
+                        }
                     });
                 });
             })
@@ -1377,10 +1419,52 @@ fn bubble(
                 egui::WidgetInfo::labeled(
                     egui::WidgetType::Panel,
                     true,
-                    format!("bubble {}", message.id),
+                    bubble_access_label(message),
                 )
             });
     });
+}
+
+/// Width of the time and delivery column. Empty when the row has neither.
+fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery) -> f32 {
+    let font = egui::FontId::new(size::CAPTION, egui::FontFamily::Proportional);
+    let text_width = |text: &str| -> f32 {
+        if text.is_empty() {
+            0.0
+        } else {
+            ui.painter()
+                .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+        }
+    };
+    let mut width = text_width(time);
+    match delivery {
+        Delivery::Pending => width = width.max(text_width("Sending…")),
+        Delivery::Failed => {
+            width = width.max(text_width("Not sent"));
+            let pad = ui.spacing().button_padding.x * 2.0;
+            width = width.max(text_width("Retry") + pad);
+        }
+        Delivery::Sent => {}
+    }
+    width
+}
+
+/// AccessKit name of a bubble.
+///
+/// A group row names the sender and the time on every message. A private
+/// row names the message. The visual sender header stays on the first row
+/// of a run.
+fn bubble_access_label(message: &Bubble) -> String {
+    if message.group {
+        format!(
+            "{} {} {}",
+            message.sender, message.layout.time, message.body
+        )
+    } else {
+        message.body.clone()
+    }
 }
 
 /// 12 on every corner. The last bubble of a run uses 4 on the sender side.
@@ -1574,6 +1658,43 @@ mod tests {
         assert!(!row_scrolls(true, false, true, true));
         assert!(row_scrolls(true, false, true, false));
         assert!(!row_scrolls(false, true, true, false));
+    }
+
+    #[test]
+    fn a_zero_width_frame_keeps_the_previous_thread_width() {
+        use thinwire_protocol::Delivery;
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut stored = 0.0;
+        let mut meta = 0.0;
+        let mut output = ctx.run_ui(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                stored = super::laid_out_width(ui, "thread-width");
+                meta = super::meta_column_width(ui, "10:00", Delivery::Sent);
+            });
+        });
+        output.textures_delta.clear();
+        let mut fallback = 0.0;
+        let mut output = ctx.run_ui(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_max_width(0.0);
+                fallback = super::laid_out_width(ui, "thread-width");
+            });
+        });
+        output.textures_delta.clear();
+        assert!(stored >= 48.0, "the first frame records a real width");
+        assert_eq!(fallback, stored, "a 0-width frame reuses that width");
+        assert!(
+            meta > 0.0 && meta < 72.0,
+            "the time column is only as wide as the time"
+        );
     }
     use thinwire_protocol::AdapterStatus;
 
