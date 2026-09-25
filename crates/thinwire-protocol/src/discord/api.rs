@@ -8,9 +8,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-/// Used when a 429 body has no usable `retry_after`.
-pub(crate) const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(1);
-
 /// Boxed future returned by [`DiscordApi`] calls. Runs on the tokio worker.
 pub(crate) type ApiFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DiscordApiError>> + Send + 'a>>;

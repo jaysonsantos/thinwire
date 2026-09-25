@@ -15,8 +15,11 @@ use twilight_model::id::Id;
 
 use super::api::{
     ApiFuture, ChannelKind, ChannelSummary, DiscordApi, DiscordApiError, GuildSummary,
-    MessageSummary, Overwrite, OverwriteTarget, RATE_LIMIT_FALLBACK,
+    MessageSummary, Overwrite, OverwriteTarget,
 };
+
+/// Used when a 429 body has no usable `retry_after`.
+const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(1);
 
 pub(crate) struct TwilightApi {
     client: Client,
