@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::Notify;
+
 use super::api::{DiscordApi, DiscordApiError};
 use super::inbox::{HISTORY_LIMIT, InboxChannel, chat_message, load_channels};
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
@@ -51,6 +53,9 @@ struct Shared {
     bodies: HashMap<String, String>,
     /// Latest `reload` in this session. An older list must not publish.
     reload_ticket: u64,
+    /// Send tasks still running. Shutdown waits until this is zero.
+    send_tasks: u64,
+    send_idle: Arc<Notify>,
 }
 
 /// Drops events from a replaced session.
@@ -122,6 +127,8 @@ impl Session {
                 history,
                 bodies,
                 reload_ticket: 0,
+                send_tasks: 0,
+                send_idle: Arc::new(Notify::new()),
             })),
             gate: Gate {
                 live: Arc::clone(live),
@@ -322,7 +329,9 @@ impl Session {
         let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
         let events = events.clone();
+        let guard = self.track_send();
         tokio::spawn(async move {
+            let _guard = guard;
             let result = api.send(access.channel_id, body).await;
             if let Ok(mut state) = shared.lock() {
                 state
@@ -401,7 +410,9 @@ impl Session {
         let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
         let events = events.clone();
+        let guard = self.track_send();
         tokio::spawn(async move {
+            let _guard = guard;
             let result = api.send(access.channel_id, body).await;
             if !gate.current() {
                 emit_message_delivery(
@@ -546,6 +557,61 @@ fn fail_send(
         return;
     }
     emit_ready(events, &format!("Send failed: {error}."));
+}
+
+/// Completes when every send task started on this session has finished.
+async fn settle_sends(shared: &Arc<Mutex<Shared>>) {
+    loop {
+        let idle = {
+            let Ok(state) = shared.lock() else {
+                return;
+            };
+            Arc::clone(&state.send_idle)
+        };
+        let wait = idle.notified();
+        let busy = shared
+            .lock()
+            .map(|state| state.send_tasks > 0)
+            .unwrap_or(false);
+        if !busy {
+            return;
+        }
+        wait.await;
+    }
+}
+
+struct SendGuard {
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl Session {
+    fn track_send(&self) -> SendGuard {
+        if let Ok(mut state) = self.shared.lock() {
+            state.send_tasks += 1;
+        }
+        SendGuard {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    pub(crate) fn wait_for_sends(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let shared = Arc::clone(&self.shared);
+        Box::pin(async move { settle_sends(&shared).await })
+    }
+}
+
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.shared.lock() else {
+            return;
+        };
+        state.send_tasks = state.send_tasks.saturating_sub(1);
+        if state.send_tasks == 0 {
+            state.send_idle.notify_waiters();
+        }
+    }
 }
 
 fn emit_ready(events: &EventTx, note: &str) {

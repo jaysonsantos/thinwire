@@ -349,9 +349,26 @@ impl ProtocolAdapter for DiscordAdapter {
         }
     }
 
-    /// Drop the bot session, then `Stopped`. Nothing is running until connect.
+    /// Let in-flight sends settle, then `Stopped`. The wait is bounded so close
+    /// cannot hang on a stuck request.
     fn shutdown(&mut self, events: &EventTx) {
-        self.stop_session(events);
+        #[cfg(any(test, feature = "discord-bot"))]
+        {
+            const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
+            let pending = self.session.as_ref().map(session::Session::wait_for_sends);
+            let live = Arc::clone(&self.live);
+            self.session = None;
+            let events = events.clone();
+            tokio::spawn(async move {
+                if let Some(pending) = pending {
+                    let _ = tokio::time::timeout(SHUTDOWN_LIMIT, pending).await;
+                }
+                live.fetch_add(1, Ordering::SeqCst);
+                super::adapter::emit_stopped(&events, ProtocolId::Discord);
+            });
+            return;
+        }
+        #[cfg(not(any(test, feature = "discord-bot")))]
         super::adapter::emit_stopped(events, ProtocolId::Discord);
     }
 
@@ -1200,6 +1217,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_waits_for_an_inflight_send_before_stopped() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "on the way".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("pending");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        adapter.shutdown(&tx);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let early = drain(&mut rx);
+        assert!(
+            !early
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Stopped { .. })),
+            "Stopped waits until the send settles"
+        );
+        hold.notify_waiters();
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Stopped { .. })
+        })
+        .await;
+        let accepted = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::SendAccepted { request: 1, .. }));
+        let stopped = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::Stopped { .. }))
+            .expect("stopped");
+        assert!(accepted.is_some_and(|at| at < stopped));
+    }
+
+    #[tokio::test]
     async fn a_revoked_token_on_send_unlinks_the_account() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
@@ -1227,10 +1286,11 @@ mod tests {
                 ..
             }
         )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AdapterEvent::SendRejected { request: 1, .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 1, .. }))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AdapterEvent::Notice { text, .. } if text.contains("Replace discord.bot_token")
