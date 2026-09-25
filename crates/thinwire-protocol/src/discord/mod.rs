@@ -2018,6 +2018,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_older_reload_ticket_does_not_emit_command_failed() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().hold_load = Some(Arc::clone(&hold));
+        api.state().hold_load_arrived = Some(Arc::clone(&arrived));
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("slow reload");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("older reload is in flight");
+        api.state().hold_load = None;
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("newer reload");
+        let _ = inbox_loaded(&mut rx).await;
+        api.state().next_error = Some(api::DiscordApiError::Transport);
+        hold.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late.iter().any(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::CommandFailed { .. }
+                        | AdapterEvent::Status {
+                            status: AdapterStatus::Error,
+                            ..
+                        }
+                        | AdapterEvent::Account {
+                            state: AccountState::Unlinked,
+                            ..
+                        }
+                )
+            }),
+            "an older reload ticket emits nothing after a newer list"
+        );
+    }
+
+    #[tokio::test]
     async fn a_revoked_session_drops_a_channel_list_that_finishes_later() {
         let hold = Arc::new(Notify::new());
         let arrived = Arc::new(Notify::new());

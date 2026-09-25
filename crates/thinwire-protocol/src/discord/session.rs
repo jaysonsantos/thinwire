@@ -235,7 +235,7 @@ impl Session {
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
-                    if finish_reload(&shared, generation, &events, error) {
+                    if finish_reload(&shared, generation, ticket, &events, error) {
                         seal_unlink(api.as_ref(), &shared, &gate, generation, &events).await;
                         emit_status(
                             &events,
@@ -649,20 +649,22 @@ fn publish_channels(
 /// Applies a finished channel-list reload under the session lock.
 ///
 /// A 401 from this generation unlinks. A result whose generation already
-/// moved is dropped, so it cannot unlink the session that replaced it.
-/// `true` when this generation's list failed with 401. The caller then seals
-/// `Unlinked` and emits the error status, after a send waiting on the lock
-/// has queued its `SendRejected`.
+/// moved, or whose reload ticket is no longer current, is dropped. It does
+/// not emit `CommandFailed` or unlink the list that replaced it.
+/// `true` when this generation's current ticket failed with 401. The caller
+/// then seals `Unlinked` and emits the error status, after a send waiting on
+/// the lock has queued its `SendRejected`.
 fn finish_reload(
     shared: &Arc<Mutex<Shared>>,
     generation: u64,
+    ticket: u64,
     events: &EventTx,
     error: DiscordApiError,
 ) -> bool {
     let Ok(mut state) = shared.lock() else {
         return false;
     };
-    if state.generation != generation {
+    if state.generation != generation || state.reload_ticket != ticket {
         return false;
     }
     if error == DiscordApiError::Unauthorized {
