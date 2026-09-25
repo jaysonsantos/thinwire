@@ -80,6 +80,17 @@ impl Session {
             .unwrap_or_default()
     }
 
+    /// Message ids from the last history page of each channel.
+    ///
+    /// A replacement session starts empty. Without these ids the next page
+    /// cannot remove rows the shell still shows.
+    pub(crate) fn carried_history(&self) -> HashMap<String, Vec<String>> {
+        self.shared
+            .lock()
+            .map(|state| state.history.clone())
+            .unwrap_or_default()
+    }
+
     /// Starts a new generation and loads the channel list.
     ///
     /// `carried` is the previous list. An empty map is a first connect.
@@ -88,6 +99,7 @@ impl Session {
         live: &Arc<AtomicU64>,
         events: &EventTx,
         carried: HashMap<String, ChannelAccess>,
+        history: HashMap<String, Vec<String>>,
     ) -> Self {
         let generation = live.fetch_add(1, Ordering::SeqCst) + 1;
         let session = Self {
@@ -96,7 +108,7 @@ impl Session {
                 bot_id: None,
                 channels: carried,
                 inflight: Vec::new(),
-                history: HashMap::new(),
+                history,
                 bodies: HashMap::new(),
             })),
             gate: Gate {
@@ -302,17 +314,21 @@ impl Session {
             }
             match result {
                 Ok(sent) => {
+                    let row = chat_message(&conversation_id, bot_id, &sent);
+                    if let Ok(mut state) = shared.lock() {
+                        state
+                            .history
+                            .entry(conversation_id.clone())
+                            .or_default()
+                            .push(row.id.clone());
+                    }
                     emit_send_accepted(
                         &events,
                         ProtocolId::Discord,
                         conversation_id.as_str(),
                         request,
                     );
-                    emit_message_replaced(
-                        &events,
-                        pending_id,
-                        chat_message(&conversation_id, bot_id, &sent),
-                    );
+                    emit_message_replaced(&events, pending_id, row);
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord send failed");
@@ -363,6 +379,7 @@ impl Session {
             return Ok(());
         };
         let api = Arc::clone(&self.api);
+        let shared = Arc::clone(&self.shared);
         let gate = self.gate.clone();
         let events = events.clone();
         tokio::spawn(async move {
@@ -380,17 +397,21 @@ impl Session {
             }
             match result {
                 Ok(sent) => {
+                    let row = chat_message(&conversation_id, bot_id, &sent);
+                    if let Ok(mut state) = shared.lock() {
+                        state
+                            .history
+                            .entry(conversation_id.clone())
+                            .or_default()
+                            .push(row.id.clone());
+                    }
                     emit_send_accepted(
                         &events,
                         ProtocolId::Discord,
                         conversation_id.as_str(),
                         request,
                     );
-                    emit_message_replaced(
-                        &events,
-                        message_id,
-                        chat_message(&conversation_id, bot_id, &sent),
-                    );
+                    emit_message_replaced(&events, message_id, row);
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord resend failed");

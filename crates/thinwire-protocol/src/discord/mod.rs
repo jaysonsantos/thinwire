@@ -173,6 +173,11 @@ impl DiscordAdapter {
             .as_ref()
             .map(session::Session::carried_channels)
             .unwrap_or_default();
+        let history = self
+            .session
+            .as_ref()
+            .map(session::Session::carried_history)
+            .unwrap_or_default();
         self.stop_session(events);
         let prepared = self.prepared_token()?;
         #[cfg(any(test, feature = "discord-bot"))]
@@ -191,7 +196,8 @@ impl DiscordAdapter {
                 }
                 Some(token) => {
                     let api = factory(token);
-                    self.session = Some(session::Session::start(api, &self.live, events, carried));
+                    self.session =
+                        Some(session::Session::start(api, &self.live, events, carried, history));
                 }
             }
             return Ok(());
@@ -1180,6 +1186,90 @@ mod tests {
                 .any(|event| matches!(event, AdapterEvent::Notice { .. }))
         );
         hold.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn reconnect_drops_rows_the_new_page_no_longer_has() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::HistoryLoaded { .. })
+        })
+        .await;
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "posted".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        let sent = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReplaced { .. })
+        })
+        .await;
+        let sent_id = sent
+            .iter()
+            .find_map(|event| match event {
+                AdapterEvent::MessageReplaced { message, .. } => Some(message.id.clone()),
+                _ => None,
+            })
+            .expect("sent id");
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = inbox_loaded(&mut rx).await;
+        api.state()
+            .history
+            .get_mut(&GENERAL)
+            .expect("history")
+            .retain(|message| message.id != 1);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                },
+                &tx,
+            )
+            .expect("reopen");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::HistoryLoaded { .. })
+        })
+        .await;
+        let removed: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessagesRemoved { message_ids, .. } => {
+                    Some(message_ids.iter().map(String::as_str))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(removed.contains(&"discord:1"), "aged-out history row");
+        assert!(
+            removed.iter().any(|row| *row == sent_id),
+            "a sent row is part of the page the next load replaces"
+        );
     }
 
     #[tokio::test]
