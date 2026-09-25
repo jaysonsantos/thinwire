@@ -33,6 +33,7 @@ const DATA_DIR_MISSING: &str =
     "Platform app-data directory is unavailable. WhatsApp pairing did not start.";
 const STORE_FAILED: &str =
     "WhatsApp device store could not be opened under app-data. Nothing was logged.";
+const REVOKE_NOT_SAVED: &str = "WhatsApp unlinked this device, but thinwire could not remove or mark its session file. Check that the app-data folder is writable, then pair again: the next pairing removes the old session first.";
 const BUILD_FAILED: &str =
     "WhatsApp pairing client could not be built. No session material was logged.";
 
@@ -81,7 +82,9 @@ pub(super) trait LinkBackend: Send + Sync + 'static {
 
     /// Record on disk that the phone revoked the store. The mark survives a
     /// restart; [`Self::delete_store`] removes it.
-    fn mark_revoked(&self) -> impl Future<Output = ()> + Send;
+    /// `Err` means that the mark is not on disk (for example a read-only
+    /// app-data folder).
+    fn mark_revoked(&self) -> impl Future<Output = Result<(), ()>> + Send;
 
     /// The store carries a revoked mark, maybe from an earlier run.
     fn is_revoked(&self) -> impl Future<Output = bool> + Send;
@@ -294,16 +297,24 @@ impl<B: LinkBackend> Owner<B> {
         // Later callbacks of this link are stale from here on.
         self.generation += 1;
         self.session.apply(event, generation, &self.events);
-        if invalidate {
+        let marked = if invalidate {
             self.stale = true;
-            self.backend.mark_revoked().await;
-        }
+            self.backend.mark_revoked().await.is_ok()
+        } else {
+            true
+        };
         if let Some(bot) = self.bot.take() {
             self.backend.stop(bot).await;
         }
         self.active.store(false, Ordering::SeqCst);
         if self.stale && self.backend.delete_store().await.is_ok() {
             self.stale = false;
+        }
+        // Neither the mark nor the delete reached the disk: only memory knows
+        // that the store is revoked. Tell the user; a Begin in this run still
+        // deletes it first (Codex r4103855622).
+        if self.stale && !marked {
+            self.status(AdapterStatus::Error, REVOKE_NOT_SAVED);
         }
     }
 
@@ -354,6 +365,8 @@ pub(super) mod tests {
         pub start_error: Option<StartError>,
         /// The revoked mark "on disk". Survives a new owner (a restart).
         pub revoked: AtomicBool,
+        /// `mark_revoked` fails (a read-only app-data folder).
+        pub mark_fails: bool,
     }
 
     #[derive(Clone, Default)]
@@ -415,9 +428,14 @@ pub(super) mod tests {
             }
         }
 
-        async fn mark_revoked(&self) {
+        async fn mark_revoked(&self) -> Result<(), ()> {
+            if self.0.mark_fails {
+                self.0.log.lock().expect("log").push("mark failed".into());
+                return Err(());
+            }
             self.0.log.lock().expect("log").push("mark revoked".into());
             self.0.revoked.store(true, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn is_revoked(&self) -> bool {
@@ -809,6 +827,55 @@ pub(super) mod tests {
                 .skip(6)
                 .any(|entry| entry.starts_with("delete"))
         );
+    }
+
+    /// Codex r4103855622: a failed mark write is not silent. If the delete
+    /// also fails, the user gets an error, and a Begin in this run still
+    /// deletes the store first.
+    #[tokio::test]
+    async fn failed_mark_and_failed_delete_report_an_error() {
+        let (fake, handle, _session, mut rx) = owner(Fake {
+            mark_fails: true,
+            delete_failures: AtomicUsize::new(1),
+            ..Fake::default()
+        });
+        handle.begin(None, 7);
+        handle.flush().await;
+        drain(&mut rx);
+        fake.callback(1).send(LinkEvent::LoggedOut);
+        handle.flush().await;
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { status: AdapterStatus::Error, detail, .. } if detail == REVOKE_NOT_SAVED
+        )));
+        handle.begin(None, 8);
+        handle.flush().await;
+        assert_eq!(
+            fake.log(),
+            vec![
+                "start 1",
+                "mark failed",
+                "stop 1",
+                "delete failed",
+                "delete",
+                "start 3"
+            ]
+        );
+
+        // A failed mark with a working delete needs no error.
+        let (fake, handle, _session, mut rx) = owner(Fake {
+            mark_fails: true,
+            ..Fake::default()
+        });
+        handle.begin(None, 7);
+        handle.flush().await;
+        drain(&mut rx);
+        fake.callback(1).send(LinkEvent::LoggedOut);
+        handle.flush().await;
+        assert!(!drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { detail, .. } if detail == REVOKE_NOT_SAVED
+        )));
     }
 
     /// #44: shutdown waits for a pending start, then stops that client.

@@ -72,12 +72,13 @@ impl LinkBackend for LiveBackend {
             .map_err(|_| ())
     }
 
-    async fn mark_revoked(&self) {
-        let Ok(path) = whatsapp_device_store_path() else {
-            return;
-        };
+    async fn mark_revoked(&self) -> Result<(), ()> {
+        let path = whatsapp_device_store_path()?;
         let marker = revoked_marker(&path);
-        let _ = tokio::task::spawn_blocking(move || std::fs::write(marker, b"")).await;
+        tokio::task::spawn_blocking(move || std::fs::write(marker, b""))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())
     }
 
     async fn is_revoked(&self) -> bool {
