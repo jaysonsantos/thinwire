@@ -14,7 +14,9 @@ jobs:
   claude-review:
     # Renovate opens dependency PRs as renovate[bot]. The action rejects that
     # actor. cursor[bot] stays in allowed_bots and still gets a review.
-    if: github.event.pull_request.user.login != 'renovate[bot]'
+    # Mergify opens merge-queue PRs as mergify[bot]. Head refs start with
+    # mergify/. Skip those runs too.
+    if: github.event.pull_request.user.login != 'renovate[bot]' && github.event.pull_request.user.login != 'mergify[bot]' && !startsWith(github.head_ref, 'mergify/')
 
     runs-on: ubuntu-latest
     permissions:
