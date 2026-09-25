@@ -533,13 +533,20 @@ mod tests {
     }
 
     fn conversations(events: &[AdapterEvent]) -> Vec<&crate::Conversation> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                AdapterEvent::ConversationUpsert { conversation } => Some(conversation),
-                _ => None,
-            })
-            .collect()
+        let mut index = std::collections::HashMap::<&str, usize>::new();
+        let mut rows = Vec::new();
+        for event in events {
+            let AdapterEvent::ConversationUpsert { conversation } = event else {
+                continue;
+            };
+            if let Some(slot) = index.get(conversation.id.as_str()).copied() {
+                rows[slot] = conversation;
+            } else {
+                index.insert(conversation.id.as_str(), rows.len());
+                rows.push(conversation);
+            }
+        }
+        rows
     }
 
     fn messages(events: &[AdapterEvent]) -> Vec<&crate::ChatMessage> {
@@ -787,13 +794,114 @@ mod tests {
         let reloaded = until(&mut rx, |event| {
             matches!(
                 event,
-                AdapterEvent::ChatListLoaded {
-                    protocol: ProtocolId::Discord
-                }
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.preview == "news line"
             )
         })
         .await;
         assert_preview_failure_keeps_channels(&reloaded);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn linked_before_preview_fetches_and_previews_stay_bounded() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::api::{ChannelKind, ChannelSummary};
+        use super::inbox::PREVIEW_FETCH_CONCURRENCY;
+
+        let mut fake = FakeDiscordApi::guild_fixture();
+        let release = Arc::new(AtomicBool::new(false));
+        fake.hold_preview = Some(Arc::clone(&release));
+        fake.state().channels.insert(
+            GUILD,
+            (0..20)
+                .map(|n| ChannelSummary {
+                    id: 3_000 + n,
+                    name: format!("c{n}"),
+                    kind: ChannelKind::Text,
+                    last_message_id: None,
+                    overwrites: Vec::new(),
+                })
+                .collect(),
+        );
+        let api = Arc::new(fake);
+        let (mut adapter, _vault) = fake_adapter(Arc::clone(&api), Some(FIXTURE_TOKEN));
+        let (tx, mut rx) = unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::ConnectDiscord {
+                    mode: DiscordAuthMode::Bot,
+                },
+                &tx,
+            )
+            .expect("connect");
+        let mut events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Linked,
+                    ..
+                }
+            )
+        })
+        .await;
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            api.preview_calls.load(Ordering::SeqCst),
+            0,
+            "Linked before any preview fetch"
+        );
+        let rows = conversations(&events);
+        assert_eq!(rows.len(), 20, "the list is published before previews");
+        assert!(rows.iter().all(|row| row.preview.is_empty()));
+
+        for _ in 0..200 {
+            if api.preview_in_flight.load(Ordering::SeqCst) >= PREVIEW_FETCH_CONCURRENCY {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            api.preview_calls.load(Ordering::SeqCst),
+            PREVIEW_FETCH_CONCURRENCY,
+            "20 channels do not all call history before the first batch finishes"
+        );
+        assert!(api.preview_max_in_flight.load(Ordering::SeqCst) <= PREVIEW_FETCH_CONCURRENCY);
+
+        release.store(true, Ordering::SeqCst);
+        for _ in 0..2_000 {
+            if api.preview_calls.load(Ordering::SeqCst) == 20
+                && api.preview_in_flight.load(Ordering::SeqCst) == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(api.preview_calls.load(Ordering::SeqCst), 20);
+        assert!(api.preview_max_in_flight.load(Ordering::SeqCst) <= PREVIEW_FETCH_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_preview_is_retried() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        api.state().preview_failures.insert(
+            GENERAL,
+            super::api::DiscordApiError::RateLimited {
+                retry_after: Duration::from_millis(1),
+            },
+        );
+        let (_adapter, _tx, _rx, events) = connected(Arc::clone(&api)).await;
+        let general = conversations(&events)
+            .into_iter()
+            .find(|row| row.title == "#general")
+            .expect("general");
+        assert_eq!(general.preview, "reply from the bot");
+        assert!(
+            api.preview_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "a 429 is tried again"
+        );
     }
 
     fn assert_preview_failure_keeps_channels(events: &[AdapterEvent]) {
@@ -1787,7 +1895,13 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_stops_the_channel_list() {
-        channel_list_fails(api::DiscordApiError::RateLimited, "rate limit").await;
+        channel_list_fails(
+            api::DiscordApiError::RateLimited {
+                retry_after: Duration::ZERO,
+            },
+            "rate limit",
+        )
+        .await;
     }
 
     #[tokio::test]

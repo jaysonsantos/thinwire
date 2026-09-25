@@ -3,12 +3,21 @@
 //! Only guild text and announcement channels that the bot can read are listed.
 //! Direct-message channels never come from these calls.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use super::api::{ChannelKind, DiscordApi, DiscordApiError, MessageSummary};
 use super::permissions::{MemberBase, can_read, can_send, channel_permissions};
 use crate::adapter::{ChatMessage, Conversation, Delivery, ProtocolId};
 
 /// Messages loaded when a channel opens. Discord allows 1..=100.
 pub(crate) const HISTORY_LIMIT: u16 = 50;
+
+/// Preview history calls in flight at once. The list is published before any of them.
+pub(crate) const PREVIEW_FETCH_CONCURRENCY: usize = 4;
+
+/// Give up on a preview after this many 429s. The row stays empty.
+const PREVIEW_RATE_LIMIT_ATTEMPTS: u32 = 3;
 
 const CONVERSATION_PREFIX: &str = "discord:";
 
@@ -62,9 +71,10 @@ pub(crate) fn conversation_id(guild_id: u64, channel_id: u64) -> String {
     format!("{CONVERSATION_PREFIX}{guild_id}:{channel_id}")
 }
 
-/// Bot user id and every readable guild channel.
+/// Bot user id and every readable guild channel, with empty previews.
 ///
 /// A guild that answers 403 or 404 is skipped. A bad token stops the load.
+/// Previews are filled later so linking does not wait on one history call per channel.
 pub(crate) async fn load_channels(
     api: &dyn DiscordApi,
 ) -> Result<(u64, Vec<InboxChannel>), DiscordApiError> {
@@ -96,22 +106,6 @@ pub(crate) async fn load_channels(
             if !can_read(perms) {
                 continue;
             }
-            let preview = match api.history(channel.id, 1).await {
-                Ok(latest) => latest
-                    .first()
-                    .map(message_body)
-                    .filter(|text| text != "[no text]")
-                    .unwrap_or_default(),
-                // One channel's preview is optional. A failure must not drop
-                // the rest of the list or invent text the channel did not have.
-                Err(error) => {
-                    tracing::info!(
-                        reason = error.reason(),
-                        "discord channel preview did not load"
-                    );
-                    String::new()
-                }
-            };
             list.push(InboxChannel {
                 guild_id: guild.id,
                 guild_name: guild.name.clone(),
@@ -119,11 +113,87 @@ pub(crate) async fn load_channels(
                 name: channel.name,
                 last_message_id: channel.last_message_id,
                 can_send: can_send(perms),
-                preview,
+                preview: String::new(),
             });
         }
     }
     Ok((bot_id, list))
+}
+
+/// Newest visible message, or empty. A failure stays empty.
+pub(crate) async fn channel_preview(
+    api: &dyn DiscordApi,
+    channel_id: u64,
+    pause: &PreviewPause,
+) -> String {
+    for attempt in 0..PREVIEW_RATE_LIMIT_ATTEMPTS {
+        pause.wait().await;
+        match api.history(channel_id, 1).await {
+            Ok(latest) => return preview_text(latest.first()),
+            Err(DiscordApiError::RateLimited { retry_after }) => {
+                pause.push(retry_after);
+                if attempt + 1 == PREVIEW_RATE_LIMIT_ATTEMPTS {
+                    tracing::info!(
+                        reason = DiscordApiError::RateLimited { retry_after }.reason(),
+                        "discord channel preview did not load"
+                    );
+                    return String::new();
+                }
+            }
+            Err(error) => {
+                tracing::info!(
+                    reason = error.reason(),
+                    "discord channel preview did not load"
+                );
+                return String::new();
+            }
+        }
+    }
+    String::new()
+}
+
+fn preview_text(latest: Option<&MessageSummary>) -> String {
+    latest
+        .map(message_body)
+        .filter(|text| text != "[no text]")
+        .unwrap_or_default()
+}
+
+/// Shared pause so one 429 holds the other preview calls too.
+pub(crate) struct PreviewPause {
+    until: Mutex<Instant>,
+}
+
+impl PreviewPause {
+    pub(crate) fn new() -> Self {
+        Self {
+            until: Mutex::new(Instant::now()),
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let delay = self
+                .until
+                .lock()
+                .map(|until| until.saturating_duration_since(Instant::now()))
+                .unwrap_or_default();
+            if delay.is_zero() {
+                return;
+            }
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    fn push(&self, retry_after: Duration) {
+        let Ok(mut until) = self.until.lock() else {
+            return;
+        };
+        let next = Instant::now() + retry_after;
+        if next > *until {
+            *until = next;
+        }
+    }
 }
 
 /// Visible text. Discord's REST `content` is kept as returned (the Message

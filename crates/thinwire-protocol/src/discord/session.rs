@@ -7,10 +7,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 use super::api::{DiscordApi, DiscordApiError};
-use super::inbox::{HISTORY_LIMIT, InboxChannel, chat_message, load_channels};
+use super::inbox::{
+    HISTORY_LIMIT, InboxChannel, PREVIEW_FETCH_CONCURRENCY, PreviewPause, channel_preview,
+    chat_message, load_channels,
+};
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
 use crate::adapter::{
     AccountState, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Delivery, EventTx,
@@ -175,6 +178,17 @@ impl Session {
                     // The shell stops the chat-list spinner on this event
                     // (adapter contract rule 9, ADR 0010).
                     emit_chat_list_loaded(&events, ProtocolId::Discord);
+                    // The list is already on the channel. Yield so it is
+                    // delivered before any preview history call starts.
+                    tokio::task::yield_now().await;
+                    if !gate.current() {
+                        return;
+                    }
+                    let current = shared.lock().map(|state| state.reload_ticket).unwrap_or(0);
+                    if current != ticket {
+                        return;
+                    }
+                    spawn_previews(api, channels, shared, gate, events, ticket);
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
@@ -555,6 +569,59 @@ fn publish_channels(
     for channel in channels {
         emit_conversation(events, channel.conversation());
     }
+}
+
+/// Fills previews after the account is linked. At most
+/// [`PREVIEW_FETCH_CONCURRENCY`] history calls run at once. A failure leaves
+/// the empty preview already published.
+fn spawn_previews(
+    api: Arc<dyn DiscordApi>,
+    channels: Vec<InboxChannel>,
+    shared: Arc<Mutex<Shared>>,
+    gate: Gate,
+    events: EventTx,
+    ticket: u64,
+) {
+    let pause = Arc::new(PreviewPause::new());
+    let limit = Arc::new(Semaphore::new(PREVIEW_FETCH_CONCURRENCY));
+    for channel in channels {
+        let api = Arc::clone(&api);
+        let shared = Arc::clone(&shared);
+        let gate = gate.clone();
+        let events = events.clone();
+        let pause = Arc::clone(&pause);
+        let limit = Arc::clone(&limit);
+        tokio::spawn(async move {
+            let Ok(_permit) = limit.acquire_owned().await else {
+                return;
+            };
+            if !preview_still_listed(&shared, &gate, ticket, &channel) {
+                return;
+            }
+            let preview = channel_preview(api.as_ref(), channel.channel_id, &pause).await;
+            if preview.is_empty() || !preview_still_listed(&shared, &gate, ticket, &channel) {
+                return;
+            }
+            let mut channel = channel;
+            channel.preview = preview;
+            emit_conversation(&events, channel.conversation());
+        });
+    }
+}
+
+fn preview_still_listed(
+    shared: &Mutex<Shared>,
+    gate: &Gate,
+    ticket: u64,
+    channel: &InboxChannel,
+) -> bool {
+    if !gate.current() {
+        return false;
+    }
+    let Ok(state) = shared.lock() else {
+        return false;
+    };
+    state.reload_ticket == ticket && state.channels.contains_key(&channel.conversation_id())
 }
 
 /// A send or retry failed. A revoked token unlinks the account. Other

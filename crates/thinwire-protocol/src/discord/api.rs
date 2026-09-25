@@ -6,6 +6,10 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
+
+/// Used when a 429 body has no usable `retry_after`.
+pub(crate) const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(1);
 
 /// Boxed future returned by [`DiscordApi`] calls. Runs on the tokio worker.
 pub(crate) type ApiFuture<'a, T> =
@@ -78,7 +82,10 @@ pub(crate) enum DiscordApiError {
     /// 403. The bot lacks a permission.
     Forbidden,
     NotFound,
-    RateLimited,
+    /// 429. `retry_after` is how long to wait before another attempt.
+    RateLimited {
+        retry_after: Duration,
+    },
     /// Discord or local validation rejected the request.
     Rejected,
     /// Network or decode failure.
@@ -94,7 +101,7 @@ impl DiscordApiError {
             }
             Self::Forbidden => "the bot does not have permission for that channel",
             Self::NotFound => "Discord did not find that guild or channel",
-            Self::RateLimited => "Discord rate limit. Try again later",
+            Self::RateLimited { .. } => "Discord rate limit. Try again later",
             Self::Rejected => "Discord rejected the request",
             Self::Transport => "network error while talking to Discord",
         }
@@ -155,6 +162,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::{
         DiscordApiError, GUILD_PAGE_CAP, GUILD_PAGE_LIMIT, GuildSummary, collect_guild_pages,
@@ -175,7 +183,9 @@ mod tests {
             DiscordApiError::Unauthorized,
             DiscordApiError::Forbidden,
             DiscordApiError::NotFound,
-            DiscordApiError::RateLimited,
+            DiscordApiError::RateLimited {
+                retry_after: Duration::ZERO,
+            },
             DiscordApiError::Rejected,
             DiscordApiError::Transport,
         ] {
