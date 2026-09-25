@@ -41,7 +41,7 @@ const UNKNOWN_MESSAGE: &str = "contract:unknown-message";
 const SEND_BODY: &str = "contract kit send";
 
 /// One adapter under test, and every event it sent.
-pub(crate) struct Contract {
+pub struct Contract {
     /// One adapter, in the form the host's `dispatch` takes.
     adapters: Vec<Box<dyn ProtocolAdapter>>,
     protocol: ProtocolId,
@@ -49,8 +49,8 @@ pub(crate) struct Contract {
     tx: EventTx,
     rx: UnboundedReceiver<AdapterEvent>,
     seen: Vec<AdapterEvent>,
-    /// Send and retry requests that the kit sent.
-    requests: HashSet<u64>,
+    /// Send and retry requests that the kit sent, with their chat.
+    requests: HashMap<u64, String>,
     next_request: u64,
     /// Pairing generations that the kit sent (rule 8).
     generations: HashSet<u64>,
@@ -58,7 +58,7 @@ pub(crate) struct Contract {
 
 impl Contract {
     /// Start the adapter on a new event channel.
-    pub(crate) fn new(mut adapter: Box<dyn ProtocolAdapter>) -> Self {
+    pub fn new(mut adapter: Box<dyn ProtocolAdapter>) -> Self {
         let (tx, rx) = unbounded_channel();
         let protocol = adapter.id();
         let caps = adapter.capabilities();
@@ -70,7 +70,7 @@ impl Contract {
             tx,
             rx,
             seen: Vec::new(),
-            requests: HashSet::new(),
+            requests: HashMap::new(),
             next_request: FIRST_REQUEST,
             generations: HashSet::new(),
         }
@@ -78,22 +78,25 @@ impl Contract {
 
     /// Check against other capabilities. For an adapter whose test build
     /// reports other capabilities than its feature build.
-    pub(crate) fn with_capabilities(mut self, caps: ProtocolCapabilities) -> Self {
+    pub fn with_capabilities(mut self, caps: ProtocolCapabilities) -> Self {
         self.caps = caps;
         self
     }
 
-    /// Send one command the way the host does.
-    pub(crate) fn send(&mut self, command: AdapterCommand) {
-        if let AdapterCommand::WhatsAppBeginLink { generation } = &command {
+    /// Send one command the way the host does. Returns true when the
+    /// adapter failed it in `handle` (the host then sends a `Status` error).
+    pub fn send(&mut self, command: AdapterCommand) -> bool {
+        if let AdapterCommand::WhatsAppBeginLink { generation }
+        | AdapterCommand::SignalBeginLink { generation } = &command
+        {
             self.generations.insert(*generation);
         }
-        dispatch(&mut self.adapters, command, &self.tx);
+        dispatch(&mut self.adapters, command, &self.tx)
     }
 
     /// Wait until an event matches. Fails after [`ANSWER_WAIT`] and names
     /// the rule.
-    pub(crate) async fn until(
+    pub async fn until(
         &mut self,
         rule: &str,
         what: &str,
@@ -117,14 +120,14 @@ impl Contract {
     }
 
     /// Read events until none comes for [`QUIET`].
-    pub(crate) async fn settle(&mut self) {
+    pub async fn settle(&mut self) {
         while let Ok(Some(event)) = tokio::time::timeout(QUIET, self.rx.recv()).await {
             self.seen.push(event);
         }
     }
 
     /// Wait for `Account { Linked }` (rule 1).
-    pub(crate) async fn linked(&mut self) {
+    pub async fn linked(&mut self) {
         let protocol = self.protocol;
         self.until("1", "Account Linked", |event| {
             is_account(event, protocol, AccountState::Linked)
@@ -135,7 +138,7 @@ impl Contract {
 
     /// Run every check on a linked adapter, in a fixed order. It ends with
     /// a disconnect and a shutdown.
-    pub(crate) async fn run_all(mut self) {
+    pub async fn run_all(mut self) {
         let chat = if self.caps.sends_text {
             self.writable_chat()
                 .expect("rule 3: a protocol that sends text lists a writable chat")
@@ -157,90 +160,118 @@ impl Contract {
 
     /// Rule 9: `LoadChats` ends with `ChatListLoaded` or a failure. Else
     /// the chat-list spinner never stops.
-    pub(crate) async fn check_load_chats(&mut self) {
-        self.send(AdapterCommand::LoadChats {
+    pub async fn check_load_chats(&mut self) {
+        let failed = self.send(AdapterCommand::LoadChats {
             protocol: self.protocol,
         });
         let protocol = self.protocol;
-        self.until("9", "answer to LoadChats", |event| {
-            matches!(event, AdapterEvent::ChatListLoaded { protocol: seen } if *seen == protocol)
-                || ends_load(event, protocol, None)
-        })
-        .await;
+        if !failed {
+            self.until("9", "answer to LoadChats", |event| {
+                matches!(event, AdapterEvent::ChatListLoaded { protocol: seen } if *seen == protocol)
+                    || fails_load(event, protocol, None)
+            })
+            .await;
+        }
         self.settle().await;
     }
 
     /// Rule 9: `OpenChat` ends with
     /// `HistoryLoaded` or a failure for the chat. Else the thread spinner
     /// never stops.
-    pub(crate) async fn check_open_chat(&mut self, chat: &str) {
-        self.send(AdapterCommand::OpenChat {
+    pub async fn check_open_chat(&mut self, chat: &str) {
+        let failed = self.send(AdapterCommand::OpenChat {
             protocol: self.protocol,
             conversation_id: chat.to_owned(),
         });
         let protocol = self.protocol;
-        self.until("9", "answer to OpenChat", |event| {
-            matches!(
-                event,
-                AdapterEvent::HistoryLoaded { protocol: seen, conversation_id }
-                    if *seen == protocol && conversation_id == chat
-            ) || ends_load(event, protocol, Some(chat))
-        })
-        .await;
+        if !failed {
+            self.until("9", "answer to OpenChat", |event| {
+                matches!(
+                    event,
+                    AdapterEvent::HistoryLoaded { protocol: seen, conversation_id }
+                        if *seen == protocol && conversation_id == chat
+                ) || fails_load(event, protocol, Some(chat))
+            })
+            .await;
+        }
         self.settle().await;
     }
 
-    /// Rule 5: an unknown chat fails the command, not the session.
-    pub(crate) async fn check_open_unknown_chat(&mut self) {
+    /// Rule 5: an unknown chat fails the command with `CommandFailed` for
+    /// that chat. The session stays: no `Account { Unlinked }` and no error
+    /// status.
+    pub async fn check_open_unknown_chat(&mut self) {
         let from = self.seen.len();
-        self.check_open_chat(UNKNOWN_CHAT).await;
-        let protocol = self.protocol;
+        let failed = self.send(AdapterCommand::OpenChat {
+            protocol: self.protocol,
+            conversation_id: UNKNOWN_CHAT.to_owned(),
+        });
         assert!(
-            !self.seen[from..].iter().any(|event| is_account(
-                event,
-                protocol,
-                AccountState::Unlinked
-            )),
-            "contract rule 5: a failed OpenChat ended the session"
+            !failed,
+            "contract rule 5: report a failed OpenChat as CommandFailed, not as an error from handle"
+        );
+        let protocol = self.protocol;
+        self.until("5", "CommandFailed for the unknown chat", |event| {
+            fails_load(event, protocol, Some(UNKNOWN_CHAT))
+        })
+        .await;
+        self.settle().await;
+        let ended = self.seen[from..].iter().find(|event| {
+            is_account(event, protocol, AccountState::Unlinked)
+                || matches!(
+                    event,
+                    AdapterEvent::Status {
+                        status: AdapterStatus::Error | AdapterStatus::Refused,
+                        ..
+                    }
+                )
+        });
+        assert!(
+            ended.is_none(),
+            "contract rule 5: a failed OpenChat must leave the session up: {ended:?}"
         );
     }
 
     /// Rule 4: `SendText` gets `SendAccepted` or `SendRejected` for its
     /// request.
-    pub(crate) async fn check_send(&mut self, chat: &str) {
-        let request = self.request();
+    pub async fn check_send(&mut self, chat: &str) {
+        let request = self.request(chat);
         self.send(AdapterCommand::SendText {
             protocol: self.protocol,
             conversation_id: chat.to_owned(),
             body: SEND_BODY.into(),
             request,
         });
-        self.until("4", "answer to SendText", |event| {
-            answer_of(event) == Some(request)
-        })
-        .await;
+        let answer = self
+            .until("4", "answer to SendText", |event| {
+                answer_of(event).is_some_and(|(seen, _)| seen == request)
+            })
+            .await;
+        assert_same_chat(&answer, chat);
         self.settle().await;
     }
 
     /// Rule 4: a retry of a message that the adapter does not know still
     /// gets an answer for its request.
-    pub(crate) async fn check_resend_unknown(&mut self, chat: &str) {
-        let request = self.request();
+    pub async fn check_resend_unknown(&mut self, chat: &str) {
+        let request = self.request(chat);
         self.send(AdapterCommand::ResendMessage {
             protocol: self.protocol,
             conversation_id: chat.to_owned(),
             message_id: UNKNOWN_MESSAGE.into(),
             request,
         });
-        self.until("4", "answer to ResendMessage", |event| {
-            answer_of(event) == Some(request)
-        })
-        .await;
+        let answer = self
+            .until("4", "answer to ResendMessage", |event| {
+                answer_of(event).is_some_and(|(seen, _)| seen == request)
+            })
+            .await;
+        assert_same_chat(&answer, chat);
         self.settle().await;
     }
 
     /// Rule 7: `ViewChat` is a hint. It never ends the session.
-    pub(crate) async fn check_view_chat(&mut self, chat: &str) {
+    pub async fn check_view_chat(&mut self, chat: &str) {
         let from = self.seen.len();
         for conversation_id in [Some(chat.to_owned()), None] {
             self.send(AdapterCommand::ViewChat {
@@ -260,7 +291,7 @@ impl Contract {
     }
 
     /// Rule 1: `Disconnect` ends the session with `Account { Unlinked }`.
-    pub(crate) async fn check_disconnect(&mut self) {
+    pub async fn check_disconnect(&mut self) {
         self.send(AdapterCommand::Disconnect {
             protocol: self.protocol,
         });
@@ -273,7 +304,7 @@ impl Contract {
     }
 
     /// `Shutdown` ends with exactly one `Stopped` (`ProtocolAdapter::shutdown`).
-    pub(crate) async fn check_shutdown(&mut self) {
+    pub async fn check_shutdown(&mut self) {
         self.send(AdapterCommand::Shutdown {
             protocol: self.protocol,
         });
@@ -295,7 +326,7 @@ impl Contract {
 
     /// The rules that hold for the whole event stream. Fails with every
     /// violation.
-    pub(crate) fn check_stream(&self) {
+    pub fn check_stream(&self) {
         let found = violations(
             self.protocol,
             &self.caps,
@@ -306,10 +337,10 @@ impl Contract {
         assert!(found.is_empty(), "contract violations: {found:#?}");
     }
 
-    fn request(&mut self) -> u64 {
+    fn request(&mut self, chat: &str) -> u64 {
         let request = self.next_request;
         self.next_request += 1;
-        self.requests.insert(request);
+        self.requests.insert(request, chat.to_owned());
         request
     }
 
@@ -357,33 +388,42 @@ fn is_account(event: &AdapterEvent, protocol: ProtocolId, state: AccountState) -
     )
 }
 
-/// The request of a send answer.
-fn answer_of(event: &AdapterEvent) -> Option<u64> {
+/// The request and the chat of a send answer.
+fn answer_of(event: &AdapterEvent) -> Option<(u64, &str)> {
     match event {
-        AdapterEvent::SendAccepted { request, .. } | AdapterEvent::SendRejected { request, .. } => {
-            Some(*request)
+        AdapterEvent::SendAccepted {
+            request,
+            conversation_id,
+            ..
         }
+        | AdapterEvent::SendRejected {
+            request,
+            conversation_id,
+            ..
+        } => Some((*request, conversation_id.as_str())),
         _ => None,
     }
 }
 
-/// A failure that ends a load: a failed command for the chat or for no
-/// chat, or an error status (the host sends one when `handle` fails, and
-/// the core stops the spinners on it).
-fn ends_load(event: &AdapterEvent, protocol: ProtocolId, chat: Option<&str>) -> bool {
-    match event {
-        AdapterEvent::CommandFailed {
-            protocol: seen,
-            conversation_id,
-            ..
-        } => *seen == protocol && (conversation_id.is_none() || conversation_id.as_deref() == chat),
-        AdapterEvent::Status {
-            protocol: seen,
-            status: AdapterStatus::Error | AdapterStatus::Refused,
-            ..
-        } => *seen == protocol,
-        _ => false,
-    }
+/// Rule 4: the answer names the chat of its request.
+fn assert_same_chat(answer: &AdapterEvent, chat: &str) {
+    let named = answer_of(answer).map(|(_, named)| named);
+    assert_eq!(
+        named,
+        Some(chat),
+        "contract rule 4: the answer names another chat: {answer:?}"
+    );
+}
+
+/// A failure of one load: `CommandFailed` of this protocol for exactly
+/// this chat, or for no chat when the load is the chat list. An error from
+/// `handle` also ends a load; `Contract::send` reports that one.
+fn fails_load(event: &AdapterEvent, protocol: ProtocolId, chat: Option<&str>) -> bool {
+    matches!(
+        event,
+        AdapterEvent::CommandFailed { protocol: seen, conversation_id, .. }
+            if *seen == protocol && conversation_id.as_deref() == chat
+    )
 }
 
 /// The protocol that an event names, if it names one.
@@ -405,14 +445,16 @@ fn event_protocol(event: &AdapterEvent) -> Option<ProtocolId> {
 /// - Every event names the adapter's own protocol.
 /// - Rule 3: a placeholder row is not writable. A protocol that does not
 ///   send text lists no writable row.
-/// - Rule 4: each send answer is for a request that was sent, and each
-///   request gets one answer at most.
-/// - Rule 8: each pairing payload carries a generation that was sent.
-pub(crate) fn violations(
+/// - Rule 4: each send answer is for a request that was sent and names
+///   its chat, and each request gets one answer at most.
+/// - Rule 8: each pairing payload (WhatsApp and Signal) carries a
+///   generation that was sent.
+#[must_use]
+pub fn violations(
     protocol: ProtocolId,
     caps: &ProtocolCapabilities,
     events: &[AdapterEvent],
-    requests: &HashSet<u64>,
+    requests: &HashMap<u64, String>,
     generations: &HashSet<u64>,
 ) -> Vec<String> {
     let mut found = Vec::new();
@@ -452,11 +494,15 @@ pub(crate) fn violations(
                 ));
             }
         }
-        if let Some(request) = answer_of(event) {
-            if !requests.contains(&request) {
-                found.push(format!(
+        if let Some((request, chat)) = answer_of(event) {
+            match requests.get(&request) {
+                None => found.push(format!(
                     "#{index}: rule 4: answer for request {request}, which was not sent"
-                ));
+                )),
+                Some(sent) if sent != chat => found.push(format!(
+                    "#{index}: rule 4: answer for request {request} names {chat}, not {sent}"
+                )),
+                Some(_) => {}
             }
             let count = answers.entry(request).or_default();
             *count += 1;
@@ -467,7 +513,8 @@ pub(crate) fn violations(
             }
         }
         if let AdapterEvent::WhatsAppQr { generation, .. }
-        | AdapterEvent::WhatsAppPairCode { generation, .. } = event
+        | AdapterEvent::WhatsAppPairCode { generation, .. }
+        | AdapterEvent::SignalQr { generation, .. } = event
             && !generations.contains(generation)
         {
             found.push(format!(
@@ -523,7 +570,7 @@ mod tests {
             ProtocolId::Telegram,
             &CAPS,
             events,
-            &HashSet::from([1]),
+            &HashMap::from([(1, "c1".to_owned())]),
             &HashSet::new(),
         )
     }
@@ -594,7 +641,7 @@ mod tests {
             ProtocolId::Telegram,
             &caps,
             &[linked(AccountState::Linked), row("c1", true, false)],
-            &HashSet::new(),
+            &HashMap::new(),
             &HashSet::new(),
         );
         assert_eq!(found.len(), 1, "{found:#?}");
@@ -612,7 +659,7 @@ mod tests {
             ProtocolId::WhatsApp,
             &CAPS,
             std::slice::from_ref(&qr),
-            &HashSet::new(),
+            &HashMap::new(),
             &HashSet::from([6]),
         );
         assert_eq!(found.len(), 1, "{found:#?}");
@@ -621,10 +668,41 @@ mod tests {
             ProtocolId::WhatsApp,
             &CAPS,
             &[qr],
-            &HashSet::new(),
+            &HashMap::new(),
             &HashSet::from([7]),
         );
         assert!(fine.is_empty(), "{fine:#?}");
+    }
+
+    /// Rule 4: an answer that names another chat than its request.
+    #[test]
+    fn an_answer_for_another_chat_is_found() {
+        let answer = AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "c2".into(),
+            request: 1,
+        };
+        let found = check(&[linked(AccountState::Linked), answer]);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("names c2, not c1"), "{found:#?}");
+    }
+
+    /// Rule 8 for Signal: a QR of a generation that was not sent.
+    #[test]
+    fn a_signal_qr_of_an_unknown_generation_is_found() {
+        let qr = AdapterEvent::SignalQr {
+            code: crate::RedactedPairingSecret::new("qr"),
+            generation: 3,
+        };
+        let found = violations(
+            ProtocolId::Signal,
+            &CAPS,
+            std::slice::from_ref(&qr),
+            &HashMap::new(),
+            &HashSet::from([2]),
+        );
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("rule 8"));
     }
 
     /// The fake adapter follows the whole contract.

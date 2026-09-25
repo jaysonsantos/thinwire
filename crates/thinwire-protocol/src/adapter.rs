@@ -111,6 +111,18 @@ pub enum AdapterStatus {
 }
 
 impl AdapterStatus {
+    /// The state in plain words, for the user. `as_str` is for logs.
+    #[must_use]
+    pub const fn plain_words(self) -> &'static str {
+        match self {
+            Self::Stubbed => "Not set up",
+            Self::Connecting => "Connecting",
+            Self::Ready => "Signed in",
+            Self::Refused => "Sign-in refused",
+            Self::Error => "Connection problem",
+        }
+    }
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -886,5 +898,35 @@ mod inbox_protocol_tests {
             .inbox_protocol(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod plain_words_tests {
+    use super::*;
+
+    /// Library and protocol jargon that the account row must not show
+    /// (ROADMAP Telegram follow-up).
+    const JARGON: [&str; 5] = ["TDLib", "OAuth", "stubbed", "twilight", "morphism"];
+
+    #[test]
+    fn account_row_words_have_no_jargon() {
+        let statuses = [
+            AdapterStatus::Stubbed,
+            AdapterStatus::Connecting,
+            AdapterStatus::Ready,
+            AdapterStatus::Refused,
+            AdapterStatus::Error,
+        ];
+        let catalog = crate::catalog();
+        let words = catalog
+            .iter()
+            .map(|caps| caps.short_label)
+            .chain(statuses.iter().map(|status| status.plain_words()));
+        for text in words {
+            for jargon in JARGON {
+                assert!(!text.contains(jargon), "{text:?} contains {jargon:?}");
+            }
+        }
     }
 }

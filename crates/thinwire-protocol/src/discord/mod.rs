@@ -68,7 +68,7 @@ const BOT_TOKEN_MISSING: &str = "bot token is not in the OS keychain";
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Discord,
     support: SupportClass::Constrained,
-    short_label: "Constrained · bot/OAuth inbox only",
+    short_label: "Constrained · bot inbox only",
     detail: CAPABILITY_DETAIL,
     official_api: true,
     allows_user_account_automation: false,
@@ -558,7 +558,7 @@ mod tests {
         assert_eq!(caps.support, SupportClass::Constrained);
         assert!(!caps.allows_user_account_automation);
         assert_eq!(caps.sends_text, DiscordAdapter::bot_inbox_compiled());
-        assert!(caps.short_label.contains("bot/OAuth"));
+        assert!(caps.short_label.contains("bot inbox only"));
         assert!(!caps.detail.to_ascii_lowercase().contains("reliable"));
         assert!(caps.detail.contains("No user-account self-bots"));
         if DiscordAdapter::bot_inbox_compiled() {

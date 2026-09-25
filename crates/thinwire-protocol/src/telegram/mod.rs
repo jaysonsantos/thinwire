@@ -48,7 +48,7 @@ const CAPABILITY_DETAIL: &str = "Official TDLib via Rust bindings (tdlib-rs). Su
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Telegram,
     support: SupportClass::Supported,
-    short_label: "Supported · TDLib",
+    short_label: "Supported · official Telegram app",
     detail: CAPABILITY_DETAIL,
     official_api: true,
     allows_user_account_automation: false,
@@ -555,7 +555,7 @@ mod tests {
         let caps = TelegramAdapter::capabilities();
         assert_eq!(caps.support, SupportClass::Supported);
         assert!(caps.official_api);
-        assert!(caps.short_label.contains("TDLib"));
+        assert!(caps.short_label.contains("official"));
         assert!(!caps.detail.to_ascii_lowercase().contains("reliable"));
     }
 

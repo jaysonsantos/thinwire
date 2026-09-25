@@ -268,6 +268,9 @@ impl Core {
                 applied = true;
             }
         }
+        // Only after the queued answers: a late accept that was queued in
+        // time still finds its send (#90 item 3).
+        self.state.prune_late_answers();
         if let Some(text) =
             refreshed_secret_store_status(&self.state.status_text, self.secrets.backend_name())
         {
@@ -275,6 +278,7 @@ impl Core {
         }
         self.state.poll_resume(&self.secrets);
         self.state.sync_viewed();
+        self.state.sync_timeout_hint();
         self.flush();
         applied || expired
     }
@@ -342,6 +346,7 @@ impl Core {
             Intent::Signal(intent) => self.signal_gate(intent),
         }
         self.state.sync_viewed();
+        self.state.sync_timeout_hint();
         self.flush();
         self.notifier.notify();
     }
@@ -1400,6 +1405,21 @@ mod tests {
             Some("Telegram did not answer in time.")
         );
         assert!(core.view().can_send());
+    }
+
+    /// #90 item 3: an accept queued in time is applied before the core
+    /// forgets old timed-out sends. The frontend was busy until after the
+    /// keep window, but the sent text still leaves the compose field.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accept_queued_in_time_is_applied_before_the_prune() {
+        let (mut core, events_tx, request) = core_with_unanswered_send();
+        core.state.age_sends_for_test(crate::sends::SEND_TIMEOUT);
+        assert!(core.pump(), "the send expired");
+        assert_eq!(core.view().compose, "hello");
+        events_tx.send(answer(true, request)).expect("queue");
+        core.state.age_sends_for_test(crate::sends::EXPIRED_KEEP);
+        assert!(core.pump());
+        assert_eq!(core.view().compose, "", "the sent text is cleared");
     }
 
     /// An accept before the deadline settles the send the normal way.

@@ -254,7 +254,7 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         if show_status && let Some(text) = public_status(&line) {
             let color = if load_failure_text(&line).is_some() {
                 palette.error
-            } else if snapshot.is_loading() || text == "Refreshing…" {
+            } else if snapshot.status_line_loads() || text == "Refreshing…" {
                 palette.warn
             } else {
                 palette.text2
@@ -481,7 +481,7 @@ fn account_chip(
         )
         .on_hover_ui(|ui| {
             ui.colored_label(palette.support(caps.support), caps.short_label);
-            ui.label(format!("status: {}", account.status.as_str()));
+            ui.label(account.status.plain_words());
         });
     let slack_sign_in = caps.id == ProtocolId::Slack && cfg!(feature = "slack-oauth");
     if caps.id == ProtocolId::Signal && cfg!(feature = "signal-local") {

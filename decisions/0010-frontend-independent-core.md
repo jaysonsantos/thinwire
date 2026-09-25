@@ -43,7 +43,7 @@ Protocol agents also add their state fields to `Snapshot`. `View` shows them wit
 The shell treats every protocol the same. Only the Telegram login and the first-run screen are Telegram-specific. An adapter follows these rules:
 
 1. Send `AdapterEvent::Account { Linked }` before the first inbox event. Send `Account { Unlinked }` when the session ends (logout, revoke, ban). Only this event changes the link state. The shell drops inbox events of an unlinked protocol.
-    - `Linking` after `Linked` is a reconnect. The session stays: rows, drafts, and open sends and retries. Inbox events and send answers still apply. New commands (open chat, Send, Retry, Refresh) wait for `Linked`.
+    - `Linking` after `Linked` is a reconnect. The session stays: rows, drafts, and open sends and retries. Inbox events and send answers still apply. New commands (open chat, Send, Retry, Refresh) wait for `Linked`. The selected chat loads again on `Linked` when its `OpenChat` was queued or had no answer yet when the reconnect started. A chat with loaded history does not load again.
     - `Linking` with no session before is a first login. The shell drops inbox events until `Linked`.
     - `Unlinked` from any other state ends the session. The shell drops that protocol's rows, messages, drafts, spinners, notes, and sends.
 2. Use `Status` for the session status line only. A `Status { Error }` never unlinks and never hides the inbox.
@@ -62,6 +62,10 @@ The shell treats every protocol the same. Only the Telegram login and the first-
 - The fake adapter, the Discord bot inbox, and the Slack workspace inbox run the whole kit in default CI.
 - Telegram has no offline TDLib fake. Only its default-build stub runs the kit (start, shutdown, and the event stream).
 - A new adapter adds one kit test next to its own tests.
+- A load check accepts only the answer of that load: `ChatListLoaded`, `HistoryLoaded` for the chat, `CommandFailed` for exactly that chat (or for no chat on `LoadChats`), or an error from `handle`. An error status of another cause does not count.
+- Rule 5: an unknown chat must fail with `CommandFailed` for that chat, not with an error from `handle`. The session stays up.
+- Rule 4: each send answer must name the chat of its request.
+- Adapter crates outside `thinwire-protocol` (for example `thinwire-signal`) turn on the `contract-kit` feature in their dev-dependencies. The app never turns it on.
 
 Rejected:
 

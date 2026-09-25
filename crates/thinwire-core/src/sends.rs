@@ -174,19 +174,20 @@ impl SendTracker {
             .min()
     }
 
-    /// Test hook: move every entry's start back by `by`.
+    /// Test hook: move every entry's start, and every expiry, back by `by`.
     #[cfg(test)]
     pub(crate) fn age_for_test(&mut self, by: Duration) {
         for open in self.open.values_mut() {
             open.since -= by;
+        }
+        for expired in self.expired.values_mut() {
+            expired.at -= by;
         }
     }
 
     /// Remove and return every entry with no answer after `SEND_TIMEOUT`
     /// (#69). `settle_expired` then finds a late answer for one of them.
     pub(crate) fn expire(&mut self, now: Instant) -> Vec<(ProtocolId, String, Pending)> {
-        self.expired
-            .retain(|_, expired| now.saturating_duration_since(expired.at) < EXPIRED_KEEP);
         let late: Vec<(ProtocolId, String)> = self
             .open
             .iter()
@@ -211,6 +212,14 @@ impl SendTracker {
             );
         }
         expired
+    }
+
+    /// Drop expired entries older than `EXPIRED_KEEP`, with their text. The
+    /// core calls it after it applies the queued events, so an answer that
+    /// came in time is never lost to the prune (#90 item 3).
+    pub(crate) fn prune_expired(&mut self, now: Instant) {
+        self.expired
+            .retain(|_, expired| now.saturating_duration_since(expired.at) < EXPIRED_KEEP);
     }
 
     /// A late answer for an entry that already expired. Returns and forgets
@@ -383,9 +392,11 @@ mod tests {
             .expect("send");
         let expired_at = start + SEND_TIMEOUT;
         assert_eq!(sends.expire(expired_at).len(), 1);
-        assert!(sends.expire(expired_at + EXPIRED_KEEP / 2).is_empty());
+        sends.prune_expired(expired_at + EXPIRED_KEEP / 2);
         assert_eq!(sends.expired.len(), 1, "still in the window");
         assert!(sends.expire(expired_at + EXPIRED_KEEP).is_empty());
+        assert_eq!(sends.expired.len(), 1, "expire never prunes (#90 item 3)");
+        sends.prune_expired(expired_at + EXPIRED_KEEP);
         assert!(sends.expired.is_empty(), "the text is gone");
         assert_eq!(
             sends.settle_expired(ProtocolId::Telegram, "telegram:1", request),

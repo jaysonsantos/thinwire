@@ -994,6 +994,17 @@ mod tests {
         }
     }
 
+    /// The default-build adapter follows the parts of the adapter contract
+    /// that need no linked device (ADR 0010).
+    #[cfg(not(feature = "signal-local"))]
+    #[tokio::test]
+    async fn the_default_adapter_follows_the_adapter_contract() {
+        let mut kit = thinwire_protocol::contract::Contract::new(Box::new(SignalAdapter::new()));
+        kit.settle().await;
+        kit.check_shutdown().await;
+        kit.check_stream();
+    }
+
     #[tokio::test]
     async fn shutdown_reports_stopped() {
         let mut adapter = SignalAdapter::new();

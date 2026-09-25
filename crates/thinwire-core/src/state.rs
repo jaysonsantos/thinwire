@@ -387,6 +387,9 @@ pub struct Snapshot {
     /// The last Telegram status line that came as `AdapterStatus::Ready`: a
     /// finished success such as "Message sent." (#56).
     ready_status: Option<String>,
+    /// The last Telegram status line that came as `Error` or `Refused`. While
+    /// `status_text` still holds it, it wins over every loading line (#90).
+    failure_status: Option<String>,
     pub compose: String,
     pub auth_busy: bool,
     /// One line above the active login form. Never holds a secret.
@@ -427,6 +430,10 @@ pub struct Snapshot {
     /// Protocols the shell shows even with their feature off: the demo
     /// adapters (#120), and tests of the shell with more than Telegram.
     pub(crate) extra_visible: HashSet<ProtocolId>,
+    /// Test hook: protocols the shell hides even with their feature on, so a
+    /// test holds in every feature build (qa on #111).
+    #[cfg(test)]
+    hidden_for_test: HashSet<ProtocolId>,
     /// Telegram chats with a request for older messages in flight (#30).
     /// One request at a time for each chat.
     older_loading: HashSet<String>,
@@ -564,6 +571,7 @@ impl Snapshot {
             error: None,
             status_text: "Sign in with Telegram to get started.".into(),
             ready_status: None,
+            failure_status: None,
             compose: String::new(),
             auth_busy: false,
             auth_notice: None,
@@ -587,6 +595,8 @@ impl Snapshot {
             open_on_link: None,
             sessions: HashSet::new(),
             extra_visible: HashSet::new(),
+            #[cfg(test)]
+            hidden_for_test: HashSet::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
@@ -681,6 +691,7 @@ impl Snapshot {
                     )
                 {
                     self.ready_status = (status == AdapterStatus::Ready).then(|| detail.clone());
+                    self.failure_status = (status != AdapterStatus::Ready).then(|| detail.clone());
                     self.status_text = detail;
                     if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                         if self.auth != AuthScreen::Idle {
@@ -784,7 +795,13 @@ impl Snapshot {
                 protocol,
                 conversation_id,
             } => {
-                self.history_loading.remove(&(protocol, conversation_id));
+                let key = (protocol, conversation_id);
+                // The history came during a reconnect: Linked need not load
+                // the chat again (Codex on #111).
+                if self.open_on_link.as_ref() == Some(&key) {
+                    self.open_on_link = None;
+                }
+                self.history_loading.remove(&key);
             }
             AdapterEvent::ConversationRemoved { protocol, id } => {
                 self.remove_conversation(protocol, &id);
@@ -1161,7 +1178,6 @@ impl Snapshot {
             self.compose.clear();
         }
         self.error = None;
-        self.status_text = "Sending…".into();
         self.pending.push(AdapterCommand::ResendMessage {
             protocol,
             conversation_id,
@@ -1213,6 +1229,10 @@ impl Snapshot {
     /// when their cargo features are on.
     #[must_use]
     pub fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
+        #[cfg(test)]
+        if self.hidden_for_test.contains(&protocol) {
+            return false;
+        }
         if self.extra_visible.contains(&protocol) {
             return true;
         }
@@ -1346,8 +1366,25 @@ impl Snapshot {
     /// With no load, it is the last status line.
     #[must_use]
     pub fn status_line(&self) -> std::borrow::Cow<'_, str> {
+        self.status_source().0
+    }
+
+    /// The status line is the line of a running load. The strip shows it in
+    /// the busy colour. A finished line or a failure is not busy (#82 qa L1).
+    #[must_use]
+    pub fn status_line_loads(&self) -> bool {
+        self.status_source().1
+    }
+
+    /// The status line, and whether it is a running load's line. A Telegram
+    /// failure that is still the last status wins over every load: a slow load
+    /// of another protocol must not hide it (#90).
+    fn status_source(&self) -> (std::borrow::Cow<'_, str>, bool) {
+        if self.failure_status.as_deref() == Some(self.status_text.as_str()) {
+            return (self.status_text.as_str().into(), false);
+        }
         if let Some(line) = self.loading_line(self.selected_protocol) {
-            return line.into();
+            return (line.into(), true);
         }
         let other = self
             .accounts
@@ -1356,8 +1393,8 @@ impl Snapshot {
             .filter(|id| *id != self.selected_protocol && self.account_surface_visible(*id))
             .find_map(|id| self.loading_line(id).map(|line| (id, line)));
         match other {
-            Some((id, line)) => format!("{}: {line}", id.display_name()).into(),
-            None => self.status_text.as_str().into(),
+            Some((id, line)) => (format!("{}: {line}", id.display_name()).into(), true),
+            None => (self.status_text.as_str().into(), false),
         }
     }
 
@@ -1719,6 +1756,16 @@ impl Snapshot {
         self.timeout_error = error;
     }
 
+    /// Build the shown timeout error again, so its hint names where the
+    /// text is now (#90 item 6): the compose field of the chat that shows,
+    /// or a draft after a chat switch. The core calls it after every
+    /// dispatch and pump. Another error, or no error, stays as it is.
+    pub(crate) fn sync_timeout_hint(&mut self) {
+        if self.error.is_some() && self.error == self.timeout_error && !self.timed_out.is_empty() {
+            self.show_timeouts();
+        }
+    }
+
     /// Where the unsent text is, and what to do (qa on #81): the compose
     /// field of the chat that shows, or the draft of another chat.
     fn resend_hint(&self, protocol: ProtocolId, chat: &str, retry: bool) -> String {
@@ -1765,6 +1812,12 @@ impl Snapshot {
     /// Returns true when an entry expired, so the state changed.
     pub(crate) fn expire_sends(&mut self) -> bool {
         self.expire_sends_at(Instant::now())
+    }
+
+    /// Forget timed-out sends older than `EXPIRED_KEEP` (#90 item 3). Call it
+    /// after the queued events are applied.
+    pub(crate) fn prune_late_answers(&mut self) {
+        self.sends.prune_expired(Instant::now());
     }
 
     /// When the next send or retry expires, if one is in flight.
@@ -1959,7 +2012,6 @@ impl Snapshot {
             body,
             request,
         });
-        self.status_text = "Sending…".into();
     }
 
     pub fn open_telegram(&mut self, store: &SecretStore) {
@@ -2340,8 +2392,44 @@ impl Snapshot {
                     self.signal_qr = None;
                 }
             }
+            AccountState::Linking if had_session => self.hold_opens_for_reconnect(protocol),
             AccountState::Linking => {}
         }
+    }
+
+    /// A reconnect starts (`Linking` after `Linked`). An `OpenChat` of this
+    /// protocol that is still queued waits for `Linked`, and one in flight
+    /// can be lost (#90 items 2 and 7). Mark the selected chat to load on
+    /// `Linked`, and drop the queued opens: new commands wait for `Linked`.
+    fn hold_opens_for_reconnect(&mut self, protocol: ProtocolId) {
+        let is_open = |command: &AdapterCommand| matches!(command, AdapterCommand::OpenChat { protocol: owner, .. } if *owner == protocol);
+        if self.selected_protocol == protocol
+            && let Some(id) = self.selected_conversation.clone()
+        {
+            let queued = self.pending.iter().any(|command| {
+                is_open(command)
+                    && matches!(command, AdapterCommand::OpenChat { conversation_id, .. } if *conversation_id == id)
+            });
+            let in_flight = self.history_loading.contains(&(protocol, id.clone()));
+            if queued || in_flight {
+                self.open_on_link = Some((protocol, id));
+            }
+        }
+        // A dropped open of another chat loads nothing: stop its spinner
+        // (qa Low on #111). The marked chat keeps its spinner until Linked.
+        let marked = self.open_on_link.clone();
+        for command in self.pending.iter().filter(|command| is_open(command)) {
+            if let AdapterCommand::OpenChat {
+                conversation_id, ..
+            } = command
+            {
+                let key = (protocol, conversation_id.clone());
+                if marked.as_ref() != Some(&key) {
+                    self.history_loading.remove(&key);
+                }
+            }
+        }
+        self.pending.retain(|command| !is_open(command));
     }
 
     /// The session of one protocol ended (shell plan 8): drop its rows,
@@ -2380,6 +2468,12 @@ impl Snapshot {
         self.chat_list_loading.remove(&protocol);
         self.notices.remove(&protocol);
         self.sends.drop_protocol(protocol);
+        // Its timed-out sends leave the timeout error too (#90).
+        let shown = self.error.is_some() && self.error == self.timeout_error;
+        self.timed_out.retain(|entry| entry.protocol != protocol);
+        if shown {
+            self.show_timeouts();
+        }
         if protocol == ProtocolId::Telegram {
             self.older_loading.clear();
             self.older_at_start.clear();
@@ -6956,12 +7050,114 @@ mod tests {
             open_chats(&mut snapshot),
             vec![(ProtocolId::Slack, "slack:C1".to_owned())]
         );
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+        });
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Slack,
             state: AccountState::Linking,
         });
         link(&mut snapshot, ProtocolId::Slack);
         assert!(open_chats(&mut snapshot).is_empty(), "no reload");
+    }
+
+    /// #90 item 2 (Codex on #86): an `OpenChat` queued in the same pump as a
+    /// later `Linking` waits for `Linked`. It is not sent during the
+    /// reconnect, and `Linked` sends it.
+    #[test]
+    fn an_open_queued_before_linking_waits_for_linked() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        // The auto-select queued an OpenChat; the flush has not run yet.
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert!(open_chats(&mut snapshot).is_empty(), "held for Linked");
+        link(&mut snapshot, ProtocolId::Slack);
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Slack, "slack:C1".to_owned())]
+        );
+    }
+
+    /// Codex on #111: history that comes during the reconnect clears the
+    /// reopen mark, so Linked does not load the chat again.
+    #[test]
+    fn history_during_the_reconnect_clears_the_reopen() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        assert_eq!(open_chats(&mut snapshot).len(), 1, "sent, no answer yet");
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+        });
+        link(&mut snapshot, ProtocolId::Slack);
+        assert!(open_chats(&mut snapshot).is_empty(), "no reload");
+    }
+
+    /// qa Low on #111: a queued open of a chat that is no longer selected is
+    /// dropped at Linking, and its spinner stops.
+    #[test]
+    fn a_dropped_open_of_another_chat_stops_its_spinner() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        for id in ["slack:C1", "slack:C2"] {
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: chat(ProtocolId::Slack, id, true),
+            });
+        }
+        snapshot.take_commands();
+        snapshot.select_conversation("slack:C2".into());
+        snapshot.select_conversation("slack:C1".into());
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert!(
+            !snapshot
+                .history_loading
+                .contains(&(ProtocolId::Slack, "slack:C2".to_owned())),
+            "no spinner for the dropped open"
+        );
+        assert!(
+            snapshot
+                .history_loading
+                .contains(&(ProtocolId::Slack, "slack:C1".to_owned())),
+            "the selected chat waits for Linked"
+        );
+    }
+
+    /// #90 item 7 (qa on #86): an `OpenChat` in flight when a reconnect
+    /// starts can be lost. `Linked` sends it again.
+    #[test]
+    fn an_open_in_flight_at_linking_loads_again_on_linked() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        assert_eq!(open_chats(&mut snapshot).len(), 1, "sent, no answer yet");
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        link(&mut snapshot, ProtocolId::Slack);
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Slack, "slack:C1".to_owned())]
+        );
     }
 
     /// qa L2 on #79: a placeholder row never becomes the viewed chat.
@@ -7261,6 +7457,90 @@ mod tests {
         );
     }
 
+    /// #90 item 4: a session end removes its timed-out sends from the
+    /// timeout error. A later timeout of another protocol does not list them.
+    #[test]
+    fn a_session_end_drops_its_timed_out_sends() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_protocol(ProtocolId::Telegram);
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.compose = "to ada".into();
+        snapshot.send_compose();
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert!(snapshot.error.is_some());
+
+        snapshot.select_protocol(ProtocolId::Slack);
+        snapshot.select_conversation("slack:C1".into());
+        snapshot.compose = "to slack".into();
+        snapshot.send_compose();
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Unlinked,
+        });
+        assert!(snapshot.error.is_none(), "Telegram's timeout left with it");
+
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        let error = snapshot.error.clone().expect("Slack's timeout");
+        assert_eq!(error.why, "Slack did not answer in time.");
+    }
+
+    /// #90 item 6: the timeout hint follows a chat switch.
+    #[test]
+    fn the_timeout_hint_follows_a_chat_switch() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        expired_send(&mut snapshot);
+        let next = |snapshot: &Snapshot| snapshot.error.as_ref().map(|error| error.next.clone());
+        assert_eq!(
+            next(&snapshot).as_deref(),
+            Some("The text is still in the compose field. Send it again.")
+        );
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.sync_timeout_hint();
+        assert_eq!(
+            next(&snapshot).as_deref(),
+            Some("The text is in the draft of Ada. Send it again.")
+        );
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.sync_timeout_hint();
+        assert_eq!(
+            next(&snapshot).as_deref(),
+            Some("The text is still in the compose field. Send it again.")
+        );
+
+        // Another error stays as it is.
+        snapshot.set_error("Chat not loaded.", "Why.", "Next.");
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.sync_timeout_hint();
+        assert_eq!(next(&snapshot).as_deref(), Some("Next."));
+    }
+
+    /// #90 item 5: the line shows "Sending…" only while a send is in flight.
+    /// After the last send times out, the line is no longer busy.
+    #[test]
+    fn the_sending_line_ends_with_the_last_timeout() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        snapshot.history_loading.clear();
+        snapshot.status_text = "Telegram is ready.".into();
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert_eq!(snapshot.status_line(), "Telegram is ready.");
+        assert!(!snapshot.status_line_loads());
+    }
+
     // endregion: #69
 
     // region: #80 one status line per protocol
@@ -7336,6 +7616,58 @@ mod tests {
         );
         snapshot.select_protocol(ProtocolId::Discord);
         assert_eq!(snapshot.status_line(), LOADING_CHATS_STATUS);
+    }
+
+    /// A Telegram session with its loads done, and Slack linked and visible.
+    fn telegram_idle_slack_linked(store: &SecretStore) -> Snapshot {
+        let mut snapshot = ready_with_chats(store);
+        snapshot.extra_visible.insert(ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        snapshot.history_loading.clear();
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot
+    }
+
+    /// #90 item 1: a Telegram failure line wins over a load of another
+    /// protocol. After a later Ready line, the load shows again.
+    #[test]
+    fn a_telegram_failure_wins_over_another_protocols_load() {
+        let store = SecretStore::memory();
+        let mut snapshot = telegram_idle_slack_linked(&store);
+        snapshot.chat_list_loading.insert(ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "Telegram connection lost.".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Telegram connection lost.");
+        assert!(!snapshot.status_line_loads(), "a failure is not busy");
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Message sent.".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Slack: Loading chats…");
+        assert!(snapshot.status_line_loads());
+    }
+
+    /// #82 qa L1: a load of a protocol with no visible surface does not make
+    /// the shown line busy.
+    #[test]
+    fn a_hidden_protocols_load_does_not_make_the_line_busy() {
+        let store = SecretStore::memory();
+        let mut snapshot = telegram_idle_slack_linked(&store);
+        snapshot.extra_visible.remove(&ProtocolId::Slack);
+        // Hidden in every feature build, also with slack-oauth on.
+        snapshot.hidden_for_test.insert(ProtocolId::Slack);
+        snapshot.chat_list_loading.insert(ProtocolId::Slack);
+        snapshot.status_text = "Message sent.".into();
+        assert!(snapshot.is_loading());
+        assert_eq!(snapshot.status_line(), "Message sent.");
+        assert!(!snapshot.status_line_loads());
     }
 
     // endregion: #80
