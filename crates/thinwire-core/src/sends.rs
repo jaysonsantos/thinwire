@@ -22,7 +22,7 @@ pub(crate) enum Pending {
 }
 
 impl Pending {
-    const fn request(&self) -> u64 {
+    pub(crate) const fn request(&self) -> u64 {
         match self {
             Self::Send { request, .. } | Self::Retry { request, .. } => *request,
         }
@@ -33,6 +33,17 @@ impl Pending {
 /// chat unlocks and the send counts as failed (#69). An adapter answers far
 /// sooner: this is a safety net for a lost answer, not the normal path.
 pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an expired entry waits for a late answer. After it, the entry and
+/// its text are gone, so the tracker never grows without end (PR #81 review).
+pub(crate) const EXPIRED_KEEP: Duration = Duration::from_secs(5 * 60);
+
+/// An entry that expired, and when.
+#[derive(Debug)]
+struct Expired {
+    pending: Pending,
+    at: Instant,
+}
 
 /// One entry: what is in flight, and since when.
 #[derive(Debug)]
@@ -49,8 +60,8 @@ pub(crate) struct SendTracker {
     open: HashMap<(ProtocolId, String), Open>,
     /// Entries that expired with no answer, by (protocol, chat, request). A
     /// late answer finds them here (PR #81 review): a late accept still means
-    /// the message went out.
-    expired: HashMap<(ProtocolId, String, u64), Pending>,
+    /// the message went out. Kept for `EXPIRED_KEEP` only.
+    expired: HashMap<(ProtocolId, String, u64), Expired>,
 }
 
 impl Default for SendTracker {
@@ -169,6 +180,8 @@ impl SendTracker {
     /// Remove and return every entry with no answer after `SEND_TIMEOUT`
     /// (#69). `settle_expired` then finds a late answer for one of them.
     pub(crate) fn expire(&mut self, now: Instant) -> Vec<(ProtocolId, String, Pending)> {
+        self.expired
+            .retain(|_, expired| now.saturating_duration_since(expired.at) < EXPIRED_KEEP);
         let late: Vec<(ProtocolId, String)> = self
             .open
             .iter()
@@ -186,7 +199,10 @@ impl SendTracker {
         for (protocol, chat, pending) in &expired {
             self.expired.insert(
                 (*protocol, chat.clone(), pending.request()),
-                pending.clone(),
+                Expired {
+                    pending: pending.clone(),
+                    at: now,
+                },
             );
         }
         expired
@@ -200,7 +216,22 @@ impl SendTracker {
         chat: &str,
         request: u64,
     ) -> Option<Pending> {
-        self.expired.remove(&(protocol, chat.to_owned(), request))
+        self.expired
+            .remove(&(protocol, chat.to_owned(), request))
+            .map(|expired| expired.pending)
+    }
+
+    /// Stop tracking this chat's retry of `message_id`, if one is in flight.
+    /// A late accept of an older retry already sent the message, so a later
+    /// answer to the new retry must not move the row (PR #81 review).
+    pub(crate) fn drop_retry_of(&mut self, protocol: ProtocolId, chat: &str, message_id: &str) {
+        let key = (protocol, chat.to_owned());
+        let same = self.open.get(&key).is_some_and(|open| {
+            matches!(&open.pending, Pending::Retry { message_id: id, .. } if id == message_id)
+        });
+        if same {
+            self.open.remove(&key);
+        }
     }
 
     /// The protocol's session ended: its sends and retries are gone.
@@ -333,6 +364,50 @@ mod tests {
             sends.settle_expired(ProtocolId::Telegram, "telegram:1", request),
             None,
             "only once"
+        );
+    }
+
+    /// PR #81 review: an expired entry waits `EXPIRED_KEEP` for a late
+    /// answer, then it and its text are gone.
+    #[test]
+    fn an_expired_entry_is_dropped_after_the_keep_window() {
+        let start = Instant::now();
+        let mut sends = SendTracker::default();
+        let request = sends
+            .begin_send(ProtocolId::Telegram, "telegram:1", "hi", start)
+            .expect("send");
+        let expired_at = start + SEND_TIMEOUT;
+        assert_eq!(sends.expire(expired_at).len(), 1);
+        assert!(sends.expire(expired_at + EXPIRED_KEEP / 2).is_empty());
+        assert_eq!(sends.expired.len(), 1, "still in the window");
+        assert!(sends.expire(expired_at + EXPIRED_KEEP).is_empty());
+        assert!(sends.expired.is_empty(), "the text is gone");
+        assert_eq!(
+            sends.settle_expired(ProtocolId::Telegram, "telegram:1", request),
+            None
+        );
+    }
+
+    /// PR #81 review: `drop_retry_of` drops only a retry of that message.
+    #[test]
+    fn drop_retry_of_drops_only_that_retry() {
+        let now = Instant::now();
+        let mut sends = SendTracker::default();
+        sends
+            .begin_retry(ProtocolId::Telegram, "telegram:1", "m1", now)
+            .expect("retry");
+        sends.drop_retry_of(ProtocolId::Telegram, "telegram:1", "m2");
+        assert!(sends.in_flight(ProtocolId::Telegram, "telegram:1"));
+        sends.drop_retry_of(ProtocolId::Telegram, "telegram:1", "m1");
+        assert!(!sends.in_flight(ProtocolId::Telegram, "telegram:1"));
+
+        sends
+            .begin_send(ProtocolId::Telegram, "telegram:1", "m1", now)
+            .expect("send");
+        sends.drop_retry_of(ProtocolId::Telegram, "telegram:1", "m1");
+        assert!(
+            sends.in_flight(ProtocolId::Telegram, "telegram:1"),
+            "a send is not a retry"
         );
     }
 }
