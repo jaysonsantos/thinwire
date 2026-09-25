@@ -62,6 +62,10 @@ The shell treats every protocol the same. Only the Telegram login and the first-
 - The fake adapter, the Discord bot inbox, and the Slack workspace inbox run the whole kit in default CI.
 - Telegram has no offline TDLib fake. Only its default-build stub runs the kit (start, shutdown, and the event stream).
 - A new adapter adds one kit test next to its own tests.
+- A load check accepts only the answer of that load: `ChatListLoaded`, `HistoryLoaded` for the chat, `CommandFailed` for exactly that chat (or for no chat on `LoadChats`), or an error from `handle`. An error status of another cause does not count.
+- Rule 5: an unknown chat must fail with `CommandFailed` for that chat, not with an error from `handle`. The session stays up.
+- Rule 4: each send answer must name the chat of its request.
+- Adapter crates outside `thinwire-protocol` (for example `thinwire-signal`) turn on the `contract-kit` feature in their dev-dependencies. The app never turns it on.
 
 Rejected:
 

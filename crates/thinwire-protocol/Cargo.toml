@@ -37,6 +37,10 @@ whatsapp-web = ["dep:whatsapp-rust", "dep:libsqlite3-sys"]
 # Bot/OAuth guild inbox spike via twilight. Default CI stays feature-off.
 # No user-token client. Never put a Discord token in CI or the MIT tree.
 discord-bot = ["dep:twilight-http", "dep:twilight-model", "dep:rustls"]
+# Test support: the adapter contract kit (`thinwire_protocol::contract`,
+# ADR 0010) for adapter crates such as thinwire-signal. Only a
+# dev-dependency turns it on. The app never does.
+contract-kit = []
 
 [dependencies]
 tdlib-rs = { version = "1.4", optional = true, default-features = false, features = [
