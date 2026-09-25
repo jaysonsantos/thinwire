@@ -619,6 +619,7 @@ fn conversation_from_contact(contact: &Contact) -> Conversation {
         last_at: 0,
         is_group: false,
         writable: true,
+        muted: false,
         placeholder: false,
     }
 }
@@ -636,6 +637,7 @@ fn conversation_from_group(key: &[u8], group: &Group) -> Conversation {
         last_at: 0,
         is_group: chat.is_group,
         writable: true,
+        muted: false,
         placeholder: false,
     }
 }
@@ -724,6 +726,7 @@ fn row_and_message(
         outbound: shown.outbound,
         delivery: Delivery::Sent,
         sent_at: super::time::sent_at_secs(sent_millis),
+        arrival: thinwire_protocol::Arrival::History,
     };
     let conversation = Conversation {
         protocol: ProtocolId::Signal,
@@ -736,6 +739,7 @@ fn row_and_message(
         last_at: message.sent_at,
         is_group,
         writable: true,
+        muted: false,
         placeholder: false,
     };
     Some((conversation, message))
@@ -790,6 +794,7 @@ async fn send_text(
             outbound: true,
             delivery: Delivery::Sent,
             sent_at: super::time::sent_at_secs(timestamp),
+            arrival: thinwire_protocol::Arrival::History,
         },
     );
     let id = format!("signal:out:{timestamp}");
