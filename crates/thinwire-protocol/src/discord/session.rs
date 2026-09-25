@@ -449,6 +449,11 @@ impl Session {
         request: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
+        if body.trim().is_empty() {
+            emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
+            emit_notice(events, ProtocolId::Discord, "A message needs text.");
+            return Ok(());
+        }
         let Some(registered) =
             self.register_send(&conversation_id, request, events, Outgoing::New(body))?
         else {
@@ -561,7 +566,12 @@ impl Session {
                 (body, message_id, SendRow::Pending)
             }
             Outgoing::Retry(message_id) => {
-                let Some(body) = state.bodies.get(&message_id).cloned() else {
+                let Some(body) = state
+                    .bodies
+                    .get(&message_id)
+                    .cloned()
+                    .filter(|text| !text.trim().is_empty())
+                else {
                     emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
                     return Ok(None);
                 };
@@ -981,7 +991,14 @@ fn queue_send_result(
     }
     match result {
         Ok(sent) => {
-            let message = chat_message(&conversation_id, bot_id, &sent);
+            let mut message = chat_message(&conversation_id, bot_id, &sent);
+            // A send echo with no content still shows the text that was posted.
+            if sent.content.is_empty()
+                && let Some(posted) = state.bodies.get(&message_id)
+                && !posted.trim().is_empty()
+            {
+                message.body = posted.clone();
+            }
             state.bodies.remove(&message_id);
             state
                 .history
