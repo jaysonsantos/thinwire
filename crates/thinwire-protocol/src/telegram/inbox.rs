@@ -456,6 +456,7 @@ fn conversation_from(chat_id: i64, chat: &ChatRecord) -> Conversation {
         last_at: chat.last_at,
         is_group: chat.is_group,
         writable: true,
+        placeholder: false,
     }
 }
 

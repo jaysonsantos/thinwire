@@ -77,6 +77,7 @@ impl ProtocolAdapter for FakeAdapter {
                         last_at: FAKE_SENT_AT,
                         is_group: false,
                         writable: true,
+                        placeholder: false,
                     },
                 );
                 emit_message(

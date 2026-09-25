@@ -136,6 +136,7 @@ impl WhatsAppAdapter {
                 last_at: 0,
                 is_group: false,
                 writable: false,
+                placeholder: true,
             },
         );
         emit_message(
