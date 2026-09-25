@@ -2544,6 +2544,7 @@ mod tests {
             conversation_id: format!("telegram:{chat}"),
             before_message_id: format!("telegram:{chat}:{before}"),
             more,
+            note: None,
         }
     }
 
