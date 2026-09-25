@@ -19,6 +19,14 @@ impl CancelWake {
         self.notify.notify_one();
     }
 
+    /// Drop a permit that no waiter consumed. The next `cancelled` waits again.
+    pub(crate) fn clear(&self) {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut pending = std::pin::pin!(self.notify.notified());
+        let _ = pending.as_mut().poll(&mut cx);
+    }
+
     pub(crate) async fn cancelled(&self) {
         self.notify.notified().await;
     }
@@ -48,5 +56,14 @@ mod tests {
         wake.wake();
         handle.await.expect("worker");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_cleared_permit_does_not_wake_the_next_wait() {
+        let wake = CancelWake::new();
+        wake.wake();
+        wake.clear();
+        let pending = tokio::time::timeout(Duration::from_millis(50), wake.cancelled()).await;
+        assert!(pending.is_err(), "a stale cancel permit must not fire");
     }
 }
