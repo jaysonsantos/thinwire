@@ -102,8 +102,15 @@ pub(crate) async fn load_channels(
                     .map(message_body)
                     .filter(|text| text != "[no text]")
                     .unwrap_or_default(),
-                Err(DiscordApiError::Forbidden | DiscordApiError::NotFound) => String::new(),
-                Err(error) => return Err(error),
+                // One channel's preview is optional. A failure must not drop
+                // the rest of the list or invent text the channel did not have.
+                Err(error) => {
+                    tracing::info!(
+                        reason = error.reason(),
+                        "discord channel preview did not load"
+                    );
+                    String::new()
+                }
             };
             list.push(InboxChannel {
                 guild_id: guild.id,

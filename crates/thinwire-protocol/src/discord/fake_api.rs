@@ -32,6 +32,8 @@ pub(crate) struct FakeState {
     pub send_error: Option<DiscordApiError>,
     /// The next call returns this error once, then clears it.
     pub next_error: Option<DiscordApiError>,
+    /// A one-message preview for these channels fails once, then the list continues.
+    pub preview_failures: HashMap<u64, DiscordApiError>,
     /// Pauses the next bot-id read until notified. A reconnect stays without a bot id.
     pub hold_load: Option<Arc<Notify>>,
     /// Pauses `channels` after the list is copied, so an older reload can finish late.
@@ -223,6 +225,12 @@ impl DiscordApi for FakeDiscordApi {
     fn history(&self, channel_id: u64, limit: u16) -> ApiFuture<'_, Vec<MessageSummary>> {
         Box::pin(async move {
             self.check_token()?;
+            if limit == 1 {
+                let failed = self.state().preview_failures.remove(&channel_id);
+                if let Some(error) = failed {
+                    return Err(error);
+                }
+            }
             // A one-message preview runs during the channel list. The hold is
             // for an open chat (limit 50), so the list can finish first.
             if limit > 1

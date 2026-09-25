@@ -752,6 +752,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_preview_keeps_the_channel_list() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        api.state().history.insert(
+            NEWS,
+            vec![super::api::MessageSummary {
+                id: 9,
+                author_id: 42,
+                author: "ada".into(),
+                content: "news line".into(),
+                images: 0,
+                files: 0,
+                embeds: 0,
+                stickers: 0,
+            }],
+        );
+        api.state()
+            .preview_failures
+            .insert(GENERAL, super::api::DiscordApiError::Transport);
+        let (_adapter, _tx, _rx, events) = connected(Arc::clone(&api)).await;
+        let rows = conversations(&events);
+        assert_eq!(rows.len(), 2, "one preview failure does not drop the list");
+        let general = rows
+            .iter()
+            .find(|row| row.title == "#general")
+            .expect("general");
+        let news = rows.iter().find(|row| row.title == "#news").expect("news");
+        assert!(general.preview.is_empty());
+        assert!(!general.preview.contains("Guild channel"));
+        assert_eq!(news.preview, "news line");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Linked,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Ready,
+                detail,
+                ..
+            } if detail.contains("2 guild channels")
+        )));
+    }
+
+    #[tokio::test]
     async fn open_chat_loads_history_oldest_first() {
         let (mut adapter, tx, mut rx, _) =
             connected(Arc::new(FakeDiscordApi::guild_fixture())).await;
