@@ -1,6 +1,6 @@
 # Thinwire roadmap
 
-Ordered work from product-council ADRs (`decisions/0001`–`0009`; `0010` comes with #33; `0011` is the local-only AGPL lock). ADRs are decisions; this file is the todo list.
+Ordered work from product-council ADRs (`decisions/0001`–`0011`; `0011` is the local-only AGPL lock). ADRs are decisions; this file is the todo list.
 
 Rule: an ADR accepted is not Done until the matching change is on `main`.
 
@@ -36,7 +36,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 ### Shared
 
 - [ ] #32 — desktop notifications for new messages.
-- [ ] #33 — move app state into a frontend-independent core library (`crates/thinwire-core`, no egui / eframe / winit). ADR `0010-frontend-independent-core` records the boundary. The egui binary becomes one frontend.
+- [ ] #33 — move app state into a frontend-independent core library (`crates/thinwire-core`, no egui / eframe / winit). ADR `0010-frontend-independent-core` records the boundary. The egui binary becomes one frontend. In progress on branch `refactor/thinwire-core`.
 
 ### Other protocols (parallel with Telegram)
 

@@ -21,7 +21,7 @@ pub use discord::{
     DiscordSecretVault, MemoryDiscordVault,
 };
 pub use fake::FakeAdapter;
-pub use host::AdapterHost;
+pub use host::{AdapterHost, HostSender};
 pub use risk::{
     CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3, CRITIC_RISK_BULLETS, critic_bullets_for,
     requires_experimental_gate,
@@ -140,6 +140,7 @@ mod tests {
         for manifest in [
             include_str!("../Cargo.toml"),
             include_str!("../../thinwire/Cargo.toml"),
+            include_str!("../../thinwire-core/Cargo.toml"),
             include_str!("../../../Cargo.toml"),
         ] {
             let lower = manifest.to_ascii_lowercase();

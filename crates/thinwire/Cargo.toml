@@ -11,34 +11,28 @@ readme = "../../README.md"
 
 [features]
 default = []
-telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
-slack-oauth = ["thinwire-protocol/slack-oauth"]
+telegram-tdlib = [
+  "thinwire-core/telegram-tdlib",
+  "thinwire-protocol/telegram-tdlib",
+]
+slack-oauth = ["thinwire-core/slack-oauth", "thinwire-protocol/slack-oauth"]
 # Experimental spike. Default CI and the default UI stay feature-off.
-whatsapp-web = ["thinwire-protocol/whatsapp-web"]
-discord-bot = ["thinwire-protocol/discord-bot"]
+whatsapp-web = ["thinwire-core/whatsapp-web", "thinwire-protocol/whatsapp-web"]
+discord-bot = ["thinwire-core/discord-bot", "thinwire-protocol/discord-bot"]
 
 [dependencies]
 chrono.workspace = true
-dirs.workspace = true
 eframe.workspace = true
 egui.workspace = true
-keyring-core.workspace = true
+thinwire-core.workspace = true
 thinwire-protocol.workspace = true
 winit.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-linux-keyutils-keyring-store.workspace = true
-zbus-secret-service-keyring-store.workspace = true
-secret-service.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-native-keyring-store.workspace = true
+[dev-dependencies]
+thinwire-core = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

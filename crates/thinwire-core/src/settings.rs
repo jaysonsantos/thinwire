@@ -1,72 +1,17 @@
 //! Appearance settings. Missing file means System (ADR 0005).
 //!
 //! Theme changes update in-memory state on the UI thread. Disk writes run on a
-//! tokio `spawn_blocking` worker so the egui event loop never waits on
+//! tokio `spawn_blocking` worker so the frontend event loop never waits on
 //! `create_dir_all` / `fs::write`. Overlapping jobs share a write lock and
 //! re-check the persist epoch under that lock so `settings.toml` always matches
 //! the latest theme.
 
-use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use eframe::egui;
-
-/// User override for light/dark. Default and missing config are System.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThemeMode {
-    #[default]
-    System,
-    Light,
-    Dark,
-}
-
-impl ThemeMode {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Light => "light",
-            Self::Dark => "dark",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().trim_matches('"').to_ascii_lowercase().as_str() {
-            "system" => Some(Self::System),
-            "light" => Some(Self::Light),
-            "dark" => Some(Self::Dark),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn to_egui(self) -> egui::ThemePreference {
-        match self {
-            Self::System => egui::ThemePreference::System,
-            Self::Light => egui::ThemePreference::Light,
-            Self::Dark => egui::ThemePreference::Dark,
-        }
-    }
-
-    #[must_use]
-    pub const fn from_egui(preference: egui::ThemePreference) -> Self {
-        match preference {
-            egui::ThemePreference::System => Self::System,
-            egui::ThemePreference::Light => Self::Light,
-            egui::ThemePreference::Dark => Self::Dark,
-        }
-    }
-}
-
-impl fmt::Display for ThemeMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+use crate::ThemeMode;
 
 /// Disk write queued after a theme change. Run on a worker, never the UI thread.
 pub struct PersistJob {
@@ -153,24 +98,6 @@ impl Settings {
         self.theme
     }
 
-    /// Apply the stored mode. System follows the OS and updates when it changes.
-    pub fn apply(&self, ctx: &egui::Context) {
-        ctx.set_theme(self.theme.to_egui());
-    }
-
-    /// Keep System mode in sync with live OS changes (egui-winit `ThemeChanged`).
-    ///
-    /// Returns true when the OS light/dark preference changed this frame so the
-    /// caller can request an immediate repaint.
-    pub fn follow_os_live(
-        &self,
-        ctx: &egui::Context,
-        last_os_theme: &mut Option<egui::Theme>,
-    ) -> bool {
-        self.apply(ctx);
-        live_os_theme_changed(self.theme, last_os_theme, ctx.system_theme())
-    }
-
     /// Update the in-memory mode immediately. Disk persist is queued.
     pub fn set_theme(&mut self, theme: ThemeMode) {
         if self.theme == theme && !self.persist_pending {
@@ -213,23 +140,6 @@ impl Settings {
             self.theme.as_str()
         )
     }
-}
-
-/// True when preference is System and the polled OS theme changed.
-#[must_use]
-pub fn live_os_theme_changed(
-    mode: ThemeMode,
-    last: &mut Option<egui::Theme>,
-    current: Option<egui::Theme>,
-) -> bool {
-    if mode != ThemeMode::System {
-        return false;
-    }
-    let changed = last.zip(current).is_some_and(|(prev, now)| prev != now);
-    if current.is_some() {
-        *last = current;
-    }
-    changed
 }
 
 fn default_path() -> PathBuf {
@@ -342,53 +252,5 @@ mod tests {
             scope.spawn(|| latest.run_after_naive_pre_io_check());
         });
         assert_eq!(Settings::load_from(path).theme(), ThemeMode::Light);
-    }
-
-    #[test]
-    fn parse_accepts_quoted_and_mixed_case() {
-        assert_eq!(ThemeMode::parse(" System "), Some(ThemeMode::System));
-        assert_eq!(ThemeMode::parse("\"DARK\""), Some(ThemeMode::Dark));
-        assert_eq!(ThemeMode::parse("light"), Some(ThemeMode::Light));
-        assert_eq!(ThemeMode::parse("nope"), None);
-    }
-
-    #[test]
-    fn egui_mapping_covers_all_modes() {
-        for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
-            assert_eq!(ThemeMode::from_egui(mode.to_egui()), mode);
-        }
-    }
-
-    #[test]
-    fn system_mode_follows_live_os_theme_changes() {
-        let mut last = None;
-        assert!(!live_os_theme_changed(
-            ThemeMode::System,
-            &mut last,
-            Some(egui::Theme::Dark)
-        ));
-        assert_eq!(last, Some(egui::Theme::Dark));
-        assert!(live_os_theme_changed(
-            ThemeMode::System,
-            &mut last,
-            Some(egui::Theme::Light)
-        ));
-        assert_eq!(last, Some(egui::Theme::Light));
-        assert!(!live_os_theme_changed(
-            ThemeMode::System,
-            &mut last,
-            Some(egui::Theme::Light)
-        ));
-    }
-
-    #[test]
-    fn light_or_dark_override_ignores_os_changes() {
-        let mut last = Some(egui::Theme::Dark);
-        assert!(!live_os_theme_changed(
-            ThemeMode::Light,
-            &mut last,
-            Some(egui::Theme::Light)
-        ));
-        assert_eq!(last, Some(egui::Theme::Dark));
     }
 }

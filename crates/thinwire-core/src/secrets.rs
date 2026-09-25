@@ -1,7 +1,7 @@
 //! OS secret store for Telegram `api_id`, `api_hash`, and session material.
 //!
 //! The UI thread only touches an in-memory map. OS keychain I/O runs on a
-//! tokio `spawn_blocking` worker so egui never waits on keyutils / Keychain /
+//! tokio `spawn_blocking` worker so a frontend never waits on keyutils / Keychain /
 //! Credential Manager. Never log or persist these values in the git repo.
 //!
 //! Attach is an ordered state machine (`Detached` → `Attaching` → `Ready` or
@@ -303,6 +303,22 @@ impl SecretStore {
         }
     }
 
+    /// Try again after a failed read. The phase leaves `ReadFailed` before
+    /// this returns, so a new keychain watch does not stop at the old failure.
+    pub fn spawn_os_retry(self: &Arc<Self>, handle: &Handle) {
+        self.leave_read_failed();
+        self.spawn_os_attach(handle);
+    }
+
+    /// `ReadFailed` → `Attaching`, under the lock, before any worker runs.
+    fn leave_read_failed(&self) {
+        if let Ok(mut inner) = self.lock()
+            && inner.phase == AttachPhase::ReadFailed
+        {
+            inner.phase = AttachPhase::Attaching;
+        }
+    }
+
     pub fn spawn_os_attach(self: &Arc<Self>, handle: &Handle) {
         let store = Arc::clone(self);
         handle.spawn_blocking(move || store.attach_os_keychain());
@@ -446,19 +462,24 @@ impl SecretStore {
             self.finish_read_failed();
             return false;
         }
-        let should_flush = self.finish_ready(os_values);
-        if let Ok(mut inner) = self.lock() {
-            inner.os_backend = Some(backend);
-        }
-        should_flush
+        self.finish_ready(os_values, Some(backend))
     }
 
     /// Merge OS values under the store lock. Dirty UI keys win. Returns
     /// whether a deferred flush (or any dirty write) must hit the keychain.
-    fn finish_ready(&self, os_values: HashMap<SecretKey, String>) -> bool {
+    /// Ready and the backend change under one lock, so a reader that sees
+    /// `Ready` also sees the backend (qa M2).
+    pub(crate) fn finish_ready(
+        &self,
+        os_values: HashMap<SecretKey, String>,
+        backend: Option<OsBackend>,
+    ) -> bool {
         let Ok(mut inner) = self.lock() else {
             return false;
         };
+        if backend.is_some() {
+            inner.os_backend = backend;
+        }
         for (key, value) in os_values {
             if inner.dirty.contains(&key) {
                 continue;
@@ -881,33 +902,35 @@ fn os_delete(key: SecretKey) -> Result<(), SecretError> {
     }
 }
 
-#[cfg(test)]
+/// Test hooks. Other workspace crates reach them through feature `test-support`.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 impl SecretStore {
-    pub(crate) fn detached_for_test() -> Arc<Self> {
+    pub fn detached_for_test() -> Arc<Self> {
         Arc::new(Self::blank(AttachPhase::Detached))
     }
 
-    pub(crate) fn fail_attach_for_test(&self) {
+    pub fn fail_attach_for_test(&self) {
         if let Ok(mut inner) = self.lock() {
             inner.phase = AttachPhase::ReadFailed;
         }
     }
 
-    pub(crate) fn complete_ready_attach_for_test(&self, os: &[(SecretKey, &str)]) {
+    pub fn complete_ready_attach_for_test(&self, os: &[(SecretKey, &str)]) {
         let values = os
             .iter()
             .map(|(key, value)| (*key, (*value).to_string()))
             .collect();
-        let _ = self.finish_ready(values);
+        let _ = self.finish_ready(values, None);
     }
 
-    pub(crate) fn set_backend_for_test(&self, backend: OsBackend) {
+    pub fn set_backend_for_test(&self, backend: OsBackend) {
         if let Ok(mut inner) = self.lock() {
             inner.os_backend = Some(backend);
         }
     }
 
-    pub(crate) fn complete_discord_hydrate_for_test(&self, token: Option<&str>) {
+    pub fn complete_discord_hydrate_for_test(&self, token: Option<&str>) {
         let value = match token {
             Some(token) => Ok(Some(token.to_string())),
             None => Ok(None),
@@ -952,7 +975,7 @@ mod tests {
                 .iter()
                 .map(|(key, value)| (*key, (*value).to_string()))
                 .collect();
-            self.finish_ready(os_values)
+            self.finish_ready(os_values, None)
         }
 
         fn finish_in_flight_flush_for_test(&self) {
@@ -1458,5 +1481,16 @@ mod tests {
             self.commits.lock().expect("commits").push(snapshot.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn retry_leaves_read_failed_before_the_worker_runs() {
+        let store = SecretStore::detached_for_test();
+        store.fail_attach_for_test();
+        assert!(store.read_failed());
+        store.leave_read_failed();
+        assert!(!store.read_failed(), "a new watch does not stop at once");
+        assert!(!store.attach_settled());
+        assert_eq!(store.persistence(), Persistence::Loading);
     }
 }

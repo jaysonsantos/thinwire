@@ -4,12 +4,14 @@
 //! until the ban acknowledgement. This is not a supported messenger.
 
 use eframe::egui::{self, RichText};
-use thinwire_protocol::{CRITIC_RISK_BULLETS, WhatsAppPhoneVault};
+use thinwire_protocol::CRITIC_RISK_BULLETS;
 
-use super::snapshot::{Snapshot, WhatsAppScreen};
 use super::theme;
+use super::ui::edited;
+use thinwire_core::state::{Snapshot, WhatsAppScreen};
+use thinwire_core::{Intent, SecretText, View, WhatsAppIntent};
 
-pub(crate) fn risk_entry(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+pub(crate) fn risk_entry(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
     ui.add_space(8.0);
     ui.label(
         RichText::new("WhatsApp spike — experimental, ban risk")
@@ -17,22 +19,22 @@ pub(crate) fn risk_entry(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
             .color(theme::palette(ui).warn),
     );
     if ui.button("Review WhatsApp ban risk").clicked() {
-        snapshot.open_whatsapp_risk_gate();
+        out.push(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate));
         ui.ctx().request_repaint();
     }
 }
 
-pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &mut Snapshot, phone: &WhatsAppPhoneVault) {
+pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| match snapshot.whatsapp_screen {
             WhatsAppScreen::Hidden => {}
-            WhatsAppScreen::RiskGate => risk_gate(ui, snapshot),
-            WhatsAppScreen::Pair => pair_screen(ui, snapshot, phone),
+            WhatsAppScreen::RiskGate => risk_gate(ui, out),
+            WhatsAppScreen::Pair => pair_screen(ui, snapshot, out),
         });
     });
 }
 
-fn risk_gate(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
+fn risk_gate(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
     ui.heading("WhatsApp experimental spike");
     ui.colored_label(
         theme::palette(ui).warn,
@@ -49,25 +51,29 @@ fn risk_gate(ui: &mut egui::Ui, snapshot: &mut Snapshot) {
         .button("I understand — this can ban my account")
         .clicked()
     {
-        snapshot.acknowledge_whatsapp_risk();
+        out.push(Intent::WhatsApp(WhatsAppIntent::AcknowledgeRisk));
     }
     if ui.button("Back").clicked() {
-        snapshot.close_whatsapp_gate();
+        out.push(Intent::WhatsApp(WhatsAppIntent::CloseGate));
     }
 }
 
-fn pair_screen(ui: &mut egui::Ui, snapshot: &mut Snapshot, phone: &WhatsAppPhoneVault) {
+fn pair_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
     ui.heading("Experimental pairing");
     ui.label(
         "The worker stays idle until you start it. A phone number stays in memory and is not placed on the command channel.",
     );
     ui.add_space(8.0);
     ui.label("Optional phone for a pair code (digits). Leave blank for a QR payload only.");
-    ui.add(
-        egui::TextEdit::singleline(&mut snapshot.whatsapp_phone)
+    if let Some(value) = edited(ui, &snapshot.whatsapp_phone, |text| {
+        egui::TextEdit::singleline(text)
             .hint_text("15551234567")
-            .desired_width(240.0),
-    );
+            .desired_width(240.0)
+    }) {
+        out.push(Intent::WhatsApp(WhatsAppIntent::SetPhone(SecretText::new(
+            value,
+        ))));
+    }
     if ui
         .add_enabled(
             !snapshot.whatsapp_started,
@@ -75,7 +81,7 @@ fn pair_screen(ui: &mut egui::Ui, snapshot: &mut Snapshot, phone: &WhatsAppPhone
         )
         .clicked()
     {
-        snapshot.begin_whatsapp_link(phone);
+        out.push(Intent::WhatsApp(WhatsAppIntent::BeginLink));
     }
     if let Some(qr) = &snapshot.whatsapp_qr {
         ui.add_space(8.0);
@@ -97,6 +103,6 @@ fn pair_screen(ui: &mut egui::Ui, snapshot: &mut Snapshot, phone: &WhatsAppPhone
             .weak(),
     );
     if ui.button("Cancel pairing").clicked() {
-        snapshot.cancel_whatsapp_link(phone);
+        out.push(Intent::WhatsApp(WhatsAppIntent::CancelLink));
     }
 }
