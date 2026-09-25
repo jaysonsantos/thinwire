@@ -271,7 +271,10 @@ impl Session {
             return Ok(());
         }
         self.next_pending += 1;
-        let pending_id = format!("discord:pending:{}", self.next_pending);
+        let pending_id = format!(
+            "discord:pending:{}:{}",
+            self.gate.generation, self.next_pending
+        );
         if let Ok(mut state) = self.shared.lock() {
             state.inflight.push(Inflight {
                 conversation_id: conversation_id.clone(),

@@ -994,12 +994,39 @@ mod tests {
             })
             .flatten()
             .collect();
-        assert_eq!(pending, vec!["discord:pending:1", "discord:pending:2"]);
+        assert_eq!(
+            pending,
+            vec!["discord:pending:2:1", "discord:pending:2:2"]
+        );
         assert_eq!(removed, pending);
         assert!(!events.iter().any(|event| matches!(
             event,
             AdapterEvent::SendAccepted { .. } | AdapterEvent::MessageReplaced { .. }
         )));
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                    body: "after reconnect".into(),
+                    request: 11,
+                },
+                &tx,
+            )
+            .expect("new pending");
+        let later = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::MessageReceived { message, .. } if message.id.contains(":pending:")
+            )
+        })
+        .await;
+        let new_id = messages(&later)[0].id.as_str();
+        assert!(
+            !pending.contains(&new_id),
+            "a replacement session does not reuse a pending id"
+        );
+        hold.notify_waiters();
     }
 
     #[tokio::test]
