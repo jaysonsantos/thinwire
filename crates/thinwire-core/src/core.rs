@@ -18,6 +18,7 @@ use thinwire_protocol::{
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+use crate::clock::Clock;
 use crate::intent::{
     AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
 };
@@ -42,6 +43,7 @@ const SECRET_STORE_STATUS_PREFIX: &str = "Sign in with Telegram to get started."
 pub struct CoreConfig {
     settings: Settings,
     memory_secrets: bool,
+    clock: Clock,
 }
 
 impl CoreConfig {
@@ -57,7 +59,16 @@ impl CoreConfig {
         Self {
             settings,
             memory_secrets: false,
+            clock: Clock::System,
         }
+    }
+
+    /// The clock of the view. The app keeps [`Clock::System`]; the demo and
+    /// tests use a fixed clock (#120).
+    #[must_use]
+    pub const fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Keep every secret in memory, as `THINWIRE_KEYRING=memory` does.
@@ -90,6 +101,7 @@ pub struct Core {
     events: UnboundedReceiver<AdapterEvent>,
     state: Snapshot,
     settings: Settings,
+    clock: Clock,
     secrets: Arc<SecretStore>,
     whatsapp_phone: Arc<WhatsAppPhoneVault>,
     notifier: ChangeNotifier,
@@ -187,6 +199,7 @@ impl Core {
             events,
             state,
             settings: config.settings,
+            clock: config.clock,
             secrets,
             whatsapp_phone,
             notifier,
@@ -218,6 +231,7 @@ impl Core {
             state: &self.state,
             secrets: &self.secrets,
             settings: &self.settings,
+            clock: self.clock,
         }
     }
 

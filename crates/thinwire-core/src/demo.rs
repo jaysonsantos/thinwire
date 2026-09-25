@@ -26,7 +26,7 @@ use tokio::runtime::Handle;
 
 use crate::secrets::SecretStore;
 use crate::settings::Settings;
-use crate::{AuthField, Core, CoreConfig, Intent, SecretText, TelegramIntent};
+use crate::{AuthField, Clock, Core, CoreConfig, Intent, SecretText, TelegramIntent};
 
 /// 2026-03-02 10:00 UTC: "now" in every scenario.
 const NOW: i64 = 1_772_445_600;
@@ -175,7 +175,9 @@ impl Scenario {
             .map(|script| Box::new(DemoAdapter::new(script)) as Box<dyn ProtocolAdapter>)
             .collect();
         let host = AdapterHost::spawn_adapters(runtime, adapters);
-        let config = CoreConfig::new(Settings::in_memory()).with_memory_secrets();
+        let config = CoreConfig::new(Settings::in_memory())
+            .with_memory_secrets()
+            .with_clock(Clock::fixed_utc(NOW));
         let mut core = Core::with_host(
             runtime,
             config,

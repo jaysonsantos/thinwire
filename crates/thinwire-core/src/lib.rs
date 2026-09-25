@@ -5,6 +5,7 @@
 //! secret store, the settings, and the adapter host. Protocol work stays on
 //! the tokio worker. This crate never depends on egui, eframe, or winit.
 
+mod clock;
 mod core;
 pub mod demo;
 mod intent;
@@ -17,6 +18,7 @@ pub mod state;
 mod theme;
 mod view;
 
+pub use crate::clock::{Clock, ViewNow};
 pub use crate::core::{Core, CoreConfig};
 pub use intent::{
     AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
