@@ -52,8 +52,10 @@ impl Clock {
     }
 }
 
-/// "Now" with its time zone. The zone also turns message times into local
-/// times: `Local` keeps the daylight saving rules of each date.
+/// "Now" with its time zone, not one UTC offset. A frontend turns each
+/// message time into a local time with this zone, so each time gets the
+/// offset of its own date: `Local` keeps the daylight saving rules (Codex on
+/// #121). `Fixed` is for the demo and tests, which use UTC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewNow {
     Local(DateTime<Local>),

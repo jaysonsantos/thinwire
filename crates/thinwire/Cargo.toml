@@ -42,6 +42,8 @@ tracing-subscriber.workspace = true
 qrcode = { version = "0.14", optional = true, default-features = false }
 
 [dev-dependencies]
+# A zone with daylight saving time for the layout tests (#122).
+chrono-tz = "0.10"
 egui_kittest = { version = "0.36", default-features = false }
 thinwire-core = { workspace = true, features = ["test-support"] }
 
