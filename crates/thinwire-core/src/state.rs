@@ -436,6 +436,9 @@ pub struct Snapshot {
     /// anchor it used and when it ended. That anchor waits
     /// `OLDER_RETRY_DELAY` (#61 review).
     older_retry: HashMap<String, (String, Instant, u32)>,
+    /// Why the last older page of a Telegram chat did not load. For that
+    /// chat only, not an account error. A later success clears it (#57).
+    older_note: HashMap<String, String>,
     scroll_to_selected: bool,
     scroll_to_focused: bool,
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
@@ -587,6 +590,7 @@ impl Snapshot {
             open_on_link: None,
             sessions: HashSet::new(),
             extra_visible: HashSet::new(),
+            older_note: HashMap::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
@@ -751,10 +755,14 @@ impl Snapshot {
                 conversation_id,
                 before_message_id,
                 more,
-                ..
+                note,
             } => {
                 if matches!(protocol, ProtocolId::Telegram | ProtocolId::Signal) {
                     self.older_loading.remove(&conversation_id);
+                    match note {
+                        Some(note) => self.older_note.insert(conversation_id.clone(), note),
+                        None => self.older_note.remove(&conversation_id),
+                    };
                     let oldest = self
                         .messages
                         .get(&(protocol, conversation_id.clone()))
@@ -1310,7 +1318,7 @@ impl Snapshot {
         !self.is_loading() && self.ready_status.as_deref() == Some(self.status_text.as_str())
     }
 
-    /// A chat list, a history page, or a send is still running. A `Ready`
+    /// A chat list, a history page, an older page, or a send is still running. A `Ready`
     /// line such as "Loading recent messages." is not idle then (#64 review).
     #[must_use]
     pub fn is_loading(&self) -> bool {
@@ -1376,6 +1384,16 @@ impl Snapshot {
             return ThreadState::Loading;
         }
         ThreadState::Empty
+    }
+
+    /// Why the last older page of the selected chat did not load (#57).
+    #[must_use]
+    pub fn older_note(&self) -> Option<&str> {
+        if self.selected_protocol != ProtocolId::Telegram {
+            return None;
+        }
+        let id = self.selected_conversation.as_ref()?;
+        self.older_note.get(id).map(String::as_str)
     }
 
     /// Older-message paging of the selected chat (#30).
@@ -2384,6 +2402,7 @@ impl Snapshot {
             self.older_loading.clear();
             self.older_at_start.clear();
             self.older_retry.clear();
+            self.older_note.clear();
         }
         #[cfg(feature = "whatsapp-web")]
         if protocol == ProtocolId::WhatsApp {
@@ -2450,6 +2469,7 @@ impl Snapshot {
             self.older_loading.remove(id);
             self.older_at_start.remove(id);
             self.older_retry.remove(id);
+            self.older_note.remove(id);
         }
         if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
             self.compose.clear();
@@ -3479,6 +3499,74 @@ mod tests {
         assert_eq!(snapshot.older_state(), OlderState::Idle);
         snapshot.load_older();
         assert_eq!(older_requests(&mut snapshot), vec!["telegram:2:9"]);
+    }
+
+    #[test]
+    fn a_telegram_error_line_comes_back_after_an_older_page() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "Could not mark messages read.".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Could not mark messages read.");
+
+        // Scroll up: the strip shows the older page's loading line.
+        snapshot.load_older();
+        assert_eq!(snapshot.status_line(), LOADING_OLDER_STATUS);
+
+        // The page ends: the error line is back, not an empty line (qa).
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 40, "older", Delivery::Sent),
+        });
+        snapshot.apply(older_loaded(1, 50, true));
+        assert_eq!(snapshot.status_line(), "Could not mark messages read.");
+        assert_eq!(snapshot.status_text, "Could not mark messages read.");
+    }
+
+    #[test]
+    fn an_older_page_failure_shows_a_chat_note_until_a_success() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        assert!(!snapshot.is_loading());
+        snapshot.load_older();
+        assert!(snapshot.is_loading(), "an older page in flight is a load");
+
+        let failed = AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            before_message_id: "telegram:1:50".into(),
+            more: true,
+            note: Some("Could not load older messages (TDLib 500).".into()),
+        };
+        snapshot.apply(failed);
+        assert!(!snapshot.is_loading());
+        assert_eq!(
+            snapshot.older_note(),
+            Some("Could not load older messages (TDLib 500).")
+        );
+        assert!(
+            snapshot.error.is_none(),
+            "a chat note, not an account error"
+        );
+        // Other chats do not show it.
+        snapshot.select_conversation("telegram:2".into());
+        assert_eq!(snapshot.older_note(), None);
+        snapshot.select_conversation("telegram:1".into());
+
+        // A later success clears it.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 40, "older", Delivery::Sent),
+        });
+        snapshot.apply(older_loaded(1, 50, true));
+        assert_eq!(snapshot.older_note(), None);
     }
 
     #[test]

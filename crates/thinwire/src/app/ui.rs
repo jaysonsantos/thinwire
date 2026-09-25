@@ -1090,6 +1090,13 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
             }
             OlderState::StartOfChat | OlderState::Idle => {}
         }
+        if older != OlderState::Loading
+            && let Some(note) = snapshot.older_note()
+        {
+            // A failed older page: a note for this chat, not an error block.
+            // The next successful page clears it (#57).
+            ui.label(RichText::new(note).small().color(theme::palette(ui).warn));
+        }
         match state {
             ThreadState::Loading => {
                 ui.horizontal(|ui| {
@@ -1826,6 +1833,10 @@ mod tests {
         let thread = &thread[..thread.find("\nfn ").expect("next")];
         assert!(thread.contains("\"Loading older messages…\""));
         assert!(thread.contains("\"Start of chat\""));
+        assert!(
+            thread.contains("snapshot.older_note()"),
+            "the chat note shows"
+        );
         assert!(thread.contains("out.push(Intent::LoadOlderMessages {"));
         assert!(
             thread.contains("older == OlderState::Idle"),
