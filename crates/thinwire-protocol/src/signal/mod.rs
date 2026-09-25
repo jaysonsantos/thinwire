@@ -210,16 +210,16 @@ impl SignalAdapter {
 
     fn cancel_link(&mut self, events: &EventTx) -> Result<(), AdapterError> {
         self.notice_accepted = false;
-        match &self.engine {
-            Engine::Sync(_) => {}
-            #[cfg(feature = "signal-local")]
-            Engine::Live(session) => {
-                session.next_generation();
-                let session = Arc::clone(session);
-                tokio::spawn(async move {
-                    session.shutdown().await;
-                });
+        #[cfg(feature = "signal-local")]
+        if let Engine::Live(session) = &self.engine {
+            session.next_generation();
+            let session = Arc::clone(session);
+            if let Some(worker) = self.worker.take() {
+                finish_worker(worker, SHUTDOWN_LIMIT);
             }
+            tokio::spawn(async move {
+                session.shutdown().await;
+            });
         }
         emit_status(
             events,
@@ -353,19 +353,18 @@ struct SignalWorker {
 }
 
 /// Join the worker. If it misses `limit`, abort its task and wait until the
-/// thread has ended. `Stopped` comes only after this returns.
+/// thread has ended. The sled store drops with that task.
 #[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
-async fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
+fn finish_worker(worker: SignalWorker, limit: std::time::Duration) {
     let SignalWorker { thread, abort } = worker;
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = thread.join();
         let _ = tx.send(());
     });
-    tokio::pin!(rx);
-    if tokio::time::timeout(limit, &mut rx).await.is_err() {
+    if rx.recv_timeout(limit).is_err() {
         abort.abort();
-        let _ = rx.await;
+        let _ = rx.recv();
     }
 }
 
@@ -414,7 +413,7 @@ impl ProtocolAdapter for SignalAdapter {
                 tokio::spawn(async move {
                     session.shutdown().await;
                     if let Some(worker) = worker {
-                        finish_worker(worker, SHUTDOWN_LIMIT).await;
+                        finish_worker(worker, SHUTDOWN_LIMIT);
                     }
                     emit_stopped(&events, ProtocolId::Signal);
                 });
@@ -779,6 +778,16 @@ mod tests {
         let join = body.find("finish_worker").expect("join");
         let stopped = body.find("emit_stopped").expect("Stopped");
         assert!(join < stopped, "Stopped only after the worker join");
+        let cancel = &src[src.find("fn cancel_link").expect("cancel")..];
+        let cancel = &cancel[..cancel.find("fn load_chats").expect("load")];
+        let release = cancel.find("finish_worker").expect("cancel joins");
+        let status = cancel
+            .find("Signal linking cancelled")
+            .expect("cancelled status");
+        assert!(
+            release < status,
+            "Cancel reports stopped only after the worker ends"
+        );
     }
 
     #[cfg(feature = "signal-local")]
@@ -814,6 +823,47 @@ mod tests {
             }
         ));
     }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn cancel_joins_the_linking_worker_before_it_returns() {
+        let mut adapter = SignalAdapter::new();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let abort = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async { tokio::spawn(async {}).abort_handle() });
+        adapter.install_worker_for_test(SignalWorker {
+            thread: handle,
+            abort,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move {
+                adapter.cancel_link(&tx).expect("cancel");
+            });
+            done_tx.send(()).expect("done");
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "Cancel waits for the linking worker"
+        );
+        release_tx.send(()).expect("release");
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("worker ended");
+    }
 }
 
 #[cfg(test)]
@@ -840,7 +890,7 @@ mod shutdown_tests {
         });
         let abort = ready_rx.recv().expect("worker started");
         let started = Instant::now();
-        finish_worker(SignalWorker { thread, abort }, Duration::from_millis(30)).await;
+        finish_worker(SignalWorker { thread, abort }, Duration::from_millis(30));
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "abort must end the worker; Stopped waits for that"
