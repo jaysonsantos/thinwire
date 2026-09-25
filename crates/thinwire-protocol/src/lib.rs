@@ -99,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_lists_protocols_with_honest_support() {
+    fn catalog_lists_v1_four_protocols_with_honest_support() {
         let caps = catalog();
         let ids: Vec<ProtocolId> = caps.iter().map(|c| c.id).collect();
         assert_eq!(
@@ -157,6 +157,69 @@ mod tests {
                 assert!(!contains_word(&blob, "official"), "{name}");
             }
         }
+    }
+
+    #[test]
+    fn v1_does_not_depend_on_agpl_signal_client_or_presage() {
+        let protocol = include_str!("../Cargo.toml");
+        let protocol_deps =
+            package_dependencies(include_str!("../../../Cargo.lock"), "thinwire-protocol");
+        for name in [
+            "presage",
+            "libsignal",
+            "libsignal-service",
+            "wacore-libsignal",
+        ] {
+            assert!(
+                !protocol.contains(name),
+                "thinwire-protocol must not name {name}"
+            );
+            assert!(
+                !protocol_deps.iter().any(|dep| dep.starts_with(name)),
+                "thinwire-protocol must not depend on {name}"
+            );
+        }
+        let app = include_str!("../../thinwire/Cargo.toml");
+        assert!(
+            app.lines().any(|line| line.trim() == "default = []"),
+            "the default feature set stays empty"
+        );
+        let release = include_str!("../../../.github/workflows/os-zips.yml");
+        assert!(release.contains("--features telegram-tdlib"));
+        for name in [
+            "signal-local",
+            "whatsapp-web",
+            "presage",
+            "libsignal",
+            "libsignal-service",
+            "wacore-libsignal",
+        ] {
+            assert!(
+                !release.contains(name),
+                "release builds must not name {name}"
+            );
+        }
+    }
+
+    fn package_dependencies<'a>(lock: &'a str, package: &str) -> Vec<&'a str> {
+        let header = format!("name = \"{package}\"");
+        let Some(start) = lock.find(&header) else {
+            return Vec::new();
+        };
+        let rest = &lock[start..];
+        let Some(deps) = rest.split("dependencies = [").nth(1) else {
+            return Vec::new();
+        };
+        let block = deps.split("]").next().unwrap_or("");
+        block
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim().trim_matches(',');
+                trimmed
+                    .strip_prefix('"')
+                    .and_then(|value| value.split('"').next())
+            })
+            .collect()
     }
 
     #[test]
