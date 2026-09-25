@@ -1927,6 +1927,68 @@ mod tests {
         assert_eq!(load(&mut adapter), 200, "the newest chats again");
     }
 
+    /// ADR 0010 rules 9 and 10: pages_history only with the live client, and every
+    /// LoadOlderMessages ends with exactly one OlderHistoryLoaded or
+    /// CommandFailed for its chat, in every state. Never a Status.
+    #[test]
+    fn contract_every_older_request_gets_one_answer() {
+        assert_eq!(
+            WhatsAppAdapter::capabilities().pages_history,
+            cfg!(feature = "whatsapp-web")
+        );
+        let chat = "whatsapp:111@s.whatsapp.net";
+        let requests = [
+            (chat, "h1"),
+            (chat, "h2"),
+            (chat, "unknown-message"),
+            ("whatsapp:999@s.whatsapp.net", "x"),
+            (PLACEHOLDER_ID, "whatsapp:placeholder:1"),
+            ("telegram:1", "telegram:1:5"),
+        ];
+        let answers = |events: &[AdapterEvent], id: &str| {
+            events
+                .iter()
+                .filter(|event| match event {
+                    AdapterEvent::OlderHistoryLoaded {
+                        conversation_id, ..
+                    } => conversation_id == id,
+                    AdapterEvent::CommandFailed {
+                        conversation_id, ..
+                    } => conversation_id.as_deref() == Some(id),
+                    _ => false,
+                })
+                .count()
+        };
+        for connected in [false, true] {
+            let (tx, mut rx) = unbounded_channel();
+            let mut adapter = with_sender(Arc::new(FakeSender::default()));
+            adapter.session.apply(history(), 1, &tx);
+            if connected {
+                adapter.session.apply(LinkEvent::Connected, 1, &tx);
+            }
+            drain(&mut rx);
+            for (id, before) in requests {
+                adapter
+                    .handle(
+                        AdapterCommand::LoadOlderMessages {
+                            protocol: ProtocolId::WhatsApp,
+                            conversation_id: id.into(),
+                            before_message_id: before.into(),
+                        },
+                        &tx,
+                    )
+                    .expect("never an adapter error");
+                let events = drain(&mut rx);
+                assert_eq!(
+                    answers(&events, id),
+                    1,
+                    "connected={connected} {id} {before}: {events:?}"
+                );
+                assert!(statuses(&events).is_empty(), "no Status for a page");
+            }
+        }
+    }
+
     #[test]
     fn terminal_events_stop_the_link_and_invalidate_only_on_logout() {
         for event in [
