@@ -225,6 +225,11 @@ impl Core {
         self.state.take_scroll_to_selected()
     }
 
+    /// The keyboard highlight moved; scroll that row into view, once.
+    pub fn take_scroll_to_focused(&mut self) -> bool {
+        self.state.take_scroll_to_focused()
+    }
+
     /// Start a keychain flush of the persistent keys on the runtime. The
     /// caller does not wait. The app calls it last at exit.
     pub fn flush_keychain(&self) {

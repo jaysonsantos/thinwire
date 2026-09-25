@@ -290,6 +290,8 @@ pub struct Snapshot {
     messages: HashMap<(ProtocolId, String), Vec<ChatMessage>>,
     pub selected_protocol: ProtocolId,
     pub selected_conversation: Option<String>,
+    /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
+    pub focused_row: Option<String>,
     pub filter: InboxFilter,
     pub search: String,
     pub auth: AuthScreen,
@@ -319,6 +321,7 @@ pub struct Snapshot {
     chat_list_loading: bool,
     history_loading: HashSet<String>,
     scroll_to_selected: bool,
+    scroll_to_focused: bool,
     /// Unsent compose text per chat. `compose` holds the selected chat's draft.
     drafts: HashMap<String, String>,
     focus_compose: bool,
@@ -409,6 +412,7 @@ impl Snapshot {
             messages: HashMap::new(),
             selected_protocol: ProtocolId::Telegram,
             selected_conversation: None,
+            focused_row: None,
             filter: InboxFilter::All,
             search: String::new(),
             auth: AuthScreen::Idle,
@@ -432,6 +436,7 @@ impl Snapshot {
             chat_list_loading: false,
             history_loading: HashSet::new(),
             scroll_to_selected: false,
+            scroll_to_focused: false,
             drafts: HashMap::new(),
             focus_compose: false,
             stopped: HashSet::new(),
@@ -733,18 +738,20 @@ impl Snapshot {
             return;
         }
         self.selected_protocol = protocol;
+        self.focused_row = None;
         self.set_selected_conversation(None);
         self.ensure_conversation_selection();
     }
 
     pub fn select_conversation(&mut self, id: String) {
+        self.focused_row = Some(id.clone());
         self.set_selected_conversation(Some(id));
         self.focus_compose = true;
         self.queue_open_chat();
     }
 
-    /// Move the highlight among the visible inbox rows.
-    /// The chat stays closed and the compose field stays unfocused.
+    /// Move the keyboard highlight among the visible inbox rows.
+    /// The open chat, its draft, and its messages stay as they are.
     pub fn move_inbox_selection(&mut self, delta: i32) {
         if delta == 0 {
             return;
@@ -758,15 +765,21 @@ impl Snapshot {
             return;
         }
         let current = self
-            .selected_conversation
+            .focused_row
             .as_deref()
+            .or(self.selected_conversation.as_deref())
             .and_then(|id| ids.iter().position(|row| row == id));
         let next = match current {
             Some(index) => (index as i32 + delta).clamp(0, ids.len() as i32 - 1) as usize,
             None if delta < 0 => ids.len() - 1,
             None => 0,
         };
-        self.set_selected_conversation(Some(ids[next].clone()));
+        let id = ids[next].clone();
+        if self.focused_row.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        self.focused_row = Some(id);
+        self.scroll_to_focused = true;
     }
 
     /// Change the selected chat. The compose text stays with the chat it was typed in.
@@ -1014,6 +1027,16 @@ impl Snapshot {
 
     pub fn take_scroll_to_selected(&mut self) -> bool {
         std::mem::take(&mut self.scroll_to_selected)
+    }
+
+    /// True once after the keyboard highlight moves. The inbox scrolls that row into view.
+    #[must_use]
+    pub const fn wants_scroll_to_focused(&self) -> bool {
+        self.scroll_to_focused
+    }
+
+    pub fn take_scroll_to_focused(&mut self) -> bool {
+        std::mem::take(&mut self.scroll_to_focused)
     }
 
     pub fn selected_messages(&self) -> &[ChatMessage] {
@@ -2225,23 +2248,30 @@ mod tests {
             snapshot.selected_conversation.as_deref(),
             Some("telegram:1")
         );
+        snapshot.compose = "draft for Ada".into();
         snapshot.move_inbox_selection(1);
         assert_eq!(
             snapshot.selected_conversation.as_deref(),
-            Some("telegram:2")
+            Some("telegram:1"),
+            "an arrow does not replace the open chat"
         );
+        assert_eq!(snapshot.compose, "draft for Ada");
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert!(snapshot.take_scroll_to_focused());
         assert!(!snapshot.wants_focus_compose());
         assert!(
             snapshot.take_commands().is_empty(),
             "an arrow does not open the chat"
         );
         snapshot.move_inbox_selection(1);
-        assert_eq!(
-            snapshot.selected_conversation.as_deref(),
-            Some("telegram:2"),
-            "the last row stays selected"
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert!(
+            !snapshot.wants_scroll_to_focused(),
+            "the last row does not request another scroll"
         );
         snapshot.move_inbox_selection(-1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
+        assert!(snapshot.take_scroll_to_focused());
         assert_eq!(
             snapshot.selected_conversation.as_deref(),
             Some("telegram:1")

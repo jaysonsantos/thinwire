@@ -56,8 +56,10 @@ const NEXT_RUN_GAP: f32 = 10.0;
 pub(crate) struct Hints {
     focus_compose: bool,
     scroll_to_selected: bool,
+    scroll_to_focused: bool,
     used_focus_compose: bool,
     used_scroll_to_selected: bool,
+    used_scroll_to_focused: bool,
 }
 
 impl Hints {
@@ -66,6 +68,7 @@ impl Hints {
         Self {
             focus_compose: view.wants_focus_compose(),
             scroll_to_selected: view.wants_scroll_to_selected(),
+            scroll_to_focused: view.wants_scroll_to_focused(),
             ..Self::default()
         }
     }
@@ -90,6 +93,17 @@ impl Hints {
     /// The scroll hint was used this frame. The app clears it in the core.
     pub(crate) const fn used_scroll_to_selected(self) -> bool {
         self.used_scroll_to_selected
+    }
+
+    /// Call only where the inbox rows draw.
+    pub(crate) fn take_scroll_to_focused(&mut self) -> bool {
+        self.used_scroll_to_focused = self.scroll_to_focused;
+        self.scroll_to_focused
+    }
+
+    /// The keyboard-highlight scroll hint was used this frame.
+    pub(crate) const fn used_scroll_to_focused(self) -> bool {
+        self.used_scroll_to_focused
     }
 }
 
@@ -519,11 +533,33 @@ fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Ve
     }
 
     let scroll_to_selected = hints.take_scroll_to_selected();
+    let scroll_to_focused = hints.take_scroll_to_focused();
+    let keyboard = snapshot.focused_row.is_some();
     let mut clicked: Option<String> = None;
     for (id, title, preview, unread, time) in rows {
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
+        let focused = snapshot.focused_row.as_deref() == Some(id.as_str());
         let response = inbox_row(ui, &id, &title, &preview, &time, unread, selected);
+        if focused {
+            ui.painter().rect_stroke(
+                response.rect,
+                egui::CornerRadius::same(radius::CONTROL),
+                egui::Stroke::new(2.0, theme::palette(ui).text),
+                egui::StrokeKind::Inside,
+            );
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                true,
+                if keyboard { focused } else { selected },
+                &title,
+            )
+        });
         if selected && scroll_to_selected {
+            response.scroll_to_me(None);
+        }
+        if focused && scroll_to_focused {
             response.scroll_to_me(None);
         }
         if response.clicked() {
@@ -559,8 +595,14 @@ fn inbox_keys(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
         out.push(Intent::MoveInbox { delta: -1 });
     } else if down {
         out.push(Intent::MoveInbox { delta: 1 });
-    } else if enter && let Some(id) = snapshot.selected_conversation.clone() {
-        out.push(Intent::SelectConversation { id });
+    } else if enter {
+        let id = snapshot
+            .focused_row
+            .clone()
+            .or_else(|| snapshot.selected_conversation.clone());
+        if let Some(id) = id {
+            out.push(Intent::SelectConversation { id });
+        }
     }
 }
 
@@ -634,11 +676,7 @@ fn inbox_row(
             );
         });
     });
-    let response = ui.interact(rect, ui.id().with(("inbox-row", id)), egui::Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, title)
-    });
-    response
+    ui.interact(rect, ui.id().with(("inbox-row", id)), egui::Sense::click())
 }
 
 /// Unread pill. `text` comes from [`badge_text`].

@@ -261,6 +261,9 @@ impl eframe::App for ThinwireApp {
         if hints.used_scroll_to_selected() {
             self.core.take_scroll_to_selected();
         }
+        if hints.used_scroll_to_focused() {
+            self.core.take_scroll_to_focused();
+        }
         for intent in self.intents.drain(..) {
             self.core.dispatch(intent);
         }

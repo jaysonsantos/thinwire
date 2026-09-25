@@ -103,8 +103,14 @@ fn arrows_move_the_highlight_and_enter_opens_it() {
     harness.step();
     assert_eq!(
         harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:1"),
+        "an arrow does not replace the open chat"
+    );
+    assert_eq!(
+        harness.state().snapshot.focused_row.as_deref(),
         Some("telegram:2")
     );
+    assert!(harness.state_mut().snapshot.take_scroll_to_focused());
     assert!(!harness.state().snapshot.wants_focus_compose());
     assert!(
         harness.state_mut().snapshot.take_commands().is_empty(),
