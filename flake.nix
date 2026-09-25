@@ -21,6 +21,7 @@
           guiLibs = pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.libGL
             pkgs.libxkbcommon
+            pkgs.vulkan-loader
             pkgs.wayland
             pkgs.xorg.libX11
             pkgs.xorg.libXcursor
@@ -64,6 +65,8 @@
             // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
               __EGL_VENDOR_LIBRARY_DIRS = "${pkgs.mesa}/share/glvnd/egl_vendor.d";
               LIBGL_DRIVERS_PATH = "${pkgs.mesa}/lib/dri";
+              # lavapipe: software Vulkan. Snapshot tests prefer a CPU adapter.
+              VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
             }
           );
         }
