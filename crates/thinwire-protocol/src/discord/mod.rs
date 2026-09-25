@@ -73,6 +73,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     official_api: true,
     allows_user_account_automation: false,
     sends_text: cfg!(feature = "discord-bot"),
+    pages_history: false,
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.

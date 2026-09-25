@@ -53,6 +53,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     official_api: true,
     allows_user_account_automation: false,
     sends_text: true,
+    pages_history: true,
 };
 
 /// Official Telegram path. Default builds report TDLib unavailable.

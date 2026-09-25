@@ -85,6 +85,9 @@ pub struct ProtocolCapabilities {
     /// The shell may offer Send for this protocol. A chat can still be
     /// read-only (`Conversation::writable`).
     pub sends_text: bool,
+    /// The adapter answers `LoadOlderMessages`. The shell asks for older
+    /// messages on scroll up only for such a protocol.
+    pub pages_history: bool,
 }
 
 /// Link state of the account of one protocol. Only

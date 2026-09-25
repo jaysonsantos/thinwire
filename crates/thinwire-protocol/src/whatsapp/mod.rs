@@ -36,6 +36,8 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     allows_user_account_automation: false,
     // Only the live spike can send. The default build has no client.
     sends_text: cfg!(feature = "whatsapp-web"),
+    // The session history pages from memory (LoadOlderMessages).
+    pages_history: cfg!(feature = "whatsapp-web"),
 };
 
 /// Conversation id of the offline placeholder row. Not a real chat.
