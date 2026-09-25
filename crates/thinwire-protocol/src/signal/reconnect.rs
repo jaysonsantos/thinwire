@@ -48,6 +48,11 @@ impl ReceiveLoop {
         self.backoff = RECONNECT_BACKOFF;
         StreamPoll::Continue
     }
+
+    /// Opening the receive stream failed. Wait, then try again.
+    pub(crate) fn on_open_failed(&mut self, still_current: bool) -> StreamPoll {
+        self.on_item(true, still_current)
+    }
 }
 
 /// After EOF the account is Connecting. The next open stream is Ready again.
@@ -127,6 +132,18 @@ mod tests {
         relink.note_end();
         assert!(relink.on_stream());
         assert!(!relink.on_stream());
+    }
+
+    #[test]
+    fn a_failed_open_uses_the_reconnect_backoff() {
+        let mut loop_ = ReceiveLoop::new();
+        assert_eq!(
+            loop_.on_open_failed(true),
+            StreamPoll::Reconnect {
+                after: RECONNECT_BACKOFF
+            }
+        );
+        assert_eq!(loop_.on_open_failed(false), StreamPoll::Stop);
     }
 
     #[test]

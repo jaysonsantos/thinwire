@@ -181,7 +181,21 @@ pub(super) async fn run(session: Arc<Session>, token: u64, events: EventTx) {
     let mut relink = Relink::new();
     while session.is_current(token) {
         let Ok(stream) = manager.receive_messages().await else {
-            fail(&events, SYNC_FAILED);
+            if let StreamPoll::Reconnect { after } =
+                receive.on_open_failed(session.is_current(token))
+            {
+                emit_status(
+                    &events,
+                    ProtocolId::Signal,
+                    AdapterStatus::Connecting,
+                    DISCONNECTED,
+                );
+                if !wait_backoff(session.as_ref(), token, after).await {
+                    break;
+                }
+                relink.note_end();
+                continue;
+            }
             break;
         };
         if relink.on_stream() {
