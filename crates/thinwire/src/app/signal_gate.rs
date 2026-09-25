@@ -139,17 +139,7 @@ mod tests {
         let image = provisioning_qr_image("sgnl://link-device?uuid=fixture").expect("qr");
         assert_eq!(image.size[0], image.size[1]);
         assert!(image.size[0] >= (21 + QR_QUIET * 2) * QR_SCALE);
-        assert!(
-            image
-                .pixels
-                .iter()
-                .any(|pixel| *pixel == egui::Color32::BLACK)
-        );
-        assert!(
-            image
-                .pixels
-                .iter()
-                .any(|pixel| *pixel == egui::Color32::WHITE)
-        );
+        assert!(image.pixels.contains(&egui::Color32::BLACK));
+        assert!(image.pixels.contains(&egui::Color32::WHITE));
     }
 }
