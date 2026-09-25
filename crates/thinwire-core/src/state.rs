@@ -264,6 +264,10 @@ pub const KEYCHAIN_READ_FAILED: &str = "The keychain could not be read. Your sav
 pub const LOADING_CHATS_STATUS: &str = "Loading chats…";
 pub const LOADING_MESSAGES_STATUS: &str = "Loading messages…";
 pub const LOADING_OLDER_STATUS: &str = "Loading older messages…";
+
+/// The thread's note after a failed older page. The adapter's detail (for
+/// example a library name and an error code) goes to the debug log only.
+pub const OLDER_PAGE_FAILED_NOTE: &str = "Could not load older messages. Try again later.";
 pub const SENDING_STATUS: &str = "Sending…";
 
 /// Center panel copy while the keychain read runs.
@@ -438,7 +442,7 @@ pub struct Snapshot {
     older_retry: HashMap<String, (String, Instant, u32)>,
     /// Why the last older page of a Telegram chat did not load. For that
     /// chat only, not an account error. A later success clears it (#57).
-    older_note: HashMap<String, String>,
+    older_note: HashSet<(ProtocolId, String)>,
     scroll_to_selected: bool,
     scroll_to_focused: bool,
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
@@ -590,7 +594,7 @@ impl Snapshot {
             open_on_link: None,
             sessions: HashSet::new(),
             extra_visible: HashSet::new(),
-            older_note: HashMap::new(),
+            older_note: HashSet::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
@@ -757,12 +761,20 @@ impl Snapshot {
                 more,
                 note,
             } => {
+                // Every protocol: a failure sets the chat's note, a success
+                // clears it. The thread shows plain text only.
+                let key = (protocol, conversation_id.clone());
+                match note {
+                    Some(detail) => {
+                        tracing::debug!(?protocol, %detail, "older page did not load");
+                        self.older_note.insert(key);
+                    }
+                    None => {
+                        self.older_note.remove(&key);
+                    }
+                }
                 if matches!(protocol, ProtocolId::Telegram | ProtocolId::Signal) {
                     self.older_loading.remove(&conversation_id);
-                    match note {
-                        Some(note) => self.older_note.insert(conversation_id.clone(), note),
-                        None => self.older_note.remove(&conversation_id),
-                    };
                     let oldest = self
                         .messages
                         .get(&(protocol, conversation_id.clone()))
@@ -1388,12 +1400,11 @@ impl Snapshot {
 
     /// Why the last older page of the selected chat did not load (#57).
     #[must_use]
-    pub fn older_note(&self) -> Option<&str> {
-        if self.selected_protocol != ProtocolId::Telegram {
-            return None;
-        }
-        let id = self.selected_conversation.as_ref()?;
-        self.older_note.get(id).map(String::as_str)
+    pub fn older_note(&self) -> Option<&'static str> {
+        let id = self.selected_conversation.clone()?;
+        self.older_note
+            .contains(&(self.selected_protocol, id))
+            .then_some(OLDER_PAGE_FAILED_NOTE)
     }
 
     /// Older-message paging of the selected chat (#30).
@@ -2402,8 +2413,8 @@ impl Snapshot {
             self.older_loading.clear();
             self.older_at_start.clear();
             self.older_retry.clear();
-            self.older_note.clear();
         }
+        self.older_note.retain(|(owner, _)| *owner != protocol);
         #[cfg(feature = "whatsapp-web")]
         if protocol == ProtocolId::WhatsApp {
             self.end_pairing();
@@ -2469,8 +2480,8 @@ impl Snapshot {
             self.older_loading.remove(id);
             self.older_at_start.remove(id);
             self.older_retry.remove(id);
-            self.older_note.remove(id);
         }
+        self.older_note.remove(&(protocol, id.to_owned()));
         if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
             self.compose.clear();
             self.selected_conversation = None;
@@ -3548,10 +3559,10 @@ mod tests {
         };
         snapshot.apply(failed);
         assert!(!snapshot.is_loading());
-        assert_eq!(
-            snapshot.older_note(),
-            Some("Could not load older messages (TDLib 500).")
-        );
+        // Plain text: no library name and no code (qa on #73).
+        assert_eq!(snapshot.older_note(), Some(OLDER_PAGE_FAILED_NOTE));
+        let note = snapshot.older_note().unwrap_or_default();
+        assert!(!note.contains("TDLib") && !note.chars().any(|c| c.is_ascii_digit()));
         assert!(
             snapshot.error.is_none(),
             "a chat note, not an account error"
@@ -3567,6 +3578,45 @@ mod tests {
         });
         snapshot.apply(older_loaded(1, 50, true));
         assert_eq!(snapshot.older_note(), None);
+    }
+
+    #[test]
+    fn older_notes_belong_to_one_protocol_and_leave_with_its_session() {
+        let mut snapshot = Snapshot::new();
+        let failed = |protocol: ProtocolId, chat: &str| AdapterEvent::OlderHistoryLoaded {
+            protocol,
+            conversation_id: chat.into(),
+            before_message_id: format!("{chat}:9"),
+            more: true,
+            note: Some("group-7f3a is not in the local store".into()),
+        };
+        for protocol in [ProtocolId::Signal, ProtocolId::Telegram] {
+            snapshot.apply(AdapterEvent::Account {
+                protocol,
+                state: AccountState::Linked,
+            });
+        }
+        // The same chat id in two protocols.
+        snapshot.apply(failed(ProtocolId::Signal, "chat:1"));
+        snapshot.apply(failed(ProtocolId::Telegram, "chat:1"));
+        snapshot.selected_protocol = ProtocolId::Signal;
+        snapshot.selected_conversation = Some("chat:1".into());
+        assert_eq!(
+            snapshot.older_note(),
+            Some(OLDER_PAGE_FAILED_NOTE),
+            "Signal too"
+        );
+
+        snapshot.end_session(ProtocolId::Signal);
+        snapshot.selected_protocol = ProtocolId::Signal;
+        snapshot.selected_conversation = Some("chat:1".into());
+        assert_eq!(snapshot.older_note(), None, "the Signal session ended");
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        assert_eq!(
+            snapshot.older_note(),
+            Some(OLDER_PAGE_FAILED_NOTE),
+            "the Telegram note stays"
+        );
     }
 
     #[test]
