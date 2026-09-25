@@ -576,6 +576,7 @@ mod tests {
             last_at: 0,
             is_group: false,
             writable: true,
+            placeholder: false,
         }
     }
 

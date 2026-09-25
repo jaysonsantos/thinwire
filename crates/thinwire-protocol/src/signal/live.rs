@@ -394,6 +394,7 @@ fn conversation_from_contact(contact: &Contact) -> Conversation {
         last_at: 0,
         is_group: false,
         writable: true,
+        placeholder: false,
     }
 }
 
@@ -410,6 +411,7 @@ fn conversation_from_group(key: &[u8], group: &Group) -> Conversation {
         last_at: 0,
         is_group: chat.is_group,
         writable: true,
+        placeholder: false,
     }
 }
 
