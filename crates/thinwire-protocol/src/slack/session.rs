@@ -709,6 +709,7 @@ where
                     last_at: 0,
                     is_group: is_group(channel.kind),
                     writable: true,
+                    placeholder: false,
                 };
                 if let Some(existing) = self.channels.get(&channel.id) {
                     // Keep live preview, unread, order, and time from Socket Mode.
@@ -982,6 +983,7 @@ where
                 last_at: sent_at,
                 is_group: !channel.starts_with('D'),
                 writable: true,
+                placeholder: false,
             };
             // The title is only the id. A later LoadChats walks the list again
             // and replaces it with the channel name.
