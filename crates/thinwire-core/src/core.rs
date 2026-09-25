@@ -157,6 +157,18 @@ impl Core {
             Arc::clone(&whatsapp_phone),
             signal,
         );
+        Self::with_host(runtime, config, secrets, whatsapp_phone, host)
+    }
+
+    /// A core over a host that the caller spawned, for example with the demo
+    /// adapters (#120).
+    pub(crate) fn with_host(
+        runtime: &Handle,
+        config: CoreConfig,
+        secrets: Arc<SecretStore>,
+        whatsapp_phone: Arc<WhatsAppPhoneVault>,
+        host: AdapterHost,
+    ) -> Self {
         // `for_ui` only schedules keychain attach. A start can run before
         // that blocking read finishes, so arm Discord and Slack again once
         // a token is in memory. The hook sends a command; it does not touch
@@ -190,6 +202,11 @@ impl Core {
     #[must_use]
     pub fn signal(&self) -> ChangeSignal {
         self.notifier.subscribe()
+    }
+
+    /// The state, for the demo scenarios (#120).
+    pub(crate) const fn state_mut(&mut self) -> &mut Snapshot {
+        &mut self.state
     }
 
     /// The state for this redraw.

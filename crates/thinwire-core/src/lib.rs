@@ -6,6 +6,7 @@
 //! the tokio worker. This crate never depends on egui, eframe, or winit.
 
 mod core;
+pub mod demo;
 mod intent;
 mod secret_text;
 pub mod secrets;

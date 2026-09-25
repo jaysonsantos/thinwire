@@ -71,6 +71,8 @@ pub struct Settings {
     persist_epoch: u64,
     latest_persist: Arc<AtomicU64>,
     persist_lock: Arc<Mutex<()>>,
+    /// Never write the file: the demo (#120) and tests.
+    in_memory: bool,
 }
 
 impl Settings {
@@ -90,6 +92,22 @@ impl Settings {
             persist_epoch: 0,
             latest_persist: Arc::new(AtomicU64::new(0)),
             persist_lock: Arc::new(Mutex::new(())),
+            in_memory: false,
+        }
+    }
+
+    /// Settings that start at System and never read or write a file. A
+    /// theme change stays in memory.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self {
+            theme: ThemeMode::System,
+            path: PathBuf::new(),
+            persist_pending: false,
+            persist_epoch: 0,
+            latest_persist: Arc::new(AtomicU64::new(0)),
+            persist_lock: Arc::new(Mutex::new(())),
+            in_memory: true,
         }
     }
 
@@ -110,7 +128,7 @@ impl Settings {
     /// Take the latest queued write. The UI thread must `spawn_blocking` this.
     #[must_use]
     pub fn take_persist_job(&mut self) -> Option<PersistJob> {
-        if !std::mem::take(&mut self.persist_pending) {
+        if !std::mem::take(&mut self.persist_pending) || self.in_memory {
             return None;
         }
         self.persist_epoch = self.persist_epoch.saturating_add(1);
