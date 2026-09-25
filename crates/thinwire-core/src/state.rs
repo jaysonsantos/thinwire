@@ -1625,12 +1625,13 @@ impl Snapshot {
         }
         self.messages
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
+        // Every removed chat loses its draft, selected or not (#43).
+        self.drafts.remove(id);
         if protocol == ProtocolId::Telegram {
             self.older_loading.remove(id);
             self.older_at_start.remove(id);
         }
         if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
-            self.drafts.remove(id);
             self.compose.clear();
             self.selected_conversation = None;
             self.ensure_conversation_selection();
@@ -2436,6 +2437,28 @@ mod tests {
             send_texts(&mut snapshot).is_empty(),
             "switching never sends"
         );
+    }
+
+    #[test]
+    fn a_removed_chat_that_is_not_selected_loses_its_draft() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "draft for Ada".into();
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.compose = "draft for Bob".into();
+        assert!(snapshot.drafts.contains_key("telegram:1"));
+
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Telegram,
+            id: "telegram:1".into(),
+        });
+        assert!(!snapshot.drafts.contains_key("telegram:1"), "draft gone");
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:2"),
+            "the selection stays"
+        );
+        assert_eq!(snapshot.compose, "draft for Bob", "the open draft stays");
     }
 
     #[test]
