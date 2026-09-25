@@ -164,6 +164,15 @@ impl LinkHandle {
         let _ = self.tx.send(Msg::Cancel);
     }
 
+    /// A sender for client events of `generation`, for code outside the
+    /// client (for example a send result that shows a revoked device).
+    pub(super) fn callbacks(&self, generation: u64) -> Callbacks {
+        Callbacks {
+            generation,
+            tx: self.tx.downgrade(),
+        }
+    }
+
     /// A pairing was asked for or a client runs.
     pub(super) fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)

@@ -386,9 +386,15 @@ impl WhatsAppAdapter {
     ) {
         let session = self.session.clone();
         let events = events.clone();
+        let owner = self.link.as_ref().map(|link| link.callbacks(generation));
         tokio::spawn(async move {
             let result = sender.send_text(&jid, &body).await;
-            session.finish_send(generation, &jid, &pending, result, &events);
+            let revoked = session.finish_send(generation, &jid, &pending, result, &events);
+            // The phone revoked the device, maybe with no LoggedOut callback.
+            // The owner stops the client and deletes the revoked store.
+            if revoked && let Some(owner) = owner {
+                owner.send(session::LinkEvent::LoggedOut);
+            }
         });
     }
 }
@@ -1706,6 +1712,46 @@ mod tests {
         // A placeholder or foreign id is ignored.
         adapter.view_chat(Some(PLACEHOLDER_ID), &tx);
         assert!(drain(&mut rx).is_empty());
+    }
+
+    /// Codex r4101563631: a send that shows a revoked device (Unlinked) with
+    /// no LoggedOut callback still stops the client and deletes the store.
+    #[tokio::test]
+    async fn unlinked_send_result_stops_the_client_and_deletes_the_store() {
+        let (fake, handle, owner_session, mut rx) =
+            link::tests::owner(link::tests::Fake::default());
+        let mut adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
+        adapter.session = owner_session;
+        adapter.link = Some(handle);
+        let link = adapter.link.as_ref().expect("link");
+        link.begin(None, 1);
+        link.flush().await;
+        // The owner started generation 1; its client now reports the chat and
+        // the connection. The send path of this client fails as Unlinked.
+        assert!(
+            adapter
+                .session
+                .attach_sender(1, failing(session::SendFailure::Unlinked))
+        );
+        fake.callback(1).send(history());
+        fake.callback(1).send(LinkEvent::Connected);
+        link.flush().await;
+        drain(&mut rx);
+
+        let (tx, _adapter_rx) = unbounded_channel();
+        adapter.handle(send_hi(), &tx).expect("send");
+        for _ in 0..200 {
+            if fake.log().iter().any(|entry| entry == "delete") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            fake.log(),
+            vec!["start 1", "mark revoked", "stop 1", "delete"],
+            "the owner stops the client and deletes the revoked store"
+        );
+        assert!(!adapter.session.is_connected());
     }
 
     #[test]

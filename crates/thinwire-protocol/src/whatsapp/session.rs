@@ -317,6 +317,10 @@ impl Session {
     ///
     /// A result from an older link is dropped: that link's inbox and sender
     /// are gone, and an `Unlinked` result must not reset the new link.
+    ///
+    /// Returns `true` if the phone revoked the current link. The caller must
+    /// tell the link owner, so it stops the client and deletes the store.
+    #[must_use]
     pub(super) fn finish_send(
         &self,
         generation: u64,
@@ -324,11 +328,12 @@ impl Session {
         pending: &str,
         result: Result<String, SendFailure>,
         events: &EventTx,
-    ) {
+    ) -> bool {
         let mut state = self.lock();
         if state.generation != generation {
-            return;
+            return false;
         }
+        let revoked = result == Err(SendFailure::Unlinked);
         let out = match result {
             Ok(server_id) => state.inbox.confirm_send(jid, pending, server_id),
             Err(failure) => {
@@ -344,6 +349,7 @@ impl Session {
         for event in out {
             let _ = events.send(event);
         }
+        revoked
     }
 }
 
