@@ -13,7 +13,7 @@ use super::thread_layout::{RowLayout, list_time, thread_rows};
 use thinwire_core::secrets::Persistence;
 use thinwire_core::state::{
     AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
-    RESUME_CONNECTING, Snapshot, ThreadState,
+    OlderState, RESUME_CONNECTING, Snapshot, ThreadState,
 };
 use thinwire_core::{Intent, TelegramIntent, ThemeMode, View};
 
@@ -800,38 +800,153 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     let reserve = compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y);
 
     let state = snapshot.thread_state();
+    let older = snapshot.older_state();
     let mut retry: Option<String> = None;
     // One scroll state per chat, so each chat opens at its newest message.
     let salt = snapshot.selected_conversation.clone().unwrap_or_default();
-    egui::ScrollArea::vertical()
+    let memo_id = ui.make_persistent_id(("thread-older", &salt));
+    let memo: ThreadMemo = ui.data(|data| data.get_temp(memo_id)).unwrap_or_default();
+    let mut area = egui::ScrollArea::vertical()
         .id_salt(("thread", salt))
         .auto_shrink([false, true])
         .stick_to_bottom(true)
-        .max_height(ui.available_height() - reserve)
-        .show(ui, |ui| {
-            match state {
-                ThreadState::Loading => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Loading messages…").weak());
-                    });
-                }
-                ThreadState::Empty => {
-                    ui.label(RichText::new("No messages in this chat.").italics().weak());
-                }
-                ThreadState::NoSelection | ThreadState::Rows => {}
+        .max_height(ui.available_height() - reserve);
+    if let Some(offset) = memo.restore {
+        area = area.vertical_scroll_offset(offset);
+    }
+    let output = area.show(ui, |ui| {
+        match older {
+            OlderState::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading older messages…").weak());
+                });
             }
-            let mut gap_before = None;
-            for message in &messages {
-                bubble(ui, message, &mut retry, gap_before);
-                gap_before = Some(message.layout.run_end);
+            OlderState::StartOfChat if state == ThreadState::Rows => {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Start of chat").small().weak());
+                });
             }
+            OlderState::StartOfChat | OlderState::Idle => {}
+        }
+        match state {
+            ThreadState::Loading => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading messages…").weak());
+                });
+            }
+            ThreadState::Empty => {
+                ui.label(RichText::new("No messages in this chat.").italics().weak());
+            }
+            ThreadState::NoSelection | ThreadState::Rows => {}
+        }
+        let mut gap_before = None;
+        for message in &messages {
+            bubble(ui, message, &mut retry, gap_before);
+            gap_before = Some(message.layout.run_end);
+        }
+    });
+    let first_id = messages.first().map(|message| message.id.clone());
+    let step = older_step(
+        &memo,
+        first_id.as_deref(),
+        |id| messages.iter().any(|message| message.id == id),
+        output.state.offset.y,
+        output.content_size.y,
+    );
+    if step.restore.is_some() {
+        // Older rows went in above: the next pass moves down by their height,
+        // so the row that was on screen stays there. Redo this pass, so the
+        // jump never shows (#30). If egui declines, the next frame moves it.
+        ui.ctx()
+            .request_discard("keep the thread position after older messages");
+        ui.ctx().request_repaint();
+    }
+    ui.data_mut(|data| {
+        data.insert_temp(
+            memo_id,
+            ThreadMemo {
+                first_id: first_id.clone(),
+                content_height: output.content_size.y,
+                restore: step.restore,
+            },
+        );
+    });
+    if step.at_top
+        && state == ThreadState::Rows
+        && older == OlderState::Idle
+        && let Some((protocol, conversation_id)) = snapshot
+            .selected_conversation
+            .clone()
+            .map(|id| (snapshot.selected_protocol, id))
+    {
+        out.push(Intent::LoadOlderMessages {
+            protocol,
+            conversation_id,
         });
+    }
     if let Some(message_id) = retry {
         out.push(Intent::Retry { message_id });
     }
 
     compose(ui, snapshot, hints, compose_height, out);
+}
+
+/// Distance from the top of the thread, in points, that asks for older
+/// messages.
+const OLDER_TRIGGER: f32 = 24.0;
+
+/// What the thread remembers between frames for older-message paging (#30).
+#[derive(Debug, Clone, Default)]
+struct ThreadMemo {
+    /// The oldest row that the last frame drew.
+    first_id: Option<String>,
+    content_height: f32,
+    /// Scroll offset for the next pass, after older rows went in above.
+    restore: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OlderStep {
+    /// The view reached the top of rows that did not change since the last
+    /// frame: ask for older messages.
+    at_top: bool,
+    /// Older rows went in above the rows of the last frame: the offset that
+    /// keeps the old top row in place.
+    restore: Option<f32>,
+}
+
+/// Pure frame logic for older-message paging. A chat that just opened (no
+/// rows last frame) never asks: `stick_to_bottom` moves it to the newest
+/// message first.
+fn older_step(
+    memo: &ThreadMemo,
+    first_id: Option<&str>,
+    has_row: impl Fn(&str) -> bool,
+    offset: f32,
+    content_height: f32,
+) -> OlderStep {
+    let Some(first) = first_id else {
+        return OlderStep {
+            at_top: false,
+            restore: None,
+        };
+    };
+    match memo.first_id.as_deref() {
+        Some(old) if old == first => OlderStep {
+            at_top: memo.restore.is_none() && offset <= OLDER_TRIGGER,
+            restore: None,
+        },
+        Some(old) if memo.restore.is_none() && has_row(old) => OlderStep {
+            at_top: false,
+            restore: Some((offset + content_height - memo.content_height).max(0.0)),
+        },
+        _ => OlderStep {
+            at_top: false,
+            restore: None,
+        },
+    }
 }
 
 /// One message row, ready to draw.
@@ -1155,6 +1270,70 @@ fn send_label(can_send: bool, palette: &theme::Palette) -> egui::Color32 {
 mod tests {
     use super::{account_label, badge_text};
     use thinwire_protocol::AdapterStatus;
+
+    #[test]
+    fn older_paging_asks_at_the_top_and_keeps_the_row_on_screen() {
+        use super::{OLDER_TRIGGER, OlderStep, ThreadMemo, older_step};
+
+        let rows = ["t:1:50", "t:1:51"];
+        let has = |id: &str| rows.contains(&id) || id == "t:1:40";
+        // A chat that just opened: no ask, even at offset 0.
+        let fresh = ThreadMemo::default();
+        assert_eq!(
+            older_step(&fresh, Some("t:1:50"), has, 0.0, 800.0),
+            OlderStep {
+                at_top: false,
+                restore: None
+            }
+        );
+        // Same rows as the last frame, near the top: ask.
+        let seen = ThreadMemo {
+            first_id: Some("t:1:50".into()),
+            content_height: 800.0,
+            restore: None,
+        };
+        assert!(older_step(&seen, Some("t:1:50"), has, OLDER_TRIGGER, 800.0).at_top);
+        assert!(!older_step(&seen, Some("t:1:50"), has, OLDER_TRIGGER + 1.0, 800.0).at_top);
+        // 300 points of older rows went in above: move down by 300.
+        let step = older_step(&seen, Some("t:1:40"), has, 4.0, 1100.0);
+        assert_eq!(
+            step,
+            OlderStep {
+                at_top: false,
+                restore: Some(304.0)
+            }
+        );
+        // The pass that applies the offset does not ask again.
+        let restoring = ThreadMemo {
+            first_id: Some("t:1:40".into()),
+            content_height: 1100.0,
+            restore: Some(304.0),
+        };
+        assert!(!older_step(&restoring, Some("t:1:40"), has, 304.0, 1100.0).at_top);
+        // Another chat's rows (the old top row is gone): no offset change.
+        assert_eq!(
+            older_step(&seen, Some("t:2:9"), |id| id == "t:2:9", 0.0, 500.0).restore,
+            None
+        );
+        // No rows: nothing.
+        assert!(!older_step(&seen, None, has, 0.0, 0.0).at_top);
+    }
+
+    #[test]
+    fn the_thread_shows_older_rows_and_asks_the_core() {
+        let ui = include_str!("ui.rs");
+        let thread = &ui[ui.find("fn thread(").expect("thread")..];
+        let thread = &thread[..thread.find("\nfn ").expect("next")];
+        assert!(thread.contains("\"Loading older messages…\""));
+        assert!(thread.contains("\"Start of chat\""));
+        assert!(thread.contains("out.push(Intent::LoadOlderMessages {"));
+        assert!(
+            thread.contains("older == OlderState::Idle"),
+            "one request at a time"
+        );
+        assert!(thread.contains("vertical_scroll_offset(offset)"));
+        assert!(thread.contains("request_discard("));
+    }
 
     #[test]
     fn compose_reserve_counts_the_frame_padding() {
