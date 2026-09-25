@@ -6,7 +6,11 @@
 
 queue_rules:
   - name: default
+    # Queue a pull request by itself when it has the label and CI is green.
+    # Without autoqueue, the label alone does not queue it.
+    autoqueue: true
     queue_conditions:
+      - label = ready-to-merge
       - check-success = check
     merge_conditions:
       - check-success = check
