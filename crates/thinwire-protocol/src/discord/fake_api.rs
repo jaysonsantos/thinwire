@@ -1,13 +1,14 @@
 //! In-memory [`DiscordApi`] for adapter tests. No network.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
 use super::api::{
     ApiFuture, ChannelKind, ChannelSummary, DiscordApi, DiscordApiError, GuildSummary,
-    MessageSummary, Overwrite, OverwriteTarget,
+    MessageSummary, Overwrite, OverwriteTarget, SendResultPause,
 };
 use super::permissions::{READ_BITS, SEND_MESSAGES, VIEW_CHANNEL};
 
@@ -34,10 +35,16 @@ pub(crate) struct FakeState {
     pub next_error: Option<DiscordApiError>,
     /// Pauses the next bot-id read until notified. A reconnect stays without a bot id.
     pub hold_load: Option<Arc<Notify>>,
+    /// Fired when `bot_user_id` is about to wait on `hold_load`.
+    pub hold_load_arrived: Option<Arc<Notify>>,
     /// Pauses `channels` after the list is copied, so an older reload can finish late.
     pub hold_channels: Option<Arc<Notify>>,
     /// Fired when `channels` is about to wait on `hold_channels`.
     pub channels_at_barrier: Option<Arc<Notify>>,
+    /// Pauses the 401 step after revocation and before `Unlinked`.
+    pub hold_unlink: Option<Arc<Notify>>,
+    /// Fired when that pause is about to wait.
+    pub unlink_at_barrier: Option<Arc<Notify>>,
     pub next_id: u64,
 }
 
@@ -47,6 +54,10 @@ pub(crate) struct FakeDiscordApi {
     pub state: Mutex<FakeState>,
     pub hold_history: Option<Arc<Notify>>,
     pub hold_send: Option<Arc<Notify>>,
+    /// Sends currently blocked in `hold_send`.
+    pub sends_at_hold: AtomicUsize,
+    /// When set, a finished send waits after its result event is queued.
+    pub send_result_pause: Option<Arc<SendResultPause>>,
 }
 
 fn channel(id: u64, name: &str, kind: ChannelKind, overwrites: Vec<Overwrite>) -> ChannelSummary {
@@ -134,6 +145,8 @@ impl FakeDiscordApi {
             state: Mutex::new(state),
             hold_history: None,
             hold_send: None,
+            sends_at_hold: AtomicUsize::new(0),
+            send_result_pause: None,
         }
     }
 
@@ -159,6 +172,9 @@ impl DiscordApi for FakeDiscordApi {
             self.check_token()?;
             let hold = self.state().hold_load.clone();
             if let Some(hold) = hold {
+                if let Some(arrived) = self.state().hold_load_arrived.clone() {
+                    arrived.notify_one();
+                }
                 hold.notified().await;
             }
             Ok(BOT_ID)
@@ -231,11 +247,26 @@ impl DiscordApi for FakeDiscordApi {
         })
     }
 
+    fn send_result_pause(&self) -> Option<Arc<SendResultPause>> {
+        self.send_result_pause.clone()
+    }
+
+    fn unlink_pause(&self) -> Option<Arc<Notify>> {
+        let state = self.state();
+        let hold = state.hold_unlink.clone()?;
+        if let Some(arrived) = state.unlink_at_barrier.clone() {
+            arrived.notify_one();
+        }
+        Some(hold)
+    }
+
     fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary> {
         Box::pin(async move {
             self.check_token()?;
             if let Some(hold) = &self.hold_send {
+                self.sends_at_hold.fetch_add(1, Ordering::SeqCst);
                 hold.notified().await;
+                self.sends_at_hold.fetch_sub(1, Ordering::SeqCst);
             }
             let mut state = self.state();
             if let Some(error) = state.send_error {

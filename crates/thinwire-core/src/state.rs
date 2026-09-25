@@ -1856,19 +1856,50 @@ impl Snapshot {
 
     /// Compose-rejected text wins when it still matches. Otherwise a retry's
     /// text fills an empty draft.
+    /// The unsent text of a chat now: the compose field of the chat that
+    /// shows, or the chat's draft.
+    fn current_text(&self, protocol: ProtocolId, chat: &str) -> &str {
+        if self.is_selected_chat(protocol, chat) {
+            self.compose.trim()
+        } else {
+            self.drafts
+                .get(&(protocol, chat.to_owned()))
+                .map_or("", |draft| draft.trim())
+        }
+    }
+
+    /// The text of each send or retry with no answer that a session end
+    /// keeps as its chat's draft (#135): one in flight, or one that expired
+    /// and still waits for a late answer (Codex r4109058384). The chat's text
+    /// must be empty or still that text. A retry keeps the text of its row,
+    /// which the session end drops. A send in flight comes last, so it wins
+    /// over an older expired send of the same chat.
+    fn pending_texts_to_keep(&self, protocol: ProtocolId) -> Vec<(String, String)> {
+        self.sends
+            .expired_of(protocol)
+            .into_iter()
+            .chain(self.sends.open_of(protocol))
+            .filter_map(|(chat, pending)| {
+                let text = match pending {
+                    Pending::Send { body, .. } => body,
+                    Pending::Retry { message_id, .. } => {
+                        self.message_body(protocol, &chat, &message_id)?
+                    }
+                };
+                let current = self.current_text(protocol, &chat);
+                (!text.is_empty() && (current.is_empty() || current == text))
+                    .then_some((chat, text))
+            })
+            .collect()
+    }
+
     fn text_to_keep(
         &self,
         protocol: ProtocolId,
         chat: &str,
         rejected: &RejectedBody,
     ) -> Option<String> {
-        let current = if self.is_selected_chat(protocol, chat) {
-            self.compose.trim()
-        } else {
-            self.drafts
-                .get(&(protocol, chat.to_owned()))
-                .map_or("", |draft| draft.trim())
-        };
+        let current = self.current_text(protocol, chat);
         if let Some(compose) = &rejected.compose
             && current == compose
         {
@@ -2355,10 +2386,14 @@ impl Snapshot {
         }
         self.sessions.remove(&protocol);
         self.conversations.remove(&protocol);
+        // Telegram drops every draft (the next account on this machine must
+        // not see them). Another protocol keeps a rejected send's text, and
+        // the text of a send still in flight (#102, #135).
         let keep: Vec<(String, String)> = if protocol == ProtocolId::Telegram {
             Vec::new()
         } else {
-            self.rejected_bodies
+            let mut keep: Vec<(String, String)> = self
+                .rejected_bodies
                 .iter()
                 .filter_map(|((owner, chat), rejected)| {
                     if *owner != protocol {
@@ -2367,7 +2402,10 @@ impl Snapshot {
                     self.text_to_keep(protocol, chat, rejected)
                         .map(|text| (chat.clone(), text))
                 })
-                .collect()
+                .collect();
+            // A send in flight is newer than an earlier rejection of its chat.
+            keep.extend(self.pending_texts_to_keep(protocol));
+            keep
         };
         self.rejected_bodies
             .retain(|(owner, _), _| *owner != protocol);
@@ -7339,4 +7377,122 @@ mod tests {
     }
 
     // endregion: #80
+
+    // region: #135 pending sends at a session end
+
+    /// A Slack send in flight in the selected chat. Returns its request.
+    fn slack_send_in_flight(snapshot: &mut Snapshot, text: &str) -> u64 {
+        link(snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_conversation("slack:C1".into());
+        snapshot.compose = text.into();
+        snapshot.send_compose();
+        snapshot
+            .sends
+            .request_of(ProtocolId::Slack, "slack:C1")
+            .expect("send in flight")
+    }
+
+    /// #135: a session end keeps the text of a send in flight as its chat's
+    /// draft. A late SendRejected does not clear it. After a relink the text
+    /// is back in the compose field.
+    #[test]
+    fn a_session_end_keeps_the_text_of_a_send_in_flight() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        let request = slack_send_in_flight(&mut snapshot, "hello");
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        assert_eq!(
+            snapshot
+                .drafts
+                .get(&(ProtocolId::Slack, "slack:C1".to_owned()))
+                .map(String::as_str),
+            Some("hello")
+        );
+
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+            request,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_conversation("slack:C1".into());
+        assert_eq!(snapshot.compose, "hello", "the text is back");
+    }
+
+    /// #135: a session end keeps the pending text only when the chat's text
+    /// is empty or still that text. Other typed text is not overwritten.
+    #[test]
+    fn a_session_end_does_not_overwrite_other_text_with_a_pending_send() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        slack_send_in_flight(&mut snapshot, "hello");
+        snapshot.compose = "something else".into();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        assert_eq!(
+            snapshot
+                .drafts
+                .get(&(ProtocolId::Slack, "slack:C1".to_owned())),
+            None
+        );
+    }
+
+    /// Codex r4109058384 on #135: a send that timed out keeps its text too.
+    /// Send, timeout, Unlinked, relink: the text is back.
+    #[test]
+    fn a_session_end_keeps_the_text_of_an_expired_send() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        slack_send_in_flight(&mut snapshot, "hello");
+        snapshot.expire_sends_at(Instant::now() + crate::sends::SEND_TIMEOUT);
+        assert!(snapshot.can_send(), "the send expired");
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        assert_eq!(
+            snapshot
+                .drafts
+                .get(&(ProtocolId::Slack, "slack:C1".to_owned()))
+                .map(String::as_str),
+            Some("hello")
+        );
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_conversation("slack:C1".into());
+        assert_eq!(snapshot.compose, "hello", "the text is back");
+    }
+
+    /// #135 keeps the R73 rule: a Telegram session end drops every draft,
+    /// also the text of a send in flight.
+    #[test]
+    fn a_telegram_session_end_still_drops_a_pending_send_text() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Unlinked,
+        });
+        assert!(
+            !snapshot
+                .drafts
+                .keys()
+                .any(|(owner, _)| *owner == ProtocolId::Telegram)
+        );
+        assert_eq!(snapshot.compose, "");
+    }
+
+    // endregion: #135
 }
