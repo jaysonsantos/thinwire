@@ -258,6 +258,13 @@ const CONNECTING_STATUS: &str = "Connecting to Telegram…";
 /// Center panel copy when a keychain read failed (the values are unknown).
 pub const KEYCHAIN_READ_FAILED: &str = "The keychain could not be read. Your saved sign-in did not load. Unlock the keychain, then press Try again.";
 
+/// Status lines of a running load (#80). The strip shows them before any
+/// finished line.
+pub const LOADING_CHATS_STATUS: &str = "Loading chats…";
+pub const LOADING_MESSAGES_STATUS: &str = "Loading messages…";
+pub const LOADING_OLDER_STATUS: &str = "Loading older messages…";
+pub const SENDING_STATUS: &str = "Sending…";
+
 /// Center panel copy while the keychain read runs.
 pub const KEYCHAIN_OPENING: &str = "Opening the keychain…";
 
@@ -1227,7 +1234,49 @@ impl Snapshot {
     pub fn is_loading(&self) -> bool {
         !self.chat_list_loading.is_empty()
             || !self.history_loading.is_empty()
+            || !self.older_loading.is_empty()
             || !self.sends.is_empty()
+    }
+
+    /// The line of a running load of one protocol, if one runs (#80).
+    #[must_use]
+    pub fn loading_line(&self, protocol: ProtocolId) -> Option<&'static str> {
+        if self.chat_list_loading.contains(&protocol) {
+            Some(LOADING_CHATS_STATUS)
+        } else if self
+            .history_loading
+            .iter()
+            .any(|(owner, _)| *owner == protocol)
+        {
+            Some(LOADING_MESSAGES_STATUS)
+        } else if protocol == ProtocolId::Telegram && !self.older_loading.is_empty() {
+            Some(LOADING_OLDER_STATUS)
+        } else if self.sends.any_for(protocol) {
+            Some(SENDING_STATUS)
+        } else {
+            None
+        }
+    }
+
+    /// The line the status strip shows (#80). While any load runs it is a
+    /// running load's line, never a finished Ready line: the selected
+    /// protocol's load first, then another visible protocol's load, named.
+    /// With no load, it is the last status line.
+    #[must_use]
+    pub fn status_line(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(line) = self.loading_line(self.selected_protocol) {
+            return line.into();
+        }
+        let other = self
+            .accounts
+            .iter()
+            .map(|row| row.caps.id)
+            .filter(|id| *id != self.selected_protocol && self.account_surface_visible(*id))
+            .find_map(|id| self.loading_line(id).map(|line| (id, line)));
+        match other {
+            Some((id, line)) => format!("{}: {line}", id.display_name()).into(),
+            None => self.status_text.as_str().into(),
+        }
     }
 
     #[must_use]
@@ -6482,4 +6531,81 @@ mod tests {
     }
 
     // endregion: #69
+
+    // region: #80 one status line per protocol
+
+    /// #80: a Telegram older page ends while Slack still loads. The strip
+    /// shows Slack's loading line, never the finished "Message sent.".
+    #[test]
+    fn a_running_load_line_wins_over_a_finished_ready_line() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.visible_for_test.insert(ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        snapshot.history_loading.clear();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Message sent.".into(),
+        });
+        assert!(snapshot.status_is_idle());
+        assert_eq!(snapshot.status_line(), "Message sent.");
+
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.chat_list_loading.insert(ProtocolId::Slack);
+        snapshot.older_loading.insert("telegram:1".into());
+        assert_eq!(
+            snapshot.status_line(),
+            LOADING_OLDER_STATUS,
+            "selected first"
+        );
+
+        // The Telegram older page ends; Slack still loads its chat list.
+        snapshot.older_loading.clear();
+        assert!(snapshot.is_loading());
+        assert!(!snapshot.status_is_idle());
+        assert_eq!(snapshot.status_line(), "Slack: Loading chats…");
+
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Slack,
+        });
+        assert_eq!(snapshot.status_line(), "Message sent.", "idle again");
+    }
+
+    /// #80: each protocol has its own loading line; the selected one wins.
+    #[test]
+    fn each_protocol_has_its_own_loading_line() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack, ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Slack);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.chat_list_loading.insert(ProtocolId::Discord);
+        snapshot.history_loading.clear();
+        snapshot.select_protocol(ProtocolId::Slack);
+        snapshot.history_loading.clear();
+        snapshot.compose = "hi".into();
+        snapshot.send_compose();
+        assert_eq!(
+            snapshot.loading_line(ProtocolId::Slack),
+            Some(SENDING_STATUS)
+        );
+        assert_eq!(
+            snapshot.loading_line(ProtocolId::Discord),
+            Some(LOADING_CHATS_STATUS)
+        );
+        assert_eq!(
+            snapshot.status_line(),
+            SENDING_STATUS,
+            "the selected protocol first"
+        );
+        snapshot.select_protocol(ProtocolId::Discord);
+        assert_eq!(snapshot.status_line(), LOADING_CHATS_STATUS);
+    }
+
+    // endregion: #80
 }
