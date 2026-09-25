@@ -446,16 +446,16 @@ fn emit_incoming(
     let Some((conversation, message)) = row_and_message(content, names) else {
         return;
     };
-    if known.insert(conversation.id.clone()) {
-        emit_conversation(events, conversation);
-    }
+    known.insert(conversation.id.clone());
+    emit_conversation(events, conversation);
     emit_message(events, message);
 }
 
 fn emit_content(events: &EventTx, content: &Content, names: &HashMap<String, String>) {
-    let Some((_, message)) = row_and_message(content, names) else {
+    let Some((conversation, message)) = row_and_message(content, names) else {
         return;
     };
+    emit_conversation(events, conversation);
     emit_message(events, message);
 }
 
@@ -516,7 +516,7 @@ fn row_and_message(
         participant: conversation_id,
         preview: message.body.clone(),
         unread: u32::from(!message.outbound),
-        order: 0,
+        order: message.sent_at,
         last_at: message.sent_at,
         is_group,
         writable: true,
@@ -717,6 +717,39 @@ mod tests {
             events.get(1),
             Some(AdapterEvent::MessageReceived { message })
                 if message.conversation_id == id && message.body == "in the group"
+        ));
+    }
+
+    #[test]
+    fn a_known_thread_refreshes_the_row_before_the_message() {
+        let contact = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+        let content = envelope(
+            contact,
+            DataMessage {
+                body: Some("second line".into()),
+                ..Default::default()
+            },
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut known = HashSet::new();
+        known.insert(contact.to_string());
+        emit_incoming(&tx, &content, &HashMap::new(), &mut known);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(matches!(
+            events.first(),
+            Some(AdapterEvent::ConversationUpsert { conversation })
+                if conversation.id == contact.to_string()
+                    && conversation.preview == "second line"
+                    && conversation.last_at == conversation.order
+                    && conversation.order > 0
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(AdapterEvent::MessageReceived { message })
+                if message.body == "second line"
         ));
     }
 }
