@@ -299,6 +299,14 @@ pub struct AccountRow {
     pub linked: bool,
 }
 
+/// Why `sync_focused_row` runs. A search change or a key move always scrolls.
+/// A list change scrolls only when the highlight's visible index changes.
+enum FocusFollow {
+    Query,
+    List,
+    Moved,
+}
+
 /// App state. `Debug` is manual: it prints no secret and no user text.
 pub struct Snapshot {
     pub accounts: Vec<AccountRow>,
@@ -306,6 +314,8 @@ pub struct Snapshot {
     messages: HashMap<(ProtocolId, String), Vec<ChatMessage>>,
     pub selected_protocol: ProtocolId,
     pub selected_conversation: Option<String>,
+    /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
+    pub focused_row: Option<String>,
     pub filter: InboxFilter,
     pub search: String,
     pub auth: AuthScreen,
@@ -347,6 +357,9 @@ pub struct Snapshot {
     /// `OLDER_RETRY_DELAY` (#61 review).
     older_retry: HashMap<String, (String, Instant)>,
     scroll_to_selected: bool,
+    scroll_to_focused: bool,
+    /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
+    seen_visible_ids: Vec<String>,
     /// Unsent compose text per chat. `compose` holds the selected chat's draft.
     drafts: HashMap<String, String>,
     focus_compose: bool,
@@ -437,6 +450,7 @@ impl Snapshot {
             messages: HashMap::new(),
             selected_protocol: ProtocolId::Telegram,
             selected_conversation: None,
+            focused_row: None,
             filter: InboxFilter::All,
             search: String::new(),
             auth: AuthScreen::Idle,
@@ -464,6 +478,8 @@ impl Snapshot {
             older_at_start: HashSet::new(),
             older_retry: HashMap::new(),
             scroll_to_selected: false,
+            scroll_to_focused: false,
+            seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
             focus_compose: false,
             stopped: HashSet::new(),
@@ -542,23 +558,26 @@ impl Snapshot {
                 let selected = (self.selected_protocol == protocol)
                     .then(|| self.selected_conversation.clone())
                     .flatten();
-                let list = self.conversations.entry(protocol).or_default();
-                let before = selected
-                    .as_ref()
-                    .and_then(|id| list.iter().position(|row| row.id == *id));
-                if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
-                    *existing = conversation;
-                } else {
-                    list.push(conversation);
-                }
-                sort_conversations(list);
-                let after = selected
-                    .as_ref()
-                    .and_then(|id| list.iter().position(|row| row.id == *id));
-                if before.is_some() && before != after {
-                    self.scroll_to_selected = true;
+                {
+                    let list = self.conversations.entry(protocol).or_default();
+                    let before = selected
+                        .as_ref()
+                        .and_then(|id| list.iter().position(|row| row.id == *id));
+                    if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
+                        *existing = conversation;
+                    } else {
+                        list.push(conversation);
+                    }
+                    sort_conversations(list);
+                    let after = selected
+                        .as_ref()
+                        .and_then(|id| list.iter().position(|row| row.id == *id));
+                    if before.is_some() && before != after {
+                        self.scroll_to_selected = true;
+                    }
                 }
                 self.ensure_conversation_selection();
+                self.sync_focused_row(FocusFollow::List);
             }
             AdapterEvent::MessageDelivery {
                 protocol,
@@ -790,14 +809,48 @@ impl Snapshot {
             return;
         }
         self.selected_protocol = protocol;
+        self.focused_row = None;
         self.set_selected_conversation(None);
         self.ensure_conversation_selection();
     }
 
     pub fn select_conversation(&mut self, id: String) {
+        self.focused_row = Some(id.clone());
         self.set_selected_conversation(Some(id));
         self.focus_compose = true;
         self.queue_open_chat();
+    }
+
+    /// Move the keyboard highlight among the visible inbox rows.
+    /// The open chat, its draft, and its messages stay as they are.
+    pub fn move_inbox_selection(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        let ids: Vec<String> = self
+            .visible_conversations()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let current = self
+            .focused_row
+            .as_deref()
+            .or(self.selected_conversation.as_deref())
+            .and_then(|id| ids.iter().position(|row| row == id));
+        let next = match current {
+            Some(index) => (index as i32 + delta).clamp(0, ids.len() as i32 - 1) as usize,
+            None if delta < 0 => ids.len() - 1,
+            None => 0,
+        };
+        let id = ids[next].clone();
+        if self.focused_row.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        self.focused_row = Some(id);
+        self.sync_focused_row(FocusFollow::Moved);
     }
 
     /// Change the selected chat. The compose text stays with the chat it was typed in.
@@ -916,6 +969,9 @@ impl Snapshot {
     }
 
     pub fn set_filter(&mut self, filter: InboxFilter) {
+        if self.filter == filter {
+            return;
+        }
         self.filter = filter;
         if !filter.matches(self.selected_protocol)
             && let Some(first) = self
@@ -928,6 +984,16 @@ impl Snapshot {
         {
             self.select_protocol(first);
         }
+        self.sync_focused_row(FocusFollow::List);
+    }
+
+    /// New inbox search. A highlight that the query hides is cleared.
+    pub fn set_search(&mut self, text: String) {
+        if self.search == text {
+            return;
+        }
+        self.search = text;
+        self.sync_focused_row(FocusFollow::Query);
     }
 
     /// Discord inbox chrome when feature `discord-bot` is compiled.
@@ -1118,6 +1184,16 @@ impl Snapshot {
 
     pub fn take_scroll_to_selected(&mut self) -> bool {
         std::mem::take(&mut self.scroll_to_selected)
+    }
+
+    /// True once after the keyboard highlight moves. The inbox scrolls that row into view.
+    #[must_use]
+    pub const fn wants_scroll_to_focused(&self) -> bool {
+        self.scroll_to_focused
+    }
+
+    pub fn take_scroll_to_focused(&mut self) -> bool {
+        std::mem::take(&mut self.scroll_to_focused)
     }
 
     pub fn selected_messages(&self) -> &[ChatMessage] {
@@ -1694,6 +1770,58 @@ impl Snapshot {
             self.selected_conversation = None;
             self.ensure_conversation_selection();
         }
+        self.sync_focused_row(FocusFollow::List);
+    }
+
+    /// Keep the highlight on a visible row.
+    ///
+    /// Set `scroll_to_focused` when the highlight moves by key, when the search
+    /// text changes, or when the highlight's visible index changes.
+    fn sync_focused_row(&mut self, reason: FocusFollow) {
+        let ids = self.visible_ids();
+        let kept = self
+            .focused_row
+            .as_ref()
+            .is_some_and(|id| ids.iter().any(|row| row == id));
+        if !kept {
+            self.focused_row = None;
+        } else if self.highlight_needs_scroll(reason, &ids) {
+            self.scroll_to_focused = true;
+        }
+        self.seen_visible_ids = ids;
+    }
+
+    fn highlight_needs_scroll(&self, reason: FocusFollow, ids: &[String]) -> bool {
+        match reason {
+            FocusFollow::Query | FocusFollow::Moved => true,
+            FocusFollow::List => self.highlight_index_changed(ids),
+        }
+    }
+
+    fn highlight_index_changed(&self, ids: &[String]) -> bool {
+        let Some(id) = self.focused_row.as_deref() else {
+            return false;
+        };
+        let old = self.seen_visible_ids.iter().position(|row| row == id);
+        let new = ids.iter().position(|row| row == id);
+        old.is_some() && new.is_some() && old != new
+    }
+
+    fn visible_ids(&self) -> Vec<String> {
+        self.visible_conversations()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
+    /// The highlight, when it is one of the rows on screen. Enter uses this.
+    #[must_use]
+    pub fn visible_focused_row(&self) -> Option<String> {
+        let id = self.focused_row.clone()?;
+        self.visible_conversations()
+            .iter()
+            .any(|row| row.id == id)
+            .then_some(id)
     }
 
     fn delivery_of(
@@ -2272,6 +2400,118 @@ mod tests {
         assert!(!snapshot.take_scroll_to_selected(), "one request per move");
     }
 
+    #[test]
+    fn a_resort_scrolls_the_highlighted_row_only_when_it_moves() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, &store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 10),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 5),
+        });
+        snapshot.move_inbox_selection(1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert!(snapshot.take_scroll_to_focused());
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 11),
+        });
+        assert!(
+            !snapshot.wants_scroll_to_focused(),
+            "the highlighted row did not move"
+        );
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(3, "Cy", 7),
+        });
+        assert!(snapshot.take_scroll_to_focused());
+        assert!(!snapshot.wants_scroll_to_focused(), "one request per move");
+    }
+
+    #[test]
+    fn a_search_scrolls_the_highlight_when_its_visible_place_changes() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, &store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 30),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 20),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(3, "Cara", 10),
+        });
+        snapshot.set_search("a".into());
+        snapshot.move_inbox_selection(1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:3"));
+        assert_eq!(visible_place(&snapshot, "telegram:3"), Some(1));
+        assert!(snapshot.take_scroll_to_focused());
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bea", 20),
+        });
+        assert_eq!(
+            visible_place(&snapshot, "telegram:3"),
+            Some(2),
+            "Bea joins the filtered list above Cara"
+        );
+        assert!(snapshot.take_scroll_to_focused());
+    }
+
+    #[test]
+    fn a_highlight_scrolls_only_when_its_place_changes() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        complete_telegram(&mut snapshot, &store);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 30),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 20),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(3, "Cara", 10),
+        });
+        snapshot.move_inbox_selection(-1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
+        assert!(snapshot.take_scroll_to_focused());
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(4, "Dee", 1),
+        });
+        assert!(
+            !snapshot.wants_scroll_to_focused(),
+            "a row below the highlight does not scroll"
+        );
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 5),
+        });
+        assert!(
+            snapshot.take_scroll_to_focused(),
+            "a resort that moves the highlight scrolls"
+        );
+
+        snapshot.set_search("Ada".into());
+        assert!(snapshot.take_scroll_to_focused());
+        snapshot.set_search(String::new());
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
+        assert!(
+            snapshot.take_scroll_to_focused(),
+            "clearing a search scrolls the highlight"
+        );
+    }
+
+    fn visible_place(snapshot: &Snapshot, id: &str) -> Option<usize> {
+        snapshot
+            .visible_conversations()
+            .iter()
+            .position(|row| row.id == id)
+    }
+
     fn outgoing(chat: i64, id: i64, body: &str, delivery: Delivery) -> ChatMessage {
         ChatMessage {
             protocol: ProtocolId::Telegram,
@@ -2501,6 +2741,88 @@ mod tests {
         );
         assert!(send_texts(&mut snapshot).is_empty());
         assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn arrow_moves_the_inbox_and_enter_opens_the_chat() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        snapshot.compose = "draft for Ada".into();
+        snapshot.move_inbox_selection(1);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1"),
+            "an arrow does not replace the open chat"
+        );
+        assert_eq!(snapshot.compose, "draft for Ada");
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert!(snapshot.take_scroll_to_focused());
+        assert!(!snapshot.wants_focus_compose());
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "an arrow does not open the chat"
+        );
+        snapshot.move_inbox_selection(1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert!(
+            !snapshot.wants_scroll_to_focused(),
+            "the last row does not request another scroll"
+        );
+        snapshot.move_inbox_selection(-1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
+        assert!(snapshot.take_scroll_to_focused());
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        snapshot.select_conversation("telegram:2".into());
+        assert!(snapshot.take_focus_compose());
+        assert!(
+            snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::OpenChat { .. })),
+            "Enter opens the highlighted chat"
+        );
+    }
+
+    #[test]
+    fn a_hidden_highlight_is_cleared_and_enter_opens_nothing() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.move_inbox_selection(1);
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        snapshot.set_search("Ada".into());
+        assert!(
+            snapshot.focused_row.is_none(),
+            "the hidden row is not highlighted"
+        );
+        assert!(snapshot.visible_focused_row().is_none());
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        assert!(snapshot.take_commands().is_empty());
+
+        snapshot.set_search(String::new());
+        snapshot.move_inbox_selection(1);
+        snapshot.set_search("Bob".into());
+        assert_eq!(
+            snapshot.visible_focused_row().as_deref(),
+            Some("telegram:2"),
+            "a row that still matches stays highlighted"
+        );
+
+        snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Telegram,
+            id: "telegram:2".into(),
+        });
+        assert!(snapshot.focused_row.is_none());
+        assert!(snapshot.visible_focused_row().is_none());
     }
 
     #[test]

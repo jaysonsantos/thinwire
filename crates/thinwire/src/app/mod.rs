@@ -1,6 +1,8 @@
 //! eframe application: draws the core view and sends user intents to the core.
 
 mod auth;
+#[cfg(test)]
+mod inbox_keys;
 mod theme;
 mod theme_mode;
 mod thread_layout;
@@ -258,6 +260,9 @@ impl eframe::App for ThinwireApp {
         }
         if hints.used_scroll_to_selected() {
             self.core.take_scroll_to_selected();
+        }
+        if hints.used_scroll_to_focused() {
+            self.core.take_scroll_to_focused();
         }
         for intent in self.intents.drain(..) {
             self.core.dispatch(intent);

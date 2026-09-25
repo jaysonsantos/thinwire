@@ -18,6 +18,9 @@ pub enum Intent {
     SelectProtocol(ProtocolId),
     /// Open a chat of the selected protocol and load its recent messages.
     SelectConversation { id: String },
+    /// Move the inbox highlight by `delta` rows. Down is positive.
+    /// This does not open the chat and does not focus the compose field.
+    MoveInbox { delta: i32 },
     /// Limit the inbox to one protocol tab, or show All.
     SetFilter(InboxFilter),
     /// Inbox search text. Matches chat title and participant only.

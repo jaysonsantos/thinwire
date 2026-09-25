@@ -56,8 +56,10 @@ const NEXT_RUN_GAP: f32 = 10.0;
 pub(crate) struct Hints {
     focus_compose: bool,
     scroll_to_selected: bool,
+    scroll_to_focused: bool,
     used_focus_compose: bool,
     used_scroll_to_selected: bool,
+    used_scroll_to_focused: bool,
 }
 
 impl Hints {
@@ -66,6 +68,7 @@ impl Hints {
         Self {
             focus_compose: view.wants_focus_compose(),
             scroll_to_selected: view.wants_scroll_to_selected(),
+            scroll_to_focused: view.wants_scroll_to_focused(),
             ..Self::default()
         }
     }
@@ -90,6 +93,17 @@ impl Hints {
     /// The scroll hint was used this frame. The app clears it in the core.
     pub(crate) const fn used_scroll_to_selected(self) -> bool {
         self.used_scroll_to_selected
+    }
+
+    /// Call only where the inbox rows draw.
+    pub(crate) fn take_scroll_to_focused(&mut self) -> bool {
+        self.used_scroll_to_focused = self.scroll_to_focused;
+        self.scroll_to_focused
+    }
+
+    /// The keyboard-highlight scroll hint was used this frame.
+    pub(crate) const fn used_scroll_to_focused(self) -> bool {
+        self.used_scroll_to_focused
     }
 }
 
@@ -370,10 +384,11 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
             ui.add_space(space::S);
             section_header(ui, "Inbox");
             ui.separator();
+            let inbox_list_id = ui.make_persistent_id("inbox");
             egui::ScrollArea::vertical()
                 .id_salt("inbox")
                 .auto_shrink([false, false])
-                .show(ui, |ui| inbox(ui, snapshot, hints, out));
+                .show(ui, |ui| inbox(ui, snapshot, hints, inbox_list_id, out));
         });
 }
 
@@ -476,7 +491,13 @@ fn show_no_chats(snapshot: &Snapshot) -> bool {
     snapshot.telegram_ready() || snapshot.selected_protocol != ProtocolId::Telegram
 }
 
-fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
+fn inbox(
+    ui: &mut egui::Ui,
+    snapshot: &View<'_>,
+    hints: &mut Hints,
+    inbox_list_id: egui::Id,
+    out: &mut Vec<Intent>,
+) {
     let now = Local::now();
     let rows: Vec<(String, String, String, u32, String)> = snapshot
         .visible_conversations()
@@ -519,11 +540,33 @@ fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Ve
     }
 
     let scroll_to_selected = hints.take_scroll_to_selected();
+    let scroll_to_focused = hints.take_scroll_to_focused();
+    let keyboard = snapshot.focused_row.is_some();
     let mut clicked: Option<String> = None;
     for (id, title, preview, unread, time) in rows {
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
+        let focused = snapshot.focused_row.as_deref() == Some(id.as_str());
         let response = inbox_row(ui, &id, &title, &preview, &time, unread, selected);
+        if focused {
+            ui.painter().rect_stroke(
+                response.rect,
+                egui::CornerRadius::same(radius::CONTROL),
+                egui::Stroke::new(2.0, theme::palette(ui).text),
+                egui::StrokeKind::Inside,
+            );
+        }
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                true,
+                if keyboard { focused } else { selected },
+                &title,
+            )
+        });
         if selected && scroll_to_selected {
+            response.scroll_to_me(None);
+        }
+        if focused && scroll_to_focused {
             response.scroll_to_me(None);
         }
         if response.clicked() {
@@ -531,6 +574,52 @@ fn inbox(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Ve
         }
     }
     if let Some(id) = clicked {
+        out.push(Intent::SelectConversation { id });
+    }
+    inbox_keys(ui, snapshot, inbox_list_id, out);
+}
+
+/// Arrow keys move the highlight. Enter opens that chat.
+/// Keys apply when nothing has keyboard focus, or the inbox list has it.
+/// A thread control such as Retry keeps Enter. Login keeps Enter.
+fn inbox_keys(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    inbox_list_id: egui::Id,
+    out: &mut Vec<Intent>,
+) {
+    if snapshot.inbox_state() != InboxState::Rows {
+        return;
+    }
+    if snapshot.center_view() != CenterView::Thread {
+        return;
+    }
+    let row_ids: Vec<egui::Id> = snapshot
+        .visible_conversations()
+        .iter()
+        .map(|row| ui.id().with(("inbox-row", &row.id)))
+        .collect();
+    let keys_here = ui.ctx().memory(|m| m.focused()).is_none()
+        || ui.ctx().memory(|memory| {
+            memory
+                .focused()
+                .is_some_and(|id| id == inbox_list_id || row_ids.contains(&id))
+        });
+    if !keys_here {
+        return;
+    }
+    let (up, down, enter) = ui.input(|input| {
+        (
+            input.key_pressed(egui::Key::ArrowUp),
+            input.key_pressed(egui::Key::ArrowDown),
+            input.key_pressed(egui::Key::Enter),
+        )
+    });
+    if up {
+        out.push(Intent::MoveInbox { delta: -1 });
+    } else if down {
+        out.push(Intent::MoveInbox { delta: 1 });
+    } else if enter && let Some(id) = snapshot.visible_focused_row() {
         out.push(Intent::SelectConversation { id });
     }
 }

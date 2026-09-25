@@ -192,8 +192,9 @@ impl Core {
         match intent {
             Intent::SelectProtocol(protocol) => self.state.select_protocol(protocol),
             Intent::SelectConversation { id } => self.state.select_conversation(id),
+            Intent::MoveInbox { delta } => self.state.move_inbox_selection(delta),
             Intent::SetFilter(filter) => self.state.set_filter(filter),
-            Intent::SetSearch(text) => self.state.search = text.into_inner(),
+            Intent::SetSearch(text) => self.state.set_search(text.into_inner()),
             Intent::Refresh => self.state.refresh_visible(),
             Intent::DismissError => self.state.error = None,
             Intent::Key(key) => self.state.center_key(key, &self.secrets),
@@ -255,6 +256,11 @@ impl Core {
     /// Frontend thread only. See [`Core`] "Threads".
     pub fn take_scroll_to_selected(&mut self) -> bool {
         self.state.take_scroll_to_selected()
+    }
+
+    /// The keyboard highlight moved; scroll that row into view, once.
+    pub fn take_scroll_to_focused(&mut self) -> bool {
+        self.state.take_scroll_to_focused()
     }
 
     /// Start a keychain flush of the persistent keys on the runtime. The
