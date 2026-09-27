@@ -55,7 +55,7 @@ pub use telegram::{
     TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,
     resolve_telegram_api, telegram_api_available,
 };
-pub use whatsapp::{WhatsAppAdapter, WhatsAppPhoneVault};
+pub use whatsapp::{WhatsAppAdapter, WhatsAppPhoneVault, parse_whatsapp_chat_id};
 
 /// Shell protocols in display order. Signal is local-only and hidden unless `signal-local` is on.
 pub fn catalog() -> [ProtocolCapabilities; 5] {

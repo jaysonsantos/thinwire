@@ -20,6 +20,7 @@ pub(crate) const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     official_api: true,
     allows_user_account_automation: false,
     sends_text: true,
+    pages_history: false,
 };
 
 /// Worker-side fake. Deliberately has no egui/eframe imports.

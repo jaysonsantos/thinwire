@@ -19,6 +19,8 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     official_api: false,
     allows_user_account_automation: false,
     sends_text: true,
+    // The Signal adapter answers LoadOlderMessages (ADR 0010 rule 10).
+    pages_history: true,
 };
 
 const FEATURE_OFF: &str = "signal-local is off in this build. No Signal session is started.";
