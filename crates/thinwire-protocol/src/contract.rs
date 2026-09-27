@@ -83,6 +83,12 @@ impl Contract {
         self
     }
 
+    /// The adapter's event channel. A test that drives a fake client (for
+    /// example WhatsApp link events) sends its events here.
+    pub(crate) fn events(&self) -> EventTx {
+        self.tx.clone()
+    }
+
     /// Send one command the way the host does.
     pub(crate) fn send(&mut self, command: AdapterCommand) {
         if let AdapterCommand::WhatsAppBeginLink { generation } = &command {

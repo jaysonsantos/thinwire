@@ -427,15 +427,15 @@ pub struct Snapshot {
     /// Protocols the shell shows even with their feature off: the demo
     /// adapters (#120), and tests of the shell with more than Telegram.
     pub(crate) extra_visible: HashSet<ProtocolId>,
-    /// Telegram chats with a request for older messages in flight (#30).
-    /// One request at a time for each chat.
-    older_loading: HashSet<String>,
-    /// Telegram chats whose start is loaded. No more older requests (#30).
-    older_at_start: HashSet<String>,
-    /// Telegram chats whose last older request brought nothing older: the
-    /// anchor it used and when it ended. That anchor waits
-    /// `OLDER_RETRY_DELAY` (#61 review).
-    older_retry: HashMap<String, (String, Instant, u32)>,
+    /// Chats with a request for older messages in flight (#30), keyed by
+    /// protocol and chat. One request at a time for each chat.
+    older_loading: HashSet<(ProtocolId, String)>,
+    /// Chats whose start is loaded. No more older requests (#30).
+    older_at_start: HashSet<(ProtocolId, String)>,
+    /// Chats whose last older request brought nothing older: the anchor it
+    /// used and when it ended. That anchor waits `OLDER_RETRY_DELAY` (#61
+    /// review).
+    older_retry: HashMap<(ProtocolId, String), (String, Instant, u32)>,
     scroll_to_selected: bool,
     scroll_to_focused: bool,
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
@@ -753,28 +753,27 @@ impl Snapshot {
                 more,
                 ..
             } => {
-                if matches!(protocol, ProtocolId::Telegram | ProtocolId::Signal) {
-                    self.older_loading.remove(&conversation_id);
-                    let oldest = self
-                        .messages
-                        .get(&(protocol, conversation_id.clone()))
-                        .and_then(|list| list.first())
-                        .map(|row| row.id.as_str());
-                    if !more {
-                        self.older_retry.remove(&conversation_id);
-                        self.older_at_start.insert(conversation_id);
-                    } else if oldest == Some(before_message_id.as_str()) {
-                        // Nothing older came: do not ask this anchor at once.
-                        // A repeat on the same anchor waits longer (#67).
-                        let tries = match self.older_retry.get(&conversation_id) {
-                            Some((anchor, _, tries)) if *anchor == before_message_id => tries + 1,
-                            _ => 1,
-                        };
-                        self.older_retry
-                            .insert(conversation_id, (before_message_id, Instant::now(), tries));
-                    } else {
-                        self.older_retry.remove(&conversation_id);
-                    }
+                let key = (protocol, conversation_id);
+                self.older_loading.remove(&key);
+                let oldest = self
+                    .messages
+                    .get(&key)
+                    .and_then(|list| list.first())
+                    .map(|row| row.id.as_str());
+                if !more {
+                    self.older_retry.remove(&key);
+                    self.older_at_start.insert(key);
+                } else if oldest == Some(before_message_id.as_str()) {
+                    // Nothing older came: do not ask this anchor at once.
+                    // A repeat on the same anchor waits longer (#67).
+                    let tries = match self.older_retry.get(&key) {
+                        Some((anchor, _, tries)) if *anchor == before_message_id => tries + 1,
+                        _ => 1,
+                    };
+                    self.older_retry
+                        .insert(key, (before_message_id, Instant::now(), tries));
+                } else {
+                    self.older_retry.remove(&key);
                 }
             }
             AdapterEvent::ChatListLoaded { protocol } => {
@@ -1257,12 +1256,18 @@ impl Snapshot {
             .unwrap_or(0)
     }
 
-    /// Telegram after Ready, and Signal after the account is linked.
+    /// The selected protocol pages its history (`pages_history`, ADR 0010
+    /// rule 10) and its account is linked. Telegram also needs its TDLib
+    /// session (Ready).
     fn pages_older(&self) -> bool {
-        match self.selected_protocol {
-            ProtocolId::Telegram => self.telegram_authorized,
-            ProtocolId::Signal => self.protocol_linked(ProtocolId::Signal),
-            _ => false,
+        let protocol = self.selected_protocol;
+        let pages = self
+            .accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.caps.pages_history);
+        match protocol {
+            ProtocolId::Telegram => pages && self.telegram_authorized,
+            _ => pages && self.protocol_linked(protocol),
         }
     }
 
@@ -1331,7 +1336,13 @@ impl Snapshot {
             .any(|(owner, _)| *owner == protocol)
         {
             Some(LOADING_MESSAGES_STATUS)
-        } else if protocol == ProtocolId::Telegram && !self.older_loading.is_empty() {
+        } else if self
+            .older_loading
+            .iter()
+            .any(|(owner, _)| *owner == protocol)
+        {
+            // F1 (#82): older pages of this protocol only, keyed by
+            // (protocol, chat) like `history_loading`.
             Some(LOADING_OLDER_STATUS)
         } else if self.sends.any_for(protocol) {
             Some(SENDING_STATUS)
@@ -1387,9 +1398,10 @@ impl Snapshot {
         if !self.pages_older() {
             return OlderState::Idle;
         }
-        if self.older_loading.contains(id) {
+        let key = (self.selected_protocol, id.clone());
+        if self.older_loading.contains(&key) {
             OlderState::Loading
-        } else if self.older_at_start.contains(id) {
+        } else if self.older_at_start.contains(&key) {
             OlderState::StartOfChat
         } else {
             OlderState::Idle
@@ -1397,9 +1409,8 @@ impl Snapshot {
     }
 
     /// Ask for the page before the oldest loaded message of the selected
-    /// chat. Telegram and a linked Signal account answer `LoadOlderMessages`.
-    /// Nothing goes out while a request runs, the first page loads, or the
-    /// start is loaded.
+    /// chat, for a protocol with `pages_history`. Nothing goes out
+    /// while a request runs, the first page loads, or the start is loaded.
     pub(crate) fn load_older(&mut self) {
         self.load_older_at(Instant::now());
     }
@@ -1411,7 +1422,7 @@ impl Snapshot {
             return;
         };
         let protocol = self.selected_protocol;
-        self.older_loading.insert(id.clone());
+        self.older_loading.insert((protocol, id.clone()));
         self.pending.push(AdapterCommand::LoadOlderMessages {
             protocol,
             conversation_id: id,
@@ -1436,14 +1447,15 @@ impl Snapshot {
         }
         let protocol = self.selected_protocol;
         let id = self.selected_conversation.clone()?;
-        if self.history_loading.contains(&(protocol, id.clone()))
-            || self.older_loading.contains(&id)
-            || self.older_at_start.contains(&id)
+        let key = (protocol, id.clone());
+        if self.history_loading.contains(&key)
+            || self.older_loading.contains(&key)
+            || self.older_at_start.contains(&key)
         {
             return None;
         }
         let oldest = self.selected_messages().first()?.id.clone();
-        if let Some((anchor, at, tries)) = self.older_retry.get(&id)
+        if let Some((anchor, at, tries)) = self.older_retry.get(&key)
             && *anchor == oldest
             && now.saturating_duration_since(*at) < older_wait(*tries)
         {
@@ -2380,11 +2392,9 @@ impl Snapshot {
         self.chat_list_loading.remove(&protocol);
         self.notices.remove(&protocol);
         self.sends.drop_protocol(protocol);
-        if protocol == ProtocolId::Telegram {
-            self.older_loading.clear();
-            self.older_at_start.clear();
-            self.older_retry.clear();
-        }
+        self.older_loading.retain(|(owner, _)| *owner != protocol);
+        self.older_at_start.retain(|(owner, _)| *owner != protocol);
+        self.older_retry.retain(|(owner, _), _| *owner != protocol);
         #[cfg(feature = "whatsapp-web")]
         if protocol == ProtocolId::WhatsApp {
             self.end_pairing();
@@ -2418,21 +2428,17 @@ impl Snapshot {
     }
 
     /// Stop the loading spinners of one protocol: one chat, or all of them.
-    /// Older-message paging is Telegram-only today (#61).
     fn stop_spinners(&mut self, protocol: ProtocolId, chat: Option<&str>) {
         match chat {
             Some(chat) => {
-                self.history_loading.remove(&(protocol, chat.to_owned()));
-                if protocol == ProtocolId::Telegram {
-                    self.older_loading.remove(chat);
-                }
+                let key = (protocol, chat.to_owned());
+                self.history_loading.remove(&key);
+                self.older_loading.remove(&key);
             }
             None => {
                 self.chat_list_loading.remove(&protocol);
                 self.history_loading.retain(|(owner, _)| *owner != protocol);
-                if protocol == ProtocolId::Telegram {
-                    self.older_loading.clear();
-                }
+                self.older_loading.retain(|(owner, _)| *owner != protocol);
             }
         }
     }
@@ -2446,11 +2452,10 @@ impl Snapshot {
         // Every removed chat loses its draft, selected or not (#43).
         self.drafts.remove(&(protocol, id.to_owned()));
         self.drop_rejected_body(protocol, id);
-        if protocol == ProtocolId::Telegram {
-            self.older_loading.remove(id);
-            self.older_at_start.remove(id);
-            self.older_retry.remove(id);
-        }
+        let key = (protocol, id.to_owned());
+        self.older_loading.remove(&key);
+        self.older_at_start.remove(&key);
+        self.older_retry.remove(&key);
         if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
             self.compose.clear();
             self.selected_conversation = None;
@@ -2562,9 +2567,13 @@ impl Snapshot {
                 .entry((message.protocol, message.conversation_id.clone()))
                 .or_insert_with(|| message.body.clone());
         }
+        let why = format!(
+            "{} did not accept the message.",
+            message.protocol.display_name()
+        );
         self.set_error(
             "Message not sent.",
-            "Telegram did not accept the message.",
+            &why,
             "Press Retry on the message, or edit the text and send it again.",
         );
     }
@@ -3581,7 +3590,11 @@ mod tests {
             protocol: ProtocolId::Telegram,
             id: "telegram:1".into(),
         });
-        assert!(!snapshot.older_at_start.contains("telegram:1"));
+        assert!(
+            !snapshot
+                .older_at_start
+                .contains(&(ProtocolId::Telegram, "telegram:1".to_owned()))
+        );
     }
 
     fn send_texts(snapshot: &mut Snapshot) -> Vec<String> {
@@ -6006,6 +6019,116 @@ mod tests {
         snapshot
     }
 
+    /// Codex r4103183195 on #53: older history pages for any linked protocol
+    /// that pages it, not only Telegram. A protocol without paging never asks.
+    #[test]
+    fn older_history_pages_any_protocol_with_pages_history() {
+        let mut snapshot = shell_with(&[ProtocolId::WhatsApp, ProtocolId::Discord]);
+        for row in &mut snapshot.accounts {
+            if row.caps.id == ProtocolId::WhatsApp {
+                row.caps.pages_history = true;
+            }
+        }
+        for (protocol, id) in [
+            (ProtocolId::WhatsApp, "whatsapp:111@s.whatsapp.net"),
+            (ProtocolId::Discord, "discord:1"),
+        ] {
+            link(&mut snapshot, protocol);
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: chat(protocol, id, true),
+            });
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: ChatMessage {
+                    protocol,
+                    conversation_id: id.into(),
+                    id: format!("{id}:m1"),
+                    sender: "Ana".into(),
+                    body: "hi".into(),
+                    outbound: false,
+                    delivery: Delivery::Sent,
+                    sent_at: 1,
+                },
+            });
+            snapshot.apply(AdapterEvent::HistoryLoaded {
+                protocol,
+                conversation_id: id.into(),
+            });
+        }
+
+        snapshot.select_protocol(ProtocolId::WhatsApp);
+        snapshot.select_conversation("whatsapp:111@s.whatsapp.net".into());
+        let _ = snapshot.take_commands();
+        assert!(snapshot.older_can_ask());
+        snapshot.load_older();
+        assert!(snapshot.take_commands().iter().any(|command| matches!(
+            command,
+            AdapterCommand::LoadOlderMessages { protocol: ProtocolId::WhatsApp, before_message_id, .. }
+                if before_message_id == "whatsapp:111@s.whatsapp.net:m1"
+        )));
+        assert_eq!(snapshot.older_state(), OlderState::Loading);
+        // The answer ends the request; the start of the chat stops asking.
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+            before_message_id: "whatsapp:111@s.whatsapp.net:m1".into(),
+            more: false,
+            note: None,
+        });
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+        assert!(!snapshot.older_can_ask());
+
+        snapshot.select_protocol(ProtocolId::Discord);
+        snapshot.select_conversation("discord:1".into());
+        let _ = snapshot.take_commands();
+        assert!(!snapshot.older_can_ask(), "Discord does not page history");
+    }
+
+    /// F1 (#82 with #53): the older-page loading line belongs to the
+    /// protocol of that page, keyed by (protocol, chat).
+    #[test]
+    fn older_loading_line_names_only_its_protocol() {
+        let mut snapshot = shell_with(&[ProtocolId::WhatsApp]);
+        snapshot
+            .older_loading
+            .insert((ProtocolId::WhatsApp, "whatsapp:1@s.whatsapp.net".into()));
+        assert_eq!(
+            snapshot.loading_line(ProtocolId::WhatsApp),
+            Some(LOADING_OLDER_STATUS)
+        );
+        assert_eq!(snapshot.loading_line(ProtocolId::Telegram), None);
+    }
+
+    /// Codex r4103183222 on #53: a failed WhatsApp send names WhatsApp.
+    #[test]
+    fn failed_delivery_names_the_protocol_of_the_message() {
+        let mut snapshot = shell_with(&[ProtocolId::WhatsApp]);
+        link(&mut snapshot, ProtocolId::WhatsApp);
+        let id = "whatsapp:111@s.whatsapp.net";
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::WhatsApp, id, true),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::WhatsApp,
+                conversation_id: id.into(),
+                id: "pending:1".into(),
+                sender: "You".into(),
+                body: "hi".into(),
+                outbound: true,
+                delivery: Delivery::Pending,
+                sent_at: 1,
+            },
+        });
+        snapshot.apply(AdapterEvent::MessageDelivery {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: id.into(),
+            message_id: "pending:1".into(),
+            delivery: Delivery::Failed,
+        });
+        let error = snapshot.error.clone().expect("error block");
+        assert_eq!(error.why, "WhatsApp did not accept the message.");
+    }
+
     fn link(snapshot: &mut Snapshot, protocol: ProtocolId) {
         snapshot.apply(AdapterEvent::Account {
             protocol,
@@ -7286,7 +7409,9 @@ mod tests {
 
         link(&mut snapshot, ProtocolId::Slack);
         snapshot.chat_list_loading.insert(ProtocolId::Slack);
-        snapshot.older_loading.insert("telegram:1".into());
+        snapshot
+            .older_loading
+            .insert((ProtocolId::Telegram, "telegram:1".into()));
         assert_eq!(
             snapshot.status_line(),
             LOADING_OLDER_STATUS,
