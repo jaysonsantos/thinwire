@@ -379,10 +379,47 @@ fn a_group_run_names_the_sender_on_every_message() {
                 let Some(label) = node.label() else {
                     return false;
                 };
-                label.contains("Nora") && label.contains(&body)
+                !node.is_hidden() && label.contains("Nora") && label.contains(&body)
             }
         }));
+        let painted = harness.get_by_role_and_label(egui::accesskit::Role::Label, body);
+        assert!(
+            painted.accesskit_node().is_hidden(),
+            "the painted body stays out of the screen reader tree"
+        );
     }
+}
+
+#[test]
+fn a_bubble_names_the_message_once() {
+    let body = "Hello from the only name on this bubble";
+    let mut state = InboxUi::ready();
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: chat_message("telegram:1:once", body, 1_790_300_000),
+    });
+    let mut harness = harness(state);
+    harness.run();
+    let announced = harness
+        .query_all(By::new().predicate({
+            let body = body.to_owned();
+            move |node| !node.is_hidden() && node_text_eq(node, &body)
+        }))
+        .count();
+    assert_eq!(announced, 1, "a screen reader reads the message once");
+    let painted = harness.get_by_role_and_label(egui::accesskit::Role::Label, body);
+    assert!(
+        painted.accesskit_node().is_hidden(),
+        "the painted body stays out of the screen reader tree"
+    );
+}
+
+fn node_text_eq(node: &egui_kittest::kittest::AccessKitNode<'_>, body: &str) -> bool {
+    let text = if node.role() == egui::accesskit::Role::Label {
+        node.value()
+    } else {
+        node.label()
+    };
+    text.as_deref() == Some(body)
 }
 
 #[test]
