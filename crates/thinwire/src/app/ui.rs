@@ -1322,8 +1322,9 @@ fn bubble(
             palette.text3,
         )
     };
+    let mut body_galley = None;
     ui.with_layout(egui::Layout::top_down(align), |ui| {
-        egui::Frame::new()
+        let frame = egui::Frame::new()
             .fill(fill)
             .corner_radius(bubble_radius(message.outbound, message.layout.run_end))
             .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
@@ -1332,7 +1333,10 @@ fn bubble(
                 let meta_width = meta_column_width(ui, &message.layout.time, message.delivery);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     if message.layout.show_sender {
-                        ui.label(RichText::new(&message.sender).small().color(palette.text));
+                        let response =
+                            ui.label(RichText::new(&message.sender).small().color(palette.text));
+                        // The pane name already includes the sender.
+                        hide_from_accesskit(ui, response.id);
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         let gap = ui.spacing().item_spacing.x;
@@ -1340,16 +1344,23 @@ fn bubble(
                         let body_rect = ui
                             .vertical(|ui| {
                                 ui.set_max_width(text_width);
-                                let response = ui.add(
+                                let (galley_pos, galley, response) =
                                     egui::Label::new(RichText::new(&message.body).color(body))
                                         .selectable(true)
                                         .wrap()
-                                        .halign(egui::Align::LEFT),
-                                );
-                                // The pane already names this text.
-                                ui.ctx().accesskit_node_builder(response.id, |node| {
-                                    node.set_hidden();
+                                        .halign(egui::Align::LEFT)
+                                        .layout_in_ui(ui);
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Label,
+                                        ui.is_enabled(),
+                                        galley.text(),
+                                    )
                                 });
+                                // The pane already names this text. Selection is bound
+                                // to the pane id below, with the text runs.
+                                hide_from_accesskit(ui, response.id);
+                                body_galley = Some((galley_pos, galley, response));
                             })
                             .response
                             .rect;
@@ -1384,9 +1395,13 @@ fn bubble(
                                     .layout(egui::Layout::top_down(egui::Align::Min)),
                                 |ui| {
                                     if !message.layout.time.is_empty() {
-                                        ui.label(
+                                        let response = ui.label(
                                             RichText::new(&message.layout.time).small().color(meta),
                                         );
+                                        if message.group {
+                                            // The pane name already includes the time.
+                                            hide_from_accesskit(ui, response.id);
+                                        }
                                     }
                                     match message.delivery {
                                         Delivery::Pending => {
@@ -1418,14 +1433,31 @@ fn bubble(
                     });
                 });
             })
-            .response
-            .widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Panel,
-                    true,
-                    bubble_access_label(message),
-                )
-            });
+            .response;
+        if let Some((galley_pos, galley, mut response)) = body_galley {
+            // The text runs and the selection handler share the pane id.
+            // A selection action from assistive tech targets that id.
+            response.id = frame.id;
+            egui::text_selection::LabelSelectionState::label_text_selection(
+                ui,
+                &response,
+                galley_pos,
+                galley,
+                body,
+                egui::Stroke::NONE,
+            );
+        }
+        // Restore the pane after selection, which sets a label role.
+        frame.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Panel, true, bubble_access_label(message))
+        });
+    });
+}
+
+/// Drop a painted widget from the screen-reader tree.
+fn hide_from_accesskit(ui: &egui::Ui, id: egui::Id) {
+    ui.ctx().accesskit_node_builder(id, |node| {
+        node.set_hidden();
     });
 }
 
@@ -1458,8 +1490,9 @@ fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery) -> f32 {
 /// AccessKit name of a bubble. A screen reader reads this once.
 ///
 /// A group row names the sender and the time on every message. A private
-/// row names the message. The painted body label is hidden, so it does
-/// not repeat this name. The visual sender header stays on the first row
+/// row names the message. The painted body, the group header, and a group
+/// time are hidden, so they do not repeat this name. Text runs on the pane
+/// keep partial selection. The visual sender header stays on the first row
 /// of a run.
 fn bubble_access_label(message: &Bubble) -> String {
     if message.group {
