@@ -392,7 +392,8 @@ pub struct Snapshot {
     /// finished success such as "Message sent." (#56).
     ready_status: Option<String>,
     /// The last Telegram status line that came as `Error` or `Refused`. While
-    /// `status_text` still holds it, it wins over every loading line (#90).
+    /// `status_text` still holds it, it wins over a load of another protocol.
+    /// The selected protocol's own load still shows (#90, #73).
     failure_status: Option<String>,
     pub compose: String,
     pub auth_busy: bool,
@@ -1397,10 +1398,11 @@ impl Snapshot {
         }
     }
 
-    /// The line the status strip shows (#80). While any load runs it is a
-    /// running load's line, never a finished Ready line: the selected
-    /// protocol's load first, then another visible protocol's load, named.
-    /// With no load, it is the last status line.
+    /// The line the status strip shows (#80). The selected protocol's own
+    /// load shows first. A Telegram failure that is still the last status
+    /// then wins over a load of another protocol (#90). Otherwise another
+    /// visible protocol's load is named. With no load, it is the last status
+    /// line.
     #[must_use]
     pub fn status_line(&self) -> std::borrow::Cow<'_, str> {
         self.status_source().0
@@ -1413,15 +1415,16 @@ impl Snapshot {
         self.status_source().1
     }
 
-    /// The status line, and whether it is a running load's line. A Telegram
-    /// failure that is still the last status wins over every load: a slow load
-    /// of another protocol must not hide it (#90).
+    /// The status line, and whether it is a running load's line. The selected
+    /// protocol's own load shows first, including an older page while a
+    /// Telegram failure is still the last status (#73). That failure then
+    /// wins over a load of another protocol (#90).
     fn status_source(&self) -> (std::borrow::Cow<'_, str>, bool) {
-        if self.failure_status.as_deref() == Some(self.status_text.as_str()) {
-            return (self.status_text.as_str().into(), false);
-        }
         if let Some(line) = self.loading_line(self.selected_protocol) {
             return (line.into(), true);
+        }
+        if self.failure_status.as_deref() == Some(self.status_text.as_str()) {
+            return (self.status_text.as_str().into(), false);
         }
         let other = self
             .accounts
