@@ -122,6 +122,7 @@ impl SignalDevice for FakeDevice {
             outbound: true,
             delivery: Delivery::Sent,
             sent_at: 0,
+            arrival: thinwire_protocol::Arrival::History,
         };
         self.history
             .entry(conversation_id.to_string())

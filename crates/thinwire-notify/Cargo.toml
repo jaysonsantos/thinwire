@@ -1,0 +1,31 @@
+[package]
+name = "thinwire-notify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "OS desktop notifications for thinwire, off the UI thread (#32)"
+
+# No egui here: a TUI frontend can use this crate too.
+[dependencies]
+thinwire-core.workspace = true
+tracing.workspace = true
+
+# freedesktop D-Bus through pure-Rust zbus (no libdbus). macOS uses
+# mac-notification-sys and Windows uses tauri-winrt-notification through it.
+# All MIT or Apache-2.0.
+[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
+notify-rust = { version = "4.18", default-features = false, features = ["z"] }
+
+# `CloseNotification` by id: notify-rust closes only through the handle
+# that the click waiter owns. Same zbus as the keychain; no new major.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = [
+  "async-io",
+  "blocking-api",
+] }
+
+[lints]
+workspace = true

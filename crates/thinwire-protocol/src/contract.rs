@@ -511,6 +511,7 @@ mod tests {
                 last_at: 0,
                 is_group: false,
                 writable,
+                muted: false,
                 placeholder,
             },
         }
@@ -562,6 +563,7 @@ mod tests {
                 outbound: false,
                 delivery: Delivery::Sent,
                 sent_at: 0,
+                arrival: crate::Arrival::History,
             },
         };
         let events = [
