@@ -5,6 +5,7 @@
 //! Each protocol has its own sub-enum, so protocol work does not collide on
 //! one match. Typed secrets use [`SecretText`], so `Debug` stays clean.
 
+use crate::notify::NotifyKey;
 use thinwire_protocol::ProtocolId;
 
 use crate::state::{AuthKey, InboxFilter};
@@ -64,6 +65,15 @@ pub enum Intent {
     SetTheme(ThemeMode),
     /// Close every client cleanly. The view reports when all stopped.
     Shutdown,
+    /// The app window gained or lost focus. A chat that is open in a window
+    /// without focus still notifies (#32).
+    WindowFocus(bool),
+    /// The user clicked a notification: open that chat (#32).
+    OpenFromNotification(NotifyKey),
+    /// Settings: desktop notifications on or off (#32).
+    SetNotifications(bool),
+    /// Settings: show the sender and the text in notifications (#32).
+    SetNotificationPreview(bool),
     /// Telegram login and account actions.
     Telegram(TelegramIntent),
     /// Experimental WhatsApp pairing. Only a `whatsapp-web` build acts on it.

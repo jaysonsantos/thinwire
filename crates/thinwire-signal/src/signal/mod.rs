@@ -625,6 +625,7 @@ mod tests {
             last_at: 0,
             is_group: false,
             writable: true,
+            muted: false,
             placeholder: false,
         }
     }
@@ -639,6 +640,7 @@ mod tests {
             outbound: false,
             delivery: thinwire_protocol::Delivery::Sent,
             sent_at: 0,
+            arrival: thinwire_protocol::Arrival::History,
         }
     }
 

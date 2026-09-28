@@ -16,10 +16,13 @@ mod ui_tests;
 #[cfg(feature = "whatsapp-web")]
 mod whatsapp_gate;
 
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use thinwire_core::notify::NotifyKey;
 use thinwire_core::{Core, CoreConfig, Intent};
+use thinwire_notify::Notifier;
 
 pub use theme::install as install_theme;
 pub use theme_mode::apply as apply_theme;
@@ -194,6 +197,12 @@ pub struct ThinwireApp {
     intents: Vec<Intent>,
     last_os_theme: Option<egui::Theme>,
     close_gate: CloseGate,
+    /// OS notifications on their own thread (#32).
+    notifier: Notifier,
+    /// Chats of clicked notifications. The notifier thread fills it.
+    clicks: Arc<Mutex<Vec<NotifyKey>>>,
+    last_focus: Option<bool>,
+    last_unread: Option<u32>,
 }
 
 impl ThinwireApp {
@@ -211,6 +220,13 @@ impl ThinwireApp {
         let core = Core::new(runtime.handle(), config);
         repaint_on_change(&runtime, &core, ctx.clone());
         close_on_stop_signal(runtime.handle(), ctx.clone());
+        let clicks = Arc::new(Mutex::new(Vec::new()));
+        let clicked = Arc::clone(&clicks);
+        let wake = ctx.clone();
+        let notifier = Notifier::spawn(move |key| {
+            lock(&clicked).push(key);
+            wake.request_repaint();
+        });
         Self {
             core,
             runtime: Some(runtime),
@@ -218,6 +234,34 @@ impl ThinwireApp {
             intents: Vec::new(),
             last_os_theme: None,
             close_gate: CloseGate::Open,
+            notifier,
+            clicks,
+            last_focus: None,
+            last_unread: None,
+        }
+    }
+
+    /// Window focus changes and notification clicks become intents (#32).
+    fn notification_intents(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        if self.last_focus != Some(focused) {
+            self.last_focus = Some(focused);
+            self.intents.push(Intent::WindowFocus(focused));
+        }
+        let clicked = std::mem::take(&mut *lock(&self.clicks));
+        for key in clicked {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.intents.push(Intent::OpenFromNotification(key));
+        }
+    }
+
+    /// "thinwire (3)" while unread messages wait in chats that are not
+    /// muted (#32). Sent only when the count changes.
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let unread = self.core.view().unread_total();
+        if self.last_unread != Some(unread) {
+            self.last_unread = Some(unread);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title(unread)));
         }
     }
 
@@ -238,6 +282,19 @@ impl ThinwireApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
+}
+
+/// Window title with the unread count of chats that are not muted.
+fn window_title(unread: u32) -> String {
+    if unread == 0 {
+        "thinwire".into()
+    } else {
+        format!("thinwire ({unread})")
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Repaint when the core changes, so an idle window needs no poll timer.
@@ -276,9 +333,12 @@ impl eframe::App for ThinwireApp {
         if hints.used_scroll_to_focused() {
             self.core.take_scroll_to_focused();
         }
+        self.notification_intents(ui.ctx());
         for intent in self.intents.drain(..) {
             self.core.dispatch(intent);
         }
+        self.notifier.send(self.core.take_notify());
+        self.update_title(ui.ctx());
     }
 
     /// Safety net for an exit that skipped the close gate. The window is gone,

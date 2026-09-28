@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::adapter::{AdapterEvent, ChatMessage, Conversation, Delivery, ProtocolId};
+use crate::adapter::{AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ProtocolId};
 
 /// Prefix on every WhatsApp conversation id. The rest is the chat JID.
 pub(super) const CONVERSATION_PREFIX: &str = "whatsapp:";
@@ -152,13 +152,20 @@ impl Inbox {
             let is_open = self.open.as_deref() == Some(jid.as_str());
             let record = self.chats.entry(jid.clone()).or_default();
             let known = record.messages.iter().any(|row| row.id == message.id);
+            // A repeat of a stored id is a refresh. Only the first sight of a
+            // pushed message is live, so a history replay cannot notify (#32).
+            let arrival = if known {
+                Arrival::History
+            } else {
+                Arrival::Live
+            };
             if !known && !message.from_me && !is_open {
                 record.unread = record.unread.saturating_add(1);
             }
             record.timestamp = record.timestamp.max(message.timestamp);
             insert_message(&mut record.messages, message.clone());
             events.push(AdapterEvent::MessageReceived {
-                message: self.chat_message(&message),
+                message: self.chat_message(&message, arrival),
             });
             if let Some(upsert) = self.upsert_event(&jid) {
                 events.push(upsert);
@@ -208,7 +215,7 @@ impl Inbox {
         let skip = record.messages.len().saturating_sub(OPEN_CHAT_MESSAGES);
         events.extend(record.messages.iter().skip(skip).map(|message| {
             AdapterEvent::MessageReceived {
-                message: self.chat_message(message),
+                message: self.chat_message(message, Arrival::History),
             }
         }));
         Some(events)
@@ -232,7 +239,7 @@ impl Inbox {
         let page = record.messages[start..end]
             .iter()
             .map(|message| AdapterEvent::MessageReceived {
-                message: self.chat_message(message),
+                message: self.chat_message(message, Arrival::History),
             })
             .collect();
         (page, start > 0)
@@ -285,7 +292,7 @@ impl Inbox {
         (
             pending,
             AdapterEvent::MessageReceived {
-                message: self.chat_message(&message),
+                message: self.chat_message(&message, Arrival::History),
             },
             self.upsert_event(jid),
         )
@@ -320,7 +327,7 @@ impl Inbox {
             protocol: ProtocolId::WhatsApp,
             conversation_id: conversation_id(jid),
             old_id: pending.to_string(),
-            message: self.chat_message(&message),
+            message: self.chat_message(&message, Arrival::History),
         }];
         events.extend(self.upsert_event(jid));
         events
@@ -379,6 +386,7 @@ impl Inbox {
                 is_group: is_group(jid),
                 writable: true,
                 placeholder: false,
+                muted: false,
             },
         })
     }
@@ -393,7 +401,7 @@ impl Inbox {
         fallback_label(jid)
     }
 
-    fn chat_message(&self, message: &WaMessage) -> ChatMessage {
+    fn chat_message(&self, message: &WaMessage, arrival: Arrival) -> ChatMessage {
         let sender = if message.from_me {
             OUTBOUND_SENDER.to_string()
         } else if let Some(name) = message.sender_name.as_ref().filter(|name| !name.is_empty()) {
@@ -428,6 +436,7 @@ impl Inbox {
             outbound: message.from_me,
             delivery,
             sent_at: message.timestamp,
+            arrival,
         }
     }
 }
@@ -664,6 +673,39 @@ pub(super) mod tests {
         inbox.apply_messages(vec![message(chat, "a", "one", 1)]);
         let events = inbox.apply_messages(vec![message(chat, "a", "one", 1)]);
         assert_eq!(upserts(&events)[0].unread, 1);
+    }
+
+    /// A pushed row can notify. A repeat, an opened history page, and a
+    /// pending send stay `History` (#32).
+    #[test]
+    fn a_pushed_message_is_live_and_a_replay_is_history() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let first = inbox.apply_messages(vec![message(chat, "live", "new", 100)]);
+        assert_eq!(received(&first).arrival, Arrival::Live);
+        assert!(!upserts(&first)[0].muted);
+        let again = inbox.apply_messages(vec![message(chat, "live", "new", 100)]);
+        assert_eq!(received(&again).arrival, Arrival::History);
+        let opened = inbox.open_chat(chat).expect("known chat");
+        assert!(opened.iter().all(|event| match event {
+            AdapterEvent::MessageReceived { message } => message.arrival == Arrival::History,
+            _ => true,
+        }));
+        let (_, pending, _) = inbox.begin_send(chat, "out", 101);
+        assert_eq!(
+            received(std::slice::from_ref(&pending)).arrival,
+            Arrival::History
+        );
+    }
+
+    fn received(events: &[AdapterEvent]) -> &ChatMessage {
+        events
+            .iter()
+            .find_map(|event| match event {
+                AdapterEvent::MessageReceived { message } => Some(message),
+                _ => None,
+            })
+            .expect("message")
     }
 
     #[test]

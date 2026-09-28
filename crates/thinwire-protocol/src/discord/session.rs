@@ -17,10 +17,11 @@ use super::api::{DiscordApi, DiscordApiError, MessageSummary};
 use super::inbox::{HISTORY_LIMIT, InboxChannel, chat_message, load_channels};
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
 use crate::adapter::{
-    AccountState, AdapterError, AdapterEvent, AdapterStatus, ChatMessage, Delivery, EventTx,
-    ProtocolId, emit_account, emit_chat_list_loaded, emit_command_failed, emit_conversation,
-    emit_conversation_removed, emit_history_loaded, emit_message, emit_message_delivery,
-    emit_message_replaced, emit_notice, emit_send_accepted, emit_send_rejected, emit_status,
+    AccountState, AdapterError, AdapterEvent, AdapterStatus, Arrival, ChatMessage, Delivery,
+    EventTx, ProtocolId, emit_account, emit_chat_list_loaded, emit_command_failed,
+    emit_conversation, emit_conversation_removed, emit_history_loaded, emit_message,
+    emit_message_delivery, emit_message_replaced, emit_notice, emit_send_accepted,
+    emit_send_rejected, emit_status,
 };
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
@@ -554,6 +555,7 @@ impl Session {
                         outbound: true,
                         delivery: Delivery::Pending,
                         sent_at: local_unix_seconds(),
+                        arrival: Arrival::History,
                     },
                 );
                 (body, message_id, SendRow::Pending)
