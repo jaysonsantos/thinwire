@@ -30,6 +30,8 @@ futures = { version = "0.3", optional = true, default-features = false, features
 
 [dev-dependencies]
 chrono.workspace = true
+# The adapter contract kit (ADR 0010) for the tests.
+thinwire-protocol = { workspace = true, features = ["contract-kit"] }
 
 [lints]
 workspace = true

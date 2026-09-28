@@ -68,7 +68,7 @@ impl AdapterHost {
             }
 
             while let Some(command) = command_rx.recv().await {
-                dispatch(&mut adapters, command, &event_tx);
+                let _ = dispatch(&mut adapters, command, &event_tx);
             }
         });
 
@@ -216,20 +216,22 @@ fn deliver(event: AdapterEvent, current_epoch: u64) -> Option<AdapterEvent> {
     }
 }
 
+/// Route one command to its adapter. Returns true when the adapter failed
+/// it in `handle`; the host then sends that failure as a `Status` event.
 pub(crate) fn dispatch(
     adapters: &mut [Box<dyn ProtocolAdapter>],
     command: AdapterCommand,
     events: &super::EventTx,
-) {
+) -> bool {
     let protocol = command.protocol();
     let Some(adapter) = adapters.iter_mut().find(|adapter| adapter.id() == protocol) else {
         tracing::warn!(%protocol, "no adapter registered");
-        return;
+        return false;
     };
     // Every adapter answers Shutdown, so the app can wait for all of them.
     if matches!(command, AdapterCommand::Shutdown { .. }) {
         adapter.shutdown(events);
-        return;
+        return false;
     }
     // The viewed chat is a hint to the adapter, not a request: route it to
     // the trait method, so an adapter with no read state needs no arm.
@@ -238,7 +240,7 @@ pub(crate) fn dispatch(
     } = &command
     {
         adapter.view_chat(conversation_id.as_deref(), events);
-        return;
+        return false;
     }
     let auth_epoch = match command {
         AdapterCommand::TelegramAuth { epoch, .. } => Some(epoch),
@@ -255,7 +257,9 @@ pub(crate) fn dispatch(
             detail: error.to_string(),
         };
         let _ = events.send(stamp_login_failure(auth_epoch, status));
+        return true;
     }
+    false
 }
 
 fn error_protocol(error: &super::AdapterError) -> super::ProtocolId {
