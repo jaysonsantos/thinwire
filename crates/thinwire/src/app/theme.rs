@@ -16,7 +16,6 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Margin,
     Stroke, TextStyle, Theme, Vec2,
 };
-use thinwire_protocol::SupportClass;
 
 /// Semantic colors for one theme. UI code reads colors only from here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,16 +126,6 @@ impl Palette {
         match theme {
             Theme::Dark => &Self::DARK,
             Theme::Light => &Self::LIGHT,
-        }
-    }
-
-    /// Label color for a protocol support class.
-    #[must_use]
-    pub(crate) const fn support(&self, support: SupportClass) -> Color32 {
-        match support {
-            SupportClass::Supported => self.ok,
-            SupportClass::Experimental => self.warn,
-            SupportClass::Constrained => self.text2,
         }
     }
 }
@@ -515,19 +504,6 @@ mod tests {
             for (pair, fg, bg) in ui_pairs(&palette) {
                 let ratio = contrast(fg, bg);
                 assert!(ratio >= UI_AA, "{name} {pair}: {ratio:.2} < {UI_AA}");
-            }
-        }
-    }
-
-    #[test]
-    fn support_labels_meet_aa_on_the_sidebar() {
-        for palette in [Palette::DARK, Palette::LIGHT] {
-            for support in [
-                SupportClass::Supported,
-                SupportClass::Experimental,
-                SupportClass::Constrained,
-            ] {
-                assert!(contrast(palette.support(support), palette.sidebar) >= TEXT_AA);
             }
         }
     }

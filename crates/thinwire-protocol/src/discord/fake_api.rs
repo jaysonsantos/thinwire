@@ -33,6 +33,8 @@ pub(crate) struct FakeState {
     pub send_error: Option<DiscordApiError>,
     /// The next call returns this error once, then clears it.
     pub next_error: Option<DiscordApiError>,
+    /// A one-message preview for these channels fails once, then the list continues.
+    pub preview_failures: HashMap<u64, DiscordApiError>,
     /// Pauses the next bot-id read until notified. A reconnect stays without a bot id.
     pub hold_load: Option<Arc<Notify>>,
     /// Fired when `bot_user_id` is about to wait on `hold_load`.
@@ -46,6 +48,9 @@ pub(crate) struct FakeState {
     /// Fired when that pause is about to wait.
     pub unlink_at_barrier: Option<Arc<Notify>>,
     pub next_id: u64,
+    /// When set, a successful send echoes an empty `content` (Message Content
+    /// intent missing on the response). The posted body is still recorded.
+    pub echo_empty_content: bool,
 }
 
 /// Fake bot HTTP backend. `hold_history` pauses history until notified.
@@ -58,6 +63,11 @@ pub(crate) struct FakeDiscordApi {
     pub sends_at_hold: AtomicUsize,
     /// When set, a finished send waits after its result event is queued.
     pub send_result_pause: Option<Arc<SendResultPause>>,
+    /// While false, a one-message preview waits. `None` does not wait.
+    pub hold_preview: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub preview_calls: AtomicUsize,
+    pub preview_in_flight: AtomicUsize,
+    pub preview_max_in_flight: AtomicUsize,
 }
 
 fn channel(id: u64, name: &str, kind: ChannelKind, overwrites: Vec<Overwrite>) -> ChannelSummary {
@@ -76,7 +86,10 @@ fn message(id: u64, author_id: u64, author: &str, content: &str) -> MessageSumma
         author_id,
         author: author.into(),
         content: content.into(),
-        attachments: 0,
+        images: 0,
+        files: 0,
+        embeds: 0,
+        stickers: 0,
     }
 }
 
@@ -147,6 +160,10 @@ impl FakeDiscordApi {
             hold_send: None,
             sends_at_hold: AtomicUsize::new(0),
             send_result_pause: None,
+            hold_preview: None,
+            preview_calls: AtomicUsize::new(0),
+            preview_in_flight: AtomicUsize::new(0),
+            preview_max_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -233,7 +250,25 @@ impl DiscordApi for FakeDiscordApi {
     fn history(&self, channel_id: u64, limit: u16) -> ApiFuture<'_, Vec<MessageSummary>> {
         Box::pin(async move {
             self.check_token()?;
-            if let Some(hold) = &self.hold_history {
+            if limit == 1 {
+                self.preview_calls.fetch_add(1, Ordering::SeqCst);
+                let now = self.preview_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.preview_max_in_flight.fetch_max(now, Ordering::SeqCst);
+                if let Some(flag) = &self.hold_preview {
+                    while !flag.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                self.preview_in_flight.fetch_sub(1, Ordering::SeqCst);
+                let failed = self.state().preview_failures.remove(&channel_id);
+                if let Some(error) = failed {
+                    return Err(error);
+                }
+            }
+            // The hold is for an open chat (limit 50). A preview is limit 1.
+            if limit > 1
+                && let Some(hold) = &self.hold_history
+            {
                 hold.notified().await;
             }
             let mut messages = self
@@ -275,7 +310,12 @@ impl DiscordApi for FakeDiscordApi {
             state.next_id += 1;
             let id = state.next_id;
             state.sent.push((channel_id, body.clone()));
-            Ok(message(id, BOT_ID, "thinwire-bot", &body))
+            let content = if state.echo_empty_content {
+                ""
+            } else {
+                body.as_str()
+            };
+            Ok(message(id, BOT_ID, "thinwire-bot", content))
         })
     }
 }

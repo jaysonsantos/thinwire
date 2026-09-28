@@ -395,6 +395,11 @@ pub struct Snapshot {
     /// `status_text` still holds it, it wins over a load of another protocol.
     /// The selected protocol's own load still shows (#90, #73).
     failure_status: Option<String>,
+    /// Accepted Telegram sends still waiting for Telegram's own status line.
+    /// `SendAccepted` drops them from [`Self::sends`], but the strip stays on
+    /// Sending… until that line. Another protocol must not restore the
+    /// previous one first.
+    telegram_send_unconfirmed: u32,
     pub compose: String,
     pub auth_busy: bool,
     /// One line above the active login form. Never holds a secret.
@@ -580,6 +585,7 @@ impl Snapshot {
             status_text: "Sign in with Telegram to get started.".into(),
             ready_status: None,
             failure_status: None,
+            telegram_send_unconfirmed: 0,
             compose: String::new(),
             auth_busy: false,
             auth_notice: None,
@@ -702,6 +708,9 @@ impl Snapshot {
                     self.ready_status = (status == AdapterStatus::Ready).then(|| detail.clone());
                     self.failure_status = (status != AdapterStatus::Ready).then(|| detail.clone());
                     self.status_text = detail;
+                    // Telegram's own line ("Message sent.") replaces Sending….
+                    // An accepted send is no longer waiting on that line.
+                    self.telegram_send_unconfirmed = 0;
                     if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                         if self.auth != AuthScreen::Idle {
                             self.auth_busy = false;
@@ -1370,6 +1379,7 @@ impl Snapshot {
             || !self.history_loading.is_empty()
             || !self.older_loading.is_empty()
             || !self.sends.is_empty()
+            || self.telegram_send_unconfirmed > 0
     }
 
     /// The line of a running load of one protocol, if one runs (#80).
@@ -1391,7 +1401,11 @@ impl Snapshot {
             // F1 (#82): older pages of this protocol only, keyed by
             // (protocol, chat) like `history_loading`.
             Some(LOADING_OLDER_STATUS)
-        } else if self.sends.any_for(protocol) {
+        } else if self.sends.any_for(protocol)
+            || (protocol == ProtocolId::Telegram && self.telegram_send_unconfirmed > 0)
+        {
+            // Telegram's accept is not "Message sent." The strip stays on
+            // Sending… until Telegram writes its own status line.
             Some(SENDING_STATUS)
         } else {
             None
@@ -1741,8 +1755,12 @@ impl Snapshot {
             Some(Pending::Send { body, .. }) => {
                 self.drop_rejected_body(protocol, chat);
                 self.clear_sent_text(protocol, chat, &body);
+                self.hold_telegram_send_line(protocol);
             }
-            Some(Pending::Retry { .. }) => self.drop_rejected_body(protocol, chat),
+            Some(Pending::Retry { .. }) => {
+                self.drop_rejected_body(protocol, chat);
+                self.hold_telegram_send_line(protocol);
+            }
             None => self.note_late_accept(protocol, chat, request),
         }
     }
@@ -1772,6 +1790,7 @@ impl Snapshot {
         if shown {
             self.show_timeouts();
         }
+        self.hold_telegram_send_line(protocol);
     }
 
     /// Set the timeout error from `timed_out`: one line per expired send, or
@@ -2093,6 +2112,13 @@ impl Snapshot {
             body,
             request,
         });
+    }
+
+    /// Telegram's accept is not its finished line. Count it until that line.
+    fn hold_telegram_send_line(&mut self, protocol: ProtocolId) {
+        if protocol == ProtocolId::Telegram {
+            self.telegram_send_unconfirmed = self.telegram_send_unconfirmed.saturating_add(1);
+        }
     }
 
     pub fn open_telegram(&mut self, store: &SecretStore) {
@@ -2596,6 +2622,9 @@ impl Snapshot {
         self.older_at_start.retain(|(owner, _)| *owner != protocol);
         self.older_retry.retain(|(owner, _), _| *owner != protocol);
         self.older_note.retain(|(owner, _)| *owner != protocol);
+        if protocol == ProtocolId::Telegram {
+            self.telegram_send_unconfirmed = 0;
+        }
         #[cfg(feature = "whatsapp-web")]
         if protocol == ProtocolId::WhatsApp {
             self.end_pairing();
@@ -6597,6 +6626,205 @@ mod tests {
             state: AccountState::Unlinked,
         });
         assert!(!snapshot.can_send(), "unlinked");
+    }
+
+    #[test]
+    fn a_finished_send_clears_the_sending_line() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.selected_protocol = ProtocolId::Slack;
+        snapshot.selected_conversation = Some("slack:C1".into());
+        snapshot.history_loading.clear();
+        let before = snapshot.status_text.clone();
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            });
+        let request = request.expect("send");
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+            request,
+        });
+        assert_ne!(snapshot.status_line(), SENDING_STATUS);
+        assert_eq!(snapshot.status_text, before);
+    }
+
+    #[test]
+    fn a_discord_accept_clears_sending_only_when_nothing_is_pending() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:1", true),
+        });
+        snapshot.selected_protocol = ProtocolId::Discord;
+        snapshot.selected_conversation = Some("discord:1".into());
+        snapshot.history_loading.clear();
+        let before = snapshot.status_text.clone();
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        let discord_request = send_request(&mut snapshot);
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1".into(),
+            request: discord_request,
+        });
+        assert_ne!(snapshot.status_line(), SENDING_STATUS);
+        assert_eq!(snapshot.status_text, before);
+
+        link_telegram(&mut snapshot);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(7, "Ada", 1),
+        });
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some("telegram:7".into());
+        snapshot.history_loading.clear();
+        snapshot.compose = "wait".into();
+        snapshot.send_compose();
+        let telegram_request = send_request(&mut snapshot);
+        snapshot.selected_protocol = ProtocolId::Discord;
+        snapshot.selected_conversation = Some("discord:1".into());
+        snapshot.compose = "also".into();
+        snapshot.send_compose();
+        let discord_request = send_request(&mut snapshot);
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1".into(),
+            request: discord_request,
+        });
+        assert_eq!(
+            snapshot.status_line(),
+            format!("{}: {SENDING_STATUS}", ProtocolId::Telegram.display_name()),
+            "Telegram is still sending"
+        );
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:7".into(),
+            request: telegram_request,
+        });
+        assert_eq!(
+            snapshot.status_line(),
+            format!("{}: {SENDING_STATUS}", ProtocolId::Telegram.display_name()),
+            "Telegram's own line has not arrived"
+        );
+    }
+
+    #[test]
+    fn a_telegram_accept_keeps_sending_until_message_sent() {
+        let mut snapshot = Snapshot::new();
+        link_telegram(&mut snapshot);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(42, "Ada", 1),
+        });
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some("telegram:42".into());
+        snapshot.history_loading.clear();
+        let before = snapshot.status_text.clone();
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        let request = send_request(&mut snapshot);
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:42".into(),
+            request,
+        });
+        assert_eq!(
+            snapshot.status_line(),
+            SENDING_STATUS,
+            "SendAccepted is not Message sent."
+        );
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Message sent.".into(),
+        });
+        assert_eq!(snapshot.status_text, "Message sent.");
+        assert_eq!(snapshot.status_line(), "Message sent.");
+        assert_ne!(snapshot.status_text, before);
+    }
+
+    #[test]
+    fn a_discord_accept_keeps_telegram_sending_until_message_sent() {
+        let mut snapshot = shell_with(&[ProtocolId::Discord]);
+        link(&mut snapshot, ProtocolId::Discord);
+        allow_send(&mut snapshot, ProtocolId::Discord);
+        link_telegram(&mut snapshot);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Discord, "discord:1", true),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(7, "Ada", 1),
+        });
+        snapshot.history_loading.clear();
+
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some("telegram:7".into());
+        snapshot.compose = "from telegram".into();
+        snapshot.send_compose();
+        let telegram_request = send_request(&mut snapshot);
+        snapshot.selected_protocol = ProtocolId::Discord;
+        snapshot.selected_conversation = Some("discord:1".into());
+        snapshot.compose = "from discord".into();
+        snapshot.send_compose();
+        let discord_request = send_request(&mut snapshot);
+
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1".into(),
+            request: discord_request,
+        });
+        assert_eq!(
+            snapshot.status_line(),
+            format!("{}: {SENDING_STATUS}", ProtocolId::Telegram.display_name()),
+            "Discord accepted first; Telegram is still sending"
+        );
+
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:7".into(),
+            request: telegram_request,
+        });
+        snapshot.compose = "again".into();
+        snapshot.send_compose();
+        let later_discord = send_request(&mut snapshot);
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Discord,
+            conversation_id: "discord:1".into(),
+            request: later_discord,
+        });
+        assert_eq!(
+            snapshot.status_line(),
+            format!("{}: {SENDING_STATUS}", ProtocolId::Telegram.display_name()),
+            "Telegram accepted, and its Message sent line has not arrived"
+        );
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Message sent.".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Message sent.");
+    }
+
+    fn send_request(snapshot: &mut Snapshot) -> u64 {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("send")
     }
 
     #[test]
