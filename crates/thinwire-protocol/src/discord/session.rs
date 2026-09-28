@@ -285,12 +285,16 @@ impl Session {
                     );
                     // The list is already on the channel. Yield so it is
                     // delivered before any preview history call starts.
+                    // A revoked or replaced session published nothing, so it
+                    // does not start preview calls either.
                     tokio::task::yield_now().await;
-                    if !gate.current() {
-                        return;
-                    }
-                    let current = shared.lock().map(|state| state.reload_ticket).unwrap_or(0);
-                    if current != ticket {
+                    let listed = shared.lock().is_ok_and(|state| {
+                        gate.current()
+                            && state.generation == generation
+                            && state.reload_ticket == ticket
+                            && !state.revoked
+                    });
+                    if !listed {
                         return;
                     }
                     spawn_previews(api, channels, shared, gate, events, ticket);
@@ -781,7 +785,9 @@ fn preview_still_listed(
     let Ok(state) = shared.lock() else {
         return false;
     };
-    state.reload_ticket == ticket && state.channels.contains_key(&channel.conversation_id())
+    state.reload_ticket == ticket
+        && !state.revoked
+        && state.channels.contains_key(&channel.conversation_id())
 }
 
 /// Applies a finished channel-list reload under the session lock.
