@@ -675,6 +675,39 @@ pub(super) mod tests {
         assert_eq!(upserts(&events)[0].unread, 1);
     }
 
+    /// A pushed row can notify. A repeat, an opened history page, and a
+    /// pending send stay `History` (#32).
+    #[test]
+    fn a_pushed_message_is_live_and_a_replay_is_history() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let first = inbox.apply_messages(vec![message(chat, "live", "new", 100)]);
+        assert_eq!(received(&first).arrival, Arrival::Live);
+        assert!(!upserts(&first)[0].muted);
+        let again = inbox.apply_messages(vec![message(chat, "live", "new", 100)]);
+        assert_eq!(received(&again).arrival, Arrival::History);
+        let opened = inbox.open_chat(chat).expect("known chat");
+        assert!(opened.iter().all(|event| match event {
+            AdapterEvent::MessageReceived { message } => message.arrival == Arrival::History,
+            _ => true,
+        }));
+        let (_, pending, _) = inbox.begin_send(chat, "out", 101);
+        assert_eq!(
+            received(std::slice::from_ref(&pending)).arrival,
+            Arrival::History
+        );
+    }
+
+    fn received(events: &[AdapterEvent]) -> &ChatMessage {
+        events
+            .iter()
+            .find_map(|event| match event {
+                AdapterEvent::MessageReceived { message } => Some(message),
+                _ => None,
+            })
+            .expect("message")
+    }
+
     #[test]
     fn send_pending_is_replaced_or_removed() {
         let mut inbox = Inbox::default();
