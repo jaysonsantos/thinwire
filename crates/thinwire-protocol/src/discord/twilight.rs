@@ -3,8 +3,10 @@
 //! Bot token only. Errors map to [`DiscordApiError`] and drop response bodies.
 
 use std::fmt;
+use std::time::Duration;
 
 use twilight_http::Client;
+use twilight_http::api_error::ApiError;
 use twilight_http::error::{Error, ErrorType};
 use twilight_model::channel::message::Message;
 use twilight_model::channel::permission_overwrite::PermissionOverwriteType;
@@ -15,6 +17,9 @@ use super::api::{
     ApiFuture, ChannelKind, ChannelSummary, DiscordApi, DiscordApiError, GuildSummary,
     MessageSummary, Overwrite, OverwriteTarget,
 };
+
+/// Used when a 429 body has no usable `retry_after`.
+const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(1);
 
 pub(crate) struct TwilightApi {
     client: Client,
@@ -70,16 +75,33 @@ fn id<T>(raw: u64) -> Result<Id<T>, DiscordApiError> {
 fn map_error(error: &Error) -> DiscordApiError {
     match error.kind() {
         ErrorType::Unauthorized => DiscordApiError::Unauthorized,
-        ErrorType::Response { status, .. } => match status.get() {
+        ErrorType::Response {
+            status,
+            error: api_error,
+            ..
+        } => match status.get() {
             401 => DiscordApiError::Unauthorized,
             403 => DiscordApiError::Forbidden,
             404 => DiscordApiError::NotFound,
-            429 => DiscordApiError::RateLimited,
+            429 => DiscordApiError::RateLimited {
+                retry_after: retry_after_of(api_error),
+            },
             _ => DiscordApiError::Rejected,
         },
         ErrorType::Validation | ErrorType::BuildingRequest => DiscordApiError::Rejected,
         _ => DiscordApiError::Transport,
     }
+}
+
+fn retry_after_of(error: &ApiError) -> Duration {
+    let ApiError::Ratelimited(body) = error else {
+        return RATE_LIMIT_FALLBACK;
+    };
+    let seconds = body.retry_after;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return RATE_LIMIT_FALLBACK;
+    }
+    Duration::try_from_secs_f64(seconds.min(30.0)).unwrap_or(RATE_LIMIT_FALLBACK)
 }
 
 fn channel_summary(channel: Channel) -> ChannelSummary {
@@ -116,12 +138,28 @@ fn channel_summary(channel: Channel) -> ChannelSummary {
 
 fn message_summary(message: Message) -> MessageSummary {
     let author = message.author.global_name.unwrap_or(message.author.name);
+    let mut images = 0;
+    let mut files = 0;
+    for attachment in &message.attachments {
+        if attachment
+            .content_type
+            .as_deref()
+            .is_some_and(|kind| kind.starts_with("image/"))
+        {
+            images += 1;
+        } else {
+            files += 1;
+        }
+    }
     MessageSummary {
         id: message.id.get(),
         author_id: message.author.id.get(),
         author,
         content: message.content,
-        attachments: message.attachments.len(),
+        images,
+        files,
+        embeds: message.embeds.len(),
+        stickers: message.sticker_items.len(),
     }
 }
 
