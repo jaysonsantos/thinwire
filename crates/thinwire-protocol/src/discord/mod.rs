@@ -444,12 +444,21 @@ impl ProtocolAdapter for DiscordAdapter {
             AdapterCommand::Disconnect {
                 protocol: ProtocolId::Discord,
             } => {
-                self.stop_session(events);
                 let detail = if Self::bot_inbox_compiled() {
                     "Discord bot inbox disconnected."
                 } else {
                     NOT_READY_DETAIL
                 };
+                // A live session emits the disconnected state from its
+                // owner, after the work in flight, so no event of it comes
+                // later (Codex r4131954091).
+                #[cfg(any(test, feature = "discord-bot"))]
+                if let Some(session) = self.session.take() {
+                    self.generation += 1;
+                    session.disconnect(detail, events);
+                    return Ok(());
+                }
+                self.stop_session(events);
                 emit_status(events, ProtocolId::Discord, AdapterStatus::Stubbed, detail);
                 emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
                 Ok(())
@@ -2046,6 +2055,53 @@ mod tests {
             })
             .count();
         assert_eq!(results, 1, "the send has one result");
+    }
+
+    /// Codex r4131954091 on #157: Disconnect while a channel list and a
+    /// history page are in flight. The owner emits the disconnected state
+    /// after its work in flight, and no event of the old session follows it.
+    #[tokio::test]
+    async fn nothing_of_the_old_session_follows_a_disconnect() {
+        let channels = Arc::new(Notify::new());
+        let history = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_history = Some(Arc::clone(&history));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().hold_channels = Some(Arc::clone(&channels));
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                },
+                &tx,
+            )
+            .expect("open");
+        // Both calls wait at their holds.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        let _ = until(&mut rx, is_unlinked).await;
+        channels.notify_waiters();
+        history.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(late.is_empty(), "an event after the disconnect: {late:?}");
     }
 
     /// Codex r4130981025 on #157: a shutdown that reaches its limit with a

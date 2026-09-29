@@ -149,6 +149,11 @@ enum Msg {
     Retire {
         carried: oneshot::Sender<Carried>,
     },
+    /// The user disconnected: settle the work in flight, then emit the
+    /// disconnected state and publish nothing more.
+    Disconnect {
+        detail: &'static str,
+    },
     Shutdown {
         done: oneshot::Sender<()>,
         limit: Duration,
@@ -356,6 +361,18 @@ impl Session {
         let (carried, rx) = oneshot::channel();
         let _ = self.tx.send(Msg::Retire { carried });
         rx
+    }
+
+    /// The user disconnects. The owner answers the sends and loads in
+    /// flight, then emits `detail` as a stubbed status and `Unlinked`, and
+    /// publishes nothing more. So no event of this session follows the
+    /// disconnected state (Codex r4131954091). When the owner is gone, the
+    /// handle emits that state itself.
+    pub(crate) fn disconnect(self, detail: &'static str, events: &EventTx) {
+        self.flags.retired.store(true, Ordering::SeqCst);
+        if self.tx.send(Msg::Disconnect { detail }).is_err() {
+            emit_disconnected(events, detail);
+        }
     }
 
     /// The app closes. The owner waits until every send in flight has its
@@ -574,6 +591,7 @@ impl Owner {
                 self.finish_shutdown_if_idle();
             }
             Msg::ShutdownLimit => self.close(),
+            Msg::Disconnect { detail } => self.disconnect(detail),
             #[cfg(test)]
             Msg::Flush { done } => {
                 let _ = done.send(());
@@ -706,7 +724,7 @@ impl Owner {
             emit_notice(&self.events, ProtocolId::Discord, EMPTY_SEND_REFUSAL);
             return;
         }
-        if self.retired || self.unlink.is_some() || self.unlinked() {
+        if self.replaced() || self.unlink.is_some() || self.unlinked() {
             // An ending or unlinked session registers no send. A pending
             // `Unlinked` comes after this rejection.
             reject(self);
@@ -940,10 +958,11 @@ impl Owner {
             return;
         };
         if self.replaced() || self.unlinked() {
-            // A load that finishes after `Retire` was handled still ends the
-            // spinner. One already queued when `retire` returned publishes
-            // nothing: disconnect may already have emitted `Unlinked`.
-            if self.retired && !self.unlinked() {
+            // A replaced load still ends its spinner, also one that was
+            // queued before the retirement (review of #157). An unlinked
+            // session already ended it. A disconnect emits its `Unlinked`
+            // from the owner after this, so nothing follows `Unlinked`.
+            if !self.unlinked() {
                 emit_history_loaded(&self.events, ProtocolId::Discord, conversation_id);
             }
             return;
@@ -1018,7 +1037,7 @@ impl Owner {
         let Some(tracked) = self.inflight.remove(&request) else {
             return;
         };
-        if self.retired {
+        if self.replaced() {
             // A later session replaced this one: the row does not stay pending.
             settle_row(&self.events, &tracked);
             emit_send_rejected(
@@ -1191,6 +1210,31 @@ impl Owner {
         }
     }
 
+    /// The user disconnected. Answer the sends in flight (settle their rows)
+    /// and end the loads, then emit the disconnected state. Nothing of this
+    /// session comes after it.
+    fn disconnect(&mut self, detail: &'static str) {
+        let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
+        sends.sort_by_key(|(request, _)| *request);
+        for (request, tracked) in sends {
+            settle_row(&self.events, &tracked);
+            emit_send_rejected(
+                &self.events,
+                ProtocolId::Discord,
+                &tracked.conversation_id,
+                request,
+            );
+        }
+        let mut loads: Vec<(u64, String)> = self.loads.drain().collect();
+        loads.sort_by_key(|(load, _)| *load);
+        for (_, conversation_id) in loads {
+            emit_history_loaded(&self.events, ProtocolId::Discord, conversation_id);
+        }
+        self.retire();
+        self.closed = true;
+        emit_disconnected(&self.events, detail);
+    }
+
     /// Ends a shutdown: retire, emit `Stopped` once, and publish nothing
     /// more, also when sends are still in flight after the limit.
     fn close(&mut self) {
@@ -1234,6 +1278,12 @@ fn settle_row(events: &EventTx, tracked: &Inflight) {
             Delivery::Failed,
         ),
     }
+}
+
+/// The disconnected state: a stubbed status with `detail`, then `Unlinked`.
+fn emit_disconnected(events: &EventTx, detail: &str) {
+    emit_status(events, ProtocolId::Discord, AdapterStatus::Stubbed, detail);
+    emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
 }
 
 fn emit_ready(events: &EventTx, note: &str) {
