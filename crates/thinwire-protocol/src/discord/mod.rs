@@ -200,7 +200,8 @@ impl DiscordAdapter {
 
     fn connect_bot_inbox(&mut self, events: &EventTx) -> Result<(), AdapterError> {
         // The old owner hands its channels, history ids, and row texts to the
-        // new one, after it handled every earlier message.
+        // new one, after it handled every earlier message. A refused token
+        // drops this handoff: no session follows, so nothing would take it.
         #[cfg(any(test, feature = "discord-bot"))]
         let handoff = self.session.take().map(session::Session::retire);
         self.stop_session(events);
@@ -209,7 +210,23 @@ impl DiscordAdapter {
         // delayed disconnect cannot overwrite that status (Codex r4132922561).
         #[cfg(any(test, feature = "discord-bot"))]
         let attempt = self.advance_active();
-        let prepared = self.prepared_token()?;
+        // Do not return before an account event. `advance_active` already
+        // suppressed the old owner's `Unlinked`.
+        let prepared = match self.prepared_token() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                emit_status(
+                    events,
+                    ProtocolId::Discord,
+                    AdapterStatus::Refused,
+                    error.to_string(),
+                );
+                emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
+                // `start` and the host turn this `Err` into another Refused
+                // status. The duplicate is the same refusal.
+                return Err(error);
+            }
+        };
         #[cfg(any(test, feature = "discord-bot"))]
         if let Some(factory) = &self.backend {
             match prepared {
@@ -2502,7 +2519,8 @@ mod tests {
 
     /// Codex r4132922561 on #157: a refused connect after Disconnect also
     /// moves the active generation. The delayed owner does not emit
-    /// "disconnected" over that refusal.
+    /// "disconnected" over that refusal. The refusal emits its own `Unlinked`,
+    /// because that move suppressed the old owner's.
     #[tokio::test]
     async fn a_refused_connect_beats_a_stale_disconnect() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
@@ -2539,22 +2557,39 @@ mod tests {
             err,
             AdapterError::Refused {
                 protocol: ProtocolId::Discord,
-                ..
-            }
+                reason,
+            } if reason == USER_TOKEN_REFUSAL
         ));
+        let early = drain(&mut rx);
+        assert!(
+            early.iter().any(is_unlinked),
+            "a refused connect emits Unlinked before the old owner runs: {early:?}"
+        );
+        assert!(
+            early.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Refused,
+                    detail,
+                    ..
+                } if detail.contains(USER_TOKEN_REFUSAL)
+            )),
+            "a refused connect emits Refused: {early:?}"
+        );
         parked.release();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let late = drain(&mut rx);
         assert!(
             !late
                 .iter()
-                .any(|event| matches!(event, AdapterEvent::Status { .. })),
+                .any(|event| matches!(event, AdapterEvent::Status { .. }) || is_unlinked(event)),
             "the old owner overwrote the refusal: {late:?}"
         );
     }
 
     /// Codex r4132922561 on #157: the user-account refusal is a connect that
-    /// starts no session. It still moves the active generation.
+    /// starts no session. It still moves the active generation, and it emits
+    /// `Unlinked` itself so the delayed owner cannot be the only unlink.
     #[tokio::test]
     async fn a_user_account_connect_beats_a_stale_disconnect() {
         let api = Arc::new(FakeDiscordApi::guild_fixture());
@@ -2593,13 +2628,18 @@ mod tests {
                 ..
             }
         ));
+        let early = drain(&mut rx);
+        assert!(
+            early.iter().any(is_unlinked),
+            "a user-account refusal emits Unlinked before the old owner runs: {early:?}"
+        );
         parked.release();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let late = drain(&mut rx);
         assert!(
             !late
                 .iter()
-                .any(|event| matches!(event, AdapterEvent::Status { .. })),
+                .any(|event| matches!(event, AdapterEvent::Status { .. }) || is_unlinked(event)),
             "the old owner overwrote the refusal: {late:?}"
         );
     }
@@ -2823,6 +2863,26 @@ mod tests {
                 ..
             }
         )
+    }
+
+    /// A refused token emits Refused, then `Unlinked`, and starts no session.
+    fn assert_refused_unlink(rx: &mut UnboundedReceiver<AdapterEvent>) {
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AdapterEvent::Status {
+                protocol: ProtocolId::Discord,
+                status: AdapterStatus::Refused,
+                detail,
+            }) if detail.contains(USER_TOKEN_REFUSAL)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AdapterEvent::Account {
+                protocol: ProtocolId::Discord,
+                state: AccountState::Unlinked,
+            })
+        ));
+        assert!(rx.try_recv().is_err(), "refusal does not start a session");
     }
 
     /// Codex r4109120586 on #135 (#138): a send whose HTTP call succeeds
@@ -4104,7 +4164,7 @@ mod tests {
     }
 
     #[test]
-    fn unverified_bearer_in_the_vault_is_refused_without_events() {
+    fn unverified_bearer_in_the_vault_refuses_and_unlinks() {
         let vault = Arc::new(MemoryDiscordVault::new());
         vault.set_bot_token("Bearer oauth-fixture");
         let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
@@ -4121,17 +4181,17 @@ mod tests {
             err,
             AdapterError::Refused {
                 protocol: ProtocolId::Discord,
-                ..
-            }
+                reason,
+            } if reason == USER_TOKEN_REFUSAL
         ));
-        assert!(rx.try_recv().is_err());
+        assert_refused_unlink(&mut rx);
         let rendered = format!("{adapter:?}");
         assert!(!rendered.contains("oauth-fixture"));
         assert!(!rendered.to_ascii_lowercase().contains("bearer oauth"));
     }
 
     #[test]
-    fn user_token_in_the_vault_is_refused_without_events() {
+    fn user_token_in_the_vault_refuses_and_unlinks() {
         let vault = Arc::new(MemoryDiscordVault::new());
         vault.set_bot_token("User personal-token");
         let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
@@ -4148,10 +4208,10 @@ mod tests {
             err,
             AdapterError::Refused {
                 protocol: ProtocolId::Discord,
-                ..
-            }
+                reason,
+            } if reason == USER_TOKEN_REFUSAL
         ));
-        assert!(rx.try_recv().is_err());
+        assert_refused_unlink(&mut rx);
         let rendered = format!("{adapter:?}");
         assert!(!rendered.contains("personal-token"));
     }

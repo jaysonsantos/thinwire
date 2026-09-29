@@ -383,7 +383,9 @@ impl Session {
     /// Retirement is visible before this returns. A [`Msg::ReloadDone`] or
     /// [`Msg::HistoryDone`] already queued publishes nothing, even though the
     /// owner handles that message before [`Msg::Retire`]. A [`Msg::SendDone`]
-    /// already queued is still accepted when the HTTP call succeeded.
+    /// already queued is still accepted when the HTTP call succeeded. A queued
+    /// success may still emit `SendAccepted` / `MessageReplaced` after a newer
+    /// `Linking` on reconnect (keyed by request and message id; harmless).
     pub(crate) fn retire(self) -> oneshot::Receiver<Carried> {
         self.flags.retired.store(true, Ordering::SeqCst);
         let (carried, rx) = oneshot::channel();
