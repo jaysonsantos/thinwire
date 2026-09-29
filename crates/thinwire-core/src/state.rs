@@ -405,7 +405,7 @@ pub struct Snapshot {
     /// Outbound pending message ids seen while a Telegram send is in flight,
     /// before `SendAccepted` binds them to that request. Keyed by request, so
     /// a late accept reclaims its own id and a newer send does not. One id for
-    /// each request, and each id goes after `TELEGRAM_QUEUED_ID_KEEP`.
+    /// each request, kept only while the send tracker keeps that request.
     telegram_unbound_messages: Vec<TelegramQueuedId>,
     pub compose: String,
     pub auth_busy: bool,
@@ -580,13 +580,7 @@ struct TelegramQueuedId {
     request: u64,
     chat: String,
     message_id: String,
-    at: Instant,
 }
-
-/// The longest time a queued Telegram id waits for its accept: the send
-/// timeout, then the time a late accept still counts (#168 item 10).
-const TELEGRAM_QUEUED_ID_KEEP: Duration =
-    crate::sends::SEND_TIMEOUT.saturating_add(crate::sends::EXPIRED_KEEP);
 
 /// How one Telegram send hold ends. Every end goes through [`Snapshot::end_telegram_send`].
 enum TelegramSendEnd {
@@ -1942,9 +1936,8 @@ impl Snapshot {
     /// Forget timed-out sends older than `EXPIRED_KEEP` (#90 item 3). Call it
     /// after the queued events are applied.
     pub(crate) fn prune_late_answers(&mut self) {
-        let now = Instant::now();
-        self.sends.prune_expired(now);
-        self.prune_unbound_telegram_messages(now);
+        self.sends.prune_expired(Instant::now());
+        self.prune_unbound_telegram_messages();
     }
 
     /// When the next send or retry expires, if one is in flight.
@@ -1969,9 +1962,6 @@ impl Snapshot {
         for hold in &mut self.telegram_send_unconfirmed {
             hold.at -= by;
         }
-        for row in &mut self.telegram_unbound_messages {
-            row.at -= by;
-        }
     }
 
     /// `expire_sends` with the clock as a parameter, for tests. An expired
@@ -1982,7 +1972,7 @@ impl Snapshot {
         let telegram_ended = self.telegram_send_unconfirmed.len() != before;
         let expired = self.sends.expire(now);
         if expired.is_empty() {
-            self.prune_unbound_telegram_messages(now);
+            self.prune_unbound_telegram_messages();
             return telegram_ended;
         }
         if self.error != self.timeout_error {
@@ -2005,7 +1995,7 @@ impl Snapshot {
         }
         // Every expired send shows, not only the last one (qa on #81).
         self.show_timeouts();
-        self.prune_unbound_telegram_messages(now);
+        self.prune_unbound_telegram_messages();
         true
     }
 
@@ -2048,7 +2038,7 @@ impl Snapshot {
             }
             None => {}
         }
-        self.prune_unbound_telegram_messages(Instant::now());
+        self.prune_unbound_telegram_messages();
     }
 
     /// Forget a rejected send for this chat. An accepted send, a removed
@@ -2234,14 +2224,14 @@ impl Snapshot {
         false
     }
 
-    /// Drop a queued id when its request is gone, or when it is older than
-    /// `TELEGRAM_QUEUED_ID_KEEP`. An expired request keeps its id for a late
-    /// accept. A newer request never receives it.
-    fn prune_unbound_telegram_messages(&mut self, now: Instant) {
-        self.telegram_unbound_messages.retain(|row| {
-            self.sends.tracks(ProtocolId::Telegram, row.request)
-                && now.saturating_duration_since(row.at) < TELEGRAM_QUEUED_ID_KEEP
-        });
+    /// Drop a queued id when the send tracker no longer keeps its request
+    /// (#168 item 10). The tracker keeps an expired request for
+    /// `EXPIRED_KEEP` from the pump that expired it, so the id lives exactly
+    /// as long as a late accept still counts, also after a late pump (for
+    /// example after a suspend). A newer request never receives it.
+    fn prune_unbound_telegram_messages(&mut self) {
+        self.telegram_unbound_messages
+            .retain(|row| self.sends.tracks(ProtocolId::Telegram, row.request));
     }
 
     /// Remember an outbound pending row for its own send (#168 item 9).
@@ -2253,21 +2243,18 @@ impl Snapshot {
     fn note_telegram_pending(&mut self, message: &ChatMessage) {
         let chat = &message.conversation_id;
         if let Some(request) = self.sends.request_of(message.protocol, chat) {
-            let at = Instant::now();
             if let Some(row) = self
                 .telegram_unbound_messages
                 .iter_mut()
                 .find(|row| row.request == request)
             {
                 row.message_id.clone_from(&message.id);
-                row.at = at;
                 return;
             }
             self.telegram_unbound_messages.push(TelegramQueuedId {
                 request,
                 chat: chat.clone(),
                 message_id: message.id.clone(),
-                at,
             });
             return;
         }
@@ -7622,10 +7609,11 @@ mod tests {
         );
     }
 
-    /// #168 item 10: a queued pending id goes by its own age, also while the
-    /// send tracker still knows its request. A send queues one id only.
+    /// #168 item 10: a queued pending id lives as long as the send tracker
+    /// keeps its request: open, then expired for `EXPIRED_KEEP`. A send
+    /// queues one id only.
     #[test]
-    fn a_queued_telegram_id_goes_by_its_own_age() {
+    fn a_queued_telegram_id_goes_with_its_request() {
         let mut snapshot = telegram_ready();
         snapshot.selected_protocol = ProtocolId::Telegram;
         snapshot.selected_conversation = Some("telegram:1".into());
@@ -7643,12 +7631,56 @@ mod tests {
             snapshot.telegram_unbound_messages[0].message_id, "telegram:1:3",
             "the newest row of the send wins"
         );
-        let now = Instant::now();
-        snapshot.prune_unbound_telegram_messages(now + TELEGRAM_QUEUED_ID_KEEP / 2);
-        assert_eq!(snapshot.telegram_unbound_messages.len(), 1, "still young");
-        snapshot.prune_unbound_telegram_messages(now + TELEGRAM_QUEUED_ID_KEEP);
-        assert!(snapshot.sends.tracks(ProtocolId::Telegram, request));
-        assert!(snapshot.telegram_unbound_messages.is_empty(), "too old");
+        snapshot.age_sends_for_test(crate::sends::SEND_TIMEOUT);
+        assert!(snapshot.expire_sends());
+        snapshot.prune_late_answers();
+        assert_eq!(
+            snapshot.telegram_unbound_messages.len(),
+            1,
+            "an expired request keeps its id for a late accept"
+        );
+        snapshot.age_sends_for_test(crate::sends::EXPIRED_KEEP);
+        snapshot.prune_late_answers();
+        assert!(!snapshot.sends.tracks(ProtocolId::Telegram, request));
+        assert!(
+            snapshot.telegram_unbound_messages.is_empty(),
+            "the id goes with its request"
+        );
+    }
+
+    /// Codex on #193: the pump that expires a send can come late, for
+    /// example after a suspend. The tracker keeps the request for
+    /// `EXPIRED_KEEP` from that pump, and the queued id stays as long. A late
+    /// accept then binds its row, and the sent row ends the hold.
+    #[test]
+    fn a_late_accept_after_a_late_expiry_pump_binds_its_row() {
+        let mut snapshot = telegram_ready();
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some("telegram:1".into());
+        snapshot.compose = "one".into();
+        snapshot.send_compose();
+        let request = send_request(&mut snapshot);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 1, "one", Delivery::Pending),
+        });
+        // The machine slept for longer than the timeout and the keep window.
+        snapshot.age_sends_for_test(crate::sends::SEND_TIMEOUT + crate::sends::EXPIRED_KEEP);
+        assert!(snapshot.expire_sends());
+        snapshot.prune_late_answers();
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(
+            hold_message(&snapshot, request).as_deref(),
+            Some("telegram:1:1")
+        );
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 1, "one", Delivery::Sent),
+        });
+        assert!(snapshot.telegram_send_unconfirmed.is_empty());
+        assert_ne!(snapshot.status_line(), SENDING_STATUS);
     }
 
     fn start_telegram_retry(snapshot: &mut Snapshot, chat: &str, message_id: &str) -> u64 {
