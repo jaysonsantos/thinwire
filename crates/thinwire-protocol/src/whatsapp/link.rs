@@ -40,6 +40,8 @@ const STORE_FAILED: &str =
 const REVOKE_NOT_SAVED: &str = "WhatsApp unlinked this device, but thinwire could not remove or mark its session file. Check that the app-data folder is writable, then pair again: the next pairing removes the old session first.";
 const STOP_PENDING: &str = "The WhatsApp client did not stop in time. thinwire keeps stopping it. A new pairing waits until it stopped.";
 const STILL_RUNNING: &str = "The last WhatsApp client is still stopping. Wait a moment, then start pairing again. If this stays, restart thinwire.";
+const STOP_ENDED: &str =
+    "The last WhatsApp client stopped. No linked-device session is running. You can pair again.";
 const BUILD_FAILED: &str =
     "WhatsApp pairing client could not be built. No session material was logged.";
 
@@ -115,6 +117,10 @@ enum Msg {
     Shutdown {
         done: oneshot::Sender<()>,
     },
+    /// A client stop ended. `stop` is its number.
+    StopEnded {
+        stop: u64,
+    },
     #[cfg(test)]
     Flush {
         done: oneshot::Sender<()>,
@@ -172,6 +178,7 @@ impl LinkHandle {
             stale: false,
             active: Arc::clone(&active),
             stop_wait,
+            stops: 0,
             stopping: None,
         };
         tokio::spawn(owner.run(rx));
@@ -240,9 +247,11 @@ struct Owner<B: LinkBackend> {
     active: Arc<AtomicBool>,
     /// Longest wait for one client stop ([`STOP_WAIT`]).
     stop_wait: Duration,
-    /// A stop that did not end within `stop_wait`. It keeps running; no new
-    /// client starts before it ends (#98).
-    stopping: Option<tokio::task::JoinHandle<()>>,
+    /// Number of the last client stop.
+    stops: u64,
+    /// A stop that did not end within `stop_wait`, with its number. It keeps
+    /// running; no new client starts before it ends (#98).
+    stopping: Option<(u64, tokio::task::JoinHandle<()>)>,
 }
 
 impl<B: LinkBackend> Owner<B> {
@@ -261,6 +270,7 @@ impl<B: LinkBackend> Owner<B> {
                         let _ = done.send(());
                     }
                 }
+                Msg::StopEnded { stop } => self.stop_ended(stop),
                 #[cfg(test)]
                 Msg::Flush { done } => {
                     let _ = done.send(());
@@ -379,14 +389,23 @@ impl<B: LinkBackend> Owner<B> {
     /// reports it and refuses a new start until it ends.
     async fn stop_bot(&mut self, bot: B::Bot) -> bool {
         let backend = self.backend.clone();
-        let mut task = tokio::spawn(async move { backend.stop(bot).await });
+        self.stops += 1;
+        let stop = self.stops;
+        let owner = self.callbacks.clone();
+        let mut task = tokio::spawn(async move {
+            backend.stop(bot).await;
+            // A slow stop clears its error when it ends (#158 review).
+            if let Some(owner) = owner.upgrade() {
+                let _ = owner.send(Msg::StopEnded { stop });
+            }
+        });
         if tokio::time::timeout(self.stop_wait, &mut task)
             .await
             .is_ok()
         {
             return true;
         }
-        self.stopping = Some(task);
+        self.stopping = Some((stop, task));
         self.status(AdapterStatus::Error, STOP_PENDING);
         false
     }
@@ -394,12 +413,26 @@ impl<B: LinkBackend> Owner<B> {
     /// A slow stop from before still runs.
     fn still_stopping(&mut self) -> bool {
         match &self.stopping {
-            Some(task) if !task.is_finished() => true,
+            Some((_, task)) if !task.is_finished() => true,
             Some(_) => {
                 self.stopping = None;
                 false
             }
             None => false,
+        }
+    }
+
+    /// The slow stop `stop` ended. Replace [`STOP_PENDING`] with the reason
+    /// of the stop, or with "stopped" (#158 review). A stop that ended in
+    /// time, or one that a later start already saw end, sends nothing.
+    fn stop_ended(&mut self, stop: u64) {
+        if !matches!(&self.stopping, Some((pending, _)) if *pending == stop) {
+            return;
+        }
+        self.stopping = None;
+        match self.session.stopped() {
+            Some(reason) => self.status(AdapterStatus::Error, reason),
+            None => self.status(AdapterStatus::Stubbed, STOP_ENDED),
         }
     }
 
@@ -1021,19 +1054,58 @@ pub(super) mod tests {
         assert_eq!(fake.log(), vec!["start 1", "stop 1"]);
         assert!(!handle.is_active());
 
-        // The old client stops; then a pairing starts.
+        // The old client stops. Its error goes (#158 review); then a pairing
+        // starts.
         gate.notify_one();
-        for _ in 0..100 {
-            if fake.log().iter().any(|entry| entry == "stopped 1") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let ended = wait_for_status(&handle, &mut rx).await;
+        assert_eq!(ended, (AdapterStatus::Stubbed, STOP_ENDED.to_string()));
+        assert!(fake.log().iter().any(|entry| entry == "stopped 1"));
         handle.begin(None, 9);
         handle.flush().await;
         assert_eq!(
             fake.log(),
             vec!["start 1", "stop 1", "stopped 1", "start 4"]
+        );
+    }
+
+    /// Poll the owner until it sends a status; return the first one.
+    async fn wait_for_status(
+        handle: &LinkHandle,
+        rx: &mut UnboundedReceiver<AdapterEvent>,
+    ) -> (AdapterStatus, String) {
+        for _ in 0..200 {
+            handle.flush().await;
+            let status = drain(rx).into_iter().find_map(|event| match event {
+                AdapterEvent::Status { status, detail, .. } => Some((status, detail)),
+                _ => None,
+            });
+            if let Some(status) = status {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("no status from the owner");
+    }
+
+    /// #158 review: a logout whose stop ends late gets its reason back, not
+    /// the stop error and not a plain "stopped".
+    #[tokio::test]
+    async fn a_late_stop_end_restores_the_stop_reason() {
+        let gate = Arc::new(Notify::new());
+        let (fake, handle, session, mut rx) = slow_stop_owner(&gate);
+        handle.begin(None, 7);
+        handle.flush().await;
+        fake.callback(1).send(LinkEvent::LoggedOut);
+        handle.flush().await;
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { status: AdapterStatus::Error, detail, .. } if detail == STOP_PENDING
+        )));
+        gate.notify_one();
+        let reason = session.stopped().expect("a logout reason");
+        assert_eq!(
+            wait_for_status(&handle, &mut rx).await,
+            (AdapterStatus::Error, reason.to_string())
         );
     }
 
