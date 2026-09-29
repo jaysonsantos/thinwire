@@ -6654,6 +6654,7 @@ dependencies = [
  "chrono",
  "dirs 7.0.0",
  "futures",
+ "libsqlite3-sys",
  "presage",
  "presage-store-sqlite",
  "sha2 0.11.0",

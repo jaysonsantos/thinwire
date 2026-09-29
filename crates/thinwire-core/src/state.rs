@@ -505,6 +505,10 @@ pub struct Snapshot {
     pub signal_qr: Option<String>,
     #[cfg(feature = "signal-local")]
     pub signal_started: bool,
+    /// `Ready` has arrived for this link. Later failures are session errors.
+    /// Startup and linking failures happen before this and keep the link error.
+    #[cfg(feature = "signal-local")]
+    signal_inbox_open: bool,
     /// The user accepted the full-screen local-build notice in this session.
     /// Linking needs it; showing the notice again or cancelling clears it.
     #[cfg(feature = "signal-local")]
@@ -544,7 +548,8 @@ impl std::fmt::Debug for Snapshot {
             .field("whatsapp_started", &self.whatsapp_started);
         #[cfg(feature = "signal-local")]
         out.field("signal_screen", &self.signal_screen)
-            .field("signal_started", &self.signal_started);
+            .field("signal_started", &self.signal_started)
+            .field("signal_inbox_open", &self.signal_inbox_open);
         out.finish_non_exhaustive()
     }
 }
@@ -647,6 +652,8 @@ impl Snapshot {
             #[cfg(feature = "signal-local")]
             signal_started: false,
             #[cfg(feature = "signal-local")]
+            signal_inbox_open: false,
+            #[cfg(feature = "signal-local")]
             signal_notice_acknowledged: false,
         }
     }
@@ -686,15 +693,16 @@ impl Snapshot {
                     row.status = status;
                     row.detail = detail.clone();
                 }
+                #[cfg(feature = "signal-local")]
+                if protocol == ProtocolId::Signal && status == AdapterStatus::Ready {
+                    self.signal_inbox_open = true;
+                }
                 if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                     // A failed load does not send its end event. Stop the spinners.
                     self.stop_spinners(protocol, None);
                     #[cfg(feature = "signal-local")]
-                    if protocol == ProtocolId::Signal
-                        && self.signal_started
-                        && !self.protocol_linked(ProtocolId::Signal)
-                    {
-                        self.set_error("Signal linking failed.", &detail, "Start linking again.");
+                    if protocol == ProtocolId::Signal && self.signal_started {
+                        self.note_signal_failure(&detail);
                     }
                 }
                 // Crate / feature jargon stays on the account row and in logs.
@@ -719,7 +727,10 @@ impl Snapshot {
                     }
                 }
             }
-            AdapterEvent::ConversationUpsert { conversation } => {
+            AdapterEvent::ConversationUpsert { mut conversation } => {
+                if self.chat_is_viewed(conversation.protocol, &conversation.id) {
+                    conversation.unread = 0;
+                }
                 let protocol = conversation.protocol;
                 let selected = (self.selected_protocol == protocol)
                     .then(|| self.selected_conversation.clone())
@@ -2430,6 +2441,26 @@ impl Snapshot {
                 conversation_id: Some(id),
             });
         }
+        self.clear_viewed_unread();
+    }
+
+    fn chat_is_viewed(&self, protocol: ProtocolId, id: &str) -> bool {
+        self.viewed
+            .as_ref()
+            .is_some_and(|(owner, chat)| *owner == protocol && chat == id)
+    }
+
+    /// The open chat is read. `ViewChat` is the signal that it is open.
+    fn clear_viewed_unread(&mut self) {
+        let Some((protocol, id)) = self.viewed.clone() else {
+            return;
+        };
+        let Some(list) = self.conversations.get_mut(&protocol) else {
+            return;
+        };
+        if let Some(row) = list.iter_mut().find(|row| row.id == id) {
+            row.unread = 0;
+        }
     }
 
     /// The chat the user looks at, as last synced by `sync_viewed`.
@@ -2526,6 +2557,7 @@ impl Snapshot {
                 #[cfg(feature = "signal-local")]
                 if protocol == ProtocolId::Signal && self.signal_started {
                     self.signal_started = false;
+                    self.signal_inbox_open = false;
                     self.signal_qr = None;
                 }
             }
@@ -2626,6 +2658,14 @@ impl Snapshot {
         if protocol == ProtocolId::WhatsApp {
             self.end_pairing();
         }
+        #[cfg(feature = "signal-local")]
+        if protocol == ProtocolId::Signal {
+            self.signal_started = false;
+            self.signal_inbox_open = false;
+            self.signal_qr = None;
+            self.signal_notice_acknowledged = false;
+            self.signal_screen = SignalScreen::Hidden;
+        }
         if self.selected_protocol == protocol {
             self.compose.clear();
             self.selected_conversation = None;
@@ -2640,6 +2680,31 @@ impl Snapshot {
                 self.select_protocol(next);
             }
         }
+    }
+
+    /// A Signal status error while linking is still in progress.
+    /// After `Ready`, the worker is already linked: `begin_signal_link`
+    /// would reject another start, so the error is a session error.
+    #[cfg(feature = "signal-local")]
+    fn note_signal_failure(&mut self, detail: &str) {
+        if self.signal_inbox_open {
+            // SendRejected already explained a failed send. Keep that hint.
+            let send_already_shown = detail.starts_with("Signal send failed")
+                && self
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.happened == "Message not sent.");
+            if !send_already_shown {
+                self.command_failed(ProtocolId::Signal, None, detail);
+            }
+            return;
+        }
+        let happened = if self.protocol_linked(ProtocolId::Signal) {
+            "Signal did not finish opening the inbox."
+        } else {
+            "Signal linking failed."
+        };
+        self.set_error(happened, detail, "Start linking again.");
     }
 
     /// One command failed; the session is still up (shell plan 7). Stop its
@@ -3020,6 +3085,7 @@ impl Snapshot {
         self.signal_screen = SignalScreen::Notice;
         self.signal_qr = None;
         self.signal_started = false;
+        self.signal_inbox_open = false;
         self.signal_notice_acknowledged = false;
     }
 
@@ -3050,6 +3116,11 @@ impl Snapshot {
             tracing::warn!("signal notice acknowledgement dropped: the notice is not shown");
             return;
         }
+        if self.protocol_linked(ProtocolId::Signal) {
+            self.signal_screen = SignalScreen::Hidden;
+            self.signal_qr = None;
+            return;
+        }
         self.signal_notice_acknowledged = true;
         self.signal_screen = SignalScreen::Link;
         self.error = None;
@@ -3068,6 +3139,7 @@ impl Snapshot {
             return;
         }
         self.signal_started = true;
+        self.signal_inbox_open = false;
         self.error = None;
         self.status_text = "Signal linking requested.".into();
         let generation = self.next_pairing_generation;
@@ -3096,6 +3168,7 @@ impl Snapshot {
         self.pairing_generation = None;
         self.signal_qr = None;
         self.signal_started = false;
+        self.signal_inbox_open = false;
         self.signal_notice_acknowledged = false;
         self.signal_screen = SignalScreen::Hidden;
         self.status_text = "Signal linking cancelled.".into();
@@ -3850,6 +3923,118 @@ mod tests {
             snapshot.older_note(),
             Some(OLDER_PAGE_FAILED_NOTE),
             "the Telegram note stays"
+        );
+    }
+
+    #[test]
+    fn ending_a_signal_session_clears_paging_so_a_relink_can_ask() {
+        let mut snapshot = Snapshot::new();
+        let chat = "signal-chat";
+        let anchor = "1700000000000:ada";
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.selected_protocol = ProtocolId::Signal;
+        snapshot.selected_conversation = Some(chat.into());
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Signal,
+                conversation_id: chat.into(),
+                id: anchor.into(),
+                sender: "Ada".into(),
+                body: "hello".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 1,
+                arrival: thinwire_protocol::Arrival::History,
+            },
+        });
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: anchor.into(),
+            more: false,
+            note: None,
+        });
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+        assert!(!snapshot.older_can_ask());
+
+        snapshot.end_session(ProtocolId::Signal);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.selected_protocol = ProtocolId::Signal;
+        snapshot.selected_conversation = Some(chat.into());
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Signal,
+                conversation_id: chat.into(),
+                id: anchor.into(),
+                sender: "Ada".into(),
+                body: "hello".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 1,
+                arrival: thinwire_protocol::Arrival::History,
+            },
+        });
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+        assert!(snapshot.older_can_ask(), "a relink can page again");
+    }
+
+    #[test]
+    fn an_open_signal_chat_does_not_count_unread() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Signal,
+                id: "s1".into(),
+                title: "Ada".into(),
+                participant: "s1".into(),
+                preview: "hello".into(),
+                unread: 1,
+                order: 1,
+                last_at: 1,
+                is_group: false,
+                writable: true,
+                muted: false,
+                placeholder: false,
+            },
+        });
+        assert_eq!(snapshot.unread_for(ProtocolId::Signal), 1);
+        snapshot.extra_visible.insert(ProtocolId::Signal);
+        snapshot.selected_protocol = ProtocolId::Signal;
+        snapshot.select_conversation("s1".into());
+        snapshot.sync_viewed();
+        assert_eq!(snapshot.unread_for(ProtocolId::Signal), 0);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Signal,
+                id: "s1".into(),
+                title: "Ada".into(),
+                participant: "s1".into(),
+                preview: "again".into(),
+                unread: 4,
+                order: 2,
+                last_at: 2,
+                is_group: false,
+                writable: true,
+                muted: false,
+                placeholder: false,
+            },
+        });
+        assert_eq!(snapshot.unread_for(ProtocolId::Signal), 0);
+        assert_eq!(
+            snapshot
+                .selected_conversation_row()
+                .map(|row| row.preview.as_str()),
+            Some("again")
         );
     }
 
@@ -4710,6 +4895,155 @@ mod tests {
         assert_eq!(error.happened, "Signal linking failed.");
         assert!(error.why.contains("No provisioning URL"));
         assert!(error.next.contains("Start linking again"));
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_sync_failure_after_link_keeps_the_error_and_allows_another_start() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        assert!(snapshot.signal_started);
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: "Signal chat list could not be read. Message text was not logged.".into(),
+        });
+        let error = snapshot.error.clone().expect("error");
+        assert_eq!(error.happened, "Signal did not finish opening the inbox.");
+        assert!(error.why.contains("chat list could not be read"));
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        assert!(!snapshot.signal_started);
+        assert!(snapshot.error.is_some());
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn an_operational_error_after_the_inbox_is_open_is_a_session_error() {
+        let mut snapshot = signal_inbox_ready();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: "Signal chat list could not be read. Message text was not logged.".into(),
+        });
+        let error = snapshot.error.clone().expect("error");
+        assert_eq!(error.happened, "Signal: the last action did not finish.");
+        assert!(error.why.contains("chat list could not be read"));
+        assert_eq!(error.next, "Try again. The inbox stays open.");
+        assert!(!error.next.contains("Start linking"));
+        assert!(snapshot.signal_started);
+        assert!(snapshot.signal_inbox_open);
+        assert!(snapshot.protocol_linked(ProtocolId::Signal));
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+        snapshot.signal_screen = SignalScreen::Link;
+        snapshot.begin_signal_link();
+        assert!(
+            !snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+            "another link must not start while the worker is already linked"
+        );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_send_failure_after_the_inbox_is_open_keeps_the_send_error() {
+        let mut snapshot = signal_inbox_ready();
+        allow_send(&mut snapshot, ProtocolId::Signal);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, "ada", true),
+        });
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Signal,
+                    request,
+                    ..
+                } => Some(request),
+                _ => None,
+            });
+        let request = request.expect("send");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Signal,
+            conversation_id: "ada".into(),
+            request,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: "Signal send failed. The message text was not logged.".into(),
+        });
+        let error = snapshot.error.clone().expect("error");
+        assert_eq!(error.happened, "Message not sent.");
+        assert!(error.why.contains("did not accept"));
+        assert!(!error.next.contains("Start linking"));
+        assert!(error.next.contains("Send it again"));
+        assert!(snapshot.signal_started);
+        assert!(snapshot.protocol_linked(ProtocolId::Signal));
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+    }
+
+    #[cfg(feature = "signal-local")]
+    fn signal_inbox_ready() -> Snapshot {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: "Signal is linked on this local build. This binary is not a release.".into(),
+        });
+        assert!(snapshot.signal_inbox_open);
+        snapshot
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn acknowledging_the_notice_leaves_a_linked_account_alone() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.open_signal_notice();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Notice);
+        snapshot.acknowledge_signal_notice();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::SignalCancelLink)
+        );
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .any(|row| row.caps.id == ProtocolId::Signal && row.linked())
+        );
     }
 
     #[cfg(feature = "signal-local")]
