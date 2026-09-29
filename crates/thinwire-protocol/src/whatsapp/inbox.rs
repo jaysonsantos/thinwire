@@ -65,9 +65,16 @@ struct ChatRecord {
     /// Local `pending:` ids whose send failed. The user can resend them.
     failed: HashSet<String>,
     /// The user saw this chat up to this message time (Unix seconds). A later
-    /// history chunk carries the phone's older unread count, so for a chat
-    /// read here only inbound messages newer than this count (#98).
+    /// history chunk carries the phone's older unread count, so a chat read
+    /// here changes its count only by new messages (#98).
     read_at: Option<i64>,
+    /// Inbound ids handled since the last local read: counted as unread, or
+    /// seen in the read second. A repeat does not count again, also after its
+    /// row left the capped cache (Codex r4131089163).
+    handled: HashSet<String>,
+    /// Newest activity time from history sync. A dropped send falls back to
+    /// it (Codex r4131089177).
+    history_at: i64,
 }
 
 impl ChatRecord {
@@ -75,16 +82,34 @@ impl ChatRecord {
     fn mark_read(&mut self) {
         self.unread = 0;
         self.read_at = Some(self.timestamp);
-    }
-
-    /// Inbound messages newer than the local read point.
-    fn unread_after(&self, read_at: i64) -> u32 {
-        let count = self
+        // Rows of the read second were seen; a later copy must not count.
+        self.handled = self
             .messages
             .iter()
-            .filter(|row| !row.from_me && row.timestamp > read_at)
-            .count();
-        u32::try_from(count).unwrap_or(u32::MAX)
+            .filter(|row| row.timestamp == self.timestamp)
+            .map(|row| row.id.clone())
+            .collect();
+    }
+
+    /// Count one new inbound message of a chat read here. `true` if it adds
+    /// to unread: not stored, not handled since the read, and not older than
+    /// the read.
+    fn counts_after_read(&mut self, message: &WaMessage) -> bool {
+        let Some(read_at) = self.read_at else {
+            return false;
+        };
+        if message.from_me || message.timestamp < read_at {
+            return false;
+        }
+        let stored = self.messages.iter().any(|row| row.id == message.id);
+        !stored && self.handled.insert(message.id.clone())
+    }
+
+    /// The chat time from what is still here: the newest row, or the
+    /// history time.
+    fn restore_time(&mut self) {
+        let newest = self.messages.iter().map(|row| row.timestamp).max();
+        self.timestamp = newest.unwrap_or(0).max(self.history_at);
     }
 }
 
@@ -137,23 +162,27 @@ impl Inbox {
             {
                 record.name = Some(name);
             }
+            record.history_at = record.history_at.max(chat.timestamp);
             record.timestamp = record.timestamp.max(chat.timestamp);
+            let mut added: u32 = 0;
             for message in chat.messages {
                 remember_name(&mut self.names, &message);
                 record.timestamp = record.timestamp.max(message.timestamp);
+                if record.counts_after_read(&message) {
+                    added = added.saturating_add(1);
+                }
                 insert_message(&mut record.messages, message);
             }
             // The user reads the open chat, so a later chunk keeps it read.
-            // A chat read here counts only what came after the read (#98).
-            // Else keep live increments: a chunk can carry an older count.
+            // A chat read here changes its count only by new messages (#98):
+            // the chunk's count is the phone's, from before the read. Else
+            // keep live increments: a chunk can carry an older count.
             if self.open.as_deref() == Some(chat.jid.as_str()) {
                 record.mark_read();
+            } else if record.read_at.is_some() {
+                record.unread = record.unread.saturating_add(added);
             } else {
-                let from_chunk = match record.read_at {
-                    Some(read_at) => record.unread_after(read_at),
-                    None => chat.unread,
-                };
-                record.unread = record.unread.max(from_chunk);
+                record.unread = record.unread.max(chat.unread);
             }
             touched.push(chat.jid);
         }
@@ -187,6 +216,9 @@ impl Inbox {
             };
             if !known && !message.from_me && !is_open {
                 record.unread = record.unread.saturating_add(1);
+                if record.read_at.is_some() {
+                    record.handled.insert(message.id.clone());
+                }
             }
             record.timestamp = record.timestamp.max(message.timestamp);
             insert_message(&mut record.messages, message.clone());
@@ -385,6 +417,8 @@ impl Inbox {
         if record.messages.len() == before {
             return Vec::new();
         }
+        // The send moved the chat time; the dropped row takes it back.
+        record.restore_time();
         let mut events = vec![AdapterEvent::MessagesRemoved {
             protocol: ProtocolId::WhatsApp,
             conversation_id: conversation_id(jid),
@@ -917,6 +951,100 @@ pub(super) mod tests {
             Vec::new(),
         );
         assert_eq!(upserts(&events)[0].unread, 4);
+    }
+
+    /// Codex r4131089163: a chat read here counts every new inbound message,
+    /// also past the 200-row cache and in the read second, and a repeat of
+    /// a chunk does not count twice.
+    #[test]
+    fn unread_after_a_read_counts_events_not_cached_rows() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let chunk = |messages: Vec<WaMessage>| HistoryChat {
+            jid: chat.into(),
+            name: None,
+            unread: 0,
+            timestamp: 10,
+            messages,
+        };
+        inbox.apply_history(
+            vec![chunk(vec![message(chat, "seen", "one", 10)])],
+            Vec::new(),
+        );
+        inbox.view(Some(chat));
+        inbox.view(None);
+
+        let flood: Vec<WaMessage> = (0..(MESSAGES_PER_CHAT + 50))
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("n{n:04}"),
+                    "new",
+                    11 + i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        let events = inbox.apply_history(vec![chunk(flood.clone())], Vec::new());
+        let total = u32::try_from(MESSAGES_PER_CHAT + 50).expect("small");
+        assert_eq!(upserts(&events)[0].unread, total, "past the row cache");
+        let events = inbox.apply_history(vec![chunk(flood)], Vec::new());
+        assert_eq!(upserts(&events)[0].unread, total, "a repeat does not count");
+
+        // The read second: a new message there counts; a seen one does not.
+        let mut inbox = Inbox::default();
+        inbox.apply_history(
+            vec![chunk(vec![message(chat, "seen", "one", 10)])],
+            Vec::new(),
+        );
+        inbox.view(Some(chat));
+        inbox.view(None);
+        let events = inbox.apply_history(
+            vec![chunk(vec![
+                message(chat, "seen", "one", 10),
+                message(chat, "same-second", "two", 10),
+            ])],
+            Vec::new(),
+        );
+        assert_eq!(upserts(&events)[0].unread, 1);
+    }
+
+    /// Codex r4131089177: a dropped send gives the chat its time back.
+    #[test]
+    fn a_dropped_send_restores_the_chat_time() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_history(
+            vec![HistoryChat {
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 5,
+                messages: vec![message(chat, "a", "before", 5)],
+            }],
+            Vec::new(),
+        );
+        let (pending, _, _) = inbox.begin_send(chat, "failed", 100);
+        let events = inbox.drop_send(chat, &pending);
+        let row = upserts(&events)[0];
+        assert_eq!(row.order, 5);
+        assert_eq!(row.last_at, 5);
+        assert_eq!(row.preview, "before");
+
+        // With no message left, the history time stays.
+        let other = "222@s.whatsapp.net";
+        inbox.apply_history(
+            vec![HistoryChat {
+                jid: other.into(),
+                name: None,
+                unread: 0,
+                timestamp: 7,
+                messages: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        let (pending, _, _) = inbox.begin_send(other, "failed", 100);
+        let events = inbox.drop_send(other, &pending);
+        assert_eq!(upserts(&events)[0].order, 7);
     }
 
     /// Messages that arrive in the open chat move the read point, so leaving
