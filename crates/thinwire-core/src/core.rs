@@ -1745,14 +1745,32 @@ mod tests {
         assert_eq!(core.view().compose, "", "the sent text is cleared");
     }
 
-    /// An accept before the deadline settles the send the normal way.
+    /// An accept before the deadline settles the send the normal way. Its
+    /// sent row ends the Telegram hold.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_accept_before_the_deadline_clears_the_text() {
+        use thinwire_protocol::Delivery;
+
         let (mut core, events_tx, request) = core_with_unanswered_send();
+        let row = |delivery| AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                id: "telegram:1:9".into(),
+                sender: "you".into(),
+                body: "hello".into(),
+                outbound: true,
+                delivery,
+                sent_at: unix_now(),
+                arrival: Arrival::History,
+            },
+        };
+        events_tx.send(row(Delivery::Pending)).expect("queue");
         events_tx.send(answer(true, request)).expect("queue");
         assert!(core.pump());
         assert_eq!(core.view().compose, "");
         assert!(core.view().error.is_none());
+        events_tx.send(row(Delivery::Sent)).expect("queue");
         events_tx
             .send(AdapterEvent::Status {
                 protocol: ProtocolId::Telegram,
