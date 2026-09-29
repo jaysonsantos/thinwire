@@ -231,6 +231,15 @@ impl ProtocolAdapter for TelegramAdapter {
         super::adapter::emit_stopped(events, ProtocolId::Telegram);
     }
 
+    /// `ViewChat` owns the chat live messages are marked read in.
+    /// History load does not. No worker yet means there is no open chat.
+    fn view_chat(&mut self, conversation_id: Option<&str>, _events: &EventTx) {
+        #[cfg(feature = "telegram-tdlib")]
+        self.tdlib.view_chat(conversation_id.map(str::to_owned));
+        #[cfg(not(feature = "telegram-tdlib"))]
+        let _ = conversation_id;
+    }
+
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         match command {
             AdapterCommand::TelegramAuth { step, epoch } => self.handle_auth(step, epoch, events),
@@ -684,6 +693,10 @@ mod tests {
         let open = fn_body(src, "async fn open_chat");
         assert!(open.contains("load_history"));
         assert!(open.contains("emit_history_loaded"));
+        assert!(
+            !open.contains("open_chat ="),
+            "history load must not keep the chat viewed"
+        );
         let history = fn_body(src, "async fn load_history");
         assert!(history.contains("functions::view_messages"));
         assert!(history.contains("true,"));
