@@ -436,12 +436,19 @@ impl ProtocolAdapter for WhatsAppAdapter {
     fn shutdown(&mut self, events: &EventTx) {
         self.risk_acknowledged = false;
         let Some(link) = self.link.take() else {
+            // No row comes after `Stopped` (Codex r4139029620).
+            self.session.stop_mute_timer();
             thinwire_protocol::emit_stopped(events, ProtocolId::WhatsApp);
             return;
         };
         let events = events.clone();
+        let session = self.session.clone();
         tokio::spawn(async move {
-            Self::finish_shutdown(link.shutdown().await, &events);
+            let stopped = link.shutdown().await;
+            // After the owner stops, no client event arms a new timer. No row
+            // comes after `Stopped` (Codex r4139029620).
+            session.stop_mute_timer();
+            Self::finish_shutdown(stopped, &events);
         });
     }
 
@@ -582,6 +589,59 @@ mod tests {
 
     use thinwire_protocol::{AdapterEvent, RedactedPairingSecret};
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    /// Codex r4139029620: shutdown stops a pending mute timer before
+    /// `Stopped`. No row comes after `Stopped`, and the timer task lets go
+    /// of the session. Both paths: no link, and a running link.
+    #[tokio::test]
+    async fn shutdown_stops_a_pending_mute_timer() {
+        for with_link in [false, true] {
+            let (tx, mut rx) = unbounded_channel();
+            let mut adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
+            if with_link {
+                let (_fake, handle, owner_session, _owner_rx) =
+                    link::tests::owner(link::tests::Fake::default());
+                handle.begin(None, 1);
+                handle.flush().await;
+                adapter.session = owner_session;
+                adapter.link = Some(handle);
+            } else {
+                adapter.session.begin(1);
+            }
+            adapter.session.apply(LinkEvent::Connected, 1, &tx);
+            let owners = adapter.session.owners();
+            let end = inbox::now_ms() + 100;
+            let timed = LinkEvent::Mute {
+                jid: CHAT.into(),
+                mute: inbox::Mute::UntilMs(end),
+            };
+            adapter.session.apply(timed, 1, &tx);
+            assert!(adapter.session.has_mute_timer());
+            assert_eq!(adapter.session.owners(), owners + 1, "the timer task");
+            drain(&mut rx);
+
+            adapter.shutdown(&tx);
+            let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("Stopped in time")
+                .expect("channel open");
+            assert_eq!(
+                stopped,
+                AdapterEvent::Stopped {
+                    protocol: ProtocolId::WhatsApp
+                }
+            );
+            assert!(!adapter.session.has_mute_timer(), "with_link={with_link}");
+            // Past the mute end: an aborted timer sends nothing.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(inbox::now_ms() > end);
+            assert!(rx.try_recv().is_err(), "no event after Stopped");
+            assert!(
+                adapter.session.owners() <= owners,
+                "the timer task let go of the session"
+            );
+        }
+    }
 
     fn adapter() -> (
         WhatsAppAdapter,

@@ -114,9 +114,22 @@ struct State {
     /// events (ADR 0010 rule 1), so the session keeps them in the inbox and
     /// sends the chat page on `Connected`.
     announced: bool,
-    /// The timer for the next timed mute end (Unix ms), and its task. One
-    /// timer runs at a time (#168 item 13).
-    mute_timer: Option<(i64, tokio::task::JoinHandle<()>)>,
+    /// The timer for the next timed mute end. One timer runs at a time
+    /// (#168 item 13).
+    mute_timer: Option<MuteTimer>,
+    /// Number of the last mute timer.
+    mute_timers: u64,
+}
+
+/// The timer for the next timed mute end (#168 item 13).
+struct MuteTimer {
+    /// The mute end it waits for (Unix ms).
+    end: i64,
+    /// Its number. A task that is no longer the armed timer does nothing:
+    /// `abort` cannot stop a task that already waits for the lock
+    /// (Codex r4139029620).
+    id: u64,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl LinkEvent {
@@ -213,7 +226,7 @@ impl Session {
     }
 
     fn reset_state(state: &mut State) -> Vec<AdapterEvent> {
-        Self::stop_mute_timer(state);
+        Self::abort_mute_timer(state);
         state.connected = false;
         state.sender = None;
         state.stopped = None;
@@ -243,13 +256,20 @@ impl Session {
         state.announced = false;
         // A timer of the old link has a stale generation: it would never end
         // a mute of this link (Codex r4138502157).
-        Self::stop_mute_timer(&mut state);
+        Self::abort_mute_timer(&mut state);
         state.inbox.new_connection();
     }
 
-    fn stop_mute_timer(state: &mut State) {
-        if let Some((_, task)) = state.mute_timer.take() {
-            task.abort();
+    /// Stop the mute timer. The adapter calls it before `Stopped`, so no row
+    /// comes after it, and the task lets go of the session and the event
+    /// sender (Codex r4139029620).
+    pub(super) fn stop_mute_timer(&self) {
+        Self::abort_mute_timer(&mut self.lock());
+    }
+
+    fn abort_mute_timer(state: &mut State) {
+        if let Some(timer) = state.mute_timer.take() {
+            timer.task.abort();
         }
     }
 
@@ -265,6 +285,18 @@ impl Session {
     #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
     pub(super) fn set_pairing(&self, pairing: u64) {
         self.lock().pairing = pairing;
+    }
+
+    /// Owners of the session state: the adapter, the link owner, and each
+    /// running timer or send task.
+    #[cfg(test)]
+    pub(super) fn owners(&self) -> usize {
+        Arc::strong_count(&self.state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_mute_timer(&self) -> bool {
+        self.lock().mute_timer.is_some()
     }
 
     pub(super) fn with_inbox<T>(&self, action: impl FnOnce(&mut Inbox) -> T) -> T {
@@ -382,15 +414,17 @@ impl Session {
         let Some(end) = state.inbox.next_mute_end() else {
             return;
         };
-        if let Some((armed, task)) = &state.mute_timer {
-            if *armed <= end && !task.is_finished() {
+        if let Some(timer) = &state.mute_timer {
+            if timer.end <= end && !timer.task.is_finished() {
                 return;
             }
-            task.abort();
+            timer.task.abort();
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        state.mute_timers += 1;
+        let id = state.mute_timers;
         let wait = u64::try_from(end.saturating_sub(inbox::now_ms())).unwrap_or(0);
         let session = self.clone();
         let events = events.clone();
@@ -398,15 +432,20 @@ impl Session {
             // One millisecond more: the sleep clock and the wall clock can
             // differ. A timer that wakes too early arms again.
             tokio::time::sleep(Duration::from_millis(wait.saturating_add(1))).await;
-            session.end_mutes(generation, &events);
+            session.end_mutes(generation, id, &events);
         });
-        state.mute_timer = Some((end, task));
+        state.mute_timer = Some(MuteTimer { end, id, task });
     }
 
-    /// The mute timer of link `generation` fired: end the mutes that passed.
-    fn end_mutes(&self, generation: u64, events: &EventTx) {
+    /// Mute timer `id` of link `generation` fired: end the mutes that
+    /// passed. A timer that was stopped or replaced does nothing.
+    fn end_mutes(&self, generation: u64, id: u64, events: &EventTx) {
         let mut state = self.lock();
-        if state.generation == NO_LINK || state.generation != generation {
+        let armed = state
+            .mute_timer
+            .as_ref()
+            .is_some_and(|timer| timer.id == id);
+        if !armed || state.generation == NO_LINK || state.generation != generation {
             return;
         }
         state.mute_timer = None;
@@ -589,7 +628,7 @@ mod tests {
     }
 
     fn armed_end(session: &Session) -> Option<i64> {
-        session.lock().mute_timer.as_ref().map(|(end, _)| *end)
+        session.lock().mute_timer.as_ref().map(|timer| timer.end)
     }
 
     /// #168 item 12: the session tells the inbox about each connection. A
@@ -719,6 +758,30 @@ mod tests {
         assert!(!row.muted);
         assert_eq!(row.unread, 1, "its unread counts in the title again");
         assert!(inbox::now_ms() >= end);
+    }
+
+    /// Codex r4139029620: `abort` cannot stop a timer task that already
+    /// waits for the lock. The task of a stopped timer does nothing when it
+    /// runs late.
+    #[tokio::test]
+    async fn a_stopped_mute_timer_task_does_nothing() {
+        let (session, tx, mut rx) = linked();
+        let passed = LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::UntilMs(inbox::now_ms() - 1),
+        };
+        // No await from here on: the spawned timer task cannot run.
+        session.apply(passed, 1, &tx);
+        last_row(&mut rx);
+        let id = session
+            .lock()
+            .mute_timer
+            .as_ref()
+            .map(|timer| timer.id)
+            .expect("armed");
+        session.stop_mute_timer();
+        session.end_mutes(1, id, &tx);
+        assert!(last_row(&mut rx).is_none(), "no row from a stopped timer");
     }
 
     /// #168 item 13: one timer waits for the earliest end. A reset stops it.
