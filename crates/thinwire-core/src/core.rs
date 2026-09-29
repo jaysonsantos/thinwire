@@ -1172,6 +1172,25 @@ mod tests {
     }
 
     /// PR #48 review: the keychain watch must not outlive the core. After a
+    /// drop, the change signal ends (no task keeps a strong notifier).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keychain_watch_stops_when_the_core_is_dropped() {
+        // A detached store never settles and never fails: the watch loops.
+        let store = SecretStore::detached_for_test();
+        let core = Core::with_store(
+            &Handle::current(),
+            CoreConfig::new(temp_settings()),
+            Arc::clone(&store),
+            Arc::new(WhatsAppPhoneVault::new()),
+            Vec::new(),
+        );
+        let mut signal = core.signal();
+        drop(core);
+        let ended = tokio::time::timeout(WAIT, async { while signal.changed().await {} }).await;
+        assert!(ended.is_ok(), "a detached task still holds the notifier");
+        assert!(!store.attach_settled(), "the watch had no end but the drop");
+    }
+
     /// A stand-in for a local-only AGPL client: only its id and caps matter.
     struct Replacement(thinwire_protocol::ProtocolCapabilities);
 
@@ -1219,25 +1238,6 @@ mod tests {
             .find(|row| row.caps.id == ProtocolId::WhatsApp)
             .expect("whatsapp row");
         assert_eq!(row.caps.detail, "local-only replacement");
-    }
-
-    /// drop, the change signal ends (no task keeps a strong notifier).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn keychain_watch_stops_when_the_core_is_dropped() {
-        // A detached store never settles and never fails: the watch loops.
-        let store = SecretStore::detached_for_test();
-        let core = Core::with_store(
-            &Handle::current(),
-            CoreConfig::new(temp_settings()),
-            Arc::clone(&store),
-            Arc::new(WhatsAppPhoneVault::new()),
-            Vec::new(),
-        );
-        let mut signal = core.signal();
-        drop(core);
-        let ended = tokio::time::timeout(WAIT, async { while signal.changed().await {} }).await;
-        assert!(ended.is_ok(), "a detached task still holds the notifier");
-        assert!(!store.attach_settled(), "the watch had no end but the drop");
     }
 
     /// PR #48 review: a failed read ends the watch after one last wake.
