@@ -689,15 +689,8 @@ async fn fetch_history_page(
             // query stops at `HISTORY_READ_LIMIT`.
             let mut page = NewestBound::new(HISTORY_PAGE);
             for ts in timestamps {
-                let Some(content) =
-                    keep_history_row(manager.store().message(thread, ts).await.map_err(|_| ()))
-                else {
-                    continue;
-                };
-                let (millis, id) = content_history_key(&content);
-                if is_on_history_page(millis, &id, before, before_id) {
-                    page.consider(millis, id, content);
-                }
+                let loaded = manager.store().message(thread, ts).await.map_err(|_| ());
+                note_history_row(&mut page, loaded, before, before_id, content_history_key);
             }
             if window_is_enough(page.passing(), HISTORY_PAGE, reached_start) {
                 return Ok(page.finish(reached_start));
@@ -710,9 +703,27 @@ async fn fetch_history_page(
     outcome
 }
 
-/// A missing or unreadable row is skipped. One bad row does not drop the page.
-fn keep_history_row<T>(row: Result<Option<T>, ()>) -> Option<T> {
-    row.ok().flatten()
+/// A missing row and a row that fails to decode are both skipped. The error
+/// is logged with no message text, and the rest of the page stays.
+fn note_history_row<T>(
+    page: &mut NewestBound<T>,
+    row: Result<Option<T>, ()>,
+    before: u64,
+    before_id: Option<&str>,
+    key_of: impl FnOnce(&T) -> (u64, String),
+) {
+    let value = match row {
+        Ok(Some(value)) => value,
+        Ok(None) => return,
+        Err(()) => {
+            tracing::warn!("signal history skipped a row that did not decode");
+            return;
+        }
+    };
+    let (millis, id) = key_of(&value);
+    if is_on_history_page(millis, &id, before, before_id) {
+        page.consider(millis, id, value);
+    }
 }
 
 fn history_store_url() -> Option<String> {
@@ -1542,10 +1553,30 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_history_row_is_skipped() {
-        assert!(keep_history_row::<u8>(Err(())).is_none());
-        assert!(keep_history_row(Ok(None::<u8>)).is_none());
-        assert_eq!(keep_history_row(Ok(Some(7))), Some(7));
+    fn a_page_with_one_corrupt_row_returns_the_other_rows() {
+        fn push(page: &mut NewestBound<u64>, row: Result<Option<u64>, ()>) {
+            note_history_row(page, row, 10_000, None, |ts| (*ts, format!("{ts}:a")));
+        }
+
+        let mut page = NewestBound::new(HISTORY_PAGE);
+        push(&mut page, Ok(Some(3)));
+        push(&mut page, Err(()));
+        push(&mut page, Ok(None));
+        push(&mut page, Ok(Some(1)));
+        push(&mut page, Ok(Some(2)));
+        let (rows, _) = page.finish(true);
+        assert_eq!(rows, vec![1, 2, 3]);
+
+        let mut bounded = NewestBound::new(HISTORY_PAGE);
+        for ts in 1..=(HISTORY_PAGE as u64 + 2) {
+            let row = if ts == 4 { Err(()) } else { Ok(Some(ts)) };
+            push(&mut bounded, row);
+        }
+        let (rows, _) = bounded.finish(true);
+        assert_eq!(rows.len(), HISTORY_PAGE);
+        assert!(!rows.contains(&4));
+        assert_eq!(rows.first().copied(), Some(2));
+        assert_eq!(rows.last().copied(), Some(HISTORY_PAGE as u64 + 2));
     }
 
     #[test]
