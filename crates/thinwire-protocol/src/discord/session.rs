@@ -297,7 +297,7 @@ impl Session {
                     if !listed {
                         return;
                     }
-                    spawn_previews(api, channels, shared, gate, events, ticket);
+                    spawn_previews(api, channels, shared, gate, events, ticket, generation);
                 }
                 Err(error) => {
                     tracing::info!(%error, "discord channel list failed");
@@ -736,8 +736,8 @@ fn publish_channels(
 }
 
 /// Fills previews after the account is linked. At most
-/// [`PREVIEW_FETCH_CONCURRENCY`] history calls run at once. A failure leaves
-/// the empty preview already published.
+/// [`PREVIEW_FETCH_CONCURRENCY`] history calls run at once. A per-channel
+/// failure leaves the empty preview. A 401 uses the same unlink step as history.
 fn spawn_previews(
     api: Arc<dyn DiscordApi>,
     channels: Vec<InboxChannel>,
@@ -745,6 +745,7 @@ fn spawn_previews(
     gate: Gate,
     events: EventTx,
     ticket: u64,
+    generation: u64,
 ) {
     let pause = Arc::new(PreviewPause::new());
     let limit = Arc::new(Semaphore::new(PREVIEW_FETCH_CONCURRENCY));
@@ -762,7 +763,28 @@ fn spawn_previews(
             if !preview_still_listed(&shared, &gate, ticket, &channel) {
                 return;
             }
-            let preview = channel_preview(api.as_ref(), channel.channel_id, &pause).await;
+            let preview = match channel_preview(api.as_ref(), channel.channel_id, &pause).await {
+                Ok(preview) => preview,
+                Err(error) => {
+                    // The preview await released the lock. Unlink only if this
+                    // generation is still the one that started the preview.
+                    // The guard ends before the seal await (it is not `Send`).
+                    {
+                        let Ok(mut state) = shared.lock() else {
+                            return;
+                        };
+                        if state.generation != generation || state.reload_ticket != ticket {
+                            return;
+                        }
+                        if !state.revoked {
+                            settle_unauthorized(&mut state, &events, error);
+                        }
+                    }
+                    let sealed = seal_unlink(api.as_ref(), generation).await;
+                    publish_unlink(&shared, &gate, sealed, &events);
+                    return;
+                }
+            };
             if preview.is_empty() || !preview_still_listed(&shared, &gate, ticket, &channel) {
                 return;
             }

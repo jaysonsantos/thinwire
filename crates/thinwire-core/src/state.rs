@@ -395,10 +395,10 @@ pub struct Snapshot {
     /// `status_text` still holds it, it wins over a load of another protocol.
     /// The selected protocol's own load still shows (#90, #73).
     failure_status: Option<String>,
-    /// Accepted Telegram sends still waiting for Telegram's own status line.
+    /// Accepted Telegram sends still waiting for their own "Message sent." line.
     /// `SendAccepted` drops them from [`Self::sends`], but the strip stays on
-    /// Sending… until that line. Another protocol must not restore the
-    /// previous one first.
+    /// Sending… until that line arrives once per send. Another Ready line does
+    /// not clear the rest.
     telegram_send_unconfirmed: u32,
     pub compose: String,
     pub auth_busy: bool,
@@ -707,10 +707,13 @@ impl Snapshot {
                 {
                     self.ready_status = (status == AdapterStatus::Ready).then(|| detail.clone());
                     self.failure_status = (status != AdapterStatus::Ready).then(|| detail.clone());
+                    // One "Message sent." closes one accepted send. A different
+                    // Ready line must not clear the other sends.
+                    if status == AdapterStatus::Ready && detail == "Message sent." {
+                        self.telegram_send_unconfirmed =
+                            self.telegram_send_unconfirmed.saturating_sub(1);
+                    }
                     self.status_text = detail;
-                    // Telegram's own line ("Message sent.") replaces Sending….
-                    // An accepted send is no longer waiting on that line.
-                    self.telegram_send_unconfirmed = 0;
                     if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                         if self.auth != AuthScreen::Idle {
                             self.auth_busy = false;
@@ -6749,6 +6752,67 @@ mod tests {
         assert_eq!(snapshot.status_text, "Message sent.");
         assert_eq!(snapshot.status_line(), "Message sent.");
         assert_ne!(snapshot.status_text, before);
+    }
+
+    #[test]
+    fn each_telegram_send_keeps_sending_until_its_own_line() {
+        let mut snapshot = Snapshot::new();
+        link_telegram(&mut snapshot);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 1),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bea", 2),
+        });
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some("telegram:1".into());
+        snapshot.history_loading.clear();
+        snapshot.chat_list_loading.clear();
+        snapshot.compose = "one".into();
+        snapshot.send_compose();
+        let first = send_request(&mut snapshot);
+        snapshot.selected_conversation = Some("telegram:2".into());
+        snapshot.history_loading.clear();
+        snapshot.compose = "two".into();
+        snapshot.send_compose();
+        let second = send_request(&mut snapshot);
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request: first,
+        });
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+            request: second,
+        });
+        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Loading recent messages.".into(),
+        });
+        assert_eq!(
+            snapshot.status_line(),
+            SENDING_STATUS,
+            "an unrelated Ready line does not clear both sends"
+        );
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Message sent.".into(),
+        });
+        assert_eq!(
+            snapshot.status_line(),
+            SENDING_STATUS,
+            "the other send still waits for its own line"
+        );
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Ready,
+            detail: "Message sent.".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Message sent.");
     }
 
     #[test]
