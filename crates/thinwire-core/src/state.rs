@@ -8310,6 +8310,33 @@ mod tests {
         assert!(snapshot.status_line_loads());
     }
 
+    /// #124: the user looks at Slack while a Slack chat loads and a Telegram
+    /// failure is the last status. The strip shows the load of the chat on
+    /// screen first. The Telegram failure shows when that load ends.
+    #[test]
+    fn the_selected_protocols_load_shows_before_a_telegram_failure() {
+        let store = SecretStore::memory();
+        let mut snapshot = telegram_idle_slack_linked(&store);
+        snapshot.select_protocol(ProtocolId::Slack);
+        snapshot
+            .history_loading
+            .insert((ProtocolId::Slack, "slack:C1".to_owned()));
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "Telegram connection lost.".into(),
+        });
+        assert_eq!(snapshot.status_line(), LOADING_MESSAGES_STATUS);
+        assert!(snapshot.status_line_loads());
+
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Telegram connection lost.");
+        assert!(!snapshot.status_line_loads(), "a failure is not busy");
+    }
+
     /// #82 qa L1: a load of a protocol with no visible surface does not make
     /// the shown line busy.
     #[test]
