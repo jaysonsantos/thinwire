@@ -2835,9 +2835,11 @@ impl Snapshot {
                 })
         });
         self.pending.retain(|command| !is_open(command));
-        // An older page in flight can lose its answer too. End it; a later
-        // scroll asks again (#163).
+        // An older page in flight can lose its answer too, and a queued one
+        // would go out during the reconnect. End both; a later scroll asks
+        // again (#163, Codex r4137896062).
         self.older_loading.retain(|(owner, _)| *owner != protocol);
+        self.pending.retain(|command| !matches!(command, AdapterCommand::LoadOlderMessages { protocol: owner, .. } if *owner == protocol));
         // A chat-list load that is in flight or queued ends here too. Its
         // spinner stops, and `Linked` loads the list again (#163).
         let is_list = |command: &AdapterCommand| matches!(command, AdapterCommand::LoadChats { protocol: owner } if *owner == protocol);
@@ -8665,6 +8667,22 @@ mod tests {
             snapshot.loading_line(ProtocolId::Slack),
             Some(LOADING_OLDER_STATUS)
         );
+    }
+
+    /// Codex r4137896062 (#187): an older-page load that is still queued
+    /// when a reconnect starts does not go out. Its spinner stops too.
+    #[test]
+    fn a_reconnect_drops_a_queued_older_page() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.load_older();
+        assert_eq!(snapshot.older_state(), OlderState::Loading);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linking,
+        });
+        assert!(older_requests(&mut snapshot).is_empty(), "not sent");
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
     }
 
     /// #163: a chat-list load in flight when a reconnect starts can lose its
