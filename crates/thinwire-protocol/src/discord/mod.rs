@@ -2104,6 +2104,84 @@ mod tests {
         assert!(late.is_empty(), "an event after the disconnect: {late:?}");
     }
 
+    /// Review of #157: a new send in flight at a reconnect is rejected with
+    /// its row removed. Its text is not kept, so a Retry of the removed row
+    /// in the new session posts nothing.
+    #[tokio::test]
+    async fn a_removed_row_keeps_no_text_for_retry() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "no retry".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        let sent = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReceived { .. })
+        })
+        .await;
+        let row = messages(&sent)
+            .iter()
+            .find(|message| message.id.contains(":pending:"))
+            .map(|message| message.id.clone())
+            .expect("pending row");
+        sends_at_hold(&api, 1).await;
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = inbox_loaded(&mut rx).await;
+        hold.notify_waiters();
+        let settled = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 1, .. })
+        })
+        .await;
+        assert!(settled.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessagesRemoved { message_ids, .. } if message_ids.contains(&row)
+        )));
+        adapter
+            .handle(
+                AdapterCommand::ResendMessage {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                    message_id: row,
+                    request: 2,
+                },
+                &tx,
+            )
+            .expect("retry");
+        let answer = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::SendAccepted { request: 2, .. }
+                    | AdapterEvent::SendRejected { request: 2, .. }
+            )
+        })
+        .await;
+        assert!(
+            matches!(
+                answer.last(),
+                Some(AdapterEvent::SendRejected { request: 2, .. })
+            ),
+            "a removed row has no text to post again"
+        );
+    }
+
     /// Codex r4130981025 on #157: a shutdown that reaches its limit with a
     /// send still in flight emits `Stopped` once, and the owner publishes
     /// nothing after it.

@@ -580,6 +580,18 @@ impl Owner {
             Msg::SealDone { unlink } => self.seal_done(unlink),
             Msg::Retire { carried } => {
                 self.retire();
+                // A new send still in flight is rejected with its row removed
+                // when its call ends. Its text cannot be retried, so it does
+                // not move to the next session.
+                let pending: Vec<String> = self
+                    .inflight
+                    .values()
+                    .filter(|tracked| tracked.row == SendRow::Pending)
+                    .map(|tracked| tracked.message_id.clone())
+                    .collect();
+                for message_id in pending {
+                    self.carried.bodies.remove(&message_id);
+                }
                 let _ = carried.send(std::mem::take(&mut self.carried));
             }
             Msg::Shutdown { done, limit } => {
@@ -1039,7 +1051,7 @@ impl Owner {
         };
         if self.replaced() {
             // A later session replaced this one: the row does not stay pending.
-            settle_row(&self.events, &tracked);
+            self.settle_row(&tracked);
             emit_send_rejected(
                 &self.events,
                 ProtocolId::Discord,
@@ -1150,7 +1162,7 @@ impl Owner {
         let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
         sends.sort_by_key(|(request, _)| *request);
         for (request, tracked) in sends {
-            settle_row(&self.events, &tracked);
+            self.settle_row(&tracked);
             emit_send_rejected(
                 &self.events,
                 ProtocolId::Discord,
@@ -1217,7 +1229,7 @@ impl Owner {
         let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
         sends.sort_by_key(|(request, _)| *request);
         for (request, tracked) in sends {
-            settle_row(&self.events, &tracked);
+            self.settle_row(&tracked);
             emit_send_rejected(
                 &self.events,
                 ProtocolId::Discord,
@@ -1233,6 +1245,16 @@ impl Owner {
         self.retire();
         self.closed = true;
         emit_disconnected(&self.events, detail);
+    }
+
+    /// A send that gets no accepted result: remove its optimistic row (and
+    /// drop its text, which nothing can retry now), or set a retried row
+    /// back to failed (it keeps its text for Retry).
+    fn settle_row(&mut self, tracked: &Inflight) {
+        if tracked.row == SendRow::Pending {
+            self.carried.bodies.remove(&tracked.message_id);
+        }
+        settle_row(&self.events, tracked);
     }
 
     /// Ends a shutdown: retire, emit `Stopped` once, and publish nothing
