@@ -497,8 +497,9 @@ pub struct Snapshot {
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
     /// Accounts that ended for good in this pump: a Telegram session that
-    /// another device or Telegram ended. The core drops their thinwire
-    /// mutes (#153 review). A reconnect or an app stop never adds one.
+    /// another device or Telegram ended, or `AccountEnded` (a WhatsApp
+    /// logout on the phone). The core drops their thinwire mutes (#153
+    /// review). A reconnect or an app stop never adds one.
     ended_accounts: Vec<ProtocolId>,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_screen: WhatsAppScreen,
@@ -929,6 +930,7 @@ impl Snapshot {
                 self.auth_rejection = Some(error);
             }
             AdapterEvent::TelegramSessionEnded => self.end_telegram_session(),
+            AdapterEvent::AccountEnded { protocol } => self.ended_accounts.push(protocol),
             AdapterEvent::TelegramDataReset { moved_to } => {
                 self.data_reset = Some(moved_to);
             }

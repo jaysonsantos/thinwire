@@ -1636,6 +1636,48 @@ mod tests {
         assert!(text.lines().any(|line| line == "slack slack:C1"));
     }
 
+    /// #201 qa B: a WhatsApp logout on the phone (`AccountEnded`) drops the
+    /// WhatsApp mutes only, on screen and in the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ended_account_drops_only_its_protocol_mutes() {
+        use crate::mutes::ChatMute;
+
+        let (mut core, events_tx, path) = core_with_written_mutes("account-ended").await;
+        let jid = "whatsapp:4915550100@s.whatsapp.net";
+        core.dispatch(Intent::SetChatMute {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: jid.into(),
+            muted: true,
+        });
+        wait_for_mutes(&path, |mutes| mutes.contains(ProtocolId::WhatsApp, jid)).await;
+        events_tx
+            .send(AdapterEvent::AccountEnded {
+                protocol: ProtocolId::WhatsApp,
+            })
+            .expect("queue");
+        assert!(core.pump());
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::WhatsApp, jid),
+            ChatMute::None
+        );
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Here
+        );
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Slack, "slack:C1"),
+            ChatMute::Here
+        );
+        wait_for_mutes(&path, |mutes| !mutes.contains(ProtocolId::WhatsApp, jid)).await;
+        let text = std::fs::read_to_string(&path).expect("file");
+        assert!(
+            !text.lines().any(|line| line.starts_with("whatsapp ")),
+            "no whatsapp line"
+        );
+        assert!(text.lines().any(|line| line == "telegram telegram:2"));
+        assert!(text.lines().any(|line| line == "slack slack:C1"));
+    }
+
     /// #153 review: a reconnect, an adapter stop, and an app shutdown never
     /// drop a mute.
     #[tokio::test(flavor = "multi_thread")]

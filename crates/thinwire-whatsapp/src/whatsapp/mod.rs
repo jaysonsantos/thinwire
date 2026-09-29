@@ -2090,6 +2090,46 @@ mod tests {
         kit.run_all().await;
     }
 
+    /// #201 qa B: only a phone logout ends the account for good and sends
+    /// `AccountEnded`, so the shell drops the WhatsApp mutes. A ban, a dead
+    /// pairing, a reconnect, a cancel, and a stop do not.
+    #[test]
+    fn only_a_logout_ends_the_account() {
+        let ended = |events: &[AdapterEvent]| {
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        AdapterEvent::AccountEnded {
+                            protocol: ProtocolId::WhatsApp
+                        }
+                    )
+                })
+                .count()
+        };
+        for event in [
+            LinkEvent::LoggedOut,
+            LinkEvent::TemporaryBan,
+            LinkEvent::PairFailed,
+            LinkEvent::PairThrottled,
+            LinkEvent::QrExhausted,
+            LinkEvent::Disconnected,
+        ] {
+            let (adapter, mut rx, tx) = connected(Arc::new(FakeSender::default()));
+            let expected = usize::from(event == LinkEvent::LoggedOut);
+            adapter.session.apply(event.clone(), 1, &tx);
+            assert_eq!(ended(&drain(&mut rx)), expected, "{event:?}");
+        }
+
+        let (mut adapter, mut rx, tx) = connected(Arc::new(FakeSender::default()));
+        adapter
+            .handle(AdapterCommand::WhatsAppCancelLink, &tx)
+            .expect("cancel");
+        adapter.shutdown(&tx);
+        assert_eq!(ended(&drain(&mut rx)), 0, "cancel and stop");
+    }
+
     #[test]
     fn terminal_events_stop_the_link_and_invalidate_only_on_logout() {
         for event in [
