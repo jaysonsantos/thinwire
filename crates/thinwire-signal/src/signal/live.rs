@@ -63,8 +63,9 @@ pub(super) enum WorkerJob {
     },
     /// Reread contacts and groups. `LoadChats` sends this.
     Refresh,
-    /// The user opened or left a chat. Clear that chat's unread count.
-    Viewed,
+    /// The user opened or left a chat. The id is the chat at enqueue time.
+    /// Clear that chat's unread count.
+    Viewed(Option<String>),
 }
 
 pub(super) struct Session {
@@ -179,8 +180,10 @@ impl Session {
         self.enqueue(WorkerJob::Refresh)
     }
 
-    pub(super) fn request_viewed(&self) -> bool {
-        self.enqueue(WorkerJob::Viewed)
+    /// Queue a clear for the chat just opened or left.
+    /// The job stores that id for the worker.
+    pub(super) fn request_viewed(&self, conversation_id: Option<String>) -> bool {
+        self.enqueue(WorkerJob::Viewed(conversation_id))
     }
 
     #[cfg(test)]
@@ -297,8 +300,9 @@ async fn run_linked(
     }
     emit_account(&events, ProtocolId::Signal, AccountState::Linked);
     let mut rows = std::collections::HashMap::<String, Conversation>::new();
+    let mut unread = std::collections::HashMap::<String, u32>::new();
     let (mut known, mut group_titles) =
-        match publish_chats(&manager, session.as_ref(), &events, &mut rows).await {
+        match publish_chats(&manager, session.as_ref(), &events, &mut rows, &unread).await {
             Ok(published) => published,
             Err(()) => {
                 fail(&events, SYNC_FAILED);
@@ -316,7 +320,6 @@ async fn run_linked(
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     *session.outbound.lock().expect("outbound") = Some(tx);
-    let mut unread = std::collections::HashMap::<String, u32>::new();
     let mut receive = ReceiveLoop::new();
     let mut relink = Relink::new();
     while session.is_current(token) {
@@ -459,7 +462,7 @@ async fn run_linked(
                 .await;
             }
             Some(WorkerJob::Refresh) => {
-                match publish_chats(&manager, session.as_ref(), &events, &mut rows).await {
+                match publish_chats(&manager, session.as_ref(), &events, &mut rows, &unread).await {
                     Ok((next_known, next_titles)) => {
                         known = next_known;
                         group_titles = next_titles;
@@ -469,15 +472,8 @@ async fn run_linked(
                 }
                 thinwire_protocol::emit_chat_list_loaded(&events, ProtocolId::Signal);
             }
-            Some(WorkerJob::Viewed) => {
-                if let Some(id) = session.viewed() {
-                    unread.insert(id.clone(), 0);
-                    if let Some(row) = rows.get(&id).cloned() {
-                        let row = read_row(row);
-                        rows.insert(id, row.clone());
-                        emit_conversation(&events, row);
-                    }
-                }
+            Some(WorkerJob::Viewed(conversation_id)) => {
+                clear_viewed(&events, &mut unread, &mut rows, conversation_id);
             }
             None => {}
         }
@@ -534,6 +530,7 @@ async fn publish_chats(
     session: &Session,
     events: &EventTx,
     rows: &mut HashMap<String, Conversation>,
+    unread: &HashMap<String, u32>,
 ) -> Result<(HashSet<String>, HashMap<String, String>), ()> {
     let mut known = HashSet::new();
     let mut group_titles = HashMap::new();
@@ -543,8 +540,7 @@ async fn publish_chats(
     for contact in contacts.flatten() {
         let conversation = conversation_from_contact(&contact);
         known.insert(conversation.id.clone());
-        remember_row(rows, &conversation);
-        emit_conversation(events, conversation);
+        emit_refreshed_row(events, rows, unread, conversation);
         let Some(before) = history_before else {
             continue;
         };
@@ -553,7 +549,7 @@ async fn publish_chats(
             continue;
         };
         for message in messages {
-            emit_content(events, &message, &names, &group_titles, rows);
+            emit_content(events, &message, &names, &group_titles, rows, Some(unread));
         }
     }
     let groups = manager.store().groups().await.map_err(|_| ())?;
@@ -563,8 +559,7 @@ async fn publish_chats(
         session.remember_group(&key).await;
         group_titles.insert(conversation.id.clone(), conversation.title.clone());
         known.insert(conversation.id.clone());
-        remember_row(rows, &conversation);
-        emit_conversation(events, conversation);
+        emit_refreshed_row(events, rows, unread, conversation);
         let Some(before) = history_before else {
             continue;
         };
@@ -573,7 +568,7 @@ async fn publish_chats(
             continue;
         };
         for message in messages {
-            emit_content(events, &message, &names, &group_titles, rows);
+            emit_content(events, &message, &names, &group_titles, rows, Some(unread));
         }
     }
     Ok((known, group_titles))
@@ -601,7 +596,7 @@ async fn load_older_page(
     .await;
     let (page, more, note) = older_page_outcome(loaded);
     for message in page {
-        emit_content(events, &message, names, group_titles, rows);
+        emit_content(events, &message, names, group_titles, rows, None);
     }
     let _ = events.send(AdapterEvent::OlderHistoryLoaded {
         protocol: ProtocolId::Signal,
@@ -749,6 +744,38 @@ fn read_row(mut row: Conversation) -> Conversation {
     row
 }
 
+/// Store and emit a row rebuilt from the store.
+/// The store row starts at unread zero. The count comes from the worker map.
+fn emit_refreshed_row(
+    events: &EventTx,
+    rows: &mut HashMap<String, Conversation>,
+    unread: &HashMap<String, u32>,
+    mut conversation: Conversation,
+) {
+    conversation.unread = unread.get(&conversation.id).copied().unwrap_or(0);
+    remember_row(rows, &conversation);
+    emit_conversation(events, conversation);
+}
+
+/// Clear the unread count stored on a `Viewed` job.
+/// `None` means the user left the open chat, so no badge changes.
+fn clear_viewed(
+    events: &EventTx,
+    unread: &mut HashMap<String, u32>,
+    rows: &mut HashMap<String, Conversation>,
+    conversation_id: Option<String>,
+) {
+    let Some(id) = conversation_id else {
+        return;
+    };
+    unread.insert(id.clone(), 0);
+    if let Some(row) = rows.get(&id).cloned() {
+        let row = read_row(row);
+        rows.insert(id, row.clone());
+        emit_conversation(events, row);
+    }
+}
+
 fn remember_row(rows: &mut HashMap<String, Conversation>, conversation: &Conversation) {
     rows.insert(conversation.id.clone(), conversation.clone());
 }
@@ -867,12 +894,17 @@ fn emit_content(
     names: &HashMap<String, String>,
     group_titles: &HashMap<String, String>,
     rows: &mut HashMap<String, Conversation>,
+    unread: Option<&HashMap<String, u32>>,
 ) {
     let Some((conversation, message)) = row_and_message(content, names, group_titles) else {
         return;
     };
-    remember_row(rows, &conversation);
-    emit_conversation(events, conversation);
+    if let Some(unread) = unread {
+        emit_refreshed_row(events, rows, unread, conversation);
+    } else {
+        remember_row(rows, &conversation);
+        emit_conversation(events, conversation);
+    }
     emit_message(events, message);
 }
 
@@ -1480,6 +1512,98 @@ mod tests {
         assert_eq!(page, vec![1]);
         assert!(!more);
         assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_worker_unread_count() {
+        let contact = Uuid::from_u128(0x5555);
+        let id = contact.to_string();
+        let mut unread = HashMap::new();
+        unread.insert(id.clone(), 4);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rows = HashMap::new();
+        emit_refreshed_row(&tx, &mut rows, &unread, inbox_row(&id, 0));
+        let content = envelope(
+            contact,
+            DataMessage {
+                body: Some("stored line".into()),
+                ..Default::default()
+            },
+        );
+        emit_content(
+            &tx,
+            &content,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut rows,
+            Some(&unread),
+        );
+        let mut counts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::ConversationUpsert { conversation } = event {
+                assert_eq!(conversation.id, id);
+                counts.push(conversation.unread);
+            }
+        }
+        assert_eq!(counts, vec![4, 4]);
+        assert_eq!(rows.get(&id).expect("row").unread, 4);
+    }
+
+    #[test]
+    fn two_queued_viewed_jobs_clear_their_own_chats() {
+        let session = Session::new();
+        let mut jobs = session.install_jobs_for_test();
+        session.set_viewed(Some("b".to_string()));
+        assert!(session.request_viewed(Some("a".to_string())));
+        assert!(session.request_viewed(Some("b".to_string())));
+        assert_eq!(session.viewed().as_deref(), Some("b"));
+
+        let mut unread = HashMap::from([("a".to_string(), 2), ("b".to_string(), 5)]);
+        let mut rows = HashMap::from([
+            ("a".to_string(), inbox_row("a", 2)),
+            ("b".to_string(), inbox_row("b", 5)),
+        ]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut queued = Vec::new();
+        for _ in 0..2 {
+            let Ok(WorkerJob::Viewed(id)) = jobs.try_recv() else {
+                panic!("queued job must carry the viewed chat");
+            };
+            queued.push(id);
+        }
+        assert!(jobs.try_recv().is_err());
+        assert_eq!(queued, vec![Some("a".to_string()), Some("b".to_string())]);
+        for id in queued {
+            clear_viewed(&tx, &mut unread, &mut rows, id);
+        }
+        assert_eq!(unread.get("a"), Some(&0));
+        assert_eq!(unread.get("b"), Some(&0));
+        assert_eq!(rows.get("a").expect("a").unread, 0);
+        assert_eq!(rows.get("b").expect("b").unread, 0);
+        let mut cleared = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::ConversationUpsert { conversation } = event {
+                cleared.push((conversation.id, conversation.unread));
+            }
+        }
+        assert_eq!(cleared, vec![("a".to_string(), 0), ("b".to_string(), 0)]);
+    }
+
+    fn inbox_row(id: &str, unread: u32) -> Conversation {
+        Conversation {
+            protocol: ProtocolId::Signal,
+            id: id.to_string(),
+            title: id.to_string(),
+            participant: id.to_string(),
+            preview: String::new(),
+            unread,
+            order: 0,
+            last_at: 0,
+            is_group: false,
+            writable: true,
+            muted: false,
+            placeholder: false,
+        }
     }
 
     fn message_id(events: &[AdapterEvent]) -> String {

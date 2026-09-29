@@ -589,7 +589,7 @@ impl ProtocolAdapter for SignalAdapter {
         #[cfg(feature = "signal-local")]
         if let Engine::Live(session) = &self.engine {
             session.set_viewed(self.viewed.clone());
-            session.request_viewed();
+            session.request_viewed(self.viewed.clone());
         }
     }
 }
