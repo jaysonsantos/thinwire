@@ -35,8 +35,21 @@ use crate::adapter::{
     emit_stopped,
 };
 
-/// Messages loaded when a channel opens.
-const HISTORY_LIMIT: u16 = 50;
+/// Messages loaded when a channel opens. Also the cap on the per-channel
+/// `shown` display cache.
+pub(super) const HISTORY_LIMIT: u16 = 50;
+
+/// How long a Slack post identity stays deduped after its timestamp.
+/// Matches `thinwire_core::notify::STALE_AFTER_SECS`: a Socket Mode retry
+/// can still notify while the post is that fresh, so liveness cannot follow
+/// the `HISTORY_LIMIT` display cache. A post at exactly this age still
+/// notifies (`now - sent_at > STALE_AFTER_SECS`), so it stays deduped too.
+pub(super) const DEDUP_FRESH_SECS: i64 = 300;
+
+/// Per-channel cap on deduped identities. Age eviction keeps every identity
+/// inside `DEDUP_FRESH_SECS`. This drops the oldest only when one channel
+/// exceeds it inside that window.
+const DEDUP_LIMIT: usize = 4096;
 
 /// Pages of `conversations.list` fetched in one load. Each page is one Web API
 /// call, so the live client's rate control applies between them. A later
@@ -279,8 +292,14 @@ where
     /// Channel the user is looking at. Inbound messages there stay read.
     viewing: Option<String>,
     /// Texts this session has shown, newest kept, so a delete can move the preview.
-    /// `counted` is true when that post increased `unread`.
+    /// `counted` is true when that post increased `unread`. Capped at
+    /// `HISTORY_LIMIT`. A post still listed here is not live again. Posts that
+    /// have left this cache stay deduped in `deduped`.
     shown: HashMap<String, Vec<Shown>>,
+    /// Post `ts` and `client_msg_id` values kept after `shown` evicts them,
+    /// for at least `DEDUP_FRESH_SECS`. A Socket Mode retry stays `History`
+    /// while its identity is here.
+    deduped: HashMap<String, Vec<Deduped>>,
 }
 
 impl<A, S, B> Session<A, S, B>
@@ -301,6 +320,7 @@ where
             names: HashMap::new(),
             viewing: None,
             shown: HashMap::new(),
+            deduped: HashMap::new(),
         }
     }
 
@@ -646,6 +666,7 @@ where
         }
         self.channels.clear();
         self.shown.clear();
+        self.deduped.clear();
     }
 
     async fn revoked(&mut self) {
@@ -696,6 +717,7 @@ where
             .collect();
         for id in gone {
             self.shown.remove(&id);
+            self.deduped.remove(&id);
             // A rejoin reads `can_post` again. A denial for a channel the
             // app has left must not stick.
             if let Some(live) = &mut self.live {
@@ -891,7 +913,9 @@ where
         let keep_cached_preview = page.posts.is_empty() && !page.authoritative;
         self.drop_posts_outside(&channel, &page);
         for post in page.posts.into_iter().rev() {
-            if let Some(message) = self.chat_message(&token, post).await {
+            // A history page refills `shown` even when the identity is already
+            // deduped. A Socket Mode retry does not; see `inbound`.
+            if let Some(message) = self.chat_message(&token, post, true).await {
                 emit_message(&self.events, message);
             }
         }
@@ -952,7 +976,7 @@ where
                 self.clear_posting_denial(channel);
                 let order = ts_rank(&post.ts);
                 let sent_at = ts_order(&post.ts);
-                let Some(message) = self.chat_message(&token, post).await else {
+                let Some(message) = self.chat_message(&token, post, true).await else {
                     // Slack accepted a post older than the cached window.
                     // The send still counts; the row is not shown.
                     emit_send_accepted(&self.events, ProtocolId::Slack, conversation, request);
@@ -1059,14 +1083,20 @@ where
         let duplicate = self.already_seen(&post);
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
-        // A Socket Mode post is live the first time only: a repeat (retry
-        // or a post the app already showed) cannot notify (#32).
+        // A Socket Mode post is live the first time only. A retry, or a post
+        // this session already accepted, stays `History` so it cannot notify
+        // (#32). `deduped` keeps that identity after `shown` evicts it, for
+        // the notification freshness window.
         let arrival = if duplicate {
             crate::Arrival::History
         } else {
             crate::Arrival::Live
         };
-        let Some(built) = self.chat_message(&token, post).await else {
+        // Putting an evicted identity back on `shown` would push out a newer
+        // row and drop its unread count. Update the display cache only when
+        // the post is new or still on screen.
+        let keep_display = !duplicate || self.displayed(&post);
+        let Some(built) = self.chat_message(&token, post, keep_display).await else {
             // Older than every cached row. `remember` already dropped it
             // without `MessagesRemoved`, so the thread stays at the cap.
             return;
@@ -1172,43 +1202,80 @@ where
     }
 
     fn already_seen(&self, post: &SlackPost) -> bool {
-        let Some(rows) = self.shown.get(&post.channel) else {
-            return false;
-        };
-        rows.iter().any(|row| {
-            row.ts == post.ts
-                || same_client_msg(row.client_msg_id.as_deref(), post.client_msg_id.as_deref())
+        // Still on screen, or kept past display eviction for the freshness
+        // window. Either one is enough; liveness does not follow `shown` alone.
+        self.displayed(post)
+            || self.deduped.get(&post.channel).is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| same_post(&row.ts, row.client_msg_id.as_deref(), post))
+            })
+    }
+
+    fn displayed(&self, post: &SlackPost) -> bool {
+        self.shown.get(&post.channel).is_some_and(|rows| {
+            rows.iter()
+                .any(|row| same_post(&row.ts, row.client_msg_id.as_deref(), post))
         })
     }
 
+    /// Records `post` for liveness. A repeat keeps the first timestamp so age
+    /// eviction follows the original post, and fills in `client_msg_id` when
+    /// the first sight of it had none.
+    fn note_seen(&mut self, post: &SlackPost) {
+        let rows = self.deduped.entry(post.channel.clone()).or_default();
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|row| same_post(&row.ts, row.client_msg_id.as_deref(), post))
+        {
+            if row.client_msg_id.is_none() {
+                row.client_msg_id.clone_from(&post.client_msg_id);
+            }
+            return;
+        }
+        rows.push(Deduped {
+            ts: post.ts.clone(),
+            client_msg_id: post.client_msg_id.clone(),
+            sent_at: ts_order(&post.ts),
+        });
+        prune_deduped(rows);
+    }
+
     /// Returns false when `post` is older than the kept window and was not shown.
+    /// A kept post is also recorded in `deduped`, so a Socket Mode retry stays
+    /// `History` after `shown` evicts it. A post this window refuses is not
+    /// recorded: a retry must hit the same refusal instead of being shown.
     fn remember(&mut self, post: &SlackPost) -> bool {
         let dropped = {
             let rows = self.shown.entry(post.channel.clone()).or_default();
-            if let Some(row) = rows.iter_mut().find(|row| {
-                row.ts == post.ts
-                    || same_client_msg(row.client_msg_id.as_deref(), post.client_msg_id.as_deref())
-            }) {
+            if let Some(row) = rows
+                .iter_mut()
+                .find(|row| same_post(&row.ts, row.client_msg_id.as_deref(), post))
+            {
                 row.text.clone_from(&post.text);
                 if row.client_msg_id.is_none() {
                     row.client_msg_id.clone_from(&post.client_msg_id);
                 }
-                return true;
-            }
-            rows.push(Shown {
-                ts: post.ts.clone(),
-                text: post.text.clone(),
-                counted: false,
-                client_msg_id: post.client_msg_id.clone(),
-            });
-            let cap = usize::from(HISTORY_LIMIT);
-            if rows.len() > cap {
-                // A live post can sit at index 0. History then appends older
-                // rows. The cap drops the oldest `ts`, not the first insert.
-                take_oldest(rows, rows.len() - cap)
+                None
             } else {
-                Vec::new()
+                rows.push(Shown {
+                    ts: post.ts.clone(),
+                    text: post.text.clone(),
+                    counted: false,
+                    client_msg_id: post.client_msg_id.clone(),
+                });
+                let cap = usize::from(HISTORY_LIMIT);
+                Some(if rows.len() > cap {
+                    // A live post can sit at index 0. History then appends older
+                    // rows. The cap drops the oldest `ts`, not the first insert.
+                    take_oldest(rows, rows.len() - cap)
+                } else {
+                    Vec::new()
+                })
             }
+        };
+        let Some(dropped) = dropped else {
+            self.note_seen(post);
+            return true;
         };
         // The post just cached can be the oldest row. Do not emit
         // `MessagesRemoved` for it: the UI has not seen it, and core applies
@@ -1223,22 +1290,24 @@ where
                 .filter(|row| row.ts != post.ts)
                 .collect()
         };
-        if dropped.is_empty() {
-            return kept;
+        if !dropped.is_empty() {
+            let lost = dropped.iter().filter(|row| row.counted).count() as u32;
+            let ids = dropped
+                .iter()
+                .map(|row| message_id_of(&post.channel, &row.ts))
+                .collect();
+            emit_messages_removed(
+                &self.events,
+                ProtocolId::Slack,
+                conversation_id(&post.channel),
+                ids,
+            );
+            if lost > 0 {
+                self.forget_unread(&post.channel, lost);
+            }
         }
-        let lost = dropped.iter().filter(|row| row.counted).count() as u32;
-        let ids = dropped
-            .iter()
-            .map(|row| message_id_of(&post.channel, &row.ts))
-            .collect();
-        emit_messages_removed(
-            &self.events,
-            ProtocolId::Slack,
-            conversation_id(&post.channel),
-            ids,
-        );
-        if lost > 0 {
-            self.forget_unread(&post.channel, lost);
+        if kept {
+            self.note_seen(post);
         }
         kept
     }
@@ -1423,8 +1492,9 @@ where
         &mut self,
         token: &SlackBotToken,
         post: SlackPost,
+        keep_display: bool,
     ) -> Option<ChatMessage> {
-        if !self.remember(&post) {
+        if keep_display && !self.remember(&post) {
             return None;
         }
         let outbound = self
@@ -1457,6 +1527,32 @@ struct Shown {
     client_msg_id: Option<String>,
 }
 
+/// One accepted post identity. `sent_at` is the Slack `ts` in unix seconds
+/// (`0` when it does not parse). Age eviction uses that, not wall time, so a
+/// retry is matched against the original post.
+struct Deduped {
+    ts: String,
+    client_msg_id: Option<String>,
+    sent_at: i64,
+}
+
+/// Drop identities older than the freshness window, then enforce `DEDUP_LIMIT`.
+fn prune_deduped(rows: &mut Vec<Deduped>) {
+    let Some(horizon) = rows.iter().map(|row| row.sent_at).max() else {
+        return;
+    };
+    let cutoff = horizon.saturating_sub(DEDUP_FRESH_SECS);
+    // `sent_at == 0` is an unparsed timestamp. Notifications still allow it,
+    // so keep the identity until the size cap.
+    rows.retain(|row| row.sent_at == 0 || row.sent_at >= cutoff);
+    if rows.len() <= DEDUP_LIMIT {
+        return;
+    }
+    rows.sort_by_key(|row| row.sent_at);
+    let extra = rows.len() - DEDUP_LIMIT;
+    rows.drain(0..extra);
+}
+
 /// A cached post leaves the thread when this page covers its timestamp and
 /// does not include it. A non-authoritative page covers only `ts >= oldest_raw`.
 fn cached_post_is_outside(
@@ -1479,6 +1575,10 @@ fn same_client_msg(stored: Option<&str>, incoming: Option<&str>) -> bool {
         (Some(stored), Some(incoming)) => !stored.is_empty() && stored == incoming,
         _ => false,
     }
+}
+
+fn same_post(ts: &str, client_msg_id: Option<&str>, post: &SlackPost) -> bool {
+    ts == post.ts || same_client_msg(client_msg_id, post.client_msg_id.as_deref())
 }
 
 fn ready_detail(team_name: &str, live_events: bool) -> String {
@@ -1680,5 +1780,90 @@ mod tests {
         assert_eq!(dropped[0].ts, "1600000000.000100");
         assert_eq!(rows.len(), 50);
         assert!(rows.iter().all(|row| row.ts != "1600000000.000100"));
+    }
+
+    #[test]
+    fn deduped_ids_outlive_the_display_cache_inside_the_freshness_window() {
+        let start = 1_700_000_000;
+        let mut rows = Vec::new();
+        for offset in 0..=i64::from(HISTORY_LIMIT) {
+            rows.push(Deduped {
+                ts: offset.to_string(),
+                client_msg_id: None,
+                sent_at: start + offset,
+            });
+        }
+        assert!(i64::from(HISTORY_LIMIT) < DEDUP_FRESH_SECS);
+        prune_deduped(&mut rows);
+        assert_eq!(rows.len(), usize::from(HISTORY_LIMIT) + 1);
+        assert!(rows.iter().any(|row| row.ts == "0"));
+
+        let horizon = start + i64::from(HISTORY_LIMIT);
+        rows.push(Deduped {
+            ts: "stale".into(),
+            client_msg_id: Some("stale-id".into()),
+            sent_at: horizon - DEDUP_FRESH_SECS - 1,
+        });
+        prune_deduped(&mut rows);
+        assert!(rows.iter().all(|row| row.ts != "stale"));
+        assert!(rows.iter().any(|row| row.ts == "0"));
+    }
+
+    #[test]
+    fn a_post_at_the_freshness_edge_stays_deduped() {
+        let horizon = 1_700_000_500;
+        let mut rows = vec![
+            Deduped {
+                ts: "edge".into(),
+                client_msg_id: None,
+                sent_at: horizon - DEDUP_FRESH_SECS,
+            },
+            Deduped {
+                ts: "newest".into(),
+                client_msg_id: None,
+                sent_at: horizon,
+            },
+            Deduped {
+                ts: "unknown".into(),
+                client_msg_id: None,
+                sent_at: 0,
+            },
+        ];
+        prune_deduped(&mut rows);
+        let ts: Vec<_> = rows.iter().map(|row| row.ts.as_str()).collect();
+        assert!(ts.contains(&"edge"));
+        assert!(ts.contains(&"newest"));
+        assert!(ts.contains(&"unknown"));
+    }
+
+    #[test]
+    fn deduped_ids_stay_bounded_inside_the_freshness_window() {
+        let mut rows = Vec::new();
+        for index in 0..=DEDUP_LIMIT {
+            rows.push(Deduped {
+                ts: index.to_string(),
+                client_msg_id: None,
+                sent_at: 1_700_000_000 + i64::try_from(index % 60).expect("second"),
+            });
+        }
+        prune_deduped(&mut rows);
+        assert_eq!(rows.len(), DEDUP_LIMIT);
+    }
+
+    #[test]
+    fn same_post_matches_ts_or_client_msg_id() {
+        let post = SlackPost {
+            channel: "C1".into(),
+            ts: "1700000001.000200".into(),
+            user: None,
+            username: None,
+            text: "x".into(),
+            client_msg_id: Some("client-1".into()),
+        };
+        assert!(same_post("1700000001.000100", Some("client-1"), &post));
+        assert!(same_post("1700000001.000200", None, &post));
+        assert!(!same_post("1700000001.000100", Some("other"), &post));
+        assert!(!same_post("1700000001.000100", Some(""), &post));
+        assert!(!same_post("nope", None, &post));
     }
 }
