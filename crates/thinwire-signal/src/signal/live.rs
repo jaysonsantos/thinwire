@@ -61,16 +61,21 @@ pub(super) enum WorkerJob {
         conversation_id: String,
         before_message_id: String,
     },
+    /// Reread contacts and groups. `LoadChats` sends this.
+    Refresh,
+    /// The user opened or left a chat. Clear that chat's unread count.
+    Viewed,
 }
 
 pub(super) struct Session {
     generation: AtomicU64,
     active: AtomicBool,
-    outbound: Mutex<Option<mpsc::UnboundedSender<WorkerJob>>>,
+    outbound: std::sync::Mutex<Option<mpsc::UnboundedSender<WorkerJob>>>,
     cancel: std::sync::Mutex<AttemptCancel>,
     pairing: AtomicU64,
     sent: Mutex<std::collections::HashMap<String, String>>,
     groups: Mutex<super::group::GroupKeys>,
+    viewed: std::sync::Mutex<Option<String>>,
 }
 
 impl Session {
@@ -78,11 +83,12 @@ impl Session {
         Self {
             generation: AtomicU64::new(0),
             active: AtomicBool::new(false),
-            outbound: Mutex::new(None),
+            outbound: std::sync::Mutex::new(None),
             cancel: std::sync::Mutex::new(AttemptCancel::new()),
             pairing: AtomicU64::new(0),
             sent: Mutex::new(std::collections::HashMap::new()),
             groups: Mutex::new(super::group::GroupKeys::default()),
+            viewed: std::sync::Mutex::new(None),
         }
     }
 
@@ -150,30 +156,51 @@ impl Session {
         self.generation.load(Ordering::SeqCst) == token
     }
 
-    pub(super) async fn submit(&self, message: Outbound) -> bool {
-        self.enqueue(WorkerJob::Send(message)).await
+    pub(super) fn set_viewed(&self, conversation_id: Option<String>) {
+        *self.viewed.lock().expect("viewed") = conversation_id;
     }
 
-    pub(super) async fn request_older(
-        &self,
-        conversation_id: String,
-        before_message_id: String,
-    ) -> bool {
+    fn viewed(&self) -> Option<String> {
+        self.viewed.lock().expect("viewed").clone()
+    }
+
+    pub(super) fn submit(&self, message: Outbound) -> bool {
+        self.enqueue(WorkerJob::Send(message))
+    }
+
+    pub(super) fn request_older(&self, conversation_id: String, before_message_id: String) -> bool {
         self.enqueue(WorkerJob::Older {
             conversation_id,
             before_message_id,
         })
-        .await
     }
 
-    async fn enqueue(&self, job: WorkerJob) -> bool {
-        let guard = self.outbound.lock().await;
-        guard.as_ref().is_some_and(|tx| tx.send(job).is_ok())
+    pub(super) fn request_refresh(&self) -> bool {
+        self.enqueue(WorkerJob::Refresh)
     }
 
-    pub(super) async fn shutdown(&self) {
+    pub(super) fn request_viewed(&self) -> bool {
+        self.enqueue(WorkerJob::Viewed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_jobs_for_test(&self) -> mpsc::UnboundedReceiver<WorkerJob> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.outbound.lock().expect("outbound") = Some(tx);
+        rx
+    }
+
+    fn enqueue(&self, job: WorkerJob) -> bool {
+        self.outbound
+            .lock()
+            .expect("outbound")
+            .as_ref()
+            .is_some_and(|tx| tx.send(job).is_ok())
+    }
+
+    pub(super) fn shutdown(&self) {
         self.active.store(false, Ordering::SeqCst);
-        *self.outbound.lock().await = None;
+        *self.outbound.lock().expect("outbound") = None;
     }
 }
 
@@ -269,8 +296,9 @@ async fn run_linked(
         return;
     }
     emit_account(&events, ProtocolId::Signal, AccountState::Linked);
+    let mut rows = std::collections::HashMap::<String, Conversation>::new();
     let (mut known, mut group_titles) =
-        match publish_chats(&manager, session.as_ref(), &events).await {
+        match publish_chats(&manager, session.as_ref(), &events, &mut rows).await {
             Ok(published) => published,
             Err(()) => {
                 fail(&events, SYNC_FAILED);
@@ -287,7 +315,8 @@ async fn run_linked(
     );
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    *session.outbound.lock().await = Some(tx);
+    *session.outbound.lock().expect("outbound") = Some(tx);
+    let mut unread = std::collections::HashMap::<String, u32>::new();
     let mut receive = ReceiveLoop::new();
     let mut relink = Relink::new();
     while session.is_current(token) {
@@ -357,6 +386,9 @@ async fn run_linked(
                                         &names,
                                         &group_titles,
                                         &mut known,
+                                        &mut unread,
+                                        session.viewed().as_deref(),
+                                        &mut rows,
                                     );
                                 }
                             }
@@ -388,9 +420,18 @@ async fn run_linked(
             Some(WorkerJob::Send(outbound)) => {
                 let request = outbound.request;
                 let conversation_id = outbound.conversation_id.clone();
-                if send_text(&mut manager, &session, &outbound, &events)
-                    .await
-                    .is_err()
+                if send_text(
+                    &mut manager,
+                    &session,
+                    &outbound,
+                    &events,
+                    &names,
+                    &group_titles,
+                    &mut rows,
+                    &mut unread,
+                )
+                .await
+                .is_err()
                 {
                     thinwire_protocol::emit_send_rejected(
                         &events,
@@ -413,14 +454,36 @@ async fn run_linked(
                     &group_titles,
                     &conversation_id,
                     &before_message_id,
+                    &mut rows,
                 )
                 .await;
+            }
+            Some(WorkerJob::Refresh) => {
+                match publish_chats(&manager, session.as_ref(), &events, &mut rows).await {
+                    Ok((next_known, next_titles)) => {
+                        known = next_known;
+                        group_titles = next_titles;
+                        names = contact_names(&manager).await;
+                    }
+                    Err(()) => fail(&events, SYNC_FAILED),
+                }
+                thinwire_protocol::emit_chat_list_loaded(&events, ProtocolId::Signal);
+            }
+            Some(WorkerJob::Viewed) => {
+                if let Some(id) = session.viewed() {
+                    unread.insert(id.clone(), 0);
+                    if let Some(row) = rows.get(&id).cloned() {
+                        let row = read_row(row);
+                        rows.insert(id, row.clone());
+                        emit_conversation(&events, row);
+                    }
+                }
             }
             None => {}
         }
     }
     session.active.store(false, Ordering::SeqCst);
-    *session.outbound.lock().await = None;
+    *session.outbound.lock().expect("outbound") = None;
 }
 
 async fn link_new(
@@ -470,6 +533,7 @@ async fn publish_chats(
     manager: &Manager<SqliteStore, Registered>,
     session: &Session,
     events: &EventTx,
+    rows: &mut HashMap<String, Conversation>,
 ) -> Result<(HashSet<String>, HashMap<String, String>), ()> {
     let mut known = HashSet::new();
     let mut group_titles = HashMap::new();
@@ -478,13 +542,14 @@ async fn publish_chats(
     for contact in contacts.flatten() {
         let conversation = conversation_from_contact(&contact);
         known.insert(conversation.id.clone());
+        remember_row(rows, &conversation);
         emit_conversation(events, conversation);
         let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
-        let Ok(messages) = manager.store().messages(&thread, ..).await else {
+        let Ok((messages, _)) = fetch_history_page(manager, &thread, u64::MAX).await else {
             continue;
         };
-        for message in last_page(messages.flatten(), HISTORY_PAGE) {
-            emit_content(events, &message, &names, &group_titles);
+        for message in messages {
+            emit_content(events, &message, &names, &group_titles, rows);
         }
     }
     let groups = manager.store().groups().await.map_err(|_| ())?;
@@ -494,33 +559,23 @@ async fn publish_chats(
         session.remember_group(&key).await;
         group_titles.insert(conversation.id.clone(), conversation.title.clone());
         known.insert(conversation.id.clone());
+        remember_row(rows, &conversation);
         emit_conversation(events, conversation);
         let thread = Thread::Group(key);
-        let Ok(messages) = manager.store().messages(&thread, ..).await else {
+        let Ok((messages, _)) = fetch_history_page(manager, &thread, u64::MAX).await else {
             continue;
         };
-        for message in last_page(messages.flatten(), HISTORY_PAGE) {
-            emit_content(events, &message, &names, &group_titles);
+        for message in messages {
+            emit_content(events, &message, &names, &group_titles, rows);
         }
     }
     Ok((known, group_titles))
 }
 
-/// Keep the newest `page` items. `more` is true when older items were dropped.
-fn last_page<T>(items: impl IntoIterator<Item = T>, page: usize) -> Vec<T> {
-    let mut kept = std::collections::VecDeque::new();
-    for item in items {
-        if page == 0 {
-            return Vec::new();
-        }
-        if kept.len() == page {
-            kept.pop_front();
-        }
-        kept.push_back(item);
-    }
-    kept.into_iter().collect()
-}
-
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one history page needs the store, the session, and the inbox maps"
+)]
 async fn load_older_page(
     manager: &Manager<SqliteStore, Registered>,
     session: &Session,
@@ -529,34 +584,150 @@ async fn load_older_page(
     group_titles: &HashMap<String, String>,
     conversation_id: &str,
     before_message_id: &str,
+    rows: &mut HashMap<String, Conversation>,
 ) {
     let loaded = async {
-        let before = before_message_id.parse::<u64>().ok()?;
+        let before = message_millis(before_message_id)?;
         let thread = thread_of(conversation_id, session.group_key(conversation_id).await)?;
-        let messages = manager.store().messages(&thread, ..before).await.ok()?;
-        Some(last_page_more(messages.flatten(), HISTORY_PAGE))
+        fetch_history_page(manager, &thread, before).await.ok()
     }
     .await;
-    let (page, more) = loaded.unwrap_or_else(|| (Vec::new(), false));
+    let (page, more, note) = older_page_outcome(loaded);
     for message in page {
-        emit_content(events, &message, names, group_titles);
+        emit_content(events, &message, names, group_titles, rows);
     }
     let _ = events.send(AdapterEvent::OlderHistoryLoaded {
         protocol: ProtocolId::Signal,
         conversation_id: conversation_id.to_string(),
         before_message_id: before_message_id.to_string(),
         more,
-        note: None,
+        note: note.map(str::to_string),
     });
+}
+
+/// First window of a history read, in milliseconds. A dense chat fills one
+/// page inside it. A quiet chat widens the window until the page is full or
+/// the read reaches the start of the thread.
+const HISTORY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+const HISTORY_READ_FAILED: &str =
+    "Signal could not load older messages. The request can be tried again.";
+
+fn older_page_outcome<T>(loaded: Option<(Vec<T>, bool)>) -> (Vec<T>, bool, Option<&'static str>) {
+    match loaded {
+        Some((page, more)) => (page, more, None),
+        None => (Vec::new(), true, Some(HISTORY_READ_FAILED)),
+    }
+}
+
+fn history_window(before: u64, span: u64) -> (u64, bool) {
+    let start = before.saturating_sub(span);
+    (start, start == 0)
+}
+
+fn window_is_enough(count: usize, page: usize, reached_start: bool) -> bool {
+    count >= page || reached_start
+}
+
+fn widen_history_span(before: u64, span: u64) -> u64 {
+    let next = span.saturating_mul(2);
+    if before.saturating_sub(next) == before.saturating_sub(span) {
+        before
+    } else {
+        next
+    }
+}
+
+async fn fetch_history_page(
+    manager: &Manager<SqliteStore, Registered>,
+    thread: &Thread,
+    before: u64,
+) -> Result<(Vec<Content>, bool), ()> {
+    let mut span = HISTORY_WINDOW_MS;
+    loop {
+        let (start, reached_start) = history_window(before, span);
+        let messages = manager
+            .store()
+            .messages(thread, start..before)
+            .await
+            .map_err(|_| ())?;
+        let collected: Vec<Content> = messages.flatten().collect();
+        if window_is_enough(collected.len(), HISTORY_PAGE, reached_start) {
+            return Ok(finish_history_page(collected, reached_start));
+        }
+        span = widen_history_span(before, span);
+    }
+}
+
+fn finish_history_page(items: Vec<Content>, reached_start: bool) -> (Vec<Content>, bool) {
+    let (page, more_in_window) = newest_page(items, HISTORY_PAGE);
+    (page, more_in_window || !reached_start)
+}
+
+fn newest_page(mut items: Vec<Content>, page: usize) -> (Vec<Content>, bool) {
+    items.sort_by_key(content_millis);
+    last_page_more(items, page)
+}
+
+fn content_millis(content: &Content) -> u64 {
+    u64::try_from(content.metadata.client_timestamp.timestamp_millis()).unwrap_or(0)
 }
 
 fn thread_of(conversation_id: &str, group_key: Option<[u8; 32]>) -> Option<Thread> {
     if super::group::is_group_id(conversation_id) {
         return group_key.map(Thread::Group);
     }
-    Uuid::parse_str(conversation_id)
-        .ok()
-        .map(|uuid| Thread::Contact(ServiceId::Aci(uuid.into())))
+    service_id_of(conversation_id).map(Thread::Contact)
+}
+
+fn service_id_of(conversation_id: &str) -> Option<ServiceId> {
+    if let Some(rest) = conversation_id.strip_prefix("pni:") {
+        let uuid = Uuid::parse_str(rest).ok()?;
+        return Some(ServiceId::Pni(uuid.into()));
+    }
+    let uuid = Uuid::parse_str(conversation_id).ok()?;
+    Some(ServiceId::Aci(uuid.into()))
+}
+
+fn contact_id(service_id: &ServiceId) -> String {
+    match service_id {
+        ServiceId::Pni(_) => format!("pni:{}", service_id.raw_uuid()),
+        ServiceId::Aci(_) => service_id.raw_uuid().to_string(),
+    }
+}
+
+fn signal_message_id(sent_millis: u64, sender: &str) -> String {
+    format!("{sent_millis}:{sender}")
+}
+
+fn message_millis(id: &str) -> Option<u64> {
+    id.split(':').next()?.parse().ok()
+}
+
+fn visible_title(name: &str, id: &str) -> String {
+    if name.is_empty() {
+        id.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn live_unread(counts: &mut HashMap<String, u32>, id: &str, inbound: bool, viewed: bool) -> u32 {
+    if !inbound || viewed {
+        counts.insert(id.to_string(), 0);
+        return 0;
+    }
+    let next = counts.get(id).copied().unwrap_or(0).saturating_add(1);
+    counts.insert(id.to_string(), next);
+    next
+}
+
+fn read_row(mut row: Conversation) -> Conversation {
+    row.unread = 0;
+    row
+}
+
+fn remember_row(rows: &mut HashMap<String, Conversation>, conversation: &Conversation) {
+    rows.insert(conversation.id.clone(), conversation.clone());
 }
 
 fn sent_sync_body(sync: &presage::libsignal_service::proto::SyncMessage) -> Option<&str> {
@@ -611,7 +782,7 @@ fn conversation_from_contact(contact: &Contact) -> Conversation {
     Conversation {
         protocol: ProtocolId::Signal,
         id: id.clone(),
-        title: contact.name.clone(),
+        title: visible_title(&contact.name, &id),
         participant: id,
         preview: String::new(),
         unread: 0,
@@ -642,17 +813,27 @@ fn conversation_from_group(key: &[u8], group: &Group) -> Conversation {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a live envelope updates the row, the unread count, and the known set"
+)]
 fn emit_incoming(
     events: &EventTx,
     content: &Content,
     names: &HashMap<String, String>,
     group_titles: &HashMap<String, String>,
     known: &mut HashSet<String>,
+    unread: &mut HashMap<String, u32>,
+    viewed: Option<&str>,
+    rows: &mut HashMap<String, Conversation>,
 ) {
-    let Some((conversation, message)) = row_and_message(content, names, group_titles) else {
+    let Some((mut conversation, message)) = row_and_message(content, names, group_titles) else {
         return;
     };
+    let open = viewed == Some(conversation.id.as_str());
+    conversation.unread = live_unread(unread, &conversation.id, !message.outbound, open);
     known.insert(conversation.id.clone());
+    remember_row(rows, &conversation);
     emit_conversation(events, conversation);
     emit_message(events, message);
 }
@@ -662,10 +843,12 @@ fn emit_content(
     content: &Content,
     names: &HashMap<String, String>,
     group_titles: &HashMap<String, String>,
+    rows: &mut HashMap<String, Conversation>,
 ) {
     let Some((conversation, message)) = row_and_message(content, names, group_titles) else {
         return;
     };
+    remember_row(rows, &conversation);
     emit_conversation(events, conversation);
     emit_message(events, message);
 }
@@ -689,12 +872,13 @@ fn row_and_message(
     let uuid = content.metadata.sender.raw_uuid().to_string();
     let (conversation_id, sender, title, is_group) = match &thread {
         Thread::Contact(id) => {
-            let conversation_id = id.raw_uuid().to_string();
+            let conversation_id = contact_id(id);
             let title = names
                 .get(&conversation_id)
                 .filter(|name| !name.is_empty())
                 .cloned()
-                .unwrap_or_else(|| conversation_id.clone());
+                .or_else(|| names.get(&uuid).filter(|name| !name.is_empty()).cloned())
+                .unwrap_or_else(|| visible_title("", &conversation_id));
             (conversation_id, uuid, title, false)
         }
         Thread::Group(key) => {
@@ -716,7 +900,7 @@ fn row_and_message(
     let message = ChatMessage {
         protocol: ProtocolId::Signal,
         conversation_id: conversation_id.clone(),
-        id: sent_millis.to_string(),
+        id: signal_message_id(sent_millis, &contact_id(&content.metadata.sender)),
         sender: if shown.outbound {
             "me".to_string()
         } else {
@@ -734,7 +918,7 @@ fn row_and_message(
         title,
         participant: conversation_id,
         preview: message.body.clone(),
-        unread: u32::from(!message.outbound),
+        unread: 0,
         order: message.sent_at,
         last_at: message.sent_at,
         is_group,
@@ -745,11 +929,19 @@ fn row_and_message(
     Some((conversation, message))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a sent message refreshes the inbox row from the same maps as a live envelope"
+)]
 async fn send_text(
     manager: &mut Manager<SqliteStore, Registered>,
     session: &Session,
     outbound: &Outbound,
     events: &EventTx,
+    names: &HashMap<String, String>,
+    group_titles: &HashMap<String, String>,
+    rows: &mut HashMap<String, Conversation>,
+    unread: &mut HashMap<String, u32>,
 ) -> Result<(), ()> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -770,8 +962,7 @@ async fn send_text(
             .await
             .map_err(|_| ())?;
     } else {
-        let uuid = Uuid::parse_str(&outbound.conversation_id).map_err(|_| ())?;
-        let service_id = ServiceId::Aci(uuid.into());
+        let service_id = service_id_of(&outbound.conversation_id).ok_or(())?;
         manager
             .send_message(service_id, data_message, timestamp)
             .await
@@ -783,23 +974,64 @@ async fn send_text(
         &outbound.conversation_id,
         outbound.request,
     );
+    let sent_at = super::time::sent_at_secs(timestamp);
+    let id = signal_message_id(timestamp, "me");
+    let conversation = sent_conversation(outbound, sent_at, names, group_titles);
+    unread.insert(conversation.id.clone(), 0);
+    remember_row(rows, &conversation);
+    emit_conversation(events, conversation);
     emit_message(
         events,
         ChatMessage {
             protocol: ProtocolId::Signal,
             conversation_id: outbound.conversation_id.clone(),
-            id: format!("signal:out:{timestamp}"),
+            id: id.clone(),
             sender: "me".into(),
             body: outbound.body.clone(),
             outbound: true,
             delivery: Delivery::Sent,
-            sent_at: super::time::sent_at_secs(timestamp),
+            sent_at,
             arrival: thinwire_protocol::Arrival::History,
         },
     );
-    let id = format!("signal:out:{timestamp}");
     session.remember(&id, &outbound.body).await;
     Ok(())
+}
+
+fn sent_conversation(
+    outbound: &Outbound,
+    sent_at: i64,
+    names: &HashMap<String, String>,
+    group_titles: &HashMap<String, String>,
+) -> Conversation {
+    let id = outbound.conversation_id.clone();
+    let is_group = super::group::is_group_id(&id);
+    let title = if is_group {
+        group_titles
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| visible_title("", &id))
+    } else {
+        names
+            .get(&id)
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .unwrap_or_else(|| visible_title("", &id))
+    };
+    Conversation {
+        protocol: ProtocolId::Signal,
+        id: id.clone(),
+        title,
+        participant: id,
+        preview: outbound.body.clone(),
+        unread: 0,
+        order: sent_at,
+        last_at: sent_at,
+        is_group,
+        writable: true,
+        muted: false,
+        placeholder: false,
+    }
 }
 
 /// `true` when this generation is still current after the wait.
@@ -853,9 +1085,28 @@ mod tests {
     }
 
     fn events_for(content: &Content, names: &HashMap<String, String>) -> Vec<AdapterEvent> {
+        events_for_view(content, names, None, &mut HashMap::new())
+    }
+
+    fn events_for_view(
+        content: &Content,
+        names: &HashMap<String, String>,
+        viewed: Option<&str>,
+        unread: &mut HashMap<String, u32>,
+    ) -> Vec<AdapterEvent> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut known = HashSet::new();
-        emit_incoming(&tx, content, names, &HashMap::new(), &mut known);
+        let mut rows = HashMap::new();
+        emit_incoming(
+            &tx,
+            content,
+            names,
+            &HashMap::new(),
+            &mut known,
+            unread,
+            viewed,
+            &mut rows,
+        );
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -970,7 +1221,18 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut known = HashSet::new();
         known.insert(contact.to_string());
-        emit_incoming(&tx, &content, &HashMap::new(), &HashMap::new(), &mut known);
+        let mut unread = HashMap::new();
+        let mut rows = HashMap::new();
+        emit_incoming(
+            &tx,
+            &content,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut known,
+            &mut unread,
+            None,
+            &mut rows,
+        );
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -1022,7 +1284,18 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut known = HashSet::new();
         known.insert(id.clone());
-        emit_incoming(&tx, &content, &HashMap::new(), &titles, &mut known);
+        let mut unread = HashMap::new();
+        let mut rows = HashMap::new();
+        emit_incoming(
+            &tx,
+            &content,
+            &HashMap::new(),
+            &titles,
+            &mut known,
+            &mut unread,
+            None,
+            &mut rows,
+        );
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -1032,5 +1305,149 @@ mod tests {
             Some(AdapterEvent::ConversationUpsert { conversation })
                 if conversation.id == id && conversation.title == "Book club"
         ));
+    }
+
+    #[test]
+    fn two_senders_at_one_millisecond_keep_distinct_ids() {
+        let first = Uuid::from_u128(0x1111);
+        let second = Uuid::from_u128(0x2222);
+        let body = DataMessage {
+            body: Some("same time".into()),
+            ..Default::default()
+        };
+        let left = events_for(&envelope(first, body.clone()), &HashMap::new());
+        let right = events_for(&envelope(second, body), &HashMap::new());
+        let left_id = message_id(&left);
+        let right_id = message_id(&right);
+        assert_ne!(left_id, right_id);
+        assert_eq!(message_millis(&left_id), message_millis(&right_id));
+        assert!(left_id.contains(&first.to_string()));
+        assert!(right_id.contains(&second.to_string()));
+    }
+
+    #[test]
+    fn a_pni_contact_keeps_its_service_id() {
+        let uuid = Uuid::from_u128(0x3333_3333_3333_3333_3333_3333_3333_3333);
+        let content = Content::from_body(
+            DataMessage {
+                body: Some("from a phone number".into()),
+                ..Default::default()
+            },
+            Metadata {
+                sender: ServiceId::Pni(uuid.into()),
+                destination: ServiceId::Aci(Uuid::nil().into()),
+                sender_device: DeviceId::new(1).expect("device"),
+                pni_verified: None,
+                client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                    .expect("time"),
+                server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                    .expect("time"),
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+            },
+        );
+        let events = events_for(&content, &HashMap::new());
+        let id = format!("pni:{uuid}");
+        assert!(matches!(
+            events.first(),
+            Some(AdapterEvent::ConversationUpsert { conversation }) if conversation.id == id
+        ));
+        let parsed = service_id_of(&id).expect("service id");
+        assert!(matches!(parsed, ServiceId::Pni(_)));
+        assert_eq!(parsed.raw_uuid(), uuid);
+    }
+
+    #[test]
+    fn an_open_chat_stays_read_and_a_closed_chat_counts() {
+        let contact = Uuid::from_u128(0x4444);
+        let body = DataMessage {
+            body: Some("ping".into()),
+            ..Default::default()
+        };
+        let content = envelope(contact, body);
+        let mut unread = HashMap::new();
+        let open = events_for_view(
+            &content,
+            &HashMap::new(),
+            Some(&contact.to_string()),
+            &mut unread,
+        );
+        assert!(matches!(
+            open.first(),
+            Some(AdapterEvent::ConversationUpsert { conversation }) if conversation.unread == 0
+        ));
+        let mut unread = HashMap::new();
+        let first = events_for_view(&content, &HashMap::new(), None, &mut unread);
+        let second = events_for_view(&content, &HashMap::new(), None, &mut unread);
+        assert!(matches!(
+            first.first(),
+            Some(AdapterEvent::ConversationUpsert { conversation }) if conversation.unread == 1
+        ));
+        assert!(matches!(
+            second.first(),
+            Some(AdapterEvent::ConversationUpsert { conversation }) if conversation.unread == 2
+        ));
+    }
+
+    #[test]
+    fn a_sent_reply_refreshes_the_row() {
+        let id = "chat-1".to_string();
+        let outbound = Outbound {
+            conversation_id: id.clone(),
+            body: "sent line".into(),
+            request: 7,
+        };
+        let mut names = HashMap::new();
+        names.insert(id.clone(), "Ada".into());
+        let row = sent_conversation(&outbound, 42, &names, &HashMap::new());
+        assert_eq!(row.preview, "sent line");
+        assert_eq!(row.title, "Ada");
+        assert_eq!(row.unread, 0);
+        assert_eq!(row.last_at, 42);
+        assert_eq!(row.order, 42);
+    }
+
+    #[test]
+    fn an_unnamed_contact_uses_its_id_as_the_title() {
+        assert_eq!(visible_title("", "abc"), "abc");
+        assert_eq!(visible_title("Ada", "abc"), "Ada");
+    }
+
+    #[test]
+    fn a_history_window_stays_bounded_until_the_page_fills() {
+        let before = 10 * HISTORY_WINDOW_MS;
+        let (start, reached) = history_window(before, HISTORY_WINDOW_MS);
+        assert_eq!(start, before - HISTORY_WINDOW_MS);
+        assert!(!reached);
+        assert!(!window_is_enough(3, HISTORY_PAGE, false));
+        assert!(window_is_enough(HISTORY_PAGE, HISTORY_PAGE, false));
+        assert!(window_is_enough(1, HISTORY_PAGE, true));
+        let wider = widen_history_span(before, HISTORY_WINDOW_MS);
+        assert!(wider > HISTORY_WINDOW_MS);
+        assert!(wider < before);
+    }
+
+    #[test]
+    fn a_failed_history_read_stays_retryable() {
+        let (page, more, note) = older_page_outcome::<u8>(None);
+        assert!(page.is_empty());
+        assert!(more);
+        assert_eq!(note, Some(HISTORY_READ_FAILED));
+        let (page, more, note) = older_page_outcome(Some((vec![1], false)));
+        assert_eq!(page, vec![1]);
+        assert!(!more);
+        assert!(note.is_none());
+    }
+
+    fn message_id(events: &[AdapterEvent]) -> String {
+        events
+            .iter()
+            .find_map(|event| match event {
+                AdapterEvent::MessageReceived { message } => Some(message.id.clone()),
+                _ => None,
+            })
+            .expect("message")
     }
 }

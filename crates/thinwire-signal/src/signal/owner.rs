@@ -129,6 +129,17 @@ impl Owner {
         self.session.set_pairing(pairing);
         self.worker = (self.start)(&self.session, events);
         self.generation = self.session.generation();
+        if self.worker.is_none() {
+            self.session.shutdown();
+            emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
+            emit_status(
+                events,
+                ProtocolId::Signal,
+                AdapterStatus::Error,
+                "Signal worker could not start. No session was opened.",
+            );
+            return;
+        }
         emit_status(
             events,
             ProtocolId::Signal,
@@ -164,7 +175,7 @@ impl Owner {
             })
             .await;
         }
-        self.session.shutdown().await;
+        self.session.shutdown();
     }
 }
 
@@ -256,5 +267,43 @@ mod tests {
             }
         }
         assert!(saw_unlinked && saw_connecting);
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_fails_to_spawn_unlinks() {
+        let session = Arc::new(Session::new());
+        let handle = Handle::spawn(
+            Arc::clone(&session),
+            Box::new(|session, _events| {
+                session.mark_active();
+                None
+            }),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle.begin(1, &tx);
+        handle.flush().await;
+        assert!(!session.is_active());
+        let mut saw_unlinked = false;
+        let mut saw_error = false;
+        let mut saw_connecting = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                } => saw_unlinked = true,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Error,
+                    ..
+                } => saw_error = true,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Connecting,
+                    ..
+                } => saw_connecting = true,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(saw_unlinked && saw_error);
+        assert!(!saw_connecting);
     }
 }

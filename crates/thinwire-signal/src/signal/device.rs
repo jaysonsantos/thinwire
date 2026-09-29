@@ -99,6 +99,9 @@ impl SignalDevice for FakeDevice {
         if !self.linked {
             return Err("Signal is not linked");
         }
+        if !self.chats.iter().any(|chat| chat.id == conversation_id) {
+            return Err("Signal chat was not found");
+        }
         Ok(self
             .history
             .get(conversation_id)
