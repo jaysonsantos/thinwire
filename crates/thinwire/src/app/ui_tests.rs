@@ -516,3 +516,31 @@ fn notifications_reach_the_os_thread_and_the_title_counts_unread() {
         "the preview switch needs notifications on"
     );
 }
+
+#[test]
+fn focus_is_known_before_live_messages_and_unknown_counts_as_unfocused() {
+    use super::resolve_focus;
+    // qa L4: the platform value wins, then this frame's focus event, then
+    // the last known value; unknown at start is unfocused.
+    assert!(resolve_focus(Some(true), Some(false), Some(false)));
+    assert!(!resolve_focus(None, Some(false), Some(true)));
+    assert!(resolve_focus(None, None, Some(true)));
+    assert!(!resolve_focus(None, None, None));
+
+    // #87 review: the focus reaches the core before `pump()` applies live
+    // messages of the same frame.
+    let app = include_str!("mod.rs");
+    let logic = &app[app.find("fn logic(").expect("logic")..];
+    let logic = &logic[..logic.find("\n    }\n").expect("end")];
+    let focus = logic.find("self.update_focus(ctx)").expect("focus first");
+    let pump = logic.find("self.core.pump()").expect("pump");
+    assert!(focus < pump);
+
+    // A click asks for attention too: on Wayland, `Focus` does nothing.
+    assert!(app.contains("ViewportCommand::RequestUserAttention("));
+    // Exit: the last dismisses reach the OS thread, with a short wait.
+    let exit = &app[app.find("fn finish_exit(").expect("exit")..];
+    let exit = &exit[..exit.find("\n    }\n").expect("end")];
+    assert!(exit.contains("self.notifier.send(self.core.take_notify())"));
+    assert!(exit.contains("self.notifier.flush(NOTIFY_FLUSH_LIMIT)"));
+}
