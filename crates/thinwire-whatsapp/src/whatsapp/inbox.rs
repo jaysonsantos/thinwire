@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! WhatsApp chat list and message store. No whatsapp-rust types and no UI calls.
 //!
 //! The live client (feature `whatsapp-web`) maps history-sync chunks and live
@@ -6,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::adapter::{AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ProtocolId};
+use thinwire_protocol::{AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ProtocolId};
 
 /// Prefix on every WhatsApp conversation id. The rest is the chat JID.
 pub(super) const CONVERSATION_PREFIX: &str = "whatsapp:";

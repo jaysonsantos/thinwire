@@ -6,6 +6,7 @@ members = [
   "crates/thinwire-notify",
   "crates/thinwire-protocol",
   "crates/thinwire-signal",
+  "crates/thinwire-whatsapp",
 ]
 
 [workspace.package]
@@ -46,6 +47,7 @@ thinwire-core = { path = "crates/thinwire-core" }
 thinwire-notify = { path = "crates/thinwire-notify" }
 thinwire-protocol = { path = "crates/thinwire-protocol" }
 thinwire-signal = { path = "crates/thinwire-signal" }
+thinwire-whatsapp = { path = "crates/thinwire-whatsapp" }
 tokio = { version = "1", features = [
   "rt-multi-thread",
   "macros",

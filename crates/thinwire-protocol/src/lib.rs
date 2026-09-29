@@ -19,8 +19,8 @@ pub use adapter::{
     Arrival, ChatMessage, Conversation, Delivery, DiscordAuthMode, EventTx, ProtocolAdapter,
     ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, TelegramAuthError,
     TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, emit_account, emit_chat_list_loaded,
-    emit_conversation, emit_history_loaded, emit_message, emit_send_accepted, emit_send_rejected,
-    emit_status, emit_stopped,
+    emit_conversation, emit_history_loaded, emit_message, emit_older_history_loaded,
+    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -55,7 +55,7 @@ pub use telegram::{
     TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,
     resolve_telegram_api, telegram_api_available,
 };
-pub use whatsapp::{WhatsAppAdapter, WhatsAppPhoneVault, parse_whatsapp_chat_id};
+pub use whatsapp::{WhatsAppAdapter, WhatsAppPhoneVault};
 
 /// Shell protocols in display order. Signal is local-only and hidden unless `signal-local` is on.
 pub fn catalog() -> [ProtocolCapabilities; 5] {
@@ -74,7 +74,7 @@ pub(crate) fn registry(
     slack: std::sync::Arc<dyn SlackSecretVault>,
     whatsapp_phone: std::sync::Arc<WhatsAppPhoneVault>,
     login_epoch: adapter::LoginEpoch,
-    signal: Option<Box<dyn ProtocolAdapter>>,
+    replacements: Vec<Box<dyn ProtocolAdapter>>,
 ) -> Vec<Box<dyn ProtocolAdapter>> {
     let mut adapters: Vec<Box<dyn ProtocolAdapter>> = vec![
         Box::new(TelegramAdapter::with_login_epoch(
@@ -87,12 +87,13 @@ pub(crate) fn registry(
         slack::registry_adapter(slack),
         Box::new(signal::SignalAdapter::new()),
     ];
-    if let Some(signal) = signal
-        && let Some(slot) = adapters
-            .iter_mut()
-            .find(|adapter| adapter.id() == ProtocolId::Signal)
-    {
-        *slot = signal;
+    // A local-only build puts its AGPL clients (Signal, WhatsApp) in place of
+    // the MIT stubs. This crate does not depend on those crates (ADR 0011).
+    for replacement in replacements {
+        let id = replacement.id();
+        if let Some(slot) = adapters.iter_mut().find(|adapter| adapter.id() == id) {
+            *slot = replacement;
+        }
     }
     adapters
 }
@@ -100,6 +101,65 @@ pub(crate) fn registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for a local-only AGPL client: only its id and caps matter.
+    struct Replacement(ProtocolCapabilities);
+
+    impl ProtocolAdapter for Replacement {
+        fn id(&self) -> ProtocolId {
+            self.0.id
+        }
+        fn capabilities(&self) -> ProtocolCapabilities {
+            self.0
+        }
+        fn start(&mut self, _events: EventTx) {}
+        fn handle(
+            &mut self,
+            _command: AdapterCommand,
+            _events: &EventTx,
+        ) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// #77: each replacement takes the slot of the stub with its protocol
+    /// id. The order and the other adapters stay.
+    #[test]
+    fn registry_puts_each_replacement_in_its_protocol_slot() {
+        let replaced = |id: ProtocolId, detail: &'static str| {
+            let caps = catalog()
+                .into_iter()
+                .find(|caps| caps.id == id)
+                .expect("in the catalog");
+            Box::new(Replacement(ProtocolCapabilities { detail, ..caps }))
+                as Box<dyn ProtocolAdapter>
+        };
+        let adapters = registry(
+            std::sync::Arc::new(MemorySecretVault::new()),
+            std::sync::Arc::new(MemoryDiscordVault::new()),
+            std::sync::Arc::new(MemorySlackVault::new()),
+            std::sync::Arc::new(WhatsAppPhoneVault::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            vec![
+                replaced(ProtocolId::Signal, "signal replacement"),
+                replaced(ProtocolId::WhatsApp, "whatsapp replacement"),
+            ],
+        );
+        let ids: Vec<ProtocolId> = adapters.iter().map(|adapter| adapter.id()).collect();
+        let catalog_ids: Vec<ProtocolId> = catalog().iter().map(|caps| caps.id).collect();
+        assert_eq!(ids, catalog_ids, "one adapter per protocol, catalog order");
+        let detail = |id: ProtocolId| {
+            adapters
+                .iter()
+                .find(|adapter| adapter.id() == id)
+                .expect("adapter")
+                .capabilities()
+                .detail
+        };
+        assert_eq!(detail(ProtocolId::WhatsApp), "whatsapp replacement");
+        assert_eq!(detail(ProtocolId::Signal), "signal replacement");
+        assert_ne!(detail(ProtocolId::Telegram), "whatsapp replacement");
+    }
 
     #[test]
     fn catalog_lists_v1_four_protocols_with_honest_support() {

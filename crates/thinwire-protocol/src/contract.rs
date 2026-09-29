@@ -85,8 +85,8 @@ impl Contract {
 
     /// The adapter's event channel. A test that drives a fake client (for
     /// example WhatsApp link events) sends its events here.
-    #[cfg(test)]
-    pub(crate) fn events(&self) -> EventTx {
+    #[must_use]
+    pub fn events(&self) -> EventTx {
         self.tx.clone()
     }
 

@@ -16,8 +16,13 @@ telegram-tdlib = [
   "thinwire-protocol/telegram-tdlib",
 ]
 slack-oauth = ["thinwire-core/slack-oauth", "thinwire-protocol/slack-oauth"]
-# Experimental spike. Default CI and the default UI stay feature-off.
-whatsapp-web = ["thinwire-core/whatsapp-web", "thinwire-protocol/whatsapp-web"]
+# Local-only AGPL WhatsApp client (#77). Release builds and OS zips leave
+# this off. Default CI and the default UI stay feature-off.
+whatsapp-web = [
+  "dep:thinwire-whatsapp",
+  "thinwire-whatsapp/whatsapp-web",
+  "thinwire-core/whatsapp-web",
+]
 discord-bot = ["thinwire-core/discord-bot", "thinwire-protocol/discord-bot"]
 # Local-only AGPL Signal client. Release builds and OS zips leave this off.
 signal-local = [
@@ -37,6 +42,7 @@ thinwire-core.workspace = true
 thinwire-notify.workspace = true
 thinwire-protocol.workspace = true
 thinwire-signal = { workspace = true, optional = true }
+thinwire-whatsapp = { workspace = true, optional = true }
 winit.workspace = true
 tokio.workspace = true
 tracing.workspace = true

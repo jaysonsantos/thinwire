@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! App-data location for the experimental WhatsApp device store.
 //!
 //! The file is never created inside the git checkout. Callers that open it run
