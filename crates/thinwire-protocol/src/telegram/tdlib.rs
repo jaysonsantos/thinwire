@@ -56,7 +56,13 @@ enum TdlibCommand {
     },
     /// The chat the user looks at. `None` means they left Telegram.
     /// This, not history load, owns `LiveInbox::open_chat`.
-    ViewChat(Option<String>),
+    /// `stamp` is the shared-cell write from the caller. The worker applies
+    /// it only while that write is still current, so a blur during
+    /// `getChatHistory` is not overwritten when this command is dequeued.
+    ViewChat {
+        conversation_id: Option<String>,
+        stamp: u64,
+    },
     /// Ask TDLib to close. The worker exits after `authorizationStateClosed`.
     /// `cancel` is true for a Cancel (Disconnect): a client that already became
     /// Ready is then rolled back (see [`close_kind`]).
@@ -101,6 +107,9 @@ struct LiveInbox {
     /// Chat `ViewChat` last named. A live message there is marked viewed.
     /// History load does not set this: the user can leave that thread.
     open_chat: Option<i64>,
+    /// Same fact, published by `view_chat` before this worker dequeues
+    /// `ViewChat`. History `viewMessages` reads this, not `open_chat`.
+    viewed: inbox::ViewedChat,
 }
 
 impl LiveInbox {
@@ -124,6 +133,9 @@ pub struct TdlibRuntime {
     /// The host's Telegram login epoch. A new worker stamps its login events
     /// with the value it starts with.
     login_epoch: LoginEpoch,
+    /// Viewed chat of the current worker. `view_chat` writes it at once.
+    /// A respawn replaces it, so a closing worker cannot clear the new one.
+    viewed: inbox::ViewedChat,
 }
 
 impl TdlibRuntime {
@@ -139,6 +151,7 @@ impl TdlibRuntime {
             commands: None,
             slots: WorkerSlots::new(),
             current_closing: None,
+            viewed: inbox::ViewedChat::new(),
         }
     }
 
@@ -221,10 +234,20 @@ impl TdlibRuntime {
 
     /// The chat the user looks at. `None` means they left.
     /// A worker that is not running has no open chat, and this must not start one.
+    /// The shared cell updates before the send, so a history load that is
+    /// still inside `getChatHistory` sees the new view before this command
+    /// is dequeued.
     pub fn view_chat(&mut self, conversation_id: Option<String>) {
-        if let Some(commands) = &self.commands {
-            let _ = commands.send(TdlibCommand::ViewChat(conversation_id));
-        }
+        let Some(commands) = &self.commands else {
+            return;
+        };
+        let stamp = self
+            .viewed
+            .publish(inbox::viewed_chat_id(conversation_id.as_deref()));
+        let _ = commands.send(TdlibCommand::ViewChat {
+            conversation_id,
+            stamp,
+        });
     }
 
     pub fn send_text(
@@ -299,13 +322,22 @@ impl TdlibRuntime {
         if self.slots.is_shut() {
             return;
         }
-        let slots = &mut self.slots;
-        let current_closing = &mut self.current_closing;
-        let login_epoch = Arc::clone(&self.login_epoch);
-        let sent = super::send_or_respawn(&mut self.commands, command, || {
+        let TdlibRuntime {
+            commands,
+            slots,
+            current_closing,
+            login_epoch,
+            viewed,
+        } = self;
+        let login_epoch = Arc::clone(login_epoch);
+        let sent = super::send_or_respawn(commands, command, || {
             let (done, wait_for) = slots.start().unwrap_or_default();
             let closing = ClosingFlag::new(Arc::clone(&login_epoch));
             *current_closing = Some(closing.clone());
+            // A new client gets a new cell. The previous worker clears its
+            // own on close and must not wipe a view this client publishes.
+            let next = inbox::ViewedChat::new();
+            *viewed = next.clone();
             spawn_tdlib_worker(
                 Arc::clone(&secrets),
                 source.clone(),
@@ -313,6 +345,7 @@ impl TdlibRuntime {
                 done,
                 wait_for,
                 closing,
+                next,
             )
         });
         if !sent {
@@ -416,6 +449,7 @@ fn spawn_tdlib_worker(
     done: DoneFlag,
     wait_for: Vec<DoneFlag>,
     closing: ClosingFlag,
+    viewed: inbox::ViewedChat,
 ) -> UnboundedSender<TdlibCommand> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -455,6 +489,7 @@ fn spawn_tdlib_worker(
             directory: ChatDirectory::new(),
             names: NameBook::new(),
             open_chat: None,
+            viewed,
         };
         let mut commands = Some(cmd_rx);
 
@@ -497,10 +532,14 @@ fn spawn_tdlib_worker(
                             load_main_chats(client_id, live.linked(), &events).await;
                         }
                         TdlibCommand::OpenChat(conversation_id) => {
-                            open_chat(client_id, &conversation_id, &mut live, &events).await;
+                            open_chat(client_id, &conversation_id, &live, &events).await;
                         }
-                        TdlibCommand::ViewChat(conversation_id) => {
+                        TdlibCommand::ViewChat {
+                            conversation_id,
+                            stamp,
+                        } => {
                             apply_viewed_chat(&mut live.open_chat, conversation_id.as_deref());
+                            live.viewed.sync(stamp, live.open_chat);
                         }
                         TdlibCommand::SendText { conversation_id, body, request } => {
                             send_text(client_id, &conversation_id, &body, request, &live, &events).await;
@@ -723,9 +762,9 @@ async fn apply_update(
     false
 }
 
-/// A live incoming message in the open chat. History already calls
-/// `viewMessages` for the page it loaded. A message that arrives after that
-/// page must be marked too, or the server unread count stays above 0.
+/// A live incoming message in the open chat. History calls `viewMessages`
+/// for a page only while that chat is still viewed. A message that arrives
+/// after that page must be marked too, or the server unread count stays above 0.
 fn live_read_of(update: &tdlib_rs::enums::Update, open_chat: Option<i64>) -> Option<(i64, i64)> {
     let tdlib_rs::enums::Update::NewMessage(update) = update else {
         return None;
@@ -858,6 +897,7 @@ async fn apply_authorization(
                 live.ended_elsewhere = true;
             }
             live.open_chat = None;
+            live.viewed.clear();
             emit_status(
                 events,
                 ProtocolId::Telegram,
@@ -1213,7 +1253,7 @@ async fn load_main_chats(client_id: i32, authorized: bool, events: &EventTx) {
     emit_chat_list_loaded(events, ProtocolId::Telegram);
 }
 
-async fn open_chat(client_id: i32, conversation_id: &str, live: &mut LiveInbox, events: &EventTx) {
+async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, events: &EventTx) {
     if !live.linked() {
         emit_status(
             events,
@@ -1233,7 +1273,8 @@ async fn open_chat(client_id: i32, conversation_id: &str, live: &mut LiveInbox, 
         return;
     };
     // `ViewChat` owns `live.open_chat`. Loading history is not a view:
-    // the user may already have left this thread.
+    // the user may already have left this thread. `load_history` reads the
+    // shared cell, which `view_chat` updates before this arm can finish.
     emit_status(
         events,
         ProtocolId::Telegram,
@@ -1257,13 +1298,17 @@ async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &E
     {
         Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
             let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
-            let viewed: Vec<i64> = messages.iter().map(|message| message.id).collect();
+            let message_ids: Vec<i64> = messages.iter().map(|message| message.id).collect();
             for message in inbox::chronological(messages) {
                 emit_mapped_message(events, &message, live, None);
             }
-            if !viewed.is_empty()
+            // Read the cell after `getChatHistory`: `ViewChat` may have been
+            // published while this call was in flight, and it is still queued.
+            if !message_ids.is_empty()
+                && inbox::should_mark_history_viewed(live.viewed.get(), chat_id)
                 && let Err(error) =
-                    tdlib_rs::functions::view_messages(chat_id, viewed, None, true, client_id).await
+                    tdlib_rs::functions::view_messages(chat_id, message_ids, None, true, client_id)
+                        .await
             {
                 log_tdlib_error("viewMessages", &error);
                 emit_status(
