@@ -155,16 +155,18 @@ Desktop notifications (#32) show a new message when you do not look at its chat.
 - Privacy: a notification sends the chat title, the sender in a group, and up to 120 characters of the message to the OS notification service. "Hide message text" sends "New message" only, with no sender. thinwire never writes message text to its log.
 - What each OS does today:
 
-| | Linux (freedesktop, D-Bus) | macOS and Windows |
-| --- | --- | --- |
-| Show a notification | Yes | Yes |
-| One notification for each chat: a new message replaces it, with the count | Yes | No: each message shows its own notification |
-| "Hide message text" also changes a notification that already shows | Yes. With more than 16 notifications on screen, one with no click waiter closes instead | No: it applies to new notifications only |
-| Remove it when you open the chat, read it on another device (where the protocol reports it), the chat leaves the list, you turn notifications off, or the app closes | Yes | No |
-| A click opens the chat | Yes. On X11 the click also raises the window. On Wayland the app cannot raise its window yet (winit 0.30): the taskbar entry asks for attention instead | No |
+| | Linux (freedesktop, D-Bus) | Windows (toasts) | macOS |
+| --- | --- | --- | --- |
+| Show a notification | Yes | Yes | Yes |
+| One notification for each chat: a new message replaces it, with the count | Yes | Yes | No: each message shows its own notification |
+| "Hide message text" also changes a notification that already shows | Yes. With more than 16 notifications on screen, one with no click waiter closes instead | Yes, with no popup and no sound | No: it applies to new notifications only |
+| Remove it when you open the chat, read it on another device (where the protocol reports it), the chat leaves the list, you turn notifications off, or the app closes | Yes | Yes | No |
+| A click opens the chat | Yes. On X11 the click also raises the window. On Wayland the app cannot raise its window yet (winit 0.30): the taskbar entry asks for attention instead | Yes, while the app runs. Windows can refuse to raise the window: the taskbar entry then flashes | No |
 
 - Linux, with more than 16 notifications on screen: a new one has no click waiter. A later message in that chat shows a second notification instead of a replace, and a click on it does not open the chat. A dismiss still closes it.
-- macOS and Windows replace, dismiss, and click are tracked in #161.
+- Windows: each start writes one registry key for the app, `HKCU\Software\Classes\AppUserModelId\dev.jaysonsantos.thinwire`, with the value `DisplayName` = `Thinwire`. Windows needs this key to show the app name on a toast and to send a click back to the app. It needs no admin, and the app writes no other registry key. To remove it: `reg delete "HKCU\Software\Classes\AppUserModelId\dev.jaysonsantos.thinwire" /f`.
+- Windows: a start removes the toasts of an earlier run that did not close cleanly. No chat id goes to Windows: each toast has a short hash of its chat as its tag.
+- macOS replace, dismiss, and click are tracked in #161.
 - A failed call to the OS notification service does not turn notifications off. The app tries again after a short wait, and turns them off for the run only after 5 failures in a row.
 
 There is no distroless GUI container. This is a desktop egui app.
