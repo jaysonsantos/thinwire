@@ -8,7 +8,7 @@ Product-council (2026-09-20) locked CI packaging after option B. Developers need
 Packaging correction (2026-09-23): `actions/upload-artifact` wraps every download in an outer zip and stores loose files as mode 644. Uploading `dist/` drops the executable bit, so `Thinwire.app` does not launch and the Linux binary is not runnable. The job uploads one `.tar.gz`. The outer zip is GitHub's wrapper. The tar.gz keeps Unix modes and the app bundle.
 
 ## Decision
-CI uploads unsigned OS artifacts on **push to `main` only**.
+CI uploads OS artifacts on **push to `main` only**. The Linux and Windows binaries are unsigned. The macOS app is ad-hoc signed, with no Developer ID, and not notarized.
 
 A matrix builds release binaries on Ubuntu, macOS, and Windows. Artifact names are `thinwire-linux-x86_64`, `thinwire-macos-arm64`, and `thinwire-windows-x86_64`. Retention is 7 days (short retention; delete-on-new-main is not needed). The workflow does not listen to `pull_request`. The upload job also requires `github.event_name == 'push'` and `github.ref == 'refs/heads/main'`.
 
@@ -16,11 +16,11 @@ GitHub always wraps the Actions download in an outer zip. That wrapper is unavoi
 
 Linux and Windows tar members are flat. The binary, `LICENSE`, and `THIRD_PARTY_NOTICES` sit at the archive root. Linux also ships the TDLib LLVM C++ runtime libraries and their copyright files. The Linux and macOS binaries are mode `755` inside the tar.gz.
 
-The macOS tar.gz contains an unsigned `Thinwire.app`. `Contents/MacOS/thinwire` is the release binary and is executable in the archive. `Contents/Info.plist` sets `CFBundleExecutable` to `thinwire`, `CFBundleIdentifier` to `dev.jaysonsantos.thinwire`, `CFBundleName` and `CFBundleDisplayName` to `Thinwire`, and `CFBundlePackageType` to `APPL`. `CFBundleShortVersionString` and `CFBundleVersion` are the workspace package version. `LICENSE` and `THIRD_PARTY_NOTICES` sit in `Contents/Resources`. There is no Developer ID signature and no notarization. Extract the tar.gz and the app is ready to run unsigned.
+The macOS tar.gz contains an ad-hoc signed `Thinwire.app` (no Developer ID, not notarized). `Contents/MacOS/thinwire` is the release binary and is executable in the archive. `Contents/Info.plist` sets `CFBundleExecutable` to `thinwire`, `CFBundleIdentifier` to `dev.jaysonsantos.thinwire`, `CFBundleName` and `CFBundleDisplayName` to `Thinwire`, and `CFBundlePackageType` to `APPL`. `CFBundleShortVersionString` and `CFBundleVersion` are the workspace package version. `LICENSE` and `THIRD_PARTY_NOTICES` sit in `Contents/Resources`. There is no Developer ID signature and no notarization. Extract the tar.gz and the app is ready to run with no Developer ID signature.
 
 Amendment (2026-09-29, #161): the stage script gives the whole bundle an ad-hoc signature (`codesign --force --sign -`) and checks it (`codesign --verify --strict`). The macOS notification center needs a bundle whose signature binds `Info.plist` and the bundle id. Before this step, only the linker signed the binary. An ad-hoc signature has no identity. Gatekeeper still treats the app as unsigned software from an unknown developer. This decision stays: no Developer ID and no notarization.
 
-Existing lint, test, build, and `check` jobs stay as they are. README states that the artifacts are unsigned and are not a release.
+Existing lint, test, build, and `check` jobs stay as they are. README states that the artifacts have no Developer ID signature and are not a release.
 
 ## Consequences
 A `main` push keeps three short-lived artifacts. Each download is an outer zip around one tar.gz. Reviewers do not get OS artifacts from pull-request CI. Users must not treat them as a release or as signed software. A later signed-release path needs a new council lock.
