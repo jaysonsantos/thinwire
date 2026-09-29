@@ -26,6 +26,7 @@ use super::session::{LinkEvent, SendFailure, SendFuture, WhatsAppSender};
 use crate::adapter::RedactedPairingSecret;
 
 /// whatsapp-rust client work for the link owner. No state of its own.
+#[derive(Clone, Copy)]
 pub(super) struct LiveBackend;
 
 impl LinkBackend for LiveBackend {
