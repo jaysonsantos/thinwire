@@ -431,6 +431,9 @@ pub struct Snapshot {
     notices: HashMap<ProtocolId, String>,
     /// The chat the adapters were last told the user looks at (`ViewChat`).
     viewed: Option<(ProtocolId, String)>,
+    /// The window has focus. An open chat stays unread until it does, so a
+    /// notification while the user is away still has a badge when they return.
+    window_focused: bool,
     /// The expired sends that the timeout error lists, and the error as the
     /// core last set it. When `error` is no longer that value (the user
     /// closed it, or another error came), the list starts again.
@@ -645,6 +648,7 @@ impl Snapshot {
             older_retry: HashMap::new(),
             notices: HashMap::new(),
             viewed: None,
+            window_focused: true,
             timed_out: Vec::new(),
             timeout_error: None,
 
@@ -764,7 +768,9 @@ impl Snapshot {
                 }
             }
             AdapterEvent::ConversationUpsert { mut conversation } => {
-                if self.chat_is_viewed(conversation.protocol, &conversation.id) {
+                if self.window_focused
+                    && self.chat_is_viewed(conversation.protocol, &conversation.id)
+                {
                     conversation.unread = 0;
                 }
                 let protocol = conversation.protocol;
@@ -2645,14 +2651,26 @@ impl Snapshot {
         self.clear_viewed_unread();
     }
 
+    /// The window gained or lost focus. Focus clears the open chat's badge.
+    pub(crate) fn set_window_focus(&mut self, focused: bool) {
+        self.window_focused = focused;
+        if focused {
+            self.clear_viewed_unread();
+        }
+    }
+
     fn chat_is_viewed(&self, protocol: ProtocolId, id: &str) -> bool {
         self.viewed
             .as_ref()
             .is_some_and(|(owner, chat)| *owner == protocol && chat == id)
     }
 
-    /// The open chat is read. `ViewChat` is the signal that it is open.
+    /// The open chat is read once the window is focused. `ViewChat` is the
+    /// signal that it is open. An unfocused window keeps the badge.
     fn clear_viewed_unread(&mut self) {
+        if !self.window_focused {
+            return;
+        }
         let Some((protocol, id)) = self.viewed.clone() else {
             return;
         };

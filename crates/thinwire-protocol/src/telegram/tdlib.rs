@@ -95,6 +95,8 @@ struct LiveInbox {
     ended_elsewhere: bool,
     directory: ChatDirectory,
     names: NameBook,
+    /// Chat the user has open. A live message there is marked viewed.
+    open_chat: Option<i64>,
 }
 
 impl LiveInbox {
@@ -440,6 +442,7 @@ fn spawn_tdlib_worker(
             ended_elsewhere: false,
             directory: ChatDirectory::new(),
             names: NameBook::new(),
+            open_chat: None,
         };
         let mut commands = Some(cmd_rx);
 
@@ -482,7 +485,7 @@ fn spawn_tdlib_worker(
                             load_main_chats(client_id, live.linked(), &events).await;
                         }
                         TdlibCommand::OpenChat(conversation_id) => {
-                            open_chat(client_id, &conversation_id, &live, &events).await;
+                            open_chat(client_id, &conversation_id, &mut live, &events).await;
                         }
                         TdlibCommand::SendText { conversation_id, body, request } => {
                             send_text(client_id, &conversation_id, &body, request, &live, &events).await;
@@ -694,9 +697,45 @@ async fn apply_update(
                 &update.user.last_name,
             );
         }
-        other => apply_chat_update(other, live, events),
+        other => {
+            let mark_read = live_read_of(&other, live.open_chat);
+            apply_chat_update(other, live, events);
+            if let Some((chat_id, message_id)) = mark_read {
+                mark_message_viewed(client_id, chat_id, message_id).await;
+            }
+        }
     }
     false
+}
+
+/// A live incoming message in the open chat. History already calls
+/// `viewMessages` for the page it loaded. A message that arrives after that
+/// page must be marked too, or the server unread count stays above 0.
+fn live_read_of(update: &tdlib_rs::enums::Update, open_chat: Option<i64>) -> Option<(i64, i64)> {
+    let tdlib_rs::enums::Update::NewMessage(update) = update else {
+        return None;
+    };
+    let message = &update.message;
+    if message.is_outgoing {
+        return None;
+    }
+    live_message_to_view(open_chat, message.chat_id, message.id)
+}
+
+fn live_message_to_view(
+    open_chat: Option<i64>,
+    chat_id: i64,
+    message_id: i64,
+) -> Option<(i64, i64)> {
+    (open_chat == Some(chat_id)).then_some((chat_id, message_id))
+}
+
+async fn mark_message_viewed(client_id: i32, chat_id: i64, message_id: i64) {
+    if let Err(error) =
+        tdlib_rs::functions::view_messages(chat_id, vec![message_id], None, true, client_id).await
+    {
+        log_tdlib_error("viewMessages", &error);
+    }
 }
 
 async fn apply_authorization(
@@ -805,6 +844,7 @@ async fn apply_authorization(
             if was_authorized && !live.closing.is_set() {
                 live.ended_elsewhere = true;
             }
+            live.open_chat = None;
             emit_status(
                 events,
                 ProtocolId::Telegram,
@@ -1160,7 +1200,7 @@ async fn load_main_chats(client_id: i32, authorized: bool, events: &EventTx) {
     emit_chat_list_loaded(events, ProtocolId::Telegram);
 }
 
-async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, events: &EventTx) {
+async fn open_chat(client_id: i32, conversation_id: &str, live: &mut LiveInbox, events: &EventTx) {
     if !live.linked() {
         emit_status(
             events,
@@ -1179,6 +1219,7 @@ async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, even
         );
         return;
     };
+    live.open_chat = Some(chat_id);
     emit_status(
         events,
         ProtocolId::Telegram,
@@ -1670,5 +1711,75 @@ fn ensure_dir(path: &std::path::Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telegram::inbox::{ChatDirectory, ChatEffect, ChatMute, ChatSeed, MuteScope};
+
+    /// A stand-in for the TDLib client. It records `viewMessages` and answers
+    /// with unread 0, which is the `updateChatReadInbox` that follows a view.
+    struct FakeTelegram {
+        open_chat: Option<i64>,
+        viewed: Vec<(i64, i64)>,
+    }
+
+    impl FakeTelegram {
+        fn open(&mut self, chat_id: i64) {
+            self.open_chat = Some(chat_id);
+        }
+
+        fn view_messages(&mut self, chat_id: i64, message_id: i64) {
+            self.viewed.push((chat_id, message_id));
+        }
+
+        /// `Some(0)` when this live message is marked viewed on the server.
+        fn receive_live(&mut self, chat_id: i64, message_id: i64, outgoing: bool) -> Option<i32> {
+            if outgoing {
+                return None;
+            }
+            let (chat_id, message_id) = live_message_to_view(self.open_chat, chat_id, message_id)?;
+            self.view_messages(chat_id, message_id);
+            Some(0)
+        }
+    }
+
+    #[test]
+    fn a_live_message_in_the_open_chat_is_marked_viewed() {
+        let mut fake = FakeTelegram {
+            open_chat: None,
+            viewed: Vec::new(),
+        };
+        fake.open(42);
+        let mut directory = ChatDirectory::new();
+        directory.upsert(
+            42,
+            ChatSeed {
+                title: "Ada",
+                order: 1,
+                unread: 3,
+                preview: "earlier",
+                participant: "Ada",
+                last_at: 1,
+                is_group: false,
+                scope: MuteScope::Private,
+                mute: ChatMute::default(),
+            },
+        );
+        assert!(
+            fake.receive_live(7, 1, false).is_none(),
+            "a closed chat is not marked"
+        );
+        let next = fake
+            .receive_live(42, 99, false)
+            .expect("the open chat is marked viewed");
+        assert_eq!(fake.viewed, vec![(42, 99)]);
+        assert!(fake.receive_live(42, 100, true).is_none(), "own message");
+        let Some(ChatEffect::Upsert(row)) = directory.set_unread(42, next) else {
+            panic!("unread upsert");
+        };
+        assert_eq!(row.unread, 0);
     }
 }
