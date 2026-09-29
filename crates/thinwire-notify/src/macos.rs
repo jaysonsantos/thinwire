@@ -115,8 +115,11 @@ impl TagService for Center {
     }
 
     fn has(&mut self, tag: &str) -> Result<bool, BackendError> {
-        let delivered = block_on(un::get_delivered_notification_ids());
+        // Pending first: a request that is delivered between the two reads
+        // is then in the delivered list. In the other order it is in
+        // neither list and looks absent.
         let pending = block_on(un::get_pending_notification_ids());
+        let delivered = block_on(un::get_delivered_notification_ids());
         Ok(listed(tag, &delivered, &pending))
     }
 
