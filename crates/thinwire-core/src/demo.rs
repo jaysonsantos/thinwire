@@ -105,11 +105,19 @@ pub enum Scenario {
     /// Telegram and Slack at once. Slack comes from its demo adapter, so the
     /// default build shows it.
     SeveralProtocols,
+    /// Muted chats in the inbox (#153): one muted in thinwire, one muted in
+    /// Telegram. A chat with no mute is open: its header shows Mute.
+    MutedInbox,
+    /// The chat muted in thinwire is open: its header shows Unmute.
+    MutedHere,
+    /// The chat muted in Telegram is open: its header shows a disabled
+    /// "Muted in Telegram".
+    MutedByProtocol,
 }
 
 impl Scenario {
     /// Every scenario, in a fixed order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::FirstRun,
         Self::EmptyInbox,
         Self::LongChat,
@@ -126,6 +134,9 @@ impl Scenario {
         Self::StatusError,
         Self::StatusNotice,
         Self::SeveralProtocols,
+        Self::MutedInbox,
+        Self::MutedHere,
+        Self::MutedByProtocol,
     ];
 
     /// A stable snake_case name, for example for a snapshot file.
@@ -148,6 +159,9 @@ impl Scenario {
             Self::StatusError => "status_error",
             Self::StatusNotice => "status_notice",
             Self::SeveralProtocols => "several_protocols",
+            Self::MutedInbox => "muted_inbox",
+            Self::MutedHere => "muted_here",
+            Self::MutedByProtocol => "muted_by_protocol",
         }
     }
 
@@ -252,6 +266,19 @@ impl Scenario {
                 setup.scripts.push(slack_linked());
                 setup.visible.push(ProtocolId::Slack);
                 setup.intents.push(select(ADA));
+            }
+            Self::MutedInbox | Self::MutedHere | Self::MutedByProtocol => {
+                telegram = telegram_linked(muted_rows());
+                setup.intents.push(Intent::SetChatMute {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id: MILO.into(),
+                    muted: true,
+                });
+                setup.intents.push(select(match self {
+                    Self::MutedHere => MILO,
+                    Self::MutedByProtocol => NORA,
+                    _ => ADA,
+                }));
             }
         }
         setup.scripts.insert(0, telegram);
@@ -507,6 +534,23 @@ fn inbox_rows() -> Vec<Conversation> {
     ]
 }
 
+/// The inbox with unread counts on two muted chats: Milo (muted in thinwire
+/// by the scenario) and Nora (muted in Telegram).
+fn muted_rows() -> Vec<Conversation> {
+    inbox_rows()
+        .into_iter()
+        .map(|row| match row.id.as_str() {
+            MILO => Conversation { unread: 5, ..row },
+            NORA => Conversation {
+                unread: 1,
+                muted: true,
+                ..row
+            },
+            _ => row,
+        })
+        .collect()
+}
+
 fn row(
     protocol: ProtocolId,
     id: &str,
@@ -598,6 +642,7 @@ fn group_chat() -> Vec<ChatMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mutes::ChatMute;
     use crate::state::{AuthScreen, OlderState};
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -718,6 +763,29 @@ mod tests {
                 }
                 Scenario::StatusNotice => {
                     assert!(view.notice(ProtocolId::Telegram).is_some(), "{name}");
+                }
+                Scenario::MutedInbox | Scenario::MutedHere | Scenario::MutedByProtocol => {
+                    let open = view.selected_conversation.as_deref().expect("open chat");
+                    let expected = match scenario {
+                        Scenario::MutedHere => ChatMute::Here,
+                        Scenario::MutedByProtocol => ChatMute::Protocol,
+                        _ => ChatMute::None,
+                    };
+                    assert_eq!(
+                        view.chat_mute(ProtocolId::Telegram, open),
+                        expected,
+                        "{name}"
+                    );
+                    assert_eq!(
+                        view.chat_mute(ProtocolId::Telegram, MILO),
+                        ChatMute::Here,
+                        "{name}"
+                    );
+                    assert_eq!(
+                        view.chat_mute(ProtocolId::Telegram, NORA),
+                        ChatMute::Protocol,
+                        "{name}"
+                    );
                 }
             }
             if scenario == Scenario::SeveralProtocols {

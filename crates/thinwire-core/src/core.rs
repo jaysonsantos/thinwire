@@ -327,6 +327,10 @@ impl Core {
             window_focused: self.notify.window_focused(),
             viewed: self.state.viewed(),
             has_session: self.state.has_session(message.protocol),
+            muted_here: self
+                .settings
+                .chat_mutes()
+                .contains(message.protocol, &message.conversation_id),
             now: unix_now(),
         };
         let chat = self
@@ -418,6 +422,21 @@ impl Core {
                 self.settings.set_notification_preview(on);
                 if !on {
                     self.notify.hide_previews();
+                }
+            }
+            Intent::SetChatMute {
+                protocol,
+                conversation_id,
+                muted,
+            } => {
+                self.settings
+                    .set_chat_muted(protocol, &conversation_id, muted);
+                if muted {
+                    // A notification of this chat on screen goes away.
+                    self.notify.dismiss(&crate::notify::NotifyKey {
+                        protocol,
+                        conversation_id,
+                    });
                 }
             }
             Intent::Telegram(intent) => self.telegram(intent),
@@ -602,6 +621,9 @@ impl Core {
             watch_keychain(&self.runtime, Arc::clone(&self.secrets), &self.notifier);
         }
         if let Some(job) = self.settings.take_persist_job() {
+            self.runtime.spawn_blocking(move || job.run());
+        }
+        if let Some(job) = self.settings.take_mutes_job() {
             self.runtime.spawn_blocking(move || job.run());
         }
         self.arm_send_wake();
@@ -1423,6 +1445,103 @@ mod tests {
         assert!(!core.view().notifications());
         core.notify_message(&live(1, "off"));
         assert!(core.take_notify().is_empty(), "the switch is off");
+    }
+
+    /// #153: a chat muted in thinwire does not notify, and its shown
+    /// notification goes. The mute stays when the adapter sends the row
+    /// again. A protocol mute wins: an unmute here does not unmute it. The
+    /// file is written off the caller thread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chat_muted_in_thinwire_does_not_notify() {
+        use crate::mutes::{ChatMute, ChatMutes};
+        use crate::notify::{NotifyCommand, NotifyKey};
+        use crate::state::test_support::ready_with_chats;
+        use thinwire_protocol::{Conversation, Delivery};
+
+        let path = std::env::temp_dir()
+            .join("thinwire-core-tests")
+            .join(format!("{}-mute", std::process::id()))
+            .join("muted_chats");
+        let _ = std::fs::remove_file(&path);
+        let settings = temp_settings().with_chat_mutes(ChatMutes::load_from(path.clone()));
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        core.state = ready_with_chats(&core.secrets);
+        core.dispatch(Intent::WindowFocus(false));
+        let live = ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+            id: "telegram:2:9".into(),
+            sender: "Bob".into(),
+            body: "hi".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+        };
+        let key = NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+        };
+        let mute = |muted| Intent::SetChatMute {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+            muted,
+        };
+        core.notify_message(&live);
+        assert_eq!(core.take_notify().len(), 1);
+
+        core.dispatch(mute(true));
+        assert_eq!(
+            core.take_notify(),
+            vec![NotifyCommand::Dismiss(key)],
+            "the shown notification goes"
+        );
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Here
+        );
+        core.notify_message(&live);
+        assert!(core.take_notify().is_empty(), "muted in thinwire");
+
+        // The written file has the mute. The write runs on a worker.
+        let deadline = Instant::now() + WAIT;
+        while !ChatMutes::load_from(path.clone()).contains(ProtocolId::Telegram, "telegram:2") {
+            assert!(Instant::now() < deadline, "the mute was not written");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The adapter sends the row again, with no protocol mute.
+        let row = core
+            .state
+            .conversation(ProtocolId::Telegram, "telegram:2")
+            .cloned()
+            .expect("row");
+        core.state.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                muted: false,
+                ..row.clone()
+            },
+        });
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Here,
+            "a row update keeps the thinwire mute"
+        );
+
+        // The protocol mutes it too, and wins over an unmute here.
+        core.state.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation { muted: true, ..row },
+        });
+        core.dispatch(mute(false));
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Protocol
+        );
+        core.notify_message(&live);
+        assert!(core.take_notify().is_empty(), "muted in the protocol");
     }
 
     /// qa L5 and #87 review: a click opens a chat only in its own protocol;

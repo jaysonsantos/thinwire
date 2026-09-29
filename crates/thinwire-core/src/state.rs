@@ -12,6 +12,7 @@ use thinwire_protocol::{
     telegram_api_available,
 };
 
+use crate::mutes::{ChatMute, ChatMutes};
 use crate::secrets::{SecretKey, SecretStore};
 use crate::sends::{Pending, SendTracker};
 
@@ -2681,15 +2682,19 @@ impl Snapshot {
             .find(|row| row.id == id)
     }
 
-    /// Unread messages of every chat that is not muted, in every protocol
-    /// with a session. For the window title and a taskbar badge (#32).
+    /// Unread messages of every chat that is not muted (in the protocol or
+    /// in thinwire, #153), in every protocol with a session. For the window
+    /// title and a taskbar badge (#32). A frontend calls
+    /// [`crate::View::unread_total`].
     #[must_use]
-    pub fn unread_total(&self) -> u32 {
+    pub(crate) fn unread_total(&self, mutes: &ChatMutes) -> u32 {
         self.conversations
             .iter()
             .filter(|(protocol, _)| self.has_session(**protocol))
             .flat_map(|(_, rows)| rows.iter())
-            .filter(|row| !row.muted)
+            .filter(|row| {
+                !ChatMute::of(row.muted, mutes.contains(row.protocol, &row.id)).is_muted()
+            })
             .map(|row| row.unread)
             .fold(0, u32::saturating_add)
     }
@@ -3952,6 +3957,7 @@ mod tests {
         snapshot
     }
 
+    /// A chat muted in the protocol or in thinwire (#153) does not count.
     #[test]
     fn unread_total_skips_muted_chats_and_protocols_without_a_session() {
         let store = SecretStore::memory();
@@ -3964,17 +3970,28 @@ mod tests {
         for row in [chat(1, 3, false), chat(2, 4, true), chat(3, 5, false)] {
             snapshot.apply(AdapterEvent::ConversationUpsert { conversation: row });
         }
-        assert_eq!(snapshot.unread_total(), 8, "the muted chat does not count");
+        let mut mutes = ChatMutes::in_memory();
+        assert_eq!(
+            snapshot.unread_total(&mutes),
+            8,
+            "the muted chat does not count"
+        );
         assert!(
             snapshot
                 .conversation(ProtocolId::Telegram, "telegram:2")
                 .is_some_and(|row| row.muted)
         );
+        mutes.set(ProtocolId::Telegram, "telegram:3", true);
+        assert_eq!(
+            snapshot.unread_total(&mutes),
+            3,
+            "a chat muted in thinwire does not count"
+        );
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Telegram,
             state: AccountState::Unlinked,
         });
-        assert_eq!(snapshot.unread_total(), 0, "no session, no count");
+        assert_eq!(snapshot.unread_total(&mutes), 0, "no session, no count");
     }
 
     #[test]

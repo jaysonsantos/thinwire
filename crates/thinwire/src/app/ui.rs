@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use eframe::egui::{self, RichText};
 use thinwire_core::ViewNow;
+use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{AdapterStatus, Delivery, ProtocolId};
 
 use super::auth;
@@ -489,7 +490,7 @@ fn account_chip(
     });
     if let Some(text) = badge_text(unread) {
         child.add_space(space::S);
-        unread_badge(&mut child, &text);
+        unread_badge(&mut child, &text, false);
     }
     let response = ui.interact(
         rect,
@@ -537,17 +538,17 @@ fn inbox(
     out: &mut Vec<Intent>,
 ) {
     let now = snapshot.now();
-    let rows: Vec<(String, String, String, u32, String)> = snapshot
+    let rows: Vec<InboxRow> = snapshot
         .visible_conversations()
         .iter()
-        .map(|row| {
-            (
-                row.id.clone(),
-                row.title.clone(),
-                row.preview.clone(),
-                row.unread,
-                view_list_time(row.last_at, now),
-            )
+        .map(|row| InboxRow {
+            protocol: row.protocol,
+            id: row.id.clone(),
+            title: row.title.clone(),
+            preview: row.preview.clone(),
+            unread: row.unread,
+            time: view_list_time(row.last_at, now),
+            mute: snapshot.chat_mute(row.protocol, &row.id),
         })
         .collect();
 
@@ -582,10 +583,34 @@ fn inbox(
     let widget_focus = ui.ctx().memory(|memory| memory.focused());
     let mut clicked: Option<String> = None;
     let mut focus_from_widget: Option<String> = None;
-    for (id, title, preview, unread, time) in rows {
+    for row in rows {
+        let InboxRow {
+            protocol,
+            id,
+            title,
+            preview,
+            unread,
+            time,
+            mute,
+        } = row;
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
         let focused = snapshot.focused_row.as_deref() == Some(id.as_str());
-        let response = inbox_row(ui, &id, &title, &preview, &time, unread, selected);
+        let response = inbox_row(
+            ui,
+            &id,
+            &title,
+            &preview,
+            &time,
+            unread,
+            selected,
+            mute.is_muted(),
+        );
+        response.context_menu(|ui| {
+            if let Some(intent) = mute_control(ui, protocol, &id, mute, "chat") {
+                out.push(intent);
+                ui.close();
+            }
+        });
         if focused {
             ui.painter().rect_stroke(
                 response.rect,
@@ -596,7 +621,12 @@ fn inbox(
         }
         // AccessKit `selected` is the open chat. The highlight is keyboard focus.
         response.widget_info(|| {
-            egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, &title)
+            let label = if mute.is_muted() {
+                format!("{title}, muted")
+            } else {
+                title.clone()
+            };
+            egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label)
         });
         if row_scrolls(selected, focused, scroll_to_selected, scroll_to_focused) {
             response.scroll_to_me(None);
@@ -625,6 +655,50 @@ fn inbox(
         let row_id = ui.id().with(("inbox-row", id));
         ui.memory_mut(|memory| memory.request_focus(row_id));
     }
+}
+
+/// One inbox row, read from the view before the rows are drawn.
+struct InboxRow {
+    protocol: ProtocolId,
+    id: String,
+    title: String,
+    preview: String,
+    unread: u32,
+    time: String,
+    mute: ChatMute,
+}
+
+/// The mute button of a chat (#153): Mute, Unmute, or a disabled "Muted in
+/// <protocol>" when the protocol mutes it. A protocol mute wins, so only
+/// the protocol can unmute it. `what` follows the verb: "chat" in the row
+/// menu, empty in the thread header. Returns the intent of a click.
+fn mute_control(
+    ui: &mut egui::Ui,
+    protocol: ProtocolId,
+    id: &str,
+    mute: ChatMute,
+    what: &str,
+) -> Option<Intent> {
+    let (verb, muted) = match mute {
+        ChatMute::None => ("Mute", true),
+        ChatMute::Here => ("Unmute", false),
+        ChatMute::Protocol => {
+            let name = protocol.display_name();
+            ui.add_enabled(false, egui::Button::new(format!("Muted in {name}")))
+                .on_disabled_hover_text(format!("Unmute it in {name}."));
+            return None;
+        }
+    };
+    let text = if what.is_empty() {
+        verb.to_owned()
+    } else {
+        format!("{verb} {what}")
+    };
+    ui.button(text).clicked().then(|| Intent::SetChatMute {
+        protocol,
+        conversation_id: id.to_owned(),
+        muted,
+    })
 }
 
 /// The highlight scroll wins when both requests exist. It is the Enter target.
@@ -741,6 +815,7 @@ fn inbox_row_height(ui: &egui::Ui) -> f32 {
 }
 
 /// One inbox row. The whole rect is the click target, including the preview.
+#[allow(clippy::too_many_arguments)]
 fn inbox_row(
     ui: &mut egui::Ui,
     id: &str,
@@ -749,6 +824,7 @@ fn inbox_row(
     time: &str,
     unread: u32,
     selected: bool,
+    muted: bool,
 ) -> egui::Response {
     let palette = theme::palette(ui);
     let width = laid_out_width(ui, "inbox-row-width");
@@ -800,6 +876,11 @@ fn inbox_row(
         },
         |ui| {
             ui.label(RichText::new(time).small().color(palette.text3));
+            // A word, not a glyph: every font has it, and a screen reader
+            // reads it (#153).
+            if muted {
+                ui.label(RichText::new("muted").small().color(palette.text3));
+            }
         },
     );
     row_ends(
@@ -817,33 +898,46 @@ fn inbox_row(
         },
         |ui| {
             if let Some(text) = badge_text(unread) {
-                unread_badge(ui, &text);
+                unread_badge(ui, &text, muted);
             }
         },
     );
     ui.interact(rect, ui.id().with(("inbox-row", id)), egui::Sense::click())
 }
 
-/// Unread pill. `text` comes from [`badge_text`].
-fn unread_badge(ui: &mut egui::Ui, text: &str) {
+/// Unread pill. `text` comes from [`badge_text`]. A muted chat gets a
+/// quiet outline pill, not the accent fill (#153).
+fn unread_badge(ui: &mut egui::Ui, text: &str, muted: bool) {
     let palette = theme::palette(ui);
+    let ink = if muted {
+        palette.text2
+    } else {
+        palette.on_badge
+    };
     let font = egui::FontId::new(size::CAPTION, theme::medium());
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), font, palette.on_badge);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, ink);
     let width = (galley.size().x + space::XS * 2.0).max(20.0);
     let height = galley.size().y + space::XS;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("unread {text}"))
     });
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(radius::PILL), palette.badge);
+    let corner = egui::CornerRadius::same(radius::PILL);
+    if muted {
+        ui.painter().rect_stroke(
+            rect,
+            corner,
+            egui::Stroke::new(1.0, palette.border_strong),
+            egui::StrokeKind::Inside,
+        );
+    } else {
+        ui.painter().rect_filled(rect, corner, palette.badge);
+    }
     let pos = egui::pos2(
         rect.center().x - galley.size().x * 0.5,
         rect.center().y - galley.size().y * 0.5,
     );
-    ui.painter().galley(pos, galley, palette.on_badge);
+    ui.painter().galley(pos, galley, ink);
 }
 
 /// Pill text for an unread count. `None` when there is nothing to show.
@@ -1048,7 +1142,7 @@ fn add_slack_workspace(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Int
 fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<Intent>) {}
 
 fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
-    thread_header(ui, snapshot);
+    thread_header(ui, snapshot, out);
 
     let is_group = snapshot
         .selected_conversation_row()
@@ -1274,16 +1368,34 @@ struct Bubble {
 }
 
 /// Title, optional "group" line, and a bottom border.
-fn thread_header(ui: &mut egui::Ui, snapshot: &Snapshot) {
+fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let palette = theme::palette(ui);
     egui::Frame::new()
         .inner_margin(egui::Margin::same(space::M as i8))
         .show(ui, |ui| match snapshot.selected_conversation_row() {
             Some(conversation) => {
-                ui.label(
-                    RichText::new(&conversation.title)
-                        .heading()
-                        .color(palette.text),
+                let mute = snapshot.chat_mute(conversation.protocol, &conversation.id);
+                // One row: the button sits right, and the title takes the
+                // rest and truncates.
+                egui::Sides::new().shrink_left().truncate().show(
+                    ui,
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&conversation.title)
+                                    .heading()
+                                    .color(palette.text),
+                            )
+                            .truncate(),
+                        );
+                    },
+                    |ui| {
+                        if let Some(intent) =
+                            mute_control(ui, conversation.protocol, &conversation.id, mute, "")
+                        {
+                            out.push(intent);
+                        }
+                    },
                 );
                 if conversation.is_group {
                     ui.label(RichText::new("group").small().color(palette.text3));

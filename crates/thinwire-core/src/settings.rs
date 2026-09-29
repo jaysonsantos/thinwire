@@ -11,21 +11,45 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::ThemeMode;
+use thinwire_protocol::ProtocolId;
 
-/// Disk write queued after a theme change. Run on a worker, never the UI thread.
+use crate::ThemeMode;
+use crate::mutes::ChatMutes;
+
+/// Disk write queued after a settings change. Run on a worker, never the UI thread.
 pub struct PersistJob {
     path: PathBuf,
     contents: String,
     epoch: u64,
     latest: Arc<AtomicU64>,
     write_lock: Arc<Mutex<()>>,
+    /// Write a temp file with mode 0600, then rename it (the muted chats,
+    /// #153). Otherwise a plain write (`settings.toml`).
+    private: bool,
 }
 
 impl PersistJob {
     /// Blocking write. Caller must run this on `spawn_blocking` / a test thread.
     pub fn run(self) {
         self.commit(true);
+    }
+
+    /// A private write: a temp file with mode 0600, then a rename.
+    pub(crate) fn private(
+        path: PathBuf,
+        contents: String,
+        epoch: u64,
+        latest: Arc<AtomicU64>,
+        write_lock: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            path,
+            contents,
+            epoch,
+            latest,
+            write_lock,
+            private: true,
+        }
     }
 
     fn commit(self, check_before_lock: bool) {
@@ -37,6 +61,13 @@ impl PersistJob {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.is_current() {
+            return;
+        }
+        if self.private {
+            // The error only: the file holds chat ids.
+            if let Err(error) = crate::mutes::write_private(&self.path, &self.contents) {
+                tracing::warn!(error = %error, "muted chats were not written");
+            }
             return;
         }
         if let Some(parent) = self.path.parent()
@@ -77,13 +108,24 @@ pub struct Settings {
     persist_lock: Arc<Mutex<()>>,
     /// Never write the file: the demo (#120) and tests.
     in_memory: bool,
+    /// Chats muted in thinwire (#153). Their own file in the data dir.
+    mutes: ChatMutes,
 }
 
 impl Settings {
-    /// Load from the platform config dir. Missing or unreadable file → System.
+    /// Load from the platform config dir, and the muted chats from the
+    /// data dir. Missing or unreadable file → System, no mute.
     #[must_use]
     pub fn load() -> Self {
-        Self::load_from(default_path())
+        Self::load_from(default_path()).with_chat_mutes(ChatMutes::load())
+    }
+
+    /// Use these muted chats. [`Self::load_from`] and [`Self::in_memory`]
+    /// start with none in memory, so a test never reads the user's file.
+    #[must_use]
+    pub fn with_chat_mutes(mut self, mutes: ChatMutes) -> Self {
+        self.mutes = mutes;
+        self
     }
 
     #[must_use]
@@ -99,6 +141,7 @@ impl Settings {
             latest_persist: Arc::new(AtomicU64::new(0)),
             persist_lock: Arc::new(Mutex::new(())),
             in_memory: false,
+            mutes: ChatMutes::in_memory(),
         }
     }
 
@@ -116,6 +159,7 @@ impl Settings {
             latest_persist: Arc::new(AtomicU64::new(0)),
             persist_lock: Arc::new(Mutex::new(())),
             in_memory: true,
+            mutes: ChatMutes::in_memory(),
         }
     }
 
@@ -159,6 +203,30 @@ impl Settings {
         }
     }
 
+    /// The chats muted in thinwire.
+    #[must_use]
+    pub const fn chat_mutes(&self) -> &ChatMutes {
+        &self.mutes
+    }
+
+    /// Mute or unmute a chat in thinwire. Returns `true` when it changed.
+    /// Disk persist is queued.
+    pub fn set_chat_muted(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        muted: bool,
+    ) -> bool {
+        self.mutes.set(protocol, conversation_id, muted)
+    }
+
+    /// Take the latest queued write of the muted chats. The UI thread must
+    /// `spawn_blocking` this.
+    #[must_use]
+    pub fn take_mutes_job(&mut self) -> Option<PersistJob> {
+        self.mutes.take_persist_job()
+    }
+
     /// Take the latest queued write. The UI thread must `spawn_blocking` this.
     #[must_use]
     pub fn take_persist_job(&mut self) -> Option<PersistJob> {
@@ -174,6 +242,7 @@ impl Settings {
             epoch: self.persist_epoch,
             latest: Arc::clone(&self.latest_persist),
             write_lock: Arc::clone(&self.persist_lock),
+            private: false,
         })
     }
 

@@ -149,6 +149,9 @@ shots! {
     status_error => StatusError,
     status_notice => StatusNotice,
     several_protocols => SeveralProtocols,
+    muted_inbox => MutedInbox,
+    muted_here => MutedHere,
+    muted_by_protocol => MutedByProtocol,
 }
 
 #[test]

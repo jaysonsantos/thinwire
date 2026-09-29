@@ -74,6 +74,15 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             }
             Intent::MoveInbox { delta } => state.snapshot.move_inbox_selection(delta),
             Intent::FocusInbox { id } => state.snapshot.focus_inbox_row(id),
+            Intent::SetChatMute {
+                protocol,
+                conversation_id,
+                muted,
+            } => {
+                state
+                    .settings
+                    .set_chat_muted(protocol, &conversation_id, muted);
+            }
             _ => {}
         }
     }
@@ -93,6 +102,89 @@ fn harness(state: InboxUi) -> Harness<'static, InboxUi> {
         .build_ui_state(draw, state);
     theme::install(&harness.ctx);
     harness
+}
+
+/// #153: the thread header mutes and unmutes the open chat in thinwire.
+/// The row reads "muted" for AccessKit.
+#[test]
+fn the_header_button_mutes_and_unmutes_the_open_chat() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Mute")
+        .click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .settings
+            .chat_mutes()
+            .contains(ProtocolId::Telegram, "telegram:1")
+    );
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Ada, muted");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Unmute")
+        .click();
+    harness.run();
+    assert!(
+        !harness
+            .state()
+            .settings
+            .chat_mutes()
+            .contains(ProtocolId::Telegram, "telegram:1")
+    );
+    harness.get_by_role_and_label(egui::accesskit::Role::Button, "Mute");
+}
+
+/// #153: a right click on a row mutes that chat. A chat muted in the
+/// protocol shows a disabled "Muted in Telegram": only Telegram unmutes it.
+#[test]
+fn the_row_menu_mutes_a_chat_and_a_protocol_mute_wins() {
+    let mut state = InboxUi::ready();
+    let mut muted = telegram_chat(3, "Cy", 1);
+    muted.muted = true;
+    state.snapshot.apply(AdapterEvent::ConversationUpsert {
+        conversation: muted,
+    });
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Bob")
+        .click_secondary();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Mute chat")
+        .click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .settings
+            .chat_mutes()
+            .contains(ProtocolId::Telegram, "telegram:2")
+    );
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Cy, muted")
+        .click();
+    harness.step();
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:3".into(),
+        });
+    harness.run();
+    let header = harness.get_by_role_and_label(egui::accesskit::Role::Button, "Muted in Telegram");
+    assert!(
+        header.accesskit_node().is_disabled(),
+        "only Telegram unmutes it"
+    );
+    assert!(
+        harness.query_by_label("Unmute").is_none(),
+        "no thinwire unmute for a protocol mute"
+    );
 }
 
 #[test]
