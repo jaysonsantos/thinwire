@@ -1,0 +1,86 @@
+# #161 spike, branch only: check UNUserNotificationCenter inside Thinwire.app
+# on a macOS runner. Remove this file before any pull request.
+name: spike macOS notify
+
+on:
+  push:
+    branches: [spike/macos-notify-161]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Clippy
+        run: cargo clippy -p thinwire-notify --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test -p thinwire-notify --locked
+      - name: Build the probe
+        run: cargo build -p thinwire-notify --example macos_probe --locked
+      - name: Make two probe bundles
+        run: |
+          # "linker": like the release zip today (only the linker signature).
+          # "adhoc": the whole bundle signed with `codesign --sign -`.
+          for kind in linker adhoc; do
+            app="probe-$kind/Thinwire.app"
+            mkdir -p "$app/Contents/MacOS"
+            cp target/debug/examples/macos_probe "$app/Contents/MacOS/thinwire"
+            cat > "$app/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>thinwire</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.jaysonsantos.thinwire</string>
+            <key>CFBundleName</key>
+            <string>Thinwire</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.0.0</string>
+            <key>CFBundleVersion</key>
+            <string>0.0.0</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+          done
+          codesign --force --sign - probe-adhoc/Thinwire.app
+          for kind in linker adhoc; do
+            echo "== $kind"
+            codesign --verify --verbose=2 "probe-$kind/Thinwire.app" 2>&1 || true
+            codesign --display --verbose=2 "probe-$kind/Thinwire.app" 2>&1 || true
+          done
+          sw_vers
+      - name: Probe with no bundle
+        timeout-minutes: 3
+        run: target/debug/examples/macos_probe || echo "exit $?"
+      - name: Probe in the release-style bundle
+        timeout-minutes: 3
+        run: probe-linker/Thinwire.app/Contents/MacOS/thinwire || echo "exit $?"
+      - name: Probe in the ad-hoc signed bundle
+        timeout-minutes: 3
+        run: probe-adhoc/Thinwire.app/Contents/MacOS/thinwire || echo "exit $?"
+      - name: Pack the ad-hoc signed probe for a manual test
+        run: ditto -c -k --keepParent probe-adhoc/Thinwire.app thinwire-macos-probe.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: thinwire-macos-probe
+          path: thinwire-macos-probe.zip
+          retention-days: 7

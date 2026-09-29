@@ -1,0 +1,110 @@
+//! macOS: UNUserNotificationCenter through `mac-usernotifications`
+//! (#161 spike).
+//!
+//! Each chat has one request identifier (the tag), so a new message
+//! replaces its notification. A dismiss removes it, and a click on the body
+//! opens the chat. The center needs a bundle id and a code signature (an
+//! ad-hoc one is enough): `Thinwire.app` has both (ADR 0003). `cargo run`
+//! has no bundle and keeps the show-only backend.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+
+use mac_usernotifications as un;
+use mac_usernotifications::block_on;
+
+use crate::tagged::TagService;
+use crate::{BackendError, ClickFn, Notification};
+
+/// Most click-waiter threads at one time, as on Linux. Over the limit, a
+/// notification shows with no click.
+const MAX_CLICK_WAITERS: usize = 16;
+
+pub(crate) struct Center {
+    clicks: ClickFn,
+    waiters: Arc<AtomicUsize>,
+}
+
+impl Center {
+    /// `None` when the process has no bundle id or the user did not allow
+    /// notifications. Runs on the notification thread.
+    pub(crate) fn new(clicks: ClickFn) -> Option<Self> {
+        un::check_bundle().ok()?;
+        match un::blocking::request_auth() {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!("notifications are off for thinwire in System Settings");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!("could not ask for notification permission");
+                return None;
+            }
+        }
+        // Notifications of an earlier run that did not end cleanly: no
+        // waiter opens their chat now.
+        for id in block_on(un::get_delivered_notification_ids()) {
+            un::blocking::close_delivered(&id);
+        }
+        Some(Self {
+            clicks,
+            waiters: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+}
+
+impl TagService for Center {
+    fn post(
+        &mut self,
+        tag: &str,
+        notification: &Notification,
+        quiet: bool,
+    ) -> Result<(), BackendError> {
+        let level = if quiet {
+            un::InterruptionLevel::Passive
+        } else {
+            un::InterruptionLevel::Active
+        };
+        let mut request = un::Notification::new()
+            .id(tag)
+            .title(&notification.title)
+            .message(notification.body())
+            .interruption_level(level);
+        if !quiet {
+            request = request.default_sound();
+        }
+        let handle = block_on(request.send()).map_err(|_| BackendError("show"))?;
+        if self.waiters.load(Ordering::SeqCst) >= MAX_CLICK_WAITERS {
+            return Ok(());
+        }
+        // A replace ends the waiter of the older request with an error.
+        let clicks = Arc::clone(&self.clicks);
+        let key = notification.key.clone();
+        let waiters = Arc::clone(&self.waiters);
+        waiters.fetch_add(1, Ordering::SeqCst);
+        let spawned = thread::Builder::new()
+            .name("thinwire-notify-click".into())
+            .spawn(move || {
+                if block_on(handle.response()).is_ok_and(|response| response.is_default_action()) {
+                    clicks(key);
+                }
+                waiters.fetch_sub(1, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            self.waiters.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn has(&mut self, tag: &str) -> Result<bool, BackendError> {
+        Ok(block_on(un::get_delivered_notification_ids())
+            .iter()
+            .any(|id| id == tag))
+    }
+
+    fn remove(&mut self, tag: &str) -> Result<(), BackendError> {
+        un::blocking::close_delivered(tag);
+        Ok(())
+    }
+}
