@@ -18,11 +18,13 @@
 //!
 //! Retirement stops new work only. A send that started before it still gets
 //! its real result, also after the owner has handled the retirement: a send
-//! that went out ends as `SendAccepted`, while the session that replaced it
-//! is still current. A send result is dropped only after the send was already
-//! answered: by the end of a disconnect (after its wait), by the 401 step
-//! (after its wait), or by the close of a shutdown. The close rejects each
-//! send still in flight, then emits `Stopped`.
+//! that went out ends as `SendAccepted`, while the account is still open.
+//! Every send in flight for the account, including one carried from the
+//! session before, gets `SendAccepted` or `SendRejected` (and its row)
+//! before the `Unlinked` or `Stopped` that ends the account. The wait is
+//! [`SEND_SETTLE_WAIT`]; then the rest are rejected. Nothing for that
+//! request is published after that end. The account gate is held from the
+//! check through the publication, and through the end event.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -132,6 +134,55 @@ struct Inflight {
     bot_id: u64,
 }
 
+/// Every send still in flight for the account, including one a previous
+/// session started. A result and the `Unlinked` or `Stopped` that ends the
+/// account both hold this lock, so the result cannot follow that end.
+pub(crate) struct AccountSends {
+    /// False after `Unlinked` or `Stopped`. A later result publishes nothing.
+    open: bool,
+    inflight: HashMap<u64, Inflight>,
+}
+
+pub(crate) type SharedSends = Arc<Mutex<AccountSends>>;
+
+pub(crate) fn shared_sends() -> SharedSends {
+    Arc::new(Mutex::new(AccountSends {
+        open: true,
+        inflight: HashMap::new(),
+    }))
+}
+
+/// An idle account can end now. [`IdleEnd::Busy`] means a send is still open.
+pub(crate) enum IdleEnd {
+    /// This call closed the account. The caller emits `Unlinked`.
+    Ended,
+    /// The account is already closed.
+    Already,
+    /// A send is still in flight. The owner answers it, then emits `Unlinked`.
+    Busy,
+}
+
+impl AccountSends {
+    /// Closes the account when nothing is in flight.
+    pub(crate) fn take_idle(&mut self) -> IdleEnd {
+        if !self.inflight.is_empty() {
+            return IdleEnd::Busy;
+        }
+        if !self.open {
+            return IdleEnd::Already;
+        }
+        self.open = false;
+        IdleEnd::Ended
+    }
+}
+
+/// How an account ends. The sends still in flight are answered first.
+enum AccountEnd {
+    Unlinked,
+    Stopped,
+    Disconnect { detail: &'static str, attempt: u64 },
+}
+
 enum Outgoing {
     New(String),
     Retry(String),
@@ -188,10 +239,12 @@ enum Msg {
     SealDone {
         unlink: u64,
     },
+    /// [`SEND_SETTLE_WAIT`] ended for sends carried into an account end.
+    AccountSettle,
     Retire {
         carried: oneshot::Sender<Carried>,
         /// The generation of the session that replaces this one. `None` when
-        /// nothing replaces it: a later send result is dropped.
+        /// nothing replaces it: the account ends after its sends are answered.
         successor: Option<u64>,
     },
     /// The user disconnected: settle the work in flight, then emit the
@@ -234,10 +287,9 @@ struct Flags {
     /// return. A list or history result already queued still sees it and
     /// publishes nothing, so disconnect can emit `Unlinked` without a later
     /// `Linked`, conversation, or history row (Codex r4131954091). Send
-    /// results do not use it: the owner applies every send result, until the
-    /// send was already answered by the end of a disconnect, the 401 step, or
-    /// a shutdown close. The close rejects each send still in flight
-    /// (Codex r4132922551, #165).
+    /// results do not use it: the owner applies every send result until the
+    /// account gate closes. The close answers each send still in flight, then
+    /// emits `Unlinked` or `Stopped` (Codex r4132922551, #165).
     retired: AtomicBool,
 }
 
@@ -278,9 +330,16 @@ impl Session {
         id: u64,
         handoff: Option<oneshot::Receiver<Carried>>,
         active: &ActiveSession,
+        sends: &SharedSends,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let flags = Arc::new(Flags::default());
+        {
+            let mut gate = sends.lock().unwrap_or_else(PoisonError::into_inner);
+            // A previous end closed the account. This link opens it again.
+            // Sends still in flight stay: they belong to this account.
+            gate.open = true;
+        }
         {
             let mut newest = active.lock().unwrap_or_else(PoisonError::into_inner);
             *newest = id;
@@ -296,8 +355,10 @@ impl Session {
             api,
             events: events.clone(),
             tx: tx.downgrade(),
+            tx_hold: Some(tx.clone()),
             flags: Arc::clone(&flags),
             active: Arc::clone(active),
+            account: Arc::clone(sends),
             id,
             carried: Carried::default(),
             bot_id: None,
@@ -313,7 +374,8 @@ impl Session {
             closed: false,
             send_tasks: 0,
             shutdown: None,
-            late_send: LateSend::Publish,
+            pending_end: None,
+            settle_armed: false,
         };
         let _ = tx.send(Msg::Reload);
         tokio::spawn(owner.run(rx, handoff));
@@ -431,9 +493,9 @@ impl Session {
     /// owner handles that message before [`Msg::Retire`]. A send result, queued
     /// or later, is still applied: it may emit `SendAccepted` and
     /// `MessageReplaced` after the new session's `Linking` (keyed by request
-    /// and message id), while that generation is still current. `successor`
-    /// is that generation. `None` drops a later result: nothing replaced
-    /// this session.
+    /// and message id), while the account stays open. `successor` is that
+    /// generation. `None` ends the account: each send still in flight is
+    /// answered, then `Unlinked` follows.
     pub(crate) fn retire(self, successor: Option<u64>) -> oneshot::Receiver<Carried> {
         self.flags.retired.store(true, Ordering::SeqCst);
         let (carried, rx) = oneshot::channel();
@@ -562,9 +624,16 @@ struct Owner {
     /// Weak: the owner ends when the session handle and every task that
     /// reports back are gone. A task holds a strong sender.
     tx: mpsc::WeakUnboundedSender<Msg>,
+    /// Strong sender for a timer armed after the session handle is gone.
+    /// A carried send's HTTP task holds the previous owner's sender, not
+    /// this one. Dropped once the account has ended, or once this session
+    /// has handed off, so the task can finish.
+    tx_hold: Option<mpsc::UnboundedSender<Msg>>,
     flags: Arc<Flags>,
     /// See [`ActiveSession`].
     active: ActiveSession,
+    /// See [`AccountSends`]. Shared with every session of this account.
+    account: SharedSends,
     id: u64,
     carried: Carried,
     bot_id: Option<u64>,
@@ -589,18 +658,10 @@ struct Owner {
     /// HTTP send tasks still running. Shutdown waits for zero.
     send_tasks: u64,
     shutdown: Option<oneshot::Sender<()>>,
-    /// Where a send result goes after this session is retired.
-    late_send: LateSend,
-}
-
-/// A send result after retirement.
-enum LateSend {
-    /// This session is current, or a disconnect is waiting for the result.
-    Publish,
-    /// Publish while this generation is still the newest.
-    WhileCurrent(u64),
-    /// Nothing replaced this session. Drop the result.
-    Drop,
+    /// An account end is waiting out [`SEND_SETTLE_WAIT`].
+    pending_end: Option<AccountEnd>,
+    /// The settle timer is already armed.
+    settle_armed: bool,
 }
 
 impl Owner {
@@ -679,15 +740,21 @@ impl Owner {
             Msg::SealDone { unlink } => self.seal_done(unlink),
             Msg::Retire { carried, successor } => {
                 self.retire();
-                self.late_send = match successor {
-                    Some(id) => LateSend::WhileCurrent(id),
-                    None => LateSend::Drop,
-                };
                 // A send still in flight shares its text with the next
                 // session: if it fails, its row can be retried there. An
                 // accept removes that text from the shared map.
                 let _ = carried.send(self.carried.handoff());
+                if successor.is_none() {
+                    // Nothing replaces this session. Answer the sends still
+                    // in flight, then emit `Unlinked`. A `SendDone` already
+                    // queued is handled first, so it is accepted before that.
+                    self.begin_account_end(AccountEnd::Unlinked);
+                }
+                // The HTTP task, if any, holds its own sender. This one would
+                // keep the owner alive after the handoff.
+                self.tx_hold = None;
             }
+            Msg::AccountSettle => self.account_settle(),
             Msg::Shutdown { done, limit } => {
                 self.shutdown = Some(done);
                 // `spawn` needs a live strong sender. The session handle is
@@ -903,15 +970,18 @@ impl Owner {
                 (body, message_id, SendRow::Retry)
             }
         };
-        self.inflight.insert(
-            request,
-            Inflight {
-                conversation_id,
-                message_id,
-                row,
-                bot_id,
-            },
-        );
+        let tracked = Inflight {
+            conversation_id,
+            message_id,
+            row,
+            bot_id,
+        };
+        self.account
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .inflight
+            .insert(request, tracked.clone());
+        self.inflight.insert(request, tracked);
         self.send_tasks += 1;
         let api = Arc::clone(&self.api);
         tokio::spawn(async move {
@@ -1136,14 +1206,14 @@ impl Owner {
         self.send_tasks = self.send_tasks.saturating_sub(1);
         self.answer_send(request, result);
         // The 401 step waited for this send. The last one starts the seal.
-        if self.inflight.is_empty()
+        if !self.account_pending()
             && let Some(unlink) = &self.unlink
             && !unlink.sealing
         {
             let id = unlink.id;
             self.start_seal(id);
         }
-        if self.inflight.is_empty() {
+        if self.disconnecting.is_some() && !self.account_pending() {
             self.finish_disconnect();
         }
         self.finish_shutdown_if_idle();
@@ -1154,62 +1224,68 @@ impl Owner {
         let Some(tracked) = self.inflight.remove(&request) else {
             return;
         };
-        if !self.publish_late_send() {
-            // The session that replaced this one has ended. A `SendAccepted`
-            // or `MessageReplaced` after its `Unlinked` recreates a row
-            // (Codex r4134458445).
-            return;
+        // The account gate stays held through the publication. A concurrent
+        // `Unlinked` or `Stopped` either waits for this result, or has already
+        // closed the account and this result publishes nothing.
+        let events = self.events.clone();
+        let mut unauthorized = None;
+        {
+            let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
+            if !gate.open || gate.inflight.remove(&request).is_none() {
+                return;
+            }
+            match result {
+                Ok(sent) => {
+                    let mut message = chat_message(&tracked.conversation_id, tracked.bot_id, &sent);
+                    // A send echo with no content still shows the text that was posted.
+                    if sent.content.is_empty()
+                        && let Some(posted) = self.carried.bodies().get(&tracked.message_id)
+                        && !posted.trim().is_empty()
+                    {
+                        message.body.clone_from(posted);
+                    }
+                    self.carried.bodies().remove(&tracked.message_id);
+                    self.carried
+                        .history()
+                        .entry(tracked.conversation_id.clone())
+                        .or_default()
+                        .push(message.id.clone());
+                    emit_send_accepted(
+                        &events,
+                        ProtocolId::Discord,
+                        &tracked.conversation_id,
+                        request,
+                    );
+                    emit_message_replaced(&events, tracked.message_id, message);
+                }
+                Err(error) => {
+                    tracing::info!(%error, "discord send failed");
+                    emit_message_delivery(
+                        &events,
+                        ProtocolId::Discord,
+                        tracked.conversation_id.clone(),
+                        tracked.message_id.clone(),
+                        Delivery::Failed,
+                    );
+                    emit_send_rejected(
+                        &events,
+                        ProtocolId::Discord,
+                        &tracked.conversation_id,
+                        request,
+                    );
+                    if error == DiscordApiError::Unauthorized {
+                        unauthorized = Some(error);
+                    } else if self.unlink.is_none() && !self.replaced() {
+                        emit_ready(&events, &format!("Send failed: {error}."));
+                    }
+                }
+            }
         }
-        // Retirement stops new work. A send that started before it still
-        // gets its real result: one that went out ends as `SendAccepted`, so
-        // the user does not send it twice (Codex r4132922551).
-        match result {
-            Ok(sent) => {
-                let mut message = chat_message(&tracked.conversation_id, tracked.bot_id, &sent);
-                // A send echo with no content still shows the text that was posted.
-                if sent.content.is_empty()
-                    && let Some(posted) = self.carried.bodies().get(&tracked.message_id)
-                    && !posted.trim().is_empty()
-                {
-                    message.body.clone_from(posted);
-                }
-                self.carried.bodies().remove(&tracked.message_id);
-                self.carried
-                    .history()
-                    .entry(tracked.conversation_id.clone())
-                    .or_default()
-                    .push(message.id.clone());
-                emit_send_accepted(
-                    &self.events,
-                    ProtocolId::Discord,
-                    &tracked.conversation_id,
-                    request,
-                );
-                emit_message_replaced(&self.events, tracked.message_id, message);
-            }
-            Err(error) => {
-                tracing::info!(%error, "discord send failed");
-                emit_message_delivery(
-                    &self.events,
-                    ProtocolId::Discord,
-                    tracked.conversation_id.clone(),
-                    tracked.message_id.clone(),
-                    Delivery::Failed,
-                );
-                emit_send_rejected(
-                    &self.events,
-                    ProtocolId::Discord,
-                    &tracked.conversation_id,
-                    request,
-                );
-                // Keep this order: the row and `SendRejected` of this send
-                // first, then the 401 step, which answers the other sends.
-                if error == DiscordApiError::Unauthorized {
-                    self.settle_unauthorized(error, false);
-                } else if self.unlink.is_none() && !self.replaced() {
-                    emit_ready(&self.events, &format!("Send failed: {error}."));
-                }
-            }
+        // Keep this order: the row and `SendRejected` of this send first,
+        // then the 401 step, which answers the other sends. The gate is
+        // released first: the 401 step may wait.
+        if let Some(error) = unauthorized {
+            self.settle_unauthorized(error, false);
         }
     }
 
@@ -1243,7 +1319,7 @@ impl Owner {
             from_reload,
             sealing: false,
         });
-        if self.inflight.is_empty() {
+        if !self.account_pending() {
             self.start_seal(unlink);
         } else {
             self.spawn(async move {
@@ -1264,17 +1340,7 @@ impl Owner {
         {
             return;
         }
-        let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
-        sends.sort_by_key(|(request, _)| *request);
-        for (request, tracked) in sends {
-            self.settle_row(&tracked);
-            emit_send_rejected(
-                &self.events,
-                ProtocolId::Discord,
-                &tracked.conversation_id,
-                request,
-            );
-        }
+        self.reject_account_sends();
         self.start_seal(unlink);
     }
 
@@ -1309,41 +1375,50 @@ impl Owner {
         // The flags first: the adapter drops the session on its next command.
         self.flags.revoked.store(true, Ordering::SeqCst);
         self.flags.ending.store(false, Ordering::SeqCst);
-        emit_account(&self.events, ProtocolId::Discord, AccountState::Unlinked);
-        emit_notice(&self.events, ProtocolId::Discord, pending.error.reason());
-        if pending.from_reload {
+        let reason = pending.error.reason();
+        let from_reload = pending.from_reload;
+        let reload_error = pending.error;
+        // Hold the gate through the leftover rejects and `Unlinked`, so a
+        // predecessor result cannot land after the account ends.
+        let events = self.events.clone();
+        let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
+        if !gate.open {
+            return;
+        }
+        reject_open(&mut self.inflight, &self.carried, &events, &mut gate);
+        gate.open = false;
+        emit_account(&events, ProtocolId::Discord, AccountState::Unlinked);
+        emit_notice(&events, ProtocolId::Discord, reason);
+        if from_reload {
             emit_status(
-                &self.events,
+                &events,
                 ProtocolId::Discord,
                 AdapterStatus::Error,
-                format!("Discord bot inbox did not load: {}", pending.error),
+                format!("Discord bot inbox did not load: {reload_error}"),
             );
         }
     }
 
     fn finish_shutdown_if_idle(&mut self) {
-        if self.send_tasks == 0 {
-            self.close();
+        if self.shutdown.is_none() || self.send_tasks > 0 {
+            return;
         }
+        // A predecessor's HTTP task is not in `send_tasks`. Wait for it, then
+        // reject whatever is still open, then emit `Stopped`.
+        if self.carried_pending() {
+            self.arm_settle(AccountEnd::Stopped);
+            return;
+        }
+        self.close();
     }
 
     /// The user disconnected. Sends in flight get up to [`SEND_SETTLE_WAIT`]
     /// for their real result (Codex r4132922551), then the disconnected state
-    /// follows. Loads end at once.
+    /// follows. Loads end at once. A send carried from the previous session
+    /// counts: it is answered before `Unlinked`.
     fn generation_is_current(&self, generation: u64) -> bool {
         let newest = self.active.lock().unwrap_or_else(PoisonError::into_inner);
         *newest == generation
-    }
-
-    /// A retired send result is published while its successor is still the
-    /// newest generation. A disconnect wait has no successor and still
-    /// publishes. A retirement with nowhere to go drops the result.
-    fn publish_late_send(&self) -> bool {
-        match self.late_send {
-            LateSend::Publish => true,
-            LateSend::WhileCurrent(generation) => self.generation_is_current(generation),
-            LateSend::Drop => false,
-        }
     }
 
     fn disconnect(&mut self, detail: &'static str, attempt: u64) {
@@ -1361,92 +1436,194 @@ impl Owner {
         for (_, conversation_id) in loads {
             emit_history_loaded(&self.events, ProtocolId::Discord, conversation_id);
         }
-        if self.inflight.is_empty() {
-            self.finish_disconnect();
-        } else {
+        if self.account_pending() {
             self.spawn(async {
                 tokio::time::sleep(SEND_SETTLE_WAIT).await;
                 Msg::DisconnectWaitOver
             });
+        } else {
+            self.finish_disconnect();
         }
     }
 
     /// Reject the sends still in flight (settle their rows), then emit the
-    /// disconnected state. Nothing of this session comes after it.
+    /// disconnected state. Nothing of this account comes after it. The
+    /// generation check and the publication hold the account gate.
     fn finish_disconnect(&mut self) {
         let Some((detail, attempt)) = self.disconnecting.take() else {
             return;
         };
-        if !self.generation_is_current(attempt) {
-            // The wait outlived this disconnect. Leave the sends: their
-            // real results still apply to the session that took over.
-            return;
-        }
-        let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
-        sends.sort_by_key(|(request, _)| *request);
-        for (request, tracked) in sends {
-            self.settle_row(&tracked);
-            emit_send_rejected(
-                &self.events,
-                ProtocolId::Discord,
-                &tracked.conversation_id,
-                request,
-            );
-        }
-        self.closed = true;
-        // A later connect or disconnect may have claimed `active` while this
-        // message waited, including one that started no session. Then this
-        // old disconnect must not overwrite that status (Codex r4132725575,
-        // r4132922561).
-        let newest = self.active.lock().unwrap_or_else(PoisonError::into_inner);
-        if *newest == attempt {
-            emit_disconnected(&self.events, detail);
+        if self.seal(AccountEnd::Disconnect { detail, attempt }) {
+            self.mark_closed();
         }
     }
 
-    /// A send that gets no accepted result: remove its optimistic row (and
-    /// drop its text, which nothing can retry now), or set a retried row
-    /// back to failed (it keeps its text for Retry).
-    fn settle_row(&mut self, tracked: &Inflight) {
-        if tracked.row == SendRow::Pending {
-            self.carried.bodies().remove(&tracked.message_id);
-        }
-        settle_row(&self.events, tracked);
-    }
-
-    /// Ends a shutdown: reject each send still in flight, emit `Stopped`
-    /// once, and publish nothing more. A result that arrives after this
-    /// finds the send already answered.
+    /// Ends a shutdown: reject each send still in flight for the account,
+    /// including one carried from the previous session, emit `Stopped` once,
+    /// and publish nothing more. The gate stays held through that.
     fn close(&mut self) {
         let Some(done) = self.shutdown.take() else {
             return;
         };
         self.retire();
-        let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
-        sends.sort_by_key(|(request, _)| *request);
-        for (request, tracked) in sends {
-            self.settle_row(&tracked);
-            emit_send_rejected(
-                &self.events,
-                ProtocolId::Discord,
-                &tracked.conversation_id,
-                request,
-            );
+        if !self.seal(AccountEnd::Stopped) {
+            // The account already ended. `Stopped` still comes once.
+            self.flags.emit_stopped_once(&self.events);
         }
-        self.closed = true;
-        self.flags.emit_stopped_once(&self.events);
+        self.mark_closed();
         let _ = done.send(());
+    }
+
+    fn account_settle(&mut self) {
+        let Some(end) = self.pending_end.take() else {
+            return;
+        };
+        match end {
+            AccountEnd::Stopped => self.close(),
+            end => {
+                if self.seal(end) {
+                    self.mark_closed();
+                }
+            }
+        }
+    }
+
+    fn begin_account_end(&mut self, end: AccountEnd) {
+        if self.account_pending() {
+            self.arm_settle(end);
+            return;
+        }
+        if self.seal(end) {
+            self.mark_closed();
+        }
+    }
+
+    fn arm_settle(&mut self, end: AccountEnd) {
+        if self.settle_armed {
+            return;
+        }
+        self.settle_armed = true;
+        self.pending_end = Some(end);
+        self.spawn(async {
+            tokio::time::sleep(SEND_SETTLE_WAIT).await;
+            Msg::AccountSettle
+        });
+    }
+
+    fn account_pending(&self) -> bool {
+        !self
+            .account
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .inflight
+            .is_empty()
+    }
+
+    /// A send this owner did not start is still in the account gate.
+    fn carried_pending(&self) -> bool {
+        let gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
+        gate.inflight
+            .keys()
+            .any(|request| !self.inflight.contains_key(request))
+    }
+
+    /// Answers every send still in the gate, then emits the end. Returns
+    /// false when the account is already closed, or this disconnect is no
+    /// longer the newest attempt (those sends stay for the session that
+    /// took over).
+    fn seal(&mut self, end: AccountEnd) -> bool {
+        if let AccountEnd::Disconnect { detail, attempt } = end {
+            return self.seal_disconnect(detail, attempt);
+        }
+        let events = self.events.clone();
+        let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
+        if !gate.open {
+            return false;
+        }
+        reject_open(&mut self.inflight, &self.carried, &events, &mut gate);
+        gate.open = false;
+        if let AccountEnd::Stopped = end {
+            self.flags.emit_stopped_once(&events);
+        } else {
+            emit_account(&events, ProtocolId::Discord, AccountState::Unlinked);
+        }
+        true
+    }
+
+    /// The generation check and `Unlinked` hold the account gate and
+    /// `active`, so a send result cannot pass the end and a newer attempt
+    /// cannot lose its status.
+    fn seal_disconnect(&mut self, detail: &'static str, attempt: u64) -> bool {
+        let events = self.events.clone();
+        let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
+        if !gate.open {
+            return false;
+        }
+        let newest = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        if *newest != attempt {
+            // The wait outlived this disconnect. Leave the sends: their
+            // real results still apply to the session that took over
+            // (Codex r4132725575, r4132922561, r4133411242).
+            return false;
+        }
+        reject_open(&mut self.inflight, &self.carried, &events, &mut gate);
+        gate.open = false;
+        emit_disconnected(&events, detail);
+        // `newest` stays held through the emit. NLL would drop it at the
+        // comparison above, and a newer attempt could land in that gap.
+        drop(newest);
+        true
+    }
+
+    /// Rejects the sends still open. The account stays open, so a result
+    /// that arrives before the end can still be accepted.
+    fn reject_account_sends(&mut self) {
+        let events = self.events.clone();
+        let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
+        if !gate.open {
+            return;
+        }
+        reject_open(&mut self.inflight, &self.carried, &events, &mut gate);
     }
 
     /// Runs HTTP work off the owner. Its result comes back as a message. The
     /// task holds a strong sender, so a retired owner still gets the result.
+    fn mark_closed(&mut self) {
+        self.closed = true;
+        self.tx_hold = None;
+    }
+
     fn spawn(&self, work: impl Future<Output = Msg> + Send + 'static) {
-        let Some(tx) = self.tx.upgrade() else {
+        let Some(tx) = self.tx.upgrade().or_else(|| self.tx_hold.clone()) else {
             return;
         };
         tokio::spawn(async move {
             let _ = tx.send(work.await);
         });
+    }
+}
+
+/// Rejects every send still in the gate. The caller holds the gate.
+fn reject_open(
+    local: &mut HashMap<u64, Inflight>,
+    carried: &Carried,
+    events: &EventTx,
+    gate: &mut AccountSends,
+) {
+    let mut sends: Vec<(u64, Inflight)> = gate.inflight.drain().collect();
+    sends.sort_by_key(|(request, _)| *request);
+    for (request, tracked) in sends {
+        local.remove(&request);
+        if tracked.row == SendRow::Pending {
+            carried.bodies().remove(&tracked.message_id);
+        }
+        settle_row(events, &tracked);
+        emit_send_rejected(
+            events,
+            ProtocolId::Discord,
+            &tracked.conversation_id,
+            request,
+        );
     }
 }
 
