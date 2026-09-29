@@ -90,6 +90,10 @@ pub struct DiscordAdapter {
     /// unique across sessions and keep their form.
     #[cfg(any(test, feature = "discord-bot"))]
     generation: u64,
+    /// The id of the newest session, shared with the owners. See
+    /// `session::ActiveSession`.
+    #[cfg(any(test, feature = "discord-bot"))]
+    active: session::ActiveSession,
     /// The chat `ViewChat` last named. `None` means the user left Discord.
     viewed: Option<String>,
     /// Longest wait at shutdown for the sends in flight. A test makes it short.
@@ -132,6 +136,8 @@ impl DiscordAdapter {
             session: None,
             #[cfg(any(test, feature = "discord-bot"))]
             generation: 0,
+            #[cfg(any(test, feature = "discord-bot"))]
+            active: Arc::default(),
             viewed: None,
             #[cfg(any(test, feature = "discord-bot"))]
             shutdown_limit: SHUTDOWN_LIMIT,
@@ -221,6 +227,7 @@ impl DiscordAdapter {
                         events,
                         self.generation,
                         handoff,
+                        &self.active,
                     ));
                 }
             }
@@ -2205,6 +2212,58 @@ mod tests {
         assert!(total + CLOSE_SLACK <= crate::APP_CLOSE_LIMIT);
         assert!(total < crate::APP_CLOSE_LIMIT);
         assert_eq!(SHUTDOWN_LIMIT, Duration::from_secs(4));
+    }
+
+    /// Codex r4132725575 on #157: Disconnect, then Connect before the old
+    /// owner handles the disconnect. The new session links, and the old
+    /// owner's disconnected state does not unlink it later.
+    #[tokio::test]
+    async fn a_stale_disconnect_does_not_unlink_the_new_session() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = inbox_loaded(&mut rx).await;
+        parked.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late.iter().any(is_unlinked),
+            "the old owner's disconnect unlinked the new session: {late:?}"
+        );
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("the new session stays linked");
+        let opened = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+            )
+        })
+        .await;
+        assert!(!opened.iter().any(is_unlinked));
     }
 
     /// Codex r4130981025 on #157: a shutdown that reaches its limit with a

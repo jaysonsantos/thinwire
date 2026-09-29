@@ -20,8 +20,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -194,6 +194,14 @@ impl Flags {
     }
 }
 
+/// The id of the adapter's newest session. A session start sets it and
+/// emits `Linking` under this lock. An owner emits its disconnected state
+/// under it too, and only while it is still the newest session. So an old
+/// owner's `Unlinked` never follows a newer session's `Linking` (Codex
+/// r4132725575). The lock is held only for that check and emit, never across
+/// an await.
+pub(crate) type ActiveSession = Arc<Mutex<u64>>;
+
 /// The adapter side of a session. Every method only sends a message.
 pub(crate) struct Session {
     tx: mpsc::UnboundedSender<Msg>,
@@ -212,21 +220,27 @@ impl Session {
         events: &EventTx,
         id: u64,
         handoff: Option<oneshot::Receiver<Carried>>,
+        active: &ActiveSession,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let flags = Arc::new(Flags::default());
-        emit_account(events, ProtocolId::Discord, AccountState::Linking);
-        emit_status(
-            events,
-            ProtocolId::Discord,
-            AdapterStatus::Connecting,
-            format!("Discord bot inbox is loading guild channels. {BOT_TOKEN_PRESENT}."),
-        );
+        {
+            let mut newest = active.lock().unwrap_or_else(PoisonError::into_inner);
+            *newest = id;
+            emit_account(events, ProtocolId::Discord, AccountState::Linking);
+            emit_status(
+                events,
+                ProtocolId::Discord,
+                AdapterStatus::Connecting,
+                format!("Discord bot inbox is loading guild channels. {BOT_TOKEN_PRESENT}."),
+            );
+        }
         let owner = Owner {
             api,
             events: events.clone(),
             tx: tx.downgrade(),
             flags: Arc::clone(&flags),
+            active: Arc::clone(active),
             id,
             carried: Carried::default(),
             bot_id: None,
@@ -481,6 +495,8 @@ struct Owner {
     /// reports back are gone. A task holds a strong sender.
     tx: mpsc::WeakUnboundedSender<Msg>,
     flags: Arc<Flags>,
+    /// See [`ActiveSession`].
+    active: ActiveSession,
     id: u64,
     carried: Carried,
     bot_id: Option<u64>,
@@ -1251,7 +1267,12 @@ impl Owner {
         }
         self.retire();
         self.closed = true;
-        emit_disconnected(&self.events, detail);
+        // A newer session may have started while this message waited. Then
+        // this old disconnect must not unlink it (Codex r4132725575).
+        let newest = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        if *newest == self.id {
+            emit_disconnected(&self.events, detail);
+        }
     }
 
     /// A send that gets no accepted result: remove its optimistic row (and
