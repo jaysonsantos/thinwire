@@ -68,9 +68,10 @@ struct ChatRecord {
     /// history chunk carries the phone's older unread count, so a chat read
     /// here changes its count only by new messages (#98).
     read_at: Option<i64>,
-    /// Inbound ids handled since the last local read: counted as unread, or
-    /// seen in the read second. A repeat does not count again, also after its
-    /// row left the capped cache (Codex r4131089163).
+    /// Inbound ids handled for this chat: counted since the last read, or
+    /// seen at or before the read point. A read keeps the set. A repeat does
+    /// not count again, also after its row left the capped cache
+    /// (Codex r4131089163, r4132341446).
     handled: HashSet<String>,
     /// Server ids that still carry the local send clock. `confirm_send`
     /// keeps that clock until a server or live copy arrives. The read point
@@ -87,13 +88,15 @@ impl ChatRecord {
         let read_at = self.server_time();
         self.unread = 0;
         self.read_at = Some(read_at);
-        // Rows of the read second were seen; a later copy must not count.
-        self.handled = self
-            .messages
-            .iter()
-            .filter(|row| row.timestamp == read_at)
-            .map(|row| row.id.clone())
-            .collect();
+        // Keep ids already handled (a row may have left the cache) and every
+        // cached inbound row at or before this time. A new id in that second
+        // still counts; a seen one does not (Codex r4132341446).
+        self.handled.extend(
+            self.messages
+                .iter()
+                .filter(|row| !row.from_me && row.timestamp <= read_at)
+                .map(|row| row.id.clone()),
+        );
     }
 
     /// The newest server time of this chat: the newest row that is not a
@@ -1075,6 +1078,45 @@ pub(super) mod tests {
             upserts(&events)[0].unread,
             total,
             "a redelivery does not count"
+        );
+    }
+
+    /// Codex r4132341446: a read keeps every seen inbound id, not only the
+    /// ids of the read second. After newer rows evict an older read id, a
+    /// live redelivery does not count. A new id in that second still does.
+    #[test]
+    fn a_read_id_evicted_from_the_cache_does_not_count_again() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![
+            message(chat, "old", "one", 1),
+            message(chat, "newer", "two", 2),
+        ]);
+        inbox.view(Some(chat));
+        let flood: Vec<WaMessage> = (0..MESSAGES_PER_CHAT)
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("n{n:04}"),
+                    "new",
+                    3 + i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        inbox.apply_messages(flood);
+        assert!(
+            !inbox.chats[chat].messages.iter().any(|row| row.id == "old"),
+            "the older row left the cache"
+        );
+        inbox.view(None);
+        let events = inbox.apply_messages(vec![message(chat, "old", "one", 1)]);
+        assert_eq!(upserts(&events)[0].unread, 0, "a redelivery does not count");
+        let read_at = inbox.chats[chat].read_at.expect("read");
+        let events = inbox.apply_messages(vec![message(chat, "fresh", "same second", read_at)]);
+        assert_eq!(
+            upserts(&events)[0].unread,
+            1,
+            "a new id in the read second counts"
         );
     }
 
