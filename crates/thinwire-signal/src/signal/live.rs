@@ -54,6 +54,10 @@ pub(super) struct Outbound {
 
 /// One page of stored history. The same size as the Telegram older page.
 const HISTORY_PAGE: usize = 50;
+/// Rows one store read may return. One extra row is the older-page cursor.
+/// One more tells the page that older rows exist. The store primary key is
+/// `(ts, thread_id)`, so a time window can still hold more rows than a page.
+const HISTORY_READ_LIMIT: usize = HISTORY_PAGE + 2;
 
 pub(super) enum WorkerJob {
     Send(Outbound),
@@ -663,33 +667,130 @@ async fn fetch_history_page(
     before: u64,
     before_id: Option<&str>,
 ) -> Result<(Vec<Content>, bool), ()> {
-    let mut span = HISTORY_WINDOW_MS;
-    let include_before = before_id.is_some();
-    loop {
-        let (start, reached_start) = history_window(before, span);
-        let messages = manager
-            .store()
-            .messages(thread, history_bounds(start, before, include_before))
-            .await
-            .map_err(|_| ())?;
-        // The store returns the whole window. Keep only one page of rows.
-        let mut page = NewestBound::new(HISTORY_PAGE);
-        for content in messages.flatten() {
-            let (millis, id) = content_history_key(&content);
-            if is_on_history_page(millis, &id, before, before_id) {
-                page.consider(millis, id, content);
+    let Some(url) = history_store_url() else {
+        return Err(());
+    };
+    let pool = open_history_read(&url).await?;
+    let outcome = async {
+        let mut span = HISTORY_WINDOW_MS;
+        let include_before = before_id.is_some();
+        loop {
+            let (start, reached_start) = history_window(before, span);
+            let timestamps = read_history_timestamps(
+                &pool,
+                thread,
+                start,
+                before,
+                include_before,
+                HISTORY_READ_LIMIT,
+            )
+            .await?;
+            // Each timestamp is one row (`message` loads that row). The timestamp
+            // query stops at `HISTORY_READ_LIMIT`.
+            let mut page = NewestBound::new(HISTORY_PAGE);
+            for ts in timestamps {
+                let Some(content) = manager.store().message(thread, ts).await.map_err(|_| ())?
+                else {
+                    continue;
+                };
+                let (millis, id) = content_history_key(&content);
+                if is_on_history_page(millis, &id, before, before_id) {
+                    page.consider(millis, id, content);
+                }
             }
+            if window_is_enough(page.passing(), HISTORY_PAGE, reached_start) {
+                return Ok(page.finish(reached_start));
+            }
+            span = widen_history_span(before, span);
         }
-        if window_is_enough(page.passing(), HISTORY_PAGE, reached_start) {
-            return Ok(page.finish(reached_start));
-        }
-        span = widen_history_span(before, span);
+    }
+    .await;
+    pool.close().await;
+    outcome
+}
+
+fn history_store_url() -> Option<String> {
+    let path = signal_session_path().ok()?;
+    sqlite_store_path(&path).to_str().map(str::to_string)
+}
+
+async fn open_history_read(url: &str) -> Result<sqlx::SqlitePool, ()> {
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .map_err(|_| ())?
+        .create_if_missing(false)
+        .read_only(true)
+        .busy_timeout(std::time::Duration::from_secs(2));
+    sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|_| ())
+}
+
+/// Newest timestamps in the window, at most `limit` rows.
+/// presage `messages()` loads every row of the window. This query stops early.
+async fn read_history_timestamps(
+    pool: &sqlx::SqlitePool,
+    thread: &Thread,
+    start: u64,
+    end: u64,
+    include_end: bool,
+    limit: usize,
+) -> Result<Vec<u64>, ()> {
+    let (group_key, recipient) = thread_store_keys(thread);
+    let start = i64::try_from(start).map_err(|_| ())?;
+    let end = i64::try_from(end).map_err(|_| ())?;
+    let limit = i64::try_from(limit).map_err(|_| ())?;
+    let sql = if include_end {
+        HISTORY_TIMESTAMPS_INCLUSIVE
+    } else {
+        HISTORY_TIMESTAMPS_EXCLUSIVE
+    };
+    let rows = sqlx::query(sql)
+        .bind(group_key)
+        .bind(recipient)
+        .bind(start)
+        .bind(end)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ())?;
+    rows.iter()
+        .map(|row| {
+            let ts: i64 = sqlx::Row::try_get(row, 0).map_err(|_| ())?;
+            u64::try_from(ts).map_err(|_| ())
+        })
+        .collect()
+}
+
+const HISTORY_TIMESTAMPS_EXCLUSIVE: &str = "\
+SELECT ts FROM thread_messages \
+WHERE thread_id = ( \
+    SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?) \
+    AND ts >= ? AND ts < ? \
+ORDER BY ts DESC \
+LIMIT ?";
+
+const HISTORY_TIMESTAMPS_INCLUSIVE: &str = "\
+SELECT ts FROM thread_messages \
+WHERE thread_id = ( \
+    SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?) \
+    AND ts >= ? AND ts <= ? \
+ORDER BY ts DESC \
+LIMIT ?";
+
+fn thread_store_keys(thread: &Thread) -> (Option<&[u8]>, Option<Uuid>) {
+    match thread {
+        Thread::Group(key) => (Some(key.as_slice()), None),
+        Thread::Contact(service_id) => (None, Some(service_id.raw_uuid())),
     }
 }
 
 /// Query bounds for one history window.
 /// An older page includes `before` so messages that share the cursor's
 /// millisecond are still returned. The page drops the cursor itself.
+#[cfg(test)]
 fn history_bounds(
     start: u64,
     before: u64,
@@ -1704,6 +1805,90 @@ mod tests {
         assert_eq!(
             burst.rows.first().expect("oldest peer").id,
             format!("8000:s{:04}", 5_000 - HISTORY_PAGE)
+        );
+    }
+
+    /// #175: a window with more rows than one page still returns a bounded read.
+    #[tokio::test]
+    async fn a_history_page_reads_a_bounded_number_of_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "thinwire-signal-history-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let url = path.to_str().expect("temp path");
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("url")
+            .create_if_missing(true);
+        let pool = sqlx::SqlitePool::connect_with(options).await.expect("db");
+        sqlx::query(
+            "CREATE TABLE threads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_master_key BLOB UNIQUE,
+                recipient_id BLOB
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("threads");
+        sqlx::query(
+            "CREATE TABLE thread_messages (
+                ts INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
+                PRIMARY KEY (ts, thread_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("messages");
+        let key = [9u8; 32];
+        sqlx::query("INSERT INTO threads (group_master_key) VALUES (?)")
+            .bind(key.as_slice())
+            .execute(&pool)
+            .await
+            .expect("thread");
+        let thread_id: i64 =
+            sqlx::query_scalar("SELECT id FROM threads WHERE group_master_key = ?")
+                .bind(key.as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("thread id");
+        let stored = 200i64;
+        for ts in 1..=stored {
+            sqlx::query("INSERT INTO thread_messages (ts, thread_id) VALUES (?, ?)")
+                .bind(ts)
+                .bind(thread_id)
+                .execute(&pool)
+                .await
+                .expect("row");
+        }
+        let thread = Thread::Group(key);
+        let got = super::read_history_timestamps(
+            &pool,
+            &thread,
+            0,
+            u64::try_from(stored).expect("end") + 1,
+            false,
+            HISTORY_READ_LIMIT,
+        )
+        .await
+        .expect("bounded read");
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            got.len() <= HISTORY_READ_LIMIT,
+            "the read stays within the limit"
+        );
+        assert!(
+            got.len() < stored as usize,
+            "the window holds more than one page"
+        );
+        assert_eq!(got.len(), HISTORY_READ_LIMIT);
+        assert_eq!(got.first().copied(), Some(stored as u64));
+        assert_eq!(
+            got.last().copied(),
+            Some(stored as u64 - HISTORY_READ_LIMIT as u64 + 1)
         );
     }
 
