@@ -10,9 +10,11 @@
 //! and there is no check/await/act gap.
 //!
 //! The adapter keeps a [`Session`] handle. Its methods only send messages. It
-//! reads three one-way flags that only the owner sets: `ready` (the bot id is
-//! known), `ending` (a 401 settled, `Unlinked` is pending), and `revoked`
-//! (the owner queued `Unlinked`).
+//! reads one-way flags: `ready` (the bot id is known), `ending` (a 401
+//! settled, `Unlinked` is pending), `revoked` (the owner queued `Unlinked`),
+//! and `retired`. The owner sets the first three. [`Session::retire`] sets
+//! `retired` before it returns, so a list or history result already queued
+//! publishes nothing.
 //!
 //! State diagram: `thinwire-team/discord.md`, section "Session owner".
 
@@ -157,6 +159,12 @@ enum Msg {
     Flush {
         done: oneshot::Sender<()>,
     },
+    /// Test hook: the owner waits before its next message.
+    #[cfg(test)]
+    Park {
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
 }
 
 /// The one-way flags that the adapter reads.
@@ -167,6 +175,10 @@ struct Flags {
     revoked: AtomicBool,
     /// `Stopped` is queued. Whoever sets it first emits it, so it comes once.
     stopped: AtomicBool,
+    /// Set by [`Session::retire`] before it returns. A completion already
+    /// queued still sees it, so disconnect can emit `Unlinked` without a
+    /// later `Linked`, conversation, or history row (Codex r4131954091).
+    retired: AtomicBool,
 }
 
 impl Flags {
@@ -331,10 +343,16 @@ impl Session {
         }
     }
 
-    /// A later session replaces this one. Results that are still running
-    /// are dropped; a send still in flight is rejected when its HTTP call
-    /// ends. The receiver gets the state for the next session.
+    /// A later session replaces this one, or the user disconnects. Results
+    /// that are still running are dropped; a send still in flight is rejected
+    /// when its HTTP call ends. The receiver gets the state for the next
+    /// session.
+    ///
+    /// Retirement is visible before this returns. A [`Msg::ReloadDone`] or
+    /// [`Msg::HistoryDone`] already queued publishes nothing, even though the
+    /// owner handles that message before [`Msg::Retire`].
     pub(crate) fn retire(self) -> oneshot::Receiver<Carried> {
+        self.flags.retired.store(true, Ordering::SeqCst);
         let (carried, rx) = oneshot::channel();
         let _ = self.tx.send(Msg::Retire { carried });
         rx
@@ -361,6 +379,50 @@ impl Session {
         if self.tx.send(Msg::Flush { done }).is_ok() {
             let _ = rx.await;
         }
+    }
+
+    /// Test hook: the owner waits before its next message. Drop the guard,
+    /// or call [`Parked::release`], to let it continue.
+    #[cfg(test)]
+    pub(crate) async fn park(&self) -> Parked {
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Park {
+                entered,
+                release: release_rx,
+            })
+            .expect("owner alive");
+        entered_rx.await.expect("owner parked");
+        Parked {
+            release: Some(release),
+        }
+    }
+}
+
+/// Releases a [`Session::park`] so the owner reads its next message.
+#[cfg(test)]
+pub(crate) struct Parked {
+    release: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+impl Parked {
+    pub(crate) fn release(mut self) {
+        self.signal();
+    }
+
+    fn signal(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for Parked {
+    fn drop(&mut self) {
+        self.signal();
     }
 }
 
@@ -435,6 +497,12 @@ impl Owner {
             self.carried = handoff.await.unwrap_or_default();
         }
         while let Some(msg) = rx.recv().await {
+            #[cfg(test)]
+            if let Msg::Park { entered, release } = msg {
+                let _ = entered.send(());
+                let _ = release.await;
+                continue;
+            }
             self.handle(msg);
         }
     }
@@ -510,6 +578,11 @@ impl Owner {
             Msg::Flush { done } => {
                 let _ = done.send(());
             }
+            // `run` waits on `Park` before it calls `handle`.
+            #[cfg(test)]
+            Msg::Park { entered, .. } => {
+                let _ = entered.send(());
+            }
         }
     }
 
@@ -523,10 +596,15 @@ impl Owner {
         self.flags.revoked.load(Ordering::SeqCst)
     }
 
+    /// [`Session::retire`] has returned, or this task has handled `Retire`.
+    fn replaced(&self) -> bool {
+        self.retired || self.flags.retired.load(Ordering::SeqCst)
+    }
+
     /// This session may publish inbox rows: not replaced, not ending, and
     /// not unlinked.
     fn publishes(&self) -> bool {
-        !self.retired && self.unlink.is_none() && !self.unlinked()
+        !self.replaced() && self.unlink.is_none() && !self.unlinked()
     }
 
     fn still_listed(&self, ticket: u64, conversation_id: &str) -> bool {
@@ -537,6 +615,7 @@ impl Owner {
 
     fn retire(&mut self) {
         self.retired = true;
+        self.flags.retired.store(true, Ordering::SeqCst);
         // A reconnect replaces this account. Its pending `Unlinked` must not
         // unlink the new session.
         self.unlink = None;
@@ -544,7 +623,7 @@ impl Owner {
     }
 
     fn reload(&mut self) {
-        if self.retired {
+        if self.replaced() {
             return;
         }
         if let Some(error) = self.ending_error() {
@@ -564,7 +643,7 @@ impl Owner {
     }
 
     fn open(&mut self, conversation_id: String) {
-        if self.retired {
+        if self.replaced() {
             return;
         }
         if let Some(error) = self.ending_error() {
@@ -860,10 +939,11 @@ impl Owner {
         let Some(conversation_id) = self.loads.remove(&load) else {
             return;
         };
-        if self.retired || self.unlinked() {
-            // A replaced load still ends the spinner. An unlinked session
-            // already did.
-            if !self.unlinked() {
+        if self.replaced() || self.unlinked() {
+            // A load that finishes after `Retire` was handled still ends the
+            // spinner. One already queued when `retire` returned publishes
+            // nothing: disconnect may already have emitted `Unlinked`.
+            if self.retired && !self.unlinked() {
                 emit_history_loaded(&self.events, ProtocolId::Discord, conversation_id);
             }
             return;
@@ -1003,7 +1083,7 @@ impl Owner {
     /// ends. Commands that come meanwhile are answered and keep the pending
     /// `Unlinked`.
     fn settle_unauthorized(&mut self, error: DiscordApiError, from_reload: bool) {
-        if self.unlink.is_some() || self.unlinked() || self.retired {
+        if self.unlink.is_some() || self.unlinked() || self.replaced() {
             return;
         }
         self.flags.ending.store(true, Ordering::SeqCst);
@@ -1079,7 +1159,7 @@ impl Owner {
     }
 
     fn seal_done(&mut self, unlink: u64) {
-        if self.retired
+        if self.replaced()
             || !self
                 .unlink
                 .as_ref()

@@ -227,8 +227,9 @@ impl DiscordAdapter {
         let _ = events;
         #[cfg(any(test, feature = "discord-bot"))]
         {
-            // The owner drops later results. A send still in flight is
-            // rejected when its HTTP call ends.
+            // `retire` marks the session retired before it returns, so a list
+            // or history result already queued publishes nothing. A send still
+            // in flight is rejected when its HTTP call ends.
             if let Some(session) = self.session.take() {
                 drop(session.retire());
             }
@@ -3333,6 +3334,131 @@ mod tests {
         assert!(
             messages(&events).is_empty() && messages(&rest).is_empty(),
             "a replaced load does not publish rows"
+        );
+    }
+
+    /// An inbox event that would link or fill the shell after `Unlinked`.
+    fn repopulates(event: &AdapterEvent) -> bool {
+        matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Linked,
+                ..
+            } | AdapterEvent::ConversationUpsert { .. }
+                | AdapterEvent::ConversationRemoved { .. }
+                | AdapterEvent::ChatListLoaded { .. }
+                | AdapterEvent::MessageReceived { .. }
+                | AdapterEvent::MessagesRemoved { .. }
+                | AdapterEvent::HistoryLoaded { .. }
+                | AdapterEvent::Status {
+                    status: AdapterStatus::Ready,
+                    ..
+                }
+        )
+    }
+
+    /// Codex r4131954091 on #157: disconnect retires the owner before
+    /// `Unlinked`. A channel-list result already queued must not publish
+    /// `Linked` or conversations after that.
+    ///
+    /// `current_thread` keeps the resumed notify and the owner's `ReloadDone`
+    /// in one poll, so the result is queued before disconnect runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_channel_list_publishes_nothing_after_unlinked() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let resumed = Arc::new(Notify::new());
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let _ = drain(&mut rx);
+        api.state().hold_channels = Some(Arc::clone(&hold));
+        api.state().channels_at_barrier = Some(Arc::clone(&arrived));
+        api.state().channels_resumed = Some(Arc::clone(&resumed));
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("list is in flight");
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        hold.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), resumed.notified())
+            .await
+            .expect("list result is queued");
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        parked.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = drain(&mut rx);
+        let unlinked = events.iter().position(is_unlinked).expect("unlinked");
+        assert!(
+            events[unlinked + 1..]
+                .iter()
+                .all(|event| !repopulates(event)),
+            "queued list published after Unlinked: {:?}",
+            &events[unlinked + 1..]
+        );
+    }
+
+    /// Codex r4131954091 on #157: a history result already queued when
+    /// disconnect retires the owner must not publish rows after `Unlinked`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_history_publishes_nothing_after_unlinked() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let resumed = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_history = Some(Arc::clone(&hold));
+        fake.history_at_hold = Some(Arc::clone(&arrived));
+        fake.history_resumed = Some(Arc::clone(&resumed));
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        let _ = drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                },
+                &tx,
+            )
+            .expect("open");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("history is in flight");
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        hold.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), resumed.notified())
+            .await
+            .expect("history result is queued");
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        parked.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = drain(&mut rx);
+        let unlinked = events.iter().position(is_unlinked).expect("unlinked");
+        assert!(
+            events[unlinked + 1..]
+                .iter()
+                .all(|event| !repopulates(event)),
+            "queued history published after Unlinked: {:?}",
+            &events[unlinked + 1..]
         );
     }
 

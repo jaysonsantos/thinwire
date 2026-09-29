@@ -43,6 +43,10 @@ pub(crate) struct FakeState {
     pub hold_channels: Option<Arc<Notify>>,
     /// Fired when `channels` is about to wait on `hold_channels`.
     pub channels_at_barrier: Option<Arc<Notify>>,
+    /// Fired after `hold_channels` releases, before the list result returns.
+    /// On a current-thread runtime the `ReloadDone` message is queued before
+    /// a task waiting on this runs.
+    pub channels_resumed: Option<Arc<Notify>>,
     /// Pauses the 401 step after revocation and before `Unlinked`.
     pub hold_unlink: Option<Arc<Notify>>,
     /// Fired when that pause is about to wait.
@@ -58,6 +62,12 @@ pub(crate) struct FakeState {
 pub(crate) struct FakeDiscordApi {
     pub state: Mutex<FakeState>,
     pub hold_history: Option<Arc<Notify>>,
+    /// Fired when a chat history call is about to wait on `hold_history`.
+    pub history_at_hold: Option<Arc<Notify>>,
+    /// Fired after `hold_history` releases, before the history result returns.
+    /// On a current-thread runtime the `HistoryDone` message is queued before
+    /// a task waiting on this runs.
+    pub history_resumed: Option<Arc<Notify>>,
     pub hold_send: Option<Arc<Notify>>,
     /// Sends currently blocked in `hold_send`.
     pub sends_at_hold: AtomicUsize,
@@ -157,6 +167,8 @@ impl FakeDiscordApi {
         Self {
             state: Mutex::new(state),
             hold_history: None,
+            history_at_hold: None,
+            history_resumed: None,
             hold_send: None,
             sends_at_hold: AtomicUsize::new(0),
             send_result_pause: None,
@@ -230,11 +242,12 @@ impl DiscordApi for FakeDiscordApi {
                 .get(&guild_id)
                 .cloned()
                 .ok_or(DiscordApiError::NotFound)?;
-            let (hold, arrived) = {
+            let (hold, arrived, resumed) = {
                 let state = self.state();
                 (
                     state.hold_channels.clone(),
                     state.channels_at_barrier.clone(),
+                    state.channels_resumed.clone(),
                 )
             };
             if let Some(arrived) = arrived {
@@ -242,6 +255,9 @@ impl DiscordApi for FakeDiscordApi {
             }
             if let Some(hold) = hold {
                 hold.notified().await;
+                if let Some(resumed) = resumed {
+                    resumed.notify_one();
+                }
             }
             Ok(channels)
         })
@@ -269,7 +285,13 @@ impl DiscordApi for FakeDiscordApi {
             if limit > 1
                 && let Some(hold) = &self.hold_history
             {
+                if let Some(arrived) = &self.history_at_hold {
+                    arrived.notify_one();
+                }
                 hold.notified().await;
+                if let Some(resumed) = &self.history_resumed {
+                    resumed.notify_one();
+                }
             }
             let mut messages = self
                 .state()
