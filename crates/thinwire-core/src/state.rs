@@ -2622,9 +2622,10 @@ impl Snapshot {
 
     /// Tell the adapters which chat shows now (shell plan 9). Sends only the
     /// difference: `None` to the protocol the user left, then the new chat.
-    /// The core calls it after every dispatch and pump, so every path (a
-    /// click, an auto-select, a removed chat, a session end, a login form
-    /// over the thread) is covered.
+    /// An unfocused window counts as no chat, so blur sends `None` and focus
+    /// sends the open chat again. The core calls it after every dispatch and
+    /// pump, so every path (a click, an auto-select, a removed chat, a
+    /// session end, a login form over the thread, a focus change) is covered.
     pub(crate) fn sync_viewed(&mut self) {
         let now = self.viewed_chat();
         if now == self.viewed {
@@ -2652,6 +2653,8 @@ impl Snapshot {
     }
 
     /// The window gained or lost focus. Focus clears the open chat's badge.
+    /// Blur changes [`Self::viewed_chat`], and the following [`Self::sync_viewed`]
+    /// tells adapters the chat is not viewed. Focus sends that chat again.
     pub(crate) fn set_window_focus(&mut self, focused: bool) {
         self.window_focused = focused;
         if focused {
@@ -2713,8 +2716,11 @@ impl Snapshot {
     }
 
     /// The chat that shows in the thread now, if any.
+    /// An unfocused window is not looking at it. Adapters that treat the
+    /// viewed chat as read must hear `ViewChat(None)` or a live message
+    /// while the user is away loses its badge.
     fn viewed_chat(&self) -> Option<(ProtocolId, String)> {
-        if self.center_view() != CenterView::Thread {
+        if !self.window_focused || self.center_view() != CenterView::Thread {
             return None;
         }
         let protocol = self.selected_protocol;
@@ -8234,6 +8240,47 @@ mod tests {
             view_commands(&mut snapshot),
             vec![(ProtocolId::Telegram, None)]
         );
+    }
+
+    /// Codex P1 on #177: blur must leave the adapter's viewed chat, and
+    /// focus must name it again. The badge stays until focus.
+    #[test]
+    fn blur_clears_the_viewed_chat_and_focus_restores_it() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, Some("telegram:1".into()))]
+        );
+
+        snapshot.set_window_focus(false);
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, None)],
+            "blur tells adapters the chat is not viewed"
+        );
+        assert!(snapshot.viewed().is_none());
+
+        let mut row = telegram_chat(1, "Ada", 1);
+        row.unread = 4;
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation: row });
+        assert_eq!(
+            snapshot.unread_for(ProtocolId::Telegram),
+            4,
+            "an unfocused open chat keeps the badge"
+        );
+        assert!(
+            view_commands(&mut snapshot).is_empty(),
+            "the upsert does not change the view"
+        );
+
+        snapshot.set_window_focus(true);
+        assert_eq!(
+            view_commands(&mut snapshot),
+            vec![(ProtocolId::Telegram, Some("telegram:1".into()))],
+            "focus names the open chat again"
+        );
+        assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 0);
     }
 
     // endregion: viewed chat

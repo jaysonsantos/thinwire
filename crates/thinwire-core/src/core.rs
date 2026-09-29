@@ -1524,6 +1524,46 @@ mod tests {
         assert_eq!(core.view().unread_for(ProtocolId::Telegram), 0);
     }
 
+    /// Codex P1 on #177: blur sends `ViewChat(None)` and focus sends the chat
+    /// again, so adapters stop treating a blurred chat as viewed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blur_sends_view_chat_none_and_focus_restores_the_chat() {
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        while sent.try_recv().is_ok() {}
+
+        core.dispatch(Intent::WindowFocus(false));
+        let mut views = Vec::new();
+        while let Ok(command) = sent.try_recv() {
+            if let AdapterCommand::ViewChat {
+                conversation_id, ..
+            } = command
+            {
+                views.push(conversation_id);
+            }
+        }
+        assert_eq!(views, vec![None]);
+
+        core.dispatch(Intent::WindowFocus(true));
+        views.clear();
+        while let Ok(command) = sent.try_recv() {
+            if let AdapterCommand::ViewChat {
+                conversation_id, ..
+            } = command
+            {
+                views.push(conversation_id);
+            }
+        }
+        assert_eq!(views, vec![Some("telegram:1".to_owned())]);
+    }
+
     /// PR #48 review (P1): one frame with a click on chat B and an edit of
     /// chat A. The frontend sends `SelectConversation(B)` first, then the
     /// edit. The edit must stay with A.
