@@ -309,7 +309,9 @@ impl<B: LinkBackend> Owner<B> {
         // status (the Cancel message waits behind it in the queue).
         if !self.session.is_link(generation) {
             if let Ok(started) = result {
-                self.stop_bot(started.bot).await;
+                // A slow stop reports itself and blocks the next start; this
+                // start is over either way.
+                let _ = self.stop_bot(started.bot).await;
             }
             self.active.store(false, Ordering::SeqCst);
             return;

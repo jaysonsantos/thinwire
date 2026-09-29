@@ -80,15 +80,30 @@ struct ChatRecord {
 impl ChatRecord {
     /// The user sees every message of this chat now.
     fn mark_read(&mut self) {
+        let read_at = self.server_time();
         self.unread = 0;
-        self.read_at = Some(self.timestamp);
+        self.read_at = Some(read_at);
         // Rows of the read second were seen; a later copy must not count.
         self.handled = self
             .messages
             .iter()
-            .filter(|row| row.timestamp == self.timestamp)
+            .filter(|row| row.timestamp == read_at)
             .map(|row| row.id.clone())
             .collect();
+    }
+
+    /// The newest server time of this chat: the newest row that is not a
+    /// local `pending:` send, or the history time. A local send time can be
+    /// ahead of the server's clock, and a later inbound message with an
+    /// earlier server time must still count (#158 review).
+    fn server_time(&self) -> i64 {
+        self.messages
+            .iter()
+            .filter(|row| !row.id.starts_with(PENDING_PREFIX))
+            .map(|row| row.timestamp)
+            .max()
+            .unwrap_or(0)
+            .max(self.history_at)
     }
 
     /// Count one new inbound message of a chat read here. `true` if it adds
@@ -214,11 +229,14 @@ impl Inbox {
             } else {
                 Arrival::Live
             };
-            if !known && !message.from_me && !is_open {
+            // After a local read, an id counts once: a redelivery after its
+            // row left the capped cache is not new (Codex r4131622220).
+            let counts = match record.read_at {
+                Some(_) => record.handled.insert(message.id.clone()),
+                None => true,
+            };
+            if !known && !message.from_me && !is_open && counts {
                 record.unread = record.unread.saturating_add(1);
-                if record.read_at.is_some() {
-                    record.handled.insert(message.id.clone());
-                }
             }
             record.timestamp = record.timestamp.max(message.timestamp);
             insert_message(&mut record.messages, message.clone());
@@ -315,7 +333,7 @@ impl Inbox {
             && Some(left.as_str()) != jid
             && let Some(record) = self.chats.get_mut(&left)
         {
-            record.read_at = Some(record.timestamp);
+            record.read_at = Some(record.server_time());
         }
         self.open = jid.map(str::to_string);
         let jid = jid?;
@@ -403,7 +421,6 @@ impl Inbox {
         events
     }
 
-    /// Keep the row and mark it failed, so the user can resend it.
     /// Remove the row of a new send that the server did not accept. The
     /// text stays in the compose field (`SendRejected`), so no failed row
     /// stays next to it (#98).
@@ -428,6 +445,7 @@ impl Inbox {
         events
     }
 
+    /// Keep the row and mark it failed, so the user can resend it.
     pub(super) fn fail_send(&mut self, jid: &str, pending: &str) -> Vec<AdapterEvent> {
         let Some(record) = self.chats.get_mut(jid) else {
             return Vec::new();
@@ -1003,6 +1021,67 @@ pub(super) mod tests {
                 message(chat, "seen", "one", 10),
                 message(chat, "same-second", "two", 10),
             ])],
+            Vec::new(),
+        );
+        assert_eq!(upserts(&events)[0].unread, 1);
+    }
+
+    /// Codex r4131622220: after a local read, a live redelivery of an id
+    /// that left the capped cache does not count again.
+    #[test]
+    fn a_redelivered_live_message_counts_once_after_a_read() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![message(chat, "seen", "one", 1)]);
+        inbox.view(Some(chat));
+        inbox.view(None);
+        let live: Vec<WaMessage> = (0..(MESSAGES_PER_CHAT + 50))
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("l{n:04}"),
+                    "new",
+                    2 + i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        let first = live[0].clone();
+        inbox.apply_messages(live);
+        let total = u32::try_from(MESSAGES_PER_CHAT + 50).expect("small");
+        assert!(
+            !inbox.chats[chat]
+                .messages
+                .iter()
+                .any(|row| row.id == first.id),
+            "the first live row left the cache"
+        );
+        let events = inbox.apply_messages(vec![first]);
+        assert_eq!(
+            upserts(&events)[0].unread,
+            total,
+            "a redelivery does not count"
+        );
+    }
+
+    /// #158 review: the read point is server time, not a local send time.
+    /// A later inbound message with an earlier server time still counts.
+    #[test]
+    fn the_read_point_uses_server_time_not_a_local_send() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![message(chat, "a", "one", 10)]);
+        // A local send with a clock far ahead of the server's.
+        let _ = inbox.begin_send(chat, "mine", 1_000);
+        inbox.view(Some(chat));
+        inbox.view(None);
+        let events = inbox.apply_history(
+            vec![HistoryChat {
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 20,
+                messages: vec![message(chat, "b", "server twenty", 20)],
+            }],
             Vec::new(),
         );
         assert_eq!(upserts(&events)[0].unread, 1);
