@@ -630,7 +630,8 @@ impl Owner {
         self.flags.revoked.load(Ordering::SeqCst)
     }
 
-    /// [`Session::retire`] has returned, or this task has handled `Retire`.
+    /// [`Session::retire`] or [`Session::disconnect`] has returned, or this
+    /// task has handled `Retire`, `Disconnect`, or the end of a shutdown.
     fn replaced(&self) -> bool {
         self.retired || self.flags.retired.load(Ordering::SeqCst)
     }
