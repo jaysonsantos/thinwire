@@ -1678,6 +1678,75 @@ mod tests {
         assert!(text.lines().any(|line| line == "slack slack:C1"));
     }
 
+    /// #201 review (Codex r4139252378): a saved Telegram session that ended
+    /// while the app was closed comes back as the phone step of a resume,
+    /// or as the phone step after a data reset. Both drop the Telegram
+    /// mutes, on screen and in the file. A Slack mute stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_ended_while_closed_drops_the_telegram_mutes() {
+        use crate::mutes::ChatMute;
+        use thinwire_protocol::TelegramAuthPhase;
+
+        for case in ["resume", "data-reset"] {
+            let (mut core, events_tx, path) =
+                core_with_written_mutes(&format!("closed-{case}")).await;
+            if case == "resume" {
+                core.state.resume_connecting_for_test();
+            } else {
+                events_tx
+                    .send(AdapterEvent::TelegramDataReset {
+                        moved_to: "tdlib.stale-1".into(),
+                    })
+                    .expect("queue");
+            }
+            events_tx
+                .send(AdapterEvent::TelegramAuth {
+                    phase: TelegramAuthPhase::NeedPhone,
+                })
+                .expect("queue");
+            assert!(core.pump());
+            assert_eq!(
+                core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+                ChatMute::None,
+                "{case}"
+            );
+            assert_eq!(
+                core.view().chat_mute(ProtocolId::Slack, "slack:C1"),
+                ChatMute::Here,
+                "{case}"
+            );
+            wait_for_mutes(&path, |mutes| {
+                !mutes.contains(ProtocolId::Telegram, "telegram:2")
+                    && mutes.contains(ProtocolId::Slack, "slack:C1")
+            })
+            .await;
+        }
+    }
+
+    /// #201 review: the phone step of a first login (no resume, no data
+    /// reset) keeps every mute.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_run_phone_step_keeps_the_mutes() {
+        use crate::mutes::ChatMute;
+        use thinwire_protocol::TelegramAuthPhase;
+
+        let (mut core, events_tx, path) = core_with_written_mutes("first-run").await;
+        events_tx
+            .send(AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::NeedPhone,
+            })
+            .expect("queue");
+        assert!(core.pump());
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Here
+        );
+        drop(core);
+        let mutes = crate::mutes::ChatMutes::load_from(path);
+        assert!(mutes.contains(ProtocolId::Telegram, "telegram:2"));
+        assert!(mutes.contains(ProtocolId::Slack, "slack:C1"));
+    }
+
     /// #153 review: a reconnect, an adapter stop, and an app shutdown never
     /// drop a mute.
     #[tokio::test(flavor = "multi_thread")]

@@ -1974,6 +1974,12 @@ impl Snapshot {
         }
     }
 
+    /// Test hook: a saved Telegram session resumes now (`Resume::Connecting`).
+    #[cfg(test)]
+    pub(crate) fn resume_connecting_for_test(&mut self) {
+        self.resume = Resume::Connecting;
+    }
+
     /// Test hook: age every tracked send by `by`.
     #[cfg(test)]
     pub(crate) fn age_sends_for_test(&mut self, by: Duration) {
@@ -2420,12 +2426,18 @@ impl Snapshot {
                 self.auth = AuthScreen::TelegramPhone;
                 self.status_text.clone_from(&notice);
                 self.auth_notice = Some(notice);
+                // The saved session is gone with the old data folder: the
+                // next login can be another account (#201 review).
+                self.ended_accounts.push(ProtocolId::Telegram);
             }
             TelegramAuthPhase::NeedPhone if resuming => {
                 // The worker drops the stale session marker on this path.
                 self.auth = AuthScreen::TelegramPhone;
                 self.auth_notice = Some(SESSION_ENDED_NOTICE.into());
                 self.status_text = SESSION_ENDED_NOTICE.into();
+                // The saved session ended while the app was closed: drop its
+                // mutes, as a live session end does (#201 review).
+                self.ended_accounts.push(ProtocolId::Telegram);
             }
             TelegramAuthPhase::NeedPhone => {
                 self.auth = AuthScreen::TelegramPhone;
