@@ -19,14 +19,14 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub use pipe::{INBOX_LIMIT, MAX_FAILURES_IN_A_ROW, RETRY_AFTER, RETRY_MAX};
+pub use pipe::{INBOX_LIMIT, MAX_DISMISS_TRIES, MAX_FAILURES_IN_A_ROW, RETRY_AFTER, RETRY_MAX};
 pub use thinwire_core::notify::{Notification, NotifyCommand, NotifyKey};
 
 mod pipe;
 #[cfg(target_os = "linux")]
 mod xdg;
 
-use pipe::{Health, Inbox, Next};
+use pipe::{Inbox, Next, Policy};
 
 /// A failed OS call. Only a fixed kind, never message data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +156,7 @@ impl Drop for Notifier {
 
 /// The thread: take one command, run it on the OS backend, follow `Health`.
 fn run(pipe: &Pipe, mut backend: impl Backend) {
-    let mut health = Health::default();
+    let mut policy = Policy::default();
     loop {
         let command = {
             let mut shared = pipe.lock();
@@ -182,12 +182,19 @@ fn run(pipe: &Pipe, mut backend: impl Backend) {
         if result.is_ok() {
             tracing::debug!(kind, "desktop notification sent to the OS");
         }
-        let next = health.record(result);
+        // A failed `Dismiss` goes back to the inbox, so its notification
+        // does not stay on screen after one busy D-Bus call (#165).
+        let (next, retry) = policy.record(&command, result);
         if let Next::Wait(wait) = next {
             thread::sleep(wait);
         }
         let mut shared = pipe.lock();
         shared.busy = false;
+        if let Some(key) = retry
+            && !shared.inbox.retry_dismiss(&key)
+        {
+            policy.forget(&key);
+        }
         if next == Next::Off {
             shared.off = true;
             while shared.inbox.pop().is_some() {}
@@ -267,6 +274,8 @@ mod tests {
         seen: Arc<Mutex<Vec<Seen>>>,
         clicks: ClickFn,
         fail_on_show: bool,
+        /// Dismisses that fail before one works.
+        fail_dismisses: u32,
     }
 
     impl Backend for Fake {
@@ -284,6 +293,10 @@ mod tests {
         }
 
         fn dismiss(&mut self, key: &NotifyKey) -> Result<(), BackendError> {
+            if self.fail_dismisses > 0 {
+                self.fail_dismisses -= 1;
+                return Err(BackendError("close"));
+            }
             self.seen
                 .lock()
                 .expect("seen")
@@ -320,6 +333,7 @@ mod tests {
                 seen: fake_seen,
                 clicks,
                 fail_on_show: false,
+                fail_dismisses: 0,
             },
             move |key| clicked_by.lock().expect("clicked").push(key),
         );
@@ -352,6 +366,7 @@ mod tests {
                 seen: fake_seen,
                 clicks,
                 fail_on_show: true,
+                fail_dismisses: 0,
             },
             |_| {},
         );
@@ -378,6 +393,7 @@ mod tests {
                 seen: fake_seen,
                 clicks,
                 fail_on_show: false,
+                fail_dismisses: 0,
             },
             |_| {},
         );
@@ -399,6 +415,55 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_dismiss_is_tried_again() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fake_seen = Arc::clone(&seen);
+        let notifier = Notifier::spawn_with(
+            move |clicks| Fake {
+                seen: fake_seen,
+                clicks,
+                fail_on_show: false,
+                fail_dismisses: 1,
+            },
+            |_| {},
+        );
+        notifier.send([NotifyCommand::Dismiss(key("telegram:1"))]);
+        assert!(notifier.flush(RETRY_AFTER * 3), "the retry ran");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![Seen::Dismiss(key("telegram:1"))],
+            "the second try reached the OS (#165)"
+        );
+    }
+
+    #[test]
+    fn a_dismiss_that_keeps_failing_stops_after_its_tries() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fake_seen = Arc::clone(&seen);
+        let notifier = Notifier::spawn_with(
+            move |clicks| Fake {
+                seen: fake_seen,
+                clicks,
+                fail_on_show: false,
+                fail_dismisses: MAX_DISMISS_TRIES,
+            },
+            |_| {},
+        );
+        notifier.send([NotifyCommand::Dismiss(key("telegram:1"))]);
+        // The failures in a row wait 1 s, 2 s, and 4 s; after the last try
+        // the thread gives up on this dismiss and goes idle.
+        assert!(notifier.flush(RETRY_AFTER * 10));
+        assert!(seen.lock().expect("seen").is_empty());
+        // The thread is still on: the next command works.
+        notifier.send([NotifyCommand::Dismiss(key("telegram:2"))]);
+        assert!(notifier.flush(RETRY_AFTER * 6));
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![Seen::Dismiss(key("telegram:2"))]
+        );
+    }
+
+    #[test]
     fn flush_waits_for_the_last_commands() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let fake_seen = Arc::clone(&seen);
@@ -407,6 +472,7 @@ mod tests {
                 seen: fake_seen,
                 clicks,
                 fail_on_show: false,
+                fail_dismisses: 0,
             },
             |_| {},
         );
