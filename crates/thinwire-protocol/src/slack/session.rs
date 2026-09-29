@@ -258,7 +258,9 @@ struct Live<T> {
     read_only: HashSet<String>,
     /// `restricted_action` is a workspace policy. It is not one channel.
     workspace_denied: bool,
-    /// Channels that were writable before `workspace_denied`.
+    /// Channels to turn back on when `workspace_denied` clears. The set starts
+    /// as the rows that were writable when the policy arrived, then gains a
+    /// channel learned during the denial when Slack would allow a post.
     policy_writable: HashSet<String>,
 }
 
@@ -745,6 +747,12 @@ where
                     .as_ref()
                     .map(|live| (live.read_only.contains(&channel.id), live.workspace_denied))
                     .unwrap_or((false, false));
+                if workspace {
+                    // `can_post` is the list flag, not `restricted_action`. A
+                    // channel that shows up while the policy is on must be
+                    // restored with the snapshot when the policy lifts.
+                    self.note_writable_under_denial(&channel.id, channel.can_post && !denied);
+                }
                 let conversation = Conversation {
                     protocol: ProtocolId::Slack,
                     id: conversation_id(&channel.id),
@@ -883,8 +891,9 @@ where
         let keep_cached_preview = page.posts.is_empty() && !page.authoritative;
         self.drop_posts_outside(&channel, &page);
         for post in page.posts.into_iter().rev() {
-            let message = self.chat_message(&token, post).await;
-            emit_message(&self.events, message);
+            if let Some(message) = self.chat_message(&token, post).await {
+                emit_message(&self.events, message);
+            }
         }
         // A dropped live post can be newer than every history row.
         // `note_latest` would keep that stale preview. An empty page that
@@ -943,7 +952,12 @@ where
                 self.clear_posting_denial(channel);
                 let order = ts_rank(&post.ts);
                 let sent_at = ts_order(&post.ts);
-                let message = self.chat_message(&token, post).await;
+                let Some(message) = self.chat_message(&token, post).await else {
+                    // Slack accepted a post older than the cached window.
+                    // The send still counts; the row is not shown.
+                    emit_send_accepted(&self.events, ProtocolId::Slack, conversation, request);
+                    return;
+                };
                 let preview = message.body.clone();
                 emit_send_accepted(
                     &self.events,
@@ -1045,7 +1059,11 @@ where
         let duplicate = self.already_seen(&post);
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
-        let message = self.chat_message(&token, post).await;
+        let Some(message) = self.chat_message(&token, post).await else {
+            // Older than every cached row. `remember` already dropped it
+            // without `MessagesRemoved`, so the thread stays at the cap.
+            return;
+        };
         let preview = message.body.clone();
         let outbound = message.outbound;
         let sender = message.sender.clone();
@@ -1058,6 +1076,7 @@ where
             } else {
                 format!("#{channel}")
             };
+            let workspace_denied = self.live.as_ref().is_some_and(|live| live.workspace_denied);
             let conversation = Conversation {
                 protocol: ProtocolId::Slack,
                 id: conversation_id(&channel),
@@ -1070,10 +1089,17 @@ where
                 order,
                 last_at: sent_at,
                 is_group: !channel.starts_with('D'),
-                writable: !self.live.as_ref().is_some_and(|live| live.workspace_denied),
+                writable: !workspace_denied,
                 muted: false,
                 placeholder: false,
             };
+            if workspace_denied {
+                let would_post = self
+                    .live
+                    .as_ref()
+                    .is_none_or(|live| !live.read_only.contains(&channel));
+                self.note_writable_under_denial(&channel, would_post);
+            }
             // The title is only the id. A later LoadChats walks the list again
             // and replaces it with the channel name.
             if let Some(live) = &mut self.live {
@@ -1144,7 +1170,8 @@ where
         })
     }
 
-    fn remember(&mut self, post: &SlackPost) {
+    /// Returns false when `post` is older than the kept window and was not shown.
+    fn remember(&mut self, post: &SlackPost) -> bool {
         let dropped = {
             let rows = self.shown.entry(post.channel.clone()).or_default();
             if let Some(row) = rows.iter_mut().find(|row| {
@@ -1155,7 +1182,7 @@ where
                 if row.client_msg_id.is_none() {
                     row.client_msg_id.clone_from(&post.client_msg_id);
                 }
-                return;
+                return true;
             }
             rows.push(Shown {
                 ts: post.ts.clone(),
@@ -1172,8 +1199,21 @@ where
                 Vec::new()
             }
         };
+        // The post just cached can be the oldest row. Do not emit
+        // `MessagesRemoved` for it: the UI has not seen it, and core applies
+        // the removal before the insert, so the row stays and the thread
+        // passes the cap.
+        let kept = !dropped.iter().any(|row| row.ts == post.ts);
+        let dropped: Vec<Shown> = if kept {
+            dropped
+        } else {
+            dropped
+                .into_iter()
+                .filter(|row| row.ts != post.ts)
+                .collect()
+        };
         if dropped.is_empty() {
-            return;
+            return kept;
         }
         let lost = dropped.iter().filter(|row| row.counted).count() as u32;
         let ids = dropped
@@ -1189,6 +1229,7 @@ where
         if lost > 0 {
             self.forget_unread(&post.channel, lost);
         }
+        kept
     }
 
     fn forget_unread(&mut self, channel: &str, lost: u32) {
@@ -1208,7 +1249,8 @@ where
     }
 
     /// `restricted_action` applies to every row. A later allow restores the
-    /// rows that were writable when the policy arrived.
+    /// rows that were writable when the policy arrived, plus channels learned
+    /// during the denial that Slack would allow.
     fn mark_workspace_read_only(&mut self) {
         let writable: Vec<String> = self
             .channels
@@ -1254,6 +1296,11 @@ where
 
     /// A successful post, or `conversations.info` that allows one, drops the
     /// refusal. A workspace policy restores every row it turned off.
+    ///
+    /// `restricted_action` is treated as workspace policy, so one channel
+    /// clearing it lifts the denial everywhere. A successful post is the
+    /// strong signal. Channel-level `can_post` may not fully reflect that
+    /// policy.
     fn clear_posting_denial(&mut self, channel: &str) {
         let (workspace, restore) = {
             let Some(live) = &mut self.live else {
@@ -1300,7 +1347,32 @@ where
         match self.deps.api.posting_allowed(token, channel).await {
             Ok(true) => self.clear_posting_denial(channel),
             Ok(false) => self.mark_read_only(channel),
-            Err(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    channel,
+                    "slack posting recheck failed; composer stays disabled"
+                );
+            }
+        }
+    }
+
+    /// Record whether `channel` should be writable once a workspace denial lifts.
+    ///
+    /// `would_post` is `can_post && !read_only` from the channel list. A
+    /// socket-mode channel has no `can_post` yet; it is recorded unless a
+    /// channel-level refusal is already set.
+    fn note_writable_under_denial(&mut self, channel: &str, would_post: bool) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        if !live.workspace_denied {
+            return;
+        }
+        if would_post {
+            live.policy_writable.insert(channel.to_string());
+        } else {
+            live.policy_writable.remove(channel);
         }
     }
 
@@ -1336,8 +1408,14 @@ where
         );
     }
 
-    async fn chat_message(&mut self, token: &SlackBotToken, post: SlackPost) -> ChatMessage {
-        self.remember(&post);
+    async fn chat_message(
+        &mut self,
+        token: &SlackBotToken,
+        post: SlackPost,
+    ) -> Option<ChatMessage> {
+        if !self.remember(&post) {
+            return None;
+        }
         let outbound = self
             .live
             .as_ref()
@@ -1347,7 +1425,7 @@ where
             (Some(user), _) => self.user_name(token, user).await,
             (None, _) => "Slack".into(),
         };
-        ChatMessage {
+        Some(ChatMessage {
             protocol: ProtocolId::Slack,
             conversation_id: conversation_id(&post.channel),
             id: message_id_of(&post.channel, &post.ts),
@@ -1357,7 +1435,7 @@ where
             delivery: Delivery::Sent,
             sent_at: ts_order(&post.ts),
             arrival: crate::Arrival::History,
-        }
+        })
     }
 }
 
@@ -1568,5 +1646,28 @@ mod tests {
             None,
             false
         ));
+    }
+
+    #[test]
+    fn take_oldest_drops_the_incoming_post_when_it_is_the_oldest() {
+        let mut rows: Vec<Shown> = (1..=50)
+            .map(|index| Shown {
+                ts: format!("170000{index:04}.000100"),
+                text: format!("n{index}"),
+                counted: false,
+                client_msg_id: None,
+            })
+            .collect();
+        rows.push(Shown {
+            ts: "1600000000.000100".into(),
+            text: "too old".into(),
+            counted: false,
+            client_msg_id: None,
+        });
+        let dropped = take_oldest(&mut rows, 1);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].ts, "1600000000.000100");
+        assert_eq!(rows.len(), 50);
+        assert!(rows.iter().all(|row| row.ts != "1600000000.000100"));
     }
 }

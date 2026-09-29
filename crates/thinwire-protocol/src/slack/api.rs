@@ -283,7 +283,8 @@ pub trait SlackWebApi: Send + Sync + 'static {
     /// `conversations.info`: whether a top-level post is allowed now.
     ///
     /// `conversations.list` does not report `restricted_action`. The inbox
-    /// asks again when the user opens a channel a send already refused.
+    /// asks again when the user opens a channel a send already refused, and
+    /// for any opened channel while a workspace denial is in effect.
     fn posting_allowed(
         &self,
         token: &SlackBotToken,
