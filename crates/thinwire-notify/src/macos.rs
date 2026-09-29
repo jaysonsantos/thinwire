@@ -39,7 +39,12 @@ impl Center {
             Err(_) => tracing::warn!("could not ask for notification permission"),
         }
         // Notifications of an earlier run that did not end cleanly: no
-        // waiter opens their chat now.
+        // waiter opens their chat now. Pending requests go too, first: one
+        // can turn into a delivered one before the close (Codex
+        // r4139073814).
+        for id in block_on(un::get_pending_notification_ids()) {
+            un::blocking::cancel_pending(&id);
+        }
         for id in block_on(un::get_delivered_notification_ids()) {
             un::blocking::close_delivered(&id);
         }
