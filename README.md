@@ -159,10 +159,11 @@ Desktop notifications (#32) show a new message when you do not look at its chat.
 | --- | --- | --- |
 | Show a notification | Yes | Yes |
 | One notification for each chat: a new message replaces it, with the count | Yes | No: each message shows its own notification |
-| "Hide message text" also changes a notification that already shows | Yes | No: it applies to new notifications only |
+| "Hide message text" also changes a notification that already shows | Yes. With more than 16 notifications on screen, one with no click waiter closes instead | No: it applies to new notifications only |
 | Remove it when you open the chat, read it on another device (where the protocol reports it), the chat leaves the list, you turn notifications off, or the app closes | Yes | No |
 | A click opens the chat | Yes. On X11 the click also raises the window. On Wayland the app cannot raise its window yet (winit 0.30): the taskbar entry asks for attention instead | No |
 
+- Linux, with more than 16 notifications on screen: a new one has no click waiter. A later message in that chat shows a second notification instead of a replace, and a click on it does not open the chat. A dismiss still closes it.
 - macOS and Windows replace, dismiss, and click are tracked in #161.
 - A failed call to the OS notification service does not turn notifications off. The app tries again after a short wait, and turns them off for the run only after 5 failures in a row.
 
