@@ -14,7 +14,7 @@ use std::thread;
 use mac_usernotifications as un;
 use mac_usernotifications::block_on;
 
-use crate::tagged::TagService;
+use crate::tagged::{TagService, listed};
 use crate::{BackendError, ClickFn, Notification};
 
 /// Most click-waiter threads at one time, as on Linux. Over the limit, a
@@ -115,12 +115,15 @@ impl TagService for Center {
     }
 
     fn has(&mut self, tag: &str) -> Result<bool, BackendError> {
-        Ok(block_on(un::get_delivered_notification_ids())
-            .iter()
-            .any(|id| id == tag))
+        let delivered = block_on(un::get_delivered_notification_ids());
+        let pending = block_on(un::get_pending_notification_ids());
+        Ok(listed(tag, &delivered, &pending))
     }
 
+    /// Cancel a pending request first: it can turn into a delivered one
+    /// before the close.
     fn remove(&mut self, tag: &str) -> Result<(), BackendError> {
+        un::blocking::cancel_pending(tag);
         un::blocking::close_delivered(tag);
         Ok(())
     }

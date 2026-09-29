@@ -16,6 +16,15 @@ pub(crate) fn tag(key: &NotifyKey) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// The OS still has `tag`: delivered (on the screen or in the list), or
+/// still pending right after a send. A check of the delivered ids only
+/// misses a pending one, so a dismiss or a hide-text update does nothing
+/// and its text stays (Codex r4138691845).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn listed<S: AsRef<str>>(tag: &str, delivered: &[S], pending: &[S]) -> bool {
+    delivered.iter().chain(pending).any(|id| id.as_ref() == tag)
+}
+
 /// One OS notification service with tags.
 pub(crate) trait TagService: Send + 'static {
     /// Show `notification` under `tag`. It replaces a shown notification
@@ -153,6 +162,15 @@ mod tests {
         let long = key(ProtocolId::Slack, &"x".repeat(500));
         assert!(tag(&long).len() <= 64);
         assert!(!tag(&chat).contains("12345"), "no chat id in the OS store");
+    }
+
+    #[test]
+    fn a_pending_notification_counts_as_shown() {
+        let none: [&str; 0] = [];
+        assert!(listed("a", &["a"], &none), "delivered");
+        assert!(listed("a", &none, &["a"]), "pending right after a send");
+        assert!(!listed("a", &["b"], &["c"]));
+        assert!(!listed("a", &none, &none));
     }
 
     #[test]
