@@ -35,6 +35,12 @@ pub(crate) struct Toasts {
 
 impl Toasts {
     /// Runs on the notification thread, not on the UI thread.
+    ///
+    /// The thread never joins a COM apartment itself (that needs `unsafe`,
+    /// which the workspace forbids). It needs none: when the first WinRT
+    /// factory call gets `CO_E_NOTINITIALIZED`, `windows-core` calls
+    /// `CoIncrementMTAUsage` and tries again, so the thread uses the
+    /// implicit MTA (Codex r4138456880). A test checks this on Windows CI.
     pub(crate) fn new(clicks: ClickFn) -> Self {
         if windows_registry::CURRENT_USER
             .create(APP_ID_KEY)
@@ -140,5 +146,39 @@ impl TagService for Toasts {
 
     fn forget(&mut self, tag: &str) {
         self.shown.remove(tag);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thinwire_core::ProtocolId;
+
+    /// Codex r4138456880: a new thread with no COM apartment starts the
+    /// backend, builds a toast, and reads the toast history with no error.
+    #[test]
+    fn winrt_works_on_a_new_thread_with_no_apartment() {
+        let checked = std::thread::spawn(|| {
+            let mut toasts = Toasts::new(Arc::new(|_| {}));
+            let notification = Notification {
+                key: crate::NotifyKey {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id: "telegram:1".into(),
+                },
+                title: "Ada <&>".into(),
+                sender: None,
+                preview: "hi".into(),
+                count: 2,
+            };
+            content(&notification, true)
+                .and_then(|doc| ToastNotification::CreateToastNotification(&doc))
+                .map_err(|error| format!("toast: {error}"))?;
+            toasts
+                .has("no-such-tag")
+                .map_err(|error| format!("history: {error:?}"))
+        })
+        .join()
+        .expect("the thread ends");
+        assert_eq!(checked, Ok(false));
     }
 }
