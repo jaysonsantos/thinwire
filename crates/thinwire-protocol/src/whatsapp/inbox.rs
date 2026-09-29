@@ -72,6 +72,10 @@ struct ChatRecord {
     /// seen in the read second. A repeat does not count again, also after its
     /// row left the capped cache (Codex r4131089163).
     handled: HashSet<String>,
+    /// Server ids that still carry the local send clock. `confirm_send`
+    /// keeps that clock until a server or live copy arrives. The read point
+    /// skips them (Codex r4132341439).
+    optimistic: HashSet<String>,
     /// Newest activity time from history sync. A dropped send falls back to
     /// it (Codex r4131089177).
     history_at: i64,
@@ -93,13 +97,14 @@ impl ChatRecord {
     }
 
     /// The newest server time of this chat: the newest row that is not a
-    /// local `pending:` send, or the history time. A local send time can be
-    /// ahead of the server's clock, and a later inbound message with an
-    /// earlier server time must still count (#158 review).
+    /// local `pending:` send and not a confirmed send still on the local
+    /// clock, or the history time. A local send time can be ahead of the
+    /// server's clock, and a later inbound message with an earlier server
+    /// time must still count (#158 review, Codex r4132341439).
     fn server_time(&self) -> i64 {
         self.messages
             .iter()
-            .filter(|row| !row.id.starts_with(PENDING_PREFIX))
+            .filter(|row| !row.id.starts_with(PENDING_PREFIX) && !self.optimistic.contains(&row.id))
             .map(|row| row.timestamp)
             .max()
             .unwrap_or(0)
@@ -183,6 +188,8 @@ impl Inbox {
             for message in chat.messages {
                 remember_name(&mut self.names, &message);
                 record.timestamp = record.timestamp.max(message.timestamp);
+                // A history copy carries the server clock (Codex r4132341439).
+                record.optimistic.remove(&message.id);
                 if record.counts_after_read(&message) {
                     added = added.saturating_add(1);
                 }
@@ -221,6 +228,8 @@ impl Inbox {
             let jid = message.chat_jid.clone();
             let is_open = self.open.as_deref() == Some(jid.as_str());
             let record = self.chats.entry(jid.clone()).or_default();
+            // A live copy carries the server clock (Codex r4132341439).
+            record.optimistic.remove(&message.id);
             let known = record.messages.iter().any(|row| row.id == message.id);
             // A repeat of a stored id is a refresh. Only the first sight of a
             // pushed message is live, so a history replay cannot notify (#32).
@@ -395,12 +404,18 @@ impl Inbox {
         let Some(record) = self.chats.get_mut(jid) else {
             return Vec::new();
         };
+        // An echo may already be stored under the server id, with its clock.
+        let had_server_copy = record.messages.iter().any(|row| row.id == server_id);
         let Some(row) = record.messages.iter_mut().find(|row| row.id == pending) else {
             return Vec::new();
         };
-        row.id = server_id;
+        row.id.clone_from(&server_id);
         let message = row.clone();
         record.failed.remove(pending);
+        if !had_server_copy {
+            // The row keeps the local clock until a server copy arrives.
+            record.optimistic.insert(server_id);
+        }
         // A live echo of the same send may already be stored under the server id.
         let mut seen = false;
         record.messages.retain(|row| {
@@ -1081,6 +1096,59 @@ pub(super) mod tests {
                 unread: 0,
                 timestamp: 20,
                 messages: vec![message(chat, "b", "server twenty", 20)],
+            }],
+            Vec::new(),
+        );
+        assert_eq!(upserts(&events)[0].unread, 1);
+    }
+
+    /// Codex r4132341439: `confirm_send` drops the `pending:` prefix and keeps
+    /// the local clock. The read point must not use that clock. An inbound
+    /// message between the last server time and the local time still counts.
+    #[test]
+    fn a_confirmed_local_send_does_not_move_the_read_point() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![message(chat, "a", "one", 10)]);
+        let (pending, _, _) = inbox.begin_send(chat, "mine", 1_000);
+        inbox.confirm_send(chat, &pending, "SRV1".into());
+        let record = inbox.chats.get(chat).expect("chat");
+        assert!(
+            record.messages.iter().any(|row| row.id == "SRV1"),
+            "the row is no longer pending"
+        );
+        assert!(record.messages.iter().all(|row| row.id != pending));
+        inbox.view(Some(chat));
+        inbox.view(None);
+        let events = inbox.apply_history(
+            vec![HistoryChat {
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 20,
+                messages: vec![message(chat, "b", "server twenty", 20)],
+            }],
+            Vec::new(),
+        );
+        assert_eq!(upserts(&events)[0].unread, 1);
+
+        // A server copy replaces the local clock. The read point can move
+        // to that time, and a message before it does not count.
+        let mut echo = message(chat, "SRV1", "mine", 30);
+        echo.from_me = true;
+        inbox.apply_messages(vec![echo]);
+        inbox.view(Some(chat));
+        inbox.view(None);
+        let events = inbox.apply_history(
+            vec![HistoryChat {
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 40,
+                messages: vec![
+                    message(chat, "c", "before the echo", 25),
+                    message(chat, "d", "after the echo", 40),
+                ],
             }],
             Vec::new(),
         );
