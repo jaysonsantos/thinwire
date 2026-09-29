@@ -18,9 +18,11 @@
 //!
 //! Retirement stops new work only. A send that started before it still gets
 //! its real result, also after the owner has handled the retirement: a send
-//! that went out ends as `SendAccepted`. A send result is dropped only after
-//! the send was already answered: by the end of a disconnect (after its
-//! wait), by the 401 step (after its wait), or by the close of a shutdown.
+//! that went out ends as `SendAccepted`, while the session that replaced it
+//! is still current. A send result is dropped only after the send was already
+//! answered: by the end of a disconnect (after its wait), by the 401 step
+//! (after its wait), or by the close of a shutdown. The close rejects each
+//! send still in flight, then emits `Stopped`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -70,26 +72,48 @@ struct ChannelAccess {
 }
 
 /// What a session hands to the session that replaces it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Carried {
     /// Channel ids from the last list. The next list removes gone rows.
     channels: HashMap<String, ChannelAccess>,
     /// Message ids from the last history page of each channel. Without them
-    /// the next page cannot remove rows the shell still shows.
-    history: HashMap<String, Vec<String>>,
+    /// the next page cannot remove rows the shell still shows. Shared with
+    /// the previous session, so a send accepted after the handoff is in this
+    /// history too.
+    history: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Texts of outgoing rows, so Retry still works after a reconnect.
-    bodies: HashMap<String, String>,
+    /// Shared with the previous session: an accept removes the text here
+    /// and there.
+    bodies: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl Default for Carried {
+    fn default() -> Self {
+        Self {
+            channels: HashMap::new(),
+            history: Arc::new(Mutex::new(HashMap::new())),
+            bodies: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 impl Carried {
-    /// The state for the next session. The row texts are copied, not
-    /// moved: a send still in flight here may still fail and need its text.
+    /// The state for the next session. History ids and row texts are shared,
+    /// not copied: a send that ends here updates the session that took over.
     fn handoff(&mut self) -> Self {
         Self {
             channels: std::mem::take(&mut self.channels),
-            history: std::mem::take(&mut self.history),
-            bodies: self.bodies.clone(),
+            history: Arc::clone(&self.history),
+            bodies: Arc::clone(&self.bodies),
         }
+    }
+
+    fn bodies(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.bodies.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn history(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<String>>> {
+        self.history.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -166,6 +190,9 @@ enum Msg {
     },
     Retire {
         carried: oneshot::Sender<Carried>,
+        /// The generation of the session that replaces this one. `None` when
+        /// nothing replaces it: a later send result is dropped.
+        successor: Option<u64>,
     },
     /// The user disconnected: settle the work in flight, then emit the
     /// disconnected state and publish nothing more.
@@ -209,7 +236,8 @@ struct Flags {
     /// `Linked`, conversation, or history row (Codex r4131954091). Send
     /// results do not use it: the owner applies every send result, until the
     /// send was already answered by the end of a disconnect, the 401 step, or
-    /// a shutdown close (Codex r4132922551).
+    /// a shutdown close. The close rejects each send still in flight
+    /// (Codex r4132922551, #165).
     retired: AtomicBool,
 }
 
@@ -285,6 +313,7 @@ impl Session {
             closed: false,
             send_tasks: 0,
             shutdown: None,
+            late_send: LateSend::Publish,
         };
         let _ = tx.send(Msg::Reload);
         tokio::spawn(owner.run(rx, handoff));
@@ -402,11 +431,13 @@ impl Session {
     /// owner handles that message before [`Msg::Retire`]. A send result, queued
     /// or later, is still applied: it may emit `SendAccepted` and
     /// `MessageReplaced` after the new session's `Linking` (keyed by request
-    /// and message id).
-    pub(crate) fn retire(self) -> oneshot::Receiver<Carried> {
+    /// and message id), while that generation is still current. `successor`
+    /// is that generation. `None` drops a later result: nothing replaced
+    /// this session.
+    pub(crate) fn retire(self, successor: Option<u64>) -> oneshot::Receiver<Carried> {
         self.flags.retired.store(true, Ordering::SeqCst);
         let (carried, rx) = oneshot::channel();
-        let _ = self.tx.send(Msg::Retire { carried });
+        let _ = self.tx.send(Msg::Retire { carried, successor });
         rx
     }
 
@@ -558,6 +589,18 @@ struct Owner {
     /// HTTP send tasks still running. Shutdown waits for zero.
     send_tasks: u64,
     shutdown: Option<oneshot::Sender<()>>,
+    /// Where a send result goes after this session is retired.
+    late_send: LateSend,
+}
+
+/// A send result after retirement.
+enum LateSend {
+    /// This session is current, or a disconnect is waiting for the result.
+    Publish,
+    /// Publish while this generation is still the newest.
+    WhileCurrent(u64),
+    /// Nothing replaced this session. Drop the result.
+    Drop,
 }
 
 impl Owner {
@@ -634,10 +677,15 @@ impl Owner {
             Msg::SendDone { request, result } => self.send_done(request, result),
             Msg::SendWaitOver { unlink } => self.send_wait_over(unlink),
             Msg::SealDone { unlink } => self.seal_done(unlink),
-            Msg::Retire { carried } => {
+            Msg::Retire { carried, successor } => {
                 self.retire();
-                // A send still in flight keeps its text in the next session:
-                // if it fails, its row can be retried there.
+                self.late_send = match successor {
+                    Some(id) => LateSend::WhileCurrent(id),
+                    None => LateSend::Drop,
+                };
+                // A send still in flight shares its text with the next
+                // session: if it fails, its row can be retried there. An
+                // accept removes that text from the shared map.
                 let _ = carried.send(self.carried.handoff());
             }
             Msg::Shutdown { done, limit } => {
@@ -822,7 +870,9 @@ impl Owner {
             Outgoing::New(body) => {
                 self.next_pending += 1;
                 let message_id = format!("discord:pending:{}:{}", self.id, self.next_pending);
-                self.carried.bodies.insert(message_id.clone(), body.clone());
+                self.carried
+                    .bodies()
+                    .insert(message_id.clone(), body.clone());
                 emit_message(
                     &self.events,
                     ChatMessage {
@@ -842,7 +892,7 @@ impl Owner {
             Outgoing::Retry(message_id) => {
                 let Some(body) = self
                     .carried
-                    .bodies
+                    .bodies()
                     .get(&message_id)
                     .cloned()
                     .filter(|text| !text.trim().is_empty())
@@ -1025,13 +1075,10 @@ impl Owner {
             return;
         };
         if self.replaced() || self.unlinked() {
-            // A replaced load still ends its spinner, also one that was
-            // queued before the retirement (review of #157). An unlinked
-            // session already ended it. A disconnect emits its `Unlinked`
-            // from the owner after this, so nothing follows `Unlinked`.
-            if !self.unlinked() {
-                emit_history_loaded(&self.events, ProtocolId::Discord, conversation_id);
-            }
+            // A newer session owns the account, or this one already ended.
+            // `HistoryLoaded` here clears the new session's open-on-link
+            // mark, so its `Linked` does not queue `OpenChat` (Codex
+            // r4133411242). The new session ends its own load.
             return;
         }
         match result {
@@ -1043,17 +1090,17 @@ impl Owner {
                     .map(|message| chat_message(&conversation_id, bot_id, message))
                     .collect();
                 let new_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-                let previous = self
-                    .carried
-                    .history
-                    .entry(conversation_id.clone())
-                    .or_default();
-                let gone: Vec<String> = previous
-                    .iter()
-                    .filter(|id| !new_ids.iter().any(|next| next == *id))
-                    .cloned()
-                    .collect();
-                *previous = new_ids;
+                let gone = {
+                    let mut history = self.carried.history();
+                    let previous = history.entry(conversation_id.clone()).or_default();
+                    let gone: Vec<String> = previous
+                        .iter()
+                        .filter(|id| !new_ids.iter().any(|next| next == *id))
+                        .cloned()
+                        .collect();
+                    *previous = new_ids;
+                    gone
+                };
                 if !gone.is_empty() {
                     let _ = self.events.send(AdapterEvent::MessagesRemoved {
                         protocol: ProtocolId::Discord,
@@ -1107,6 +1154,12 @@ impl Owner {
         let Some(tracked) = self.inflight.remove(&request) else {
             return;
         };
+        if !self.publish_late_send() {
+            // The session that replaced this one has ended. A `SendAccepted`
+            // or `MessageReplaced` after its `Unlinked` recreates a row
+            // (Codex r4134458445).
+            return;
+        }
         // Retirement stops new work. A send that started before it still
         // gets its real result: one that went out ends as `SendAccepted`, so
         // the user does not send it twice (Codex r4132922551).
@@ -1115,14 +1168,14 @@ impl Owner {
                 let mut message = chat_message(&tracked.conversation_id, tracked.bot_id, &sent);
                 // A send echo with no content still shows the text that was posted.
                 if sent.content.is_empty()
-                    && let Some(posted) = self.carried.bodies.get(&tracked.message_id)
+                    && let Some(posted) = self.carried.bodies().get(&tracked.message_id)
                     && !posted.trim().is_empty()
                 {
                     message.body.clone_from(posted);
                 }
-                self.carried.bodies.remove(&tracked.message_id);
+                self.carried.bodies().remove(&tracked.message_id);
                 self.carried
-                    .history
+                    .history()
                     .entry(tracked.conversation_id.clone())
                     .or_default()
                     .push(message.id.clone());
@@ -1277,8 +1330,31 @@ impl Owner {
     /// The user disconnected. Sends in flight get up to [`SEND_SETTLE_WAIT`]
     /// for their real result (Codex r4132922551), then the disconnected state
     /// follows. Loads end at once.
+    fn generation_is_current(&self, generation: u64) -> bool {
+        let newest = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+        *newest == generation
+    }
+
+    /// A retired send result is published while its successor is still the
+    /// newest generation. A disconnect wait has no successor and still
+    /// publishes. A retirement with nowhere to go drops the result.
+    fn publish_late_send(&self) -> bool {
+        match self.late_send {
+            LateSend::Publish => true,
+            LateSend::WhileCurrent(generation) => self.generation_is_current(generation),
+            LateSend::Drop => false,
+        }
+    }
+
     fn disconnect(&mut self, detail: &'static str, attempt: u64) {
         self.retire();
+        if !self.generation_is_current(attempt) {
+            // A newer session already owns the account. HistoryLoaded,
+            // SendRejected, and MessagesRemoved from this disconnect would
+            // settle that session (Codex r4133411242).
+            self.loads.clear();
+            return;
+        }
         self.disconnecting = Some((detail, attempt));
         let mut loads: Vec<(u64, String)> = self.loads.drain().collect();
         loads.sort_by_key(|(load, _)| *load);
@@ -1301,6 +1377,11 @@ impl Owner {
         let Some((detail, attempt)) = self.disconnecting.take() else {
             return;
         };
+        if !self.generation_is_current(attempt) {
+            // The wait outlived this disconnect. Leave the sends: their
+            // real results still apply to the session that took over.
+            return;
+        }
         let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
         sends.sort_by_key(|(request, _)| *request);
         for (request, tracked) in sends {
@@ -1328,18 +1409,30 @@ impl Owner {
     /// back to failed (it keeps its text for Retry).
     fn settle_row(&mut self, tracked: &Inflight) {
         if tracked.row == SendRow::Pending {
-            self.carried.bodies.remove(&tracked.message_id);
+            self.carried.bodies().remove(&tracked.message_id);
         }
         settle_row(&self.events, tracked);
     }
 
-    /// Ends a shutdown: retire, emit `Stopped` once, and publish nothing
-    /// more, also when sends are still in flight after the limit.
+    /// Ends a shutdown: reject each send still in flight, emit `Stopped`
+    /// once, and publish nothing more. A result that arrives after this
+    /// finds the send already answered.
     fn close(&mut self) {
         let Some(done) = self.shutdown.take() else {
             return;
         };
         self.retire();
+        let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
+        sends.sort_by_key(|(request, _)| *request);
+        for (request, tracked) in sends {
+            self.settle_row(&tracked);
+            emit_send_rejected(
+                &self.events,
+                ProtocolId::Discord,
+                &tracked.conversation_id,
+                request,
+            );
+        }
         self.closed = true;
         self.flags.emit_stopped_once(&self.events);
         let _ = done.send(());
