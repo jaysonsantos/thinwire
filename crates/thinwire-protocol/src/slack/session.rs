@@ -688,6 +688,11 @@ where
             .collect();
         for id in gone {
             self.shown.remove(&id);
+            // A rejoin reads `can_post` again. A denial for a channel the
+            // app has left must not stick.
+            if let Some(live) = &mut self.live {
+                live.read_only.remove(&id);
+            }
             if let Some(row) = self.channels.remove(&id) {
                 emit_conversation_removed(&self.events, ProtocolId::Slack, row.id);
             }

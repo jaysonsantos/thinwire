@@ -1116,6 +1116,61 @@ async fn a_refresh_keeps_a_read_only_channel() {
 }
 
 #[tokio::test]
+async fn a_rejoin_drops_the_old_posting_denial() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.post_error = Some(SlackApiError::api("not_in_channel"));
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.send(AdapterCommand::SendText {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        body: "nope".into(),
+        request: 10,
+    });
+    h.until("read only", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && !conversation.writable
+        )
+    })
+    .await;
+    h.api.with(|state| {
+        state.pages[0].channels.retain(|row| row.id != "C1");
+    });
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    h.until("C1 left", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if id == "slack:C1"
+        )
+    })
+    .await;
+    h.api.with(|state| {
+        state.pages[0]
+            .channels
+            .insert(0, channel("C1", "general", SlackChannelKind::Public, true));
+    });
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    h.until("C1 can post again", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.writable
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn channel_list_stops_at_the_page_cap() {
     let api = FakeApi::workspace();
     api.with(|state| state.list_forever = true);
