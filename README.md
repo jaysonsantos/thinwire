@@ -139,11 +139,33 @@ Theme preference is `System` (follow the OS, including live `ThemeChanged` updat
 
 Desktop notifications (#32) show a new message when you do not look at its chat. They are on by default. The "⋯" menu has two switches: "Show notifications" and "Hide message text".
 
-- The rules are the same for each protocol. A muted chat, your own message (also from another device), an open chat in a focused window, and a message older than 5 minutes do not notify.
-- One notification shows for each chat, with the count of new messages.
+- The core rules are the same for each protocol. A muted chat, your own message (also from another device), an open chat in a focused window, and a message older than 5 minutes do not notify.
+- A protocol notifies only for a message that it marks as new (live). A history page never notifies. A protocol can also report whether you muted a chat. The table says what each protocol does today:
+
+| Protocol | Notifies for new messages | Reads your mute |
+| --- | --- | --- |
+| Telegram | Yes | Yes (the chat setting, or the private, group, or channel default) |
+| WhatsApp (`whatsapp-web`, local only) | Yes | Yes (the phone's chat mute, also a mute with an end time) |
+| Slack (`slack-oauth`) | Yes (Socket Mode messages) | No: the workspace bot cannot see your personal mute |
+| Discord (`discord-bot`) | No: the bot inbox has no gateway yet, so no message arrives live | No: the bot cannot see your personal mute |
+| Signal (`signal-local`, local only) | Yes (the receive stream) | No: the Signal library does not expose chat mute |
+
+- A chat whose mute the app cannot read notifies. Turn off "Show notifications" if that is too much.
 - The window title shows the unread count of chats that are not muted, for example "thinwire (3)".
-- Privacy: a notification sends the chat title, the sender in a group, and up to 120 characters of the message to the OS notification service. "Hide message text" sends "New message" only. thinwire never writes message text to its log.
-- Linux uses the freedesktop notification service over D-Bus. A click opens the chat. macOS and Windows show notifications, but a click does not open the chat yet.
+- Privacy: a notification sends the chat title, the sender in a group, and up to 120 characters of the message to the OS notification service. "Hide message text" sends "New message" only, with no sender. thinwire never writes message text to its log.
+- What each OS does today:
+
+| | Linux (freedesktop, D-Bus) | macOS and Windows |
+| --- | --- | --- |
+| Show a notification | Yes | Yes |
+| One notification for each chat: a new message replaces it, with the count | Yes | No: each message shows its own notification |
+| "Hide message text" also changes a notification that already shows | Yes. With more than 16 notifications on screen, one with no click waiter closes instead | No: it applies to new notifications only |
+| Remove it when you open the chat, read it on another device (where the protocol reports it), the chat leaves the list, you turn notifications off, or the app closes | Yes | No |
+| A click opens the chat | Yes. On X11 the click also raises the window. On Wayland the app cannot raise its window yet (winit 0.30): the taskbar entry asks for attention instead | No |
+
+- Linux, with more than 16 notifications on screen: a new one has no click waiter. A later message in that chat shows a second notification instead of a replace, and a click on it does not open the chat. A dismiss still closes it.
+- macOS and Windows replace, dismiss, and click are tracked in #161.
+- A failed call to the OS notification service does not turn notifications off. The app tries again after a short wait, and turns them off for the run only after 5 failures in a row.
 
 There is no distroless GUI container. This is a desktop egui app.
 

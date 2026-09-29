@@ -22,7 +22,7 @@ use crate::clock::Clock;
 use crate::intent::{
     AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
 };
-use crate::notify::{Notifications, NotifyCommand, NotifyContext};
+use crate::notify::{ChatNow, Notifications, NotifyCommand, NotifyContext};
 use crate::secrets::SecretStore;
 use crate::settings::Settings;
 use crate::signal::{ChangeNotifier, ChangeSignal, WeakNotifier, change_channel};
@@ -325,8 +325,14 @@ impl Core {
 
     fn sync_notifications(&mut self) {
         let state = &self.state;
-        self.notify
-            .sync(state.viewed(), |protocol| state.has_session(protocol));
+        self.notify.sync(
+            state.viewed(),
+            |protocol| state.has_session(protocol),
+            |key| match state.conversation(key.protocol, &key.conversation_id) {
+                Some(row) => ChatNow::Listed { unread: row.unread },
+                None => ChatNow::Gone,
+            },
+        );
     }
 
     /// Apply one user action, then queue its commands for the worker.
@@ -374,12 +380,33 @@ impl Core {
             Intent::Shutdown => self.shutdown(),
             Intent::WindowFocus(focused) => self.notify.set_focus(focused),
             Intent::OpenFromNotification(key) => {
-                self.state.select_protocol(key.protocol);
-                self.state.select_conversation(key.conversation_id.clone());
+                // Open the chat only in its own protocol: a late click after
+                // a session end must not open that id in another one (qa L5).
+                if self.state.has_session(key.protocol) {
+                    self.state.select_protocol(key.protocol);
+                }
+                if self.state.selected_protocol == key.protocol
+                    && self
+                        .state
+                        .conversation(key.protocol, &key.conversation_id)
+                        .is_some()
+                {
+                    self.state.select_conversation(key.conversation_id.clone());
+                }
                 self.notify.dismiss(&key);
             }
-            Intent::SetNotifications(on) => self.settings.set_notifications(on),
-            Intent::SetNotificationPreview(on) => self.settings.set_notification_preview(on),
+            Intent::SetNotifications(on) => {
+                self.settings.set_notifications(on);
+                if !on {
+                    self.notify.clear_all();
+                }
+            }
+            Intent::SetNotificationPreview(on) => {
+                self.settings.set_notification_preview(on);
+                if !on {
+                    self.notify.hide_previews();
+                }
+            }
             Intent::Telegram(intent) => self.telegram(intent),
             Intent::WhatsApp(intent) => self.whatsapp(intent),
             Intent::Discord(DiscordIntent::Connect) => {
@@ -1333,6 +1360,58 @@ mod tests {
         assert!(!core.view().notifications());
         core.notify_message(&live(1, "off"));
         assert!(core.take_notify().is_empty(), "the switch is off");
+    }
+
+    /// qa L5 and #87 review: a click opens a chat only in its own protocol;
+    /// the switches remove or hide what already shows; Shutdown dismisses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clicks_switches_and_shutdown_handle_shown_notifications() {
+        use crate::notify::{HIDDEN_PREVIEW, NotifyCommand, NotifyKey};
+        use crate::state::test_support::ready_with_chats;
+        use thinwire_protocol::Delivery;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        core.dispatch(Intent::WindowFocus(false));
+        let live = |chat: i64| ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: format!("telegram:{chat}"),
+            id: format!("telegram:{chat}:9"),
+            sender: "Bob".into(),
+            body: "private words".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+        };
+        core.notify_message(&live(2));
+        assert_eq!(core.take_notify().len(), 1);
+
+        // Hide the text: the shown notification gets an `Update`, never a
+        // second `Show` (a backend with no replace ignores the update).
+        core.dispatch(Intent::SetNotificationPreview(false));
+        let hidden = core.take_notify();
+        assert!(
+            matches!(&hidden[..], [NotifyCommand::Update(note)] if note.preview == HIDDEN_PREVIEW),
+            "{hidden:?}"
+        );
+
+        // A click for a protocol with no session changes no selection.
+        let selected = core.view().selected_conversation.clone();
+        core.dispatch(Intent::OpenFromNotification(NotifyKey {
+            protocol: ProtocolId::Slack,
+            conversation_id: "telegram:2".into(),
+        }));
+        assert_eq!(core.view().selected_protocol, ProtocolId::Telegram);
+        assert_eq!(core.view().selected_conversation, selected);
+
+        // Shutdown: the shown notification gets its dismiss.
+        core.dispatch(Intent::Shutdown);
+        let key = NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+        };
+        assert_eq!(core.take_notify(), vec![NotifyCommand::Dismiss(key)]);
     }
 
     /// PR #48 review (P1): one frame with a click on chat B and an edit of

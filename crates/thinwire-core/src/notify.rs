@@ -77,7 +77,30 @@ impl fmt::Debug for Notification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyCommand {
     Show(Notification),
+    /// Change a notification that already shows, for example to hide its
+    /// text. It never shows a new one: a backend that cannot replace a
+    /// shown notification ignores it, so no second notification with the
+    /// old text appears (#160 review).
+    Update(Notification),
     Dismiss(NotifyKey),
+}
+
+impl NotifyCommand {
+    /// The chat this command is about.
+    #[must_use]
+    pub const fn key(&self) -> &NotifyKey {
+        match self {
+            Self::Show(notification) | Self::Update(notification) => &notification.key,
+            Self::Dismiss(key) => key,
+        }
+    }
+
+    /// `Show` or `Update`: it holds text and may be dropped when the queue
+    /// is full. A `Dismiss` is never dropped.
+    #[must_use]
+    pub const fn is_content(&self) -> bool {
+        !matches!(self, Self::Dismiss(_))
+    }
 }
 
 /// Facts for one decision. The caller reads them from the state and the
@@ -140,9 +163,27 @@ pub(crate) fn decide(
     Ok(())
 }
 
+/// What the state says now about the chat of a pending notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatNow {
+    /// The chat left the list (removed, archived, or its session ended).
+    Gone,
+    /// The chat row and its unread count.
+    Listed { unread: u32 },
+}
+
+/// One shown notification of a chat.
+struct Pending {
+    shown: Notification,
+    /// The chat had unread messages after this notification. A later count
+    /// of zero means the user read it on another device. A row with a stale
+    /// zero can come before the new count, so zero alone is not enough.
+    saw_unread: bool,
+}
+
 /// Pending notifications and the queue for the frontend.
 pub(crate) struct Notifications {
-    pending: HashMap<NotifyKey, u32>,
+    pending: HashMap<NotifyKey, Pending>,
     queue: VecDeque<NotifyCommand>,
     window_focused: bool,
     closing: bool,
@@ -189,8 +230,11 @@ impl Notifications {
             protocol: message.protocol,
             conversation_id: message.conversation_id.clone(),
         };
-        let count = self.pending.entry(key.clone()).or_insert(0);
-        *count += 1;
+        let count = self
+            .pending
+            .get(&key)
+            .map_or(0, |pending| pending.shown.count)
+            + 1;
         let notification = Notification {
             key: key.clone(),
             title: chat.title.clone(),
@@ -200,14 +244,75 @@ impl Notifications {
             } else {
                 HIDDEN_PREVIEW.into()
             },
-            count: *count,
+            count,
         };
-        // The newest notification of a chat replaces the one still queued.
-        self.queue
-            .retain(|command| !matches!(command, NotifyCommand::Show(shown) if shown.key == key));
-        self.push(NotifyCommand::Show(notification));
-        tracing::info!(protocol = ?message.protocol, "notification queued");
+        self.pending.insert(
+            key,
+            Pending {
+                shown: notification.clone(),
+                saw_unread: false,
+            },
+        );
+        self.show(notification);
+        // Debug, not info: the line shows when messages arrive (qa on #87).
+        tracing::debug!(protocol = ?message.protocol, "notification queued");
         Ok(())
+    }
+
+    /// Queue `notification`. It replaces a queued `Show` or `Update` of the
+    /// same chat.
+    fn show(&mut self, notification: Notification) {
+        let key = notification.key.clone();
+        self.queue
+            .retain(|command| !(command.is_content() && command.key() == &key));
+        self.push(NotifyCommand::Show(notification));
+    }
+
+    /// The switch "Show notifications" went off: remove every queued and
+    /// shown notification (#87 review).
+    pub(crate) fn clear_all(&mut self) {
+        for key in self.pending_keys() {
+            self.dismiss(&key);
+        }
+    }
+
+    /// "Hide message text" went on: no queued or shown notification keeps
+    /// its text or sender. A shown one is replaced by a hidden one
+    /// (#87 review).
+    pub(crate) fn hide_previews(&mut self) {
+        for key in self.pending_keys() {
+            let Some(pending) = self.pending.get_mut(&key) else {
+                continue;
+            };
+            if pending.shown.preview == HIDDEN_PREVIEW && pending.shown.sender.is_none() {
+                continue;
+            }
+            pending.shown.preview = HIDDEN_PREVIEW.into();
+            pending.shown.sender = None;
+            let hidden = pending.shown.clone();
+            // Not shown yet: the queued `Show` gets the hidden text. Shown:
+            // an `Update`, which a backend with no replace ignores.
+            if let Some(NotifyCommand::Show(queued)) = self
+                .queue
+                .iter_mut()
+                .find(|command| matches!(command, NotifyCommand::Show(queued) if queued.key == key))
+            {
+                *queued = hidden;
+                continue;
+            }
+            self.queue
+                .retain(|command| !matches!(command, NotifyCommand::Update(old) if old.key == key));
+            self.push(NotifyCommand::Update(hidden));
+        }
+    }
+
+    fn pending_keys(&self) -> Vec<NotifyKey> {
+        let mut keys: Vec<NotifyKey> = self.pending.keys().cloned().collect();
+        keys.sort_by(|a, b| {
+            (a.protocol.display_name(), &a.conversation_id)
+                .cmp(&(b.protocol.display_name(), &b.conversation_id))
+        });
+        keys
     }
 
     /// Remove the notification of this chat, if one shows.
@@ -216,56 +321,68 @@ impl Notifications {
             return;
         }
         self.queue
-            .retain(|command| !matches!(command, NotifyCommand::Show(shown) if &shown.key == key));
+            .retain(|command| !(command.is_content() && command.key() == key));
         self.push(NotifyCommand::Dismiss(key.clone()));
     }
 
-    /// Dismiss the chat the user looks at, and every chat of a protocol
-    /// whose session ended. Runs after each state change.
+    /// Dismiss the notification of a chat when the user looks at it, when
+    /// its protocol session ended, when the chat left the list, or when the
+    /// chat was read on another device. Runs after each state change.
     pub(crate) fn sync(
         &mut self,
         viewed: Option<(ProtocolId, &str)>,
         has_session: impl Fn(ProtocolId) -> bool,
+        chat_now: impl Fn(&NotifyKey) -> ChatNow,
     ) {
-        let mut gone: Vec<NotifyKey> = self
-            .pending
-            .keys()
-            .filter(|key| {
-                let seen = self.window_focused
-                    && viewed == Some((key.protocol, key.conversation_id.as_str()));
-                seen || !has_session(key.protocol)
-            })
-            .cloned()
-            .collect();
-        gone.sort_by(|a, b| a.conversation_id.cmp(&b.conversation_id));
+        let mut gone = Vec::new();
+        for key in self.pending_keys() {
+            let seen =
+                self.window_focused && viewed == Some((key.protocol, key.conversation_id.as_str()));
+            let read_elsewhere = match chat_now(&key) {
+                ChatNow::Gone => true,
+                ChatNow::Listed { unread: 0 } => self
+                    .pending
+                    .get(&key)
+                    .is_some_and(|pending| pending.saw_unread),
+                ChatNow::Listed { .. } => {
+                    if let Some(pending) = self.pending.get_mut(&key) {
+                        pending.saw_unread = true;
+                    }
+                    false
+                }
+            };
+            if seen || read_elsewhere || !has_session(key.protocol) {
+                gone.push(key);
+            }
+        }
         for key in gone {
             self.dismiss(&key);
         }
     }
 
-    /// The app is closing: nothing more goes out.
+    /// The app is closing: no new notification goes out, and every shown
+    /// one gets a `Dismiss`, so none stays on screen after exit
+    /// (#87 review).
     pub(crate) fn close(&mut self) {
+        self.clear_all();
         self.closing = true;
-        self.queue.clear();
     }
 
     pub(crate) fn take(&mut self) -> Vec<NotifyCommand> {
         self.queue.drain(..).collect()
     }
 
+    /// Add `command`. Over `QUEUE_LIMIT`, drop the oldest `Show` or
+    /// `Update`. Never drop a `Dismiss`: each one closes a shown
+    /// notification, and there is at most one for each pending chat
+    /// (#87 review).
     fn push(&mut self, command: NotifyCommand) {
         self.queue.push_back(command);
         while self.queue.len() > QUEUE_LIMIT {
-            // Drop the oldest `Show`. A `Dismiss` is small and must arrive.
-            if let Some(index) = self
-                .queue
-                .iter()
-                .position(|command| matches!(command, NotifyCommand::Show(_)))
-            {
-                self.queue.remove(index);
-            } else {
-                self.queue.pop_front();
-            }
+            let Some(index) = self.queue.iter().position(NotifyCommand::is_content) else {
+                break;
+            };
+            self.queue.remove(index);
         }
     }
 }
@@ -446,17 +563,29 @@ mod tests {
         assert_eq!(team.body(), "Bob: hi team");
 
         // Focus with the chat open dismisses it.
-        notes.sync(Some((ProtocolId::Telegram, "telegram:1")), |_| true);
+        notes.sync(
+            Some((ProtocolId::Telegram, "telegram:1")),
+            |_| true,
+            |_| ChatNow::Listed { unread: 1 },
+        );
         assert_eq!(notes.take(), vec![]);
         notes.set_focus(true);
-        notes.sync(Some((ProtocolId::Telegram, "telegram:1")), |_| true);
+        notes.sync(
+            Some((ProtocolId::Telegram, "telegram:1")),
+            |_| true,
+            |_| ChatNow::Listed { unread: 1 },
+        );
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
         };
         assert_eq!(notes.take(), vec![NotifyCommand::Dismiss(key)]);
         // The session ends: its notifications go.
-        notes.sync(None, |protocol| protocol != ProtocolId::Telegram);
+        notes.sync(
+            None,
+            |protocol| protocol != ProtocolId::Telegram,
+            |_| ChatNow::Listed { unread: 1 },
+        );
         assert_eq!(notes.take().len(), 1);
     }
 
@@ -515,7 +644,16 @@ mod tests {
         }
         assert_eq!(notes.take().len(), QUEUE_LIMIT, "no unbounded queue");
 
+        // Shutdown dismisses every shown notification, more than the queue
+        // limit: a `Dismiss` is never dropped (#87 review).
         notes.close();
+        let closing = notes.take();
+        assert_eq!(closing.len(), QUEUE_LIMIT * 2);
+        assert!(
+            closing
+                .iter()
+                .all(|command| matches!(command, NotifyCommand::Dismiss(_)))
+        );
         let row = chat(ProtocolId::Slack, "slack:1");
         assert!(
             notes
@@ -527,5 +665,110 @@ mod tests {
                 .is_err()
         );
         assert!(notes.take().is_empty(), "nothing after Shutdown");
+    }
+
+    fn show_three(notes: &mut Notifications) {
+        for n in 1..=3 {
+            let id = format!("telegram:{n}");
+            let group = Conversation {
+                is_group: true,
+                ..chat(ProtocolId::Telegram, &id)
+            };
+            notes
+                .on_message(
+                    &message(ProtocolId::Telegram, &id, "secret text"),
+                    Some(&group),
+                    &ctx(None, false),
+                )
+                .expect("notifies");
+        }
+        assert_eq!(notes.take().len(), 3);
+    }
+
+    #[test]
+    fn the_privacy_switches_apply_to_shown_and_queued_notifications() {
+        let mut notes = Notifications::new();
+        show_three(&mut notes);
+        // One more is still queued when the user hides the text.
+        let row = Conversation {
+            is_group: true,
+            ..chat(ProtocolId::Telegram, "telegram:1")
+        };
+        notes
+            .on_message(
+                &message(ProtocolId::Telegram, "telegram:1", "queued text"),
+                Some(&row),
+                &ctx(None, false),
+            )
+            .expect("notifies");
+        notes.hide_previews();
+        let hidden = notes.take();
+        assert_eq!(hidden.len(), 3, "one command for each chat: {hidden:?}");
+        // Chat 1 was still queued: its `Show` got the hidden text. Chats 2
+        // and 3 already show: an `Update`, never a second `Show`.
+        assert!(
+            matches!(&hidden[0], NotifyCommand::Show(shown) if shown.key.conversation_id == "telegram:1")
+        );
+        assert!(
+            hidden[1..]
+                .iter()
+                .all(|command| matches!(command, NotifyCommand::Update(_)))
+        );
+        for command in &hidden {
+            let (NotifyCommand::Show(shown) | NotifyCommand::Update(shown)) = command else {
+                panic!("content")
+            };
+            assert_eq!(shown.preview, HIDDEN_PREVIEW);
+            assert_eq!(shown.sender, None);
+            assert!(!shown.body().contains("text"));
+        }
+        notes.hide_previews();
+        assert!(notes.take().is_empty(), "already hidden: nothing new");
+
+        // Off: every notification goes, none stays queued.
+        notes
+            .on_message(
+                &message(ProtocolId::Telegram, "telegram:2", "late"),
+                Some(&chat(ProtocolId::Telegram, "telegram:2")),
+                &ctx(None, false),
+            )
+            .expect("notifies");
+        notes.clear_all();
+        let cleared = notes.take();
+        assert_eq!(cleared.len(), 3);
+        assert!(
+            cleared
+                .iter()
+                .all(|command| matches!(command, NotifyCommand::Dismiss(_)))
+        );
+    }
+
+    #[test]
+    fn a_chat_that_leaves_or_is_read_elsewhere_loses_its_notification() {
+        let mut notes = Notifications::new();
+        notes.set_focus(false);
+        show_three(&mut notes);
+        let key = |n: u8| NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: format!("telegram:{n}"),
+        };
+        // Chat 2 still shows a stale zero: no dismiss yet.
+        let now = |unread_2: u32, listed_3: bool| {
+            move |k: &NotifyKey| match k.conversation_id.as_str() {
+                "telegram:2" => ChatNow::Listed { unread: unread_2 },
+                "telegram:3" if !listed_3 => ChatNow::Gone,
+                _ => ChatNow::Listed { unread: 1 },
+            }
+        };
+        notes.sync(None, |_| true, now(0, true));
+        assert!(notes.take().is_empty(), "a stale zero before the count");
+        // The count goes up, then back to zero: read on another device.
+        notes.sync(None, |_| true, now(2, true));
+        assert!(notes.take().is_empty());
+        notes.sync(None, |_| true, now(0, true));
+        assert_eq!(notes.take(), vec![NotifyCommand::Dismiss(key(2))]);
+        // Chat 3 leaves the list.
+        notes.sync(None, |_| true, now(0, false));
+        assert_eq!(notes.take(), vec![NotifyCommand::Dismiss(key(3))]);
     }
 }
