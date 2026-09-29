@@ -259,12 +259,42 @@ fn platform_backend(clicks: ClickFn) -> impl Backend {
     tagged::Tagged(winrt::Toasts::new(clicks))
 }
 
-/// macOS: the notification center inside `Thinwire.app`, else show only.
+/// macOS: the notification center inside `Thinwire.app` on macOS 12 or
+/// later, else show only.
 #[cfg(target_os = "macos")]
 fn platform_backend(clicks: ClickFn) -> impl Backend {
+    if mac_choice(macos::os_major()) == MacChoice::ShowOnly {
+        return Mac::ShowOnly(ShowOnly);
+    }
     match macos::Center::new(clicks) {
         Some(center) => Mac::Center(tagged::Tagged(center)),
         None => Mac::ShowOnly(ShowOnly),
+    }
+}
+
+/// The first macOS major version for the notification center backend.
+/// `mac-usernotifications` sets the interruption level of each request, a
+/// macOS 12 API, with no availability check: on macOS 11 the first
+/// notification aborts the app (Codex r4138724926).
+#[cfg(any(target_os = "macos", test))]
+const MIN_CENTER_MACOS: isize = 12;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacChoice {
+    /// UNUserNotificationCenter, if the process has a bundle id.
+    Center,
+    /// notify-rust, with no UNUserNotificationCenter call at all.
+    ShowOnly,
+}
+
+/// The macOS backend for the OS major version `major`.
+#[cfg(any(target_os = "macos", test))]
+const fn mac_choice(major: isize) -> MacChoice {
+    if major >= MIN_CENTER_MACOS {
+        MacChoice::Center
+    } else {
+        MacChoice::ShowOnly
     }
 }
 
@@ -575,6 +605,17 @@ mod tests {
             *seen.lock().expect("seen"),
             vec![Seen::Dismiss(key("telegram:2"))]
         );
+    }
+
+    #[test]
+    fn macos_before_12_keeps_show_only() {
+        // The bundle says macOS 11.0 is enough (LSMinimumSystemVersion).
+        // Only macOS 12 and later use the notification center
+        // (Codex r4138724926).
+        assert_eq!(mac_choice(10), MacChoice::ShowOnly);
+        assert_eq!(mac_choice(11), MacChoice::ShowOnly);
+        assert_eq!(mac_choice(12), MacChoice::Center);
+        assert_eq!(mac_choice(26), MacChoice::Center);
     }
 
     #[test]
