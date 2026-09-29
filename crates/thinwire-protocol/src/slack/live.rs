@@ -14,8 +14,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::api::{
     SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
-    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound,
-    SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi, channel_can_post,
+    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackHistoryPage,
+    SlackInbound, SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi, channel_can_post,
+    history_has_more, history_page_is_authoritative,
 };
 use super::install::SlackInstalledWorkspace;
 use super::morphism::{oauth_v2_access_request, workspace_bot_token};
@@ -297,7 +298,7 @@ impl SlackWebApi for MorphismWebApi {
         token: &SlackBotToken,
         channel: &str,
         limit: u16,
-    ) -> Result<Vec<SlackPost>, SlackApiError> {
+    ) -> Result<SlackHistoryPage, SlackApiError> {
         let token = self.bot_session_token(token.reveal());
         let request = SlackApiConversationsHistoryRequest::new()
             .with_channel(SlackChannelId::new(channel.into()))
@@ -308,7 +309,19 @@ impl SlackWebApi for MorphismWebApi {
             .conversations_history(&request)
             .await
             .map_err(map_error)?;
-        Ok(response
+        // Newest first. The last row is the oldest timestamp this page
+        // covered, including subtypes the channel view ignores.
+        let oldest_raw_ts = response
+            .messages
+            .last()
+            .map(|message| message.origin.ts.to_string());
+        let next_cursor = response
+            .response_metadata
+            .as_ref()
+            .and_then(|meta| meta.next_cursor.as_ref())
+            .map(AsRef::as_ref);
+        let has_more = history_has_more(response.has_more, next_cursor);
+        let posts: Vec<SlackPost> = response
             .messages
             .into_iter()
             .filter(|message| shown_in_channel(message.subtype.as_ref(), &message.origin))
@@ -320,7 +333,13 @@ impl SlackWebApi for MorphismWebApi {
                 text: body(message.content.text),
                 client_msg_id: client_msg_id(&message.origin),
             })
-            .collect())
+            .collect();
+        let authoritative = history_page_is_authoritative(posts.len(), limit, has_more);
+        Ok(SlackHistoryPage {
+            posts,
+            oldest_raw_ts,
+            authoritative,
+        })
     }
 
     async fn post_message(

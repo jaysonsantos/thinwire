@@ -24,8 +24,8 @@ use credentials::require_slack_client;
 
 pub use api::{
     SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
-    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound,
-    SlackInstallGrant, SlackPost, SlackWebApi,
+    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackHistoryPage,
+    SlackInbound, SlackInstallGrant, SlackPost, SlackWebApi,
 };
 pub use credentials::{
     SlackApiOrigin, SlackApiSource, resolve_slack_app_token, resolve_slack_client,

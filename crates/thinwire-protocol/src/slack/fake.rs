@@ -11,8 +11,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::api::{
     SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
-    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound,
-    SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
+    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackHistoryPage,
+    SlackInbound, SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
 };
 use super::credentials::SlackApiSource;
 use super::install::SlackInstalledWorkspace;
@@ -43,7 +43,7 @@ struct ApiState {
     list_forever: bool,
     /// Pages returned before `pages`, one call each.
     script: Vec<SlackChannelPage>,
-    history: HashMap<String, Vec<SlackPost>>,
+    history: HashMap<String, SlackHistoryPage>,
     history_error: Option<SlackApiError>,
     post_error: Option<SlackApiError>,
     users: HashMap<String, String>,
@@ -91,10 +91,10 @@ impl FakeApi {
             state.users.insert(BOT_USER.into(), "thinwire".into());
             state.history.insert(
                 "C1".into(),
-                vec![
+                SlackHistoryPage::complete(vec![
                     post("C1", "1700000002.000200", BOT_USER, "second, from the app"),
                     post("C1", "1700000001.000100", "U1", "first"),
-                ],
+                ]),
             );
             state.next_ts = 1_700_000_100;
         });
@@ -192,7 +192,7 @@ impl SlackWebApi for FakeApi {
         token: &SlackBotToken,
         channel: &str,
         limit: u16,
-    ) -> Result<Vec<SlackPost>, SlackApiError> {
+    ) -> Result<SlackHistoryPage, SlackApiError> {
         Self::check_token(token);
         assert!(limit > 0);
         self.with(|state| {
@@ -792,7 +792,9 @@ async fn history_replaces_a_newer_cached_preview() {
 async fn empty_history_clears_a_cached_preview() {
     let api = FakeApi::workspace();
     api.with(|state| {
-        state.history.insert("C1".into(), Vec::new());
+        state
+            .history
+            .insert("C1".into(), SlackHistoryPage::default());
     });
     let vault = installed_vault();
     vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
@@ -850,6 +852,77 @@ async fn history_drops_posts_outside_the_latest_page() {
         )
     })
     .await;
+}
+
+#[tokio::test]
+async fn history_keeps_a_cached_post_behind_ignored_subtypes() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        // The latest raw page is joins. The displayable post is older than
+        // that page, so it is outside the covered range.
+        state.history.insert(
+            "C1".into(),
+            SlackHistoryPage {
+                posts: Vec::new(),
+                oldest_raw_ts: Some("1700000003.000100".into()),
+                authoritative: false,
+            },
+        );
+    });
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(api, vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1690000000.000100",
+        "U1",
+        "still shown",
+    )));
+    h.message("still shown").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000004.000100",
+        "U1",
+        "gone from slack",
+    )));
+    h.message("gone from slack").await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.until("history loaded", |event| {
+        matches!(
+            event,
+            AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == "slack:C1"
+        )
+    })
+    .await;
+    assert!(
+        h.seen.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessagesRemoved { message_ids, .. }
+                if message_ids.iter().any(|id| id.contains("1700000004"))
+        )),
+        "a cached post inside the raw page that Slack omitted is removed"
+    );
+    assert!(
+        !h.seen.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessagesRemoved { message_ids, .. }
+                if message_ids.iter().any(|id| id.contains("1690000000"))
+        )),
+        "a displayable post older than the diluted page stays"
+    );
+    let preview = h.seen.iter().rev().find_map(|event| match event {
+        AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C1" => {
+            Some((conversation.preview.as_str(), conversation.order))
+        }
+        _ => None,
+    });
+    assert_eq!(preview, Some(("still shown", 1_690_000_000_000_100)));
 }
 
 #[tokio::test]
@@ -1628,10 +1701,10 @@ async fn a_new_session_does_not_keep_posts_from_the_previous_one() {
     api.with(|state| {
         state.history.insert(
             "C1".into(),
-            vec![
+            SlackHistoryPage::complete(vec![
                 post("C1", "1700000100.000100", "U1", "gone"),
                 post("C1", "1700000200.000100", "U1", "kept"),
-            ],
+            ]),
         );
     });
     let mut h = Harness::new(api, vault, true);
@@ -1650,7 +1723,7 @@ async fn a_new_session_does_not_keep_posts_from_the_previous_one() {
     h.api.with(|state| {
         state.history.insert(
             "C1".into(),
-            vec![post("C1", "1700000200.000100", "U1", "kept")],
+            SlackHistoryPage::complete(vec![post("C1", "1700000200.000100", "U1", "kept")]),
         );
     });
     h.send(AdapterCommand::Connect {
@@ -2045,7 +2118,7 @@ async fn failed_user_lookup_is_not_cached() {
         state.users.insert("U1".into(), "Ana".into());
         state.history.insert(
             "D1".into(),
-            vec![post("D1", "1700000003.000100", "U1", "dm hello")],
+            SlackHistoryPage::complete(vec![post("D1", "1700000003.000100", "U1", "dm hello")]),
         );
     });
     h.send(AdapterCommand::OpenChat {

@@ -137,6 +137,62 @@ pub struct SlackChannelPage {
     pub next_cursor: Option<String>,
 }
 
+/// Displayable posts from one `conversations.history` call.
+///
+/// Slack counts ignored subtypes (`channel_join` and the rest) toward
+/// `limit`. `posts` can be shorter than that limit while older messages
+/// still exist. `authoritative` is false then; `oldest_raw_ts` is the
+/// oldest raw row the response covered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackHistoryPage {
+    /// Displayable posts, newest first.
+    pub posts: Vec<SlackPost>,
+    /// Oldest raw `ts` in the Slack page, including ignored subtypes.
+    /// `None` when Slack returned no rows.
+    pub oldest_raw_ts: Option<String>,
+    /// `posts` is the latest displayable window. Slack had no older rows,
+    /// or this page already held `limit` displayable posts.
+    pub authoritative: bool,
+}
+
+impl Default for SlackHistoryPage {
+    fn default() -> Self {
+        Self {
+            posts: Vec::new(),
+            oldest_raw_ts: None,
+            authoritative: true,
+        }
+    }
+}
+
+impl SlackHistoryPage {
+    /// Newest-first displayable posts that are the whole channel.
+    #[must_use]
+    pub fn complete(posts: Vec<SlackPost>) -> Self {
+        let oldest_raw_ts = posts.last().map(|post| post.ts.clone());
+        Self {
+            posts,
+            oldest_raw_ts,
+            authoritative: true,
+        }
+    }
+}
+
+/// Slack has older history when it says so, or when it returns a cursor.
+#[must_use]
+#[cfg(any(test, feature = "slack-oauth"))]
+pub(crate) fn history_has_more(has_more: Option<bool>, next_cursor: Option<&str>) -> bool {
+    let cursor = next_cursor.is_some_and(|cursor| !cursor.trim().is_empty());
+    has_more == Some(true) || cursor
+}
+
+/// A full displayable page, or the end of the channel, is the latest window.
+#[must_use]
+#[cfg(any(test, feature = "slack-oauth"))]
+pub(crate) fn history_page_is_authoritative(shown: usize, limit: u16, has_more: bool) -> bool {
+    !has_more || shown >= usize::from(limit)
+}
+
 /// One message from history, `chat.postMessage`, or a Socket Mode event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlackPost {
@@ -207,13 +263,15 @@ pub trait SlackWebApi: Send + Sync + 'static {
         cursor: Option<String>,
     ) -> impl Future<Output = Result<SlackChannelPage, SlackApiError>> + Send;
 
-    /// Newest first, as Slack returns it.
+    /// Newest-first displayable posts from `conversations.history`.
+    ///
+    /// `limit` is the raw page size. Ignored subtypes count toward it.
     fn history(
         &self,
         token: &SlackBotToken,
         channel: &str,
         limit: u16,
-    ) -> impl Future<Output = Result<Vec<SlackPost>, SlackApiError>> + Send;
+    ) -> impl Future<Output = Result<SlackHistoryPage, SlackApiError>> + Send;
 
     fn post_message(
         &self,
@@ -357,5 +415,24 @@ mod tests {
             SlackApiError::api("").to_string(),
             "Slack returned unknown_error"
         );
+    }
+
+    #[test]
+    fn a_cursor_means_more_history_and_an_empty_one_does_not() {
+        assert!(!history_has_more(None, None));
+        assert!(!history_has_more(Some(false), None));
+        assert!(!history_has_more(Some(false), Some("  ")));
+        assert!(history_has_more(Some(true), None));
+        assert!(history_has_more(None, Some("next")));
+        assert!(history_has_more(Some(false), Some("next")));
+    }
+
+    #[test]
+    fn a_short_page_with_more_history_is_not_the_latest_window() {
+        assert!(!history_page_is_authoritative(0, 50, true));
+        assert!(!history_page_is_authoritative(49, 50, true));
+        assert!(history_page_is_authoritative(50, 50, true));
+        assert!(history_page_is_authoritative(0, 50, false));
+        assert!(history_page_is_authoritative(2, 50, false));
     }
 }

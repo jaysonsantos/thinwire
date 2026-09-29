@@ -16,8 +16,8 @@ use tokio::task::AbortHandle;
 
 use super::api::{
     SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
-    SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound, SlackInstallGrant,
-    SlackPost, SlackSocketScope, SlackWebApi,
+    SlackCodeExchange, SlackEventSource, SlackEventStream, SlackHistoryPage, SlackInbound,
+    SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
 };
 use super::credentials::{SlackApiSource, resolve_slack_app_token, resolve_slack_client};
 use super::install::{
@@ -754,7 +754,7 @@ where
         self.accumulated_seen()
     }
 
-    /// Set the inbox row from the history page. An empty page clears it.
+    /// Set the inbox row from the history page. An empty authoritative page clears it.
     fn replace_preview(&mut self, channel: &str, newest: Option<(i64, i64, String)>) {
         let Some(row) = self.channels.get(channel) else {
             return;
@@ -839,8 +839,8 @@ where
             return;
         };
         let token = live.token.clone();
-        let posts = match self.deps.api.history(&token, channel, HISTORY_LIMIT).await {
-            Ok(posts) => posts,
+        let page = match self.deps.api.history(&token, channel, HISTORY_LIMIT).await {
+            Ok(page) => page,
             Err(error) => {
                 self.api_failed(&error).await;
                 emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
@@ -849,20 +849,29 @@ where
         };
         // `conversations.history` is newest-first. A channel with no Socket
         // Mode event still needs that post on the inbox row.
-        let newest = posts
+        let newest = page
+            .posts
             .iter()
             .max_by_key(|post| ts_rank(&post.ts))
             .map(|post| (ts_rank(&post.ts), ts_order(&post.ts), post.text.clone()));
-        let kept: HashSet<String> = posts.iter().map(|post| post.ts.clone()).collect();
-        // Drop cached posts that are not on this page before `remember` can
-        // evict them without `MessagesRemoved`.
-        self.drop_posts_outside(channel, &kept);
-        for post in posts.into_iter().rev() {
+        // Ignored subtypes count toward Slack's raw limit, so a short
+        // displayable page is not the latest window. Drop only the posts
+        // that page covers, before `remember` can evict them without
+        // `MessagesRemoved`.
+        let keep_cached_preview = page.posts.is_empty() && !page.authoritative;
+        self.drop_posts_outside(channel, &page);
+        for post in page.posts.into_iter().rev() {
             let message = self.chat_message(&token, post).await;
             emit_message(&self.events, message);
         }
-        // The fetched page is the thread. A dropped live post can be newer
-        // than every history row; `note_latest` would keep that stale preview.
+        // A dropped live post can be newer than every history row;
+        // `note_latest` would keep that stale preview. An empty page that
+        // still has older history keeps the newest cached post instead.
+        let newest = if keep_cached_preview {
+            self.newest_shown(channel)
+        } else {
+            newest
+        };
         self.replace_preview(channel, newest);
         self.mark_channel_read(channel);
         emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
@@ -1163,19 +1172,29 @@ where
         self.upsert(channel.to_string(), row);
     }
 
-    fn drop_posts_outside(&mut self, channel: &str, kept: &HashSet<String>) {
+    fn newest_shown(&self, channel: &str) -> Option<(i64, i64, String)> {
+        self.shown.get(channel).and_then(|rows| {
+            rows.iter()
+                .max_by_key(|row| ts_rank(&row.ts))
+                .map(|row| (ts_rank(&row.ts), ts_order(&row.ts), row.text.clone()))
+        })
+    }
+
+    fn drop_posts_outside(&mut self, channel: &str, page: &SlackHistoryPage) {
+        let kept: HashSet<&str> = page.posts.iter().map(|post| post.ts.as_str()).collect();
+        let oldest_raw = page.oldest_raw_ts.as_deref().map(ts_rank);
         let Some(rows) = self.shown.get_mut(channel) else {
             return;
         };
         let gone: Vec<String> = rows
             .iter()
-            .filter(|row| !kept.contains(&row.ts))
+            .filter(|row| cached_post_is_outside(&row.ts, &kept, oldest_raw, page.authoritative))
             .map(|row| row.ts.clone())
             .collect();
         if gone.is_empty() {
             return;
         }
-        rows.retain(|row| kept.contains(&row.ts));
+        rows.retain(|row| !gone.contains(&row.ts));
         let ids = gone.iter().map(|ts| message_id_of(channel, ts)).collect();
         emit_messages_removed(
             &self.events,
@@ -1215,6 +1234,23 @@ struct Shown {
     text: String,
     counted: bool,
     client_msg_id: Option<String>,
+}
+
+/// A cached post leaves the thread when this page covers its timestamp and
+/// does not include it. A non-authoritative page covers only `ts >= oldest_raw`.
+fn cached_post_is_outside(
+    ts: &str,
+    kept: &HashSet<&str>,
+    oldest_raw: Option<i64>,
+    authoritative: bool,
+) -> bool {
+    if kept.contains(ts) {
+        return false;
+    }
+    if authoritative {
+        return true;
+    }
+    oldest_raw.is_some_and(|oldest| ts_rank(ts) >= oldest)
 }
 
 fn same_client_msg(stored: Option<&str>, incoming: Option<&str>) -> bool {
@@ -1321,6 +1357,8 @@ fn ts_rank(ts: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -1346,5 +1384,41 @@ mod tests {
             "slack:C1:1700000001000100"
         );
         assert_eq!(ts_rank("bad"), 0);
+    }
+
+    #[test]
+    fn a_post_older_than_a_diluted_page_stays() {
+        let kept = HashSet::new();
+        let oldest = ts_rank("1700000003.000100");
+        assert!(!cached_post_is_outside(
+            "1690000000.000100",
+            &kept,
+            Some(oldest),
+            false
+        ));
+        assert!(cached_post_is_outside(
+            "1700000004.000100",
+            &kept,
+            Some(oldest),
+            false
+        ));
+        assert!(!cached_post_is_outside(
+            "1700000004.000100",
+            &HashSet::from(["1700000004.000100"]),
+            Some(oldest),
+            false
+        ));
+        assert!(cached_post_is_outside(
+            "1690000000.000100",
+            &kept,
+            Some(oldest),
+            true
+        ));
+        assert!(!cached_post_is_outside(
+            "1690000000.000100",
+            &kept,
+            None,
+            false
+        ));
     }
 }
