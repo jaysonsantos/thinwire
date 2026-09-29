@@ -6,4 +6,9 @@
 //! with feature `whatsapp-web`. `thinwire-protocol` does not depend on it.
 //! Release builds and OS zips do not enable that feature.
 //!
-//! The adapter moves here from `thinwire-protocol` in #77.
+//! The adapter moved here from `thinwire-protocol` in #77. That crate keeps
+//! an MIT stub and the shared [`thinwire_protocol::WhatsAppPhoneVault`].
+
+mod whatsapp;
+
+pub use whatsapp::{WhatsAppAdapter, parse_whatsapp_chat_id};

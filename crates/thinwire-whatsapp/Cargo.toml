@@ -10,12 +10,35 @@ description = "Local-only WhatsApp linked-device adapter (AGPL-3.0-only). Not in
 
 [features]
 default = []
-# Links whatsapp-rust and its AGPL `wacore-libsignal`. thinwire enables this
-# only through its `whatsapp-web` feature. Default CI stays off (ADR 0011).
-whatsapp-web = []
+# Experimental WhatsApp Web / linked-device client (oxidezap whatsapp-rust).
+# It links the AGPL `wacore-libsignal`. thinwire enables this only through
+# its `whatsapp-web` feature. Default CI stays off (ADR 0011). Git revision
+# matches ZapFast 0.14 so the spike builds on stable Rust. Not a supported
+# messenger. `sqlite-storage` (not `sqlite-storage-bundled`) so the lock can
+# use libsqlite3-sys 0.36. The 0.38 pin cannot share the graph with the
+# Signal sqlite store. The bundled build is the direct dependency below.
+whatsapp-web = ["dep:whatsapp-rust", "dep:libsqlite3-sys"]
 
 [dependencies]
+dirs.workspace = true
 thinwire-protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "008a68a4fa823e5a3f5e96715d7673dedd259e35", optional = true, default-features = false, features = [
+  "sqlite-storage",
+  "tokio-transport",
+  "tokio-runtime",
+  "ureq-client",
+  "tokio-native",
+] }
+# Same 0.36 line as the Signal sqlite store. `bundled` keeps WhatsApp off the system libsqlite.
+libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
+  "bundled",
+] }
+
+[dev-dependencies]
+# The adapter contract kit (ADR 0010) for the tests.
+thinwire-protocol = { workspace = true, features = ["contract-kit"] }
 
 [lints]
 workspace = true

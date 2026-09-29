@@ -19,8 +19,8 @@ pub use adapter::{
     Arrival, ChatMessage, Conversation, Delivery, DiscordAuthMode, EventTx, ProtocolAdapter,
     ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, TelegramAuthError,
     TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, emit_account, emit_chat_list_loaded,
-    emit_conversation, emit_history_loaded, emit_message, emit_send_accepted, emit_send_rejected,
-    emit_status, emit_stopped,
+    emit_conversation, emit_history_loaded, emit_message, emit_older_history_loaded,
+    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -55,7 +55,7 @@ pub use telegram::{
     TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,
     resolve_telegram_api, telegram_api_available,
 };
-pub use whatsapp::{WhatsAppAdapter, WhatsAppPhoneVault, parse_whatsapp_chat_id};
+pub use whatsapp::{WhatsAppAdapter, WhatsAppPhoneVault};
 
 /// Shell protocols in display order. Signal is local-only and hidden unless `signal-local` is on.
 pub fn catalog() -> [ProtocolCapabilities; 5] {

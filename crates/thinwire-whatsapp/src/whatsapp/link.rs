@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! One owner for the WhatsApp link lifecycle.
 //!
 //! A single tokio task ([`Owner`]) owns the link generation, the bot handle,
@@ -21,7 +22,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use super::session::{LinkEvent, Session, WhatsAppSender, account};
-use crate::adapter::{AccountState, AdapterStatus, EventTx, ProtocolId, emit_status};
+use thinwire_protocol::{AccountState, AdapterStatus, EventTx, ProtocolId, emit_status};
 
 /// Longest wait of [`LinkHandle::shutdown`]. Below the 5 s close limit of
 /// the app, so `Stopped` still fits (#44).
@@ -469,8 +470,8 @@ pub(super) mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     use super::*;
-    use crate::adapter::{AdapterEvent, RedactedPairingSecret};
     use crate::whatsapp::session::fake::FakeSender;
+    use thinwire_protocol::{AdapterEvent, RedactedPairingSecret};
 
     /// Records every backend call in order. The bot is its generation.
     #[derive(Default)]
