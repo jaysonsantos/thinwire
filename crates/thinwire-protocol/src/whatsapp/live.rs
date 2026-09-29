@@ -16,7 +16,7 @@ use whatsapp_rust::wacore::proto_helpers::{MessageBuilderExt, MessageExt};
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::{Client, ClientError, Jid};
 
-use super::inbox::{HistoryChat, WaMessage};
+use super::inbox::{HistoryChat, Mute, WaMessage};
 use super::link::{Callbacks, LinkBackend, StartError, Started};
 use super::path::{
     prepare_session_dir, remove_device_store, restrict_store_file, revoked_marker,
@@ -165,6 +165,10 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
         Event::LoggedOut(_) => LinkEvent::LoggedOut,
         Event::TemporaryBan(_) => LinkEvent::TemporaryBan,
         Event::HistorySync(sync) => map_history(sync.get()?),
+        Event::MuteUpdate(update) => LinkEvent::Mute {
+            jid: update.jid.to_string(),
+            mute: Mute::from_action(update.action.muted, update.action.mute_end_timestamp),
+        },
         Event::Messages(batch) => LinkEvent::Messages(
             batch
                 .iter()
@@ -209,6 +213,7 @@ fn map_history(sync: &wa::HistorySync) -> LinkEvent {
                     .or(conversation.last_msg_timestamp)
                     .and_then(|ts| i64::try_from(ts).ok())
                     .unwrap_or(0),
+                mute: Mute::from_history(conversation.mute_end_time),
                 jid,
                 messages,
             }

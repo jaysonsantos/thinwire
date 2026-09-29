@@ -11,17 +11,22 @@
 //! - macOS and Windows: show only. Click, replace, and dismiss are not
 //!   wired yet.
 //!
-//! No log line holds a title, a sender, or message text. A backend error
-//! logs its kind once, then notifications stay off for this run.
+//! No log line holds a title, a sender, or message text. A failed OS call
+//! waits and tries the next command; notifications turn off for the run
+//! only after `MAX_FAILURES_IN_A_ROW` failures in a row.
 
-use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
+use std::time::{Duration, Instant};
 
+pub use pipe::{INBOX_LIMIT, MAX_FAILURES_IN_A_ROW, RETRY_AFTER, RETRY_MAX};
 pub use thinwire_core::notify::{Notification, NotifyCommand, NotifyKey};
 
+mod pipe;
 #[cfg(target_os = "linux")]
 mod xdg;
+
+use pipe::{Health, Inbox, Next};
 
 /// A failed OS call. Only a fixed kind, never message data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,12 +39,43 @@ pub type ClickFn = Arc<dyn Fn(NotifyKey) + Send + Sync>;
 /// One OS notification service.
 pub trait Backend: Send + 'static {
     fn show(&mut self, notification: &Notification) -> Result<(), BackendError>;
+
+    /// Change a notification that still shows. It never shows a new one.
+    /// The default does nothing: a backend that cannot replace a shown
+    /// notification must not show a second one (#160 review).
+    fn update(&mut self, _notification: &Notification) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn dismiss(&mut self, key: &NotifyKey) -> Result<(), BackendError>;
+}
+
+/// State that the frontend and the thread share.
+#[derive(Default)]
+struct Shared {
+    inbox: Inbox,
+    /// The thread runs an OS call now.
+    busy: bool,
+    /// The `Notifier` is gone: the thread ends when the inbox is empty.
+    closed: bool,
+    /// Too many failures: the thread drops every command.
+    off: bool,
+}
+
+struct Pipe {
+    shared: Mutex<Shared>,
+    changed: Condvar,
+}
+
+impl Pipe {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.shared.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Handle of the notification thread. Drop it to stop the thread.
 pub struct Notifier {
-    commands: Sender<NotifyCommand>,
+    pipe: Arc<Pipe>,
 }
 
 impl Notifier {
@@ -53,46 +89,113 @@ impl Notifier {
         make: impl FnOnce(ClickFn) -> B + Send + 'static,
         on_click: impl Fn(NotifyKey) + Send + Sync + 'static,
     ) -> Self {
-        let (commands, inbox) = mpsc::channel::<NotifyCommand>();
+        let pipe = Arc::new(Pipe {
+            shared: Mutex::new(Shared::default()),
+            changed: Condvar::new(),
+        });
         let clicks: ClickFn = Arc::new(on_click);
+        let worker = Arc::clone(&pipe);
         let spawned = thread::Builder::new()
             .name("thinwire-notify".into())
-            .spawn(move || {
-                let mut backend = make(clicks);
-                let mut on = true;
-                for command in inbox {
-                    if !on {
-                        continue;
-                    }
-                    let result = match &command {
-                        NotifyCommand::Show(notification) => backend.show(notification),
-                        NotifyCommand::Dismiss(key) => backend.dismiss(key),
-                    };
-                    if result.is_ok() {
-                        let kind = match &command {
-                            NotifyCommand::Show(_) => "show",
-                            NotifyCommand::Dismiss(_) => "dismiss",
-                        };
-                        tracing::debug!(kind, "desktop notification sent to the OS");
-                    }
-                    if let Err(BackendError(kind)) = result {
-                        tracing::warn!(kind, "desktop notifications are off for this run");
-                        on = false;
-                    }
-                }
-            });
+            .spawn(move || run(&worker, make(clicks)));
         if let Err(error) = spawned {
             tracing::warn!(%error, "desktop notification thread did not start");
+            pipe.lock().off = true;
         }
-        Self { commands }
+        Self { pipe }
     }
 
-    /// Queue commands for the thread. Never blocks.
+    /// Queue commands for the thread. Never blocks on the OS: it only takes
+    /// a short lock.
     pub fn send(&self, commands: impl IntoIterator<Item = NotifyCommand>) {
+        let mut shared = self.pipe.lock();
+        if shared.off {
+            return;
+        }
+        let mut any = false;
         for command in commands {
-            if self.commands.send(command).is_err() {
-                return;
+            shared.inbox.push(command);
+            any = true;
+        }
+        drop(shared);
+        if any {
+            self.pipe.changed.notify_all();
+        }
+    }
+
+    /// Wait at most `limit` until the thread sent every queued command to
+    /// the OS. The app calls it at exit, so the last dismisses arrive.
+    /// Returns `true` when the inbox is empty and no OS call runs.
+    pub fn flush(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        let mut shared = self.pipe.lock();
+        loop {
+            if shared.off || (shared.inbox.is_empty() && !shared.busy) {
+                return true;
             }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            shared = self
+                .pipe
+                .changed
+                .wait_timeout(shared, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+impl Drop for Notifier {
+    fn drop(&mut self) {
+        self.pipe.lock().closed = true;
+        self.pipe.changed.notify_all();
+    }
+}
+
+/// The thread: take one command, run it on the OS backend, follow `Health`.
+fn run(pipe: &Pipe, mut backend: impl Backend) {
+    let mut health = Health::default();
+    loop {
+        let command = {
+            let mut shared = pipe.lock();
+            loop {
+                if let Some(command) = shared.inbox.pop() {
+                    shared.busy = true;
+                    break command;
+                }
+                if shared.closed {
+                    return;
+                }
+                shared = pipe
+                    .changed
+                    .wait(shared)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        };
+        let (kind, result) = match &command {
+            NotifyCommand::Show(notification) => ("show", backend.show(notification)),
+            NotifyCommand::Update(notification) => ("update", backend.update(notification)),
+            NotifyCommand::Dismiss(key) => ("dismiss", backend.dismiss(key)),
+        };
+        if result.is_ok() {
+            tracing::debug!(kind, "desktop notification sent to the OS");
+        }
+        let next = health.record(result);
+        if let Next::Wait(wait) = next {
+            thread::sleep(wait);
+        }
+        let mut shared = pipe.lock();
+        shared.busy = false;
+        if next == Next::Off {
+            shared.off = true;
+            while shared.inbox.pop().is_some() {}
+        }
+        drop(shared);
+        pipe.changed.notify_all();
+        if next == Next::Off {
+            return;
         }
     }
 }
@@ -206,15 +309,6 @@ mod tests {
         })
     }
 
-    fn wait_for(seen: &Arc<Mutex<Vec<Seen>>>, len: usize) {
-        for _ in 0..200 {
-            if seen.lock().expect("seen").len() >= len {
-                return;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
     #[test]
     fn the_thread_runs_commands_in_order_and_reports_clicks() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -229,12 +323,15 @@ mod tests {
             },
             move |key| clicked_by.lock().expect("clicked").push(key),
         );
-        notifier.send([
+        // One at a time: queued commands of one chat merge in the inbox.
+        for command in [
             note("telegram:1", 1),
             note("telegram:1", 2),
             NotifyCommand::Dismiss(key("telegram:1")),
-        ]);
-        wait_for(&seen, 3);
+        ] {
+            notifier.send([command]);
+            assert!(notifier.flush(Duration::from_secs(2)));
+        }
         assert_eq!(
             *seen.lock().expect("seen"),
             vec![
@@ -247,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_backend_turns_off_after_one_error() {
+    fn one_failure_does_not_turn_notifications_off() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let fake_seen = Arc::clone(&seen);
         let notifier = Notifier::spawn_with(
@@ -258,20 +355,73 @@ mod tests {
             },
             |_| {},
         );
+        // The Show fails once; the next command still reaches the backend.
         notifier.send([
             note("telegram:1", 1),
-            NotifyCommand::Dismiss(key("telegram:1")),
+            NotifyCommand::Dismiss(key("telegram:2")),
         ]);
-        thread::sleep(Duration::from_millis(50));
-        assert!(
-            seen.lock().expect("seen").is_empty(),
-            "no dismiss after the backend turned off"
+        assert!(notifier.flush(RETRY_AFTER * 3), "the thread went on");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![Seen::Dismiss(key("telegram:2"))]
         );
     }
 
     #[test]
+    fn a_backend_with_no_replace_shows_no_second_notification() {
+        // macOS and Windows backends keep the default `update`: a hidden
+        // text must not appear as a second notification (#160 review).
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fake_seen = Arc::clone(&seen);
+        let notifier = Notifier::spawn_with(
+            move |clicks| Fake {
+                seen: fake_seen,
+                clicks,
+                fail_on_show: false,
+            },
+            |_| {},
+        );
+        notifier.send([note("telegram:1", 1)]);
+        assert!(notifier.flush(Duration::from_secs(2)));
+        let NotifyCommand::Show(shown) = note("telegram:1", 1) else {
+            unreachable!()
+        };
+        notifier.send([NotifyCommand::Update(Notification {
+            preview: "New message".into(),
+            ..shown
+        })]);
+        assert!(notifier.flush(Duration::from_secs(2)));
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![Seen::Show(key("telegram:1"), 1)],
+            "one notification only"
+        );
+    }
+
+    #[test]
+    fn flush_waits_for_the_last_commands() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fake_seen = Arc::clone(&seen);
+        let notifier = Notifier::spawn_with(
+            move |clicks| Fake {
+                seen: fake_seen,
+                clicks,
+                fail_on_show: false,
+            },
+            |_| {},
+        );
+        notifier.send([NotifyCommand::Dismiss(key("telegram:1"))]);
+        assert!(notifier.flush(Duration::from_secs(2)));
+        assert_eq!(seen.lock().expect("seen").len(), 1);
+    }
+
+    #[test]
     fn no_log_line_holds_notification_text() {
-        for src in [include_str!("lib.rs"), include_str!("xdg.rs")] {
+        for src in [
+            include_str!("lib.rs"),
+            include_str!("xdg.rs"),
+            include_str!("pipe.rs"),
+        ] {
             for line in src.lines().filter(|line| line.contains("tracing::")) {
                 for field in ["title", "body", "preview", "sender"] {
                     assert!(!line.contains(field), "{line}");
