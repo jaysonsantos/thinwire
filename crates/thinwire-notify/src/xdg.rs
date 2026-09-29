@@ -42,6 +42,10 @@ pub(crate) struct IdBook {
     /// Unwatched ids in the order they came, for `MAX_UNWATCHED_TOTAL`. An
     /// entry whose id already left `unwatched` is skipped.
     unwatched_order: VecDeque<(NotifyKey, u32)>,
+    /// Ids that a limit took out of the book while they can still show. The
+    /// backend closes them after the command, so none stays on screen with
+    /// no way to close it (#168 items 3 and 14).
+    evicted: Vec<u32>,
 }
 
 /// Most unwatched ids kept for one chat. An older one expires by itself.
@@ -64,6 +68,10 @@ impl IdBook {
             && old != id
         {
             self.by_id.remove(&old);
+            // The server answered a replace with a new id. The old
+            // notification can still show: keep it closable, never
+            // replaceable (#168 item 2).
+            self.shown_unwatched(key, old);
         }
         self.by_id.insert(id, key.clone());
     }
@@ -75,27 +83,38 @@ impl IdBook {
         {
             self.by_key.remove(&key);
         }
+        // An old id kept after a replace leaves when its waiter sees it close.
+        self.unwatched.retain(|_, ids| {
+            ids.retain(|kept| *kept != id);
+            !ids.is_empty()
+        });
     }
 
     /// The server showed `key` with `id`, but no click waiter watches it.
     pub(crate) fn shown_unwatched(&mut self, key: &NotifyKey, id: u32) {
         let ids = self.unwatched.entry(key.clone()).or_default();
-        if !ids.contains(&id) {
-            ids.push(id);
+        // A known id is not added again: no second order entry (#168 item 1).
+        if ids.contains(&id) {
+            return;
         }
-        if ids.len() > MAX_UNWATCHED_PER_CHAT {
-            ids.remove(0);
-        }
+        ids.push(id);
         self.unwatched_order.push_back((key.clone(), id));
+        if ids.len() > MAX_UNWATCHED_PER_CHAT {
+            let oldest = ids.remove(0);
+            self.evicted.push(oldest);
+        }
         while self.unwatched.values().map(Vec::len).sum::<usize>() > MAX_UNWATCHED_TOTAL {
             let Some((owner, oldest)) = self.unwatched_order.pop_front() else {
                 break;
             };
-            if let Some(ids) = self.unwatched.get_mut(&owner) {
-                ids.retain(|id| *id != oldest);
+            if let Some(ids) = self.unwatched.get_mut(&owner)
+                && let Some(at) = ids.iter().position(|kept| *kept == oldest)
+            {
+                ids.remove(at);
                 if ids.is_empty() {
                     self.unwatched.remove(&owner);
                 }
+                self.evicted.push(oldest);
             }
         }
         // Drop entries of ids that already left, so the order list stays
@@ -129,6 +148,12 @@ impl IdBook {
         for id in open.unwatched {
             self.shown_unwatched(key, id);
         }
+    }
+
+    /// Ids that a limit took out of the book since the last call. The
+    /// backend closes them.
+    pub(crate) fn take_evicted(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.evicted)
     }
 
     /// Take the unwatched ids of `key` out of the book.
@@ -192,6 +217,85 @@ fn dismiss_ids(
     }
 }
 
+/// The OS calls that the id rules need. `Xdg` talks to D-Bus; the tests
+/// use a fake (#168 item 15).
+trait Server {
+    fn close(&mut self, id: u32) -> Result<(), BackendError>;
+    /// Show `notification` again, as a replace of its open id.
+    fn replace(&mut self, notification: &Notification) -> Result<(), BackendError>;
+}
+
+/// An `Update`: close the chat's unwatched ids, then replace the watched
+/// one while it is still open. A failed close does not stop the replace:
+/// the watched notification must lose its old text too (#168 item 4). An
+/// update never shows a new notification.
+fn update_with(
+    book: &Mutex<IdBook>,
+    notification: &Notification,
+    server: &mut impl Server,
+) -> Result<(), BackendError> {
+    let closed = close_unwatched(book, &notification.key, |id| server.close(id));
+    if lock(book).replace_id(&notification.key) == NEW_NOTIFICATION {
+        return closed;
+    }
+    let replaced = server.replace(notification);
+    closed.and(replaced)
+}
+
+/// What `show` does with the id that the server returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    /// A replace kept its id: its waiter goes on.
+    Kept,
+    /// Over `MAX_CLICK_WAITERS`: no waiter, the id is unwatched.
+    Unwatched,
+    /// Start a new click waiter for this id.
+    Start,
+}
+
+/// Record the id that the server returned for `key`, and decide about its
+/// click waiter.
+fn after_show(
+    book: &Mutex<IdBook>,
+    waiting: &Mutex<HashSet<u32>>,
+    key: &NotifyKey,
+    id: u32,
+) -> Watch {
+    let mut waiters = lock(waiting);
+    if waiters.contains(&id) {
+        drop(waiters);
+        lock(book).shown(key, id);
+        return Watch::Kept;
+    }
+    if !may_wait(waiters.len()) {
+        drop(waiters);
+        // No waiter learns when this one closes: never replace it, but a
+        // dismiss still closes it (#160 review).
+        lock(book).shown_unwatched(key, id);
+        return Watch::Unwatched;
+    }
+    waiters.insert(id);
+    drop(waiters);
+    lock(book).shown(key, id);
+    Watch::Start
+}
+
+/// The freedesktop message for `notification`. `replaces` is the open id
+/// of its chat, or `NEW_NOTIFICATION`: a new notification calls no `.id()`.
+fn message_for(notification: &Notification, replaces: u32) -> notify_rust::Notification {
+    let mut message = notify_rust::Notification::new();
+    message
+        .appname(APP_NAME)
+        .summary(&notification.title)
+        .body(&notification.body())
+        .urgency(Urgency::Normal)
+        .action(OPEN_ACTION, "Open");
+    if replaces != NEW_NOTIFICATION {
+        message.id(replaces);
+    }
+    message
+}
+
 /// Close the unwatched ids of `key` for an `Update`. They cannot be
 /// replaced safely: no waiter knows if they expired. Closing them removes
 /// the old text, for example after "Hide message text" (#160 qa). A failed
@@ -210,6 +314,29 @@ fn close_unwatched(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Start the click waiter of `id` with `spawn`. A failed spawn leaves no
+/// waiter: the id was recorded as watched before, so it moves to the
+/// unwatched list. A replace does not reuse it, and a dismiss can still
+/// close it.
+fn start_waiter(
+    book: &Mutex<IdBook>,
+    waiting: &Mutex<HashSet<u32>>,
+    key: &NotifyKey,
+    id: u32,
+    spawn: impl FnOnce() -> std::io::Result<()>,
+) {
+    if spawn().is_err() {
+        unwatch(book, waiting, key, id);
+    }
+}
+
+/// The last step of a click waiter: the notification closed on the server,
+/// so its id is gone. Never replace it again.
+fn waiter_ended(book: &Mutex<IdBook>, waiting: &Mutex<HashSet<u32>>, id: u32) {
+    lock(book).closed(id);
+    lock(waiting).remove(&id);
 }
 
 /// No click thread watches `id`. It stays dismissible. A replace does not
@@ -242,6 +369,55 @@ impl Xdg {
         }
     }
 
+    /// Close the ids that a limit took out of the book. They are no longer
+    /// tracked, so a failure only logs (#168 items 3 and 14).
+    fn close_evicted(&mut self) {
+        let evicted = lock(&self.book).take_evicted();
+        for id in evicted {
+            if self.close_notification(id).is_err() {
+                tracing::debug!(kind = "evicted", "desktop notification close failed");
+            }
+        }
+    }
+
+    /// Show `notification`: a replace of its open id, or a new one.
+    fn show_now(&mut self, notification: &Notification) -> Result<(), BackendError> {
+        let replaces = lock(&self.book).replace_id(&notification.key);
+        let handle = message_for(notification, replaces)
+            .show()
+            .map_err(|_| BackendError("show"))?;
+        let id = handle.id();
+        match after_show(&self.book, &self.waiting, &notification.key, id) {
+            Watch::Kept => {}
+            Watch::Unwatched => {
+                tracing::debug!(kind = "no click waiter", "desktop notification shown");
+            }
+            Watch::Start => {
+                let book = Arc::clone(&self.book);
+                let waiting = Arc::clone(&self.waiting);
+                let clicks = Arc::clone(&self.clicks);
+                start_waiter(&self.book, &self.waiting, &notification.key, id, || {
+                    thread::Builder::new()
+                        .name("thinwire-notify-click".into())
+                        .spawn(move || {
+                            // Returns on a click, or when the notification closes.
+                            handle.wait_for_action(|action| {
+                                if action == OPEN_ACTION
+                                    && let Some(key) = lock(&book).key_of(id)
+                                {
+                                    tracing::info!(kind = "open", "desktop notification clicked");
+                                    clicks(key);
+                                }
+                            });
+                            waiter_ended(&book, &waiting, id);
+                        })
+                        .map(drop)
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// `CloseNotification` by id. The click waiter owns the handle.
     fn close_notification(&mut self, id: u32) -> Result<(), BackendError> {
         let bus = match self.bus.take() {
@@ -268,84 +444,39 @@ impl Xdg {
     }
 }
 
+impl Server for Xdg {
+    fn close(&mut self, id: u32) -> Result<(), BackendError> {
+        self.close_notification(id)
+    }
+
+    fn replace(&mut self, notification: &Notification) -> Result<(), BackendError> {
+        self.show_now(notification)
+    }
+}
+
 impl Backend for Xdg {
     fn show(&mut self, notification: &Notification) -> Result<(), BackendError> {
-        let mut message = notify_rust::Notification::new();
-        message
-            .appname(APP_NAME)
-            .summary(&notification.title)
-            .body(&notification.body())
-            .urgency(Urgency::Normal)
-            .action(OPEN_ACTION, "Open");
-        let replaces = lock(&self.book).replace_id(&notification.key);
-        if replaces != NEW_NOTIFICATION {
-            message.id(replaces);
-        }
-        let handle = message.show().map_err(|_| BackendError("show"))?;
-        let id = handle.id();
-        {
-            let mut waiting = lock(&self.waiting);
-            if waiting.contains(&id) {
-                // A replace keeps its id and its waiter.
-                drop(waiting);
-                lock(&self.book).shown(&notification.key, id);
-                return Ok(());
-            }
-            if !may_wait(waiting.len()) {
-                drop(waiting);
-                // No waiter learns when this one closes: never replace it,
-                // but a dismiss still closes it (#160 review).
-                lock(&self.book).shown_unwatched(&notification.key, id);
-                tracing::debug!(kind = "no click waiter", "desktop notification shown");
-                return Ok(());
-            }
-            waiting.insert(id);
-        }
-        lock(&self.book).shown(&notification.key, id);
-        let book = Arc::clone(&self.book);
-        let waiting = Arc::clone(&self.waiting);
-        let clicks = Arc::clone(&self.clicks);
-        let spawned = thread::Builder::new()
-            .name("thinwire-notify-click".into())
-            .spawn(move || {
-                // Returns on a click, or when the notification closes.
-                handle.wait_for_action(|action| {
-                    if action == OPEN_ACTION
-                        && let Some(key) = lock(&book).key_of(id)
-                    {
-                        tracing::info!(kind = "open", "desktop notification clicked");
-                        clicks(key);
-                    }
-                });
-                // The id is gone on the server: never replace it again.
-                lock(&book).closed(id);
-                lock(&waiting).remove(&id);
-            });
-        if spawned.is_err() {
-            // The id was recorded as watched before the thread started.
-            // Move it to the unwatched list so a replace does not reuse it
-            // and a dismiss can still close it.
-            unwatch(&self.book, &self.waiting, &notification.key, id);
-        }
-        Ok(())
+        let shown = self.show_now(notification);
+        self.close_evicted();
+        shown
     }
 
     /// Replace the notification only while its id is still open. A closed
     /// one stays closed: an update never shows a new notification.
     fn update(&mut self, notification: &Notification) -> Result<(), BackendError> {
         let book = Arc::clone(&self.book);
-        let closed = close_unwatched(&book, &notification.key, |id| self.close_notification(id));
-        if lock(&self.book).replace_id(&notification.key) == NEW_NOTIFICATION {
-            return closed;
-        }
-        closed.and(self.show(notification))
+        let updated = update_with(&book, notification, self);
+        self.close_evicted();
+        updated
     }
 
     fn dismiss(&mut self, key: &NotifyKey) -> Result<(), BackendError> {
         // One close can fail. The others still close, and a failed id goes
         // back into the book so a later dismiss can find it (#160 review).
         let book = Arc::clone(&self.book);
-        dismiss_ids(&book, key, |id| self.close_notification(id))
+        let dismissed = dismiss_ids(&book, key, |id| self.close_notification(id));
+        self.close_evicted();
+        dismissed
     }
 }
 
@@ -401,24 +532,28 @@ mod tests {
 
     #[test]
     fn each_notification_has_a_normal_urgency_and_no_desktop_entry() {
-        let src = include_str!("xdg.rs");
-        let show = &src[src.find("fn show(").expect("show")..];
-        let show = &show[..show.find("fn dismiss(").expect("dismiss")];
-        assert!(show.contains("Urgency::Normal"));
+        use notify_rust::Hint;
+        let message = message_for(&note("telegram:1"), NEW_NOTIFICATION);
+        assert!(message.hints.contains(&Hint::Urgency(Urgency::Normal)));
         assert!(
-            !show.contains(concat!("Hint::", "DesktopEntry")),
+            !message
+                .hints
+                .iter()
+                .any(|hint| matches!(hint, Hint::DesktopEntry(_))),
             "no entry is installed"
         );
-        assert!(
-            show.contains("if replaces != NEW_NOTIFICATION"),
-            "a new notification calls no .id()"
-        );
-        assert!(show.contains("lock(&book).closed(id)"));
-        let update = &src[src.find("fn update(").expect("update")..];
-        let update = &update[..update.find("fn dismiss(").expect("dismiss")];
-        let open = update.find("== NEW_NOTIFICATION").expect("open id check");
-        let replace = update.find("self.show(notification)").expect("replace");
-        assert!(open < replace, "a closed notification is never shown again");
+        assert!(message.actions.iter().any(|action| action == OPEN_ACTION));
+    }
+
+    /// The #87 KDE fix: Plasma drops a `Notify` that replaces an id it does
+    /// not know, so a new notification sets no id. A replace sets our own.
+    /// notify-rust keeps the id private; its `Debug` output shows it last.
+    #[test]
+    fn a_new_notification_sets_no_id_and_a_replace_sets_its_own() {
+        let new = format!("{:?}", message_for(&note("telegram:1"), NEW_NOTIFICATION));
+        assert!(new.ends_with("id: None }"), "{new}");
+        let replace = format!("{:?}", message_for(&note("telegram:1"), 582));
+        assert!(replace.ends_with("id: Some(582) }"), "{replace}");
     }
 
     #[test]
@@ -462,13 +597,6 @@ mod tests {
         );
         assert_eq!(book.forget(&key("telegram:73")).ids(), vec![1073]);
         assert!(book.unwatched_order.len() <= 2 * MAX_UNWATCHED_TOTAL + 1);
-        let src = include_str!("xdg.rs");
-        let show = &src[src.find("fn show(").expect("show")..];
-        let show = &show[..show.find("fn update(").expect("update")];
-        let over = &show[show.find("if !may_wait(waiting.len())").expect("cap")..];
-        let over = &over[..over.find("return Ok(());").expect("end")];
-        assert!(over.contains("shown_unwatched("), "kept for a dismiss");
-        assert!(!over.contains(".closed(id)"));
     }
 
     #[test]
@@ -510,14 +638,41 @@ mod tests {
             vec![20],
             "other chats are not touched"
         );
-        let src = include_str!("xdg.rs");
-        let update = &src[src.find("fn update(").expect("update")..];
-        let update = &update[..update.find("fn dismiss(").expect("dismiss")];
-        let close = update.find("close_unwatched(").expect("close unwatched");
-        let open = update.find("== NEW_NOTIFICATION").expect("open id check");
+    }
+
+    #[test]
+    fn an_update_replaces_the_watched_id_even_after_a_failed_close() {
+        let book = Mutex::new(IdBook::default());
+        let ada = key("telegram:1");
+        {
+            let mut book = lock(&book);
+            book.shown(&ada, 10);
+            book.shown_unwatched(&ada, 11);
+        }
+        // The unwatched close fails: the watched notification still gets
+        // the hidden text (#168 item 4).
+        let mut server = FakeServer {
+            fail_close: Some(11),
+            ..FakeServer::default()
+        };
+        let result = update_with(&book, &note("telegram:1"), &mut server);
+        assert_eq!(result, Err(BackendError("close")));
+        assert_eq!(server.closed, vec![11]);
+        assert_eq!(
+            server.replaced,
+            vec![ada.clone()],
+            "replaced despite the failure"
+        );
+
+        // No watched id open: the unwatched ids close, nothing new shows.
+        let book = Mutex::new(IdBook::default());
+        lock(&book).shown_unwatched(&ada, 21);
+        let mut server = FakeServer::default();
+        assert_eq!(update_with(&book, &note("telegram:1"), &mut server), Ok(()));
+        assert_eq!(server.closed, vec![21]);
         assert!(
-            close < open,
-            "the unwatched ids close even with no watched id"
+            server.replaced.is_empty(),
+            "an update never shows a new one"
         );
     }
 
@@ -526,17 +681,37 @@ mod tests {
         assert!(may_wait(0));
         assert!(may_wait(MAX_CLICK_WAITERS - 1));
         assert!(!may_wait(MAX_CLICK_WAITERS));
-        let src = include_str!("xdg.rs");
-        let show = &src[src.find("fn show(").expect("show")..];
-        let show = &show[..show.find("fn dismiss(").expect("dismiss")];
-        let bound = show.find("if !may_wait(waiting.len())").expect("bound");
-        let spawn = show.find("thread::Builder::new()").expect("spawn");
-        assert!(bound < spawn, "the bound comes before a new thread");
-        let failed = show.find("if spawned.is_err()").expect("spawn failure");
-        let tail = &show[failed..];
-        assert!(
-            tail.contains("unwatch("),
-            "a failed waiter leaves the id unwatched"
+        let book = Mutex::new(IdBook::default());
+        let waiting = Mutex::new(HashSet::new());
+        let ada = key("telegram:1");
+        assert_eq!(after_show(&book, &waiting, &ada, 1), Watch::Start);
+        assert_eq!(
+            after_show(&book, &waiting, &ada, 1),
+            Watch::Kept,
+            "a replace keeps its waiter"
+        );
+        for id in 2..=MAX_CLICK_WAITERS as u32 {
+            assert_eq!(
+                after_show(&book, &waiting, &key(&format!("c:{id}")), id),
+                Watch::Start
+            );
+        }
+        let bob = key("telegram:2");
+        assert_eq!(
+            after_show(&book, &waiting, &bob, 99),
+            Watch::Unwatched,
+            "no new thread over the limit"
+        );
+        assert_eq!(lock(&waiting).len(), MAX_CLICK_WAITERS);
+        assert_eq!(
+            lock(&book).replace_id(&bob),
+            NEW_NOTIFICATION,
+            "never replaced"
+        );
+        assert_eq!(
+            lock(&book).forget(&bob).ids(),
+            vec![99],
+            "still dismissible"
         );
     }
 
@@ -604,12 +779,124 @@ mod tests {
     #[test]
     fn a_failed_click_thread_leaves_the_id_dismissible() {
         let book = Mutex::new(IdBook::default());
-        let waiting = Mutex::new(HashSet::from([7]));
+        let waiting = Mutex::new(HashSet::new());
         let ada = key("telegram:1");
-        lock(&book).shown(&ada, 7);
-        unwatch(&book, &waiting, &ada, 7);
+        assert_eq!(after_show(&book, &waiting, &ada, 7), Watch::Start);
+        start_waiter(&book, &waiting, &ada, 7, || Ok(()));
+        assert_eq!(lock(&book).replace_id(&ada), 7, "a started waiter watches");
+
+        let bob = key("telegram:2");
+        assert_eq!(after_show(&book, &waiting, &bob, 8), Watch::Start);
+        start_waiter(&book, &waiting, &bob, 8, || {
+            Err(std::io::Error::other("no thread"))
+        });
+        assert!(!lock(&waiting).contains(&8));
+        assert_eq!(lock(&book).replace_id(&bob), NEW_NOTIFICATION);
+        assert_eq!(lock(&book).forget(&bob).ids(), vec![8]);
+    }
+
+    #[test]
+    fn a_waiter_that_ends_marks_its_id_closed() {
+        let book = Mutex::new(IdBook::default());
+        let waiting = Mutex::new(HashSet::new());
+        let ada = key("telegram:1");
+        assert_eq!(after_show(&book, &waiting, &ada, 7), Watch::Start);
+        waiter_ended(&book, &waiting, 7);
         assert!(lock(&waiting).is_empty());
-        assert_eq!(lock(&book).replace_id(&ada), NEW_NOTIFICATION);
-        assert_eq!(lock(&book).forget(&ada).ids(), vec![7]);
+        assert_eq!(
+            lock(&book).replace_id(&ada),
+            NEW_NOTIFICATION,
+            "a closed id is never replaced"
+        );
+        assert_eq!(lock(&book).key_of(7), None);
+        assert_eq!(
+            after_show(&book, &waiting, &ada, 7),
+            Watch::Start,
+            "the server can use the id again"
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeServer {
+        closed: Vec<u32>,
+        replaced: Vec<NotifyKey>,
+        fail_close: Option<u32>,
+    }
+
+    impl Server for FakeServer {
+        fn close(&mut self, id: u32) -> Result<(), BackendError> {
+            self.closed.push(id);
+            if self.fail_close == Some(id) {
+                Err(BackendError("close"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn replace(&mut self, notification: &Notification) -> Result<(), BackendError> {
+            self.replaced.push(notification.key.clone());
+            Ok(())
+        }
+    }
+
+    fn note(id: &str) -> Notification {
+        Notification {
+            key: key(id),
+            title: "Ada".into(),
+            sender: None,
+            preview: "hi".into(),
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn a_known_unwatched_id_adds_no_second_order_entry() {
+        let mut book = IdBook::default();
+        let ada = key("telegram:1");
+        book.shown_unwatched(&ada, 5);
+        book.shown_unwatched(&ada, 5);
+        assert_eq!(book.unwatched_order.len(), 1, "#168 item 1");
+        assert_eq!(book.forget(&ada).ids(), vec![5]);
+    }
+
+    #[test]
+    fn a_replace_with_a_new_id_keeps_the_old_one_closable() {
+        let mut book = IdBook::default();
+        let ada = key("telegram:1");
+        book.shown(&ada, 600);
+        // The server answered the replace with a new id (#168 item 2).
+        book.shown(&ada, 601);
+        assert_eq!(book.replace_id(&ada), 601, "the new id is replaced next");
+        let mut open = book.forget(&ada).ids();
+        open.sort_unstable();
+        assert_eq!(open, vec![600, 601], "a dismiss closes the old one too");
+
+        // When the old one closes on the server, it leaves the book.
+        book.shown(&ada, 700);
+        book.shown(&ada, 701);
+        book.closed(700);
+        assert_eq!(book.forget(&ada).ids(), vec![701]);
+    }
+
+    #[test]
+    fn an_id_that_a_limit_drops_is_handed_over_to_close() {
+        let mut book = IdBook::default();
+        let ada = key("telegram:1");
+        // Per chat (#168 item 3).
+        for id in 0..=MAX_UNWATCHED_PER_CHAT as u32 {
+            book.shown_unwatched(&ada, id);
+        }
+        assert_eq!(book.take_evicted(), vec![0], "the oldest id of the chat");
+        assert!(book.take_evicted().is_empty(), "handed over once");
+        book.forget(&ada);
+        // Across chats (#168 item 14).
+        for n in 0..=MAX_UNWATCHED_TOTAL as u32 {
+            book.shown_unwatched(&key(&format!("c:{n}")), 1000 + n);
+        }
+        assert_eq!(
+            book.take_evicted(),
+            vec![1000],
+            "the oldest id of all chats"
+        );
     }
 }
