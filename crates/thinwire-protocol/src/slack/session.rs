@@ -16,8 +16,8 @@ use tokio::task::AbortHandle;
 
 use super::api::{
     SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
-    SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound, SlackInstallGrant,
-    SlackPost, SlackSocketScope, SlackWebApi,
+    SlackCodeExchange, SlackEventSource, SlackEventStream, SlackHistoryPage, SlackInbound,
+    SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
 };
 use super::credentials::{SlackApiSource, resolve_slack_app_token, resolve_slack_client};
 use super::install::{
@@ -250,6 +250,12 @@ struct Live<T> {
     forwarder: Option<AbortHandle>,
     next_cursor: Option<String>,
     list_done: bool,
+    /// Member ids from the current `conversations.list` walk, including
+    /// pages from an earlier `LoadChats` that stopped at the page cap.
+    list_seen: HashSet<String>,
+    /// Channels a send already refused. A later list must not turn the
+    /// composer back on.
+    read_only: HashSet<String>,
 }
 
 struct Session<A, S, B>
@@ -339,7 +345,10 @@ where
                 if self.live.as_ref().is_some_and(|live| live.list_done) {
                     self.refresh_channels().await;
                 } else {
-                    let _ = self.load_channels().await;
+                    let seen = self.load_channels().await;
+                    if self.live.as_ref().is_some_and(|live| live.list_done) {
+                        self.drop_left_channels(&seen);
+                    }
                 }
                 emit_chat_list_loaded(&self.events, ProtocolId::Slack);
             }
@@ -527,6 +536,8 @@ where
             forwarder: None,
             next_cursor: None,
             list_done: false,
+            list_seen: HashSet::new(),
+            read_only: HashSet::new(),
         });
         // Linked before any inbox row. A later Linking is only a reconnect.
         self.account(AccountState::Linked);
@@ -536,7 +547,10 @@ where
             AdapterStatus::Ready,
             ready_detail(identity.team_name(), live_events),
         );
-        let _ = self.load_channels().await;
+        let seen = self.load_channels().await;
+        if self.live.as_ref().is_some_and(|live| live.list_done) {
+            self.drop_left_channels(&seen);
+        }
     }
 
     /// Refresh on a live workspace. Reset the cursor, walk `conversations.list`
@@ -545,20 +559,11 @@ where
         if let Some(live) = &mut self.live {
             live.list_done = false;
             live.next_cursor = None;
+            live.list_seen.clear();
         }
         let seen = self.load_channels().await;
         if self.live.as_ref().is_some_and(|live| live.list_done) {
-            let gone: Vec<String> = self
-                .channels
-                .keys()
-                .filter(|id| !seen.contains(*id))
-                .cloned()
-                .collect();
-            for id in gone {
-                if let Some(row) = self.channels.remove(&id) {
-                    emit_conversation_removed(&self.events, ProtocolId::Slack, row.id);
-                }
-            }
+            self.drop_left_channels(&seen);
         }
         let Some(live) = &self.live else {
             return;
@@ -667,26 +672,52 @@ where
         emit_command_failed(&self.events, ProtocolId::Slack, None, format!("{error}."));
     }
 
+    fn accumulated_seen(&self) -> HashSet<String> {
+        self.live
+            .as_ref()
+            .map(|live| live.list_seen.clone())
+            .unwrap_or_default()
+    }
+
+    fn drop_left_channels(&mut self, seen: &HashSet<String>) {
+        let gone: Vec<String> = self
+            .channels
+            .keys()
+            .filter(|id| !seen.contains(*id))
+            .cloned()
+            .collect();
+        for id in gone {
+            self.shown.remove(&id);
+            // A rejoin reads `can_post` again. A denial for a channel the
+            // app has left must not stick.
+            if let Some(live) = &mut self.live {
+                live.read_only.remove(&id);
+            }
+            if let Some(row) = self.channels.remove(&id) {
+                emit_conversation_removed(&self.events, ProtocolId::Slack, row.id);
+            }
+        }
+    }
+
     async fn load_channels(&mut self) -> HashSet<String> {
-        let mut seen = HashSet::new();
         let Some(live) = &self.live else {
             emit_command_failed(&self.events, ProtocolId::Slack, None, DETAIL_NOT_READY);
-            return seen;
+            return self.accumulated_seen();
         };
         if live.list_done {
-            return seen;
+            return self.accumulated_seen();
         }
         let token = live.token.clone();
         for _ in 0..MAX_CHANNEL_PAGES {
             if self.live.as_ref().is_none_or(|live| live.list_done) {
-                return seen;
+                return self.accumulated_seen();
             }
             let cursor = self.live.as_ref().and_then(|live| live.next_cursor.clone());
             let page = match self.deps.api.list_channels(&token, cursor).await {
                 Ok(page) => page,
                 Err(error) => {
                     self.api_failed(&error).await;
-                    return seen;
+                    return self.accumulated_seen();
                 }
             };
             let next = page.next_cursor.filter(|cursor| !cursor.is_empty());
@@ -698,8 +729,14 @@ where
                 if !channel.is_member {
                     continue;
                 }
-                seen.insert(channel.id.clone());
+                if let Some(live) = &mut self.live {
+                    live.list_seen.insert(channel.id.clone());
+                }
                 let title = self.channel_title(&token, &channel).await;
+                let denied = self
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.read_only.contains(&channel.id));
                 let conversation = Conversation {
                     protocol: ProtocolId::Slack,
                     id: conversation_id(&channel.id),
@@ -710,7 +747,7 @@ where
                     order: 0,
                     last_at: 0,
                     is_group: is_group(channel.kind),
-                    writable: true,
+                    writable: channel.can_post && !denied,
                     muted: false,
                     placeholder: false,
                 };
@@ -727,7 +764,28 @@ where
                 }
             }
         }
-        seen
+        self.accumulated_seen()
+    }
+
+    /// Set the inbox row from the history page. An empty authoritative page clears it.
+    fn replace_preview(&mut self, channel: &str, newest: Option<(i64, i64, String)>) {
+        let Some(row) = self.channels.get(channel) else {
+            return;
+        };
+        let mut row = row.clone();
+        match newest {
+            Some((order, sent_at, preview)) => {
+                row.preview = preview;
+                row.order = order;
+                row.last_at = sent_at;
+            }
+            None => {
+                row.preview.clear();
+                row.order = 0;
+                row.last_at = 0;
+            }
+        }
+        self.upsert(channel.to_string(), row);
     }
 
     fn note_latest(&mut self, channel: &str, order: i64, sent_at: i64, preview: &str) {
@@ -794,8 +852,8 @@ where
             return;
         };
         let token = live.token.clone();
-        let posts = match self.deps.api.history(&token, channel, HISTORY_LIMIT).await {
-            Ok(posts) => posts,
+        let page = match self.deps.api.history(&token, channel, HISTORY_LIMIT).await {
+            Ok(page) => page,
             Err(error) => {
                 self.api_failed(&error).await;
                 emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
@@ -804,16 +862,31 @@ where
         };
         // `conversations.history` is newest-first. A channel with no Socket
         // Mode event still needs that post on the inbox row.
-        let newest = posts
+        let newest = page
+            .posts
             .iter()
             .max_by_key(|post| ts_rank(&post.ts))
             .map(|post| (ts_rank(&post.ts), ts_order(&post.ts), post.text.clone()));
-        for post in posts.into_iter().rev() {
+        // Ignored subtypes count toward Slack's raw limit, so a short
+        // displayable page is not the latest window. Drop only the posts
+        // that page covers, before `remember` can evict them without
+        // `MessagesRemoved`.
+        let keep_cached_preview = page.posts.is_empty() && !page.authoritative;
+        self.drop_posts_outside(channel, &page);
+        for post in page.posts.into_iter().rev() {
             let message = self.chat_message(&token, post).await;
             emit_message(&self.events, message);
         }
-        if let Some((order, sent_at, preview)) = newest {
-            self.note_latest(channel, order, sent_at, &preview);
+        // A dropped live post can be newer than every history row;
+        // `note_latest` would keep that stale preview. An empty page that
+        // is not the end of the channel keeps a remaining cached post.
+        // If that page removed every cached post, the older preview stays.
+        if keep_cached_preview {
+            if let Some(cached) = self.newest_shown(channel) {
+                self.replace_preview(channel, Some(cached));
+            }
+        } else {
+            self.replace_preview(channel, newest);
         }
         self.mark_channel_read(channel);
         emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
@@ -876,6 +949,9 @@ where
                 self.note_latest(channel, order, sent_at, &preview);
             }
             Err(error) => {
+                if posting_denied(&error) {
+                    self.mark_read_only(channel);
+                }
                 emit_send_rejected(&self.events, ProtocolId::Slack, conversation, request);
                 self.api_failed(&error).await;
             }
@@ -993,6 +1069,7 @@ where
             if let Some(live) = &mut self.live {
                 live.list_done = false;
                 live.next_cursor = None;
+                live.list_seen.clear();
             }
             if conversation.unread > 0 {
                 self.count_unread(&channel, &post_ts);
@@ -1058,28 +1135,91 @@ where
     }
 
     fn remember(&mut self, post: &SlackPost) {
-        let rows = self.shown.entry(post.channel.clone()).or_default();
-        if let Some(row) = rows.iter_mut().find(|row| {
-            row.ts == post.ts
-                || same_client_msg(row.client_msg_id.as_deref(), post.client_msg_id.as_deref())
-        }) {
-            row.text.clone_from(&post.text);
-            if row.client_msg_id.is_none() {
-                row.client_msg_id.clone_from(&post.client_msg_id);
+        let lost = {
+            let rows = self.shown.entry(post.channel.clone()).or_default();
+            if let Some(row) = rows.iter_mut().find(|row| {
+                row.ts == post.ts
+                    || same_client_msg(row.client_msg_id.as_deref(), post.client_msg_id.as_deref())
+            }) {
+                row.text.clone_from(&post.text);
+                if row.client_msg_id.is_none() {
+                    row.client_msg_id.clone_from(&post.client_msg_id);
+                }
+                return;
             }
+            rows.push(Shown {
+                ts: post.ts.clone(),
+                text: post.text.clone(),
+                counted: false,
+                client_msg_id: post.client_msg_id.clone(),
+            });
+            let cap = usize::from(HISTORY_LIMIT);
+            if rows.len() > cap {
+                let extra = rows.len() - cap;
+                rows.drain(0..extra).filter(|row| row.counted).count() as u32
+            } else {
+                0
+            }
+        };
+        if lost > 0 {
+            self.forget_unread(&post.channel, lost);
+        }
+    }
+
+    fn forget_unread(&mut self, channel: &str, lost: u32) {
+        let Some(row) = self.channels.get(channel) else {
+            return;
+        };
+        let mut row = row.clone();
+        row.unread = row.unread.saturating_sub(lost);
+        self.upsert(channel.to_string(), row);
+    }
+
+    fn mark_read_only(&mut self, channel: &str) {
+        if let Some(live) = &mut self.live {
+            live.read_only.insert(channel.to_string());
+        }
+        let Some(row) = self.channels.get(channel) else {
+            return;
+        };
+        if !row.writable {
             return;
         }
-        rows.push(Shown {
-            ts: post.ts.clone(),
-            text: post.text.clone(),
-            counted: false,
-            client_msg_id: post.client_msg_id.clone(),
-        });
-        let cap = usize::from(HISTORY_LIMIT);
-        if rows.len() > cap {
-            let extra = rows.len() - cap;
-            rows.drain(0..extra);
+        let mut row = row.clone();
+        row.writable = false;
+        self.upsert(channel.to_string(), row);
+    }
+
+    fn newest_shown(&self, channel: &str) -> Option<(i64, i64, String)> {
+        self.shown.get(channel).and_then(|rows| {
+            rows.iter()
+                .max_by_key(|row| ts_rank(&row.ts))
+                .map(|row| (ts_rank(&row.ts), ts_order(&row.ts), row.text.clone()))
+        })
+    }
+
+    fn drop_posts_outside(&mut self, channel: &str, page: &SlackHistoryPage) {
+        let kept: HashSet<&str> = page.posts.iter().map(|post| post.ts.as_str()).collect();
+        let oldest_raw = page.oldest_raw_ts.as_deref().map(ts_rank);
+        let Some(rows) = self.shown.get_mut(channel) else {
+            return;
+        };
+        let gone: Vec<String> = rows
+            .iter()
+            .filter(|row| cached_post_is_outside(&row.ts, &kept, oldest_raw, page.authoritative))
+            .map(|row| row.ts.clone())
+            .collect();
+        if gone.is_empty() {
+            return;
         }
+        rows.retain(|row| !gone.contains(&row.ts));
+        let ids = gone.iter().map(|ts| message_id_of(channel, ts)).collect();
+        emit_messages_removed(
+            &self.events,
+            ProtocolId::Slack,
+            conversation_id(channel),
+            ids,
+        );
     }
 
     async fn chat_message(&mut self, token: &SlackBotToken, post: SlackPost) -> ChatMessage {
@@ -1112,6 +1252,23 @@ struct Shown {
     text: String,
     counted: bool,
     client_msg_id: Option<String>,
+}
+
+/// A cached post leaves the thread when this page covers its timestamp and
+/// does not include it. A non-authoritative page covers only `ts >= oldest_raw`.
+fn cached_post_is_outside(
+    ts: &str,
+    kept: &HashSet<&str>,
+    oldest_raw: Option<i64>,
+    authoritative: bool,
+) -> bool {
+    if kept.contains(ts) {
+        return false;
+    }
+    if authoritative {
+        return true;
+    }
+    oldest_raw.is_some_and(|oldest| ts_rank(ts) >= oldest)
 }
 
 fn same_client_msg(stored: Option<&str>, incoming: Option<&str>) -> bool {
@@ -1178,6 +1335,21 @@ fn ts_order(ts: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Slack refused a top-level post in this channel. A transport error is not a refusal.
+fn posting_denied(error: &SlackApiError) -> bool {
+    matches!(
+        error,
+        SlackApiError::Api(code) if matches!(
+            code.as_str(),
+            "not_in_channel"
+                | "is_archived"
+                | "restricted_action"
+                | "restricted_action_read_only_channel"
+                | "restricted_action_thread_only_channel"
+        )
+    )
+}
+
 /// Slack `ts` (`seconds.microseconds`) as the integer the shell sorts on.
 /// A dotted timestamp does not parse as `i64`, so every message would rank 0.
 fn ts_rank(ts: &str) -> i64 {
@@ -1203,6 +1375,8 @@ fn ts_rank(ts: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -1228,5 +1402,41 @@ mod tests {
             "slack:C1:1700000001000100"
         );
         assert_eq!(ts_rank("bad"), 0);
+    }
+
+    #[test]
+    fn a_post_older_than_a_diluted_page_stays() {
+        let kept = HashSet::new();
+        let oldest = ts_rank("1700000003.000100");
+        assert!(!cached_post_is_outside(
+            "1690000000.000100",
+            &kept,
+            Some(oldest),
+            false
+        ));
+        assert!(cached_post_is_outside(
+            "1700000004.000100",
+            &kept,
+            Some(oldest),
+            false
+        ));
+        assert!(!cached_post_is_outside(
+            "1700000004.000100",
+            &HashSet::from(["1700000004.000100"]),
+            Some(oldest),
+            false
+        ));
+        assert!(cached_post_is_outside(
+            "1690000000.000100",
+            &kept,
+            Some(oldest),
+            true
+        ));
+        assert!(!cached_post_is_outside(
+            "1690000000.000100",
+            &kept,
+            None,
+            false
+        ));
     }
 }

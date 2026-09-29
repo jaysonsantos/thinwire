@@ -7,14 +7,16 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::Deserialize;
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::api::{
     SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
-    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackInbound,
-    SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
+    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackHistoryPage,
+    SlackInbound, SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi, channel_can_post,
+    history_has_more, history_page_is_authoritative,
 };
 use super::install::SlackInstalledWorkspace;
 use super::morphism::{oauth_v2_access_request, workspace_bot_token};
@@ -27,6 +29,62 @@ const CHANNEL_PAGE: u16 = 200;
 
 /// Placeholder body for a message with no text (files, blocks only).
 const NO_TEXT: &str = "(no text)";
+
+/// `conversations.list` body. Slack's `ok` field is ignored.
+#[derive(Debug, Deserialize)]
+struct ConversationsListBody {
+    channels: Vec<ListedConversation>,
+    response_metadata: Option<SlackResponseMetadata>,
+}
+
+/// One conversation, including the posting fields `SlackChannelFlags` omits.
+#[derive(Debug, Deserialize)]
+struct ListedConversation {
+    id: SlackChannelId,
+    name: Option<String>,
+    #[serde(default)]
+    is_read_only: Option<bool>,
+    #[serde(default)]
+    is_thread_only: Option<bool>,
+    #[serde(default)]
+    is_frozen: Option<bool>,
+    #[serde(flatten)]
+    flags: SlackChannelFlags,
+}
+
+fn channel_from_listed(info: ListedConversation, dm_user: Option<String>) -> SlackChannel {
+    let flags = &info.flags;
+    let kind = if flags.is_im == Some(true) {
+        SlackChannelKind::DirectMessage
+    } else if flags.is_mpim == Some(true) {
+        SlackChannelKind::GroupMessage
+    } else if flags.is_private == Some(true) || flags.is_group == Some(true) {
+        SlackChannelKind::Private
+    } else {
+        SlackChannelKind::Public
+    };
+    let dm = kind == SlackChannelKind::DirectMessage;
+    // IM and MPIM rows omit `is_member`; the bot is always in them.
+    let is_member = flags
+        .is_member
+        .unwrap_or(dm || kind == SlackChannelKind::GroupMessage);
+    let can_post = channel_can_post(
+        kind,
+        is_member,
+        info.is_read_only.unwrap_or(false),
+        info.is_thread_only.unwrap_or(false),
+        info.is_frozen.unwrap_or(false),
+        flags.is_archived.unwrap_or(false),
+    );
+    SlackChannel {
+        id: info.id.to_string(),
+        name: info.name.unwrap_or_default(),
+        kind,
+        is_member,
+        can_post,
+        dm_user,
+    }
+}
 
 fn map_error(error: SlackClientError) -> SlackApiError {
     match error {
@@ -194,51 +252,35 @@ impl SlackWebApi for MorphismWebApi {
         cursor: Option<String>,
     ) -> Result<SlackChannelPage, SlackApiError> {
         let token = self.bot_session_token(token.reveal());
-        let request = SlackApiConversationsListRequest::new()
-            .with_types(vec![
-                SlackConversationType::Public,
-                SlackConversationType::Private,
-                SlackConversationType::Im,
-                SlackConversationType::Mpim,
-            ])
-            .with_exclude_archived(true)
-            .with_limit(CHANNEL_PAGE)
-            .opt_cursor(cursor.map(SlackCursorId::new));
-        let response = self
-            .client
-            .open_session(&token)
-            .conversations_list(&request)
+        // `SlackChannelInfo` drops `is_read_only`, `is_thread_only`, and
+        // `is_frozen`. Read those conversation-object fields ourselves.
+        let limit = CHANNEL_PAGE.to_string();
+        let exclude_archived = true.to_string();
+        let types = "public_channel,private_channel,im,mpim";
+        let session = self.client.open_session(&token);
+        let response: ConversationsListBody = session
+            .http_session_api
+            .http_get(
+                "conversations.list",
+                &[
+                    ("cursor", cursor.as_deref()),
+                    ("limit", Some(limit.as_str())),
+                    ("exclude_archived", Some(exclude_archived.as_str())),
+                    ("types", Some(types)),
+                ],
+                Some(&SLACK_TIER2_METHOD_CONFIG),
+            )
             .await
             .map_err(map_error)?;
         let mut channels = Vec::with_capacity(response.channels.len());
         for info in response.channels {
-            let flags = &info.flags;
-            let kind = if flags.is_im == Some(true) {
-                SlackChannelKind::DirectMessage
-            } else if flags.is_mpim == Some(true) {
-                SlackChannelKind::GroupMessage
-            } else if flags.is_private == Some(true) || flags.is_group == Some(true) {
-                SlackChannelKind::Private
-            } else {
-                SlackChannelKind::Public
-            };
-            let dm = kind == SlackChannelKind::DirectMessage;
-            // IM and MPIM rows omit `is_member`; the bot is always in them.
-            let is_member = flags
-                .is_member
-                .unwrap_or(dm || kind == SlackChannelKind::GroupMessage);
+            let dm = info.flags.is_im == Some(true);
             let dm_user = if dm {
                 self.dm_peer(&token, &info.id).await
             } else {
                 None
             };
-            channels.push(SlackChannel {
-                id: info.id.to_string(),
-                name: info.name.clone().unwrap_or_default(),
-                kind,
-                is_member,
-                dm_user,
-            });
+            channels.push(channel_from_listed(info, dm_user));
         }
         let next_cursor = response
             .response_metadata
@@ -256,7 +298,7 @@ impl SlackWebApi for MorphismWebApi {
         token: &SlackBotToken,
         channel: &str,
         limit: u16,
-    ) -> Result<Vec<SlackPost>, SlackApiError> {
+    ) -> Result<SlackHistoryPage, SlackApiError> {
         let token = self.bot_session_token(token.reveal());
         let request = SlackApiConversationsHistoryRequest::new()
             .with_channel(SlackChannelId::new(channel.into()))
@@ -267,7 +309,19 @@ impl SlackWebApi for MorphismWebApi {
             .conversations_history(&request)
             .await
             .map_err(map_error)?;
-        Ok(response
+        // Newest first. The last row is the oldest timestamp this page
+        // covered, including subtypes the channel view ignores.
+        let oldest_raw_ts = response
+            .messages
+            .last()
+            .map(|message| message.origin.ts.to_string());
+        let next_cursor = response
+            .response_metadata
+            .as_ref()
+            .and_then(|meta| meta.next_cursor.as_ref())
+            .map(AsRef::as_ref);
+        let has_more = history_has_more(response.has_more, next_cursor);
+        let posts: Vec<SlackPost> = response
             .messages
             .into_iter()
             .filter(|message| shown_in_channel(message.subtype.as_ref(), &message.origin))
@@ -279,7 +333,13 @@ impl SlackWebApi for MorphismWebApi {
                 text: body(message.content.text),
                 client_msg_id: client_msg_id(&message.origin),
             })
-            .collect())
+            .collect();
+        let authoritative = history_page_is_authoritative(posts.len(), limit, has_more);
+        Ok(SlackHistoryPage {
+            posts,
+            oldest_raw_ts,
+            authoritative,
+        })
     }
 
     async fn post_message(
@@ -554,6 +614,38 @@ async fn on_push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writeability_follows_slack_fields_not_membership() {
+        let read_only: ListedConversation = serde_json::from_str(
+            r#"{"id":"C1","name":"announce","is_channel":true,"is_member":true,"is_read_only":true}"#,
+        )
+        .expect("conversation");
+        let row = channel_from_listed(read_only, None);
+        assert!(row.is_member);
+        assert!(!row.can_post);
+
+        let public_guest: ListedConversation = serde_json::from_str(
+            r#"{"id":"C2","name":"general","is_channel":true,"is_member":false}"#,
+        )
+        .expect("conversation");
+        let row = channel_from_listed(public_guest, None);
+        assert!(!row.is_member);
+        assert!(row.can_post);
+
+        let private_guest: ListedConversation = serde_json::from_str(
+            r#"{"id":"C3","name":"secret","is_private":true,"is_member":false}"#,
+        )
+        .expect("conversation");
+        let row = channel_from_listed(private_guest, None);
+        assert!(!row.can_post);
+
+        let thread_only: ListedConversation = serde_json::from_str(
+            r#"{"id":"C4","name":"threads","is_channel":true,"is_member":true,"is_thread_only":true}"#,
+        )
+        .expect("conversation");
+        assert!(!channel_from_listed(thread_only, None).can_post);
+    }
 
     #[test]
     fn a_foreign_workspace_or_app_does_not_match_this_install() {

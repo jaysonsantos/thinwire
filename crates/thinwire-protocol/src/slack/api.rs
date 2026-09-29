@@ -96,8 +96,37 @@ pub struct SlackChannel {
     pub kind: SlackChannelKind,
     /// The bot is in the channel and can read its history.
     pub is_member: bool,
+    /// The bot can post a top-level message. Independent of `is_member`.
+    pub can_post: bool,
     /// Peer user id for a direct message.
     pub dm_user: Option<String>,
+}
+
+/// Posting permission from the Slack conversation object.
+///
+/// `is_read_only`, `is_thread_only`, `is_frozen`, and `is_archived` block a
+/// top-level post. A public channel stays open to a non-member
+/// (`chat:write.public`). A private channel, a DM, or a group DM requires
+/// membership.
+#[must_use]
+#[cfg(any(test, feature = "slack-oauth"))]
+pub(crate) fn channel_can_post(
+    kind: SlackChannelKind,
+    is_member: bool,
+    is_read_only: bool,
+    is_thread_only: bool,
+    is_frozen: bool,
+    is_archived: bool,
+) -> bool {
+    if is_read_only || is_thread_only || is_frozen || is_archived {
+        return false;
+    }
+    match kind {
+        SlackChannelKind::Public => true,
+        SlackChannelKind::Private
+        | SlackChannelKind::DirectMessage
+        | SlackChannelKind::GroupMessage => is_member,
+    }
 }
 
 /// One page of `conversations.list`.
@@ -106,6 +135,62 @@ pub struct SlackChannelPage {
     pub channels: Vec<SlackChannel>,
     /// Empty or `None` means the last page.
     pub next_cursor: Option<String>,
+}
+
+/// Displayable posts from one `conversations.history` call.
+///
+/// Slack counts ignored subtypes (`channel_join` and the rest) toward
+/// `limit`. `posts` can be shorter than that limit while older messages
+/// still exist. `authoritative` is false then; `oldest_raw_ts` is the
+/// oldest raw row the response covered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlackHistoryPage {
+    /// Displayable posts, newest first.
+    pub posts: Vec<SlackPost>,
+    /// Oldest raw `ts` in the Slack page, including ignored subtypes.
+    /// `None` when Slack returned no rows.
+    pub oldest_raw_ts: Option<String>,
+    /// `posts` is the latest displayable window. Slack had no older rows,
+    /// or this page already held `limit` displayable posts.
+    pub authoritative: bool,
+}
+
+impl Default for SlackHistoryPage {
+    fn default() -> Self {
+        Self {
+            posts: Vec::new(),
+            oldest_raw_ts: None,
+            authoritative: true,
+        }
+    }
+}
+
+impl SlackHistoryPage {
+    /// Newest-first displayable posts that are the whole channel.
+    #[must_use]
+    pub fn complete(posts: Vec<SlackPost>) -> Self {
+        let oldest_raw_ts = posts.last().map(|post| post.ts.clone());
+        Self {
+            posts,
+            oldest_raw_ts,
+            authoritative: true,
+        }
+    }
+}
+
+/// Slack has older history when it says so, or when it returns a cursor.
+#[must_use]
+#[cfg(any(test, feature = "slack-oauth"))]
+pub(crate) fn history_has_more(has_more: Option<bool>, next_cursor: Option<&str>) -> bool {
+    let cursor = next_cursor.is_some_and(|cursor| !cursor.trim().is_empty());
+    has_more == Some(true) || cursor
+}
+
+/// A full displayable page, or the end of the channel, is the latest window.
+#[must_use]
+#[cfg(any(test, feature = "slack-oauth"))]
+pub(crate) fn history_page_is_authoritative(shown: usize, limit: u16, has_more: bool) -> bool {
+    !has_more || shown >= usize::from(limit)
 }
 
 /// One message from history, `chat.postMessage`, or a Socket Mode event.
@@ -178,13 +263,15 @@ pub trait SlackWebApi: Send + Sync + 'static {
         cursor: Option<String>,
     ) -> impl Future<Output = Result<SlackChannelPage, SlackApiError>> + Send;
 
-    /// Newest first, as Slack returns it.
+    /// Newest-first displayable posts from `conversations.history`.
+    ///
+    /// `limit` is the raw page size. Ignored subtypes count toward it.
     fn history(
         &self,
         token: &SlackBotToken,
         channel: &str,
         limit: u16,
-    ) -> impl Future<Output = Result<Vec<SlackPost>, SlackApiError>> + Send;
+    ) -> impl Future<Output = Result<SlackHistoryPage, SlackApiError>> + Send;
 
     fn post_message(
         &self,
@@ -275,6 +362,46 @@ mod tests {
     }
 
     #[test]
+    fn posting_follows_slack_conversation_fields() {
+        use SlackChannelKind::{DirectMessage, GroupMessage, Private, Public};
+        assert!(
+            !channel_can_post(Public, true, true, false, false, false),
+            "a member of a read-only channel cannot post"
+        );
+        assert!(
+            !channel_can_post(Public, true, false, true, false, false),
+            "a thread-only channel refuses a top-level post"
+        );
+        assert!(!channel_can_post(Public, true, false, false, true, false));
+        assert!(!channel_can_post(Public, true, false, false, false, true));
+        assert!(
+            channel_can_post(Public, false, false, false, false, false),
+            "a non-member can post in a public channel"
+        );
+        assert!(!channel_can_post(
+            Private, false, false, false, false, false
+        ));
+        assert!(!channel_can_post(
+            DirectMessage,
+            false,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!channel_can_post(
+            GroupMessage,
+            false,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(channel_can_post(Public, true, false, false, false, false));
+        assert!(channel_can_post(Private, true, false, false, false, false));
+    }
+
+    #[test]
     fn api_error_keeps_only_safe_codes() {
         assert_eq!(
             SlackApiError::api("not_in_channel"),
@@ -288,5 +415,24 @@ mod tests {
             SlackApiError::api("").to_string(),
             "Slack returned unknown_error"
         );
+    }
+
+    #[test]
+    fn a_cursor_means_more_history_and_an_empty_one_does_not() {
+        assert!(!history_has_more(None, None));
+        assert!(!history_has_more(Some(false), None));
+        assert!(!history_has_more(Some(false), Some("  ")));
+        assert!(history_has_more(Some(true), None));
+        assert!(history_has_more(None, Some("next")));
+        assert!(history_has_more(Some(false), Some("next")));
+    }
+
+    #[test]
+    fn a_short_page_with_more_history_is_not_the_latest_window() {
+        assert!(!history_page_is_authoritative(0, 50, true));
+        assert!(!history_page_is_authoritative(49, 50, true));
+        assert!(history_page_is_authoritative(50, 50, true));
+        assert!(history_page_is_authoritative(0, 50, false));
+        assert!(history_page_is_authoritative(2, 50, false));
     }
 }

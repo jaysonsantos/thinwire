@@ -1035,6 +1035,10 @@ fn add_slack_workspace(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Int
     if slack.is_some_and(|row| row.linked()) {
         return;
     }
+    if snapshot.persistence() == Persistence::Loading {
+        ui.add_enabled(false, egui::Button::new("Add Slack workspace"));
+        return;
+    }
     if ui.button("Add Slack workspace").clicked() {
         out.push(Intent::Slack(SlackIntent::Connect));
     }
