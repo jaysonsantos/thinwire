@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
@@ -40,16 +40,19 @@ use crate::adapter::{
 pub(super) const HISTORY_LIMIT: u16 = 50;
 
 /// How long a Slack post identity stays deduped after its timestamp.
-/// Matches `thinwire_core::notify::STALE_AFTER_SECS`: a Socket Mode retry
-/// can still notify while the post is that fresh, so liveness cannot follow
-/// the `HISTORY_LIMIT` display cache. A post at exactly this age still
+/// `slack_dedup_window_matches_notification_staleness` in core locks this to
+/// `thinwire_core::notify::STALE_AFTER_SECS`. A post at exactly this age still
 /// notifies (`now - sent_at > STALE_AFTER_SECS`), so it stays deduped too.
-pub(super) const DEDUP_FRESH_SECS: i64 = 300;
+pub const DEDUP_FRESH_SECS: i64 = 300;
 
 /// Per-channel cap on deduped identities. Age eviction keeps every identity
 /// inside `DEDUP_FRESH_SECS`. This drops the oldest only when one channel
 /// exceeds it inside that window.
 const DEDUP_LIMIT: usize = 4096;
+
+/// Shortest gap between walks of every channel's dedup set. A job prunes
+/// only its own channel. This walk drops ids on quiet channels.
+const DEDUP_SWEEP_SECS: i64 = 30;
 
 /// Pages of `conversations.list` fetched in one load. Each page is one Web API
 /// call, so the live client's rate control applies between them. A later
@@ -300,6 +303,8 @@ where
     /// for at least `DEDUP_FRESH_SECS`. A Socket Mode retry stays `History`
     /// while its identity is here.
     deduped: HashMap<String, Vec<Deduped>>,
+    /// Wall time of the last walk of every channel in `deduped`.
+    dedup_swept_at: Option<i64>,
 }
 
 impl<A, S, B> Session<A, S, B>
@@ -321,11 +326,15 @@ where
             viewing: None,
             shown: HashMap::new(),
             deduped: HashMap::new(),
+            dedup_swept_at: None,
         }
     }
 
     async fn run(mut self, mut jobs: UnboundedReceiver<Job>) {
         while let Some(job) = jobs.recv().await {
+            // Quiet channels have no post of their own to prune. The full
+            // walk is at most once per `DEDUP_SWEEP_SECS`.
+            self.sweep_deduped(unix_secs());
             match job {
                 Job::Command(command) => self.command(command).await,
                 Job::View(conversation_id) => self.set_view(conversation_id),
@@ -1080,23 +1089,31 @@ where
         let token = live.token.clone();
         let channel = post.channel.clone();
         let post_ts = post.ts.clone();
+        // Drop this channel's expired ids before the dedup check. Other
+        // channels wait for `sweep_deduped`.
+        self.prune_channel(&channel, unix_secs());
         let duplicate = self.already_seen(&post);
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
-        // A Socket Mode post is live the first time only. A retry, or a post
-        // this session already accepted, stays `History` so it cannot notify
-        // (#32). `deduped` keeps that identity after `shown` evicts it, for
-        // the notification freshness window.
+        // A Socket Mode post is live the first time only. A retry of a post
+        // still on screen stays `History` so it cannot notify (#32). A retry
+        // after `shown` evicts it, including a new `ts` with the same
+        // `client_msg_id`, is not emitted: core would insert a row this
+        // adapter no longer tracks, and nothing would remove it later.
+        let on_screen = self
+            .shown
+            .get(&channel)
+            .is_some_and(|rows| rows.iter().any(|row| row.ts == post.ts));
+        if duplicate && !on_screen {
+            self.note_seen(&post);
+            return;
+        }
         let arrival = if duplicate {
             crate::Arrival::History
         } else {
             crate::Arrival::Live
         };
-        // Putting an evicted identity back on `shown` would push out a newer
-        // row and drop its unread count. Update the display cache only when
-        // the post is new or still on screen.
-        let keep_display = !duplicate || self.displayed(&post);
-        let Some(built) = self.chat_message(&token, post, keep_display).await else {
+        let Some(built) = self.chat_message(&token, post, true).await else {
             // Older than every cached row. `remember` already dropped it
             // without `MessagesRemoved`, so the thread stays at the cap.
             return;
@@ -1222,7 +1239,9 @@ where
     /// eviction follows the original post, and fills in `client_msg_id` when
     /// the first sight of it had none.
     fn note_seen(&mut self, post: &SlackPost) {
+        let now = unix_secs();
         let rows = self.deduped.entry(post.channel.clone()).or_default();
+        prune_deduped(rows, now);
         if let Some(row) = rows
             .iter_mut()
             .find(|row| same_post(&row.ts, row.client_msg_id.as_deref(), post))
@@ -1237,7 +1256,21 @@ where
             client_msg_id: post.client_msg_id.clone(),
             sent_at: ts_order(&post.ts),
         });
-        prune_deduped(rows);
+        prune_deduped(rows, now);
+    }
+
+    fn prune_channel(&mut self, channel: &str, now: i64) {
+        let Some(rows) = self.deduped.get_mut(channel) else {
+            return;
+        };
+        prune_deduped(rows, now);
+        if rows.is_empty() {
+            self.deduped.remove(channel);
+        }
+    }
+
+    fn sweep_deduped(&mut self, now: i64) {
+        sweep_deduped_channels(&mut self.deduped, &mut self.dedup_swept_at, now);
     }
 
     /// Returns false when `post` is older than the kept window and was not shown.
@@ -1528,20 +1561,38 @@ struct Shown {
 }
 
 /// One accepted post identity. `sent_at` is the Slack `ts` in unix seconds
-/// (`0` when it does not parse). Age eviction uses that, not wall time, so a
-/// retry is matched against the original post.
+/// (`0` when it does not parse). Age eviction compares it to wall time.
 struct Deduped {
     ts: String,
     client_msg_id: Option<String>,
     sent_at: i64,
 }
 
-/// Drop identities older than the freshness window, then enforce `DEDUP_LIMIT`.
-fn prune_deduped(rows: &mut Vec<Deduped>) {
-    let Some(horizon) = rows.iter().map(|row| row.sent_at).max() else {
-        return;
-    };
-    let cutoff = horizon.saturating_sub(DEDUP_FRESH_SECS);
+/// Drop identities older than `DEDUP_FRESH_SECS` before `now`, then enforce
+/// `DEDUP_LIMIT`. The cutoff is wall time. A quiet channel does not keep ids
+/// until a newer post arrives, and a future `ts` does not move the cutoff.
+/// Walk every channel when `now` is at least `DEDUP_SWEEP_SECS` after
+/// `swept_at`. Returns true when this call scanned. A burst of jobs inside
+/// the interval returns true once.
+fn sweep_deduped_channels(
+    deduped: &mut HashMap<String, Vec<Deduped>>,
+    swept_at: &mut Option<i64>,
+    now: i64,
+) -> bool {
+    let due = swept_at.is_none_or(|last| now.saturating_sub(last) >= DEDUP_SWEEP_SECS);
+    if !due {
+        return false;
+    }
+    *swept_at = Some(now);
+    for rows in deduped.values_mut() {
+        prune_deduped(rows, now);
+    }
+    deduped.retain(|_, rows| !rows.is_empty());
+    true
+}
+
+fn prune_deduped(rows: &mut Vec<Deduped>, now: i64) {
+    let cutoff = now.saturating_sub(DEDUP_FRESH_SECS);
     // `sent_at == 0` is an unparsed timestamp. Notifications still allow it,
     // so keep the identity until the size cap.
     rows.retain(|row| row.sent_at == 0 || row.sent_at >= cutoff);
@@ -1551,6 +1602,13 @@ fn prune_deduped(rows: &mut Vec<Deduped>) {
     rows.sort_by_key(|row| row.sent_at);
     let extra = rows.len() - DEDUP_LIMIT;
     rows.drain(0..extra);
+}
+
+pub(super) fn unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// A cached post leaves the thread when this page covers its timestamp and
@@ -1794,17 +1852,17 @@ mod tests {
             });
         }
         assert!(i64::from(HISTORY_LIMIT) < DEDUP_FRESH_SECS);
-        prune_deduped(&mut rows);
+        let horizon = start + i64::from(HISTORY_LIMIT);
+        prune_deduped(&mut rows, horizon);
         assert_eq!(rows.len(), usize::from(HISTORY_LIMIT) + 1);
         assert!(rows.iter().any(|row| row.ts == "0"));
 
-        let horizon = start + i64::from(HISTORY_LIMIT);
         rows.push(Deduped {
             ts: "stale".into(),
             client_msg_id: Some("stale-id".into()),
             sent_at: horizon - DEDUP_FRESH_SECS - 1,
         });
-        prune_deduped(&mut rows);
+        prune_deduped(&mut rows, horizon);
         assert!(rows.iter().all(|row| row.ts != "stale"));
         assert!(rows.iter().any(|row| row.ts == "0"));
     }
@@ -1829,7 +1887,7 @@ mod tests {
                 sent_at: 0,
             },
         ];
-        prune_deduped(&mut rows);
+        prune_deduped(&mut rows, horizon);
         let ts: Vec<_> = rows.iter().map(|row| row.ts.as_str()).collect();
         assert!(ts.contains(&"edge"));
         assert!(ts.contains(&"newest"));
@@ -1846,8 +1904,90 @@ mod tests {
                 sent_at: 1_700_000_000 + i64::try_from(index % 60).expect("second"),
             });
         }
-        prune_deduped(&mut rows);
+        prune_deduped(&mut rows, 1_700_000_059);
         assert_eq!(rows.len(), DEDUP_LIMIT);
+    }
+
+    #[test]
+    fn a_global_dedup_sweep_runs_at_most_once_per_interval() {
+        let now = 1_700_000_000;
+        let channels = 40;
+        let jobs = 80;
+        let mut deduped = HashMap::new();
+        for index in 0..channels {
+            deduped.insert(
+                format!("C{index}"),
+                vec![
+                    Deduped {
+                        ts: "old".into(),
+                        client_msg_id: None,
+                        sent_at: now - DEDUP_FRESH_SECS - 1,
+                    },
+                    Deduped {
+                        ts: "fresh".into(),
+                        client_msg_id: None,
+                        sent_at: now,
+                    },
+                ],
+            );
+        }
+        let mut swept_at = None;
+        let mut scans = 0_u32;
+        for _ in 0..jobs {
+            if sweep_deduped_channels(&mut deduped, &mut swept_at, now) {
+                scans += 1;
+            }
+        }
+        assert_eq!(scans, 1, "a burst of jobs scans once");
+        assert!(
+            deduped
+                .values()
+                .all(|rows| rows.len() == 1 && rows[0].ts == "fresh")
+        );
+        for _ in 0..jobs {
+            if sweep_deduped_channels(&mut deduped, &mut swept_at, now + DEDUP_SWEEP_SECS - 1) {
+                scans += 1;
+            }
+        }
+        assert_eq!(scans, 1, "the next scan waits for the interval");
+        let later = now + DEDUP_SWEEP_SECS;
+        deduped.get_mut("C0").expect("channel").push(Deduped {
+            ts: "aged".into(),
+            client_msg_id: None,
+            sent_at: later - DEDUP_FRESH_SECS - 1,
+        });
+        assert!(sweep_deduped_channels(&mut deduped, &mut swept_at, later));
+        let quiet = deduped.get("C0").expect("channel");
+        assert!(quiet.iter().all(|row| row.ts != "aged"));
+        assert!(quiet.iter().any(|row| row.ts == "fresh"));
+    }
+
+    #[test]
+    fn a_quiet_channel_drops_deduped_ids_by_time() {
+        let sent_at = 1_700_000_000;
+        let mut rows = vec![
+            Deduped {
+                ts: "only".into(),
+                client_msg_id: None,
+                sent_at,
+            },
+            Deduped {
+                ts: "future".into(),
+                client_msg_id: None,
+                sent_at: sent_at + DEDUP_FRESH_SECS + 10_000,
+            },
+        ];
+        prune_deduped(&mut rows, sent_at + DEDUP_FRESH_SECS);
+        assert!(rows.iter().any(|row| row.ts == "only"));
+        prune_deduped(&mut rows, sent_at + DEDUP_FRESH_SECS + 1);
+        assert!(
+            rows.iter().all(|row| row.ts != "only"),
+            "the newest id still expires when the channel stays quiet"
+        );
+        assert!(
+            rows.iter().any(|row| row.ts == "future"),
+            "a future timestamp does not set the cutoff"
+        );
     }
 
     #[test]
