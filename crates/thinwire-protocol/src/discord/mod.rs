@@ -23,8 +23,6 @@ mod twilight;
 
 use std::fmt;
 use std::sync::Arc;
-#[cfg(any(test, feature = "discord-bot"))]
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::adapter::{
     AccountState, AdapterCommand, AdapterError, AdapterStatus, DiscordAuthMode, EventTx,
@@ -87,9 +85,11 @@ pub struct DiscordAdapter {
     backend: Option<BackendFactory>,
     #[cfg(any(test, feature = "discord-bot"))]
     session: Option<session::Session>,
-    /// Session generation. A bump makes running tasks drop their results.
+    /// Session number. It moves when a session stops and when one starts,
+    /// as the old live counter did. Pending row ids carry it, so they stay
+    /// unique across sessions and keep their form.
     #[cfg(any(test, feature = "discord-bot"))]
-    live: Arc<AtomicU64>,
+    generation: u64,
     /// The chat `ViewChat` last named. `None` means the user left Discord.
     viewed: Option<String>,
 }
@@ -108,7 +108,7 @@ impl DiscordAdapter {
             #[cfg(any(test, feature = "discord-bot"))]
             session: None,
             #[cfg(any(test, feature = "discord-bot"))]
-            live: Arc::new(AtomicU64::new(0)),
+            generation: 0,
             viewed: None,
         }
     }
@@ -168,18 +168,10 @@ impl DiscordAdapter {
     }
 
     fn connect_bot_inbox(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        // The old owner hands its channels, history ids, and row texts to the
+        // new one, after it handled every earlier message.
         #[cfg(any(test, feature = "discord-bot"))]
-        let (carried, history, bodies) = self
-            .session
-            .as_ref()
-            .map(|session| {
-                (
-                    session.carried_channels(),
-                    session.carried_history(),
-                    session.carried_bodies(),
-                )
-            })
-            .unwrap_or_default();
+        let handoff = self.session.take().map(session::Session::retire);
         self.stop_session(events);
         let prepared = self.prepared_token()?;
         #[cfg(any(test, feature = "discord-bot"))]
@@ -198,8 +190,12 @@ impl DiscordAdapter {
                 }
                 Some(token) => {
                     let api = factory(token);
+                    self.generation += 1;
                     self.session = Some(session::Session::start(
-                        api, &self.live, events, carried, history, bodies,
+                        api,
+                        events,
+                        self.generation,
+                        handoff,
                     ));
                 }
             }
@@ -221,12 +217,12 @@ impl DiscordAdapter {
         let _ = events;
         #[cfg(any(test, feature = "discord-bot"))]
         {
+            // The owner drops later results. A send still in flight is
+            // rejected when its HTTP call ends.
             if let Some(session) = self.session.take() {
-                // Generation and the live counter move together under the session lock.
-                session.retire();
-            } else {
-                self.live.fetch_add(1, Ordering::SeqCst);
+                drop(session.retire());
             }
+            self.generation += 1;
         }
     }
 
@@ -243,13 +239,15 @@ impl DiscordAdapter {
 
     #[cfg(any(test, feature = "discord-bot"))]
     fn load_chats(&mut self, events: &EventTx) -> Result<(), AdapterError> {
-        self.session_mut()?.reload(events);
+        let _ = events;
+        self.session_mut()?.reload();
         Ok(())
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
     fn open_chat(&mut self, conversation_id: String, events: &EventTx) -> Result<(), AdapterError> {
-        self.session_mut()?.open(conversation_id, events)
+        let _ = events;
+        self.session_mut()?.open(conversation_id)
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
@@ -260,8 +258,8 @@ impl DiscordAdapter {
         request: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
-        self.session_mut()?
-            .send(conversation_id, body, request, events)
+        let _ = events;
+        self.session_mut()?.send(conversation_id, body, request)
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
@@ -272,8 +270,9 @@ impl DiscordAdapter {
         request: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
+        let _ = events;
         self.session_mut()?
-            .resend(conversation_id, message_id, request, events)
+            .resend(conversation_id, message_id, request)
     }
 
     #[cfg(not(any(test, feature = "discord-bot")))]
@@ -314,21 +313,14 @@ impl DiscordAdapter {
 
     fn drop_if_revoked(&mut self, events: &EventTx) {
         #[cfg(any(test, feature = "discord-bot"))]
+        // Only after the owner queued `Unlinked`. While it is still pending,
+        // the session stays: retiring it would drop that `Unlinked`. Connect
+        // and Disconnect still retire through `stop_session`.
         if self
             .session
             .as_ref()
             .is_some_and(session::Session::is_revoked)
         {
-            // A pending unlink belongs to this generation. Retiring here would
-            // bump it and the seal would drop `Unlinked`. Connect and
-            // Disconnect still retire through `stop_session`.
-            if self
-                .session
-                .as_ref()
-                .is_some_and(session::Session::unlink_pending)
-            {
-                return;
-            }
             self.stop_session(events);
         }
         #[cfg(not(any(test, feature = "discord-bot")))]
@@ -385,15 +377,11 @@ impl ProtocolAdapter for DiscordAdapter {
         #[cfg(any(test, feature = "discord-bot"))]
         {
             const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
-            let session = self.session.take();
-            let pending = session.as_ref().map(session::Session::wait_for_sends);
+            let settled = self.session.take().map(session::Session::shutdown);
             let events = events.clone();
             tokio::spawn(async move {
-                if let Some(pending) = pending {
-                    let _ = tokio::time::timeout(SHUTDOWN_LIMIT, pending).await;
-                }
-                if let Some(session) = session {
-                    session.retire();
+                if let Some(settled) = settled {
+                    let _ = tokio::time::timeout(SHUTDOWN_LIMIT, settled).await;
                 }
                 super::adapter::emit_stopped(&events, ProtocolId::Discord);
             });
@@ -403,10 +391,11 @@ impl ProtocolAdapter for DiscordAdapter {
     }
 
     fn view_chat(&mut self, conversation_id: Option<&str>, events: &EventTx) {
+        // While `Unlinked` is pending, the owner answers with
+        // `CommandFailed`, and the viewed chat does not change.
         #[cfg(any(test, feature = "discord-bot"))]
-        if self.session.as_ref().is_some_and(|session| {
-            session.refuse_pending_unlink(events, conversation_id.map(str::to_owned))
-        }) {
+        if let Some(session) = self.session.as_ref().filter(|session| session.is_ending()) {
+            session.view(conversation_id.map(str::to_owned));
             return;
         }
         let _ = events;
@@ -496,6 +485,14 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     const FIXTURE_TOKEN: &str = "fixture-bot-token";
+
+    /// Waits until the session owner handled every earlier command (#138).
+    /// A test that reads events right after `handle` calls this first.
+    async fn settled(adapter: &DiscordAdapter) {
+        if let Some(session) = &adapter.session {
+            session.flush().await;
+        }
+    }
 
     fn drain(rx: &mut UnboundedReceiver<AdapterEvent>) -> Vec<AdapterEvent> {
         let mut events = Vec::new();
@@ -2130,6 +2127,158 @@ mod tests {
         );
     }
 
+    /// Waits until `count` sends are past the token check and at the hold.
+    async fn sends_at_hold(api: &FakeDiscordApi, count: usize) {
+        for _ in 0..100 {
+            if api.sends_at_hold.load(std::sync::atomic::Ordering::SeqCst) == count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{count} sends did not reach the hold");
+    }
+
+    fn position(events: &[AdapterEvent], test: impl Fn(&AdapterEvent) -> bool) -> Option<usize> {
+        events.iter().position(test)
+    }
+
+    fn is_unlinked(event: &AdapterEvent) -> bool {
+        matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Unlinked,
+                ..
+            }
+        )
+    }
+
+    /// Codex r4109120586 on #135 (#138): a send whose HTTP call succeeds
+    /// while the 401 step waits ends as `SendAccepted`, before `Unlinked`.
+    /// It went out, so the user must not send it again.
+    #[tokio::test]
+    async fn a_send_that_goes_out_during_the_401_step_is_accepted() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "went out".into(),
+                    request: 7,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        api.state().unauthorized = true;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                },
+                &tx,
+            )
+            .expect("open");
+        // The 401 step has finished the load and waits for the send.
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::HistoryLoaded { .. })
+        })
+        .await;
+        hold.notify_waiters();
+        let events = until(&mut rx, is_unlinked).await;
+        let accepted = position(&events, |event| {
+            matches!(event, AdapterEvent::SendAccepted { request: 7, .. })
+        })
+        .expect("the send that went out is accepted");
+        assert!(accepted < position(&events, is_unlinked).expect("unlinked"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 7, .. })),
+            "a send that went out is not rejected"
+        );
+    }
+
+    /// qa Low on #135 (#138): a retry in flight during the 401 step sets its
+    /// row back to failed with its `SendRejected`, before `Unlinked`.
+    #[tokio::test]
+    async fn a_retry_during_the_401_step_fails_its_row_again() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        api.state().send_error = Some(api::DiscordApiError::Rejected);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "try again".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        hold.notify_one();
+        let failed = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 1, .. })
+        })
+        .await;
+        let row = messages(&failed)
+            .iter()
+            .find(|message| message.id.contains(":pending:"))
+            .map(|message| message.id.clone())
+            .expect("the failed row");
+        api.state().send_error = None;
+        adapter
+            .handle(
+                AdapterCommand::ResendMessage {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    message_id: row.clone(),
+                    request: 2,
+                },
+                &tx,
+            )
+            .expect("retry");
+        sends_at_hold(&api, 1).await;
+        api.state().unauthorized = true;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                },
+                &tx,
+            )
+            .expect("open");
+        let events = until(&mut rx, is_unlinked).await;
+        let failed_again = position(&events, |event| {
+            matches!(
+                event,
+                AdapterEvent::MessageDelivery { message_id, delivery: crate::Delivery::Failed, .. }
+                    if *message_id == row
+            )
+        })
+        .expect("the retried row is failed again");
+        let rejected = position(&events, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 2, .. })
+        })
+        .expect("the retry is rejected");
+        let unlinked = position(&events, is_unlinked).expect("unlinked");
+        assert!(failed_again < rejected && rejected < unlinked);
+        hold.notify_waiters();
+    }
+
     /// Codex r4108983123: a 401 settles a send in flight. When a reconnect
     /// comes during the seal, the optimistic row does not stay pending: the
     /// 401 step removes it with the send's one `SendRejected`.
@@ -2369,6 +2518,7 @@ mod tests {
             )
             .expect("open while unlink is pending");
         adapter.view_chat(Some(&id), &tx);
+        settled(&adapter).await;
         let during = drain(&mut rx);
         assert!(
             during.iter().any(|event| matches!(
@@ -2454,6 +2604,7 @@ mod tests {
                 &tx,
             )
             .expect("unknown channel is a note");
+        settled(&adapter).await;
         let events = drain(&mut rx);
         assert_eq!(
             events
