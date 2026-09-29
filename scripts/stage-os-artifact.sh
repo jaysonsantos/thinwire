@@ -85,7 +85,12 @@ workspace_version() {
   ' Cargo.toml
 }
 
-if [[ -f target/release/thinwire.exe ]]; then
+# THINWIRE_BIN: stage another binary. Pull-request CI stages a macOS debug
+# build with it, so the bundle signature step runs before main (#161).
+if [[ -n "${THINWIRE_BIN:-}" ]]; then
+  cp "$THINWIRE_BIN" dist/thinwire
+  bin=dist/thinwire
+elif [[ -f target/release/thinwire.exe ]]; then
   cp target/release/thinwire.exe dist/
   bin=dist/thinwire.exe
 else

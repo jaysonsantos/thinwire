@@ -44,7 +44,7 @@
 | `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh`, `check-core-deps.sh`, `check-release-tree.sh`, `check-agpl-deps.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |
-| `.github/workflows/ci.yml` | Parallel lint/test/build plus the `check` guard. `notify-os` runs clippy and tests of `thinwire-notify` on Windows and macOS only when that crate, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, or `ci.yml` changes; `check` accepts its skip |
+| `.github/workflows/ci.yml` | Parallel lint/test/build plus the `check` guard. `notify-os` runs clippy and tests of `thinwire-notify` on Windows and macOS, and on macOS stages a signed `Thinwire.app` from a debug build, only when that crate, `scripts/stage-os-artifact.sh`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, or `ci.yml` changes; `check` accepts its skip |
 | `.github/workflows/os-zips.yml` | Main-only unsigned OS zips with `telegram-tdlib` and publisher secrets (ADR 0003, 0007) |
 | `.github/workflows/release-tag.yml` | Manual tag. No distroless GUI image |
 
