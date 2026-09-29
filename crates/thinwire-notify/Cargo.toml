@@ -42,6 +42,8 @@ windows-registry = "0.6"
 # keeps notify-rust. MIT or Apache-2.0, by the notify-rust author.
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-usernotifications = "0.3"
+# The running macOS version (NSProcessInfo), safe API. Already in the lock.
+objc2-foundation = { version = "0.3", features = ["NSProcessInfo"] }
 
 [lints]
 workspace = true

@@ -161,7 +161,7 @@ Desktop notifications (#32) show a new message when you do not look at its chat.
 - Privacy: a notification sends the chat title, the sender in a group, and up to 120 characters of the message to the OS notification service. "Hide message text" sends "New message" only, with no sender. thinwire never writes message text to its log.
 - What each OS does today:
 
-| | Linux (freedesktop, D-Bus) | Windows (toasts) | macOS (`Thinwire.app`) |
+| | Linux (freedesktop, D-Bus) | Windows (toasts) | macOS 12 or later (`Thinwire.app`) |
 | --- | --- | --- | --- |
 | Show a notification | Yes | Yes | Yes, after you allow it |
 | One notification for each chat: a new message replaces it, with the count | Yes | Yes | Yes |
@@ -173,7 +173,7 @@ Desktop notifications (#32) show a new message when you do not look at its chat.
 - Windows: each start writes one registry key for the app, `HKCU\Software\Classes\AppUserModelId\dev.jaysonsantos.thinwire`, with the value `DisplayName` = `Thinwire`. Windows needs this key to show the app name on a toast and to send a click back to the app. It needs no admin, and the app writes no other registry key. To remove it: `reg delete "HKCU\Software\Classes\AppUserModelId\dev.jaysonsantos.thinwire" /f`.
 - Windows: a start removes the toasts of an earlier run that did not close cleanly. No chat id goes to Windows: each toast has a short hash of its chat as its tag.
 - macOS: the first start of `Thinwire.app` asks for permission to show notifications. If you say no, macOS shows nothing. You can allow thinwire later in System Settings > Notifications, and that applies at once.
-- macOS: the notification center works only inside `Thinwire.app`, which has a bundle id and an ad-hoc signature. `cargo run` has no bundle: it shows each message as its own notification, with no replace, no remove, and no click.
+- macOS: the notification center works only inside `Thinwire.app`, which has a bundle id and an ad-hoc signature, on macOS 12 or later. `cargo run` has no bundle, and macOS 11 has no API that the notification library needs. In both cases the app shows each message as its own notification, with no replace, no remove, and no click.
 - macOS: a start removes the notifications of an earlier run. No chat id goes to macOS: each notification has a short hash of its chat as its id. With more than 16 notifications that wait for a click, a new one still replaces and goes away, but a click on it does not open the chat.
 - A failed call to the OS notification service does not turn notifications off. The app tries again after a short wait, and turns them off for the run only after 5 failures in a row.
 

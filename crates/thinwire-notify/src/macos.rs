@@ -4,7 +4,8 @@
 //! replaces its notification. A dismiss removes it, and a click on the body
 //! opens the chat. The center needs a bundle id and a code signature (an
 //! ad-hoc one is enough): `Thinwire.app` has both (ADR 0003). `cargo run`
-//! has no bundle and keeps the show-only backend.
+//! has no bundle and keeps the show-only backend. macOS 11 also keeps it:
+//! the crate uses a macOS 12 API (see `MIN_CENTER_MACOS`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,6 +48,14 @@ impl Center {
             waiters: Arc::new(AtomicUsize::new(0)),
         })
     }
+}
+
+/// Major version of the running macOS, for example 26. Safe API, no
+/// `unsafe` (the workspace forbids it).
+pub(crate) fn os_major() -> isize {
+    objc2_foundation::NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion
 }
 
 /// The user did not allow notifications (yet). macOS then rejects each

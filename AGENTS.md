@@ -35,7 +35,7 @@
 | --- | --- |
 | `crates/thinwire/` | Desktop binary: egui frontend. Draws the core view and sends intents |
 | `crates/thinwire-core/` | Frontend-independent core: state, `Intent`, view, change signal, secret store, settings, host wiring, notification rules (`notify`), chats muted in thinwire (`mutes`, #153). No egui / eframe / winit (ADR `0010`) |
-| `crates/thinwire-notify/` | OS desktop notifications on their own thread: Linux D-Bus through `notify-rust`, Windows WinRT toasts through `windows`, macOS UNUserNotificationCenter through `mac-usernotifications` inside `Thinwire.app` (show-only through `notify-rust` with no bundle) (#161). No egui (#32) |
+| `crates/thinwire-notify/` | OS desktop notifications on their own thread: Linux D-Bus through `notify-rust`, Windows WinRT toasts through `windows`, macOS UNUserNotificationCenter through `mac-usernotifications` inside `Thinwire.app` on macOS 12+ (show-only through `notify-rust` with no bundle or on macOS 11) (#161). No egui (#32) |
 | `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings, and the Telegram / Slack / Discord adapters. Signal and WhatsApp here are MIT stubs |
 | `crates/thinwire-signal/` | AGPL-3.0-only Signal adapter. `thinwire` depends on it only with feature `signal-local`. `thinwire-protocol` does not depend on it |
 | `crates/thinwire-whatsapp/` | AGPL-3.0-only WhatsApp linked-device adapter (#77). `thinwire` depends on it only with feature `whatsapp-web`. `thinwire-protocol` does not depend on it |

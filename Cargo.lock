@@ -6675,6 +6675,7 @@ version = "0.1.0"
 dependencies = [
  "mac-usernotifications",
  "notify-rust",
+ "objc2-foundation 0.3.2",
  "thinwire-core",
  "tracing",
  "windows",
