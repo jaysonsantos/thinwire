@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Live backend of the WhatsApp link. Compiled only with `whatsapp-web`.
 //!
 //! The link owner ([`super::link`]) calls [`LiveBackend`] one step at a time.
@@ -23,7 +24,7 @@ use super::path::{
     whatsapp_device_store_path,
 };
 use super::session::{LinkEvent, SendFailure, SendFuture, WhatsAppSender};
-use crate::adapter::RedactedPairingSecret;
+use thinwire_protocol::RedactedPairingSecret;
 
 /// whatsapp-rust client work for the link owner. No state of its own.
 #[derive(Clone, Copy)]

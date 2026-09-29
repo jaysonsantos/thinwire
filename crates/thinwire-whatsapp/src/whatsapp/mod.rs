@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! WhatsApp unofficial linked-device adapter (ZapFast / whatsapp-rust).
 //!
-//! Experimental. ToS / ban risk. The default build keeps a stub and does not
-//! open a network session. Feature `whatsapp-web` may pair only after the UI
-//! has accepted the full-screen ban gate. Secrets never travel on commands.
+//! Experimental. ToS / ban risk. Feature `whatsapp-web` may pair only after
+//! the UI has accepted the full-screen ban gate. Secrets never travel on
+//! commands. A build without this crate uses the MIT stub in
+//! `thinwire-protocol` (#77).
 
 mod inbox;
 mod link;
@@ -14,10 +16,11 @@ mod live;
 
 use std::sync::Arc;
 
-use super::adapter::{
+use thinwire_protocol::{
     AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx,
-    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_chat_list_loaded,
-    emit_history_loaded, emit_older_history_loaded, emit_send_rejected, emit_status,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, WhatsAppPhoneVault,
+    emit_chat_list_loaded, emit_history_loaded, emit_older_history_loaded, emit_send_rejected,
+    emit_status,
 };
 
 #[cfg(not(feature = "whatsapp-web"))]
@@ -52,52 +55,6 @@ const RISK_GATE_REQUIRED: &str =
 
 #[cfg_attr(feature = "whatsapp-web", allow(dead_code))]
 const FEATURE_OFF: &str = "whatsapp-web is off in this build. No QR or pair session is started.";
-
-/// In-memory phone for an optional pair code.
-///
-/// The UI writes it. The worker reads it. [`AdapterCommand`] never carries it.
-#[derive(Default)]
-pub struct WhatsAppPhoneVault {
-    phone: std::sync::Mutex<Option<String>>,
-}
-
-impl WhatsAppPhoneVault {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set_phone(&self, value: &str) {
-        let Ok(mut slot) = self.phone.lock() else {
-            return;
-        };
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            *slot = None;
-        } else {
-            *slot = Some(trimmed.to_string());
-        }
-    }
-
-    #[must_use]
-    pub fn phone(&self) -> Option<String> {
-        self.phone.lock().ok().and_then(|slot| slot.clone())
-    }
-
-    pub fn clear(&self) {
-        if let Ok(mut slot) = self.phone.lock() {
-            *slot = None;
-        }
-    }
-}
-
-impl std::fmt::Debug for WhatsAppPhoneVault {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WhatsAppPhoneVault")
-            .field("phone", &"<redacted>")
-            .finish()
-    }
-}
 
 /// Experimental WhatsApp adapter. Network pairing exists only with `whatsapp-web`
 /// and only after [`AdapterCommand::WhatsAppAcknowledgeRisk`].
@@ -213,7 +170,7 @@ impl WhatsAppAdapter {
     /// own limit.
     fn finish_shutdown(stopped: bool, events: &EventTx) {
         if stopped {
-            super::adapter::emit_stopped(events, ProtocolId::WhatsApp);
+            thinwire_protocol::emit_stopped(events, ProtocolId::WhatsApp);
         } else {
             emit_status(
                 events,
@@ -479,7 +436,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
     fn shutdown(&mut self, events: &EventTx) {
         self.risk_acknowledged = false;
         let Some(link) = self.link.take() else {
-            super::adapter::emit_stopped(events, ProtocolId::WhatsApp);
+            thinwire_protocol::emit_stopped(events, ProtocolId::WhatsApp);
             return;
         };
         let events = events.clone();
@@ -571,7 +528,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
 mod tests {
     use super::*;
 
-    use crate::adapter::Delivery;
+    use thinwire_protocol::Delivery;
 
     /// A WhatsApp-looking id with no JID. The adapter never lists it.
     const PLACEHOLDER_ID: &str = "whatsapp:placeholder";
@@ -623,7 +580,7 @@ mod tests {
         );
     }
 
-    use crate::adapter::{AdapterEvent, RedactedPairingSecret};
+    use thinwire_protocol::{AdapterEvent, RedactedPairingSecret};
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     fn adapter() -> (
@@ -2120,13 +2077,12 @@ mod tests {
         let session = adapter.session.clone();
         // The test build compiles WhatsApp without `whatsapp-web`, so check
         // against the capabilities of the feature build.
-        let mut kit = crate::contract::Contract::new(Box::new(adapter)).with_capabilities(
-            ProtocolCapabilities {
+        let mut kit = thinwire_protocol::contract::Contract::new(Box::new(adapter))
+            .with_capabilities(ProtocolCapabilities {
                 sends_text: true,
                 pages_history: true,
                 ..CAPABILITIES
-            },
-        );
+            });
         let events = kit.events();
         session.apply(history(), 1, &events);
         session.apply(LinkEvent::Connected, 1, &events);

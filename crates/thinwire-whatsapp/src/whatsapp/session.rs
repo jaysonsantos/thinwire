@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Shared WhatsApp session state between the adapter and the live client.
 //!
 //! The live client (feature `whatsapp-web`) turns whatsapp-rust events into
@@ -9,7 +10,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::inbox::{HistoryChat, Inbox, Mute, WaMessage};
-use crate::adapter::{
+use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret,
     emit_status,
 };

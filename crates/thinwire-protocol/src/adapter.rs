@@ -847,7 +847,8 @@ pub fn emit_stopped(events: &EventTx, protocol: ProtocolId) {
     let _ = events.send(AdapterEvent::Stopped { protocol });
 }
 
-pub(crate) fn emit_older_history_loaded(
+/// End one `LoadOlderMessages` (ADR 0010 rule 10).
+pub fn emit_older_history_loaded(
     events: &EventTx,
     protocol: ProtocolId,
     conversation_id: impl Into<String>,

@@ -29,7 +29,7 @@ impl AdapterHost {
         discord: Arc<dyn DiscordSecretVault>,
         slack: Arc<dyn SlackSecretVault>,
         whatsapp_phone: Arc<WhatsAppPhoneVault>,
-        signal: Option<Box<dyn ProtocolAdapter>>,
+        replacements: Vec<Box<dyn ProtocolAdapter>>,
     ) -> Self {
         let login_epoch: LoginEpoch = Arc::new(AtomicU64::new(0));
         let adapter_epoch = Arc::clone(&login_epoch);
@@ -40,7 +40,7 @@ impl AdapterHost {
                 slack,
                 whatsapp_phone,
                 adapter_epoch,
-                signal,
+                replacements,
             )
         })
     }
@@ -367,7 +367,7 @@ mod tests {
             Arc::new(crate::MemoryDiscordVault::new()) as Arc<dyn DiscordSecretVault>,
             Arc::new(crate::MemorySlackVault::new()) as Arc<dyn SlackSecretVault>,
             Arc::new(WhatsAppPhoneVault::new()),
-            None,
+            Vec::new(),
         );
         assert_eq!(host.login_epoch.load(Ordering::SeqCst), 0);
         host.send(AdapterCommand::Disconnect {

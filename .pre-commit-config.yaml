@@ -56,7 +56,7 @@ repos:
         name: editorconfig
         entry: editorconfig-checker
         language: system
-        args: ["-exclude", "crates/thinwire-signal/LICENSE"]
+        args: ["-exclude", "crates/thinwire-(signal|whatsapp)/LICENSE"]
 
       - id: gitleaks
         name: gitleaks

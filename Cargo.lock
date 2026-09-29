@@ -6596,6 +6596,7 @@ dependencies = [
  "thinwire-notify",
  "thinwire-protocol",
  "thinwire-signal",
+ "thinwire-whatsapp",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6635,7 +6636,6 @@ version = "0.1.0"
 dependencies = [
  "dirs 7.0.0",
  "getrandom 0.4.3",
- "libsqlite3-sys",
  "rustls",
  "serde",
  "serde_json",
@@ -6646,7 +6646,6 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "webbrowser",
- "whatsapp-rust",
 ]
 
 [[package]]
@@ -6663,6 +6662,18 @@ dependencies = [
  "thinwire-protocol",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "thinwire-whatsapp"
+version = "0.1.0"
+dependencies = [
+ "dirs 7.0.0",
+ "libsqlite3-sys",
+ "thinwire-protocol",
+ "tokio",
+ "tracing",
+ "whatsapp-rust",
 ]
 
 [[package]]

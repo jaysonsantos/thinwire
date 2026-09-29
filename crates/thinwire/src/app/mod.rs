@@ -211,14 +211,7 @@ impl ThinwireApp {
     pub fn new(settings: Settings, ctx: &egui::Context) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime for protocol adapters");
         let config = CoreConfig::new(settings);
-        #[cfg(feature = "signal-local")]
-        let core = Core::with_signal_adapter(
-            runtime.handle(),
-            config,
-            Box::new(thinwire_signal::SignalAdapter::new()),
-        );
-        #[cfg(not(feature = "signal-local"))]
-        let core = Core::new(runtime.handle(), config);
+        let core = Core::with_replacement_adapters(runtime.handle(), config, local_only_adapters);
         repaint_on_change(&runtime, &core, ctx.clone());
         close_on_stop_signal(runtime.handle(), ctx.clone());
         let clicks = Arc::new(Mutex::new(Vec::new()));
@@ -312,6 +305,19 @@ const NOTIFY_FLUSH_LIMIT: Duration = Duration::from_millis(500);
 /// platform reports no focus (qa L4).
 fn resolve_focus(reported: Option<bool>, event: Option<bool>, last: Option<bool>) -> bool {
     reported.or(event).or(last).unwrap_or(false)
+}
+
+/// The local-only AGPL clients of this build, in place of the MIT stubs
+/// (ADR 0011, #77). A release build turns on neither feature: no client.
+fn local_only_adapters(
+    _phone: &Arc<thinwire_protocol::WhatsAppPhoneVault>,
+) -> Vec<Box<dyn thinwire_protocol::ProtocolAdapter>> {
+    vec![
+        #[cfg(feature = "whatsapp-web")]
+        Box::new(thinwire_whatsapp::WhatsAppAdapter::new(Arc::clone(_phone))),
+        #[cfg(feature = "signal-local")]
+        Box::new(thinwire_signal::SignalAdapter::new()),
+    ]
 }
 
 /// Window title with the unread count of chats that are not muted.
