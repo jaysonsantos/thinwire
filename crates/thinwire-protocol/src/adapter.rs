@@ -390,6 +390,14 @@ pub enum AdapterEvent {
     /// A live session ended without a request from this app (remote logout,
     /// or the session was revoked). The client closes; a new login follows.
     TelegramSessionEnded,
+    /// The account of `protocol` ended for good: the user removed this
+    /// device from the account, for example a WhatsApp logout on the phone.
+    /// The shell drops the data it keeps for that account, such as the
+    /// thinwire mutes (#153). A reconnect, a ban, a failed pairing, or a stop
+    /// never sends it.
+    AccountEnded {
+        protocol: ProtocolId,
+    },
     /// A login event stamped with its client's login epoch. Internal: the host
     /// unwraps it in `poll_events` and drops it when the epoch is stale, so the
     /// UI never sees this variant.
@@ -916,6 +924,14 @@ mod inbox_protocol_tests {
             None
         );
         assert_eq!(AdapterEvent::TelegramSessionEnded.inbox_protocol(), None);
+        assert_eq!(
+            AdapterEvent::AccountEnded {
+                protocol: ProtocolId::WhatsApp
+            }
+            .inbox_protocol(),
+            None,
+            "it can come after the session ended"
+        );
         assert_eq!(
             AdapterEvent::Stopped {
                 protocol: ProtocolId::Telegram

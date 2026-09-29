@@ -2,8 +2,11 @@
 
 use std::ops::Deref;
 
+use thinwire_protocol::ProtocolId;
+
 use crate::ThemeMode;
 use crate::clock::{Clock, ViewNow};
+use crate::mutes::ChatMute;
 use crate::secrets::{Persistence, SecretStore};
 use crate::settings::Settings;
 use crate::state::Snapshot;
@@ -55,6 +58,28 @@ impl View<'_> {
     #[must_use]
     pub fn notification_preview(&self) -> bool {
         self.settings.notification_preview()
+    }
+
+    /// The mute of one chat (#153). A protocol mute wins over a thinwire
+    /// mute. A chat that is not listed has no protocol mute.
+    #[must_use]
+    pub fn chat_mute(&self, protocol: ProtocolId, conversation_id: &str) -> ChatMute {
+        let protocol_muted = self
+            .state
+            .conversation(protocol, conversation_id)
+            .is_some_and(|row| row.muted);
+        let muted_here = self
+            .settings
+            .chat_mutes()
+            .contains(protocol, conversation_id);
+        ChatMute::of(protocol_muted, muted_here)
+    }
+
+    /// Unread messages of every chat that is not muted, in every protocol
+    /// with a session. For the window title and a taskbar badge (#32).
+    #[must_use]
+    pub fn unread_total(&self) -> u32 {
+        self.state.unread_total(self.settings.chat_mutes())
     }
 }
 

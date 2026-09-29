@@ -12,6 +12,7 @@ use thinwire_protocol::{
     telegram_api_available,
 };
 
+use crate::mutes::{ChatMute, ChatMutes};
 use crate::secrets::{SecretKey, SecretStore};
 use crate::sends::{Pending, SendTracker};
 
@@ -498,6 +499,11 @@ pub struct Snapshot {
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
+    /// Accounts that ended for good in this pump: a Telegram session that
+    /// another device or Telegram ended, or `AccountEnded` (a WhatsApp
+    /// logout on the phone). The core drops their thinwire mutes (#153
+    /// review). A reconnect or an app stop never adds one.
+    ended_accounts: Vec<ProtocolId>,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_screen: WhatsAppScreen,
     #[cfg(feature = "whatsapp-web")]
@@ -674,6 +680,7 @@ impl Snapshot {
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
+            ended_accounts: Vec::new(),
             #[cfg(feature = "whatsapp-web")]
             whatsapp_screen: WhatsAppScreen::Hidden,
             #[cfg(feature = "whatsapp-web")]
@@ -929,6 +936,7 @@ impl Snapshot {
                 self.auth_rejection = Some(error);
             }
             AdapterEvent::TelegramSessionEnded => self.end_telegram_session(),
+            AdapterEvent::AccountEnded { protocol } => self.ended_accounts.push(protocol),
             AdapterEvent::TelegramDataReset { moved_to } => {
                 self.data_reset = Some(moved_to);
             }
@@ -983,6 +991,13 @@ impl Snapshot {
     #[must_use]
     pub fn take_keychain_flush(&mut self) -> bool {
         std::mem::take(&mut self.keychain_flush)
+    }
+
+    /// Accounts that ended for good since the last call. See
+    /// `ended_accounts`.
+    #[must_use]
+    pub(crate) fn take_ended_accounts(&mut self) -> Vec<ProtocolId> {
+        std::mem::take(&mut self.ended_accounts)
     }
 
     /// Start TDLib with no click when the keychain holds a saved session.
@@ -1965,6 +1980,12 @@ impl Snapshot {
         }
     }
 
+    /// Test hook: a saved Telegram session resumes now (`Resume::Connecting`).
+    #[cfg(test)]
+    pub(crate) fn resume_connecting_for_test(&mut self) {
+        self.resume = Resume::Connecting;
+    }
+
     /// Test hook: age every tracked send by `by`.
     #[cfg(test)]
     pub(crate) fn age_sends_for_test(&mut self, by: Duration) {
@@ -2411,12 +2432,18 @@ impl Snapshot {
                 self.auth = AuthScreen::TelegramPhone;
                 self.status_text.clone_from(&notice);
                 self.auth_notice = Some(notice);
+                // The saved session is gone with the old data folder: the
+                // next login can be another account (#201 review).
+                self.ended_accounts.push(ProtocolId::Telegram);
             }
             TelegramAuthPhase::NeedPhone if resuming => {
                 // The worker drops the stale session marker on this path.
                 self.auth = AuthScreen::TelegramPhone;
                 self.auth_notice = Some(SESSION_ENDED_NOTICE.into());
                 self.status_text = SESSION_ENDED_NOTICE.into();
+                // The saved session ended while the app was closed: drop its
+                // mutes, as a live session end does (#201 review).
+                self.ended_accounts.push(ProtocolId::Telegram);
             }
             TelegramAuthPhase::NeedPhone => {
                 self.auth = AuthScreen::TelegramPhone;
@@ -2485,6 +2512,9 @@ impl Snapshot {
         }
         self.telegram_authorized = false;
         self.end_session(ProtocolId::Telegram);
+        // The next account on this machine must not get this account's
+        // mutes, as it does not get its drafts (#153 review).
+        self.ended_accounts.push(ProtocolId::Telegram);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
         self.error = None;
@@ -2702,15 +2732,19 @@ impl Snapshot {
             .find(|row| row.id == id)
     }
 
-    /// Unread messages of every chat that is not muted, in every protocol
-    /// with a session. For the window title and a taskbar badge (#32).
+    /// Unread messages of every chat that is not muted (in the protocol or
+    /// in thinwire, #153), in every protocol with a session. For the window
+    /// title and a taskbar badge (#32). A frontend calls
+    /// [`crate::View::unread_total`].
     #[must_use]
-    pub fn unread_total(&self) -> u32 {
+    pub(crate) fn unread_total(&self, mutes: &ChatMutes) -> u32 {
         self.conversations
             .iter()
             .filter(|(protocol, _)| self.has_session(**protocol))
             .flat_map(|(_, rows)| rows.iter())
-            .filter(|row| !row.muted)
+            .filter(|row| {
+                !ChatMute::of(row.muted, mutes.contains(row.protocol, &row.id)).is_muted()
+            })
             .map(|row| row.unread)
             .fold(0, u32::saturating_add)
     }
@@ -3976,6 +4010,7 @@ mod tests {
         snapshot
     }
 
+    /// A chat muted in the protocol or in thinwire (#153) does not count.
     #[test]
     fn unread_total_skips_muted_chats_and_protocols_without_a_session() {
         let store = SecretStore::memory();
@@ -3988,17 +4023,28 @@ mod tests {
         for row in [chat(1, 3, false), chat(2, 4, true), chat(3, 5, false)] {
             snapshot.apply(AdapterEvent::ConversationUpsert { conversation: row });
         }
-        assert_eq!(snapshot.unread_total(), 8, "the muted chat does not count");
+        let mut mutes = ChatMutes::in_memory();
+        assert_eq!(
+            snapshot.unread_total(&mutes),
+            8,
+            "the muted chat does not count"
+        );
         assert!(
             snapshot
                 .conversation(ProtocolId::Telegram, "telegram:2")
                 .is_some_and(|row| row.muted)
         );
+        mutes.set(ProtocolId::Telegram, "telegram:3", true);
+        assert_eq!(
+            snapshot.unread_total(&mutes),
+            3,
+            "a chat muted in thinwire does not count"
+        );
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Telegram,
             state: AccountState::Unlinked,
         });
-        assert_eq!(snapshot.unread_total(), 0, "no session, no count");
+        assert_eq!(snapshot.unread_total(&mutes), 0, "no session, no count");
     }
 
     #[test]

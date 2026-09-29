@@ -10,6 +10,8 @@ use std::fmt;
 
 use thinwire_protocol::{Arrival, ChatMessage, Conversation, ProtocolId};
 
+use crate::mutes::ChatMute;
+
 /// A live message older than this does not notify. After a reconnect, a
 /// protocol can push a burst of old messages; they count as unread only.
 pub const STALE_AFTER_SECS: i64 = 300;
@@ -111,6 +113,8 @@ pub(crate) struct NotifyContext<'a> {
     pub window_focused: bool,
     pub viewed: Option<(ProtocolId, &'a str)>,
     pub has_session: bool,
+    /// The chat of the message is muted in thinwire (#153).
+    pub muted_here: bool,
     /// Unix seconds.
     pub now: i64,
 }
@@ -150,7 +154,8 @@ pub(crate) fn decide(
     let Some(chat) = chat else {
         return Err(SkipReason::UnknownChat);
     };
-    if chat.muted {
+    // A thinwire mute counts like a protocol mute (#153).
+    if ChatMute::of(chat.muted, ctx.muted_here).is_muted() {
         return Err(SkipReason::Muted);
     }
     let seen = ctx.viewed == Some((message.protocol, message.conversation_id.as_str()));
@@ -432,7 +437,43 @@ mod tests {
             window_focused: focused,
             viewed,
             has_session: true,
+            muted_here: false,
             now: NOW,
+        }
+    }
+
+    /// #153: a thinwire mute counts like a protocol mute, in every
+    /// protocol. Slack, Discord, and Signal rows never carry a protocol
+    /// mute, so there the thinwire mute is the only one.
+    #[test]
+    fn a_thinwire_mute_counts_like_a_protocol_mute() {
+        let here = NotifyContext {
+            muted_here: true,
+            ..ctx(None, false)
+        };
+        for protocol in ProtocolId::ALL {
+            let row = chat(protocol, "chat:1");
+            let live = message(protocol, "chat:1", "hi");
+            let protocol_muted = Conversation {
+                muted: true,
+                ..row.clone()
+            };
+            assert_eq!(decide(&live, Some(&row), &ctx(None, false)), Ok(()));
+            assert_eq!(
+                decide(&live, Some(&row), &here),
+                Err(SkipReason::Muted),
+                "muted in thinwire only: {protocol}"
+            );
+            assert_eq!(
+                decide(&live, Some(&protocol_muted), &ctx(None, false)),
+                Err(SkipReason::Muted),
+                "muted in the protocol only: {protocol}"
+            );
+            assert_eq!(
+                decide(&live, Some(&protocol_muted), &here),
+                Err(SkipReason::Muted),
+                "both: {protocol}"
+            );
         }
     }
 
