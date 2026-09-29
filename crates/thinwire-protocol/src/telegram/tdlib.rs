@@ -1797,10 +1797,15 @@ mod tests {
         };
         assert_eq!(row.unread, 0);
 
+        // Blur sends `ViewChat(None)`. A live message after that is not marked.
         fake.view(None);
         assert!(
             fake.receive_live(42, 101, false).is_none(),
-            "leaving the thread stops viewMessages"
+            "after ViewChat(None), a live message is not passed to viewMessages"
+        );
+        assert!(
+            !fake.viewed.contains(&(42, 101)),
+            "blur does not call viewMessages"
         );
         fake.view(Some("not-a-telegram-chat"));
         assert!(

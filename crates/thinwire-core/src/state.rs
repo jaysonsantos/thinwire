@@ -8242,44 +8242,73 @@ mod tests {
         );
     }
 
-    /// Codex P1 on #177: blur must leave the adapter's viewed chat, and
-    /// focus must name it again. The badge stays until focus.
+    /// WhatsApp and Slack: a live message in the viewed chat upserts unread 0.
+    /// A chat they were told is not viewed keeps a badge.
+    struct ViewingFake {
+        open: Option<String>,
+    }
+
+    impl ViewingFake {
+        fn apply(&mut self, commands: &[(ProtocolId, Option<String>)]) {
+            for (_, id) in commands {
+                self.open.clone_from(id);
+            }
+        }
+
+        fn live_unread(&self, chat: &str) -> u32 {
+            if self.open.as_deref() == Some(chat) {
+                0
+            } else {
+                3
+            }
+        }
+    }
+
+    /// Codex P1 on #177: with the window blurred, a live message in the open
+    /// chat keeps unread above 0. The count comes from a fake adapter that
+    /// zeros only the chat `ViewChat` still names. Focus clears the badge.
     #[test]
-    fn blur_clears_the_viewed_chat_and_focus_restores_it() {
+    fn blur_keeps_a_fake_adapters_unread_until_focus() {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
+        let mut fake = ViewingFake { open: None };
+        let opened = view_commands(&mut snapshot);
         assert_eq!(
-            view_commands(&mut snapshot),
+            opened,
             vec![(ProtocolId::Telegram, Some("telegram:1".into()))]
         );
+        fake.apply(&opened);
 
         snapshot.set_window_focus(false);
+        let blurred = view_commands(&mut snapshot);
         assert_eq!(
-            view_commands(&mut snapshot),
+            blurred,
             vec![(ProtocolId::Telegram, None)],
             "blur tells adapters the chat is not viewed"
         );
+        fake.apply(&blurred);
         assert!(snapshot.viewed().is_none());
 
+        let unread = fake.live_unread("telegram:1");
+        assert!(unread > 0, "the fake keeps a badge while blurred");
         let mut row = telegram_chat(1, "Ada", 1);
-        row.unread = 4;
+        row.unread = unread;
         snapshot.apply(AdapterEvent::ConversationUpsert { conversation: row });
-        assert_eq!(
-            snapshot.unread_for(ProtocolId::Telegram),
-            4,
-            "an unfocused open chat keeps the badge"
-        );
+        assert_eq!(snapshot.unread_for(ProtocolId::Telegram), unread);
         assert!(
             view_commands(&mut snapshot).is_empty(),
             "the upsert does not change the view"
         );
 
         snapshot.set_window_focus(true);
+        let focused = view_commands(&mut snapshot);
         assert_eq!(
-            view_commands(&mut snapshot),
+            focused,
             vec![(ProtocolId::Telegram, Some("telegram:1".into()))],
             "focus names the open chat again"
         );
+        fake.apply(&focused);
+        assert_eq!(fake.live_unread("telegram:1"), 0);
         assert_eq!(snapshot.unread_for(ProtocolId::Telegram), 0);
     }
 
