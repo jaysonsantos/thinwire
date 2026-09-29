@@ -348,7 +348,7 @@ pub(super) fn should_mark_history_viewed(viewed: Option<i64>, chat_id: i64) -> b
 /// The chat the user looks at, shared by the UI thread and the TDLib worker.
 ///
 /// `view_chat` publishes here before the worker can leave `getChatHistory`.
-/// The worker applies the same generation when it handles `ViewChat`, and
+/// The worker applies the same `view_seq` when it handles `ViewChat`, and
 /// clears the cell when the session closes. A newer publish wins, so a blur
 /// queued behind `OpenChat` is not undone by the older command.
 #[derive(Clone, Debug)]
@@ -358,7 +358,7 @@ pub(super) struct ViewedChat {
 
 #[derive(Debug)]
 struct ViewedInner {
-    generation: u64,
+    view_seq: u64,
     chat: Option<i64>,
 }
 
@@ -366,7 +366,7 @@ impl ViewedChat {
     pub(super) fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(ViewedInner {
-                generation: 0,
+                view_seq: 0,
                 chat: None,
             })),
         }
@@ -382,20 +382,20 @@ impl ViewedChat {
         self.lock().chat
     }
 
-    /// Caller side. Returns the generation the matching `ViewChat` must carry.
+    /// Caller side. Returns the `view_seq` the matching `ViewChat` must carry.
     #[must_use]
     pub(super) fn publish(&self, chat: Option<i64>) -> u64 {
         let mut viewed = self.lock();
-        viewed.generation = viewed.generation.wrapping_add(1);
+        viewed.view_seq = viewed.view_seq.wrapping_add(1);
         viewed.chat = chat;
-        viewed.generation
+        viewed.view_seq
     }
 
-    /// Worker side. Applies `chat` only while `generation` is still current.
+    /// Worker side. Applies `chat` only while `view_seq` is still current.
     /// `false` means a newer publish already replaced this one.
-    pub(super) fn sync(&self, generation: u64, chat: Option<i64>) -> bool {
+    pub(super) fn sync(&self, view_seq: u64, chat: Option<i64>) -> bool {
         let mut viewed = self.lock();
-        if viewed.generation == generation {
+        if viewed.view_seq == view_seq {
             viewed.chat = chat;
             true
         } else {
@@ -406,7 +406,7 @@ impl ViewedChat {
     /// The session closed. A `ViewChat` queued before this no longer applies.
     pub(super) fn clear(&self) {
         let mut viewed = self.lock();
-        viewed.generation = viewed.generation.wrapping_add(1);
+        viewed.view_seq = viewed.view_seq.wrapping_add(1);
         viewed.chat = None;
     }
 }
@@ -758,7 +758,7 @@ mod tests {
             "history for the chat they opened is marked"
         );
         viewed.sync(opened, Some(42));
-        assert_eq!(viewed.get(), Some(7), "a stale generation does not win");
+        assert_eq!(viewed.get(), Some(7), "a stale view_seq does not win");
         viewed.sync(switched, Some(7));
         assert!(should_mark_history_viewed(viewed.get(), 7));
         assert!(
