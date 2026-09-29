@@ -4,14 +4,24 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
-use notify_rust::{Hint, Urgency};
+use notify_rust::Urgency;
 
 use crate::{Backend, BackendError, ClickFn, Notification, NotifyKey};
 
 const APP_NAME: &str = "thinwire";
-/// `desktop-entry` hint: the `.desktop` file name without the suffix.
-const DESKTOP_ENTRY: &str = "thinwire";
+// No `desktop-entry` hint: the OS zips install no `thinwire.desktop` file,
+// so the hint would name an entry that does not exist (qa on #87).
 const OPEN_ACTION: &str = "default";
+
+/// Most click-waiter threads at one time: one for each shown notification.
+/// Over the limit, a notification shows with no click and no replace
+/// (qa and #87 review: bound the waiter threads).
+pub(crate) const MAX_CLICK_WAITERS: usize = 16;
+
+/// A new click waiter may start while fewer than `MAX_CLICK_WAITERS` run.
+pub(crate) const fn may_wait(running: usize) -> bool {
+    running < MAX_CLICK_WAITERS
+}
 /// `replaces_id` of a new notification (freedesktop spec).
 const NEW_NOTIFICATION: u32 = 0;
 
@@ -70,6 +80,9 @@ pub(crate) struct Xdg {
     /// so its waiter stays and no second one starts.
     waiting: Arc<Mutex<HashSet<u32>>>,
     clicks: ClickFn,
+    /// One session-bus connection for `CloseNotification`, made on first
+    /// use and made again after an error (qa L2).
+    bus: Option<zbus::blocking::Connection>,
 }
 
 impl Xdg {
@@ -78,6 +91,32 @@ impl Xdg {
             book: Arc::new(Mutex::new(IdBook::default())),
             waiting: Arc::new(Mutex::new(HashSet::new())),
             clicks,
+            bus: None,
+        }
+    }
+
+    /// `CloseNotification` by id. The click waiter owns the handle.
+    fn close_notification(&mut self, id: u32) -> Result<(), BackendError> {
+        let bus = match self.bus.take() {
+            Some(bus) => bus,
+            None => {
+                zbus::blocking::Connection::session().map_err(|_| BackendError("session bus"))?
+            }
+        };
+        let closed = bus.call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "CloseNotification",
+            &(id,),
+        );
+        match closed {
+            Ok(_) => {
+                self.bus = Some(bus);
+                Ok(())
+            }
+            // Drop the connection: the next dismiss makes a new one.
+            Err(_) => Err(BackendError("close")),
         }
     }
 }
@@ -89,7 +128,6 @@ impl Backend for Xdg {
             .appname(APP_NAME)
             .summary(&notification.title)
             .body(&notification.body())
-            .hint(Hint::DesktopEntry(DESKTOP_ENTRY.into()))
             .urgency(Urgency::Normal)
             .action(OPEN_ACTION, "Open");
         let replaces = lock(&self.book).replace_id(&notification.key);
@@ -99,8 +137,20 @@ impl Backend for Xdg {
         let handle = message.show().map_err(|_| BackendError("show"))?;
         let id = handle.id();
         lock(&self.book).shown(&notification.key, id);
-        if !lock(&self.waiting).insert(id) {
-            return Ok(());
+        {
+            let mut waiting = lock(&self.waiting);
+            if waiting.contains(&id) {
+                // A replace keeps its id and its waiter.
+                return Ok(());
+            }
+            if !may_wait(waiting.len()) {
+                drop(waiting);
+                // No waiter learns when this one closes, so never replace it.
+                lock(&self.book).closed(id);
+                tracing::debug!(kind = "no click waiter", "desktop notification shown");
+                return Ok(());
+            }
+            waiting.insert(id);
         }
         let book = Arc::clone(&self.book);
         let waiting = Arc::clone(&self.waiting);
@@ -113,6 +163,7 @@ impl Backend for Xdg {
                     if action == OPEN_ACTION
                         && let Some(key) = lock(&book).key_of(id)
                     {
+                        tracing::info!(kind = "open", "desktop notification clicked");
                         clicks(key);
                     }
                 });
@@ -130,24 +181,8 @@ impl Backend for Xdg {
         let Some(id) = lock(&self.book).forget(key) else {
             return Ok(());
         };
-        close_notification(id)
+        self.close_notification(id)
     }
-}
-
-/// `CloseNotification` by id. The click waiter owns the handle.
-fn close_notification(id: u32) -> Result<(), BackendError> {
-    let connection =
-        zbus::blocking::Connection::session().map_err(|_| BackendError("session bus"))?;
-    connection
-        .call_method(
-            Some("org.freedesktop.Notifications"),
-            "/org/freedesktop/Notifications",
-            Some("org.freedesktop.Notifications"),
-            "CloseNotification",
-            &(id,),
-        )
-        .map(drop)
-        .map_err(|_| BackendError("close"))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -201,16 +236,32 @@ mod tests {
     }
 
     #[test]
-    fn each_notification_names_the_app_and_a_normal_urgency() {
+    fn each_notification_has_a_normal_urgency_and_no_desktop_entry() {
         let src = include_str!("xdg.rs");
         let show = &src[src.find("fn show(").expect("show")..];
         let show = &show[..show.find("fn dismiss(").expect("dismiss")];
-        assert!(show.contains("Hint::DesktopEntry(DESKTOP_ENTRY.into())"));
         assert!(show.contains("Urgency::Normal"));
+        assert!(
+            !show.contains(concat!("Hint::", "DesktopEntry")),
+            "no entry is installed"
+        );
         assert!(
             show.contains("if replaces != NEW_NOTIFICATION"),
             "a new notification calls no .id()"
         );
         assert!(show.contains("lock(&book).closed(id)"));
+    }
+
+    #[test]
+    fn click_waiters_are_bounded() {
+        assert!(may_wait(0));
+        assert!(may_wait(MAX_CLICK_WAITERS - 1));
+        assert!(!may_wait(MAX_CLICK_WAITERS));
+        let src = include_str!("xdg.rs");
+        let show = &src[src.find("fn show(").expect("show")..];
+        let show = &show[..show.find("fn dismiss(").expect("dismiss")];
+        let bound = show.find("if !may_wait(waiting.len())").expect("bound");
+        let spawn = show.find("thread::Builder::new()").expect("spawn");
+        assert!(bound < spawn, "the bound comes before a new thread");
     }
 }
