@@ -30,6 +30,12 @@ const CHANNEL_PAGE: u16 = 200;
 /// Placeholder body for a message with no text (files, blocks only).
 const NO_TEXT: &str = "(no text)";
 
+/// `conversations.info` body. Slack's `ok` field is ignored.
+#[derive(Debug, Deserialize)]
+struct ConversationInfoBody {
+    channel: ListedConversation,
+}
+
 /// `conversations.list` body. Slack's `ok` field is ignored.
 #[derive(Debug, Deserialize)]
 struct ConversationsListBody {
@@ -340,6 +346,25 @@ impl SlackWebApi for MorphismWebApi {
             oldest_raw_ts,
             authoritative,
         })
+    }
+
+    async fn posting_allowed(
+        &self,
+        token: &SlackBotToken,
+        channel: &str,
+    ) -> Result<bool, SlackApiError> {
+        let token = self.bot_session_token(token.reveal());
+        let session = self.client.open_session(&token);
+        let response: ConversationInfoBody = session
+            .http_session_api
+            .http_get(
+                "conversations.info",
+                &[("channel", Some(channel))],
+                Some(&SLACK_TIER3_METHOD_CONFIG),
+            )
+            .await
+            .map_err(map_error)?;
+        Ok(channel_from_listed(response.channel, None).can_post)
     }
 
     async fn post_message(

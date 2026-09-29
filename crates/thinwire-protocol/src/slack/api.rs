@@ -280,6 +280,17 @@ pub trait SlackWebApi: Send + Sync + 'static {
         text: &str,
     ) -> impl Future<Output = Result<SlackPost, SlackApiError>> + Send;
 
+    /// `conversations.info`: whether a top-level post is allowed now.
+    ///
+    /// `conversations.list` does not report `restricted_action`. The inbox
+    /// asks again when the user opens a channel a send already refused, and
+    /// for any opened channel while a workspace denial is in effect.
+    fn posting_allowed(
+        &self,
+        token: &SlackBotToken,
+        channel: &str,
+    ) -> impl Future<Output = Result<bool, SlackApiError>> + Send;
+
     /// Display name for a user id (`users.info`).
     fn user_name(
         &self,
