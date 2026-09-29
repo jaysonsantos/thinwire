@@ -129,34 +129,47 @@ impl Core {
         } else {
             SecretStore::for_ui(runtime)
         };
-        Self::with_store(runtime, config, secrets, None)
+        let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
+        Self::with_store(runtime, config, secrets, whatsapp_phone, Vec::new())
     }
 
-    /// Same as [`Self::new`], with the AGPL Signal adapter in place of the stub.
+    /// Same as [`Self::new`], with local-only AGPL adapters in place of the
+    /// MIT stubs (ADR 0011): `thinwire-signal` with `signal-local`,
+    /// `thinwire-whatsapp` with `whatsapp-web`.
     ///
-    /// Only a `signal-local` binary calls this. The core crate does not depend
-    /// on `thinwire-signal`.
+    /// `build` gets the core's WhatsApp phone vault: the pairing screen writes
+    /// it and the WhatsApp adapter reads it. Each adapter that `build`
+    /// returns replaces the stub with the same protocol id, and its
+    /// capabilities replace the account row's. The core crate does not
+    /// depend on the AGPL crates.
     #[must_use]
-    pub fn with_signal_adapter(
+    pub fn with_replacement_adapters(
         runtime: &Handle,
         config: CoreConfig,
-        signal: Box<dyn ProtocolAdapter>,
+        build: impl FnOnce(&Arc<WhatsAppPhoneVault>) -> Vec<Box<dyn ProtocolAdapter>>,
     ) -> Self {
-        let caps = signal.capabilities();
         let secrets = if config.memory_secrets {
             Arc::new(SecretStore::memory())
         } else {
             SecretStore::for_ui(runtime)
         };
-        let mut core = Self::with_store(runtime, config, secrets, Some(signal));
-        if let Some(row) = core
-            .state
-            .accounts
-            .iter_mut()
-            .find(|row| row.caps.id == ProtocolId::Signal)
-        {
-            row.detail = caps.detail.to_string();
-            row.caps = caps;
+        let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
+        let replacements = build(&whatsapp_phone);
+        let caps: Vec<_> = replacements
+            .iter()
+            .map(|adapter| adapter.capabilities())
+            .collect();
+        let mut core = Self::with_store(runtime, config, secrets, whatsapp_phone, replacements);
+        for caps in caps {
+            if let Some(row) = core
+                .state
+                .accounts
+                .iter_mut()
+                .find(|row| row.caps.id == caps.id)
+            {
+                row.detail = caps.detail.to_string();
+                row.caps = caps;
+            }
         }
         core
     }
@@ -165,16 +178,16 @@ impl Core {
         runtime: &Handle,
         config: CoreConfig,
         secrets: Arc<SecretStore>,
-        signal: Option<Box<dyn ProtocolAdapter>>,
+        whatsapp_phone: Arc<WhatsAppPhoneVault>,
+        replacements: Vec<Box<dyn ProtocolAdapter>>,
     ) -> Self {
-        let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
         let host = AdapterHost::spawn(
             runtime,
             Arc::clone(&secrets) as Arc<dyn TelegramSecretVault>,
             Arc::clone(&secrets) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&secrets) as Arc<dyn SlackSecretVault>,
             Arc::clone(&whatsapp_phone),
-            signal,
+            replacements,
         );
         Self::with_host(runtime, config, secrets, whatsapp_phone, host)
     }
@@ -863,7 +876,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&store) as Arc<dyn SlackSecretVault>,
             Arc::clone(&whatsapp_phone),
-            None,
+            Vec::new(),
         );
         bind_discord_after_hydrate(&store, &host);
 
@@ -919,7 +932,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&store) as Arc<dyn SlackSecretVault>,
             whatsapp_phone,
-            None,
+            Vec::new(),
         );
         for caps in catalog() {
             host.send(AdapterCommand::Shutdown { protocol: caps.id });
@@ -1159,6 +1172,55 @@ mod tests {
     }
 
     /// PR #48 review: the keychain watch must not outlive the core. After a
+    /// A stand-in for a local-only AGPL client: only its id and caps matter.
+    struct Replacement(thinwire_protocol::ProtocolCapabilities);
+
+    impl ProtocolAdapter for Replacement {
+        fn id(&self) -> ProtocolId {
+            self.0.id
+        }
+        fn capabilities(&self) -> thinwire_protocol::ProtocolCapabilities {
+            self.0
+        }
+        fn start(&mut self, _events: thinwire_protocol::EventTx) {}
+        fn handle(
+            &mut self,
+            _command: AdapterCommand,
+            _events: &thinwire_protocol::EventTx,
+        ) -> Result<(), thinwire_protocol::AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// #77: the builder gets the core's own phone vault, and a replacement's
+    /// capabilities replace the account row's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replacement_adapters_share_the_phone_vault_and_set_the_row() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_in_build = Arc::clone(&seen);
+        let core = Core::with_replacement_adapters(
+            &Handle::current(),
+            CoreConfig::new(temp_settings()).with_memory_secrets(),
+            move |phone| {
+                *seen_in_build.lock().expect("lock") = Some(Arc::clone(phone));
+                let caps = thinwire_protocol::ProtocolCapabilities {
+                    detail: "local-only replacement",
+                    ..thinwire_protocol::WhatsAppAdapter::capabilities()
+                };
+                vec![Box::new(Replacement(caps))]
+            },
+        );
+        let seen = seen.lock().expect("lock").clone().expect("builder ran");
+        assert!(Arc::ptr_eq(&seen, &core.whatsapp_phone));
+        let row = core
+            .state
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::WhatsApp)
+            .expect("whatsapp row");
+        assert_eq!(row.caps.detail, "local-only replacement");
+    }
+
     /// drop, the change signal ends (no task keeps a strong notifier).
     #[tokio::test(flavor = "multi_thread")]
     async fn keychain_watch_stops_when_the_core_is_dropped() {
@@ -1168,7 +1230,8 @@ mod tests {
             &Handle::current(),
             CoreConfig::new(temp_settings()),
             Arc::clone(&store),
-            None,
+            Arc::new(WhatsAppPhoneVault::new()),
+            Vec::new(),
         );
         let mut signal = core.signal();
         drop(core);
