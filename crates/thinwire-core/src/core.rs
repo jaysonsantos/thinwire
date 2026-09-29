@@ -391,7 +391,10 @@ impl Core {
             Intent::RetryKeychain => self.state.retry_keychain(),
             Intent::SetTheme(theme) => self.settings.set_theme(theme),
             Intent::Shutdown => self.shutdown(),
-            Intent::WindowFocus(focused) => self.notify.set_focus(focused),
+            Intent::WindowFocus(focused) => {
+                self.notify.set_focus(focused);
+                self.state.set_window_focus(focused);
+            }
             Intent::OpenFromNotification(key) => {
                 // Open the chat only in its own protocol: a late click after
                 // a session end must not open that id in another one (qa L5).
@@ -1475,6 +1478,90 @@ mod tests {
             conversation_id: "telegram:2".into(),
         };
         assert_eq!(core.take_notify(), vec![NotifyCommand::Dismiss(key)]);
+    }
+
+    /// #174 item 3: an unfocused open chat still notifies, and its badge
+    /// stays until the window is focused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfocused_open_chat_keeps_its_badge_until_focus() {
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+        use thinwire_protocol::Delivery;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        core.dispatch(Intent::WindowFocus(false));
+        let _ = core.take_notify();
+        let mut row = telegram_chat(1, "Ada", 10);
+        row.unread = 4;
+        row.preview = "while away".into();
+        core.state
+            .apply(AdapterEvent::ConversationUpsert { conversation: row });
+        core.notify_message(&ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            id: "telegram:1:9".into(),
+            sender: "Ada".into(),
+            body: "while away".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+        });
+        assert_eq!(
+            core.take_notify().len(),
+            1,
+            "an unfocused open chat notifies"
+        );
+        assert_eq!(
+            core.view().unread_for(ProtocolId::Telegram),
+            4,
+            "the badge stays until focus"
+        );
+        core.dispatch(Intent::WindowFocus(true));
+        assert_eq!(core.view().unread_for(ProtocolId::Telegram), 0);
+    }
+
+    /// Codex P1 on #177: blur sends `ViewChat(None)` and focus sends the chat
+    /// again, so adapters stop treating a blurred chat as viewed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blur_sends_view_chat_none_and_focus_restores_the_chat() {
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        while sent.try_recv().is_ok() {}
+
+        core.dispatch(Intent::WindowFocus(false));
+        let mut views = Vec::new();
+        while let Ok(command) = sent.try_recv() {
+            if let AdapterCommand::ViewChat {
+                conversation_id, ..
+            } = command
+            {
+                views.push(conversation_id);
+            }
+        }
+        assert_eq!(views, vec![None]);
+
+        core.dispatch(Intent::WindowFocus(true));
+        views.clear();
+        while let Ok(command) = sent.try_recv() {
+            if let AdapterCommand::ViewChat {
+                conversation_id, ..
+            } = command
+            {
+                views.push(conversation_id);
+            }
+        }
+        assert_eq!(views, vec![Some("telegram:1".to_owned())]);
     }
 
     /// PR #48 review (P1): one frame with a click on chat B and an edit of

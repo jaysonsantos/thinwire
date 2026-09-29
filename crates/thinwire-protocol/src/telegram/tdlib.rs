@@ -3,6 +3,7 @@
 //! FFI and network I/O stay on a dedicated receive thread plus tokio tasks.
 //! Credential values are read from the vault and never logged.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -54,6 +55,15 @@ enum TdlibCommand {
         conversation_id: String,
         before_message_id: String,
     },
+    /// The chat the user looks at. `None` means they left Telegram.
+    /// This, not history load, owns `LiveInbox::open_chat`.
+    /// `stamp` is the shared-cell write from the caller. The worker applies
+    /// it only while that write is still current, so a blur during
+    /// `getChatHistory` is not overwritten when this command is dequeued.
+    ViewChat {
+        conversation_id: Option<String>,
+        stamp: u64,
+    },
     /// Ask TDLib to close. The worker exits after `authorizationStateClosed`.
     /// `cancel` is true for a Cancel (Disconnect): a client that already became
     /// Ready is then rolled back (see [`close_kind`]).
@@ -95,6 +105,15 @@ struct LiveInbox {
     ended_elsewhere: bool,
     directory: ChatDirectory,
     names: NameBook,
+    /// Chat `ViewChat` last named. A live message there is marked viewed.
+    /// History load does not set this: the user can leave that thread.
+    open_chat: Option<i64>,
+    /// Same fact, published by `view_chat` before this worker dequeues
+    /// `ViewChat`. History `viewMessages` reads this, not `open_chat`.
+    viewed: inbox::ViewedChat,
+    /// Latest incoming message id per chat that arrived while that chat was
+    /// not viewed. Focus calls `viewMessages` through this id.
+    unviewed: HashMap<i64, i64>,
 }
 
 impl LiveInbox {
@@ -118,6 +137,13 @@ pub struct TdlibRuntime {
     /// The host's Telegram login epoch. A new worker stamps its login events
     /// with the value it starts with.
     login_epoch: LoginEpoch,
+    /// Viewed chat of the current worker. `view_chat` writes it at once.
+    /// A respawn replaces it, so a closing worker cannot clear the new one.
+    viewed: inbox::ViewedChat,
+    /// Last `ViewChat`, including one that arrived while no worker was running.
+    /// Ready copies it into the new cell. A restart does not drop it, and
+    /// storing it does not start a client.
+    requested_view: Arc<Mutex<Option<String>>>,
 }
 
 impl TdlibRuntime {
@@ -133,6 +159,8 @@ impl TdlibRuntime {
             commands: None,
             slots: WorkerSlots::new(),
             current_closing: None,
+            viewed: inbox::ViewedChat::new(),
+            requested_view: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -146,10 +174,12 @@ impl TdlibRuntime {
     /// shutdown keeps the session.
     fn stop_client(&mut self, cancel: bool) {
         // Mark first: from now on the old client sends no login events, even
-        // before its worker reads `Close` (issue #42).
+        // before its worker reads `Close` (issue #42). The viewed chat goes
+        // with it, so a message that arrives while closing is not marked read.
         if let Some(closing) = self.current_closing.take() {
             closing.mark();
         }
+        self.viewed.clear();
         if let Some(commands) = self.commands.take() {
             let _ = commands.send(TdlibCommand::Close { cancel });
         }
@@ -211,6 +241,36 @@ impl TdlibRuntime {
             source,
             events,
         );
+    }
+
+    /// The chat the user looks at. `None` means they left.
+    /// The request is kept when no worker is running, and that must not start one.
+    /// Ready copies it into the new worker. The shared cell updates before the
+    /// send, so a history load still inside `getChatHistory` sees the new view
+    /// before this command is dequeued.
+    pub fn view_chat(&mut self, conversation_id: Option<String>) {
+        let stamp = {
+            let mut requested = self
+                .requested_view
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *requested = conversation_id.clone();
+            // No worker: keep the request for Ready. Do not start a client.
+            if self.commands.is_none() {
+                return;
+            }
+            // Publish before releasing the request lock. Ready reads and
+            // publishes under the same lock, so it cannot restore a chat
+            // this write already replaced.
+            self.viewed
+                .publish(inbox::viewed_chat_id(conversation_id.as_deref()))
+        };
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(TdlibCommand::ViewChat {
+                conversation_id,
+                stamp,
+            });
+        }
     }
 
     pub fn send_text(
@@ -285,13 +345,24 @@ impl TdlibRuntime {
         if self.slots.is_shut() {
             return;
         }
-        let slots = &mut self.slots;
-        let current_closing = &mut self.current_closing;
-        let login_epoch = Arc::clone(&self.login_epoch);
-        let sent = super::send_or_respawn(&mut self.commands, command, || {
+        let TdlibRuntime {
+            commands,
+            slots,
+            current_closing,
+            login_epoch,
+            viewed,
+            requested_view,
+        } = self;
+        let login_epoch = Arc::clone(login_epoch);
+        let requested_view = Arc::clone(requested_view);
+        let sent = super::send_or_respawn(commands, command, || {
             let (done, wait_for) = slots.start().unwrap_or_default();
             let closing = ClosingFlag::new(Arc::clone(&login_epoch));
             *current_closing = Some(closing.clone());
+            // A new client gets a new cell. The previous worker clears its
+            // own on close and must not wipe a view this client publishes.
+            let next = inbox::ViewedChat::new();
+            *viewed = next.clone();
             spawn_tdlib_worker(
                 Arc::clone(&secrets),
                 source.clone(),
@@ -299,6 +370,10 @@ impl TdlibRuntime {
                 done,
                 wait_for,
                 closing,
+                WorkerView {
+                    viewed: next,
+                    requested: Arc::clone(&requested_view),
+                },
             )
         });
         if !sent {
@@ -395,6 +470,11 @@ fn receiver_idle() -> bool {
     })
 }
 
+struct WorkerView {
+    viewed: inbox::ViewedChat,
+    requested: Arc<Mutex<Option<String>>>,
+}
+
 fn spawn_tdlib_worker(
     secrets: Arc<dyn TelegramSecretVault>,
     source: TelegramApiSource,
@@ -402,6 +482,7 @@ fn spawn_tdlib_worker(
     done: DoneFlag,
     wait_for: Vec<DoneFlag>,
     closing: ClosingFlag,
+    view: WorkerView,
 ) -> UnboundedSender<TdlibCommand> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -440,7 +521,11 @@ fn spawn_tdlib_worker(
             ended_elsewhere: false,
             directory: ChatDirectory::new(),
             names: NameBook::new(),
+            open_chat: None,
+            viewed: view.viewed,
+            unviewed: HashMap::new(),
         };
+        let requested_view = view.requested;
         let mut commands = Some(cmd_rx);
 
         loop {
@@ -463,6 +548,8 @@ fn spawn_tdlib_worker(
                             live.close_requested = true;
                             live.close_cancel = Some(cancel);
                             live.closing.mark();
+                            live.viewed.clear();
+                            live.open_chat = None;
                             let signed_in = live.authorized || live.late_ready;
                             match close_kind(signed_in, live.new_login, cancel) {
                                 CloseKind::LogOut => {
@@ -484,6 +571,25 @@ fn spawn_tdlib_worker(
                         TdlibCommand::OpenChat(conversation_id) => {
                             open_chat(client_id, &conversation_id, &live, &events).await;
                         }
+                        TdlibCommand::ViewChat {
+                            conversation_id,
+                            stamp,
+                        } => {
+                            apply_view_command(
+                                &live.viewed,
+                                &mut live.open_chat,
+                                conversation_id.as_deref(),
+                                stamp,
+                            );
+                            // Messages that arrived while this chat was not
+                            // viewed never reached viewMessages. Mark through
+                            // the latest one now. `force_read` covers that id.
+                            if let Some((chat_id, message_id)) =
+                                catch_up_read(live.open_chat, &mut live.unviewed)
+                            {
+                                tokio::spawn(mark_message_viewed(client_id, chat_id, message_id));
+                            }
+                        }
                         TdlibCommand::SendText { conversation_id, body, request } => {
                             send_text(client_id, &conversation_id, &body, request, &live, &events).await;
                         }
@@ -499,7 +605,16 @@ fn spawn_tdlib_worker(
                     let Some(update) = update else {
                         break;
                     };
-                    let closed = apply_update(client_id, update, secrets.as_ref(), &source, &events, &mut live).await;
+                    let closed = apply_update(
+                        client_id,
+                        update,
+                        secrets.as_ref(),
+                        &source,
+                        &events,
+                        &mut live,
+                        &requested_view,
+                    )
+                    .await;
                     if closed {
                         break;
                     }
@@ -669,12 +784,17 @@ async fn apply_update(
     source: &TelegramApiSource,
     events: &EventTx,
     live: &mut LiveInbox,
+    requested_view: &Mutex<Option<String>>,
 ) -> bool {
     match update {
         tdlib_rs::enums::Update::AuthorizationState(state) => {
             let closed = matches!(
                 state.authorization_state,
                 tdlib_rs::enums::AuthorizationState::Closed
+            );
+            let ready = matches!(
+                state.authorization_state,
+                tdlib_rs::enums::AuthorizationState::Ready
             );
             apply_authorization(
                 client_id,
@@ -685,6 +805,9 @@ async fn apply_update(
                 live,
             )
             .await;
+            if ready && live.authorized {
+                apply_requested_view(requested_view, &live.viewed, &mut live.open_chat);
+            }
             return closed;
         }
         tdlib_rs::enums::Update::User(update) => {
@@ -694,9 +817,120 @@ async fn apply_update(
                 &update.user.last_name,
             );
         }
-        other => apply_chat_update(other, live, events),
+        other => {
+            // `view_chat` published the cell while this update waited behind
+            // `getChatHistory`. `open_chat` is still the previous command.
+            live.open_chat = live.viewed.get();
+            let mark_read = live_read_while_linked(live, &other);
+            remember_unviewed(&other, live.open_chat, &mut live.unviewed);
+            apply_chat_update(other, live, events);
+            if let Some((chat_id, message_id)) = mark_read {
+                // A round trip here would stall every later update.
+                tokio::spawn(mark_message_viewed(client_id, chat_id, message_id));
+            }
+        }
     }
     false
+}
+
+/// `viewMessages` for a live message. A client that is closing, or whose
+/// login epoch moved, is not linked and must not mark anything read.
+fn live_read_while_linked(
+    live: &LiveInbox,
+    update: &tdlib_rs::enums::Update,
+) -> Option<(i64, i64)> {
+    if !live.linked() {
+        return None;
+    }
+    live_read_of(update, live.open_chat)
+}
+
+/// A live incoming message in the open chat. History calls `viewMessages`
+/// for a page only while that chat is still viewed. A message that arrives
+/// after that page must be marked too, or the server unread count stays above 0.
+fn live_read_of(update: &tdlib_rs::enums::Update, open_chat: Option<i64>) -> Option<(i64, i64)> {
+    let tdlib_rs::enums::Update::NewMessage(update) = update else {
+        return None;
+    };
+    let message = &update.message;
+    if message.is_outgoing {
+        return None;
+    }
+    inbox::live_message_to_view(open_chat, message.chat_id, message.id)
+}
+
+/// `ViewChat` names the chat the user looks at. `None`, or an id that is
+/// not a Telegram chat, leaves no chat open for live `viewMessages`.
+fn apply_viewed_chat(open_chat: &mut Option<i64>, conversation_id: Option<&str>) {
+    *open_chat = inbox::viewed_chat_id(conversation_id);
+}
+
+/// Apply a queued `ViewChat`. A stamp that lost the race does not write its
+/// chat back; the worker keeps whatever the cell already published.
+fn apply_view_command(
+    viewed: &inbox::ViewedChat,
+    open_chat: &mut Option<i64>,
+    conversation_id: Option<&str>,
+    stamp: u64,
+) {
+    let chat = inbox::viewed_chat_id(conversation_id);
+    if viewed.sync(stamp, chat) {
+        apply_viewed_chat(open_chat, conversation_id);
+    } else {
+        *open_chat = viewed.get();
+    }
+}
+
+/// An incoming message in a chat the user is not looking at. The latest id
+/// is enough: `viewMessages` with `force_read` marks through that id.
+fn remember_unviewed(
+    update: &tdlib_rs::enums::Update,
+    open_chat: Option<i64>,
+    unviewed: &mut HashMap<i64, i64>,
+) {
+    let tdlib_rs::enums::Update::NewMessage(update) = update else {
+        return;
+    };
+    let message = &update.message;
+    if message.is_outgoing || open_chat == Some(message.chat_id) {
+        return;
+    }
+    let slot = unviewed.entry(message.chat_id).or_insert(message.id);
+    if message.id > *slot {
+        *slot = message.id;
+    }
+}
+
+/// `ViewChat` selected this chat again. Returns the id to pass to
+/// `viewMessages`, if any message arrived while it was not viewed.
+fn catch_up_read(open_chat: Option<i64>, unviewed: &mut HashMap<i64, i64>) -> Option<(i64, i64)> {
+    let chat_id = open_chat?;
+    let message_id = unviewed.remove(&chat_id)?;
+    Some((chat_id, message_id))
+}
+
+/// Ready copies the last `ViewChat` into this worker's cell. `sync_viewed`
+/// does not send the same chat again after a restart, and a request that
+/// arrived with no worker was not on the command channel.
+fn apply_requested_view(
+    requested: &Mutex<Option<String>>,
+    viewed: &inbox::ViewedChat,
+    open_chat: &mut Option<i64>,
+) {
+    let requested = requested.lock().unwrap_or_else(PoisonError::into_inner);
+    let chat = inbox::viewed_chat_id(requested.as_deref());
+    // Still holding `requested`. A blur cannot store None and then lose
+    // the race to this publish.
+    let _ = viewed.publish(chat);
+    *open_chat = chat;
+}
+
+async fn mark_message_viewed(client_id: i32, chat_id: i64, message_id: i64) {
+    if let Err(error) =
+        tdlib_rs::functions::view_messages(chat_id, vec![message_id], None, true, client_id).await
+    {
+        log_tdlib_error("viewMessages", &error);
+    }
 }
 
 async fn apply_authorization(
@@ -805,6 +1039,8 @@ async fn apply_authorization(
             if was_authorized && !live.closing.is_set() {
                 live.ended_elsewhere = true;
             }
+            live.open_chat = None;
+            live.viewed.clear();
             emit_status(
                 events,
                 ProtocolId::Telegram,
@@ -1179,6 +1415,9 @@ async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, even
         );
         return;
     };
+    // `ViewChat` owns `live.open_chat`. Loading history is not a view:
+    // the user may already have left this thread. `load_history` reads the
+    // shared cell, which `view_chat` updates before this arm can finish.
     emit_status(
         events,
         ProtocolId::Telegram,
@@ -1202,13 +1441,17 @@ async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &E
     {
         Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
             let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
-            let viewed: Vec<i64> = messages.iter().map(|message| message.id).collect();
+            let message_ids: Vec<i64> = messages.iter().map(|message| message.id).collect();
             for message in inbox::chronological(messages) {
                 emit_mapped_message(events, &message, live, None);
             }
-            if !viewed.is_empty()
+            // Read the cell after `getChatHistory`: `ViewChat` may have been
+            // published while this call was in flight, and it is still queued.
+            if !message_ids.is_empty()
+                && inbox::should_mark_history_viewed(live.viewed.get(), chat_id)
                 && let Err(error) =
-                    tdlib_rs::functions::view_messages(chat_id, viewed, None, true, client_id).await
+                    tdlib_rs::functions::view_messages(chat_id, message_ids, None, true, client_id)
+                        .await
             {
                 log_tdlib_error("viewMessages", &error);
                 emit_status(
@@ -1670,5 +1913,331 @@ fn ensure_dir(path: &std::path::Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telegram::inbox::{ChatDirectory, ChatEffect, ChatMute, ChatSeed, MuteScope};
+
+    /// A stand-in for the TDLib client. It records `viewMessages` and answers
+    /// with unread 0, which is the `updateChatReadInbox` that follows a view.
+    struct FakeTelegram {
+        open_chat: Option<i64>,
+        viewed: Vec<(i64, i64)>,
+        unviewed: HashMap<i64, i64>,
+    }
+
+    impl FakeTelegram {
+        fn new() -> Self {
+            Self {
+                open_chat: None,
+                viewed: Vec::new(),
+                unviewed: HashMap::new(),
+            }
+        }
+
+        /// `Some(0)` when focus marks messages that arrived while the chat
+        /// was not viewed. That is the unread upsert after `viewMessages`.
+        fn view(&mut self, conversation_id: Option<&str>) -> Option<i32> {
+            apply_viewed_chat(&mut self.open_chat, conversation_id);
+            let (chat_id, message_id) = catch_up_read(self.open_chat, &mut self.unviewed)?;
+            self.view_messages(chat_id, message_id);
+            Some(0)
+        }
+
+        fn view_messages(&mut self, chat_id: i64, message_id: i64) {
+            self.viewed.push((chat_id, message_id));
+        }
+
+        /// `Some(0)` when this live message is marked viewed on the server.
+        fn receive_live(&mut self, chat_id: i64, message_id: i64, outgoing: bool) -> Option<i32> {
+            if outgoing {
+                return None;
+            }
+            if let Some((chat_id, message_id)) =
+                inbox::live_message_to_view(self.open_chat, chat_id, message_id)
+            {
+                self.view_messages(chat_id, message_id);
+                return Some(0);
+            }
+            remember_unviewed(
+                &live_message(chat_id, message_id, false),
+                self.open_chat,
+                &mut self.unviewed,
+            );
+            None
+        }
+    }
+
+    #[test]
+    fn a_live_message_in_the_open_chat_is_marked_viewed() {
+        let mut fake = FakeTelegram::new();
+        fake.view(Some("telegram:42"));
+        let mut directory = ChatDirectory::new();
+        directory.upsert(
+            42,
+            ChatSeed {
+                title: "Ada",
+                order: 1,
+                unread: 3,
+                preview: "earlier",
+                participant: "Ada",
+                last_at: 1,
+                is_group: false,
+                scope: MuteScope::Private,
+                mute: ChatMute::default(),
+            },
+        );
+        assert!(
+            fake.receive_live(7, 1, false).is_none(),
+            "a closed chat is not marked"
+        );
+        let next = fake
+            .receive_live(42, 99, false)
+            .expect("the open chat is marked viewed");
+        assert_eq!(fake.viewed, vec![(42, 99)]);
+        assert!(fake.receive_live(42, 100, true).is_none(), "own message");
+        let Some(ChatEffect::Upsert(row)) = directory.set_unread(42, next) else {
+            panic!("unread upsert");
+        };
+        assert_eq!(row.unread, 0);
+
+        // Blur sends `ViewChat(None)`. A live message after that is not marked.
+        fake.view(None);
+        assert!(
+            fake.receive_live(42, 101, false).is_none(),
+            "after ViewChat(None), a live message is not passed to viewMessages"
+        );
+        assert!(
+            !fake.viewed.contains(&(42, 101)),
+            "blur does not call viewMessages"
+        );
+        fake.view(Some("not-a-telegram-chat"));
+        assert!(
+            fake.receive_live(42, 102, false).is_none(),
+            "a foreign id does not keep the old chat open"
+        );
+        fake.view(Some("telegram:42"));
+        assert_eq!(
+            fake.receive_live(42, 103, false),
+            Some(0),
+            "focus names the chat again"
+        );
+    }
+
+    #[test]
+    fn a_blurred_live_message_is_marked_viewed_when_focus_returns() {
+        let mut fake = FakeTelegram::new();
+        let mut directory = ChatDirectory::new();
+        directory.upsert(
+            42,
+            ChatSeed {
+                title: "Ada",
+                order: 1,
+                unread: 1,
+                preview: "earlier",
+                participant: "Ada",
+                last_at: 1,
+                is_group: false,
+                scope: MuteScope::Private,
+                mute: ChatMute::default(),
+            },
+        );
+        fake.view(Some("telegram:42"));
+        fake.view(None);
+        assert!(
+            fake.receive_live(42, 101, false).is_none(),
+            "a message that arrives while blurred is not marked yet"
+        );
+        assert!(
+            !fake.viewed.contains(&(42, 101)),
+            "blur does not call viewMessages"
+        );
+        let unread = fake
+            .view(Some("telegram:42"))
+            .expect("focus marks through the message that arrived while blurred");
+        assert_eq!(fake.viewed, vec![(42, 101)]);
+        let Some(ChatEffect::Upsert(row)) = directory.set_unread(42, unread) else {
+            panic!("unread upsert");
+        };
+        assert_eq!(row.unread, 0);
+    }
+
+    #[test]
+    fn a_view_request_is_applied_when_the_worker_becomes_ready() {
+        let mut runtime = TdlibRuntime::new();
+        runtime.view_chat(Some("telegram:42".into()));
+        assert!(
+            runtime.commands.is_none(),
+            "view_chat must not start a client"
+        );
+        let cell = inbox::ViewedChat::new();
+        let mut open = None;
+        apply_requested_view(&runtime.requested_view, &cell, &mut open);
+        assert_eq!(open, Some(42));
+        assert_eq!(cell.get(), Some(42));
+
+        // The worker died. A new cell starts empty. The request is still kept.
+        let restarted = inbox::ViewedChat::new();
+        open = None;
+        apply_requested_view(&runtime.requested_view, &restarted, &mut open);
+        assert_eq!(open, Some(42));
+        assert_eq!(restarted.get(), Some(42));
+
+        runtime.view_chat(None);
+        assert!(runtime.commands.is_none());
+        apply_requested_view(&runtime.requested_view, &restarted, &mut open);
+        assert_eq!(open, None);
+        assert_eq!(restarted.get(), None);
+    }
+
+    #[test]
+    fn a_ready_restore_loses_to_a_newer_blur() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let mut runtime = TdlibRuntime::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.commands = Some(tx);
+        for _ in 0..32 {
+            runtime.view_chat(Some("telegram:42".into()));
+            while rx.try_recv().is_ok() {}
+            let requested = Arc::clone(&runtime.requested_view);
+            let viewed = runtime.viewed.clone();
+            let start = Arc::new(Barrier::new(2));
+            let ready = thread::spawn({
+                let start = Arc::clone(&start);
+                move || {
+                    start.wait();
+                    let mut open = Some(42);
+                    apply_requested_view(&requested, &viewed, &mut open);
+                    open
+                }
+            });
+            start.wait();
+            runtime.view_chat(None);
+            let mut open = ready.join().expect("ready");
+            while let Ok(TdlibCommand::ViewChat {
+                conversation_id,
+                stamp,
+            }) = rx.try_recv()
+            {
+                apply_view_command(
+                    &runtime.viewed,
+                    &mut open,
+                    conversation_id.as_deref(),
+                    stamp,
+                );
+            }
+            assert_eq!(runtime.viewed.get(), None, "the blur stays published");
+            assert_eq!(open, None, "the worker does not keep the old chat");
+        }
+    }
+
+    fn live_message(chat_id: i64, message_id: i64, outgoing: bool) -> tdlib_rs::enums::Update {
+        use tdlib_rs::enums::{MessageContent, MessageSender, Update};
+        use tdlib_rs::types::{
+            FormattedText, Message, MessageSenderUser, MessageText, UpdateNewMessage,
+        };
+        Update::NewMessage(UpdateNewMessage {
+            message: Message {
+                id: message_id,
+                sender_id: MessageSender::User(MessageSenderUser { user_id: 1 }),
+                chat_id,
+                sending_state: None,
+                scheduling_state: None,
+                is_outgoing: outgoing,
+                is_pinned: false,
+                is_from_offline: false,
+                can_be_saved: true,
+                has_timestamped_media: false,
+                is_channel_post: false,
+                is_paid_star_suggested_post: false,
+                is_paid_ton_suggested_post: false,
+                contains_unread_mention: false,
+                date: 1,
+                edit_date: 0,
+                forward_info: None,
+                import_info: None,
+                interaction_info: None,
+                unread_reactions: Vec::new(),
+                fact_check: None,
+                suggested_post_info: None,
+                reply_to: None,
+                topic_id: None,
+                self_destruct_type: None,
+                self_destruct_in: 0.0,
+                auto_delete_in: 0.0,
+                via_bot_user_id: 0,
+                sender_business_bot_user_id: 0,
+                sender_boost_count: 0,
+                paid_message_star_count: 0,
+                author_signature: String::new(),
+                media_album_id: 0,
+                effect_id: 0,
+                restriction_info: None,
+                summary_language_code: String::new(),
+                content: MessageContent::MessageText(MessageText {
+                    text: FormattedText {
+                        text: "hi".into(),
+                        entities: Vec::new(),
+                    },
+                    link_preview: None,
+                    link_preview_options: None,
+                }),
+                reply_markup: None,
+            },
+        })
+    }
+
+    #[test]
+    fn a_message_after_closing_starts_is_not_marked_viewed() {
+        let mut runtime = TdlibRuntime::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.commands = Some(tx);
+        let closing = ClosingFlag::new(Arc::clone(&runtime.login_epoch));
+        runtime.current_closing = Some(closing.clone());
+        let _ = runtime.viewed.publish(Some(42));
+        let mut live = LiveInbox {
+            authorized: true,
+            older: OlderHistory::new(),
+            new_login: false,
+            late_ready: false,
+            close_cancel: None,
+            closing: closing.clone(),
+            close_requested: false,
+            ended_elsewhere: false,
+            directory: ChatDirectory::new(),
+            names: NameBook::new(),
+            open_chat: Some(42),
+            viewed: runtime.viewed.clone(),
+            unviewed: HashMap::new(),
+        };
+        // Disconnect or Shutdown has marked closing. The cell can still name
+        // the chat until `stop_client` clears it.
+        live.closing.mark();
+        let update = live_message(42, 200, false);
+        assert!(
+            live_read_while_linked(&live, &update).is_none(),
+            "closing started, then a NewMessage: no viewMessages"
+        );
+
+        runtime.stop();
+        assert!(closing.is_set());
+        assert_eq!(runtime.viewed.get(), None, "closing clears the viewed chat");
+        live.open_chat = live.viewed.get();
+        assert!(live_read_while_linked(&live, &update).is_none());
+    }
+
+    #[test]
+    fn live_read_of_marks_an_incoming_message_in_the_open_chat() {
+        let incoming = live_message(42, 99, false);
+        assert_eq!(live_read_of(&incoming, Some(42)), Some((42, 99)));
+        assert_eq!(live_read_of(&incoming, Some(7)), None);
+        assert_eq!(live_read_of(&incoming, None), None);
+        let outgoing = live_message(42, 100, true);
+        assert_eq!(live_read_of(&outgoing, Some(42)), None);
     }
 }

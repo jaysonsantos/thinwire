@@ -7,6 +7,7 @@
 #![cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::adapter::{ChatMessage, Conversation, Delivery, ProtocolId};
 
@@ -318,6 +319,98 @@ pub fn parse_telegram_chat_id(conversation_id: &str) -> Option<i64> {
     rest.parse().ok()
 }
 
+/// Chat id from `ViewChat`. `None` means the user left, or the id is not a
+/// Telegram chat, so live `viewMessages` must not keep the previous chat.
+#[must_use]
+pub(super) fn viewed_chat_id(conversation_id: Option<&str>) -> Option<i64> {
+    conversation_id.and_then(parse_telegram_chat_id)
+}
+
+/// A live message is marked viewed only when `ViewChat` still names its chat.
+#[must_use]
+pub(super) fn live_message_to_view(
+    open_chat: Option<i64>,
+    chat_id: i64,
+    message_id: i64,
+) -> Option<(i64, i64)> {
+    (open_chat == Some(chat_id)).then_some((chat_id, message_id))
+}
+
+/// History calls `viewMessages` only when this page's chat is still the one
+/// the user looks at. The shared cell is what counts: `open_chat` on the
+/// worker is still the previous `ViewChat` while that command sits behind
+/// an in-flight `OpenChat`.
+#[must_use]
+pub(super) fn should_mark_history_viewed(viewed: Option<i64>, chat_id: i64) -> bool {
+    viewed == Some(chat_id)
+}
+
+/// The chat the user looks at, shared by the UI thread and the TDLib worker.
+///
+/// `view_chat` publishes here before the worker can leave `getChatHistory`.
+/// The worker applies the same `view_seq` when it handles `ViewChat`, and
+/// clears the cell when the session closes. A newer publish wins, so a blur
+/// queued behind `OpenChat` is not undone by the older command.
+#[derive(Clone, Debug)]
+pub(super) struct ViewedChat {
+    inner: Arc<Mutex<ViewedInner>>,
+}
+
+#[derive(Debug)]
+struct ViewedInner {
+    view_seq: u64,
+    chat: Option<i64>,
+}
+
+impl ViewedChat {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ViewedInner {
+                view_seq: 0,
+                chat: None,
+            })),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ViewedInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The chat a history page may mark read. `None` means the user left.
+    #[must_use]
+    pub(super) fn get(&self) -> Option<i64> {
+        self.lock().chat
+    }
+
+    /// Caller side. Returns the `view_seq` the matching `ViewChat` must carry.
+    #[must_use]
+    pub(super) fn publish(&self, chat: Option<i64>) -> u64 {
+        let mut viewed = self.lock();
+        viewed.view_seq = viewed.view_seq.wrapping_add(1);
+        viewed.chat = chat;
+        viewed.view_seq
+    }
+
+    /// Worker side. Applies `chat` only while `view_seq` is still current.
+    /// `false` means a newer publish already replaced this one.
+    pub(super) fn sync(&self, view_seq: u64, chat: Option<i64>) -> bool {
+        let mut viewed = self.lock();
+        if viewed.view_seq == view_seq {
+            viewed.chat = chat;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The session closed. A `ViewChat` queued before this no longer applies.
+    pub(super) fn clear(&self) {
+        let mut viewed = self.lock();
+        viewed.view_seq = viewed.view_seq.wrapping_add(1);
+        viewed.chat = None;
+    }
+}
+
 #[must_use]
 pub(super) fn message_id(chat_id: i64, message_id: i64) -> String {
     format!("telegram:{chat_id}:{message_id}")
@@ -582,6 +675,107 @@ mod tests {
             Some(ChatEffect::Upsert(row)) => row.muted,
             other => panic!("expected an upsert, got {other:?}"),
         }
+    }
+
+    /// Codex P1 on #177: leaving the thread clears the open chat, so a later
+    /// message is not marked viewed. Focus names it again.
+    #[test]
+    fn leaving_the_chat_stops_marking_live_messages_viewed() {
+        let mut open = viewed_chat_id(Some("telegram:42"));
+        assert_eq!(live_message_to_view(open, 42, 99), Some((42, 99)));
+        assert_eq!(
+            live_message_to_view(open, 7, 1),
+            None,
+            "a different chat stays unread"
+        );
+        open = viewed_chat_id(None);
+        assert_eq!(
+            live_message_to_view(open, 42, 100),
+            None,
+            "leaving stops viewMessages"
+        );
+        open = viewed_chat_id(Some("not-a-telegram-chat"));
+        assert_eq!(
+            live_message_to_view(open, 42, 101),
+            None,
+            "a foreign id does not keep the old chat"
+        );
+        open = viewed_chat_id(Some("telegram:42"));
+        assert_eq!(
+            live_message_to_view(open, 42, 103),
+            Some((42, 103)),
+            "returning names the chat again"
+        );
+    }
+
+    /// Codex P1 on #177: history `viewMessages` waits until `getChatHistory`
+    /// returns, and `ViewChat` is still queued then. The caller publishes the
+    /// cell immediately. The mark runs only while that cell names the page.
+    #[test]
+    fn history_mark_read_is_skipped_when_the_view_leaves_during_load() {
+        let viewed = ViewedChat::new();
+        let opened = viewed.publish(Some(42));
+        assert!(
+            should_mark_history_viewed(viewed.get(), 42),
+            "the page is marked while this chat is still viewed"
+        );
+
+        // Blur, or leaving the thread, lands before the worker finishes the load.
+        // The worker's `open_chat` is still 42: `ViewChat(None)` is queued
+        // behind `OpenChat`. The cell is what the mark must read.
+        let left = viewed.publish(None);
+        assert!(
+            !should_mark_history_viewed(viewed.get(), 42),
+            "a queued ViewChat(None) skips viewMessages"
+        );
+        assert!(
+            live_message_to_view(viewed.get(), 42, 11).is_none(),
+            "a message that arrived after the blur is not marked while ViewChat is queued"
+        );
+        assert!(
+            !viewed.sync(opened, Some(42)),
+            "the queued ViewChat for the old chat is stale"
+        );
+        assert!(
+            live_message_to_view(viewed.get(), 42, 12).is_none(),
+            "a stale ViewChat does not mark that message"
+        );
+        assert!(
+            !should_mark_history_viewed(viewed.get(), 42),
+            "the queued ViewChat for the old chat does not undo the blur"
+        );
+        viewed.sync(left, None);
+        assert!(!should_mark_history_viewed(viewed.get(), 42));
+
+        // A switch names the new chat before its history page is ready.
+        let switched = viewed.publish(Some(7));
+        assert!(
+            !should_mark_history_viewed(viewed.get(), 42),
+            "history for the chat the user left is not marked"
+        );
+        assert!(
+            should_mark_history_viewed(viewed.get(), 7),
+            "history for the chat they opened is marked"
+        );
+        viewed.sync(opened, Some(42));
+        assert_eq!(viewed.get(), Some(7), "a stale view_seq does not win");
+        viewed.sync(switched, Some(7));
+        assert!(should_mark_history_viewed(viewed.get(), 7));
+        assert!(
+            should_mark_history_viewed(Some(-100), -100),
+            "a channel id is still that chat"
+        );
+
+        viewed.clear();
+        assert!(
+            !should_mark_history_viewed(viewed.get(), 7),
+            "close clears the viewed chat"
+        );
+        viewed.sync(switched, Some(7));
+        assert!(
+            viewed.get().is_none(),
+            "a ViewChat queued before close does not restore it"
+        );
     }
 
     #[test]
