@@ -67,6 +67,9 @@ const HISTORY_SQL_INCLUDES_CURSOR: bool = false;
 /// A non-empty page at this cap keeps `more` true, and the next request
 /// starts before that page's oldest row. An empty page at the cap sets
 /// `more` false: the rest is unreadable, and the same cursor is not asked again.
+/// That takes more than 208 unreadable rows in a row. Those rows stay in the
+/// store. Continuing past them needs a store cursor in the protocol
+/// (#174 item 15).
 const HISTORY_SCAN_CAP: usize = HISTORY_READ_LIMIT * 4;
 
 pub(super) enum WorkerJob {
