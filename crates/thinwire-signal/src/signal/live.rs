@@ -538,14 +538,18 @@ async fn publish_chats(
     let mut known = HashSet::new();
     let mut group_titles = HashMap::new();
     let names = contact_names(manager).await;
+    let history_before = unix_now_millis().map(initial_history_before);
     let contacts = manager.store().contacts().await.map_err(|_| ())?;
     for contact in contacts.flatten() {
         let conversation = conversation_from_contact(&contact);
         known.insert(conversation.id.clone());
         remember_row(rows, &conversation);
         emit_conversation(events, conversation);
+        let Some(before) = history_before else {
+            continue;
+        };
         let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
-        let Ok((messages, _)) = fetch_history_page(manager, &thread, u64::MAX).await else {
+        let Ok((messages, _)) = fetch_history_page(manager, &thread, before).await else {
             continue;
         };
         for message in messages {
@@ -561,8 +565,11 @@ async fn publish_chats(
         known.insert(conversation.id.clone());
         remember_row(rows, &conversation);
         emit_conversation(events, conversation);
+        let Some(before) = history_before else {
+            continue;
+        };
         let thread = Thread::Group(key);
-        let Ok((messages, _)) = fetch_history_page(manager, &thread, u64::MAX).await else {
+        let Ok((messages, _)) = fetch_history_page(manager, &thread, before).await else {
             continue;
         };
         for message in messages {
@@ -622,6 +629,22 @@ fn older_page_outcome<T>(loaded: Option<(Vec<T>, bool)>) -> (Vec<T>, bool, Optio
 fn history_window(before: u64, span: u64) -> (u64, bool) {
     let start = before.saturating_sub(span);
     (start, start == 0)
+}
+
+/// Exclusive end of the first history page. The store orders by timestamp and
+/// has no limit, so the page must start at the current time. One millisecond
+/// past `now_millis` keeps a message stamped at that millisecond inside
+/// `start..before`.
+fn initial_history_before(now_millis: u64) -> u64 {
+    now_millis.saturating_add(1)
+}
+
+fn unix_now_millis() -> Option<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    u64::try_from(millis).ok()
 }
 
 fn window_is_enough(count: usize, page: usize, reached_start: bool) -> bool {
@@ -1413,6 +1436,24 @@ mod tests {
     fn an_unnamed_contact_uses_its_id_as_the_title() {
         assert_eq!(visible_title("", "abc"), "abc");
         assert_eq!(visible_title("Ada", "abc"), "Ada");
+    }
+
+    #[test]
+    fn the_first_history_page_uses_the_current_time() {
+        let now = 1_700_000_000_000;
+        let before = initial_history_before(now);
+        assert_eq!(before, now + 1);
+        let (start, reached_start) = history_window(before, HISTORY_WINDOW_MS);
+        assert!(!reached_start);
+        assert_eq!(start, before - HISTORY_WINDOW_MS);
+        assert!(now >= start && now < before);
+        let older_than_the_window = now - HISTORY_WINDOW_MS - 1;
+        assert!(older_than_the_window < start);
+        let wider = widen_history_span(before, HISTORY_WINDOW_MS);
+        let (wider_start, wider_reached) = history_window(before, wider);
+        assert!(!wider_reached);
+        assert!(wider_start > 0);
+        assert!(wider_start < start);
     }
 
     #[test]
