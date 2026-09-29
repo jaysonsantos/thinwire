@@ -456,6 +456,9 @@ pub struct Snapshot {
     /// Chats with a request for older messages in flight (#30), keyed by
     /// protocol and chat. One request at a time for each chat.
     older_loading: HashSet<(ProtocolId, String)>,
+    /// Protocols whose chat-list load a reconnect ended. `Linked` loads the
+    /// list again (#163).
+    list_on_link: HashSet<ProtocolId>,
     /// Chats whose start is loaded. No more older requests (#30).
     older_at_start: HashSet<(ProtocolId, String)>,
     /// Chats whose last older request brought nothing older: the anchor it
@@ -640,6 +643,7 @@ impl Snapshot {
             chat_list_loading: HashSet::new(),
             history_loading: HashSet::new(),
             older_loading: HashSet::new(),
+            list_on_link: HashSet::new(),
             older_at_start: HashSet::new(),
             older_retry: HashMap::new(),
             notices: HashMap::new(),
@@ -2768,6 +2772,12 @@ impl Snapshot {
                 if waiting {
                     self.queue_open_chat();
                 }
+                // A chat-list load that a reconnect ended loads again now
+                // (#163).
+                if self.list_on_link.remove(&protocol) {
+                    self.chat_list_loading.insert(protocol);
+                    self.pending.push(AdapterCommand::LoadChats { protocol });
+                }
                 #[cfg(feature = "whatsapp-web")]
                 if protocol == ProtocolId::WhatsApp {
                     self.finish_whatsapp_link();
@@ -2798,6 +2808,7 @@ impl Snapshot {
     /// protocol that is still queued waits for `Linked`, and one in flight
     /// can be lost (#90 items 2 and 7). Mark the selected chat to load on
     /// `Linked`, and drop the queued opens: new commands wait for `Linked`.
+    /// Older pages and the chat list of this protocol end too (#163).
     fn hold_opens_for_reconnect(&mut self, protocol: ProtocolId) {
         let is_open = |command: &AdapterCommand| matches!(command, AdapterCommand::OpenChat { protocol: owner, .. } if *owner == protocol);
         if self.selected_protocol == protocol
@@ -2824,6 +2835,17 @@ impl Snapshot {
                 })
         });
         self.pending.retain(|command| !is_open(command));
+        // An older page in flight can lose its answer too. End it; a later
+        // scroll asks again (#163).
+        self.older_loading.retain(|(owner, _)| *owner != protocol);
+        // A chat-list load that is in flight or queued ends here too. Its
+        // spinner stops, and `Linked` loads the list again (#163).
+        let is_list = |command: &AdapterCommand| matches!(command, AdapterCommand::LoadChats { protocol: owner } if *owner == protocol);
+        let queued_list = self.pending.iter().any(is_list);
+        if self.chat_list_loading.remove(&protocol) || queued_list {
+            self.list_on_link.insert(protocol);
+        }
+        self.pending.retain(|command| !is_list(command));
     }
 
     /// The session of one protocol ended (shell plan 8): drop its rows,
@@ -2867,6 +2889,7 @@ impl Snapshot {
         self.messages.retain(|(owner, _), _| *owner != protocol);
         self.history_loading.retain(|(owner, _)| *owner != protocol);
         self.chat_list_loading.remove(&protocol);
+        self.list_on_link.remove(&protocol);
         self.notices.remove(&protocol);
         self.sends.drop_protocol(protocol);
         // Its timed-out sends leave the timeout error too (#90).
@@ -8620,6 +8643,103 @@ mod tests {
             open_chats(&mut snapshot),
             vec![(ProtocolId::Slack, "slack:C1".to_owned())]
         );
+    }
+
+    /// #163: an older page in flight when a reconnect starts can lose its
+    /// answer. Its spinner stops, and a later scroll asks again.
+    #[test]
+    fn a_reconnect_ends_an_older_page_in_flight() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        let key = (ProtocolId::Slack, "slack:C1".to_owned());
+        snapshot.older_loading.insert(key.clone());
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert!(
+            !snapshot.older_loading.contains(&key),
+            "the older spinner stops"
+        );
+        assert_ne!(
+            snapshot.loading_line(ProtocolId::Slack),
+            Some(LOADING_OLDER_STATUS)
+        );
+    }
+
+    /// #163: a chat-list load in flight when a reconnect starts can lose its
+    /// answer. Its spinner stops, and `Linked` loads the list again.
+    #[test]
+    fn a_reconnect_ends_a_chat_list_load_and_loads_again_on_linked() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.take_commands();
+        snapshot.refresh_visible();
+        assert!(
+            snapshot
+                .take_commands()
+                .contains(&AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Slack
+                }),
+            "the list load is sent"
+        );
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert!(!snapshot.chat_list_loading.contains(&ProtocolId::Slack));
+        assert_eq!(snapshot.loading_line(ProtocolId::Slack), None);
+        link(&mut snapshot, ProtocolId::Slack);
+        assert!(snapshot.chat_list_loading.contains(&ProtocolId::Slack));
+        let loads = snapshot
+            .take_commands()
+            .into_iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    AdapterCommand::LoadChats {
+                        protocol: ProtocolId::Slack
+                    }
+                )
+            })
+            .count();
+        assert_eq!(loads, 1, "Linked loads the list again, once");
+    }
+
+    /// #163: a chat-list load still queued when a reconnect starts waits for
+    /// `Linked`, and goes out once then.
+    #[test]
+    fn a_queued_chat_list_load_waits_for_linked() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.take_commands();
+        snapshot.refresh_visible();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Slack
+                }),
+            "held for Linked"
+        );
+        link(&mut snapshot, ProtocolId::Slack);
+        let loads = snapshot
+            .take_commands()
+            .into_iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    AdapterCommand::LoadChats {
+                        protocol: ProtocolId::Slack
+                    }
+                )
+            })
+            .count();
+        assert_eq!(loads, 1);
     }
 
     /// Codex r4107046484 (#124): a load of another chat that was already
