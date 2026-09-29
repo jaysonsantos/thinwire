@@ -40,11 +40,10 @@ use crate::adapter::{
 pub(super) const HISTORY_LIMIT: u16 = 50;
 
 /// How long a Slack post identity stays deduped after its timestamp.
-/// Matches `thinwire_core::notify::STALE_AFTER_SECS`: a Socket Mode retry
-/// can still notify while the post is that fresh, so liveness cannot follow
-/// the `HISTORY_LIMIT` display cache. A post at exactly this age still
+/// `slack_dedup_window_matches_notification_staleness` in core locks this to
+/// `thinwire_core::notify::STALE_AFTER_SECS`. A post at exactly this age still
 /// notifies (`now - sent_at > STALE_AFTER_SECS`), so it stays deduped too.
-pub(super) const DEDUP_FRESH_SECS: i64 = 300;
+pub const DEDUP_FRESH_SECS: i64 = 300;
 
 /// Per-channel cap on deduped identities. Age eviction keeps every identity
 /// inside `DEDUP_FRESH_SECS`. This drops the oldest only when one channel
@@ -1086,20 +1085,25 @@ where
         let duplicate = self.already_seen(&post);
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
-        // A Socket Mode post is live the first time only. A retry, or a post
-        // this session already accepted, stays `History` so it cannot notify
-        // (#32). `deduped` keeps that identity after `shown` evicts it, for
-        // the notification freshness window.
+        // A Socket Mode post is live the first time only. A retry of a post
+        // still on screen stays `History` so it cannot notify (#32). A retry
+        // after `shown` evicts it, including a new `ts` with the same
+        // `client_msg_id`, is not emitted: core would insert a row this
+        // adapter no longer tracks, and nothing would remove it later.
+        let on_screen = self
+            .shown
+            .get(&channel)
+            .is_some_and(|rows| rows.iter().any(|row| row.ts == post.ts));
+        if duplicate && !on_screen {
+            self.note_seen(&post);
+            return;
+        }
         let arrival = if duplicate {
             crate::Arrival::History
         } else {
             crate::Arrival::Live
         };
-        // Putting an evicted identity back on `shown` would push out a newer
-        // row and drop its unread count. Update the display cache only when
-        // the post is new or still on screen.
-        let keep_display = !duplicate || self.displayed(&post);
-        let Some(built) = self.chat_message(&token, post, keep_display).await else {
+        let Some(built) = self.chat_message(&token, post, true).await else {
             // Older than every cached row. `remember` already dropped it
             // without `MessagesRemoved`, so the thread stays at the cap.
             return;

@@ -39,7 +39,7 @@ pub use loopback::SlackLoopback;
 #[cfg(feature = "slack-oauth")]
 pub use morphism::{oauth_v2_access_request, socket_mode_config, workspace_bot_token};
 pub use secrets::{MemorySlackVault, SLACK_SECRET_SERVICE, SlackSecretKey, SlackSecretVault};
-pub use session::{SlackDeps, SlackInbox};
+pub use session::{DEDUP_FRESH_SECS, SlackDeps, SlackInbox};
 
 /// Adapter the host registers. Feature on: the live workspace-app inbox.
 /// The vault is the core secret store, so an install survives a restart.

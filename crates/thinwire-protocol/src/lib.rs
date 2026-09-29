@@ -40,7 +40,7 @@ pub use secrets::{
 };
 pub use signal::SignalAdapter;
 pub use slack::{
-    MemorySlackVault, SLACK_CONVERSATION_PREFIX, SLACK_OAUTH_CALLBACK_PATH,
+    DEDUP_FRESH_SECS, MemorySlackVault, SLACK_CONVERSATION_PREFIX, SLACK_OAUTH_CALLBACK_PATH,
     SLACK_OAUTH_LOOPBACK_PORT, SLACK_SECRET_SERVICE, SlackAdapter, SlackApiError, SlackApiOrigin,
     SlackApiSource, SlackAppToken, SlackBotToken, SlackBrowser, SlackCallbackError, SlackChannel,
     SlackChannelKind, SlackChannelPage, SlackCodeExchange, SlackDeps, SlackEventSource,
