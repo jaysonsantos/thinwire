@@ -270,7 +270,7 @@ impl<B: LinkBackend> Owner<B> {
                         let _ = done.send(());
                     }
                 }
-                Msg::StopEnded { stop } => self.stop_ended(stop),
+                Msg::StopEnded { stop } => self.stop_ended(stop).await,
                 #[cfg(test)]
                 Msg::Flush { done } => {
                     let _ = done.send(());
@@ -422,14 +422,26 @@ impl<B: LinkBackend> Owner<B> {
         }
     }
 
-    /// The slow stop `stop` ended. Replace [`STOP_PENDING`] with the reason
-    /// of the stop, or with "stopped" (#158 review). A stop that ended in
-    /// time, or one that a later start already saw end, sends nothing.
-    fn stop_ended(&mut self, stop: u64) {
+    /// The slow stop `stop` ended. Delete a revoked store (#167), then
+    /// replace [`STOP_PENDING`] with the reason of the stop, or with
+    /// "stopped" (#158 review). A stop that ended in time, or one that a
+    /// later start already saw end, does nothing.
+    async fn stop_ended(&mut self, stop: u64) {
         if !matches!(&self.stopping, Some((pending, _)) if *pending == stop) {
             return;
         }
         self.stopping = None;
+        // The client let go of a revoked store: delete it now, not at the
+        // next pairing (#167). A Begin still deletes a leftover.
+        if self.stale && self.backend.delete_store().await.is_ok() {
+            self.stale = false;
+        }
+        // Neither the delete nor the mark reached the disk. Keep the warning;
+        // the stop reason would hide it.
+        if self.stale && !self.backend.is_revoked().await {
+            self.status(AdapterStatus::Error, REVOKE_NOT_SAVED);
+            return;
+        }
         match self.session.stopped() {
             Some(reason) => self.status(AdapterStatus::Error, reason),
             None => self.status(AdapterStatus::Stubbed, STOP_ENDED),
@@ -998,21 +1010,21 @@ pub(super) mod tests {
         )));
     }
 
+    /// An owner whose client stops only when `gate` opens. The stop bound is
+    /// zero: a gated stop cannot end before the gate opens, so every stop is
+    /// slow with no timer race (#167).
     fn slow_stop_owner(
         gate: &Arc<Notify>,
+        fake: Fake,
     ) -> (Shared, LinkHandle, Session, UnboundedReceiver<AdapterEvent>) {
         let shared = Shared(Arc::new(Fake {
             stop_gate: Some(Arc::clone(gate)),
-            ..Fake::default()
+            ..fake
         }));
         let (tx, rx) = unbounded_channel();
         let session = Session::default();
-        let handle = LinkHandle::spawn_with_stop_wait(
-            shared.clone(),
-            session.clone(),
-            tx,
-            Duration::from_millis(50),
-        );
+        let handle =
+            LinkHandle::spawn_with_stop_wait(shared.clone(), session.clone(), tx, Duration::ZERO);
         (shared, handle, session, rx)
     }
 
@@ -1022,15 +1034,13 @@ pub(super) mod tests {
     #[tokio::test]
     async fn a_slow_stop_is_bounded_and_blocks_the_next_pairing() {
         let gate = Arc::new(Notify::new());
-        let (fake, handle, _session, mut rx) = slow_stop_owner(&gate);
+        let (fake, handle, _session, mut rx) = slow_stop_owner(&gate, Fake::default());
         handle.begin(None, 7);
         handle.flush().await;
         drain(&mut rx);
 
         handle.cancel();
-        tokio::time::timeout(Duration::from_secs(2), handle.flush())
-            .await
-            .expect("the owner queue does not wait for the hung stop");
+        handle.flush().await;
         assert!(drain(&mut rx).iter().any(|event| matches!(
             event,
             AdapterEvent::Status { status: AdapterStatus::Error, detail, .. } if detail == STOP_PENDING
@@ -1057,7 +1067,7 @@ pub(super) mod tests {
         // The old client stops. Its error goes (#158 review); then a pairing
         // starts.
         gate.notify_one();
-        let ended = wait_for_status(&handle, &mut rx).await;
+        let ended = next_status(&mut rx).await;
         assert_eq!(ended, (AdapterStatus::Stubbed, STOP_ENDED.to_string()));
         assert!(fake.log().iter().any(|entry| entry == "stopped 1"));
         handle.begin(None, 9);
@@ -1068,23 +1078,15 @@ pub(super) mod tests {
         );
     }
 
-    /// Poll the owner until it sends a status; return the first one.
-    async fn wait_for_status(
-        handle: &LinkHandle,
-        rx: &mut UnboundedReceiver<AdapterEvent>,
-    ) -> (AdapterStatus, String) {
-        for _ in 0..200 {
-            handle.flush().await;
-            let status = drain(rx).into_iter().find_map(|event| match event {
-                AdapterEvent::Status { status, detail, .. } => Some((status, detail)),
-                _ => None,
-            });
-            if let Some(status) = status {
-                return status;
+    /// The next status the owner sends. It waits for the event itself, with
+    /// no poll (#167).
+    async fn next_status(rx: &mut UnboundedReceiver<AdapterEvent>) -> (AdapterStatus, String) {
+        loop {
+            match rx.recv().await.expect("the owner is alive") {
+                AdapterEvent::Status { status, detail, .. } => return (status, detail),
+                _ => continue,
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!("no status from the owner");
     }
 
     /// #158 review: a logout whose stop ends late gets its reason back, not
@@ -1092,7 +1094,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn a_late_stop_end_restores_the_stop_reason() {
         let gate = Arc::new(Notify::new());
-        let (fake, handle, session, mut rx) = slow_stop_owner(&gate);
+        let (fake, handle, session, mut rx) = slow_stop_owner(&gate, Fake::default());
         handle.begin(None, 7);
         handle.flush().await;
         fake.callback(1).send(LinkEvent::LoggedOut);
@@ -1104,8 +1106,70 @@ pub(super) mod tests {
         gate.notify_one();
         let reason = session.stopped().expect("a logout reason");
         assert_eq!(
-            wait_for_status(&handle, &mut rx).await,
+            next_status(&mut rx).await,
             (AdapterStatus::Error, reason.to_string())
+        );
+    }
+
+    /// #167: after a logout with a slow stop, the revoked store goes when the
+    /// stop ends, before any new pairing.
+    #[tokio::test]
+    async fn a_revoked_store_is_deleted_when_its_slow_stop_ends() {
+        let gate = Arc::new(Notify::new());
+        let (fake, handle, _session, mut rx) = slow_stop_owner(&gate, Fake::default());
+        handle.begin(None, 7);
+        handle.flush().await;
+        fake.callback(1).send(LinkEvent::LoggedOut);
+        handle.flush().await;
+        assert_eq!(fake.log(), vec!["start 1", "mark revoked", "stop 1"]);
+        drain(&mut rx);
+
+        gate.notify_one();
+        next_status(&mut rx).await;
+        assert_eq!(
+            fake.log(),
+            vec!["start 1", "mark revoked", "stop 1", "stopped 1", "delete"]
+        );
+        assert!(!fake.0.revoked.load(Ordering::SeqCst), "the mark goes too");
+    }
+
+    /// #167: when neither the mark nor the delete at the stop end reaches
+    /// the disk, the warning stays. The next Begin deletes the store first.
+    #[tokio::test]
+    async fn a_failed_delete_at_the_stop_end_keeps_the_warning() {
+        let gate = Arc::new(Notify::new());
+        let (fake, handle, _session, mut rx) = slow_stop_owner(
+            &gate,
+            Fake {
+                mark_fails: true,
+                delete_failures: AtomicUsize::new(1),
+                ..Fake::default()
+            },
+        );
+        handle.begin(None, 7);
+        handle.flush().await;
+        fake.callback(1).send(LinkEvent::LoggedOut);
+        handle.flush().await;
+        drain(&mut rx);
+
+        gate.notify_one();
+        assert_eq!(
+            next_status(&mut rx).await,
+            (AdapterStatus::Error, REVOKE_NOT_SAVED.to_string())
+        );
+        handle.begin(None, 8);
+        handle.flush().await;
+        assert_eq!(
+            fake.log(),
+            vec![
+                "start 1",
+                "mark failed",
+                "stop 1",
+                "stopped 1",
+                "delete failed",
+                "delete",
+                "start 3"
+            ]
         );
     }
 
@@ -1114,15 +1178,20 @@ pub(super) mod tests {
     #[tokio::test]
     async fn shutdown_with_a_slow_stop_is_not_confirmed() {
         let gate = Arc::new(Notify::new());
-        let (_fake, handle, _session, _rx) = slow_stop_owner(&gate);
+        let (_fake, handle, _session, _rx) = slow_stop_owner(&gate, Fake::default());
         handle.begin(None, 7);
         handle.flush().await;
-        let started = std::time::Instant::now();
-        assert!(!handle.shutdown_within(Duration::from_secs(2)).await);
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the owner answers after its own stop bound"
-        );
+        // The owner itself answers "not stopped": it drops the reply. The
+        // long limit is only a guard; no timer decides the result (#167).
+        let (done, wait) = oneshot::channel();
+        handle
+            .tx
+            .send(Msg::Shutdown { done })
+            .unwrap_or_else(|_| panic!("the owner is alive"));
+        let answer = tokio::time::timeout(Duration::from_secs(60), wait)
+            .await
+            .expect("the owner answers without a timer");
+        assert!(answer.is_err(), "a slow stop is not confirmed");
         assert!(STOP_WAIT < SHUTDOWN_WAIT);
     }
 
