@@ -1846,8 +1846,11 @@ mod tests {
         hold.notify_waiters();
     }
 
+    /// Codex r4132922551 on #157: a reconnect stops new work, but each send
+    /// in flight still gets its real result. Both sends went out, so both
+    /// end as `SendAccepted` and their rows are replaced, not removed.
     #[tokio::test]
-    async fn a_new_session_rejects_inflight_sends() {
+    async fn a_reconnect_keeps_the_results_of_sends_in_flight() {
         let hold = Arc::new(Notify::new());
         let mut fake = FakeDiscordApi::guild_fixture();
         fake.hold_send = Some(Arc::clone(&hold));
@@ -1885,18 +1888,21 @@ mod tests {
             "a live HTTP send stays pending until Discord answers"
         );
         hold.notify_waiters();
-        let events = until(&mut rx, |event| {
-            matches!(event, AdapterEvent::SendRejected { request: 9, .. })
+        let mut events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendAccepted { request: 9, .. })
         })
         .await;
-        let rejected: Vec<u64> = events
+        // The row of request 9 is replaced right after its `SendAccepted`.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        events.extend(drain(&mut rx));
+        let accepted: Vec<u64> = events
             .iter()
             .filter_map(|event| match event {
-                AdapterEvent::SendRejected { request, .. } => Some(*request),
+                AdapterEvent::SendAccepted { request, .. } => Some(*request),
                 _ => None,
             })
             .collect();
-        assert_eq!(rejected, vec![4, 9]);
+        assert_eq!(accepted, vec![4, 9]);
         let pending: Vec<&str> = early
             .iter()
             .filter_map(|event| match event {
@@ -1906,21 +1912,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let removed: Vec<&str> = events
+        let replaced: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                AdapterEvent::MessagesRemoved { message_ids, .. } => {
-                    Some(message_ids.iter().map(String::as_str))
-                }
+                AdapterEvent::MessageReplaced { old_id, .. } => Some(old_id.as_str()),
                 _ => None,
             })
-            .flatten()
             .collect();
         assert_eq!(pending, vec!["discord:pending:2:1", "discord:pending:2:2"]);
-        assert_eq!(removed, pending);
+        assert_eq!(replaced, pending);
         assert!(!events.iter().any(|event| matches!(
             event,
-            AdapterEvent::SendAccepted { .. } | AdapterEvent::MessageReplaced { .. }
+            AdapterEvent::SendRejected { .. } | AdapterEvent::MessagesRemoved { .. }
         )));
         adapter
             .handle(
@@ -2171,38 +2174,34 @@ mod tests {
         assert!(late.is_empty(), "an event after the disconnect: {late:?}");
     }
 
-    /// Review of #157: a new send in flight at a reconnect is rejected with
-    /// its row removed. Its text is not kept, so a Retry of the removed row
-    /// in the new session posts nothing.
+    /// Codex r4132922551 on #157: a send result that is already queued when
+    /// a reconnect retires the session is still applied. The send went out,
+    /// so it ends as `SendAccepted`, not `SendRejected`.
     #[tokio::test]
-    async fn a_removed_row_keeps_no_text_for_retry() {
+    async fn a_send_result_queued_before_a_reconnect_is_accepted() {
         let hold = Arc::new(Notify::new());
         let mut fake = FakeDiscordApi::guild_fixture();
         fake.hold_send = Some(Arc::clone(&hold));
         let api = Arc::new(fake);
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
-        let id = conversation_id(GUILD, GENERAL);
         adapter
             .handle(
                 AdapterCommand::SendText {
                     protocol: ProtocolId::Discord,
-                    conversation_id: id.clone(),
-                    body: "no retry".into(),
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "went out".into(),
                     request: 1,
                 },
                 &tx,
             )
             .expect("send");
-        let sent = until(&mut rx, |event| {
-            matches!(event, AdapterEvent::MessageReceived { .. })
-        })
-        .await;
-        let row = messages(&sent)
-            .iter()
-            .find(|message| message.id.contains(":pending:"))
-            .map(|message| message.id.clone())
-            .expect("pending row");
         sends_at_hold(&api, 1).await;
+        // The owner waits; the send's result goes into its queue.
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        hold.notify_waiters();
+        sends_at_hold(&api, 0).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The reconnect retires the session before the owner reads the result.
         adapter
             .handle(
                 AdapterCommand::Connect {
@@ -2211,52 +2210,66 @@ mod tests {
                 &tx,
             )
             .expect("reconnect");
-        let _ = inbox_loaded(&mut rx).await;
-        hold.notify_waiters();
-        let settled = until(&mut rx, |event| {
-            matches!(event, AdapterEvent::SendRejected { request: 1, .. })
-        })
-        .await;
-        assert!(settled.iter().any(|event| matches!(
-            event,
-            AdapterEvent::MessagesRemoved { message_ids, .. } if message_ids.contains(&row)
-        )));
-        adapter
-            .handle(
-                AdapterCommand::ResendMessage {
-                    protocol: ProtocolId::Discord,
-                    conversation_id: id,
-                    message_id: row,
-                    request: 2,
-                },
-                &tx,
-            )
-            .expect("retry");
-        let answer = until(&mut rx, |event| {
+        parked.release();
+        let events = until(&mut rx, |event| {
             matches!(
                 event,
-                AdapterEvent::SendAccepted { request: 2, .. }
-                    | AdapterEvent::SendRejected { request: 2, .. }
+                AdapterEvent::SendAccepted { request: 1, .. }
+                    | AdapterEvent::SendRejected { request: 1, .. }
             )
         })
         .await;
         assert!(
             matches!(
-                answer.last(),
-                Some(AdapterEvent::SendRejected { request: 2, .. })
+                events.last(),
+                Some(AdapterEvent::SendAccepted { request: 1, .. })
             ),
-            "a removed row has no text to post again"
+            "a send that went out is accepted"
         );
     }
 
-    /// Review of #157: the Discord shutdown bound, the owner margin, and
-    /// the slack stay below the app close limit.
-    #[test]
-    fn the_shutdown_bound_leaves_slack_under_the_app_close_limit() {
-        let total = SHUTDOWN_LIMIT + session::CLOSING_MARGIN;
-        assert!(total + CLOSE_SLACK <= crate::APP_CLOSE_LIMIT);
-        assert!(total < crate::APP_CLOSE_LIMIT);
-        assert_eq!(SHUTDOWN_LIMIT, Duration::from_secs(4));
+    /// Codex r4132922551 on #157: a send that goes out while a disconnect
+    /// waits ends as `SendAccepted`, before `Unlinked`.
+    #[tokio::test]
+    async fn a_send_that_goes_out_during_a_disconnect_is_accepted() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "went out".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        hold.notify_waiters();
+        let events = until(&mut rx, is_unlinked).await;
+        let accepted = position(&events, |event| {
+            matches!(event, AdapterEvent::SendAccepted { request: 1, .. })
+        })
+        .expect("the send that went out is accepted");
+        assert!(accepted < position(&events, is_unlinked).expect("unlinked"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 1, .. }))
+        );
     }
 
     /// Codex r4132725575 on #157: Disconnect, then Connect before the old
@@ -2642,6 +2655,16 @@ mod tests {
                 .any(|event| matches!(event, AdapterEvent::Status { .. }) || is_unlinked(event)),
             "the old owner overwrote the refusal: {late:?}"
         );
+    }
+
+    /// Review of #157: the Discord shutdown bound, the owner margin, and
+    /// the slack stay below the app close limit.
+    #[test]
+    fn the_shutdown_bound_leaves_slack_under_the_app_close_limit() {
+        let total = SHUTDOWN_LIMIT + session::CLOSING_MARGIN;
+        assert!(total + CLOSE_SLACK <= crate::APP_CLOSE_LIMIT);
+        assert!(total < crate::APP_CLOSE_LIMIT);
+        assert_eq!(SHUTDOWN_LIMIT, Duration::from_secs(4));
     }
 
     /// Codex r4130981025 on #157: a shutdown that reaches its limit with a

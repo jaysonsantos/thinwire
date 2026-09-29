@@ -80,6 +80,18 @@ pub(crate) struct Carried {
     bodies: HashMap<String, String>,
 }
 
+impl Carried {
+    /// The state for the next session. The row texts are copied, not
+    /// moved: a send still in flight here may still fail and need its text.
+    fn handoff(&mut self) -> Self {
+        Self {
+            channels: std::mem::take(&mut self.channels),
+            history: std::mem::take(&mut self.history),
+            bodies: self.bodies.clone(),
+        }
+    }
+}
+
 /// The row of a send in flight: a new optimistic row, or a retried row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendRow {
@@ -141,6 +153,8 @@ enum Msg {
         request: u64,
         result: Result<MessageSummary, DiscordApiError>,
     },
+    /// [`SEND_SETTLE_WAIT`] of a disconnect ended.
+    DisconnectWaitOver,
     /// [`SEND_SETTLE_WAIT`] of the 401 step `unlink` ended.
     SendWaitOver {
         unlink: u64,
@@ -265,6 +279,7 @@ impl Session {
             unlink: None,
             next_unlink: 0,
             retired: false,
+            disconnecting: None,
             closed: false,
             send_tasks: 0,
             shutdown: None,
@@ -532,6 +547,9 @@ struct Owner {
     next_unlink: u64,
     /// A later session replaced this one, or the app closed.
     retired: bool,
+    /// The user disconnected. The owner waits for its sends in flight, then
+    /// emits the disconnected state with this detail, for this attempt.
+    disconnecting: Option<(&'static str, u64)>,
     /// The app closed: `Stopped` is queued and nothing more is published.
     closed: bool,
     /// HTTP send tasks still running. Shutdown waits for zero.
@@ -615,19 +633,9 @@ impl Owner {
             Msg::SealDone { unlink } => self.seal_done(unlink),
             Msg::Retire { carried } => {
                 self.retire();
-                // A new send still in flight is rejected with its row removed
-                // when its call ends. Its text cannot be retried, so it does
-                // not move to the next session.
-                let pending: Vec<String> = self
-                    .inflight
-                    .values()
-                    .filter(|tracked| tracked.row == SendRow::Pending)
-                    .map(|tracked| tracked.message_id.clone())
-                    .collect();
-                for message_id in pending {
-                    self.carried.bodies.remove(&message_id);
-                }
-                let _ = carried.send(std::mem::take(&mut self.carried));
+                // A send still in flight keeps its text in the next session:
+                // if it fails, its row can be retried there.
+                let _ = carried.send(self.carried.handoff());
             }
             Msg::Shutdown { done, limit } => {
                 self.shutdown = Some(done);
@@ -643,6 +651,7 @@ impl Owner {
             }
             Msg::ShutdownLimit => self.close(),
             Msg::Disconnect { detail, attempt } => self.disconnect(detail, attempt),
+            Msg::DisconnectWaitOver => self.finish_disconnect(),
             #[cfg(test)]
             Msg::Flush { done } => {
                 let _ = done.send(());
@@ -1084,6 +1093,9 @@ impl Owner {
             let id = unlink.id;
             self.start_seal(id);
         }
+        if self.inflight.is_empty() {
+            self.finish_disconnect();
+        }
         self.finish_shutdown_if_idle();
     }
 
@@ -1092,22 +1104,9 @@ impl Owner {
         let Some(tracked) = self.inflight.remove(&request) else {
             return;
         };
-        // `flags.retired` is set before this task handles Retire or
-        // Disconnect, so a list or history result already queued publishes
-        // nothing. A send result already queued is earlier work. Discord
-        // accepted it, so accept it here. A failure still drops its row, and
-        // a result that arrives after this task has handled the retirement
-        // does too (Codex r4132922551).
-        if self.retired || (self.flags.retired.load(Ordering::SeqCst) && result.is_err()) {
-            self.settle_row(&tracked);
-            emit_send_rejected(
-                &self.events,
-                ProtocolId::Discord,
-                &tracked.conversation_id,
-                request,
-            );
-            return;
-        }
+        // Retirement stops new work. A send that started before it still
+        // gets its real result: one that went out ends as `SendAccepted`, so
+        // the user does not send it twice (Codex r4132922551).
         match result {
             Ok(sent) => {
                 let mut message = chat_message(&tracked.conversation_id, tracked.bot_id, &sent);
@@ -1151,7 +1150,7 @@ impl Owner {
                 // first, then the 401 step, which answers the other sends.
                 if error == DiscordApiError::Unauthorized {
                     self.settle_unauthorized(error, false);
-                } else if self.unlink.is_none() {
+                } else if self.unlink.is_none() && !self.replaced() {
                     emit_ready(&self.events, &format!("Send failed: {error}."));
                 }
             }
@@ -1272,10 +1271,33 @@ impl Owner {
         }
     }
 
-    /// The user disconnected. Answer the sends in flight (settle their rows)
-    /// and end the loads, then emit the disconnected state. Nothing of this
-    /// session comes after it.
+    /// The user disconnected. Sends in flight get up to [`SEND_SETTLE_WAIT`]
+    /// for their real result (Codex r4132922551), then the disconnected state
+    /// follows. Loads end at once.
     fn disconnect(&mut self, detail: &'static str, attempt: u64) {
+        self.retire();
+        self.disconnecting = Some((detail, attempt));
+        let mut loads: Vec<(u64, String)> = self.loads.drain().collect();
+        loads.sort_by_key(|(load, _)| *load);
+        for (_, conversation_id) in loads {
+            emit_history_loaded(&self.events, ProtocolId::Discord, conversation_id);
+        }
+        if self.inflight.is_empty() {
+            self.finish_disconnect();
+        } else {
+            self.spawn(async {
+                tokio::time::sleep(SEND_SETTLE_WAIT).await;
+                Msg::DisconnectWaitOver
+            });
+        }
+    }
+
+    /// Reject the sends still in flight (settle their rows), then emit the
+    /// disconnected state. Nothing of this session comes after it.
+    fn finish_disconnect(&mut self) {
+        let Some((detail, attempt)) = self.disconnecting.take() else {
+            return;
+        };
         let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
         sends.sort_by_key(|(request, _)| *request);
         for (request, tracked) in sends {
@@ -1287,12 +1309,6 @@ impl Owner {
                 request,
             );
         }
-        let mut loads: Vec<(u64, String)> = self.loads.drain().collect();
-        loads.sort_by_key(|(load, _)| *load);
-        for (_, conversation_id) in loads {
-            emit_history_loaded(&self.events, ProtocolId::Discord, conversation_id);
-        }
-        self.retire();
         self.closed = true;
         // A later connect or disconnect may have claimed `active` while this
         // message waited, including one that started no session. Then this
