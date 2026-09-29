@@ -3,6 +3,7 @@
 //! FFI and network I/O stay on a dedicated receive thread plus tokio tasks.
 //! Credential values are read from the vault and never logged.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -110,6 +111,9 @@ struct LiveInbox {
     /// Same fact, published by `view_chat` before this worker dequeues
     /// `ViewChat`. History `viewMessages` reads this, not `open_chat`.
     viewed: inbox::ViewedChat,
+    /// Latest incoming message id per chat that arrived while that chat was
+    /// not viewed. Focus calls `viewMessages` through this id.
+    unviewed: HashMap<i64, i64>,
 }
 
 impl LiveInbox {
@@ -510,6 +514,7 @@ fn spawn_tdlib_worker(
             names: NameBook::new(),
             open_chat: None,
             viewed: view.viewed,
+            unviewed: HashMap::new(),
         };
         let requested_view = view.requested;
         let mut commands = Some(cmd_rx);
@@ -566,6 +571,14 @@ fn spawn_tdlib_worker(
                                 // A newer blur or switch already won. Do not
                                 // put this command's chat back.
                                 live.open_chat = live.viewed.get();
+                            }
+                            // Messages that arrived while this chat was not
+                            // viewed never reached viewMessages. Mark through
+                            // the latest one now. `force_read` covers that id.
+                            if let Some((chat_id, message_id)) =
+                                catch_up_read(live.open_chat, &mut live.unviewed)
+                            {
+                                tokio::spawn(mark_message_viewed(client_id, chat_id, message_id));
                             }
                         }
                         TdlibCommand::SendText { conversation_id, body, request } => {
@@ -800,6 +813,7 @@ async fn apply_update(
             // `getChatHistory`. `open_chat` is still the previous command.
             live.open_chat = live.viewed.get();
             let mark_read = live_read_of(&other, live.open_chat);
+            remember_unviewed(&other, live.open_chat, &mut live.unviewed);
             apply_chat_update(other, live, events);
             if let Some((chat_id, message_id)) = mark_read {
                 // A round trip here would stall every later update.
@@ -828,6 +842,34 @@ fn live_read_of(update: &tdlib_rs::enums::Update, open_chat: Option<i64>) -> Opt
 /// not a Telegram chat, leaves no chat open for live `viewMessages`.
 fn apply_viewed_chat(open_chat: &mut Option<i64>, conversation_id: Option<&str>) {
     *open_chat = inbox::viewed_chat_id(conversation_id);
+}
+
+/// An incoming message in a chat the user is not looking at. The latest id
+/// is enough: `viewMessages` with `force_read` marks through that id.
+fn remember_unviewed(
+    update: &tdlib_rs::enums::Update,
+    open_chat: Option<i64>,
+    unviewed: &mut HashMap<i64, i64>,
+) {
+    let tdlib_rs::enums::Update::NewMessage(update) = update else {
+        return;
+    };
+    let message = &update.message;
+    if message.is_outgoing || open_chat == Some(message.chat_id) {
+        return;
+    }
+    let slot = unviewed.entry(message.chat_id).or_insert(message.id);
+    if message.id > *slot {
+        *slot = message.id;
+    }
+}
+
+/// `ViewChat` selected this chat again. Returns the id to pass to
+/// `viewMessages`, if any message arrived while it was not viewed.
+fn catch_up_read(open_chat: Option<i64>, unviewed: &mut HashMap<i64, i64>) -> Option<(i64, i64)> {
+    let chat_id = open_chat?;
+    let message_id = unviewed.remove(&chat_id)?;
+    Some((chat_id, message_id))
 }
 
 /// Ready copies the last `ViewChat` into this worker's cell. `sync_viewed`
@@ -1848,11 +1890,25 @@ mod tests {
     struct FakeTelegram {
         open_chat: Option<i64>,
         viewed: Vec<(i64, i64)>,
+        unviewed: HashMap<i64, i64>,
     }
 
     impl FakeTelegram {
-        fn view(&mut self, conversation_id: Option<&str>) {
+        fn new() -> Self {
+            Self {
+                open_chat: None,
+                viewed: Vec::new(),
+                unviewed: HashMap::new(),
+            }
+        }
+
+        /// `Some(0)` when focus marks messages that arrived while the chat
+        /// was not viewed. That is the unread upsert after `viewMessages`.
+        fn view(&mut self, conversation_id: Option<&str>) -> Option<i32> {
             apply_viewed_chat(&mut self.open_chat, conversation_id);
+            let (chat_id, message_id) = catch_up_read(self.open_chat, &mut self.unviewed)?;
+            self.view_messages(chat_id, message_id);
+            Some(0)
         }
 
         fn view_messages(&mut self, chat_id: i64, message_id: i64) {
@@ -1864,19 +1920,24 @@ mod tests {
             if outgoing {
                 return None;
             }
-            let (chat_id, message_id) =
-                inbox::live_message_to_view(self.open_chat, chat_id, message_id)?;
-            self.view_messages(chat_id, message_id);
-            Some(0)
+            if let Some((chat_id, message_id)) =
+                inbox::live_message_to_view(self.open_chat, chat_id, message_id)
+            {
+                self.view_messages(chat_id, message_id);
+                return Some(0);
+            }
+            remember_unviewed(
+                &live_message(chat_id, message_id, false),
+                self.open_chat,
+                &mut self.unviewed,
+            );
+            None
         }
     }
 
     #[test]
     fn a_live_message_in_the_open_chat_is_marked_viewed() {
-        let mut fake = FakeTelegram {
-            open_chat: None,
-            viewed: Vec::new(),
-        };
+        let mut fake = FakeTelegram::new();
         fake.view(Some("telegram:42"));
         let mut directory = ChatDirectory::new();
         directory.upsert(
@@ -1928,6 +1989,44 @@ mod tests {
             Some(0),
             "focus names the chat again"
         );
+    }
+
+    #[test]
+    fn a_blurred_live_message_is_marked_viewed_when_focus_returns() {
+        let mut fake = FakeTelegram::new();
+        let mut directory = ChatDirectory::new();
+        directory.upsert(
+            42,
+            ChatSeed {
+                title: "Ada",
+                order: 1,
+                unread: 1,
+                preview: "earlier",
+                participant: "Ada",
+                last_at: 1,
+                is_group: false,
+                scope: MuteScope::Private,
+                mute: ChatMute::default(),
+            },
+        );
+        fake.view(Some("telegram:42"));
+        fake.view(None);
+        assert!(
+            fake.receive_live(42, 101, false).is_none(),
+            "a message that arrives while blurred is not marked yet"
+        );
+        assert!(
+            !fake.viewed.contains(&(42, 101)),
+            "blur does not call viewMessages"
+        );
+        let unread = fake
+            .view(Some("telegram:42"))
+            .expect("focus marks through the message that arrived while blurred");
+        assert_eq!(fake.viewed, vec![(42, 101)]);
+        let Some(ChatEffect::Upsert(row)) = directory.set_unread(42, unread) else {
+            panic!("unread upsert");
+        };
+        assert_eq!(row.unread, 0);
     }
 
     #[test]
