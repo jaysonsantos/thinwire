@@ -8,8 +8,9 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
-use super::inbox::{HistoryChat, Inbox, Mute, WaMessage};
+use super::inbox::{self, HistoryChat, Inbox, Mute, WaMessage};
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret,
     emit_status,
@@ -113,6 +114,22 @@ struct State {
     /// events (ADR 0010 rule 1), so the session keeps them in the inbox and
     /// sends the chat page on `Connected`.
     announced: bool,
+    /// The timer for the next timed mute end. One timer runs at a time
+    /// (#168 item 13).
+    mute_timer: Option<MuteTimer>,
+    /// Number of the last mute timer.
+    mute_timers: u64,
+}
+
+/// The timer for the next timed mute end (#168 item 13).
+struct MuteTimer {
+    /// The mute end it waits for (Unix ms).
+    end: i64,
+    /// Its number. A task that is no longer the armed timer does nothing:
+    /// `abort` cannot stop a task that already waits for the lock
+    /// (Codex r4139029620).
+    id: u64,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl LinkEvent {
@@ -209,6 +226,7 @@ impl Session {
     }
 
     fn reset_state(state: &mut State) -> Vec<AdapterEvent> {
+        Self::abort_mute_timer(state);
         state.connected = false;
         state.sender = None;
         state.stopped = None;
@@ -236,6 +254,23 @@ impl Session {
         state.generation = generation;
         state.sender = None;
         state.announced = false;
+        // A timer of the old link has a stale generation: it would never end
+        // a mute of this link (Codex r4138502157).
+        Self::abort_mute_timer(&mut state);
+        state.inbox.new_connection();
+    }
+
+    /// Stop the mute timer. The adapter calls it before `Stopped`, so no row
+    /// comes after it, and the task lets go of the session and the event
+    /// sender (Codex r4139029620).
+    pub(super) fn stop_mute_timer(&self) {
+        Self::abort_mute_timer(&mut self.lock());
+    }
+
+    fn abort_mute_timer(state: &mut State) {
+        if let Some(timer) = state.mute_timer.take() {
+            timer.task.abort();
+        }
     }
 
     /// The session still belongs to link `generation`: no cancel reset it
@@ -250,6 +285,18 @@ impl Session {
     #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
     pub(super) fn set_pairing(&self, pairing: u64) {
         self.lock().pairing = pairing;
+    }
+
+    /// Owners of the session state: the adapter, the link owner, and each
+    /// running timer or send task.
+    #[cfg(test)]
+    pub(super) fn owners(&self) -> usize {
+        Arc::strong_count(&self.state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_mute_timer(&self) -> bool {
+        self.lock().mute_timer.is_some()
     }
 
     pub(super) fn with_inbox<T>(&self, action: impl FnOnce(&mut Inbox) -> T) -> T {
@@ -268,6 +315,7 @@ impl Session {
             return;
         }
         let stop = event.stop_detail();
+        let mute_may_change = matches!(event, LinkEvent::History { .. } | LinkEvent::Mute { .. });
         let out = match event {
             LinkEvent::Qr(code) => vec![AdapterEvent::WhatsAppQr {
                 code,
@@ -304,6 +352,9 @@ impl Session {
             }
             LinkEvent::Disconnected => {
                 state.connected = false;
+                // The next connection starts here: a reconnect can send
+                // History before Connected (Codex r4138502149).
+                state.inbox.new_connection();
                 status(events, AdapterStatus::Connecting, DISCONNECTED);
                 // A reconnect: the shell keeps the session and its rows.
                 vec![account(AccountState::Linking)]
@@ -340,12 +391,69 @@ impl Session {
         if let Some(detail) = stop {
             state.connected = false;
             state.stopped = Some(detail);
+            // Every terminal event ends the link here. The adapter's shutdown
+            // stops the timer through the same helper (Codex r4139171813).
+            Self::abort_mute_timer(&mut state);
             // Logout, ban, or a dead pairing ends the session.
             out.push(account(AccountState::Unlinked));
         }
         for event in out {
             let _ = events.send(event);
         }
+        if mute_may_change {
+            self.arm_mute_timer(&mut state, generation, events);
+        }
+    }
+
+    /// Wake at the next timed mute end, so the row stops being muted then
+    /// and not only at the next message (#168 item 13). An earlier end
+    /// replaces the timer.
+    fn arm_mute_timer(&self, state: &mut State, generation: u64, events: &EventTx) {
+        let Some(end) = state.inbox.next_mute_end() else {
+            return;
+        };
+        if let Some(timer) = &state.mute_timer {
+            if timer.end <= end && !timer.task.is_finished() {
+                return;
+            }
+            timer.task.abort();
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        state.mute_timers += 1;
+        let id = state.mute_timers;
+        let wait = u64::try_from(end.saturating_sub(inbox::now_ms())).unwrap_or(0);
+        let session = self.clone();
+        let events = events.clone();
+        let task = runtime.spawn(async move {
+            // One millisecond more: the sleep clock and the wall clock can
+            // differ. A timer that wakes too early arms again.
+            tokio::time::sleep(Duration::from_millis(wait.saturating_add(1))).await;
+            session.end_mutes(generation, id, &events);
+        });
+        state.mute_timer = Some(MuteTimer { end, id, task });
+    }
+
+    /// Mute timer `id` of link `generation` fired: end the mutes that
+    /// passed. A timer that was stopped or replaced does nothing.
+    fn end_mutes(&self, generation: u64, id: u64, events: &EventTx) {
+        let mut state = self.lock();
+        let armed = state
+            .mute_timer
+            .as_ref()
+            .is_some_and(|timer| timer.id == id);
+        if !armed || state.generation == NO_LINK || state.generation != generation {
+            return;
+        }
+        state.mute_timer = None;
+        let rows = state.inbox.expire_mutes(inbox::now_ms());
+        if state.announced {
+            for row in rows {
+                let _ = events.send(row);
+            }
+        }
+        self.arm_mute_timer(&mut state, generation, events);
     }
 
     /// Apply the result of a send that started on link `generation`, and
@@ -470,5 +578,284 @@ pub(super) mod fake {
                 }
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    use super::*;
+    use crate::whatsapp::inbox::tests::message;
+    use thinwire_protocol::Conversation;
+
+    const CHAT: &str = "111@s.whatsapp.net";
+
+    fn linked() -> (Session, EventTx, UnboundedReceiver<AdapterEvent>) {
+        let session = Session::default();
+        session.begin(1);
+        let (tx, rx) = unbounded_channel();
+        session.apply(LinkEvent::Connected, 1, &tx);
+        (session, tx, rx)
+    }
+
+    fn history(mute: Mute) -> LinkEvent {
+        LinkEvent::History {
+            chats: vec![HistoryChat {
+                jid: CHAT.into(),
+                name: None,
+                unread: 0,
+                timestamp: 10,
+                messages: Vec::new(),
+                mute,
+            }],
+            push_names: Vec::new(),
+        }
+    }
+
+    fn last_row(rx: &mut UnboundedReceiver<AdapterEvent>) -> Option<Conversation> {
+        let mut row = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::ConversationUpsert { conversation } = event {
+                row = Some(conversation);
+            }
+        }
+        row
+    }
+
+    fn armed_end(session: &Session) -> Option<i64> {
+        session.lock().mute_timer.as_ref().map(|timer| timer.end)
+    }
+
+    /// #168 item 12: the session tells the inbox about each connection. A
+    /// history value after a reconnect refreshes a mute that a live change
+    /// of the last connection set.
+    #[test]
+    fn a_reconnect_lets_history_refresh_a_live_mute() {
+        let (session, tx, mut rx) = linked();
+        let live = LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::Forever,
+        };
+        session.apply(live, 1, &tx);
+        session.apply(history(Mute::Off), 1, &tx);
+        assert!(
+            last_row(&mut rx).expect("row").muted,
+            "the live change wins"
+        );
+
+        session.apply(LinkEvent::Disconnected, 1, &tx);
+        session.apply(LinkEvent::Connected, 1, &tx);
+        session.apply(history(Mute::Off), 1, &tx);
+        assert!(
+            !last_row(&mut rx).expect("row").muted,
+            "unmuted while offline"
+        );
+    }
+
+    /// Codex r4138502149: a reconnect can send History before Connected.
+    /// That history value still applies over a live change of the last
+    /// connection.
+    #[test]
+    fn reconnect_history_before_connected_applies_its_mute() {
+        let (session, tx, mut rx) = linked();
+        let live = LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::Forever,
+        };
+        session.apply(live, 1, &tx);
+        session.apply(history(Mute::Off), 1, &tx);
+        assert!(
+            last_row(&mut rx).expect("row").muted,
+            "the live change wins"
+        );
+
+        session.apply(LinkEvent::Disconnected, 1, &tx);
+        session.apply(history(Mute::Off), 1, &tx);
+        assert!(!last_row(&mut rx).expect("row").muted, "before Connected");
+        session.apply(LinkEvent::Connected, 1, &tx);
+        assert!(
+            !last_row(&mut rx).expect("row").muted,
+            "the chat page agrees"
+        );
+    }
+
+    /// Codex r4138502149: a new link is a new connection too. Its history
+    /// before Connected applies over a live change of the old link.
+    #[test]
+    fn a_new_link_lets_history_refresh_a_live_mute() {
+        let (session, tx, mut rx) = linked();
+        let live = LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::Forever,
+        };
+        session.apply(live, 1, &tx);
+        assert!(last_row(&mut rx).expect("row").muted);
+
+        session.begin(2);
+        session.apply(history(Mute::Off), 2, &tx);
+        session.apply(LinkEvent::Connected, 2, &tx);
+        assert!(!last_row(&mut rx).expect("row").muted);
+    }
+
+    /// Codex r4138502157: a new link drops the mute timer of the old link.
+    /// A mute of the new link that ends later gets its own timer.
+    #[tokio::test]
+    async fn a_new_link_drops_the_old_mute_timer() {
+        let (session, tx, _rx) = linked();
+        let now = inbox::now_ms();
+        let mute = |end: i64| LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::UntilMs(end),
+        };
+        session.apply(mute(now + 60_000), 1, &tx);
+        assert_eq!(armed_end(&session), Some(now + 60_000));
+
+        session.begin(2);
+        assert_eq!(armed_end(&session), None, "the old timer is gone");
+        session.apply(LinkEvent::Connected, 2, &tx);
+        session.apply(mute(now + 120_000), 2, &tx);
+        assert_eq!(
+            armed_end(&session),
+            Some(now + 120_000),
+            "a timer of link 2"
+        );
+    }
+
+    /// #168 item 13: at the mute end the row stops being muted, with no new
+    /// message. The window title counts its unread again.
+    #[tokio::test]
+    async fn the_mute_timer_unmutes_the_row_at_its_end() {
+        let (session, tx, mut rx) = linked();
+        session.apply(
+            LinkEvent::Messages(vec![message(CHAT, "a", "one", 1)]),
+            1,
+            &tx,
+        );
+        let end = inbox::now_ms() + 100;
+        let timed = LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::UntilMs(end),
+        };
+        session.apply(timed, 1, &tx);
+        assert!(last_row(&mut rx).expect("row").muted);
+
+        let row = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let AdapterEvent::ConversationUpsert { conversation } =
+                    rx.recv().await.expect("the session is alive")
+                {
+                    return conversation;
+                }
+            }
+        })
+        .await
+        .expect("the timer sends the row");
+        assert!(!row.muted);
+        assert_eq!(row.unread, 1, "its unread counts in the title again");
+        assert!(inbox::now_ms() >= end);
+    }
+
+    /// Codex r4139171813: every terminal link event stops a pending mute
+    /// timer, not only a logout. No event comes after `Unlinked`, and the
+    /// timer task lets go of the session.
+    #[tokio::test]
+    async fn every_terminal_event_stops_the_mute_timer() {
+        for terminal in [
+            LinkEvent::TemporaryBan,
+            LinkEvent::LoggedOut,
+            LinkEvent::PairFailed,
+            LinkEvent::PairThrottled,
+            LinkEvent::QrExhausted,
+        ] {
+            let name = format!("{terminal:?}");
+            let is_ban = matches!(terminal, LinkEvent::TemporaryBan);
+            let (session, tx, mut rx) = linked();
+            let owners = session.owners();
+            let end = inbox::now_ms() + 100;
+            let timed = LinkEvent::Mute {
+                jid: CHAT.into(),
+                mute: Mute::UntilMs(end),
+            };
+            session.apply(timed, 1, &tx);
+            assert!(session.has_mute_timer(), "{name}");
+            assert!(terminal.stops_link(), "{name}");
+
+            session.apply(terminal, 1, &tx);
+            assert!(!session.has_mute_timer(), "{name}: the timer stopped");
+            let mut last = None;
+            while let Ok(event) = rx.try_recv() {
+                last = Some(event);
+            }
+            assert!(
+                matches!(
+                    last,
+                    Some(AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    })
+                ),
+                "{name}: Unlinked is the last event"
+            );
+            if is_ban {
+                // Past the mute end: the stopped timer sends nothing.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(inbox::now_ms() > end);
+                assert!(rx.try_recv().is_err(), "no event after Unlinked");
+            }
+            for _ in 0..100 {
+                if session.owners() <= owners {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(session.owners() <= owners, "{name}: the task let go");
+        }
+    }
+
+    /// Codex r4139029620: `abort` cannot stop a timer task that already
+    /// waits for the lock. The task of a stopped timer does nothing when it
+    /// runs late.
+    #[tokio::test]
+    async fn a_stopped_mute_timer_task_does_nothing() {
+        let (session, tx, mut rx) = linked();
+        let passed = LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::UntilMs(inbox::now_ms() - 1),
+        };
+        // No await from here on: the spawned timer task cannot run.
+        session.apply(passed, 1, &tx);
+        last_row(&mut rx);
+        let id = session
+            .lock()
+            .mute_timer
+            .as_ref()
+            .map(|timer| timer.id)
+            .expect("armed");
+        session.stop_mute_timer();
+        session.end_mutes(1, id, &tx);
+        assert!(last_row(&mut rx).is_none(), "no row from a stopped timer");
+    }
+
+    /// #168 item 13: one timer waits for the earliest end. A reset stops it.
+    #[tokio::test]
+    async fn the_mute_timer_waits_for_the_earliest_end_and_stops_on_reset() {
+        let (session, tx, _rx) = linked();
+        let now = inbox::now_ms();
+        let mute = |jid: &str, end: i64| LinkEvent::Mute {
+            jid: jid.into(),
+            mute: Mute::UntilMs(end),
+        };
+        session.apply(mute(CHAT, now + 120_000), 1, &tx);
+        assert_eq!(armed_end(&session), Some(now + 120_000));
+        session.apply(mute("222@s.whatsapp.net", now + 60_000), 1, &tx);
+        assert_eq!(armed_end(&session), Some(now + 60_000), "the earlier end");
+        session.apply(mute("333@s.whatsapp.net", now + 90_000), 1, &tx);
+        assert_eq!(armed_end(&session), Some(now + 60_000), "a later end waits");
+
+        session.reset();
+        assert_eq!(armed_end(&session), None);
     }
 }

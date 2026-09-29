@@ -120,7 +120,7 @@ impl Mute {
     }
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -159,8 +159,8 @@ struct ChatRecord {
     /// it (Codex r4131089177).
     history_at: i64,
     mute: Mute,
-    /// A live `MuteUpdate` set `mute`: an older history chunk does not
-    /// change it again.
+    /// A live `MuteUpdate` of this connection set `mute`: an older history
+    /// chunk does not change it again. A reconnect clears it (#168 item 12).
     mute_live: bool,
 }
 
@@ -361,6 +361,10 @@ impl Inbox {
             // A mute that ended by its time: the row goes first, so this
             // message sees the chat as not muted.
             let mute_ended = !known && matches!(record.mute, Mute::UntilMs(end) if end <= now_ms());
+            if mute_ended {
+                // Once: a later message sends no extra row (#168 item 13).
+                record.mute = Mute::Off;
+            }
             // A repeat of a stored id is a refresh. Only the first sight of a
             // pushed message is live, so a history replay cannot notify (#32).
             let arrival = if known {
@@ -632,6 +636,49 @@ impl Inbox {
             .body
             .clone();
         Some((body, delivery_event(jid, id, Delivery::Pending)))
+    }
+
+    /// A new connection to the server starts: a reconnect or a new link
+    /// (#168 item 12). The phone can change a mute while thinwire is
+    /// offline, so a history value may be newer than a live change of the
+    /// last connection. A live change of the new connection still wins over
+    /// a later chunk. Call it before the first event of the connection: a
+    /// reconnect can send `History` before `Connected` (Codex r4138502149).
+    pub(super) fn new_connection(&mut self) {
+        for record in self.chats.values_mut() {
+            record.mute_live = false;
+        }
+    }
+
+    /// End every timed mute whose end passed (#168 item 13). The record
+    /// becomes [`Mute::Off`] and sends one row, so the shell counts its
+    /// unread messages again (window title).
+    pub(super) fn expire_mutes(&mut self, now_ms: i64) -> Vec<AdapterEvent> {
+        let mut ended: Vec<String> = self
+            .chats
+            .iter_mut()
+            .filter(|(_, record)| matches!(record.mute, Mute::UntilMs(end) if end <= now_ms))
+            .map(|(jid, record)| {
+                record.mute = Mute::Off;
+                jid.clone()
+            })
+            .collect();
+        ended.sort();
+        ended
+            .iter()
+            .filter_map(|jid| self.upsert_event(jid))
+            .collect()
+    }
+
+    /// The earliest end of a timed mute, in Unix milliseconds.
+    pub(super) fn next_mute_end(&self) -> Option<i64> {
+        self.chats
+            .values()
+            .filter_map(|record| match record.mute {
+                Mute::UntilMs(end) => Some(end),
+                Mute::Off | Mute::Forever => None,
+            })
+            .min()
     }
 
     /// A live mute change from the phone. Returns the new row.
@@ -920,6 +967,93 @@ pub(super) mod tests {
             .expect("message");
         assert!(first_row < the_message);
         assert!(!upserts(&events)[0].muted);
+    }
+
+    /// Unread messages of the rows that are not muted: the shell's window
+    /// title count (`Snapshot::unread_total`).
+    fn title_count(rows: &[&Conversation]) -> u32 {
+        rows.iter()
+            .filter(|row| !row.muted)
+            .map(|row| row.unread)
+            .sum()
+    }
+
+    fn mute_chunk(jid: &str, mute: Mute) -> Vec<HistoryChat> {
+        vec![HistoryChat {
+            jid: jid.into(),
+            name: None,
+            unread: 0,
+            timestamp: 10,
+            messages: Vec::new(),
+            mute,
+        }]
+    }
+
+    /// #168 item 12: after a reconnect, a history value refreshes the mute.
+    /// A live change of the same connection still wins over a later chunk.
+    #[test]
+    fn a_reconnect_lets_a_history_mute_refresh_the_row() {
+        const CHAT: &str = "111@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        inbox.apply_mute(CHAT, Mute::Forever);
+        let rows = inbox.apply_history(mute_chunk(CHAT, Mute::Off), Vec::new());
+        assert!(
+            upserts(&rows)[0].muted,
+            "the live change of this connection wins"
+        );
+
+        inbox.new_connection();
+        let rows = inbox.apply_history(mute_chunk(CHAT, Mute::Off), Vec::new());
+        assert!(
+            !upserts(&rows)[0].muted,
+            "the phone unmuted it while offline"
+        );
+
+        inbox.apply_mute(CHAT, Mute::Forever);
+        let rows = inbox.apply_history(mute_chunk(CHAT, Mute::Off), Vec::new());
+        assert!(upserts(&rows)[0].muted, "a new live change wins again");
+    }
+
+    /// #168 item 13: a timed mute becomes Off when its end passes. Its row
+    /// comes once, not muted, so its unread counts in the title again.
+    #[test]
+    fn an_expired_mute_turns_off_and_counts_in_the_title_again() {
+        const CHAT: &str = "111@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        let end = now_ms() + 60_000;
+        inbox.apply_mute(CHAT, Mute::UntilMs(end));
+        let rows = inbox.apply_messages(vec![
+            message(CHAT, "a", "one", 1),
+            message(CHAT, "b", "two", 2),
+        ]);
+        let last = upserts(&rows).into_iter().last().expect("row");
+        assert_eq!(last.unread, 2);
+        assert_eq!(title_count(&[last]), 0, "a muted chat is not in the title");
+        assert_eq!(inbox.next_mute_end(), Some(end));
+        assert!(inbox.expire_mutes(end - 1).is_empty(), "not yet");
+
+        let rows = inbox.expire_mutes(end);
+        assert_eq!(upserts(&rows).len(), 1);
+        assert_eq!(title_count(&upserts(&rows)), 2, "its unread counts again");
+        assert_eq!(inbox.chats[CHAT].mute, Mute::Off);
+        assert_eq!(inbox.next_mute_end(), None);
+        assert!(inbox.expire_mutes(end + 1).is_empty(), "one row only");
+    }
+
+    /// #168 item 13: a message after the mute end sends the extra row once.
+    #[test]
+    fn an_ended_mute_sends_its_extra_row_once() {
+        const CHAT: &str = "111@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        inbox.apply_mute(CHAT, Mute::UntilMs(1));
+        let first = inbox.apply_messages(vec![message(CHAT, "a", "one", 10)]);
+        assert_eq!(
+            upserts(&first).len(),
+            2,
+            "a row before the message and after it"
+        );
+        let second = inbox.apply_messages(vec![message(CHAT, "b", "two", 11)]);
+        assert_eq!(upserts(&second).len(), 1, "no extra row");
     }
 
     #[test]
