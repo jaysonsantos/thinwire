@@ -64,6 +64,28 @@ struct ChatRecord {
     messages: Vec<WaMessage>,
     /// Local `pending:` ids whose send failed. The user can resend them.
     failed: HashSet<String>,
+    /// The user saw this chat up to this message time (Unix seconds). A later
+    /// history chunk carries the phone's older unread count, so for a chat
+    /// read here only inbound messages newer than this count (#98).
+    read_at: Option<i64>,
+}
+
+impl ChatRecord {
+    /// The user sees every message of this chat now.
+    fn mark_read(&mut self) {
+        self.unread = 0;
+        self.read_at = Some(self.timestamp);
+    }
+
+    /// Inbound messages newer than the local read point.
+    fn unread_after(&self, read_at: i64) -> u32 {
+        let count = self
+            .messages
+            .iter()
+            .filter(|row| !row.from_me && row.timestamp > read_at)
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
 }
 
 /// In-memory WhatsApp inbox for one linked device.
@@ -115,19 +137,23 @@ impl Inbox {
             {
                 record.name = Some(name);
             }
-            // The user reads the open chat, so a later chunk keeps it read.
-            let is_open = self.open.as_deref() == Some(chat.jid.as_str());
-            // Keep live increments: a later chunk can carry an older count.
-            record.unread = if is_open {
-                0
-            } else {
-                record.unread.max(chat.unread)
-            };
             record.timestamp = record.timestamp.max(chat.timestamp);
             for message in chat.messages {
                 remember_name(&mut self.names, &message);
                 record.timestamp = record.timestamp.max(message.timestamp);
                 insert_message(&mut record.messages, message);
+            }
+            // The user reads the open chat, so a later chunk keeps it read.
+            // A chat read here counts only what came after the read (#98).
+            // Else keep live increments: a chunk can carry an older count.
+            if self.open.as_deref() == Some(chat.jid.as_str()) {
+                record.mark_read();
+            } else {
+                let from_chunk = match record.read_at {
+                    Some(read_at) => record.unread_after(read_at),
+                    None => chat.unread,
+                };
+                record.unread = record.unread.max(from_chunk);
             }
             touched.push(chat.jid);
         }
@@ -164,6 +190,9 @@ impl Inbox {
             }
             record.timestamp = record.timestamp.max(message.timestamp);
             insert_message(&mut record.messages, message.clone());
+            if is_open {
+                record.mark_read();
+            }
             events.push(AdapterEvent::MessageReceived {
                 message: self.chat_message(&message, arrival),
             });
@@ -205,7 +234,7 @@ impl Inbox {
     /// Mark a chat open and read. Returns the upsert and the latest messages.
     pub(super) fn open_chat(&mut self, jid: &str) -> Option<Vec<AdapterEvent>> {
         let record = self.chats.get_mut(jid)?;
-        record.unread = 0;
+        record.mark_read();
         self.open = Some(jid.to_string());
         let mut events = Vec::new();
         if let Some(upsert) = self.upsert_event(jid) {
@@ -249,14 +278,23 @@ impl Inbox {
     /// in the viewed chat do not raise unread; a chat the user left counts
     /// again. Viewing a known chat marks it read and returns its upsert.
     pub(super) fn view(&mut self, jid: Option<&str>) -> Option<AdapterEvent> {
+        // The chat the user leaves was read up to its newest message.
+        if let Some(left) = self.open.take()
+            && Some(left.as_str()) != jid
+            && let Some(record) = self.chats.get_mut(&left)
+        {
+            record.read_at = Some(record.timestamp);
+        }
         self.open = jid.map(str::to_string);
         let jid = jid?;
         let record = self.chats.get_mut(jid)?;
-        if record.unread == 0 {
-            return None;
+        let had_unread = record.unread > 0;
+        record.mark_read();
+        if had_unread {
+            self.upsert_event(jid)
+        } else {
+            None
         }
-        record.unread = 0;
-        self.upsert_event(jid)
     }
 
     #[must_use]
@@ -808,6 +846,78 @@ pub(super) mod tests {
         inbox.view(Some("222@s.whatsapp.net"));
         let events = inbox.apply_messages(vec![message(chat, "d", "four", 4)]);
         assert_eq!(upserts(&events)[0].unread, 2);
+    }
+
+    /// #98 (Codex r4104217030): a chat read here and then left stays read
+    /// when a later history chunk repeats the phone's older unread count.
+    /// Only inbound messages newer than the read count.
+    #[test]
+    fn a_chat_read_here_stays_read_after_a_later_chunk() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let chunk = |unread: u32, messages: Vec<WaMessage>| HistoryChat {
+            jid: chat.into(),
+            name: None,
+            unread,
+            timestamp: 10,
+            messages,
+        };
+        inbox.apply_history(
+            vec![chunk(3, vec![message(chat, "a", "one", 10)])],
+            Vec::new(),
+        );
+        assert!(inbox.view(Some(chat)).is_some(), "viewing marks it read");
+        inbox.view(None);
+
+        // The phone still reports 3 unread: the chat stays read.
+        let events = inbox.apply_history(vec![chunk(3, Vec::new())], Vec::new());
+        assert_eq!(upserts(&events)[0].unread, 0);
+
+        // A newer inbound message in a chunk counts; an own message does not.
+        let mut own = message(chat, "c", "mine", 12);
+        own.from_me = true;
+        let events = inbox.apply_history(
+            vec![chunk(5, vec![message(chat, "b", "new", 11), own])],
+            Vec::new(),
+        );
+        assert_eq!(upserts(&events)[0].unread, 1);
+
+        // A chat never read here still takes the phone's count.
+        let other = "222@s.whatsapp.net";
+        let events = inbox.apply_history(
+            vec![HistoryChat {
+                jid: other.into(),
+                name: None,
+                unread: 4,
+                timestamp: 1,
+                messages: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        assert_eq!(upserts(&events)[0].unread, 4);
+    }
+
+    /// Messages that arrive in the open chat move the read point, so leaving
+    /// the chat later keeps them read.
+    #[test]
+    fn messages_seen_in_the_open_chat_stay_read_after_leaving() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![message(chat, "a", "one", 1)]);
+        inbox.view(Some(chat));
+        inbox.apply_messages(vec![message(chat, "b", "two", 2)]);
+        inbox.view(Some("222@s.whatsapp.net"));
+        let events = inbox.apply_history(
+            vec![HistoryChat {
+                jid: chat.into(),
+                name: None,
+                unread: 2,
+                timestamp: 2,
+                messages: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        assert_eq!(upserts(&events)[0].unread, 0);
     }
 
     /// Codex r4103183211: a later history chunk keeps live unread increments.
