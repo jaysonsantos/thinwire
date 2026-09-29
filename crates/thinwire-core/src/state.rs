@@ -2552,20 +2552,17 @@ impl Snapshot {
                 self.open_on_link = Some((protocol, id));
             }
         }
-        // A dropped open of another chat loads nothing: stop its spinner
-        // (qa Low on #111). The marked chat keeps its spinner until Linked.
+        // Every other load of this protocol ends here: a dropped open loads
+        // nothing, and the reconnect can lose one already in flight. Stop
+        // their spinners (qa Low on #111, Codex r4107046484). The marked
+        // chat keeps its spinner until Linked loads it again.
         let marked = self.open_on_link.clone();
-        for command in self.pending.iter().filter(|command| is_open(command)) {
-            if let AdapterCommand::OpenChat {
-                conversation_id, ..
-            } = command
-            {
-                let key = (protocol, conversation_id.clone());
-                if marked.as_ref() != Some(&key) {
-                    self.history_loading.remove(&key);
-                }
-            }
-        }
+        self.history_loading.retain(|(owner, chat)| {
+            *owner != protocol
+                || marked.as_ref().is_some_and(|(marked_owner, marked_chat)| {
+                    marked_owner == owner && marked_chat == chat
+                })
+        });
         self.pending.retain(|command| !is_open(command));
     }
 
@@ -7700,6 +7697,48 @@ mod tests {
         );
     }
 
+    /// Codex r4107046484 (#124): a load of another chat that was already
+    /// sent when a reconnect starts can be lost. Its spinner stops; only the
+    /// selected chat loads again on Linked.
+    #[test]
+    fn a_reconnect_stops_the_spinner_of_a_sent_load_of_another_chat() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        for id in ["slack:C1", "slack:C2"] {
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: chat(ProtocolId::Slack, id, true),
+            });
+        }
+        snapshot.take_commands();
+        snapshot.select_conversation("slack:C1".into());
+        snapshot.take_commands();
+        snapshot.select_conversation("slack:C2".into());
+        snapshot.take_commands();
+        let loading = |snapshot: &Snapshot, id: &str| {
+            snapshot
+                .history_loading
+                .contains(&(ProtocolId::Slack, id.to_owned()))
+        };
+        assert!(loading(&snapshot, "slack:C1") && loading(&snapshot, "slack:C2"));
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert!(
+            !loading(&snapshot, "slack:C1"),
+            "the other chat's spinner stops"
+        );
+        assert!(
+            loading(&snapshot, "slack:C2"),
+            "the selected chat waits for Linked"
+        );
+        link(&mut snapshot, ProtocolId::Slack);
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Slack, "slack:C2".to_owned())]
+        );
+    }
+
     /// Codex on #111: history that comes during the reconnect clears the
     /// reopen mark, so Linked does not load the chat again.
     #[test]
@@ -8269,6 +8308,33 @@ mod tests {
         });
         assert_eq!(snapshot.status_line(), "Slack: Loading chats…");
         assert!(snapshot.status_line_loads());
+    }
+
+    /// #124: the user looks at Slack while a Slack chat loads and a Telegram
+    /// failure is the last status. The strip shows the load of the chat on
+    /// screen first. The Telegram failure shows when that load ends.
+    #[test]
+    fn the_selected_protocols_load_shows_before_a_telegram_failure() {
+        let store = SecretStore::memory();
+        let mut snapshot = telegram_idle_slack_linked(&store);
+        snapshot.select_protocol(ProtocolId::Slack);
+        snapshot
+            .history_loading
+            .insert((ProtocolId::Slack, "slack:C1".to_owned()));
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Telegram,
+            status: AdapterStatus::Error,
+            detail: "Telegram connection lost.".into(),
+        });
+        assert_eq!(snapshot.status_line(), LOADING_MESSAGES_STATUS);
+        assert!(snapshot.status_line_loads());
+
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Slack,
+            conversation_id: "slack:C1".into(),
+        });
+        assert_eq!(snapshot.status_line(), "Telegram connection lost.");
+        assert!(!snapshot.status_line_loads(), "a failure is not busy");
     }
 
     /// #82 qa L1: a load of a protocol with no visible surface does not make
