@@ -27,6 +27,10 @@ use crate::adapter::{AccountState, AdapterStatus, EventTx, ProtocolId, emit_stat
 /// the app, so `Stopped` still fits (#44).
 pub(super) const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 
+/// Longest wait of the owner for one client stop. Below [`SHUTDOWN_WAIT`],
+/// so a shutdown still gets its answer in time (#98).
+pub(super) const STOP_WAIT: Duration = Duration::from_secs(2);
+
 const PAIRING_RUNNING: &str =
     "Experimental WhatsApp pairing is running on the worker. This is not a supported messenger.";
 const DATA_DIR_MISSING: &str =
@@ -34,6 +38,10 @@ const DATA_DIR_MISSING: &str =
 const STORE_FAILED: &str =
     "WhatsApp device store could not be opened under app-data. Nothing was logged.";
 const REVOKE_NOT_SAVED: &str = "WhatsApp unlinked this device, but thinwire could not remove or mark its session file. Check that the app-data folder is writable, then pair again: the next pairing removes the old session first.";
+const STOP_PENDING: &str = "The WhatsApp client did not stop in time. thinwire keeps stopping it. A new pairing waits until it stopped.";
+const STILL_RUNNING: &str = "The last WhatsApp client is still stopping. Wait a moment, then start pairing again. If this stays, restart thinwire.";
+const STOP_ENDED: &str =
+    "The last WhatsApp client stopped. No linked-device session is running. You can pair again.";
 const BUILD_FAILED: &str =
     "WhatsApp pairing client could not be built. No session material was logged.";
 
@@ -43,6 +51,8 @@ pub(super) enum StartError {
     DataDir,
     Store,
     Build,
+    /// An earlier client did not stop yet. Two clients on one store break it.
+    StillRunning,
 }
 
 impl StartError {
@@ -51,6 +61,7 @@ impl StartError {
             Self::DataDir => DATA_DIR_MISSING,
             Self::Store => STORE_FAILED,
             Self::Build => BUILD_FAILED,
+            Self::StillRunning => STILL_RUNNING,
         }
     }
 }
@@ -62,7 +73,8 @@ pub(super) struct Started<B> {
 }
 
 /// Platform work of the link. Only the owner calls it, one call at a time.
-pub(super) trait LinkBackend: Send + Sync + 'static {
+/// `Clone`: a stop runs on its own task, so the owner can bound it.
+pub(super) trait LinkBackend: Clone + Send + Sync + 'static {
     type Bot: Send + 'static;
 
     /// Open the device store, build the client, and spawn it. Client events
@@ -105,6 +117,10 @@ enum Msg {
     Shutdown {
         done: oneshot::Sender<()>,
     },
+    /// A client stop ended. `stop` is its number.
+    StopEnded {
+        stop: u64,
+    },
     #[cfg(test)]
     Flush {
         done: oneshot::Sender<()>,
@@ -140,6 +156,16 @@ pub(super) struct LinkHandle {
 impl LinkHandle {
     /// Spawn the owner task on the current tokio runtime.
     pub(super) fn spawn<B: LinkBackend>(backend: B, session: Session, events: EventTx) -> Self {
+        Self::spawn_with_stop_wait(backend, session, events, STOP_WAIT)
+    }
+
+    /// [`Self::spawn`] with another bound for one client stop.
+    pub(super) fn spawn_with_stop_wait<B: LinkBackend>(
+        backend: B,
+        session: Session,
+        events: EventTx,
+        stop_wait: Duration,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let active = Arc::new(AtomicBool::new(false));
         let owner = Owner {
@@ -151,6 +177,9 @@ impl LinkHandle {
             bot: None,
             stale: false,
             active: Arc::clone(&active),
+            stop_wait,
+            stops: 0,
+            stopping: None,
         };
         tokio::spawn(owner.run(rx));
         Self { tx, active }
@@ -216,6 +245,13 @@ struct Owner<B: LinkBackend> {
     /// A logout revoked the store, and the delete did not succeed yet.
     stale: bool,
     active: Arc<AtomicBool>,
+    /// Longest wait for one client stop ([`STOP_WAIT`]).
+    stop_wait: Duration,
+    /// Number of the last client stop.
+    stops: u64,
+    /// A stop that did not end within `stop_wait`, with its number. It keeps
+    /// running; no new client starts before it ends (#98).
+    stopping: Option<(u64, tokio::task::JoinHandle<()>)>,
 }
 
 impl<B: LinkBackend> Owner<B> {
@@ -224,11 +260,17 @@ impl<B: LinkBackend> Owner<B> {
             match msg {
                 Msg::Begin { phone, pairing } => self.begin(phone, pairing).await,
                 Msg::Client { generation, event } => self.client(generation, event).await,
-                Msg::Cancel => self.stop().await,
-                Msg::Shutdown { done } => {
+                Msg::Cancel => {
                     self.stop().await;
-                    let _ = done.send(());
                 }
+                Msg::Shutdown { done } => {
+                    // Confirm only a client that really stopped. With no
+                    // answer the adapter sends an error, not `Stopped`.
+                    if self.stop().await && !self.still_stopping() {
+                        let _ = done.send(());
+                    }
+                }
+                Msg::StopEnded { stop } => self.stop_ended(stop),
                 #[cfg(test)]
                 Msg::Flush { done } => {
                     let _ = done.send(());
@@ -236,14 +278,22 @@ impl<B: LinkBackend> Owner<B> {
             }
         }
         // Every handle is gone: close the client.
-        self.stop().await;
+        let _ = self.stop().await;
     }
 
     async fn begin(&mut self, phone: Option<String>, pairing: u64) {
         self.generation += 1;
         let generation = self.generation;
-        if let Some(bot) = self.bot.take() {
-            self.backend.stop(bot).await;
+        // A client that did not stop yet still holds the store (#98).
+        if self.still_stopping() {
+            self.fail(StartError::StillRunning);
+            return;
+        }
+        if let Some(bot) = self.bot.take()
+            && !self.stop_bot(bot).await
+        {
+            self.fail(StartError::StillRunning);
+            return;
         }
         self.session.begin(generation);
         self.session.set_pairing(pairing);
@@ -269,7 +319,9 @@ impl<B: LinkBackend> Owner<B> {
         // status (the Cancel message waits behind it in the queue).
         if !self.session.is_link(generation) {
             if let Ok(started) = result {
-                self.backend.stop(started.bot).await;
+                // A slow stop reports itself and blocks the next start; this
+                // start is over either way.
+                let _ = self.stop_bot(started.bot).await;
             }
             self.active.store(false, Ordering::SeqCst);
             return;
@@ -303,11 +355,14 @@ impl<B: LinkBackend> Owner<B> {
         } else {
             true
         };
-        if let Some(bot) = self.bot.take() {
-            self.backend.stop(bot).await;
-        }
+        let stopped = match self.bot.take() {
+            Some(bot) => self.stop_bot(bot).await,
+            None => true,
+        };
         self.active.store(false, Ordering::SeqCst);
-        if self.stale && self.backend.delete_store().await.is_ok() {
+        // A client that still runs holds the store: the next Begin deletes it
+        // after the stop ends.
+        if self.stale && stopped && self.backend.delete_store().await.is_ok() {
             self.stale = false;
         }
         // Neither the mark nor the delete reached the disk: only memory knows
@@ -318,12 +373,67 @@ impl<B: LinkBackend> Owner<B> {
         }
     }
 
-    async fn stop(&mut self) {
+    /// Stop the current client. `false` if it did not stop in time.
+    async fn stop(&mut self) -> bool {
         self.generation += 1;
-        if let Some(bot) = self.bot.take() {
-            self.backend.stop(bot).await;
-        }
+        let stopped = match self.bot.take() {
+            Some(bot) => self.stop_bot(bot).await,
+            None => true,
+        };
         self.active.store(false, Ordering::SeqCst);
+        stopped
+    }
+
+    /// Stop one client on its own task and wait at most `stop_wait`
+    /// (Codex r4104252007). A stop that takes longer keeps running; the owner
+    /// reports it and refuses a new start until it ends.
+    async fn stop_bot(&mut self, bot: B::Bot) -> bool {
+        let backend = self.backend.clone();
+        self.stops += 1;
+        let stop = self.stops;
+        let owner = self.callbacks.clone();
+        let mut task = tokio::spawn(async move {
+            backend.stop(bot).await;
+            // A slow stop clears its error when it ends (#158 review).
+            if let Some(owner) = owner.upgrade() {
+                let _ = owner.send(Msg::StopEnded { stop });
+            }
+        });
+        if tokio::time::timeout(self.stop_wait, &mut task)
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+        self.stopping = Some((stop, task));
+        self.status(AdapterStatus::Error, STOP_PENDING);
+        false
+    }
+
+    /// A slow stop from before still runs.
+    fn still_stopping(&mut self) -> bool {
+        match &self.stopping {
+            Some((_, task)) if !task.is_finished() => true,
+            Some(_) => {
+                self.stopping = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// The slow stop `stop` ended. Replace [`STOP_PENDING`] with the reason
+    /// of the stop, or with "stopped" (#158 review). A stop that ended in
+    /// time, or one that a later start already saw end, sends nothing.
+    fn stop_ended(&mut self, stop: u64) {
+        if !matches!(&self.stopping, Some((pending, _)) if *pending == stop) {
+            return;
+        }
+        self.stopping = None;
+        match self.session.stopped() {
+            Some(reason) => self.status(AdapterStatus::Error, reason),
+            None => self.status(AdapterStatus::Stubbed, STOP_ENDED),
+        }
     }
 
     fn fail(&self, error: StartError) {
@@ -361,6 +471,8 @@ pub(super) mod tests {
         pub delete_failures: AtomicUsize,
         /// `stop` never returns.
         pub stop_hangs: bool,
+        /// `stop` waits for this notify, then returns (a slow stop).
+        pub stop_gate: Option<Arc<Notify>>,
         /// `start` fails with this error.
         pub start_error: Option<StartError>,
         /// The revoked mark "on disk". Survives a new owner (a restart).
@@ -407,6 +519,14 @@ pub(super) mod tests {
             self.0.log.lock().expect("log").push(format!("stop {bot}"));
             if self.0.stop_hangs {
                 std::future::pending::<()>().await;
+            }
+            if let Some(gate) = &self.0.stop_gate {
+                gate.notified().await;
+                self.0
+                    .log
+                    .lock()
+                    .expect("log")
+                    .push(format!("stopped {bot}"));
             }
         }
 
@@ -876,6 +996,134 @@ pub(super) mod tests {
             event,
             AdapterEvent::Status { detail, .. } if detail == REVOKE_NOT_SAVED
         )));
+    }
+
+    fn slow_stop_owner(
+        gate: &Arc<Notify>,
+    ) -> (Shared, LinkHandle, Session, UnboundedReceiver<AdapterEvent>) {
+        let shared = Shared(Arc::new(Fake {
+            stop_gate: Some(Arc::clone(gate)),
+            ..Fake::default()
+        }));
+        let (tx, rx) = unbounded_channel();
+        let session = Session::default();
+        let handle = LinkHandle::spawn_with_stop_wait(
+            shared.clone(),
+            session.clone(),
+            tx,
+            Duration::from_millis(50),
+        );
+        (shared, handle, session, rx)
+    }
+
+    /// #98 (Codex r4104252007): a stop that hangs does not block the owner.
+    /// The owner reports it and refuses a new pairing until the old client
+    /// stopped; then a pairing starts again.
+    #[tokio::test]
+    async fn a_slow_stop_is_bounded_and_blocks_the_next_pairing() {
+        let gate = Arc::new(Notify::new());
+        let (fake, handle, _session, mut rx) = slow_stop_owner(&gate);
+        handle.begin(None, 7);
+        handle.flush().await;
+        drain(&mut rx);
+
+        handle.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle.flush())
+            .await
+            .expect("the owner queue does not wait for the hung stop");
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { status: AdapterStatus::Error, detail, .. } if detail == STOP_PENDING
+        )));
+
+        // A new pairing is refused while the old client still stops.
+        handle.begin(None, 8);
+        handle.flush().await;
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { status: AdapterStatus::Error, detail, .. } if detail == STILL_RUNNING
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Unlinked,
+                ..
+            }
+        )));
+        assert_eq!(fake.log(), vec!["start 1", "stop 1"]);
+        assert!(!handle.is_active());
+
+        // The old client stops. Its error goes (#158 review); then a pairing
+        // starts.
+        gate.notify_one();
+        let ended = wait_for_status(&handle, &mut rx).await;
+        assert_eq!(ended, (AdapterStatus::Stubbed, STOP_ENDED.to_string()));
+        assert!(fake.log().iter().any(|entry| entry == "stopped 1"));
+        handle.begin(None, 9);
+        handle.flush().await;
+        assert_eq!(
+            fake.log(),
+            vec!["start 1", "stop 1", "stopped 1", "start 4"]
+        );
+    }
+
+    /// Poll the owner until it sends a status; return the first one.
+    async fn wait_for_status(
+        handle: &LinkHandle,
+        rx: &mut UnboundedReceiver<AdapterEvent>,
+    ) -> (AdapterStatus, String) {
+        for _ in 0..200 {
+            handle.flush().await;
+            let status = drain(rx).into_iter().find_map(|event| match event {
+                AdapterEvent::Status { status, detail, .. } => Some((status, detail)),
+                _ => None,
+            });
+            if let Some(status) = status {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("no status from the owner");
+    }
+
+    /// #158 review: a logout whose stop ends late gets its reason back, not
+    /// the stop error and not a plain "stopped".
+    #[tokio::test]
+    async fn a_late_stop_end_restores_the_stop_reason() {
+        let gate = Arc::new(Notify::new());
+        let (fake, handle, session, mut rx) = slow_stop_owner(&gate);
+        handle.begin(None, 7);
+        handle.flush().await;
+        fake.callback(1).send(LinkEvent::LoggedOut);
+        handle.flush().await;
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { status: AdapterStatus::Error, detail, .. } if detail == STOP_PENDING
+        )));
+        gate.notify_one();
+        let reason = session.stopped().expect("a logout reason");
+        assert_eq!(
+            wait_for_status(&handle, &mut rx).await,
+            (AdapterStatus::Error, reason.to_string())
+        );
+    }
+
+    /// #98: a shutdown whose stop does not end in time gets no confirmation,
+    /// so the adapter sends no false `Stopped` (#44).
+    #[tokio::test]
+    async fn shutdown_with_a_slow_stop_is_not_confirmed() {
+        let gate = Arc::new(Notify::new());
+        let (_fake, handle, _session, _rx) = slow_stop_owner(&gate);
+        handle.begin(None, 7);
+        handle.flush().await;
+        let started = std::time::Instant::now();
+        assert!(!handle.shutdown_within(Duration::from_secs(2)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the owner answers after its own stop bound"
+        );
+        assert!(STOP_WAIT < SHUTDOWN_WAIT);
     }
 
     /// #44: shutdown waits for a pending start, then stops that client.
