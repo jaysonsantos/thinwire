@@ -77,7 +77,30 @@ impl fmt::Debug for Notification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyCommand {
     Show(Notification),
+    /// Change a notification that already shows, for example to hide its
+    /// text. It never shows a new one: a backend that cannot replace a
+    /// shown notification ignores it, so no second notification with the
+    /// old text appears (#160 review).
+    Update(Notification),
     Dismiss(NotifyKey),
+}
+
+impl NotifyCommand {
+    /// The chat this command is about.
+    #[must_use]
+    pub const fn key(&self) -> &NotifyKey {
+        match self {
+            Self::Show(notification) | Self::Update(notification) => &notification.key,
+            Self::Dismiss(key) => key,
+        }
+    }
+
+    /// `Show` or `Update`: it holds text and may be dropped when the queue
+    /// is full. A `Dismiss` is never dropped.
+    #[must_use]
+    pub const fn is_content(&self) -> bool {
+        !matches!(self, Self::Dismiss(_))
+    }
 }
 
 /// Facts for one decision. The caller reads them from the state and the
@@ -236,11 +259,12 @@ impl Notifications {
         Ok(())
     }
 
-    /// Queue `notification`. It replaces a queued one of the same chat.
+    /// Queue `notification`. It replaces a queued `Show` or `Update` of the
+    /// same chat.
     fn show(&mut self, notification: Notification) {
         let key = notification.key.clone();
         self.queue
-            .retain(|command| !matches!(command, NotifyCommand::Show(shown) if shown.key == key));
+            .retain(|command| !(command.is_content() && command.key() == &key));
         self.push(NotifyCommand::Show(notification));
     }
 
@@ -266,7 +290,19 @@ impl Notifications {
             pending.shown.preview = HIDDEN_PREVIEW.into();
             pending.shown.sender = None;
             let hidden = pending.shown.clone();
-            self.show(hidden);
+            // Not shown yet: the queued `Show` gets the hidden text. Shown:
+            // an `Update`, which a backend with no replace ignores.
+            if let Some(NotifyCommand::Show(queued)) = self
+                .queue
+                .iter_mut()
+                .find(|command| matches!(command, NotifyCommand::Show(queued) if queued.key == key))
+            {
+                *queued = hidden;
+                continue;
+            }
+            self.queue
+                .retain(|command| !matches!(command, NotifyCommand::Update(old) if old.key == key));
+            self.push(NotifyCommand::Update(hidden));
         }
     }
 
@@ -285,7 +321,7 @@ impl Notifications {
             return;
         }
         self.queue
-            .retain(|command| !matches!(command, NotifyCommand::Show(shown) if &shown.key == key));
+            .retain(|command| !(command.is_content() && command.key() == key));
         self.push(NotifyCommand::Dismiss(key.clone()));
     }
 
@@ -336,17 +372,14 @@ impl Notifications {
         self.queue.drain(..).collect()
     }
 
-    /// Add `command`. Over `QUEUE_LIMIT`, drop the oldest `Show`. Never drop
-    /// a `Dismiss`: each one closes a shown notification, and there is at
-    /// most one for each pending chat (#87 review).
+    /// Add `command`. Over `QUEUE_LIMIT`, drop the oldest `Show` or
+    /// `Update`. Never drop a `Dismiss`: each one closes a shown
+    /// notification, and there is at most one for each pending chat
+    /// (#87 review).
     fn push(&mut self, command: NotifyCommand) {
         self.queue.push_back(command);
         while self.queue.len() > QUEUE_LIMIT {
-            let Some(index) = self
-                .queue
-                .iter()
-                .position(|command| matches!(command, NotifyCommand::Show(_)))
-            else {
+            let Some(index) = self.queue.iter().position(NotifyCommand::is_content) else {
                 break;
             };
             self.queue.remove(index);
@@ -670,10 +703,20 @@ mod tests {
             .expect("notifies");
         notes.hide_previews();
         let hidden = notes.take();
-        assert_eq!(hidden.len(), 3, "one replacement for each chat: {hidden:?}");
+        assert_eq!(hidden.len(), 3, "one command for each chat: {hidden:?}");
+        // Chat 1 was still queued: its `Show` got the hidden text. Chats 2
+        // and 3 already show: an `Update`, never a second `Show`.
+        assert!(
+            matches!(&hidden[0], NotifyCommand::Show(shown) if shown.key.conversation_id == "telegram:1")
+        );
+        assert!(
+            hidden[1..]
+                .iter()
+                .all(|command| matches!(command, NotifyCommand::Update(_)))
+        );
         for command in &hidden {
-            let NotifyCommand::Show(shown) = command else {
-                panic!("show")
+            let (NotifyCommand::Show(shown) | NotifyCommand::Update(shown)) = command else {
+                panic!("content")
             };
             assert_eq!(shown.preview, HIDDEN_PREVIEW);
             assert_eq!(shown.sender, None);

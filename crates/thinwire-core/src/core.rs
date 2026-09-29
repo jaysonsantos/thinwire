@@ -1387,11 +1387,12 @@ mod tests {
         core.notify_message(&live(2));
         assert_eq!(core.take_notify().len(), 1);
 
-        // Hide the text: the shown notification is replaced by a hidden one.
+        // Hide the text: the shown notification gets an `Update`, never a
+        // second `Show` (a backend with no replace ignores the update).
         core.dispatch(Intent::SetNotificationPreview(false));
         let hidden = core.take_notify();
         assert!(
-            matches!(&hidden[..], [NotifyCommand::Show(note)] if note.preview == HIDDEN_PREVIEW),
+            matches!(&hidden[..], [NotifyCommand::Update(note)] if note.preview == HIDDEN_PREVIEW),
             "{hidden:?}"
         );
 
