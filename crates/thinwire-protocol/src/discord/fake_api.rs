@@ -8,7 +8,7 @@ use tokio::sync::Notify;
 
 use super::api::{
     ApiFuture, ChannelKind, ChannelSummary, DiscordApi, DiscordApiError, GuildSummary,
-    MessageSummary, Overwrite, OverwriteTarget, SendResultPause,
+    MessageSummary, Overwrite, OverwriteTarget, RegisterPause, SendResultPause,
 };
 use super::permissions::{READ_BITS, SEND_MESSAGES, VIEW_CHANNEL};
 
@@ -73,6 +73,8 @@ pub(crate) struct FakeDiscordApi {
     pub sends_at_hold: AtomicUsize,
     /// When set, a finished send waits after its result event is queued.
     pub send_result_pause: Option<Arc<SendResultPause>>,
+    /// When set, registration waits after the flag checks and before the gate.
+    pub register_pause: Option<Arc<RegisterPause>>,
     /// While false, a one-message preview waits. `None` does not wait.
     pub hold_preview: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub preview_calls: AtomicUsize,
@@ -172,6 +174,7 @@ impl FakeDiscordApi {
             hold_send: None,
             sends_at_hold: AtomicUsize::new(0),
             send_result_pause: None,
+            register_pause: None,
             hold_preview: None,
             preview_calls: AtomicUsize::new(0),
             preview_in_flight: AtomicUsize::new(0),
@@ -306,6 +309,10 @@ impl DiscordApi for FakeDiscordApi {
 
     fn send_result_pause(&self) -> Option<Arc<SendResultPause>> {
         self.send_result_pause.clone()
+    }
+
+    fn register_pause(&self) -> Option<Arc<RegisterPause>> {
+        self.register_pause.clone()
     }
 
     fn unlink_pause(&self) -> Option<Arc<Notify>> {

@@ -6,7 +6,7 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -139,10 +139,44 @@ pub(crate) trait DiscordApi: Send + Sync {
 
     /// Set by tests. The live client leaves this empty.
     ///
+    /// The owner waits here after its flag checks and before it registers the
+    /// send on the account gate, so a connect can close the gate in that gap.
+    fn register_pause(&self) -> Option<Arc<RegisterPause>> {
+        None
+    }
+
+    /// Set by tests. The live client leaves this empty.
+    ///
     /// The 401 step waits here after it has marked the generation revoked and
     /// before it queues `Unlinked`, so a send can reject itself first.
     fn unlink_pause(&self) -> Option<Arc<Notify>> {
         None
+    }
+}
+
+/// Test barrier between the send's flag checks and its gate registration.
+#[derive(Debug, Default)]
+pub(crate) struct RegisterPause {
+    /// The owner has passed its flag checks and is about to register the send.
+    pub arrived: Notify,
+    ready: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl RegisterPause {
+    /// Lets the owner register the send.
+    pub(crate) fn release(&self) {
+        let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        *ready = true;
+        self.cv.notify_one();
+    }
+
+    /// Blocks the owner until [`Self::release`].
+    pub(crate) fn wait(&self) {
+        let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*ready {
+            ready = self.cv.wait(ready).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 }
 

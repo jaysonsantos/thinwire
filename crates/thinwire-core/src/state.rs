@@ -9810,5 +9810,32 @@ mod tests {
         );
     }
 
+    /// #174 item 7: the default shell accepts `Unlinked` for a Discord
+    /// account that was never linked. The account stays idle.
+    #[test]
+    fn an_unlinked_discord_account_that_was_never_linked_stays_idle() {
+        let mut snapshot = Snapshot::new();
+        let selected = snapshot.selected_protocol;
+        let discord = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Discord)
+            .expect("discord is in the catalog");
+        assert_eq!(discord.state, AccountState::Unlinked);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Discord,
+            state: AccountState::Unlinked,
+        });
+        assert!(!snapshot.protocol_linked(ProtocolId::Discord));
+        assert_eq!(snapshot.selected_protocol, selected);
+        assert!(snapshot.error.is_none());
+        let discord = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Discord)
+            .expect("discord stays in the catalog");
+        assert_eq!(discord.state, AccountState::Unlinked);
+    }
+
     // endregion: #135
 }
