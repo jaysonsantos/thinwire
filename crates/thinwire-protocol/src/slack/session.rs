@@ -1049,8 +1049,7 @@ where
         let preview = message.body.clone();
         let outbound = message.outbound;
         let sender = message.sender.clone();
-        emit_message(&self.events, message);
-        let Some(row) = self.channels.get(&channel) else {
+        let Some(mut row) = self.channels.get(&channel).cloned() else {
             // A new DM or a channel the bot just joined. `conversations.list` fills the
             // real title on the next load; until then a DM shows the sender.
             let title = if channel.starts_with('D') {
@@ -1084,10 +1083,14 @@ where
             if conversation.unread > 0 {
                 self.count_unread(&channel, &post_ts);
             }
+            // Core skips a live message whose chat is missing (`UnknownChat`)
+            // and does not reconsider it. The row goes out first, so this
+            // first post can notify. A repeat stays `History` (#160 review).
             self.upsert(channel, conversation);
+            emit_message(&self.events, message);
             return;
         };
-        let mut row = row.clone();
+        emit_message(&self.events, message);
         if order >= row.order {
             row.preview = preview;
             row.order = order;

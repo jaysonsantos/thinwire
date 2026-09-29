@@ -1430,6 +1430,115 @@ async fn editing_the_latest_message_updates_the_preview() {
 }
 
 #[tokio::test]
+async fn a_first_post_in_an_unknown_chat_arrives_after_its_row() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+
+    h.socket.push(SlackInbound::Message(post(
+        "C9",
+        "1700000300.000100",
+        "U1",
+        "first in a new channel",
+    )));
+    let live = h.message("first in a new channel").await;
+    assert_eq!(live.arrival, crate::Arrival::Live);
+    assert_eq!(live.conversation_id, "slack:C9");
+    let channel = h
+        .seen
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C9" => {
+                Some(conversation.clone())
+            }
+            _ => None,
+        })
+        .expect("channel row");
+    assert_eq!(channel.title, "#C9");
+    assert!(channel.is_group);
+    assert_eq!(channel.unread, 1);
+    assert!(
+        row_before_message(&h.seen, "slack:C9", "first in a new channel"),
+        "the row is applied before the live message, so core can notify"
+    );
+
+    h.socket.push(SlackInbound::Message(post(
+        "D9",
+        "1700000301.000100",
+        "U1",
+        "first in a new dm",
+    )));
+    let dm_message = h.message("first in a new dm").await;
+    assert_eq!(dm_message.arrival, crate::Arrival::Live);
+    assert_eq!(dm_message.conversation_id, "slack:D9");
+    let dm = h
+        .seen
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:D9" => {
+                Some(conversation.clone())
+            }
+            _ => None,
+        })
+        .expect("dm row");
+    assert_eq!(dm.title, "Ana");
+    assert!(!dm.is_group);
+    assert_eq!(dm.unread, 1);
+    assert!(row_before_message(&h.seen, "slack:D9", "first in a new dm"));
+
+    h.socket.push(SlackInbound::Message(post(
+        "C9",
+        "1700000300.000100",
+        "U1",
+        "first in a new channel",
+    )));
+    let again = h
+        .until("the repeat", |event| {
+            matches!(
+                event,
+                AdapterEvent::MessageReceived { message }
+                    if message.conversation_id == "slack:C9"
+                        && message.arrival == crate::Arrival::History
+            )
+        })
+        .await;
+    assert!(matches!(again, AdapterEvent::MessageReceived { .. }));
+    let unread = h.seen.iter().rev().find_map(|event| match event {
+        AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C9" => {
+            Some(conversation.unread)
+        }
+        _ => None,
+    });
+    assert_eq!(
+        unread,
+        Some(1),
+        "a retry is history and does not notify again"
+    );
+}
+
+fn row_before_message(seen: &[AdapterEvent], id: &str, body: &str) -> bool {
+    let row = seen.iter().position(|event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation } if conversation.id == id
+        )
+    });
+    let message = seen.iter().position(|event| {
+        matches!(
+            event,
+            AdapterEvent::MessageReceived { message }
+                if message.conversation_id == id && message.body == body
+        )
+    });
+    matches!((row, message), (Some(row), Some(message)) if row < message)
+}
+
+#[tokio::test]
 async fn load_chats_names_a_channel_first_seen_by_id() {
     let vault = installed_vault();
     vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
