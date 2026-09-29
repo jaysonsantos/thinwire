@@ -26,7 +26,7 @@ mod pipe;
 #[cfg(target_os = "linux")]
 mod xdg;
 
-use pipe::{Health, Inbox, Next};
+use pipe::{Inbox, Next, Policy};
 
 /// A failed OS call. Only a fixed kind, never message data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,10 +156,7 @@ impl Drop for Notifier {
 
 /// The thread: take one command, run it on the OS backend, follow `Health`.
 fn run(pipe: &Pipe, mut backend: impl Backend) {
-    let mut health = Health::default();
-    // Failed tries of each chat's `Dismiss` (#165).
-    let mut dismiss_tries: std::collections::HashMap<NotifyKey, u32> =
-        std::collections::HashMap::new();
+    let mut policy = Policy::default();
     loop {
         let command = {
             let mut shared = pipe.lock();
@@ -185,38 +182,18 @@ fn run(pipe: &Pipe, mut backend: impl Backend) {
         if result.is_ok() {
             tracing::debug!(kind, "desktop notification sent to the OS");
         }
-        // A failed `Dismiss` goes back to the inbox, at most
-        // `MAX_DISMISS_TRIES` tries in all, so its notification does not
-        // stay on screen after one busy D-Bus call (#165).
-        let retry = match &command {
-            NotifyCommand::Dismiss(key) if result.is_err() => {
-                let tries = dismiss_tries.entry(key.clone()).or_insert(0);
-                *tries += 1;
-                if *tries < MAX_DISMISS_TRIES {
-                    Some(key.clone())
-                } else {
-                    dismiss_tries.remove(key);
-                    tracing::debug!(kind, "desktop notification dismiss gave up");
-                    None
-                }
-            }
-            NotifyCommand::Dismiss(key) => {
-                dismiss_tries.remove(key);
-                None
-            }
-            _ => None,
-        };
-        let next = health.record(result);
+        // A failed `Dismiss` goes back to the inbox, so its notification
+        // does not stay on screen after one busy D-Bus call (#165).
+        let (next, retry) = policy.record(&command, result);
         if let Next::Wait(wait) = next {
             thread::sleep(wait);
         }
         let mut shared = pipe.lock();
         shared.busy = false;
         if let Some(key) = retry
-            && next != Next::Off
             && !shared.inbox.retry_dismiss(&key)
         {
-            dismiss_tries.remove(&key);
+            policy.forget(&key);
         }
         if next == Next::Off {
             shared.off = true;

@@ -316,6 +316,29 @@ fn close_unwatched(
     first_error.map_or(Ok(()), Err)
 }
 
+/// Start the click waiter of `id` with `spawn`. A failed spawn leaves no
+/// waiter: the id was recorded as watched before, so it moves to the
+/// unwatched list. A replace does not reuse it, and a dismiss can still
+/// close it.
+fn start_waiter(
+    book: &Mutex<IdBook>,
+    waiting: &Mutex<HashSet<u32>>,
+    key: &NotifyKey,
+    id: u32,
+    spawn: impl FnOnce() -> std::io::Result<()>,
+) {
+    if spawn().is_err() {
+        unwatch(book, waiting, key, id);
+    }
+}
+
+/// The last step of a click waiter: the notification closed on the server,
+/// so its id is gone. Never replace it again.
+fn waiter_ended(book: &Mutex<IdBook>, waiting: &Mutex<HashSet<u32>>, id: u32) {
+    lock(book).closed(id);
+    lock(waiting).remove(&id);
+}
+
 /// No click thread watches `id`. It stays dismissible. A replace does not
 /// use it, because nothing learns when it expires.
 fn unwatch(book: &Mutex<IdBook>, waiting: &Mutex<HashSet<u32>>, key: &NotifyKey, id: u32) {
@@ -373,28 +396,23 @@ impl Xdg {
                 let book = Arc::clone(&self.book);
                 let waiting = Arc::clone(&self.waiting);
                 let clicks = Arc::clone(&self.clicks);
-                let spawned = thread::Builder::new()
-                    .name("thinwire-notify-click".into())
-                    .spawn(move || {
-                        // Returns on a click, or when the notification closes.
-                        handle.wait_for_action(|action| {
-                            if action == OPEN_ACTION
-                                && let Some(key) = lock(&book).key_of(id)
-                            {
-                                tracing::info!(kind = "open", "desktop notification clicked");
-                                clicks(key);
-                            }
-                        });
-                        // The id is gone on the server: never replace it again.
-                        lock(&book).closed(id);
-                        lock(&waiting).remove(&id);
-                    });
-                if spawned.is_err() {
-                    // The id was recorded as watched before the thread
-                    // started. Move it to the unwatched list so a replace
-                    // does not reuse it and a dismiss can still close it.
-                    unwatch(&self.book, &self.waiting, &notification.key, id);
-                }
+                start_waiter(&self.book, &self.waiting, &notification.key, id, || {
+                    thread::Builder::new()
+                        .name("thinwire-notify-click".into())
+                        .spawn(move || {
+                            // Returns on a click, or when the notification closes.
+                            handle.wait_for_action(|action| {
+                                if action == OPEN_ACTION
+                                    && let Some(key) = lock(&book).key_of(id)
+                                {
+                                    tracing::info!(kind = "open", "desktop notification clicked");
+                                    clicks(key);
+                                }
+                            });
+                            waiter_ended(&book, &waiting, id);
+                        })
+                        .map(drop)
+                });
             }
         }
         Ok(())
@@ -525,6 +543,17 @@ mod tests {
             "no entry is installed"
         );
         assert!(message.actions.iter().any(|action| action == OPEN_ACTION));
+    }
+
+    /// The #87 KDE fix: Plasma drops a `Notify` that replaces an id it does
+    /// not know, so a new notification sets no id. A replace sets our own.
+    /// notify-rust keeps the id private; its `Debug` output shows it last.
+    #[test]
+    fn a_new_notification_sets_no_id_and_a_replace_sets_its_own() {
+        let new = format!("{:?}", message_for(&note("telegram:1"), NEW_NOTIFICATION));
+        assert!(new.ends_with("id: None }"), "{new}");
+        let replace = format!("{:?}", message_for(&note("telegram:1"), 582));
+        assert!(replace.ends_with("id: Some(582) }"), "{replace}");
     }
 
     #[test]
@@ -750,13 +779,41 @@ mod tests {
     #[test]
     fn a_failed_click_thread_leaves_the_id_dismissible() {
         let book = Mutex::new(IdBook::default());
-        let waiting = Mutex::new(HashSet::from([7]));
+        let waiting = Mutex::new(HashSet::new());
         let ada = key("telegram:1");
-        lock(&book).shown(&ada, 7);
-        unwatch(&book, &waiting, &ada, 7);
+        assert_eq!(after_show(&book, &waiting, &ada, 7), Watch::Start);
+        start_waiter(&book, &waiting, &ada, 7, || Ok(()));
+        assert_eq!(lock(&book).replace_id(&ada), 7, "a started waiter watches");
+
+        let bob = key("telegram:2");
+        assert_eq!(after_show(&book, &waiting, &bob, 8), Watch::Start);
+        start_waiter(&book, &waiting, &bob, 8, || {
+            Err(std::io::Error::other("no thread"))
+        });
+        assert!(!lock(&waiting).contains(&8));
+        assert_eq!(lock(&book).replace_id(&bob), NEW_NOTIFICATION);
+        assert_eq!(lock(&book).forget(&bob).ids(), vec![8]);
+    }
+
+    #[test]
+    fn a_waiter_that_ends_marks_its_id_closed() {
+        let book = Mutex::new(IdBook::default());
+        let waiting = Mutex::new(HashSet::new());
+        let ada = key("telegram:1");
+        assert_eq!(after_show(&book, &waiting, &ada, 7), Watch::Start);
+        waiter_ended(&book, &waiting, 7);
         assert!(lock(&waiting).is_empty());
-        assert_eq!(lock(&book).replace_id(&ada), NEW_NOTIFICATION);
-        assert_eq!(lock(&book).forget(&ada).ids(), vec![7]);
+        assert_eq!(
+            lock(&book).replace_id(&ada),
+            NEW_NOTIFICATION,
+            "a closed id is never replaced"
+        );
+        assert_eq!(lock(&book).key_of(7), None);
+        assert_eq!(
+            after_show(&book, &waiting, &ada, 7),
+            Watch::Start,
+            "the server can use the id again"
+        );
     }
 
     #[derive(Default)]

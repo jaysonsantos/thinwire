@@ -1,10 +1,10 @@
 //! The bounded inbox of the notification thread, and its failure policy.
 //! Pure logic with no OS call, so the tests run on every platform.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use crate::{NotifyCommand, NotifyKey};
+use crate::{BackendError, NotifyCommand, NotifyKey};
 
 /// Most commands that wait for the backend thread. A slow or hung OS
 /// notification service does not grow memory (#87 review).
@@ -140,12 +140,20 @@ impl Health {
         self.off
     }
 
-    pub(crate) fn record(&mut self, result: Result<(), crate::BackendError>) -> Next {
-        let Err(crate::BackendError(kind)) = result else {
+    pub(crate) fn record(&mut self, result: Result<(), BackendError>) -> Next {
+        self.record_try(result, true)
+    }
+
+    /// `counts` is false for a later try of the same command. Its failure
+    /// waits, but it does not add to the failures in a row (#188 review).
+    fn record_try(&mut self, result: Result<(), BackendError>, counts: bool) -> Next {
+        let Err(BackendError(kind)) = result else {
             self.failures = 0;
             return Next::Go;
         };
-        self.failures += 1;
+        if counts {
+            self.failures += 1;
+        }
         if self.failures >= MAX_FAILURES_IN_A_ROW {
             self.off = true;
             tracing::warn!(kind, "desktop notifications are off for this run");
@@ -163,6 +171,54 @@ impl Health {
             tracing::warn!(kind, "desktop notification failed; the app tries again");
         }
         Next::Wait(retry_wait(self.failures))
+    }
+}
+
+/// The failure policy of the thread: the failures in a row, and the tries
+/// of each chat's `Dismiss` (#165). Only the first try of a command counts
+/// in the failures in a row, so two dismisses that keep failing do not turn
+/// notifications off (#188 review).
+#[derive(Debug, Default)]
+pub(crate) struct Policy {
+    health: Health,
+    /// Failed tries of each chat's `Dismiss`.
+    dismiss_tries: HashMap<NotifyKey, u32>,
+}
+
+impl Policy {
+    /// After one OS call: what the thread does next, and the chat of a
+    /// failed `Dismiss` to queue again. A `Dismiss` gets at most
+    /// `MAX_DISMISS_TRIES` tries in all.
+    pub(crate) fn record(
+        &mut self,
+        command: &NotifyCommand,
+        result: Result<(), BackendError>,
+    ) -> (Next, Option<NotifyKey>) {
+        let NotifyCommand::Dismiss(key) = command else {
+            return (self.health.record(result), None);
+        };
+        let failed_before = self.dismiss_tries.remove(key).unwrap_or(0);
+        let next = self.health.record_try(result, failed_before == 0);
+        if result.is_ok() || next == Next::Off {
+            return (next, None);
+        }
+        let tries = failed_before + 1;
+        if tries >= MAX_DISMISS_TRIES {
+            tracing::debug!(kind = "dismiss", "desktop notification dismiss gave up");
+            return (next, None);
+        }
+        self.dismiss_tries.insert(key.clone(), tries);
+        (next, Some(key.clone()))
+    }
+
+    /// The retry of `key` did not go back to the inbox: forget its tries.
+    pub(crate) fn forget(&mut self, key: &NotifyKey) {
+        self.dismiss_tries.remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_off(&self) -> bool {
+        self.health.is_off()
     }
 }
 
@@ -285,5 +341,27 @@ mod tests {
         assert_eq!(retry_wait(1), RETRY_AFTER);
         assert_eq!(retry_wait(2), RETRY_AFTER * 2);
         assert_eq!(retry_wait(40), RETRY_MAX);
+    }
+
+    /// #188 review: only the first try of a `Dismiss` counts in the failures
+    /// in a row. Two dismisses that keep failing (six tries) leave
+    /// notifications on, and the next show goes out.
+    #[test]
+    fn two_failing_dismisses_leave_notifications_on() {
+        let mut policy = Policy::default();
+        let fail = Err(BackendError("close"));
+        for chat in [1, 2] {
+            let dismiss = NotifyCommand::Dismiss(key(chat));
+            for _ in 1..MAX_DISMISS_TRIES {
+                let (next, retry) = policy.record(&dismiss, fail);
+                assert!(matches!(next, Next::Wait(_)));
+                assert_eq!(retry, Some(key(chat)), "tried again");
+            }
+            let (next, retry) = policy.record(&dismiss, fail);
+            assert!(matches!(next, Next::Wait(_)));
+            assert_eq!(retry, None, "the last try gives up");
+        }
+        assert!(!policy.is_off());
+        assert_eq!(policy.record(&show(3, 1), Ok(())), (Next::Go, None));
     }
 }
