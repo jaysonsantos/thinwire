@@ -12,14 +12,15 @@
 //! The adapter keeps a [`Session`] handle. Its methods only send messages. It
 //! reads one-way flags: `ready` (the bot id is known), `ending` (a 401
 //! settled, `Unlinked` is pending), `revoked` (the owner queued `Unlinked`),
-//! and `retired`. The owner sets the first three. [`Session::retire`] sets
-//! `retired` before it returns, so a list or history result already queued
-//! publishes nothing. A send result already queued is still this session's:
-//! a success Discord accepted stays accepted. The flag is not that
-//! retirement. Only a `Retire`, `Disconnect`, or shutdown the owner has
-//! already handled drops a later send.
+//! and `retired`. The owner sets the first three. [`Session::retire`] and
+//! [`Session::disconnect`] set `retired` before they return, so a list or
+//! history result already queued publishes nothing.
 //!
-//! State diagram: `thinwire-team/discord.md`, section "Session owner".
+//! Retirement stops new work only. A send that started before it still gets
+//! its real result, also after the owner has handled the retirement: a send
+//! that went out ends as `SendAccepted`. A send result is dropped only after
+//! the send was already answered: by the end of a disconnect (after its
+//! wait), by the 401 step (after its wait), or by the close of a shutdown.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -203,11 +204,12 @@ struct Flags {
     /// `Stopped` is queued. Whoever sets it first emits it, so it comes once.
     stopped: AtomicBool,
     /// Set by [`Session::retire`] and [`Session::disconnect`] before they
-    /// return. A list or history result already queued still sees it, so
-    /// disconnect can emit `Unlinked` without a later `Linked`, conversation,
-    /// or history row (Codex r4131954091). A send result already queued does
-    /// not use this flag: the owner accepts it until it has handled the
-    /// retirement message (Codex r4132922551).
+    /// return. A list or history result already queued still sees it and
+    /// publishes nothing, so disconnect can emit `Unlinked` without a later
+    /// `Linked`, conversation, or history row (Codex r4131954091). Send
+    /// results do not use it: the owner applies every send result, until the
+    /// send was already answered by the end of a disconnect, the 401 step, or
+    /// a shutdown close (Codex r4132922551).
     retired: AtomicBool,
 }
 
@@ -390,17 +392,17 @@ impl Session {
         }
     }
 
-    /// A later session replaces this one, or the user disconnects. Results
-    /// that are still running are dropped; a send still in flight is rejected
-    /// when its HTTP call ends. The receiver gets the state for the next
-    /// session.
+    /// A later session replaces this one. List and history results that are
+    /// still running are dropped. A send still in flight gets its real
+    /// result when its HTTP call ends. The receiver gets the state for the
+    /// next session.
     ///
     /// Retirement is visible before this returns. A [`Msg::ReloadDone`] or
     /// [`Msg::HistoryDone`] already queued publishes nothing, even though the
-    /// owner handles that message before [`Msg::Retire`]. A [`Msg::SendDone`]
-    /// already queued is still accepted when the HTTP call succeeded. A queued
-    /// success may still emit `SendAccepted` / `MessageReplaced` after a newer
-    /// `Linking` on reconnect (keyed by request and message id; harmless).
+    /// owner handles that message before [`Msg::Retire`]. A send result, queued
+    /// or later, is still applied: it may emit `SendAccepted` and
+    /// `MessageReplaced` after the new session's `Linking` (keyed by request
+    /// and message id).
     pub(crate) fn retire(self) -> oneshot::Receiver<Carried> {
         self.flags.retired.store(true, Ordering::SeqCst);
         let (carried, rx) = oneshot::channel();
@@ -408,11 +410,12 @@ impl Session {
         rx
     }
 
-    /// The user disconnects. The owner answers the sends and loads in
-    /// flight, then emits `detail` as a stubbed status and `Unlinked`, and
-    /// publishes nothing more. So no event of this session follows the
-    /// disconnected state (Codex r4131954091). When the owner is gone, the
-    /// handle emits that state itself.
+    /// The user disconnects. The owner ends the loads at once. Sends in
+    /// flight get up to [`SEND_SETTLE_WAIT`] for their real result; the rest
+    /// are rejected. Then the owner emits `detail` as a stubbed status and
+    /// `Unlinked`, and publishes nothing more. So no event of this session
+    /// follows the disconnected state (Codex r4131954091). When the owner is
+    /// gone, the handle emits that state itself.
     ///
     /// `attempt` is the generation just stored in [`ActiveSession`]. The
     /// owner emits only while that generation is still the newest.
