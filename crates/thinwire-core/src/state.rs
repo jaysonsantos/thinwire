@@ -2552,20 +2552,17 @@ impl Snapshot {
                 self.open_on_link = Some((protocol, id));
             }
         }
-        // A dropped open of another chat loads nothing: stop its spinner
-        // (qa Low on #111). The marked chat keeps its spinner until Linked.
+        // Every other load of this protocol ends here: a dropped open loads
+        // nothing, and the reconnect can lose one already in flight. Stop
+        // their spinners (qa Low on #111, Codex r4107046484). The marked
+        // chat keeps its spinner until Linked loads it again.
         let marked = self.open_on_link.clone();
-        for command in self.pending.iter().filter(|command| is_open(command)) {
-            if let AdapterCommand::OpenChat {
-                conversation_id, ..
-            } = command
-            {
-                let key = (protocol, conversation_id.clone());
-                if marked.as_ref() != Some(&key) {
-                    self.history_loading.remove(&key);
-                }
-            }
-        }
+        self.history_loading.retain(|(owner, chat)| {
+            *owner != protocol
+                || marked.as_ref().is_some_and(|(marked_owner, marked_chat)| {
+                    marked_owner == owner && marked_chat == chat
+                })
+        });
         self.pending.retain(|command| !is_open(command));
     }
 
@@ -7697,6 +7694,48 @@ mod tests {
         assert_eq!(
             open_chats(&mut snapshot),
             vec![(ProtocolId::Slack, "slack:C1".to_owned())]
+        );
+    }
+
+    /// Codex r4107046484 (#124): a load of another chat that was already
+    /// sent when a reconnect starts can be lost. Its spinner stops; only the
+    /// selected chat loads again on Linked.
+    #[test]
+    fn a_reconnect_stops_the_spinner_of_a_sent_load_of_another_chat() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        for id in ["slack:C1", "slack:C2"] {
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: chat(ProtocolId::Slack, id, true),
+            });
+        }
+        snapshot.take_commands();
+        snapshot.select_conversation("slack:C1".into());
+        snapshot.take_commands();
+        snapshot.select_conversation("slack:C2".into());
+        snapshot.take_commands();
+        let loading = |snapshot: &Snapshot, id: &str| {
+            snapshot
+                .history_loading
+                .contains(&(ProtocolId::Slack, id.to_owned()))
+        };
+        assert!(loading(&snapshot, "slack:C1") && loading(&snapshot, "slack:C2"));
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Linking,
+        });
+        assert!(
+            !loading(&snapshot, "slack:C1"),
+            "the other chat's spinner stops"
+        );
+        assert!(
+            loading(&snapshot, "slack:C2"),
+            "the selected chat waits for Linked"
+        );
+        link(&mut snapshot, ProtocolId::Slack);
+        assert_eq!(
+            open_chats(&mut snapshot),
+            vec![(ProtocolId::Slack, "slack:C2".to_owned())]
         );
     }
 
