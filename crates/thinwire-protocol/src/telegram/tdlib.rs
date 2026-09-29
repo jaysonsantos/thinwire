@@ -247,21 +247,28 @@ impl TdlibRuntime {
     /// send, so a history load still inside `getChatHistory` sees the new view
     /// before this command is dequeued.
     pub fn view_chat(&mut self, conversation_id: Option<String>) {
-        *self
-            .requested_view
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = conversation_id.clone();
-        // No worker: keep the request for Ready. Do not start a client.
-        let Some(commands) = &self.commands else {
-            return;
+        let stamp = {
+            let mut requested = self
+                .requested_view
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *requested = conversation_id.clone();
+            // No worker: keep the request for Ready. Do not start a client.
+            if self.commands.is_none() {
+                return;
+            }
+            // Publish before releasing the request lock. Ready reads and
+            // publishes under the same lock, so it cannot restore a chat
+            // this write already replaced.
+            self.viewed
+                .publish(inbox::viewed_chat_id(conversation_id.as_deref()))
         };
-        let stamp = self
-            .viewed
-            .publish(inbox::viewed_chat_id(conversation_id.as_deref()));
-        let _ = commands.send(TdlibCommand::ViewChat {
-            conversation_id,
-            stamp,
-        });
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(TdlibCommand::ViewChat {
+                conversation_id,
+                stamp,
+            });
+        }
     }
 
     pub fn send_text(
@@ -564,14 +571,12 @@ fn spawn_tdlib_worker(
                             conversation_id,
                             stamp,
                         } => {
-                            let chat = inbox::viewed_chat_id(conversation_id.as_deref());
-                            if live.viewed.sync(stamp, chat) {
-                                apply_viewed_chat(&mut live.open_chat, conversation_id.as_deref());
-                            } else {
-                                // A newer blur or switch already won. Do not
-                                // put this command's chat back.
-                                live.open_chat = live.viewed.get();
-                            }
+                            apply_view_command(
+                                &live.viewed,
+                                &mut live.open_chat,
+                                conversation_id.as_deref(),
+                                stamp,
+                            );
                             // Messages that arrived while this chat was not
                             // viewed never reached viewMessages. Mark through
                             // the latest one now. `force_read` covers that id.
@@ -844,6 +849,22 @@ fn apply_viewed_chat(open_chat: &mut Option<i64>, conversation_id: Option<&str>)
     *open_chat = inbox::viewed_chat_id(conversation_id);
 }
 
+/// Apply a queued `ViewChat`. A stamp that lost the race does not write its
+/// chat back; the worker keeps whatever the cell already published.
+fn apply_view_command(
+    viewed: &inbox::ViewedChat,
+    open_chat: &mut Option<i64>,
+    conversation_id: Option<&str>,
+    stamp: u64,
+) {
+    let chat = inbox::viewed_chat_id(conversation_id);
+    if viewed.sync(stamp, chat) {
+        apply_viewed_chat(open_chat, conversation_id);
+    } else {
+        *open_chat = viewed.get();
+    }
+}
+
 /// An incoming message in a chat the user is not looking at. The latest id
 /// is enough: `viewMessages` with `force_read` marks through that id.
 fn remember_unviewed(
@@ -880,11 +901,10 @@ fn apply_requested_view(
     viewed: &inbox::ViewedChat,
     open_chat: &mut Option<i64>,
 ) {
-    let id = requested
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    let chat = inbox::viewed_chat_id(id.as_deref());
+    let requested = requested.lock().unwrap_or_else(PoisonError::into_inner);
+    let chat = inbox::viewed_chat_id(requested.as_deref());
+    // Still holding `requested`. A blur cannot store None and then lose the
+    // generation to this publish.
     let _ = viewed.publish(chat);
     *open_chat = chat;
 }
@@ -2055,6 +2075,49 @@ mod tests {
         apply_requested_view(&runtime.requested_view, &restarted, &mut open);
         assert_eq!(open, None);
         assert_eq!(restarted.get(), None);
+    }
+
+    #[test]
+    fn a_ready_restore_loses_to_a_newer_blur() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let mut runtime = TdlibRuntime::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.commands = Some(tx);
+        for _ in 0..32 {
+            runtime.view_chat(Some("telegram:42".into()));
+            while rx.try_recv().is_ok() {}
+            let requested = Arc::clone(&runtime.requested_view);
+            let viewed = runtime.viewed.clone();
+            let start = Arc::new(Barrier::new(2));
+            let ready = thread::spawn({
+                let start = Arc::clone(&start);
+                move || {
+                    start.wait();
+                    let mut open = Some(42);
+                    apply_requested_view(&requested, &viewed, &mut open);
+                    open
+                }
+            });
+            start.wait();
+            runtime.view_chat(None);
+            let mut open = ready.join().expect("ready");
+            while let Ok(TdlibCommand::ViewChat {
+                conversation_id,
+                stamp,
+            }) = rx.try_recv()
+            {
+                apply_view_command(
+                    &runtime.viewed,
+                    &mut open,
+                    conversation_id.as_deref(),
+                    stamp,
+                );
+            }
+            assert_eq!(runtime.viewed.get(), None, "the blur stays published");
+            assert_eq!(open, None, "the worker does not keep the old chat");
+        }
     }
 
     fn live_message(chat_id: i64, message_id: i64, outgoing: bool) -> tdlib_rs::enums::Update {
