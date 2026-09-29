@@ -28,8 +28,9 @@ pub use theme::install as install_theme;
 pub use theme_mode::apply as apply_theme;
 pub use thinwire_core::settings::Settings;
 
-/// Longest wait for TDLib to close before the window closes anyway.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for TDLib to close before the window closes anyway. The
+/// adapters derive their own shutdown bounds from this limit.
+const SHUTDOWN_TIMEOUT: Duration = thinwire_protocol::APP_CLOSE_LIMIT;
 /// Idle repaint step (10 Hz). The change signal wakes the window at once for
 /// core changes. This timer covers what the core does not see: the OS
 /// light/dark switch in System mode (ADR 0005) and the close deadline.
