@@ -10,8 +10,9 @@
 //!   replaces its notification, and a dismiss closes it.
 //! - Windows: WinRT toasts (`windows`). The same as Linux: one toast per
 //!   chat, replace, dismiss, and click (#161).
-//! - macOS: show only, through `notify-rust`. Click, replace, and dismiss
-//!   are not wired yet.
+//! - macOS: UNUserNotificationCenter (`mac-usernotifications`) inside
+//!   `Thinwire.app`: the same as Windows (#161). With no bundle id
+//!   (`cargo run`), show only through `notify-rust`.
 //!
 //! No log line holds a title, a sender, or message text. A failed OS call
 //! waits and tries the next command; notifications turn off for the run
@@ -24,8 +25,10 @@ use std::time::{Duration, Instant};
 pub use pipe::{INBOX_LIMIT, MAX_DISMISS_TRIES, MAX_FAILURES_IN_A_ROW, RETRY_AFTER, RETRY_MAX};
 pub use thinwire_core::notify::{Notification, NotifyCommand, NotifyKey};
 
+#[cfg(target_os = "macos")]
+mod macos;
 mod pipe;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 mod tagged;
 #[cfg(windows)]
 mod winrt;
@@ -256,9 +259,73 @@ fn platform_backend(clicks: ClickFn) -> impl Backend {
     tagged::Tagged(winrt::Toasts::new(clicks))
 }
 
+/// macOS: the notification center inside `Thinwire.app` on macOS 12 or
+/// later, else show only.
 #[cfg(target_os = "macos")]
-fn platform_backend(_clicks: ClickFn) -> impl Backend {
-    ShowOnly
+fn platform_backend(clicks: ClickFn) -> impl Backend {
+    if mac_choice(macos::os_major()) == MacChoice::ShowOnly {
+        return Mac::ShowOnly(ShowOnly);
+    }
+    match macos::Center::new(clicks) {
+        Some(center) => Mac::Center(tagged::Tagged(center)),
+        None => Mac::ShowOnly(ShowOnly),
+    }
+}
+
+/// The first macOS major version for the notification center backend.
+/// `mac-usernotifications` sets the interruption level of each request, a
+/// macOS 12 API, with no availability check: on macOS 11 the first
+/// notification aborts the app (Codex r4138724926).
+#[cfg(any(target_os = "macos", test))]
+const MIN_CENTER_MACOS: isize = 12;
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacChoice {
+    /// UNUserNotificationCenter, if the process has a bundle id.
+    Center,
+    /// notify-rust, with no UNUserNotificationCenter call at all.
+    ShowOnly,
+}
+
+/// The macOS backend for the OS major version `major`.
+#[cfg(any(target_os = "macos", test))]
+const fn mac_choice(major: isize) -> MacChoice {
+    if major >= MIN_CENTER_MACOS {
+        MacChoice::Center
+    } else {
+        MacChoice::ShowOnly
+    }
+}
+
+#[cfg(target_os = "macos")]
+enum Mac {
+    Center(tagged::Tagged<macos::Center>),
+    ShowOnly(ShowOnly),
+}
+
+#[cfg(target_os = "macos")]
+impl Backend for Mac {
+    fn show(&mut self, notification: &Notification) -> Result<(), BackendError> {
+        match self {
+            Self::Center(center) => center.show(notification),
+            Self::ShowOnly(show) => show.show(notification),
+        }
+    }
+
+    fn update(&mut self, notification: &Notification) -> Result<(), BackendError> {
+        match self {
+            Self::Center(center) => center.update(notification),
+            Self::ShowOnly(show) => show.update(notification),
+        }
+    }
+
+    fn dismiss(&mut self, key: &NotifyKey) -> Result<(), BackendError> {
+        match self {
+            Self::Center(center) => center.dismiss(key),
+            Self::ShowOnly(show) => show.dismiss(key),
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -266,7 +333,8 @@ fn platform_backend(_clicks: ClickFn) -> impl Backend {
     Unsupported
 }
 
-/// macOS: show a notification. No click, replace, or dismiss.
+/// macOS with no bundle (`cargo run`): show a notification. No click,
+/// replace, or dismiss.
 #[cfg(target_os = "macos")]
 struct ShowOnly;
 
@@ -540,6 +608,17 @@ mod tests {
     }
 
     #[test]
+    fn macos_before_12_keeps_show_only() {
+        // The bundle says macOS 11.0 is enough (LSMinimumSystemVersion).
+        // Only macOS 12 and later use the notification center
+        // (Codex r4138724926).
+        assert_eq!(mac_choice(10), MacChoice::ShowOnly);
+        assert_eq!(mac_choice(11), MacChoice::ShowOnly);
+        assert_eq!(mac_choice(12), MacChoice::Center);
+        assert_eq!(mac_choice(26), MacChoice::Center);
+    }
+
+    #[test]
     fn flush_waits_for_the_last_commands() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let fake_seen = Arc::clone(&seen);
@@ -565,6 +644,7 @@ mod tests {
             include_str!("pipe.rs"),
             include_str!("tagged.rs"),
             include_str!("winrt.rs"),
+            include_str!("macos.rs"),
         ] {
             for line in src.lines().filter(|line| line.contains("tracing::")) {
                 for field in ["title", "body", "preview", "sender"] {

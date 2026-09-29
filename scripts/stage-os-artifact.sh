@@ -2,7 +2,7 @@
 # Stage dist/, then write one mode-preserving thinwire-$ARTIFACT.tar.gz.
 # actions/upload-artifact wraps downloads in an outer zip and stores loose
 # files as 644. The tar.gz is what keeps executable bits and the .app tree.
-# macOS: unsigned Thinwire.app. Linux and Windows: flat binary plus notices.
+# macOS: Thinwire.app with an ad-hoc signature only (no Developer ID). Linux and Windows: flat binary plus notices.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,7 +85,12 @@ workspace_version() {
   ' Cargo.toml
 }
 
-if [[ -f target/release/thinwire.exe ]]; then
+# THINWIRE_BIN: stage another binary. Pull-request CI stages a macOS debug
+# build with it, so the bundle signature step runs before main (#161).
+if [[ -n "${THINWIRE_BIN:-}" ]]; then
+  cp "$THINWIRE_BIN" dist/thinwire
+  bin=dist/thinwire
+elif [[ -f target/release/thinwire.exe ]]; then
   cp target/release/thinwire.exe dist/
   bin=dist/thinwire.exe
 else
@@ -173,6 +178,11 @@ EOF
     printf '%s\n' "$leftover"
     exit 1
   fi
+  # Ad-hoc signature for the whole bundle, so macOS knows its bundle id.
+  # The notification center needs it (#161). It is not a Developer ID
+  # signature and there is no notarization (ADR 0003).
+  codesign --force --sign - "$app"
+  codesign --verify --strict "$app"
 fi
 
 if [[ -f dist/thinwire.exe ]]; then

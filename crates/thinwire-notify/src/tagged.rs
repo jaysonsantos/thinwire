@@ -1,6 +1,6 @@
 //! A backend for an OS service that knows each notification by a tag:
-//! Windows toasts (#161). The rules here have no OS code, so Linux CI
-//! tests them.
+//! Windows toasts and the macOS notification center (#161). The rules here
+//! have no OS code, so Linux CI tests them.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -14,6 +14,15 @@ pub(crate) fn tag(key: &NotifyKey) -> String {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// The OS still has `tag`: delivered (on the screen or in the list), or
+/// still pending right after a send. A check of the delivered ids only
+/// misses a pending one, so a dismiss or a hide-text update does nothing
+/// and its text stays (Codex r4138691845).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn listed<S: AsRef<str>>(tag: &str, delivered: &[S], pending: &[S]) -> bool {
+    delivered.iter().chain(pending).any(|id| id.as_ref() == tag)
 }
 
 /// One OS notification service with tags.
@@ -153,6 +162,15 @@ mod tests {
         let long = key(ProtocolId::Slack, &"x".repeat(500));
         assert!(tag(&long).len() <= 64);
         assert!(!tag(&chat).contains("12345"), "no chat id in the OS store");
+    }
+
+    #[test]
+    fn a_pending_notification_counts_as_shown() {
+        let none: [&str; 0] = [];
+        assert!(listed("a", &["a"], &none), "delivered");
+        assert!(listed("a", &none, &["a"]), "pending right after a send");
+        assert!(!listed("a", &["b"], &["c"]));
+        assert!(!listed("a", &none, &none));
     }
 
     #[test]

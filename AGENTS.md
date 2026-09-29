@@ -35,7 +35,7 @@
 | --- | --- |
 | `crates/thinwire/` | Desktop binary: egui frontend. Draws the core view and sends intents |
 | `crates/thinwire-core/` | Frontend-independent core: state, `Intent`, view, change signal, secret store, settings, host wiring, notification rules (`notify`). No egui / eframe / winit (ADR `0010`) |
-| `crates/thinwire-notify/` | OS desktop notifications on their own thread: Linux D-Bus and macOS through `notify-rust`, Windows WinRT toasts through `windows` (#161). No egui (#32) |
+| `crates/thinwire-notify/` | OS desktop notifications on their own thread: Linux D-Bus through `notify-rust`, Windows WinRT toasts through `windows`, macOS UNUserNotificationCenter through `mac-usernotifications` inside `Thinwire.app` on macOS 12+ (show-only through `notify-rust` with no bundle or on macOS 11) (#161). No egui (#32) |
 | `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings, and the Telegram / Slack / Discord adapters. Signal and WhatsApp here are MIT stubs |
 | `crates/thinwire-signal/` | AGPL-3.0-only Signal adapter. `thinwire` depends on it only with feature `signal-local`. `thinwire-protocol` does not depend on it |
 | `crates/thinwire-whatsapp/` | AGPL-3.0-only WhatsApp linked-device adapter (#77). `thinwire` depends on it only with feature `whatsapp-web`. `thinwire-protocol` does not depend on it |
@@ -44,7 +44,7 @@
 | `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh`, `check-core-deps.sh`, `check-release-tree.sh`, `check-agpl-deps.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |
-| `.github/workflows/ci.yml` | Parallel lint/test/build plus the `check` guard. `notify-os` runs clippy and tests of `thinwire-notify` on Windows only when that crate, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, or `ci.yml` changes; `check` accepts its skip |
+| `.github/workflows/ci.yml` | Parallel lint/test/build plus the `check` guard. `notify-os` runs clippy and tests of `thinwire-notify` on Windows and macOS, and on macOS stages a signed `Thinwire.app` from a debug build, only when that crate, `scripts/stage-os-artifact.sh`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, or `ci.yml` changes; `check` accepts its skip |
 | `.github/workflows/os-zips.yml` | Main-only unsigned OS zips with `telegram-tdlib` and publisher secrets (ADR 0003, 0007) |
 | `.github/workflows/release-tag.yml` | Manual tag. No distroless GUI image |
 
