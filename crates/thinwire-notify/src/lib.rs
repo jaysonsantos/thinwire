@@ -4,12 +4,14 @@
 //! shows it. A thread owns the OS backend, so no OS call runs on the UI
 //! thread. The crate has no egui dependency: a TUI can use it too.
 //!
-//! Backends (all through `notify-rust`, MIT or Apache-2.0):
-//! - Linux: freedesktop notifications over D-Bus (pure-Rust zbus). A click
-//!   opens the chat. The newest message of a chat replaces its notification,
-//!   and a dismiss closes it.
-//! - macOS and Windows: show only. Click, replace, and dismiss are not
-//!   wired yet.
+//! Backends (MIT or Apache-2.0):
+//! - Linux: freedesktop notifications over D-Bus (pure-Rust zbus, through
+//!   `notify-rust`). A click opens the chat. The newest message of a chat
+//!   replaces its notification, and a dismiss closes it.
+//! - Windows: WinRT toasts (`windows`). The same as Linux: one toast per
+//!   chat, replace, dismiss, and click (#161).
+//! - macOS: show only, through `notify-rust`. Click, replace, and dismiss
+//!   are not wired yet.
 //!
 //! No log line holds a title, a sender, or message text. A failed OS call
 //! waits and tries the next command; notifications turn off for the run
@@ -23,6 +25,10 @@ pub use pipe::{INBOX_LIMIT, MAX_DISMISS_TRIES, MAX_FAILURES_IN_A_ROW, RETRY_AFTE
 pub use thinwire_core::notify::{Notification, NotifyCommand, NotifyKey};
 
 mod pipe;
+#[cfg(any(windows, test))]
+mod tagged;
+#[cfg(windows)]
+mod winrt;
 #[cfg(target_os = "linux")]
 mod xdg;
 
@@ -245,7 +251,12 @@ fn platform_backend(clicks: ClickFn) -> impl Backend {
     xdg::Xdg::new(clicks)
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(windows)]
+fn platform_backend(clicks: ClickFn) -> impl Backend {
+    tagged::Tagged(winrt::Toasts::new(clicks))
+}
+
+#[cfg(target_os = "macos")]
 fn platform_backend(_clicks: ClickFn) -> impl Backend {
     ShowOnly
 }
@@ -255,11 +266,11 @@ fn platform_backend(_clicks: ClickFn) -> impl Backend {
     Unsupported
 }
 
-/// macOS and Windows: show a notification. No click, replace, or dismiss.
-#[cfg(any(target_os = "macos", windows))]
+/// macOS: show a notification. No click, replace, or dismiss.
+#[cfg(target_os = "macos")]
 struct ShowOnly;
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 impl Backend for ShowOnly {
     fn show(&mut self, notification: &Notification) -> Result<(), BackendError> {
         notify_rust::Notification::new()
@@ -417,7 +428,7 @@ mod tests {
 
     #[test]
     fn a_backend_with_no_replace_shows_no_second_notification() {
-        // macOS and Windows backends keep the default `update`: a hidden
+        // The macOS backend keeps the default `update`: a hidden
         // text must not appear as a second notification (#160 review).
         let seen = Arc::new(Mutex::new(Vec::new()));
         let fake_seen = Arc::clone(&seen);
@@ -552,6 +563,8 @@ mod tests {
             include_str!("lib.rs"),
             include_str!("xdg.rs"),
             include_str!("pipe.rs"),
+            include_str!("tagged.rs"),
+            include_str!("winrt.rs"),
         ] {
             for line in src.lines().filter(|line| line.contains("tracing::")) {
                 for field in ["title", "body", "preview", "sender"] {

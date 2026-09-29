@@ -73,6 +73,8 @@ fn random_suffix() -> io::Result<String> {
 /// Create a new folder, mode 0700. Fails when anything (a folder, a file,
 /// or a symlink) is already at the path.
 pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
+    // Only Unix sets a mode (the Windows clippy job, #161).
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
