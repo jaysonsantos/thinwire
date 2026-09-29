@@ -92,7 +92,15 @@ pub struct DiscordAdapter {
     generation: u64,
     /// The chat `ViewChat` last named. `None` means the user left Discord.
     viewed: Option<String>,
+    /// Longest wait at shutdown for the sends in flight. A test makes it short.
+    #[cfg(any(test, feature = "discord-bot"))]
+    shutdown_limit: std::time::Duration,
 }
+
+/// Longest wait at shutdown for the sends in flight, below the 5 s close
+/// limit of the app.
+#[cfg(any(test, feature = "discord-bot"))]
+const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
 
 impl DiscordAdapter {
     #[must_use]
@@ -110,6 +118,8 @@ impl DiscordAdapter {
             #[cfg(any(test, feature = "discord-bot"))]
             generation: 0,
             viewed: None,
+            #[cfg(any(test, feature = "discord-bot"))]
+            shutdown_limit: SHUTDOWN_LIMIT,
         }
     }
 
@@ -258,8 +268,8 @@ impl DiscordAdapter {
         request: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
-        let _ = events;
-        self.session_mut()?.send(conversation_id, body, request)
+        self.session_mut()?
+            .send(conversation_id, body, request, events)
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
@@ -270,9 +280,8 @@ impl DiscordAdapter {
         request: u64,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
-        let _ = events;
         self.session_mut()?
-            .resend(conversation_id, message_id, request)
+            .resend(conversation_id, message_id, request, events)
     }
 
     #[cfg(not(any(test, feature = "discord-bot")))]
@@ -376,15 +385,15 @@ impl ProtocolAdapter for DiscordAdapter {
     fn shutdown(&mut self, events: &EventTx) {
         #[cfg(any(test, feature = "discord-bot"))]
         {
-            const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
-            let settled = self.session.take().map(session::Session::shutdown);
+            // The owner emits `Stopped` when its sends end, or at the limit,
+            // and publishes nothing after it (Codex r4130981025).
+            let Some(session) = self.session.take() else {
+                super::adapter::emit_stopped(events, ProtocolId::Discord);
+                return;
+            };
+            let closing = session.shutdown(self.shutdown_limit);
             let events = events.clone();
-            tokio::spawn(async move {
-                if let Some(settled) = settled {
-                    let _ = tokio::time::timeout(SHUTDOWN_LIMIT, settled).await;
-                }
-                super::adapter::emit_stopped(&events, ProtocolId::Discord);
-            });
+            tokio::spawn(async move { closing.wait(&events).await });
         }
         #[cfg(not(any(test, feature = "discord-bot")))]
         super::adapter::emit_stopped(events, ProtocolId::Discord);
@@ -1973,6 +1982,113 @@ mod tests {
                 .any(|event| matches!(event, AdapterEvent::SendAccepted { request: 4, .. }))
         );
         assert_eq!(api.state().sent, vec![(GENERAL, "try later".to_string())]);
+    }
+
+    /// Codex r4130981018 on #157: the owner gets a send after its handle is
+    /// gone (Disconnect right after SendText). The send gets `SendRejected`,
+    /// and no optimistic row stays pending.
+    #[tokio::test]
+    async fn a_send_right_before_a_disconnect_leaves_no_pending_row() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        // The previews are done, so no task holds the owner's sender.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "just before".into(),
+                    request: 3,
+                },
+                &tx,
+            )
+            .expect("send");
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        let mut events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 3, .. })
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        events.extend(drain(&mut rx));
+        let removed: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessagesRemoved { message_ids, .. } => Some(message_ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for row in messages(&events) {
+            assert!(
+                !row.id.contains(":pending:") || removed.contains(&row.id),
+                "the optimistic row {} stays pending",
+                row.id
+            );
+        }
+        let results = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::SendAccepted { request: 3, .. }
+                        | AdapterEvent::SendRejected { request: 3, .. }
+                )
+            })
+            .count();
+        assert_eq!(results, 1, "the send has one result");
+    }
+
+    /// Codex r4130981025 on #157: a shutdown that reaches its limit with a
+    /// send still in flight emits `Stopped` once, and the owner publishes
+    /// nothing after it.
+    #[tokio::test]
+    async fn a_late_send_publishes_nothing_after_stopped() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        adapter.shutdown_limit = Duration::from_millis(100);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "stuck".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        adapter.shutdown(&tx);
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Stopped { .. })
+        })
+        .await;
+        hold.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late.iter().any(|event| matches!(
+                event,
+                AdapterEvent::SendAccepted { .. }
+                    | AdapterEvent::SendRejected { .. }
+                    | AdapterEvent::MessageReplaced { .. }
+                    | AdapterEvent::MessagesRemoved { .. }
+                    | AdapterEvent::Stopped { .. }
+            )),
+            "nothing after Stopped: {late:?}"
+        );
     }
 
     #[tokio::test]

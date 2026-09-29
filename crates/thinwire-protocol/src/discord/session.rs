@@ -35,7 +35,7 @@ use crate::adapter::{
     Delivery, EventTx, ProtocolId, emit_account, emit_chat_list_loaded, emit_command_failed,
     emit_conversation, emit_conversation_removed, emit_history_loaded, emit_message,
     emit_message_delivery, emit_message_replaced, emit_notice, emit_send_accepted,
-    emit_send_rejected, emit_status,
+    emit_send_rejected, emit_status, emit_stopped,
 };
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
@@ -149,7 +149,10 @@ enum Msg {
     },
     Shutdown {
         done: oneshot::Sender<()>,
+        limit: Duration,
     },
+    /// The shutdown limit ended with sends still in flight.
+    ShutdownLimit,
     #[cfg(test)]
     Flush {
         done: oneshot::Sender<()>,
@@ -162,6 +165,16 @@ struct Flags {
     ready: AtomicBool,
     ending: AtomicBool,
     revoked: AtomicBool,
+    /// `Stopped` is queued. Whoever sets it first emits it, so it comes once.
+    stopped: AtomicBool,
+}
+
+impl Flags {
+    fn emit_stopped_once(&self, events: &EventTx) {
+        if !self.stopped.swap(true, Ordering::SeqCst) {
+            emit_stopped(events, ProtocolId::Discord);
+        }
+    }
 }
 
 /// The adapter side of a session. Every method only sends a message.
@@ -208,6 +221,7 @@ impl Session {
             unlink: None,
             next_unlink: 0,
             retired: false,
+            closed: false,
             send_tasks: 0,
             shutdown: None,
         };
@@ -250,8 +264,9 @@ impl Session {
         conversation_id: String,
         body: String,
         request: u64,
+        events: &EventTx,
     ) -> Result<(), AdapterError> {
-        self.send_outgoing(conversation_id, request, Outgoing::New(body))
+        self.send_outgoing(conversation_id, request, Outgoing::New(body), events)
     }
 
     /// Posts a failed outgoing row again. The shell names that row and a new request.
@@ -260,8 +275,14 @@ impl Session {
         conversation_id: String,
         message_id: String,
         request: u64,
+        events: &EventTx,
     ) -> Result<(), AdapterError> {
-        self.send_outgoing(conversation_id, request, Outgoing::Retry(message_id))
+        self.send_outgoing(
+            conversation_id,
+            request,
+            Outgoing::Retry(message_id),
+            events,
+        )
     }
 
     fn send_outgoing(
@@ -269,16 +290,27 @@ impl Session {
         conversation_id: String,
         request: u64,
         outgoing: Outgoing,
+        events: &EventTx,
     ) -> Result<(), AdapterError> {
         // An ending or revoked session still answers a send (`SendRejected`).
         if !self.is_ending() && !self.is_revoked() {
             self.check_ready()?;
         }
-        let _ = self.tx.send(Msg::Send {
+        let sent = self.tx.send(Msg::Send {
             conversation_id,
             request,
             outgoing,
         });
+        // The owner is gone, so no row was emitted: answer here, so the send
+        // does not stay open (Codex r4130981018).
+        if let Err(mpsc::error::SendError(Msg::Send {
+            conversation_id,
+            request,
+            ..
+        })) = sent
+        {
+            emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
+        }
         Ok(())
     }
 
@@ -308,12 +340,18 @@ impl Session {
         rx
     }
 
-    /// The app closes. The receiver completes when every send in flight has
-    /// its result. Then the session drops later results.
-    pub(crate) fn shutdown(self) -> oneshot::Receiver<()> {
+    /// The app closes. The owner waits until every send in flight has its
+    /// result, at most `limit`. Then it closes: it emits `Stopped` once and
+    /// publishes nothing more (Codex r4130981025). The returned value waits
+    /// for that, and emits `Stopped` itself only if the owner is gone.
+    pub(crate) fn shutdown(self, limit: Duration) -> Closing {
         let (done, rx) = oneshot::channel();
-        let _ = self.tx.send(Msg::Shutdown { done });
-        rx
+        let _ = self.tx.send(Msg::Shutdown { done, limit });
+        Closing {
+            done: rx,
+            flags: self.flags,
+            limit,
+        }
     }
 
     /// Test hook: completes after the owner handled every earlier message.
@@ -322,6 +360,27 @@ impl Session {
         let (done, rx) = oneshot::channel();
         if self.tx.send(Msg::Flush { done }).is_ok() {
             let _ = rx.await;
+        }
+    }
+}
+
+/// The end of a shutdown. See [`Session::shutdown`].
+pub(crate) struct Closing {
+    done: oneshot::Receiver<()>,
+    flags: Arc<Flags>,
+    limit: Duration,
+}
+
+impl Closing {
+    /// Extra time over the limit before the adapter stops waiting for a
+    /// stuck owner.
+    const MARGIN: Duration = Duration::from_secs(1);
+
+    pub(crate) async fn wait(self, events: &EventTx) {
+        let closed = tokio::time::timeout(self.limit + Self::MARGIN, self.done).await;
+        if !matches!(closed, Ok(Ok(()))) {
+            // The owner is gone or stuck. `Stopped` still comes once.
+            self.flags.emit_stopped_once(events);
         }
     }
 }
@@ -359,6 +418,8 @@ struct Owner {
     next_unlink: u64,
     /// A later session replaced this one, or the app closed.
     retired: bool,
+    /// The app closed: `Stopped` is queued and nothing more is published.
+    closed: bool,
     /// HTTP send tasks still running. Shutdown waits for zero.
     send_tasks: u64,
     shutdown: Option<oneshot::Sender<()>>,
@@ -379,6 +440,14 @@ impl Owner {
     }
 
     fn handle(&mut self, msg: Msg) {
+        if self.closed {
+            // After `Stopped`, nothing more is published.
+            #[cfg(test)]
+            if let Msg::Flush { done } = msg {
+                let _ = done.send(());
+            }
+            return;
+        }
         match msg {
             Msg::Reload => self.reload(),
             Msg::Open { conversation_id } => self.open(conversation_id),
@@ -428,10 +497,15 @@ impl Owner {
                 self.retire();
                 let _ = carried.send(std::mem::take(&mut self.carried));
             }
-            Msg::Shutdown { done } => {
+            Msg::Shutdown { done, limit } => {
                 self.shutdown = Some(done);
+                self.spawn(async move {
+                    tokio::time::sleep(limit).await;
+                    Msg::ShutdownLimit
+                });
                 self.finish_shutdown_if_idle();
             }
+            Msg::ShutdownLimit => self.close(),
             #[cfg(test)]
             Msg::Flush { done } => {
                 let _ = done.send(());
@@ -573,6 +647,13 @@ impl Owner {
             emit_notice(&self.events, ProtocolId::Discord, READ_ONLY_REFUSAL);
             return;
         }
+        // The session handle is gone (a disconnect, reconnect, or shutdown
+        // follows): no call can report back. Reject before any row shows, so
+        // no optimistic row stays pending (Codex r4130981018).
+        let Some(tx) = self.tx.upgrade() else {
+            reject(self);
+            return;
+        };
         let (body, message_id, row) = match outgoing {
             Outgoing::New(body) => {
                 self.next_pending += 1;
@@ -607,10 +688,6 @@ impl Owner {
                 };
                 (body, message_id, SendRow::Retry)
             }
-        };
-        let Some(tx) = self.tx.upgrade() else {
-            reject(self);
-            return;
         };
         self.inflight.insert(
             request,
@@ -1029,13 +1106,21 @@ impl Owner {
     }
 
     fn finish_shutdown_if_idle(&mut self) {
-        if self.send_tasks > 0 {
+        if self.send_tasks == 0 {
+            self.close();
+        }
+    }
+
+    /// Ends a shutdown: retire, emit `Stopped` once, and publish nothing
+    /// more, also when sends are still in flight after the limit.
+    fn close(&mut self) {
+        let Some(done) = self.shutdown.take() else {
             return;
-        }
-        if let Some(done) = self.shutdown.take() {
-            self.retire();
-            let _ = done.send(());
-        }
+        };
+        self.retire();
+        self.closed = true;
+        self.flags.emit_stopped_once(&self.events);
+        let _ = done.send(());
     }
 
     /// Runs HTTP work off the owner. Its result comes back as a message. The
