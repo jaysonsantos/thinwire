@@ -496,6 +496,10 @@ pub struct Snapshot {
     api_source: TelegramApiSource,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
+    /// Accounts that ended for good in this pump: a Telegram session that
+    /// another device or Telegram ended. The core drops their thinwire
+    /// mutes (#153 review). A reconnect or an app stop never adds one.
+    ended_accounts: Vec<ProtocolId>,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_screen: WhatsAppScreen,
     #[cfg(feature = "whatsapp-web")]
@@ -671,6 +675,7 @@ impl Snapshot {
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
             keychain_flush: false,
+            ended_accounts: Vec::new(),
             #[cfg(feature = "whatsapp-web")]
             whatsapp_screen: WhatsAppScreen::Hidden,
             #[cfg(feature = "whatsapp-web")]
@@ -978,6 +983,13 @@ impl Snapshot {
     #[must_use]
     pub fn take_keychain_flush(&mut self) -> bool {
         std::mem::take(&mut self.keychain_flush)
+    }
+
+    /// Accounts that ended for good since the last call. See
+    /// `ended_accounts`.
+    #[must_use]
+    pub(crate) fn take_ended_accounts(&mut self) -> Vec<ProtocolId> {
+        std::mem::take(&mut self.ended_accounts)
     }
 
     /// Start TDLib with no click when the keychain holds a saved session.
@@ -2480,6 +2492,9 @@ impl Snapshot {
         }
         self.telegram_authorized = false;
         self.end_session(ProtocolId::Telegram);
+        // The next account on this machine must not get this account's
+        // mutes, as it does not get its drafts (#153 review).
+        self.ended_accounts.push(ProtocolId::Telegram);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
         self.error = None;

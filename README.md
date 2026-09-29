@@ -154,6 +154,8 @@ Desktop notifications (#32) show a new message when you do not look at its chat.
   - A protocol mute wins. A chat that the protocol mutes shows "Muted in Telegram" (or its protocol), and only that protocol can unmute it.
   - The thinwire mute stays on this computer. It does not change the mute on your phone or in other apps.
   - The muted chats are stored in `muted_chats` in the platform data dir (`~/.local/share/thinwire/muted_chats` on Linux), with file mode 0600. Chat ids can hold personal data (a WhatsApp id holds a phone number), so the file is not next to `settings.toml`.
+  - When the mutes go: the Telegram mutes go when the Telegram session ends for good (a logout from another device, or Telegram ended the session). The next account on this computer does not get them. A reconnect, an app restart, or a stopped client keeps every mute. The other protocols have no account removal in the app yet, so their mutes stay in the file until you unmute the chats or delete the file.
+  - If the app cannot read `muted_chats` (for example, no read permission), it does not change the file. New mutes then work until the app closes.
 - A chat whose mute the app cannot read notifies, unless you mute it in thinwire. Turn off "Show notifications" if that is too much.
 - The window title shows the unread count of chats that are not muted, for example "thinwire (3)".
 - Privacy: a notification sends the chat title, the sender in a group, and up to 120 characters of the message to the OS notification service. "Hide message text" sends "New message" only, with no sender. thinwire never writes message text to its log.

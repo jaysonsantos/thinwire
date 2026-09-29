@@ -220,6 +220,12 @@ impl Settings {
         self.mutes.set(protocol, conversation_id, muted)
     }
 
+    /// Drop every thinwire mute of `protocol`: its account ended for good
+    /// (#153 review). Disk persist is queued.
+    pub fn forget_chat_mutes(&mut self, protocol: ProtocolId) {
+        self.mutes.forget(protocol);
+    }
+
     /// Take the latest queued write of the muted chats. The UI thread must
     /// `spawn_blocking` this.
     #[must_use]
