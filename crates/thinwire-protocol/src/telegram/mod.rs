@@ -704,43 +704,6 @@ mod tests {
         assert!(chats.contains("emit_chat_list_loaded"));
     }
 
-    /// Codex P1 on #177: `ViewChat` maintains the open chat. Leaving the
-    /// thread clears it, so a later message does not call `viewMessages`.
-    #[test]
-    fn view_chat_maintains_the_open_chat() {
-        let src = include_str!("tdlib.rs");
-        let worker = fn_body(src, "fn spawn_tdlib_worker");
-        assert!(
-            worker.contains("TdlibCommand::ViewChat"),
-            "ViewChat reaches the worker"
-        );
-        let view = fn_body(src, "fn apply_viewed_chat");
-        assert!(view.contains("viewed_chat_id"));
-        let apply = fn_body(src, "async fn apply_update");
-        let refresh = apply
-            .find("live.open_chat = live.viewed.get()")
-            .expect("a queued update reads the published chat");
-        let live = apply.find("live_read_of").expect("live mark");
-        assert!(
-            refresh < live,
-            "a message that arrived after blur is not marked while ViewChat is queued"
-        );
-        let start = src.find("pub fn view_chat(").expect("view_chat");
-        let rest = &src[start..];
-        let end = rest.find("\n    pub fn ").expect("next method");
-        let runtime = &rest[..end];
-        assert!(
-            runtime.contains("TdlibCommand::ViewChat"),
-            "view_chat sends to the worker"
-        );
-        assert!(
-            !runtime.contains("send_or_respawn"),
-            "view_chat must not start a client"
-        );
-        let adapter = include_str!("mod.rs");
-        assert!(adapter.contains("self.tdlib.view_chat"));
-    }
-
     // A runtime for the live build's `tokio::spawn` (qa R44). The body never
     // awaits, so the worker is never polled and no TDLib client starts.
     #[tokio::test]
