@@ -129,6 +129,19 @@ impl Owner {
         self.session.set_pairing(pairing);
         self.worker = (self.start)(&self.session, events);
         self.generation = self.session.generation();
+        if self.worker.is_none() {
+            self.session.shutdown();
+            // The link failure dialog is created only while `signal_started`
+            // is set. Unlinked clears that flag, so the error has to land first.
+            emit_status(
+                events,
+                ProtocolId::Signal,
+                AdapterStatus::Error,
+                "Signal worker could not start. No session was opened.",
+            );
+            emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
+            return;
+        }
         emit_status(
             events,
             ProtocolId::Signal,
@@ -164,7 +177,7 @@ impl Owner {
             })
             .await;
         }
-        self.session.shutdown().await;
+        self.session.shutdown();
     }
 }
 
@@ -256,5 +269,51 @@ mod tests {
             }
         }
         assert!(saw_unlinked && saw_connecting);
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_fails_to_spawn_reports_the_error_before_unlinked() {
+        let session = Arc::new(Session::new());
+        let handle = Handle::spawn(
+            Arc::clone(&session),
+            Box::new(|session, _events| {
+                session.mark_active();
+                None
+            }),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle.begin(1, &tx);
+        handle.flush().await;
+        assert!(!session.is_active());
+        let mut order = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                } => order.push("unlinked"),
+                AdapterEvent::Status {
+                    status: AdapterStatus::Error,
+                    detail,
+                    ..
+                } => {
+                    assert!(
+                        detail.contains("could not start"),
+                        "worker-start failure detail, got {detail}"
+                    );
+                    order.push("error");
+                }
+                AdapterEvent::Status {
+                    status: AdapterStatus::Connecting,
+                    ..
+                } => order.push("connecting"),
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(
+            order,
+            ["error", "unlinked"],
+            "Unlinked clears signal_started before the link failure dialog is created"
+        );
     }
 }
