@@ -1,0 +1,21 @@
+[package]
+name = "thinwire-whatsapp"
+version.workspace = true
+edition.workspace = true
+license = "AGPL-3.0-only"
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Local-only WhatsApp linked-device adapter (AGPL-3.0-only). Not in release builds."
+
+[features]
+default = []
+# Links whatsapp-rust and its AGPL `wacore-libsignal`. thinwire enables this
+# only through its `whatsapp-web` feature. Default CI stays off (ADR 0011).
+whatsapp-web = []
+
+[dependencies]
+thinwire-protocol.workspace = true
+
+[lints]
+workspace = true

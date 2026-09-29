@@ -26,7 +26,7 @@ if command -v nixfmt >/dev/null; then
   nixfmt --check flake.nix
 fi
 if command -v editorconfig-checker >/dev/null; then
-  editorconfig-checker -exclude 'crates/thinwire-signal/LICENSE'
+  editorconfig-checker -exclude 'crates/thinwire-(signal|whatsapp)/LICENSE'
 fi
 if command -v gitleaks >/dev/null; then
   gitleaks detect --no-git --source . --redact
