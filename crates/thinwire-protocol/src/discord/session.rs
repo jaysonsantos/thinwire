@@ -140,6 +140,9 @@ struct Inflight {
 pub(crate) struct AccountSends {
     /// False after `Unlinked` or `Stopped`. A later result publishes nothing.
     open: bool,
+    /// Bumped when a session opens the account, and when shutdown stops it.
+    /// A seal publishes only for the epoch that armed it.
+    epoch: u64,
     inflight: HashMap<u64, Inflight>,
 }
 
@@ -148,6 +151,7 @@ pub(crate) type SharedSends = Arc<Mutex<AccountSends>>;
 pub(crate) fn shared_sends() -> SharedSends {
     Arc::new(Mutex::new(AccountSends {
         open: true,
+        epoch: 0,
         inflight: HashMap::new(),
     }))
 }
@@ -173,6 +177,25 @@ impl AccountSends {
         }
         self.open = false;
         IdleEnd::Ended
+    }
+
+    /// Answers every open send, then emits `Stopped`. The epoch moves, so a
+    /// retiring owner seals nothing after this.
+    pub(crate) fn stop(&mut self, events: &EventTx) {
+        let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
+        sends.sort_by_key(|(request, _)| *request);
+        self.open = false;
+        self.epoch = self.epoch.saturating_add(1);
+        for (request, tracked) in &sends {
+            settle_row(events, tracked);
+            emit_send_rejected(
+                events,
+                ProtocolId::Discord,
+                &tracked.conversation_id,
+                *request,
+            );
+        }
+        emit_stopped(events, ProtocolId::Discord);
     }
 }
 
@@ -334,13 +357,12 @@ impl Session {
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let flags = Arc::new(Flags::default());
-        {
+        // The epoch bump and `Linking` share the gate lock, so an older seal
+        // cannot emit `Unlinked` after this link.
+        let epoch = {
             let mut gate = sends.lock().unwrap_or_else(PoisonError::into_inner);
-            // A previous end closed the account. This link opens it again.
-            // Sends still in flight stay: they belong to this account.
+            gate.epoch = gate.epoch.saturating_add(1);
             gate.open = true;
-        }
-        {
             let mut newest = active.lock().unwrap_or_else(PoisonError::into_inner);
             *newest = id;
             emit_account(events, ProtocolId::Discord, AccountState::Linking);
@@ -350,7 +372,8 @@ impl Session {
                 AdapterStatus::Connecting,
                 format!("Discord bot inbox is loading guild channels. {BOT_TOKEN_PRESENT}."),
             );
-        }
+            gate.epoch
+        };
         let owner = Owner {
             api,
             events: events.clone(),
@@ -359,6 +382,7 @@ impl Session {
             flags: Arc::clone(&flags),
             active: Arc::clone(active),
             account: Arc::clone(sends),
+            epoch,
             id,
             carried: Carried::default(),
             bot_id: None,
@@ -634,6 +658,9 @@ struct Owner {
     active: ActiveSession,
     /// See [`AccountSends`]. Shared with every session of this account.
     account: SharedSends,
+    /// The gate epoch this session opened. A seal for an older epoch publishes
+    /// nothing.
+    epoch: u64,
     id: u64,
     carried: Carried,
     bot_id: Option<u64>,
@@ -891,11 +918,12 @@ impl Owner {
     }
 
     fn send(&mut self, conversation_id: String, request: u64, outgoing: Outgoing) {
+        let reject_conversation = conversation_id.clone();
         let reject = |owner: &Self| {
             emit_send_rejected(
                 &owner.events,
                 ProtocolId::Discord,
-                &conversation_id,
+                &reject_conversation,
                 request,
             );
         };
@@ -929,10 +957,48 @@ impl Owner {
         // The session handle is gone (a disconnect, reconnect, or shutdown
         // follows): no call can report back. Reject before any row shows, so
         // no optimistic row stays pending (Codex r4130981018).
-        let Some(tx) = self.tx.upgrade() else {
+        let Some(tx) = self.tx.upgrade().or_else(|| self.tx_hold.clone()) else {
             reject(self);
             return;
         };
+        // A test closes the gate in this gap. The flag check above is already
+        // done; registration below re-checks the gate.
+        if let Some(pause) = self.api.register_pause() {
+            pause.arrived.notify_one();
+            tokio::task::block_in_place(|| pause.wait());
+        }
+        let Some(body) = self.register_send(conversation_id, request, outgoing, bot_id) else {
+            reject(self);
+            return;
+        };
+        self.send_tasks += 1;
+        let api = Arc::clone(&self.api);
+        tokio::spawn(async move {
+            let result = api.send(access.channel_id, body).await;
+            let _ = tx.send(Msg::SendDone { request, result });
+            // The result is with the owner now. A test can run a 401 here.
+            if let Some(pause) = api.send_result_pause() {
+                pause.arrived.notify_one();
+                pause.release.notified().await;
+            }
+        });
+    }
+
+    /// Checks the gate, inserts the send, and emits a new pending row, in one
+    /// lock hold. Returns the body to post. `None` rejects with no row: the
+    /// account is closed, or this session's epoch has ended.
+    fn register_send(
+        &mut self,
+        conversation_id: String,
+        request: u64,
+        outgoing: Outgoing,
+        bot_id: u64,
+    ) -> Option<String> {
+        let events = self.events.clone();
+        let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
+        if !gate.open || gate.epoch != self.epoch {
+            return None;
+        }
         let (body, message_id, row) = match outgoing {
             Outgoing::New(body) => {
                 self.next_pending += 1;
@@ -941,7 +1007,7 @@ impl Owner {
                     .bodies()
                     .insert(message_id.clone(), body.clone());
                 emit_message(
-                    &self.events,
+                    &events,
                     ChatMessage {
                         protocol: ProtocolId::Discord,
                         conversation_id: conversation_id.clone(),
@@ -957,16 +1023,12 @@ impl Owner {
                 (body, message_id, SendRow::Pending)
             }
             Outgoing::Retry(message_id) => {
-                let Some(body) = self
+                let body = self
                     .carried
                     .bodies()
                     .get(&message_id)
                     .cloned()
-                    .filter(|text| !text.trim().is_empty())
-                else {
-                    reject(self);
-                    return;
-                };
+                    .filter(|text| !text.trim().is_empty())?;
                 (body, message_id, SendRow::Retry)
             }
         };
@@ -976,23 +1038,10 @@ impl Owner {
             row,
             bot_id,
         };
-        self.account
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .inflight
-            .insert(request, tracked.clone());
+        gate.inflight.insert(request, tracked.clone());
+        drop(gate);
         self.inflight.insert(request, tracked);
-        self.send_tasks += 1;
-        let api = Arc::clone(&self.api);
-        tokio::spawn(async move {
-            let result = api.send(access.channel_id, body).await;
-            let _ = tx.send(Msg::SendDone { request, result });
-            // The result is with the owner now. A test can run a 401 here.
-            if let Some(pause) = api.send_result_pause() {
-                pause.arrived.notify_one();
-                pause.release.notified().await;
-            }
-        });
+        Some(body)
     }
 
     fn reload_done(
@@ -1382,7 +1431,7 @@ impl Owner {
         // predecessor result cannot land after the account ends.
         let events = self.events.clone();
         let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
-        if !gate.open {
+        if !gate.open || gate.epoch != self.epoch {
             return;
         }
         reject_open(&mut self.inflight, &self.carried, &events, &mut gate);
@@ -1537,7 +1586,7 @@ impl Owner {
         }
         let events = self.events.clone();
         let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
-        if !gate.open {
+        if !gate.open || gate.epoch != self.epoch {
             return false;
         }
         reject_open(&mut self.inflight, &self.carried, &events, &mut gate);
@@ -1556,7 +1605,7 @@ impl Owner {
     fn seal_disconnect(&mut self, detail: &'static str, attempt: u64) -> bool {
         let events = self.events.clone();
         let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
-        if !gate.open {
+        if !gate.open || gate.epoch != self.epoch {
             return false;
         }
         let newest = self.active.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1580,7 +1629,7 @@ impl Owner {
     fn reject_account_sends(&mut self) {
         let events = self.events.clone();
         let mut gate = self.account.lock().unwrap_or_else(PoisonError::into_inner);
-        if !gate.open {
+        if !gate.open || gate.epoch != self.epoch {
             return;
         }
         reject_open(&mut self.inflight, &self.carried, &events, &mut gate);
