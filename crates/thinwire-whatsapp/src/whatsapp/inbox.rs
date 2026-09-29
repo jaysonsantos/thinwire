@@ -638,11 +638,13 @@ impl Inbox {
         Some((body, delivery_event(jid, id, Delivery::Pending)))
     }
 
-    /// A new connection to the server (#168 item 12). The phone can change a
-    /// mute while thinwire is offline, so a history value may be newer than
-    /// a live change of the last connection. A live change of this
-    /// connection still wins over a later chunk.
-    pub(super) fn reconnected(&mut self) {
+    /// A new connection to the server starts: a reconnect or a new link
+    /// (#168 item 12). The phone can change a mute while thinwire is
+    /// offline, so a history value may be newer than a live change of the
+    /// last connection. A live change of the new connection still wins over
+    /// a later chunk. Call it before the first event of the connection: a
+    /// reconnect can send `History` before `Connected` (Codex r4138502149).
+    pub(super) fn new_connection(&mut self) {
         for record in self.chats.values_mut() {
             record.mute_live = false;
         }
@@ -1000,7 +1002,7 @@ pub(super) mod tests {
             "the live change of this connection wins"
         );
 
-        inbox.reconnected();
+        inbox.new_connection();
         let rows = inbox.apply_history(mute_chunk(CHAT, Mute::Off), Vec::new());
         assert!(
             !upserts(&rows)[0].muted,
