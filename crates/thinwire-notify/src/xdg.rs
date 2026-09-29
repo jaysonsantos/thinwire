@@ -34,7 +34,15 @@ const NEW_NOTIFICATION: u32 = 0;
 pub(crate) struct IdBook {
     by_key: HashMap<NotifyKey, u32>,
     by_id: HashMap<u32, NotifyKey>,
+    /// Ids with no click waiter (over `MAX_CLICK_WAITERS`), per chat, at
+    /// most `MAX_UNWATCHED_PER_CHAT`. A dismiss still closes them
+    /// (#160 review). A replace never uses them: no waiter learns when they
+    /// close.
+    unwatched: HashMap<NotifyKey, Vec<u32>>,
 }
+
+/// Most unwatched ids kept for one chat. An older one expires by itself.
+pub(crate) const MAX_UNWATCHED_PER_CHAT: usize = 8;
 
 impl IdBook {
     /// `replaces_id` for the next notification of `key`: the id that is
@@ -62,11 +70,26 @@ impl IdBook {
         }
     }
 
-    /// Forget `key` for a dismiss. Returns the id to close, if it is open.
-    pub(crate) fn forget(&mut self, key: &NotifyKey) -> Option<u32> {
-        let id = self.by_key.remove(key)?;
-        self.by_id.remove(&id);
-        Some(id)
+    /// The server showed `key` with `id`, but no click waiter watches it.
+    pub(crate) fn shown_unwatched(&mut self, key: &NotifyKey, id: u32) {
+        let ids = self.unwatched.entry(key.clone()).or_default();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        if ids.len() > MAX_UNWATCHED_PER_CHAT {
+            ids.remove(0);
+        }
+    }
+
+    /// Forget `key` for a dismiss. Returns every id of the chat to close:
+    /// the watched one and the unwatched ones.
+    pub(crate) fn forget(&mut self, key: &NotifyKey) -> Vec<u32> {
+        let mut ids = self.unwatched.remove(key).unwrap_or_default();
+        if let Some(id) = self.by_key.remove(key) {
+            self.by_id.remove(&id);
+            ids.push(id);
+        }
+        ids
     }
 
     pub(crate) fn key_of(&self, id: u32) -> Option<NotifyKey> {
@@ -136,22 +159,25 @@ impl Backend for Xdg {
         }
         let handle = message.show().map_err(|_| BackendError("show"))?;
         let id = handle.id();
-        lock(&self.book).shown(&notification.key, id);
         {
             let mut waiting = lock(&self.waiting);
             if waiting.contains(&id) {
                 // A replace keeps its id and its waiter.
+                drop(waiting);
+                lock(&self.book).shown(&notification.key, id);
                 return Ok(());
             }
             if !may_wait(waiting.len()) {
                 drop(waiting);
-                // No waiter learns when this one closes, so never replace it.
-                lock(&self.book).closed(id);
+                // No waiter learns when this one closes: never replace it,
+                // but a dismiss still closes it (#160 review).
+                lock(&self.book).shown_unwatched(&notification.key, id);
                 tracing::debug!(kind = "no click waiter", "desktop notification shown");
                 return Ok(());
             }
             waiting.insert(id);
         }
+        lock(&self.book).shown(&notification.key, id);
         let book = Arc::clone(&self.book);
         let waiting = Arc::clone(&self.waiting);
         let clicks = Arc::clone(&self.clicks);
@@ -177,11 +203,21 @@ impl Backend for Xdg {
         Ok(())
     }
 
-    fn dismiss(&mut self, key: &NotifyKey) -> Result<(), BackendError> {
-        let Some(id) = lock(&self.book).forget(key) else {
+    /// Replace the notification only while its id is still open. A closed
+    /// one stays closed: an update never shows a new notification.
+    fn update(&mut self, notification: &Notification) -> Result<(), BackendError> {
+        if lock(&self.book).replace_id(&notification.key) == NEW_NOTIFICATION {
             return Ok(());
-        };
-        self.close_notification(id)
+        }
+        self.show(notification)
+    }
+
+    fn dismiss(&mut self, key: &NotifyKey) -> Result<(), BackendError> {
+        let ids = lock(&self.book).forget(key);
+        for id in ids {
+            self.close_notification(id)?;
+        }
+        Ok(())
     }
 }
 
@@ -230,9 +266,9 @@ mod tests {
             "a stale close keeps the open id"
         );
 
-        assert_eq!(book.forget(&ada), Some(601));
+        assert_eq!(book.forget(&ada), vec![601]);
         assert_eq!(book.replace_id(&ada), NEW_NOTIFICATION);
-        assert_eq!(book.forget(&ada), None);
+        assert!(book.forget(&ada).is_empty());
     }
 
     #[test]
@@ -250,6 +286,49 @@ mod tests {
             "a new notification calls no .id()"
         );
         assert!(show.contains("lock(&book).closed(id)"));
+        let update = &src[src.find("fn update(").expect("update")..];
+        let update = &update[..update.find("fn dismiss(").expect("dismiss")];
+        let open = update.find("== NEW_NOTIFICATION").expect("open id check");
+        let replace = update.find("self.show(notification)").expect("replace");
+        assert!(open < replace, "a closed notification is never shown again");
+    }
+
+    #[test]
+    fn a_notification_over_the_waiter_limit_can_still_be_dismissed() {
+        let mut book = IdBook::default();
+        let ada = key("telegram:1");
+        book.shown(&ada, 10);
+        // Over the limit: shown with no waiter.
+        book.shown_unwatched(&ada, 11);
+        assert_eq!(
+            book.replace_id(&ada),
+            10,
+            "a replace uses only the watched id"
+        );
+        let bob = key("telegram:2");
+        book.shown_unwatched(&bob, 20);
+        assert_eq!(
+            book.replace_id(&bob),
+            NEW_NOTIFICATION,
+            "never an unwatched id"
+        );
+        // A dismiss closes every id of the chat.
+        let mut closing = book.forget(&ada);
+        closing.sort_unstable();
+        assert_eq!(closing, vec![10, 11]);
+        assert_eq!(book.forget(&bob), vec![20]);
+        // The unwatched ids of one chat are bounded.
+        for id in 0..(MAX_UNWATCHED_PER_CHAT as u32 + 5) {
+            book.shown_unwatched(&bob, 100 + id);
+        }
+        assert_eq!(book.forget(&bob).len(), MAX_UNWATCHED_PER_CHAT);
+        let src = include_str!("xdg.rs");
+        let show = &src[src.find("fn show(").expect("show")..];
+        let show = &show[..show.find("fn update(").expect("update")];
+        let over = &show[show.find("if !may_wait(waiting.len())").expect("cap")..];
+        let over = &over[..over.find("return Ok(());").expect("end")];
+        assert!(over.contains("shown_unwatched("), "kept for a dismiss");
+        assert!(!over.contains(".closed(id)"));
     }
 
     #[test]

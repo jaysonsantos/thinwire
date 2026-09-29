@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::{NotifyCommand, NotifyKey};
+use crate::NotifyCommand;
 
 /// Most commands that wait for the backend thread. A slow or hung OS
 /// notification service does not grow memory (#87 review).
@@ -20,9 +20,10 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Longest wait between two tries.
 pub const RETRY_MAX: Duration = Duration::from_secs(30);
 
-/// Commands that wait for the backend. A new `Show` of a chat replaces the
-/// queued one of that chat. A `Dismiss` removes the queued `Show` of its
-/// chat. Over `INBOX_LIMIT`, the oldest `Show` goes; a `Dismiss` never goes.
+/// Commands that wait for the backend. A new `Show` or `Update` of a chat
+/// replaces the queued one of that chat (an `Update` of a queued `Show`
+/// stays a `Show`). A `Dismiss` removes the queued text of its chat. Over
+/// `INBOX_LIMIT`, the oldest `Show` or `Update` goes; a `Dismiss` never goes.
 #[derive(Debug, Default)]
 pub(crate) struct Inbox {
     commands: VecDeque<NotifyCommand>,
@@ -30,21 +31,44 @@ pub(crate) struct Inbox {
 
 impl Inbox {
     pub(crate) fn push(&mut self, command: NotifyCommand) {
+        let key = command.key().clone();
         match &command {
-            NotifyCommand::Show(shown) => {
-                if let Some(slot) = self.commands.iter_mut().find(
-                    |queued| matches!(queued, NotifyCommand::Show(old) if old.key == shown.key),
-                ) {
+            NotifyCommand::Show(_) => {
+                // The newest text wins; a queued `Update` of this chat goes.
+                self.commands.retain(
+                    |queued| !matches!(queued, NotifyCommand::Update(_) if queued.key() == &key),
+                );
+                if let Some(slot) = self
+                    .commands
+                    .iter_mut()
+                    .find(|queued| matches!(queued, NotifyCommand::Show(_) if queued.key() == &key))
+                {
                     *slot = command;
                     return;
                 }
             }
-            NotifyCommand::Dismiss(key) => {
-                self.remove_show(key);
+            NotifyCommand::Update(notification) => {
+                // Not shown yet: the queued `Show` takes the new text and
+                // stays a `Show`.
+                if let Some(slot) = self
+                    .commands
+                    .iter_mut()
+                    .find(|queued| queued.is_content() && queued.key() == &key)
+                {
+                    *slot = match slot {
+                        NotifyCommand::Show(_) => NotifyCommand::Show(notification.clone()),
+                        _ => command,
+                    };
+                    return;
+                }
+            }
+            NotifyCommand::Dismiss(_) => {
+                self.commands
+                    .retain(|queued| !(queued.is_content() && queued.key() == &key));
                 if self
                     .commands
                     .iter()
-                    .any(|queued| matches!(queued, NotifyCommand::Dismiss(old) if old == key))
+                    .any(|queued| matches!(queued, NotifyCommand::Dismiss(old) if old == &key))
                 {
                     return;
                 }
@@ -52,20 +76,11 @@ impl Inbox {
         }
         self.commands.push_back(command);
         while self.commands.len() > INBOX_LIMIT {
-            let Some(index) = self
-                .commands
-                .iter()
-                .position(|queued| matches!(queued, NotifyCommand::Show(_)))
-            else {
+            let Some(index) = self.commands.iter().position(NotifyCommand::is_content) else {
                 break;
             };
             self.commands.remove(index);
         }
-    }
-
-    fn remove_show(&mut self, key: &NotifyKey) {
-        self.commands
-            .retain(|queued| !matches!(queued, NotifyCommand::Show(old) if &old.key == key));
     }
 
     pub(crate) fn pop(&mut self) -> Option<NotifyCommand> {
@@ -145,7 +160,7 @@ pub(crate) fn retry_wait(failures: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BackendError, Notification};
+    use crate::{BackendError, Notification, NotifyKey};
     use thinwire_core::ProtocolId;
 
     fn key(n: usize) -> NotifyKey {
@@ -195,6 +210,32 @@ mod tests {
             inbox.push(NotifyCommand::Dismiss(key(1000 + n)));
         }
         assert_eq!(inbox.len(), INBOX_LIMIT * 2, "every Dismiss stays");
+    }
+
+    #[test]
+    fn an_update_never_becomes_a_second_show() {
+        let update = |n: usize| {
+            let NotifyCommand::Show(notification) = show(n, 1) else {
+                unreachable!()
+            };
+            NotifyCommand::Update(Notification {
+                preview: "New message".into(),
+                ..notification
+            })
+        };
+        let mut inbox = Inbox::default();
+        // A queued Show takes the new text and stays a Show.
+        inbox.push(show(1, 1));
+        inbox.push(update(1));
+        assert_eq!(inbox.len(), 1);
+        assert!(matches!(inbox.pop(), Some(NotifyCommand::Show(n)) if n.preview == "New message"));
+        // Shown already: an Update waits alone; a new Show replaces it.
+        inbox.push(update(2));
+        inbox.push(update(2));
+        assert_eq!(inbox.len(), 1);
+        inbox.push(show(2, 2));
+        assert!(matches!(inbox.pop(), Some(NotifyCommand::Show(_))));
+        assert!(inbox.is_empty());
     }
 
     #[test]

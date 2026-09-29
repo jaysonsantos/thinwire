@@ -151,10 +151,19 @@ Desktop notifications (#32) show a new message when you do not look at its chat.
 | Signal (`signal-local`, local only) | Yes (the receive stream) | No: the Signal library does not expose chat mute |
 
 - A chat whose mute the app cannot read notifies. Turn off "Show notifications" if that is too much.
-- One notification shows for each chat, with the count of new messages. It goes away when you open the chat, when the chat leaves the list, when you read the chat on another device (where the protocol reports it), and when the app closes.
 - The window title shows the unread count of chats that are not muted, for example "thinwire (3)".
-- Privacy: a notification sends the chat title, the sender in a group, and up to 120 characters of the message to the OS notification service. "Hide message text" sends "New message" only, also for notifications that already show. thinwire never writes message text to its log.
-- Linux uses the freedesktop notification service over D-Bus. A click opens the chat. On X11 the click also raises the window. On Wayland the app cannot raise its window yet (winit 0.30): the taskbar entry asks for attention instead. macOS and Windows show notifications, but a click does not open the chat yet.
+- Privacy: a notification sends the chat title, the sender in a group, and up to 120 characters of the message to the OS notification service. "Hide message text" sends "New message" only, with no sender. thinwire never writes message text to its log.
+- What each OS does today:
+
+| | Linux (freedesktop, D-Bus) | macOS and Windows |
+| --- | --- | --- |
+| Show a notification | Yes | Yes |
+| One notification for each chat: a new message replaces it, with the count | Yes | No: each message shows its own notification |
+| "Hide message text" also changes a notification that already shows | Yes | No: it applies to new notifications only |
+| Remove it when you open the chat, read it on another device (where the protocol reports it), the chat leaves the list, you turn notifications off, or the app closes | Yes | No |
+| A click opens the chat | Yes. On X11 the click also raises the window. On Wayland the app cannot raise its window yet (winit 0.30): the taskbar entry asks for attention instead | No |
+
+- macOS and Windows replace, dismiss, and click are tracked in #161.
 - A failed call to the OS notification service does not turn notifications off. The app tries again after a short wait, and turns them off for the run only after 5 failures in a row.
 
 There is no distroless GUI container. This is a desktop egui app.

@@ -39,6 +39,14 @@ pub type ClickFn = Arc<dyn Fn(NotifyKey) + Send + Sync>;
 /// One OS notification service.
 pub trait Backend: Send + 'static {
     fn show(&mut self, notification: &Notification) -> Result<(), BackendError>;
+
+    /// Change a notification that still shows. It never shows a new one.
+    /// The default does nothing: a backend that cannot replace a shown
+    /// notification must not show a second one (#160 review).
+    fn update(&mut self, _notification: &Notification) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     fn dismiss(&mut self, key: &NotifyKey) -> Result<(), BackendError>;
 }
 
@@ -168,6 +176,7 @@ fn run(pipe: &Pipe, mut backend: impl Backend) {
         };
         let (kind, result) = match &command {
             NotifyCommand::Show(notification) => ("show", backend.show(notification)),
+            NotifyCommand::Update(notification) => ("update", backend.update(notification)),
             NotifyCommand::Dismiss(key) => ("dismiss", backend.dismiss(key)),
         };
         if result.is_ok() {
@@ -355,6 +364,37 @@ mod tests {
         assert_eq!(
             *seen.lock().expect("seen"),
             vec![Seen::Dismiss(key("telegram:2"))]
+        );
+    }
+
+    #[test]
+    fn a_backend_with_no_replace_shows_no_second_notification() {
+        // macOS and Windows backends keep the default `update`: a hidden
+        // text must not appear as a second notification (#160 review).
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fake_seen = Arc::clone(&seen);
+        let notifier = Notifier::spawn_with(
+            move |clicks| Fake {
+                seen: fake_seen,
+                clicks,
+                fail_on_show: false,
+            },
+            |_| {},
+        );
+        notifier.send([note("telegram:1", 1)]);
+        assert!(notifier.flush(Duration::from_secs(2)));
+        let NotifyCommand::Show(shown) = note("telegram:1", 1) else {
+            unreachable!()
+        };
+        notifier.send([NotifyCommand::Update(Notification {
+            preview: "New message".into(),
+            ..shown
+        })]);
+        assert!(notifier.flush(Duration::from_secs(2)));
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![Seen::Show(key("telegram:1"), 1)],
+            "one notification only"
         );
     }
 
