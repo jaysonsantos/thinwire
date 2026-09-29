@@ -1,6 +1,6 @@
 //! Linux: freedesktop notifications over D-Bus.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
@@ -39,10 +39,17 @@ pub(crate) struct IdBook {
     /// (#160 review). A replace never uses them: no waiter learns when they
     /// close.
     unwatched: HashMap<NotifyKey, Vec<u32>>,
+    /// Unwatched ids in the order they came, for `MAX_UNWATCHED_TOTAL`. An
+    /// entry whose id already left `unwatched` is skipped.
+    unwatched_order: VecDeque<(NotifyKey, u32)>,
 }
 
 /// Most unwatched ids kept for one chat. An older one expires by itself.
 pub(crate) const MAX_UNWATCHED_PER_CHAT: usize = 8;
+
+/// Most unwatched ids kept for all chats. The oldest goes first
+/// (#160 review).
+pub(crate) const MAX_UNWATCHED_TOTAL: usize = 64;
 
 impl IdBook {
     /// `replaces_id` for the next notification of `key`: the id that is
@@ -79,6 +86,25 @@ impl IdBook {
         if ids.len() > MAX_UNWATCHED_PER_CHAT {
             ids.remove(0);
         }
+        self.unwatched_order.push_back((key.clone(), id));
+        while self.unwatched.values().map(Vec::len).sum::<usize>() > MAX_UNWATCHED_TOTAL {
+            let Some((owner, oldest)) = self.unwatched_order.pop_front() else {
+                break;
+            };
+            if let Some(ids) = self.unwatched.get_mut(&owner) {
+                ids.retain(|id| *id != oldest);
+                if ids.is_empty() {
+                    self.unwatched.remove(&owner);
+                }
+            }
+        }
+        // Drop entries of ids that already left, so the order list stays
+        // small too.
+        if self.unwatched_order.len() > 2 * MAX_UNWATCHED_TOTAL {
+            let unwatched = &self.unwatched;
+            self.unwatched_order
+                .retain(|(owner, id)| unwatched.get(owner).is_some_and(|ids| ids.contains(id)));
+        }
     }
 
     /// Forget `key` for a dismiss. The unwatched ids come first; the watched
@@ -103,6 +129,11 @@ impl IdBook {
         for id in open.unwatched {
             self.shown_unwatched(key, id);
         }
+    }
+
+    /// Take the unwatched ids of `key` out of the book.
+    pub(crate) fn take_unwatched(&mut self, key: &NotifyKey) -> Vec<u32> {
+        self.unwatched.remove(key).unwrap_or_default()
     }
 
     pub(crate) fn key_of(&self, id: u32) -> Option<NotifyKey> {
@@ -135,6 +166,8 @@ fn dismiss_ids(
     key: &NotifyKey,
     mut close: impl FnMut(u32) -> Result<(), BackendError>,
 ) -> Result<(), BackendError> {
+    // The notifier thread runs one command at a time, so no `Show` of this
+    // chat can land between `forget` and `keep` and be overwritten.
     let open = lock(book).forget(key);
     let mut failed = OpenIds::default();
     let mut first_error = None;
@@ -157,6 +190,26 @@ fn dismiss_ids(
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// Close the unwatched ids of `key` for an `Update`. They cannot be
+/// replaced safely: no waiter knows if they expired. Closing them removes
+/// the old text, for example after "Hide message text" (#160 qa). A failed
+/// id goes back to the book for a later dismiss.
+fn close_unwatched(
+    book: &Mutex<IdBook>,
+    key: &NotifyKey,
+    mut close: impl FnMut(u32) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    let ids = lock(book).take_unwatched(key);
+    let mut first_error = None;
+    for id in ids {
+        if let Err(error) = close(id) {
+            first_error.get_or_insert(error);
+            lock(book).shown_unwatched(key, id);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// No click thread watches `id`. It stays dismissible. A replace does not
@@ -280,10 +333,12 @@ impl Backend for Xdg {
     /// Replace the notification only while its id is still open. A closed
     /// one stays closed: an update never shows a new notification.
     fn update(&mut self, notification: &Notification) -> Result<(), BackendError> {
+        let book = Arc::clone(&self.book);
+        let closed = close_unwatched(&book, &notification.key, |id| self.close_notification(id));
         if lock(&self.book).replace_id(&notification.key) == NEW_NOTIFICATION {
-            return Ok(());
+            return closed;
         }
-        self.show(notification)
+        closed.and(self.show(notification))
     }
 
     fn dismiss(&mut self, key: &NotifyKey) -> Result<(), BackendError> {
@@ -395,6 +450,18 @@ mod tests {
             book.shown_unwatched(&bob, 100 + id);
         }
         assert_eq!(book.forget(&bob).ids().len(), MAX_UNWATCHED_PER_CHAT);
+        // Bounded across chats too: the oldest goes first (#160 review).
+        for n in 0..(MAX_UNWATCHED_TOTAL + 10) {
+            book.shown_unwatched(&key(&format!("telegram:{n}")), 1000 + n as u32);
+        }
+        let total: usize = book.unwatched.values().map(Vec::len).sum();
+        assert_eq!(total, MAX_UNWATCHED_TOTAL);
+        assert!(
+            book.forget(&key("telegram:0")).ids().is_empty(),
+            "the oldest went"
+        );
+        assert_eq!(book.forget(&key("telegram:73")).ids(), vec![1073]);
+        assert!(book.unwatched_order.len() <= 2 * MAX_UNWATCHED_TOTAL + 1);
         let src = include_str!("xdg.rs");
         let show = &src[src.find("fn show(").expect("show")..];
         let show = &show[..show.find("fn update(").expect("update")];
@@ -402,6 +469,56 @@ mod tests {
         let over = &over[..over.find("return Ok(());").expect("end")];
         assert!(over.contains("shown_unwatched("), "kept for a dismiss");
         assert!(!over.contains(".closed(id)"));
+    }
+
+    #[test]
+    fn an_update_closes_the_unwatched_ids_of_its_chat() {
+        // More than `MAX_CLICK_WAITERS` shown: "Hide message text" must not
+        // leave old text on screen in an unwatched notification (#160 qa).
+        let book = Mutex::new(IdBook::default());
+        let ada = key("telegram:1");
+        let bob = key("telegram:2");
+        {
+            let mut book = lock(&book);
+            book.shown(&ada, 10);
+            book.shown_unwatched(&ada, 11);
+            book.shown_unwatched(&ada, 12);
+            book.shown_unwatched(&bob, 20);
+        }
+        let mut closed = Vec::new();
+        let result = close_unwatched(&book, &ada, |id| {
+            closed.push(id);
+            if id == 12 {
+                Err(BackendError("close"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err(BackendError("close")));
+        assert_eq!(closed, vec![11, 12], "every unwatched id of the chat");
+        let mut book = lock(&book);
+        assert_eq!(
+            book.replace_id(&ada),
+            10,
+            "the watched id is replaced, not closed"
+        );
+        let mut left = book.forget(&ada).ids();
+        left.sort_unstable();
+        assert_eq!(left, vec![10, 12], "the failed id stays for a dismiss");
+        assert_eq!(
+            book.forget(&bob).ids(),
+            vec![20],
+            "other chats are not touched"
+        );
+        let src = include_str!("xdg.rs");
+        let update = &src[src.find("fn update(").expect("update")..];
+        let update = &update[..update.find("fn dismiss(").expect("dismiss")];
+        let close = update.find("close_unwatched(").expect("close unwatched");
+        let open = update.find("== NEW_NOTIFICATION").expect("open id check");
+        assert!(
+            close < open,
+            "the unwatched ids close even with no watched id"
+        );
     }
 
     #[test]
