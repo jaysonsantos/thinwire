@@ -1070,7 +1070,7 @@ where
                 order,
                 last_at: sent_at,
                 is_group: !channel.starts_with('D'),
-                writable: true,
+                writable: !self.live.as_ref().is_some_and(|live| live.workspace_denied),
                 muted: false,
                 placeholder: false,
             };
@@ -1165,8 +1165,9 @@ where
             });
             let cap = usize::from(HISTORY_LIMIT);
             if rows.len() > cap {
-                let extra = rows.len() - cap;
-                rows.drain(0..extra).collect::<Vec<_>>()
+                // A live post can sit at index 0. History then appends older
+                // rows. The cap drops the oldest `ts`, not the first insert.
+                take_oldest(rows, rows.len() - cap)
             } else {
                 Vec::new()
             }
@@ -1465,6 +1466,18 @@ fn posting_denied(error: &SlackApiError) -> bool {
 /// `restricted_action` is a workspace policy. The channel-specific codes are not.
 fn workspace_policy(error: &SlackApiError) -> bool {
     matches!(error, SlackApiError::Api(code) if code == "restricted_action")
+}
+
+/// Drop the `extra` rows with the smallest `ts_rank`.
+fn take_oldest(rows: &mut Vec<Shown>, extra: usize) -> Vec<Shown> {
+    let mut ranked: Vec<usize> = (0..rows.len()).collect();
+    ranked.sort_by_key(|&index| (ts_rank(&rows[index].ts), index));
+    let mut victims: Vec<usize> = ranked.into_iter().take(extra).collect();
+    victims.sort_unstable_by(|left, right| right.cmp(left));
+    victims
+        .into_iter()
+        .map(|index| rows.remove(index))
+        .collect()
 }
 
 /// Slack `ts` (`seconds.microseconds`) as the integer the shell sorts on.

@@ -1068,6 +1068,75 @@ async fn a_capped_history_removes_the_oldest_post() {
 }
 
 #[tokio::test]
+async fn cap_eviction_keeps_a_live_post_cached_before_history() {
+    let api = FakeApi::workspace();
+    // Newest first. The live post is the newest row. The last row is the oldest.
+    let posts: Vec<SlackPost> = (1..=50)
+        .rev()
+        .map(|index| {
+            post(
+                "C1",
+                &format!("170000{index:04}.000100"),
+                "U1",
+                &format!("h{index}"),
+            )
+        })
+        .collect();
+    api.with(|state| {
+        state
+            .history
+            .insert("C1".into(), SlackHistoryPage::complete(posts));
+    });
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(api, vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000050.000100",
+        "U1",
+        "live recent",
+    )));
+    h.message("live recent").await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.until("history loaded", |event| {
+        matches!(
+            event,
+            AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == "slack:C1"
+        )
+    })
+    .await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000051.000100",
+        "U1",
+        "one more",
+    )));
+    h.message("one more").await;
+    assert!(
+        h.seen.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessagesRemoved { message_ids, .. }
+                if message_ids.iter().any(|id| id.contains("1700000001000100"))
+        )),
+        "the oldest history row leaves"
+    );
+    assert!(
+        !h.seen.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessagesRemoved { message_ids, .. }
+                if message_ids.iter().any(|id| id.contains("1700000050000100"))
+        )),
+        "the live post cached before history stays"
+    );
+}
+
+#[tokio::test]
 async fn a_read_only_channel_is_not_writable() {
     let api = FakeApi::workspace();
     api.with(|state| {
@@ -1213,6 +1282,38 @@ async fn a_read_only_channel_can_post_again() {
     .await;
     assert_eq!(latest_writable(&h, "slack:C1"), Some(true));
     assert_eq!(latest_writable(&h, "slack:G1"), Some(true));
+}
+
+#[tokio::test]
+async fn a_new_channel_stays_read_only_under_a_workspace_denial() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.post_error = Some(SlackApiError::api("restricted_action"));
+    });
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(api, vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.send(AdapterCommand::SendText {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        body: "nope".into(),
+        request: 12,
+    });
+    h.until("policy refused", |event| {
+        matches!(event, AdapterEvent::SendRejected { request: 12, .. })
+    })
+    .await;
+    h.socket.push(SlackInbound::Message(post(
+        "C9",
+        "1700000300.000100",
+        "U1",
+        "later channel",
+    )));
+    let row = h.conversation("slack:C9").await;
+    assert!(!row.writable);
 }
 
 fn latest_writable(h: &Harness, id: &str) -> Option<bool> {
