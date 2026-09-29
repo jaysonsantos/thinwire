@@ -282,6 +282,19 @@ mod tests {
             },
         );
         assert_eq!(row.sent_at, 1_700_000_000);
+        // The HTTP inbox has no gateway: every message comes from a history
+        // load, so none is live and Discord does not notify yet (#32).
+        assert_eq!(row.arrival, crate::Arrival::History);
+        for src in [
+            include_str!("inbox.rs"),
+            include_str!("session.rs"),
+            include_str!("mod.rs"),
+        ] {
+            assert!(
+                !src.contains(concat!("Arrival::", "Live")),
+                "a gateway path must mark its new messages live"
+            );
+        }
     }
 
     #[test]

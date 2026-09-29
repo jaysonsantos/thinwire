@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::inbox::{HistoryChat, Inbox, WaMessage};
+use super::inbox::{HistoryChat, Inbox, Mute, WaMessage};
 use crate::adapter::{
     AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret,
     emit_status,
@@ -84,6 +84,11 @@ pub(super) enum LinkEvent {
         push_names: Vec<(String, String)>,
     },
     Messages(Vec<WaMessage>),
+    /// The phone muted or unmuted a chat (app-state `MuteAction`).
+    Mute {
+        jid: String,
+        mute: Mute,
+    },
 }
 
 /// A connected sender and the link generation it belongs to.
@@ -320,6 +325,14 @@ impl Session {
             LinkEvent::Messages(messages) => {
                 let rows = state.inbox.apply_messages(messages);
                 if state.announced { rows } else { Vec::new() }
+            }
+            LinkEvent::Mute { jid, mute } => {
+                let row = state.inbox.apply_mute(&jid, mute);
+                if state.announced {
+                    row.into_iter().collect()
+                } else {
+                    Vec::new()
+                }
             }
         };
         let mut out = out;

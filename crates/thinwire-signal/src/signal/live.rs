@@ -959,7 +959,13 @@ fn emit_incoming(
     viewed: Option<&str>,
     rows: &mut HashMap<String, Conversation>,
 ) {
-    let Some((mut conversation, message)) = row_and_message(content, names, group_titles) else {
+    // The receive stream: a message that the server pushes now (#32).
+    let Some((mut conversation, message)) = row_and_message(
+        content,
+        names,
+        group_titles,
+        thinwire_protocol::Arrival::Live,
+    ) else {
         return;
     };
     let open = viewed == Some(conversation.id.as_str());
@@ -978,7 +984,13 @@ fn emit_content(
     rows: &mut HashMap<String, Conversation>,
     unread: Option<&HashMap<String, u32>>,
 ) {
-    let Some((conversation, message)) = row_and_message(content, names, group_titles) else {
+    // Stored messages (chat list, older pages): never notify.
+    let Some((conversation, message)) = row_and_message(
+        content,
+        names,
+        group_titles,
+        thinwire_protocol::Arrival::History,
+    ) else {
         return;
     };
     if let Some(unread) = unread {
@@ -994,6 +1006,7 @@ fn row_and_message(
     content: &Content,
     names: &HashMap<String, String>,
     group_titles: &HashMap<String, String>,
+    arrival: thinwire_protocol::Arrival,
 ) -> Option<(Conversation, ChatMessage)> {
     let incoming = match &content.body {
         ContentBody::DataMessage(DataMessage { body, .. }) => {
@@ -1047,7 +1060,7 @@ fn row_and_message(
         outbound: shown.outbound,
         delivery: Delivery::Sent,
         sent_at: super::time::sent_at_secs(sent_millis),
-        arrival: thinwire_protocol::Arrival::History,
+        arrival,
     };
     let conversation = Conversation {
         protocol: ProtocolId::Signal,
@@ -1249,6 +1262,38 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    #[test]
+    fn the_receive_stream_is_live_and_stored_messages_are_not() {
+        let body = DataMessage {
+            body: Some("hi".into()),
+            ..Default::default()
+        };
+        let content = envelope(Uuid::from_u128(7), body);
+        let names = HashMap::new();
+        let arrival_of = |events: Vec<AdapterEvent>| {
+            events.into_iter().find_map(|event| match event {
+                AdapterEvent::MessageReceived { message } => Some(message.arrival),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            arrival_of(events_for(&content, &names)),
+            Some(thinwire_protocol::Arrival::Live)
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut rows = HashMap::new();
+        emit_content(&tx, &content, &names, &HashMap::new(), &mut rows, None);
+        let mut stored = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            stored.push(event);
+        }
+        assert_eq!(
+            arrival_of(stored),
+            Some(thinwire_protocol::Arrival::History),
+            "a stored message never notifies"
+        );
     }
 
     #[tokio::test]

@@ -1678,6 +1678,37 @@ async fn a_live_message_ranks_after_older_history() {
 }
 
 #[tokio::test]
+async fn a_socket_mode_post_is_live_once_and_history_is_not() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    let pushed = || SlackInbound::Message(post("C1", "1700000200.000100", "U1", "live hello"));
+    h.socket.push(pushed());
+    let live = h.message("live hello").await;
+    assert_eq!(live.arrival, crate::Arrival::Live);
+    // The same post again (a Socket Mode retry): not live.
+    h.socket.push(pushed());
+    let again = h
+        .until("the repeat", |event| {
+            matches!(
+                event,
+                AdapterEvent::MessageReceived { message }
+                    if message.body == "live hello" && message.arrival == crate::Arrival::History
+            )
+        })
+        .await;
+    assert!(matches!(again, AdapterEvent::MessageReceived { .. }));
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    let first = h.message("first").await;
+    assert_eq!(first.arrival, crate::Arrival::History, "a history page");
+}
+
+#[tokio::test]
 async fn an_edit_updates_the_body_and_a_delete_removes_the_row() {
     let vault = installed_vault();
     vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);

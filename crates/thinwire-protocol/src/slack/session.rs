@@ -1059,11 +1059,19 @@ where
         let duplicate = self.already_seen(&post);
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
-        let Some(message) = self.chat_message(&token, post).await else {
+        // A Socket Mode post is live the first time only: a repeat (retry
+        // or a post the app already showed) cannot notify (#32).
+        let arrival = if duplicate {
+            crate::Arrival::History
+        } else {
+            crate::Arrival::Live
+        };
+        let Some(built) = self.chat_message(&token, post).await else {
             // Older than every cached row. `remember` already dropped it
             // without `MessagesRemoved`, so the thread stays at the cap.
             return;
         };
+        let message = ChatMessage { arrival, ..built };
         let preview = message.body.clone();
         let outbound = message.outbound;
         let sender = message.sender.clone();
