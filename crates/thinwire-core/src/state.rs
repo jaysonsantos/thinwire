@@ -505,6 +505,10 @@ pub struct Snapshot {
     pub signal_qr: Option<String>,
     #[cfg(feature = "signal-local")]
     pub signal_started: bool,
+    /// `Ready` has arrived for this link. Later failures are session errors.
+    /// Startup and linking failures happen before this and keep the link error.
+    #[cfg(feature = "signal-local")]
+    signal_inbox_open: bool,
     /// The user accepted the full-screen local-build notice in this session.
     /// Linking needs it; showing the notice again or cancelling clears it.
     #[cfg(feature = "signal-local")]
@@ -544,7 +548,8 @@ impl std::fmt::Debug for Snapshot {
             .field("whatsapp_started", &self.whatsapp_started);
         #[cfg(feature = "signal-local")]
         out.field("signal_screen", &self.signal_screen)
-            .field("signal_started", &self.signal_started);
+            .field("signal_started", &self.signal_started)
+            .field("signal_inbox_open", &self.signal_inbox_open);
         out.finish_non_exhaustive()
     }
 }
@@ -647,6 +652,8 @@ impl Snapshot {
             #[cfg(feature = "signal-local")]
             signal_started: false,
             #[cfg(feature = "signal-local")]
+            signal_inbox_open: false,
+            #[cfg(feature = "signal-local")]
             signal_notice_acknowledged: false,
         }
     }
@@ -686,17 +693,16 @@ impl Snapshot {
                     row.status = status;
                     row.detail = detail.clone();
                 }
+                #[cfg(feature = "signal-local")]
+                if protocol == ProtocolId::Signal && status == AdapterStatus::Ready {
+                    self.signal_inbox_open = true;
+                }
                 if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                     // A failed load does not send its end event. Stop the spinners.
                     self.stop_spinners(protocol, None);
                     #[cfg(feature = "signal-local")]
                     if protocol == ProtocolId::Signal && self.signal_started {
-                        let happened = if self.protocol_linked(ProtocolId::Signal) {
-                            "Signal did not finish opening the inbox."
-                        } else {
-                            "Signal linking failed."
-                        };
-                        self.set_error(happened, &detail, "Start linking again.");
+                        self.note_signal_failure(&detail);
                     }
                 }
                 // Crate / feature jargon stays on the account row and in logs.
@@ -2551,6 +2557,7 @@ impl Snapshot {
                 #[cfg(feature = "signal-local")]
                 if protocol == ProtocolId::Signal && self.signal_started {
                     self.signal_started = false;
+                    self.signal_inbox_open = false;
                     self.signal_qr = None;
                 }
             }
@@ -2654,6 +2661,7 @@ impl Snapshot {
         #[cfg(feature = "signal-local")]
         if protocol == ProtocolId::Signal {
             self.signal_started = false;
+            self.signal_inbox_open = false;
             self.signal_qr = None;
             self.signal_notice_acknowledged = false;
             self.signal_screen = SignalScreen::Hidden;
@@ -2672,6 +2680,31 @@ impl Snapshot {
                 self.select_protocol(next);
             }
         }
+    }
+
+    /// A Signal status error while linking is still in progress.
+    /// After `Ready`, the worker is already linked: `begin_signal_link`
+    /// would reject another start, so the error is a session error.
+    #[cfg(feature = "signal-local")]
+    fn note_signal_failure(&mut self, detail: &str) {
+        if self.signal_inbox_open {
+            // SendRejected already explained a failed send. Keep that hint.
+            let send_already_shown = detail.starts_with("Signal send failed")
+                && self
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.happened == "Message not sent.");
+            if !send_already_shown {
+                self.command_failed(ProtocolId::Signal, None, detail);
+            }
+            return;
+        }
+        let happened = if self.protocol_linked(ProtocolId::Signal) {
+            "Signal did not finish opening the inbox."
+        } else {
+            "Signal linking failed."
+        };
+        self.set_error(happened, detail, "Start linking again.");
     }
 
     /// One command failed; the session is still up (shell plan 7). Stop its
@@ -3052,6 +3085,7 @@ impl Snapshot {
         self.signal_screen = SignalScreen::Notice;
         self.signal_qr = None;
         self.signal_started = false;
+        self.signal_inbox_open = false;
         self.signal_notice_acknowledged = false;
     }
 
@@ -3105,6 +3139,7 @@ impl Snapshot {
             return;
         }
         self.signal_started = true;
+        self.signal_inbox_open = false;
         self.error = None;
         self.status_text = "Signal linking requested.".into();
         let generation = self.next_pairing_generation;
@@ -3133,6 +3168,7 @@ impl Snapshot {
         self.pairing_generation = None;
         self.signal_qr = None;
         self.signal_started = false;
+        self.signal_inbox_open = false;
         self.signal_notice_acknowledged = false;
         self.signal_screen = SignalScreen::Hidden;
         self.status_text = "Signal linking cancelled.".into();
@@ -4888,6 +4924,97 @@ mod tests {
         });
         assert!(!snapshot.signal_started);
         assert!(snapshot.error.is_some());
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn an_operational_error_after_the_inbox_is_open_is_a_session_error() {
+        let mut snapshot = signal_inbox_ready();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: "Signal chat list could not be read. Message text was not logged.".into(),
+        });
+        let error = snapshot.error.clone().expect("error");
+        assert_eq!(error.happened, "Signal: the last action did not finish.");
+        assert!(error.why.contains("chat list could not be read"));
+        assert_eq!(error.next, "Try again. The inbox stays open.");
+        assert!(!error.next.contains("Start linking"));
+        assert!(snapshot.signal_started);
+        assert!(snapshot.signal_inbox_open);
+        assert!(snapshot.protocol_linked(ProtocolId::Signal));
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+        snapshot.signal_screen = SignalScreen::Link;
+        snapshot.begin_signal_link();
+        assert!(
+            !snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+            "another link must not start while the worker is already linked"
+        );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_send_failure_after_the_inbox_is_open_keeps_the_send_error() {
+        let mut snapshot = signal_inbox_ready();
+        allow_send(&mut snapshot, ProtocolId::Signal);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, "ada", true),
+        });
+        snapshot.compose = "hello".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Signal,
+                    request,
+                    ..
+                } => Some(request),
+                _ => None,
+            });
+        let request = request.expect("send");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Signal,
+            conversation_id: "ada".into(),
+            request,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: "Signal send failed. The message text was not logged.".into(),
+        });
+        let error = snapshot.error.clone().expect("error");
+        assert_eq!(error.happened, "Message not sent.");
+        assert!(error.why.contains("did not accept"));
+        assert!(!error.next.contains("Start linking"));
+        assert!(error.next.contains("Send it again"));
+        assert!(snapshot.signal_started);
+        assert!(snapshot.protocol_linked(ProtocolId::Signal));
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+    }
+
+    #[cfg(feature = "signal-local")]
+    fn signal_inbox_ready() -> Snapshot {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: "Signal is linked on this local build. This binary is not a release.".into(),
+        });
+        assert!(snapshot.signal_inbox_open);
+        snapshot
     }
 
     #[cfg(feature = "signal-local")]
