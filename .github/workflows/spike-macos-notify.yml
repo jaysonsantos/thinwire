@@ -77,8 +77,27 @@ jobs:
       - name: Probe in the ad-hoc signed bundle
         timeout-minutes: 3
         run: probe-adhoc/Thinwire.app/Contents/MacOS/thinwire || echo "exit $?"
-      - name: Pack the ad-hoc signed probe for a manual test
-        run: ditto -c -k --keepParent probe-adhoc/Thinwire.app thinwire-macos-probe.zip
+      - name: Pack both probes for a manual test
+        run: |
+          mkdir -p manual
+          ditto probe-linker manual/release-style
+          ditto probe-adhoc manual/adhoc-signed
+          cat > manual/HOW-TO-TEST.txt <<'TXT'
+          thinwire #161 macOS probe. Test each folder, adhoc-signed first.
+
+          1. Remove the download quarantine:
+             xattr -dr com.apple.quarantine adhoc-signed/Thinwire.app
+          2. Start the probe through Launch Services and wait up to 90 s:
+             open -W --env PROBE_WAIT_CLICK=60 --stdout /tmp/probe.log --stderr /tmp/probe.log adhoc-signed/Thinwire.app
+          3. Click "Allow" when macOS asks about notifications.
+          4. Look at the notification list: one "thinwire probe" notification
+             shows, then changes to the quiet second text, then goes away.
+          5. A last notification says "click this notification". Click it.
+          6. Send /tmp/probe.log back. It has one STEP line per check.
+          7. Do steps 1, 2, 4, 5, and 6 again with release-style/Thinwire.app.
+             Both use the same bundle id, so the permission from step 3 stays.
+          TXT
+          ditto -c -k --keepParent manual thinwire-macos-probe.zip
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: thinwire-macos-probe
