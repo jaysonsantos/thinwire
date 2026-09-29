@@ -309,6 +309,124 @@ dependencies = [
     }
 
     #[test]
+    fn a_disabled_optional_is_skipped_only_on_its_declaring_edge() {
+        let thinwire = r#"
+[package]
+name = "thinwire"
+
+[features]
+default = []
+telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
+"#;
+        let protocol = r#"
+[package]
+name = "thinwire-protocol"
+
+[features]
+default = []
+telegram-tdlib = ["dep:tdlib-rs"]
+discord-bot = ["dep:rustls"]
+
+[dependencies]
+tdlib-rs = { version = "1.4", optional = true }
+rustls = { version = "0.23", optional = true }
+secret-optional = { version = "1", optional = true }
+"#;
+        let skipped = release_skipped_deps(&[thinwire, protocol], &["telegram-tdlib".to_string()]);
+        assert!(
+            skipped
+                .iter()
+                .any(|(package, dep)| package == "thinwire-protocol" && dep == "rustls")
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|(package, dep)| package == "thinwire-protocol" && dep == "secret-optional")
+        );
+        assert!(
+            !skipped.iter().any(|(_, dep)| dep == "tdlib-rs"),
+            "an enabled optional stays in the closure"
+        );
+        let lock = r#"
+[[package]]
+name = "thinwire"
+version = "0.1.0"
+dependencies = [
+    "thinwire-protocol 0.1.0",
+    "tdlib-rs 1.4.0",
+]
+
+[[package]]
+name = "thinwire-protocol"
+version = "0.1.0"
+dependencies = [
+    "rustls 0.23.0",
+    "secret-optional 1.0.0",
+    "tdlib-rs 1.4.0",
+]
+
+[[package]]
+name = "tdlib-rs"
+version = "1.4.0"
+dependencies = [
+    "ureq 3.0.0",
+]
+
+[[package]]
+name = "ureq"
+version = "3.0.0"
+dependencies = [
+    "rustls 0.23.0",
+]
+
+[[package]]
+name = "rustls"
+version = "0.23.0"
+dependencies = [
+    "wacore-libsignal 0.7.0",
+]
+
+[[package]]
+name = "secret-optional"
+version = "1.0.0"
+dependencies = [
+    "presage 0.8.0",
+]
+
+[[package]]
+name = "wacore-libsignal"
+version = "0.7.0"
+dependencies = [
+]
+
+[[package]]
+name = "presage"
+version = "0.8.0"
+dependencies = [
+]
+"#;
+        let closure = dependency_closure(lock, "thinwire", &skipped);
+        assert!(closure.contains("tdlib-rs"));
+        assert!(closure.contains("ureq"));
+        assert!(
+            closure.contains("rustls"),
+            "ureq -> rustls stays when rustls is also a disabled optional of thinwire-protocol"
+        );
+        assert!(
+            closure.contains("wacore-libsignal"),
+            "a crate under the enabled rustls edge stays in the release closure"
+        );
+        assert!(
+            !closure.contains("secret-optional"),
+            "the disabled optional edge from its declaring package is skipped"
+        );
+        assert!(
+            !closure.contains("presage"),
+            "a crate reached only through that disabled edge stays out"
+        );
+    }
+
+    #[test]
     fn a_release_command_rejects_all_features() {
         let workflow = "run: cargo build --release -p thinwire --all-features\n";
         assert!(parse_release_build(workflow).is_err());
@@ -369,10 +487,12 @@ dependencies = [
         None
     }
 
-    /// Optional dependencies the release features do not enable.
-    /// The lock still lists them. The walk does not enter them, from any package.
-    /// The walk has no host target, so a macOS-only or Windows-only edge stays.
-    fn release_skipped_deps(manifests: &[&str], features: &[String]) -> Vec<String> {
+    /// Optional dependencies the release features leave off.
+    /// Each entry is the crate that declares the optional and the dependency
+    /// name. The walk skips that edge only. A later package that depends on
+    /// the same name stays in the closure. The walk has no host target, so a
+    /// macOS-only or Windows-only edge stays.
+    fn release_skipped_deps(manifests: &[&str], features: &[String]) -> Vec<(String, String)> {
         let crates = manifests
             .iter()
             .filter_map(|manifest| parse_crate(manifest))
@@ -381,8 +501,12 @@ dependencies = [
         let mut skipped = Vec::new();
         for krate in &crates {
             for name in &krate.optional {
-                if !enabled.iter().any(|on| on == name) && !skipped.iter().any(|on| on == name) {
-                    skipped.push(name.clone());
+                if enabled.iter().any(|on| on == name) {
+                    continue;
+                }
+                let edge = (krate.name.clone(), name.clone());
+                if !skipped.iter().any(|on| on == &edge) {
+                    skipped.push(edge);
                 }
             }
         }
@@ -511,7 +635,7 @@ dependencies = [
     fn dependency_closure(
         lock: &str,
         root: &str,
-        skip_from_root: &[String],
+        skip_edges: &[(String, String)],
     ) -> std::collections::BTreeSet<String> {
         let packages = lock_packages(lock);
         let mut by_name: std::collections::BTreeMap<&str, Vec<usize>> =
@@ -529,7 +653,11 @@ dependencies = [
             }
             names.insert(packages[index].name.to_string());
             for dep in &packages[index].deps {
-                if skip_from_root.iter().any(|name| name == dep.name) {
+                let from = packages[index].name;
+                if skip_edges
+                    .iter()
+                    .any(|(package, name)| package == from && name == dep.name)
+                {
                     continue;
                 }
                 let Some(indexes) = by_name.get(dep.name) else {
