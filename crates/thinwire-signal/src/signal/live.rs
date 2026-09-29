@@ -58,6 +58,10 @@ const HISTORY_PAGE: usize = 50;
 /// One more tells the page that older rows exist. The store primary key is
 /// `(ts, thread_id)`, so a time window can still hold more rows than a page.
 const HISTORY_READ_LIMIT: usize = HISTORY_PAGE + 2;
+/// The store keeps one row per millisecond per thread. An older page reads
+/// strictly before the cursor. Including the cursor filled the limit and then
+/// dropped that row, so a full batch looked one short and started a second read.
+const HISTORY_SQL_INCLUDES_CURSOR: bool = false;
 /// How many distinct store rows one page may scan. Each read is still at
 /// most [`HISTORY_READ_LIMIT`]. A widened window does not count a row twice.
 /// A non-empty page at this cap keeps `more` true, and the next request
@@ -680,12 +684,11 @@ async fn fetch_history_page(
     let pool = open_history_read(&url).await?;
     let outcome = async {
         let mut span = HISTORY_WINDOW_MS;
-        let include_before = before_id.is_some();
         let mut page = NewestBound::new(HISTORY_PAGE);
         let mut good = 0usize;
         let mut seen = HashSet::new();
         let mut cursor_before = before;
-        let mut cursor_inclusive = include_before;
+        let mut cursor_inclusive = HISTORY_SQL_INCLUDES_CURSOR;
         let mut hit_cap = false;
         let mut exhausted = false;
         loop {
@@ -910,8 +913,8 @@ fn thread_store_keys(thread: &Thread) -> (Option<&[u8]>, Option<Uuid>) {
 }
 
 /// Query bounds for one history window.
-/// An older page includes `before` so messages that share the cursor's
-/// millisecond are still returned. The page drops the cursor itself.
+/// The SQL read is exclusive of the cursor. `include_before` remains for a
+/// caller that still wants the cursor millisecond in the bound.
 #[cfg(test)]
 fn history_bounds(
     start: u64,
@@ -1734,6 +1737,54 @@ mod tests {
             return None;
         }
         Some(page.first().copied().unwrap_or(requested))
+    }
+
+    /// How many SQL reads one older page takes. The cursor row is not a page
+    /// row. An inclusive read puts it in the first batch and then drops it, so
+    /// a full batch stays one short of the limit and reads again.
+    fn sql_reads_for_older_page(store_newest_first: &[u64], cursor: u64) -> usize {
+        let rows: Vec<u64> = store_newest_first
+            .iter()
+            .copied()
+            .filter(|ts| *ts < cursor || (*ts == cursor && HISTORY_SQL_INCLUDES_CURSOR))
+            .collect();
+        let mut reads = 0usize;
+        let mut good = 0usize;
+        let mut scanned = 0usize;
+        let mut index = 0usize;
+        loop {
+            if scanned >= HISTORY_SCAN_CAP || good >= HISTORY_READ_LIMIT {
+                break;
+            }
+            if index >= rows.len() {
+                break;
+            }
+            reads += 1;
+            let ask = (HISTORY_SCAN_CAP - scanned).min(HISTORY_READ_LIMIT);
+            let end = (index + ask).min(rows.len());
+            let batch = &rows[index..end];
+            index = end;
+            scanned += batch.len();
+            for ts in batch {
+                if *ts < cursor {
+                    good += 1;
+                }
+            }
+            if matches!(
+                history_read_after(good, batch.len(), scanned, false),
+                HistoryRead::Stop
+            ) {
+                break;
+            }
+        }
+        reads
+    }
+
+    #[test]
+    fn a_full_first_batch_does_exactly_one_sql_read() {
+        let cursor = 200u64;
+        let store: Vec<u64> = (1..=cursor).rev().collect();
+        assert_eq!(sql_reads_for_older_page(&store, cursor), 1);
     }
 
     #[test]
