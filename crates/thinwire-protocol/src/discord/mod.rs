@@ -4352,6 +4352,10 @@ mod tests {
             mode: DiscordAuthMode::Bot,
         });
         kit.linked().await;
+        kit.check_loads_after_reconnect(AdapterCommand::Connect {
+            protocol: ProtocolId::Discord,
+        })
+        .await;
         kit.run_all().await;
     }
 }

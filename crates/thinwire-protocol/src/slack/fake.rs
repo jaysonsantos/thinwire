@@ -3053,5 +3053,9 @@ async fn the_workspace_inbox_follows_the_adapter_contract() {
     let h = Harness::new(FakeApi::workspace(), installed_vault(), true);
     let mut kit = crate::contract::Contract::new(Box::new(h.adapter));
     kit.linked().await;
+    kit.check_loads_after_reconnect(AdapterCommand::Connect {
+        protocol: ProtocolId::Slack,
+    })
+    .await;
     kit.run_all().await;
 }
