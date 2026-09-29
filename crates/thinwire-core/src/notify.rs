@@ -744,6 +744,11 @@ mod tests {
     }
 
     #[test]
+    fn slack_dedup_window_matches_notification_staleness() {
+        assert_eq!(thinwire_protocol::DEDUP_FRESH_SECS, STALE_AFTER_SECS);
+    }
+
+    #[test]
     fn a_chat_that_leaves_or_is_read_elsewhere_loses_its_notification() {
         let mut notes = Notifications::new();
         notes.set_focus(false);

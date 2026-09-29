@@ -18,7 +18,9 @@ use super::credentials::SlackApiSource;
 use super::install::SlackInstalledWorkspace;
 use super::loopback::tests::get;
 use super::secrets::{MemorySlackVault, SlackSecretKey, SlackSecretVault};
-use super::session::{DEDUP_FRESH_SECS, HISTORY_LIMIT, MAX_CHANNEL_PAGES, SlackDeps, SlackInbox};
+use super::session::{
+    DEDUP_FRESH_SECS, HISTORY_LIMIT, MAX_CHANNEL_PAGES, SlackDeps, SlackInbox, unix_secs,
+};
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation,
     ProtocolAdapter, ProtocolId,
@@ -1720,7 +1722,7 @@ async fn a_retry_after_the_display_cache_fills_is_not_live() {
     // One original post, then enough newer posts to evict it from `shown`.
     // The whole flood sits inside the notification freshness window, which is
     // when a retried `Live` arrival would notify again.
-    let base = 1_700_000_200_i64;
+    let base = unix_secs();
     let extra = usize::from(HISTORY_LIMIT);
     let span = i64::try_from(extra).expect("flood span");
     assert!(
@@ -1751,18 +1753,9 @@ async fn a_retry_after_the_display_cache_fills_is_not_live() {
         assert_eq!(message.arrival, crate::Arrival::Live);
     }
 
+    let before_retries = h.seen.len();
     h.socket.push(SlackInbound::Message(original));
-    let again = h.message("original").await;
-    assert_eq!(
-        again.arrival,
-        crate::Arrival::History,
-        "a retry of an evicted ts is not live"
-    );
-    let after_ts = h.conversation("slack:C1").await;
-    assert_eq!(after_ts.unread, u32::from(HISTORY_LIMIT));
-    assert_eq!(after_ts.preview, format!("later {extra}"));
-
-    // Same client_msg_id, different ts, still older than the newest post.
+    // Same client_msg_id, different ts. That id is not on screen either.
     h.socket.push(SlackInbound::Message(post_id(
         "C1",
         &format!("{base}.000200"),
@@ -1770,16 +1763,6 @@ async fn a_retry_after_the_display_cache_fills_is_not_live() {
         "same client",
         "client-original",
     )));
-    let same_client = h.message("same client").await;
-    assert_eq!(
-        same_client.arrival,
-        crate::Arrival::History,
-        "a retry of an evicted client_msg_id is not live"
-    );
-    let after_id = h.conversation("slack:C1").await;
-    assert_eq!(after_id.unread, u32::from(HISTORY_LIMIT));
-    assert_eq!(after_id.preview, format!("later {extra}"));
-
     h.socket.push(SlackInbound::Message(post(
         "C1",
         &format!("{}.000100", base + span + 1),
@@ -1788,6 +1771,17 @@ async fn a_retry_after_the_display_cache_fills_is_not_live() {
     )));
     let fresh = h.message("after the flood").await;
     assert_eq!(fresh.arrival, crate::Arrival::Live);
+    let after = h.conversation("slack:C1").await;
+    let retried = h.seen[before_retries..].iter().any(|event| {
+        matches!(
+            event,
+            AdapterEvent::MessageReceived { message }
+                if message.body == "original" || message.body == "same client"
+        )
+    });
+    assert!(!retried, "a retry of an evicted post is not emitted");
+    assert_eq!(after.unread, u32::from(HISTORY_LIMIT));
+    assert_eq!(after.preview, "after the flood");
 }
 
 #[tokio::test]
@@ -2442,11 +2436,34 @@ async fn a_redelivered_slack_event_does_not_raise_unread_again() {
         )
     })
     .await;
-    h.socket.push(SlackInbound::Message(first));
+    h.socket.push(SlackInbound::Message(first.clone()));
     h.message("once").await;
-    let again = post_id("C1", "1700000601.000100", "U1", "same id", "client-1");
-    h.socket.push(SlackInbound::Message(again));
-    h.message("same id").await;
+    // A new `ts` with the same `client_msg_id` is the same post. Emitting it
+    // would insert a second row. The same `ts` again is the sentinel.
+    let before = h.seen.len();
+    h.socket.push(SlackInbound::Message(post_id(
+        "C1",
+        "1700000601.000100",
+        "U1",
+        "same id",
+        "client-1",
+    )));
+    h.socket.push(SlackInbound::Message(first));
+    h.until("same ts again", |event| {
+        matches!(
+            event,
+            AdapterEvent::MessageReceived { message }
+                if message.body == "once" && message.arrival == crate::Arrival::History
+        )
+    })
+    .await;
+    assert!(
+        h.seen[before..].iter().all(|event| !matches!(
+            event,
+            AdapterEvent::MessageReceived { message } if message.body == "same id"
+        )),
+        "a different ts with the same client_msg_id is not emitted"
+    );
     let unread = h.seen.iter().rev().find_map(|event| match event {
         AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C1" => {
             Some(conversation.unread)
