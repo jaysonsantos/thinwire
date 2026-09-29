@@ -14,6 +14,10 @@ pub(super) const CONVERSATION_PREFIX: &str = "whatsapp:";
 /// Messages kept per chat. Older ones drop off the front.
 const MESSAGES_PER_CHAT: usize = 200;
 
+/// Handled ids kept per chat. Past this, the older half goes, oldest first
+/// (#158 review).
+const HANDLED_PER_CHAT: usize = 1_000;
+
 /// Messages sent to the UI when a chat opens.
 pub(super) const OPEN_CHAT_MESSAGES: usize = 50;
 
@@ -66,13 +70,19 @@ struct ChatRecord {
     failed: HashSet<String>,
     /// The user saw this chat up to this message time (Unix seconds). A later
     /// history chunk carries the phone's older unread count, so a chat read
-    /// here changes its count only by new messages (#98).
+    /// here changes its count only by new messages (#98). A message older
+    /// than this time does not count. It only moves forward; a full
+    /// `handled` set also moves it (#158 review).
     read_at: Option<i64>,
-    /// Inbound ids handled for this chat: counted since the last read, or
-    /// seen at or before the read point. A read keeps the set. A repeat does
-    /// not count again, also after its row left the capped cache
-    /// (Codex r4131089163, r4132341446).
-    handled: HashSet<String>,
+    /// Inbound ids handled since the read point, with their time and arrival
+    /// number: counted, or seen in the read second. A repeat does not count
+    /// again, also after its row left the capped cache (Codex r4131089163,
+    /// r4131622220). An id older than the read point goes: the read point
+    /// refuses it already (Codex r4132341446, #158 review). At most
+    /// [`HANDLED_PER_CHAT`] ids.
+    handled: HashMap<String, (i64, u64)>,
+    /// Arrival number of the newest id in `handled`.
+    handled_seq: u64,
     /// Server ids that still carry the local send clock. `confirm_send`
     /// keeps that clock until a server or live copy arrives. The read point
     /// skips them (Codex r4132341439).
@@ -85,18 +95,55 @@ struct ChatRecord {
 impl ChatRecord {
     /// The user sees every message of this chat now.
     fn mark_read(&mut self) {
-        let read_at = self.server_time();
         self.unread = 0;
-        self.read_at = Some(read_at);
-        // Keep ids already handled (a row may have left the cache) and every
-        // cached inbound row at or before this time. A new id in that second
-        // still counts; a seen one does not (Codex r4132341446).
-        self.handled.extend(
-            self.messages
-                .iter()
-                .filter(|row| !row.from_me && row.timestamp <= read_at)
-                .map(|row| row.id.clone()),
-        );
+        let read_at = self.count_from(self.server_time());
+        // Rows of the read second were seen; a later copy must not count. A
+        // new id in that second still counts. An older id needs no entry:
+        // the read point refuses it (Codex r4132341446, #158 review).
+        let seen: Vec<(String, i64)> = self
+            .messages
+            .iter()
+            .filter(|row| !row.from_me && row.timestamp >= read_at)
+            .map(|row| (row.id.clone(), row.timestamp))
+            .collect();
+        for (id, timestamp) in seen {
+            self.remember(&id, timestamp);
+        }
+    }
+
+    /// Move the read point forward to `point` and drop the handled ids older
+    /// than it. Returns the read point. It never moves back.
+    fn count_from(&mut self, point: i64) -> i64 {
+        let point = self.read_at.map_or(point, |old| old.max(point));
+        self.read_at = Some(point);
+        self.handled.retain(|_, (timestamp, _)| *timestamp >= point);
+        point
+    }
+
+    /// Note one inbound id as handled. `false` if it was handled before.
+    fn remember(&mut self, id: &str, timestamp: i64) -> bool {
+        if self.handled.contains_key(id) {
+            return false;
+        }
+        self.handled_seq += 1;
+        self.handled
+            .insert(id.to_string(), (timestamp, self.handled_seq));
+        if self.handled.len() > HANDLED_PER_CHAT {
+            self.forget_older_half();
+        }
+        true
+    }
+
+    /// Keep the newer half of `handled`, by time and then by arrival, so a
+    /// chat with equal times keeps a bound too (#158 review). The read point
+    /// moves to the oldest time kept: an older message does not count. Only
+    /// a repeat of a dropped id of that same second can count again.
+    fn forget_older_half(&mut self) {
+        let mut order: Vec<(i64, u64)> = self.handled.values().copied().collect();
+        order.sort_unstable();
+        let keep = order[order.len() / 2];
+        self.handled.retain(|_, entry| *entry >= keep);
+        self.count_from(keep.0);
     }
 
     /// The newest server time of this chat: the newest row that is not a
@@ -114,9 +161,10 @@ impl ChatRecord {
             .max(self.history_at)
     }
 
-    /// Count one new inbound message of a chat read here. `true` if it adds
-    /// to unread: not stored, not handled since the read, and not older than
-    /// the read.
+    /// Count one new inbound message of a chat read here, from history or
+    /// live. `true` if it adds to unread: not stored, not handled since the
+    /// read, and not older than the read point. Both paths use this one rule
+    /// (#158 review), so `handled` keeps no id older than the read point.
     fn counts_after_read(&mut self, message: &WaMessage) -> bool {
         let Some(read_at) = self.read_at else {
             return false;
@@ -125,7 +173,7 @@ impl ChatRecord {
             return false;
         }
         let stored = self.messages.iter().any(|row| row.id == message.id);
-        !stored && self.handled.insert(message.id.clone())
+        !stored && self.remember(&message.id, message.timestamp)
     }
 
     /// The chat time from what is still here: the newest row, or the
@@ -242,12 +290,14 @@ impl Inbox {
                 Arrival::Live
             };
             // After a local read, an id counts once: a redelivery after its
-            // row left the capped cache is not new (Codex r4131622220).
-            let counts = match record.read_at {
-                Some(_) => record.handled.insert(message.id.clone()),
-                None => true,
-            };
-            if !known && !message.from_me && !is_open && counts {
+            // row left the capped cache is not new (Codex r4131622220). Only
+            // an id that can count goes into `handled`, and the history rule
+            // applies (#158 review).
+            let counts = !known
+                && !message.from_me
+                && !is_open
+                && (record.read_at.is_none() || record.counts_after_read(&message));
+            if counts {
                 record.unread = record.unread.saturating_add(1);
             }
             record.timestamp = record.timestamp.max(message.timestamp);
@@ -340,12 +390,13 @@ impl Inbox {
     /// in the viewed chat do not raise unread; a chat the user left counts
     /// again. Viewing a known chat marks it read and returns its upsert.
     pub(super) fn view(&mut self, jid: Option<&str>) -> Option<AdapterEvent> {
-        // The chat the user leaves was read up to its newest message.
+        // The chat the user leaves was read up to its newest message. Same
+        // rule as an open chat, so its seen ids stay handled (#158 review).
         if let Some(left) = self.open.take()
             && Some(left.as_str()) != jid
             && let Some(record) = self.chats.get_mut(&left)
         {
-            record.read_at = Some(record.server_time());
+            record.mark_read();
         }
         self.open = jid.map(str::to_string);
         let jid = jid?;
@@ -415,6 +466,10 @@ impl Inbox {
         row.id.clone_from(&server_id);
         let message = row.clone();
         record.failed.remove(pending);
+        // An id whose row left the cache has no clock to skip (#158 review).
+        record
+            .optimistic
+            .retain(|id| record.messages.iter().any(|row| row.id == *id));
         if !had_server_copy {
             // The row keeps the local clock until a server copy arrives.
             record.optimistic.insert(server_id);
@@ -1118,6 +1173,148 @@ pub(super) mod tests {
             1,
             "a new id in the read second counts"
         );
+    }
+
+    /// #158 review: a read drops handled ids older than the read point.
+    /// 10,000 messages with a read after each keep the set tiny.
+    #[test]
+    fn many_reads_keep_handled_small() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let mut largest = 0;
+        for n in 0..10_000_i64 {
+            inbox.apply_messages(vec![message(chat, &format!("m{n}"), "new", n + 1)]);
+            inbox.view(Some(chat));
+            inbox.view(None);
+            largest = largest.max(inbox.chats[chat].handled.len());
+        }
+        assert!(largest <= 2, "a read drops older ids, got {largest}");
+        assert_eq!(inbox.chats[chat].unread, 0);
+    }
+
+    /// #158 review: a chat read once and then ignored keeps `handled` below
+    /// the cap. A dropped id of an older second does not count twice.
+    #[test]
+    fn a_busy_chat_after_one_read_keeps_handled_below_the_cap() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![message(chat, "seen", "one", 1)]);
+        inbox.view(Some(chat));
+        inbox.view(None);
+        let flood: u32 = 10_000;
+        for n in 0..flood {
+            inbox.apply_messages(vec![message(
+                chat,
+                &format!("n{n:05}"),
+                "new",
+                2 + i64::from(n),
+            )]);
+            assert!(inbox.chats[chat].handled.len() <= HANDLED_PER_CHAT);
+        }
+        assert_eq!(inbox.chats[chat].unread, flood);
+        assert!(!inbox.chats[chat].handled.contains_key("n00000"));
+        let events = inbox.apply_messages(vec![message(chat, "n00000", "new", 2)]);
+        assert_eq!(
+            upserts(&events)[0].unread,
+            flood,
+            "a dropped id does not count again"
+        );
+        let events =
+            inbox.apply_messages(vec![message(chat, "fresh", "new", 2 + i64::from(flood))]);
+        assert_eq!(upserts(&events)[0].unread, flood + 1);
+    }
+
+    /// #158 review: messages with one equal time also keep `handled` below
+    /// the cap. The oldest arrivals go first.
+    #[test]
+    fn equal_times_keep_handled_below_the_cap() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![message(chat, "seen", "one", 0)]);
+        inbox.view(Some(chat));
+        inbox.view(None);
+        let flood: u32 = 10_000;
+        for n in 0..flood {
+            inbox.apply_messages(vec![message(chat, &format!("n{n:05}"), "new", 0)]);
+        }
+        let record = &inbox.chats[chat];
+        assert!(record.handled.len() <= HANDLED_PER_CHAT);
+        assert!(
+            !record.handled.contains_key("n00000"),
+            "the oldest went first"
+        );
+        assert!(record.handled.contains_key("n09999"));
+        assert_eq!(record.unread, flood);
+    }
+
+    /// #158 review: an id that cannot count does not go into `handled`.
+    #[test]
+    fn only_ids_that_can_count_are_handled() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![message(chat, "a", "one", 1)]);
+        inbox.view(Some(chat));
+        inbox.view(None);
+        let mut mine = message(chat, "mine", "sent on the phone", 2);
+        mine.from_me = true;
+        inbox.apply_messages(vec![mine]);
+        assert!(!inbox.chats[chat].handled.contains_key("mine"));
+    }
+
+    /// #158 review: after a read, a message older than the read point does
+    /// not count, live or from history. One rule for both paths.
+    #[test]
+    fn a_message_older_than_the_read_point_counts_on_neither_path() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        inbox.apply_messages(vec![message(chat, "a", "one", 10)]);
+        inbox.view(Some(chat));
+        inbox.view(None);
+        let events = inbox.apply_messages(vec![message(chat, "late", "live", 5)]);
+        assert_eq!(upserts(&events)[0].unread, 0);
+        let events = inbox.apply_history(
+            vec![HistoryChat {
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 10,
+                messages: vec![message(chat, "old", "history", 6)],
+            }],
+            Vec::new(),
+        );
+        assert_eq!(upserts(&events)[0].unread, 0);
+        let events = inbox.apply_messages(vec![message(chat, "new", "live", 10)]);
+        assert_eq!(
+            upserts(&events)[0].unread,
+            1,
+            "the read second still counts"
+        );
+    }
+
+    /// #158 review: a confirmed send with no echo leaves `optimistic` when
+    /// its row leaves the cache.
+    #[test]
+    fn a_confirmed_send_without_an_echo_leaves_with_its_row() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let (pending, _, _) = inbox.begin_send(chat, "first", 1);
+        inbox.confirm_send(chat, &pending, "SRV1".into());
+        let flood: Vec<WaMessage> = (0..MESSAGES_PER_CHAT)
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("n{n:04}"),
+                    "new",
+                    2 + i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        inbox.apply_messages(flood);
+        let (pending, _, _) = inbox.begin_send(chat, "second", 1_000);
+        inbox.confirm_send(chat, &pending, "SRV2".into());
+        let optimistic = &inbox.chats[chat].optimistic;
+        assert!(!optimistic.contains("SRV1"), "its row left the cache");
+        assert!(optimistic.contains("SRV2"));
     }
 
     /// #158 review: the read point is server time, not a local send time.
