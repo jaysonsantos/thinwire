@@ -60,8 +60,9 @@ const HISTORY_PAGE: usize = 50;
 const HISTORY_READ_LIMIT: usize = HISTORY_PAGE + 2;
 /// How many distinct store rows one page may scan. Each read is still at
 /// most [`HISTORY_READ_LIMIT`]. A widened window does not count a row twice.
-/// At this cap the page stops with `more` still true, so the next page can
-/// continue. `more` is false only when a read returns fewer rows than asked.
+/// A non-empty page at this cap keeps `more` true, and the next request
+/// starts before that page's oldest row. An empty page at the cap sets
+/// `more` false: the rest is unreadable, and the same cursor is not asked again.
 const HISTORY_SCAN_CAP: usize = HISTORY_READ_LIMIT * 4;
 
 pub(super) enum WorkerJob {
@@ -739,7 +740,7 @@ async fn fetch_history_page(
             }
         }
         let (rows, overflow) = page.finish(true);
-        let more = history_page_more(hit_cap, exhausted) || overflow;
+        let more = history_page_more(hit_cap, exhausted, rows.is_empty()) || overflow;
         Ok((rows, more))
     }
     .await;
@@ -793,11 +794,16 @@ fn observe_history_rows(seen: &mut HashSet<u64>, timestamps: &[u64]) -> Vec<u64>
     fresh
 }
 
-/// `more` is false only when a read returned fewer rows than asked and the
-/// store is exhausted. The scan count does not hide older rows. At
-/// [`HISTORY_SCAN_CAP`] the next page can continue.
-fn history_page_more(hit_cap: bool, exhausted: bool) -> bool {
-    hit_cap || !exhausted
+/// `more` is false when the page is empty. That includes the scan cap: the
+/// rest is unreadable, and asking the same cursor again would not move.
+/// A non-empty page at the cap stays open. Otherwise `more` is false only
+/// when a read returned fewer rows than asked.
+fn history_page_more(hit_cap: bool, exhausted: bool, page_empty: bool) -> bool {
+    if page_empty {
+        false
+    } else {
+        hit_cap || !exhausted
+    }
 }
 
 /// `true` when the row was kept as a newly seen page candidate.
@@ -1692,7 +1698,7 @@ mod tests {
             }
         }
         let (rows, overflow) = page.finish(true);
-        let more = history_page_more(hit_cap, exhausted) || overflow;
+        let more = history_page_more(hit_cap, exhausted, rows.is_empty()) || overflow;
         (rows, more, seen.len())
     }
 
@@ -1717,7 +1723,58 @@ mod tests {
         let (page, more, scanned) = page_from_store(&corrupt);
         assert!(page.is_empty());
         assert_eq!(scanned, HISTORY_SCAN_CAP);
-        assert!(more, "the scan cap lets the next page continue");
+        assert!(!more, "an empty page at the cap does not ask again");
+    }
+
+    /// The next older-page request. `more == false` asks for nothing. A page
+    /// with rows continues before its oldest row. An empty page that still
+    /// says `more` would ask for `requested` again.
+    fn next_history_cursor(page: &[u64], more: bool, requested: u64) -> Option<u64> {
+        if !more {
+            return None;
+        }
+        Some(page.first().copied().unwrap_or(requested))
+    }
+
+    #[test]
+    fn a_corrupt_store_past_the_cap_does_not_repeat_the_cursor() {
+        let rows = vec![Err(()); HISTORY_SCAN_CAP + HISTORY_READ_LIMIT];
+        let mut cursor = Some(u64::MAX);
+        let mut asked = Vec::new();
+        for _ in 0..3 {
+            let Some(requested) = cursor else {
+                break;
+            };
+            assert!(
+                !asked.contains(&requested),
+                "no request repeats the same cursor"
+            );
+            asked.push(requested);
+            let (page, more, _) = page_from_store(&rows);
+            assert!(page.is_empty());
+            assert!(!more, "an empty page at the cap ends");
+            cursor = next_history_cursor(&page, more, requested);
+        }
+        assert!(cursor.is_none());
+        assert_eq!(asked, vec![u64::MAX]);
+
+        let mut mixed = Vec::new();
+        for ts in (1..=40).rev() {
+            mixed.push(Ok(Some(ts + 1_000)));
+        }
+        while mixed.len() < HISTORY_SCAN_CAP + HISTORY_READ_LIMIT {
+            mixed.push(Err(()));
+        }
+        let requested = 9_999;
+        let (page, more, _) = page_from_store(&mixed);
+        assert!(!page.is_empty());
+        assert!(more, "a non-empty page at the cap can continue");
+        let next = next_history_cursor(&page, more, requested).expect("next cursor");
+        assert_eq!(next, *page.first().expect("oldest"));
+        assert_ne!(
+            next, requested,
+            "the next request starts before the oldest row"
+        );
     }
 
     #[test]
@@ -1748,14 +1805,21 @@ mod tests {
             ),
             "a short batch is not the end of the store"
         );
-        assert!(history_page_more(false, false), "older rows stay reachable");
         assert!(
-            !history_page_more(false, true),
+            history_page_more(false, false, false),
+            "older rows stay reachable"
+        );
+        assert!(
+            !history_page_more(false, true, false),
             "a short read ends the page only when the store is exhausted"
         );
         assert!(
-            history_page_more(true, true),
-            "the scan cap still lets the user page"
+            history_page_more(true, true, false),
+            "a non-empty page at the cap still lets the user page"
+        );
+        assert!(
+            !history_page_more(true, true, true),
+            "an empty page at the cap does not ask again"
         );
     }
 
