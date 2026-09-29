@@ -301,6 +301,14 @@ mod tests {
         assert!(stage.contains("<string>11.0</string>"));
         assert!(stage.contains("Contents/Resources"));
         assert!(
+            stage.contains("codesign --force --sign - \"$app\""),
+            "Thinwire.app needs an ad-hoc signature for the notification center (#161)"
+        );
+        assert!(
+            stage.contains("codesign --verify --strict \"$app\""),
+            "the stage script must check the bundle signature"
+        );
+        assert!(
             !os_zips.contains("tr -d"),
             "TELEGRAM_API_ID check must not strip embedded whitespace"
         );
