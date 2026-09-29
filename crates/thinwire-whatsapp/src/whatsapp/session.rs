@@ -213,9 +213,7 @@ impl Session {
     }
 
     fn reset_state(state: &mut State) -> Vec<AdapterEvent> {
-        if let Some((_, task)) = state.mute_timer.take() {
-            task.abort();
-        }
+        Self::stop_mute_timer(state);
         state.connected = false;
         state.sender = None;
         state.stopped = None;
@@ -243,6 +241,16 @@ impl Session {
         state.generation = generation;
         state.sender = None;
         state.announced = false;
+        // A timer of the old link has a stale generation: it would never end
+        // a mute of this link (Codex r4138502157).
+        Self::stop_mute_timer(&mut state);
+        state.inbox.new_connection();
+    }
+
+    fn stop_mute_timer(state: &mut State) {
+        if let Some((_, task)) = state.mute_timer.take() {
+            task.abort();
+        }
     }
 
     /// The session still belongs to link `generation`: no cancel reset it
@@ -304,7 +312,6 @@ impl Session {
             LinkEvent::Connected => {
                 state.connected = true;
                 state.announced = true;
-                state.inbox.reconnected();
                 status(events, AdapterStatus::Ready, CONNECTED);
                 // ADR 0010 rule 1: Linked comes before the first inbox event.
                 let mut out = vec![account(AccountState::Linked)];
@@ -313,6 +320,9 @@ impl Session {
             }
             LinkEvent::Disconnected => {
                 state.connected = false;
+                // The next connection starts here: a reconnect can send
+                // History before Connected (Codex r4138502149).
+                state.inbox.new_connection();
                 status(events, AdapterStatus::Connecting, DISCONNECTED);
                 // A reconnect: the shell keeps the session and its rows.
                 vec![account(AccountState::Linking)]
@@ -605,6 +615,75 @@ mod tests {
         assert!(
             !last_row(&mut rx).expect("row").muted,
             "unmuted while offline"
+        );
+    }
+
+    /// Codex r4138502149: a reconnect can send History before Connected.
+    /// That history value still applies over a live change of the last
+    /// connection.
+    #[test]
+    fn reconnect_history_before_connected_applies_its_mute() {
+        let (session, tx, mut rx) = linked();
+        let live = LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::Forever,
+        };
+        session.apply(live, 1, &tx);
+        session.apply(history(Mute::Off), 1, &tx);
+        assert!(
+            last_row(&mut rx).expect("row").muted,
+            "the live change wins"
+        );
+
+        session.apply(LinkEvent::Disconnected, 1, &tx);
+        session.apply(history(Mute::Off), 1, &tx);
+        assert!(!last_row(&mut rx).expect("row").muted, "before Connected");
+        session.apply(LinkEvent::Connected, 1, &tx);
+        assert!(
+            !last_row(&mut rx).expect("row").muted,
+            "the chat page agrees"
+        );
+    }
+
+    /// Codex r4138502149: a new link is a new connection too. Its history
+    /// before Connected applies over a live change of the old link.
+    #[test]
+    fn a_new_link_lets_history_refresh_a_live_mute() {
+        let (session, tx, mut rx) = linked();
+        let live = LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::Forever,
+        };
+        session.apply(live, 1, &tx);
+        assert!(last_row(&mut rx).expect("row").muted);
+
+        session.begin(2);
+        session.apply(history(Mute::Off), 2, &tx);
+        session.apply(LinkEvent::Connected, 2, &tx);
+        assert!(!last_row(&mut rx).expect("row").muted);
+    }
+
+    /// Codex r4138502157: a new link drops the mute timer of the old link.
+    /// A mute of the new link that ends later gets its own timer.
+    #[tokio::test]
+    async fn a_new_link_drops_the_old_mute_timer() {
+        let (session, tx, _rx) = linked();
+        let now = inbox::now_ms();
+        let mute = |end: i64| LinkEvent::Mute {
+            jid: CHAT.into(),
+            mute: Mute::UntilMs(end),
+        };
+        session.apply(mute(now + 60_000), 1, &tx);
+        assert_eq!(armed_end(&session), Some(now + 60_000));
+
+        session.begin(2);
+        assert_eq!(armed_end(&session), None, "the old timer is gone");
+        session.apply(LinkEvent::Connected, 2, &tx);
+        session.apply(mute(now + 120_000), 2, &tx);
+        assert_eq!(
+            armed_end(&session),
+            Some(now + 120_000),
+            "a timer of link 2"
         );
     }
 
