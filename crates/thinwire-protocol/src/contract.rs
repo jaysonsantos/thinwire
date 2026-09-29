@@ -165,6 +165,27 @@ impl Contract {
         self.check_stream();
     }
 
+    /// Rule 9 after a reconnect (#163). The core ends the loads that a
+    /// reconnect interrupts and asks again once the account is linked, so
+    /// the adapter must answer loads after `reconnect` too. `reconnect` is
+    /// the adapter's own command that restarts a linked session.
+    pub async fn check_loads_after_reconnect(&mut self, reconnect: AdapterCommand) {
+        let protocol = self.protocol;
+        let failed = self.send(reconnect);
+        assert!(!failed, "contract rule 9: the reconnect command failed");
+        self.until("1", "Account Linked after the reconnect", |event| {
+            is_account(event, protocol, AccountState::Linked)
+        })
+        .await;
+        self.settle().await;
+        let chat = self
+            .writable_chat()
+            .or_else(|| self.any_chat())
+            .expect("the adapter lists a chat after the reconnect");
+        self.check_load_chats().await;
+        self.check_open_chat(&chat).await;
+    }
+
     /// Rule 9: `LoadChats` ends with `ChatListLoaded` or a failure. Else
     /// the chat-list spinner never stops.
     pub async fn check_load_chats(&mut self) {
