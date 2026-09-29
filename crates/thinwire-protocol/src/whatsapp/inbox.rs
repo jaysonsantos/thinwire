@@ -1432,6 +1432,7 @@ pub(super) mod tests {
         let chat = "111@s.whatsapp.net";
         inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: chat.into(),
                 name: None,
                 unread: 0,
@@ -1450,6 +1451,7 @@ pub(super) mod tests {
         let empty = "222@s.whatsapp.net";
         inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: empty.into(),
                 name: None,
                 unread: 0,
