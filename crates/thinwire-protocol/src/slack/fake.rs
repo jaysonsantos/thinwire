@@ -926,6 +926,59 @@ async fn history_keeps_a_cached_post_behind_ignored_subtypes() {
 }
 
 #[tokio::test]
+async fn an_empty_diluted_page_keeps_the_preview_when_nothing_remains() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.history.insert(
+            "C1".into(),
+            SlackHistoryPage {
+                posts: Vec::new(),
+                oldest_raw_ts: Some("1600000000.000100".into()),
+                authoritative: false,
+            },
+        );
+    });
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(api, vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1700000005.000100",
+        "U1",
+        "only local",
+    )));
+    h.until("local preview", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.preview == "only local"
+        )
+    })
+    .await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.until("history loaded", |event| {
+        matches!(
+            event,
+            AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == "slack:C1"
+        )
+    })
+    .await;
+    let preview = h.seen.iter().rev().find_map(|event| match event {
+        AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C1" => {
+            Some(conversation.preview.as_str())
+        }
+        _ => None,
+    });
+    assert_eq!(preview, Some("only local"));
+}
+
+#[tokio::test]
 async fn evicting_a_counted_post_lowers_the_badge() {
     let vault = installed_vault();
     vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
@@ -1020,6 +1073,46 @@ async fn a_read_only_post_error_marks_the_channel_read_only() {
         )
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_refresh_keeps_a_read_only_channel() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.post_error = Some(SlackApiError::api("restricted_action"));
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.send(AdapterCommand::SendText {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        body: "nope".into(),
+        request: 9,
+    });
+    h.until("read only", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && !conversation.writable
+        )
+    })
+    .await;
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    h.until("list loaded", |event| {
+        matches!(event, AdapterEvent::ChatListLoaded { .. })
+    })
+    .await;
+    let writable = h.seen.iter().rev().find_map(|event| match event {
+        AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C1" => {
+            Some(conversation.writable)
+        }
+        _ => None,
+    });
+    assert_eq!(writable, Some(false));
 }
 
 #[tokio::test]

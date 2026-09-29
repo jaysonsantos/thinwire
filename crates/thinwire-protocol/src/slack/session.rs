@@ -253,6 +253,9 @@ struct Live<T> {
     /// Member ids from the current `conversations.list` walk, including
     /// pages from an earlier `LoadChats` that stopped at the page cap.
     list_seen: HashSet<String>,
+    /// Channels a send already refused. A later list must not turn the
+    /// composer back on.
+    read_only: HashSet<String>,
 }
 
 struct Session<A, S, B>
@@ -534,6 +537,7 @@ where
             next_cursor: None,
             list_done: false,
             list_seen: HashSet::new(),
+            read_only: HashSet::new(),
         });
         // Linked before any inbox row. A later Linking is only a reconnect.
         self.account(AccountState::Linked);
@@ -724,6 +728,10 @@ where
                     live.list_seen.insert(channel.id.clone());
                 }
                 let title = self.channel_title(&token, &channel).await;
+                let denied = self
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.read_only.contains(&channel.id));
                 let conversation = Conversation {
                     protocol: ProtocolId::Slack,
                     id: conversation_id(&channel.id),
@@ -734,7 +742,7 @@ where
                     order: 0,
                     last_at: 0,
                     is_group: is_group(channel.kind),
-                    writable: channel.can_post,
+                    writable: channel.can_post && !denied,
                     muted: false,
                     placeholder: false,
                 };
@@ -866,13 +874,15 @@ where
         }
         // A dropped live post can be newer than every history row;
         // `note_latest` would keep that stale preview. An empty page that
-        // still has older history keeps the newest cached post instead.
-        let newest = if keep_cached_preview {
-            self.newest_shown(channel)
+        // is not the end of the channel keeps a remaining cached post.
+        // If that page removed every cached post, the older preview stays.
+        if keep_cached_preview {
+            if let Some(cached) = self.newest_shown(channel) {
+                self.replace_preview(channel, Some(cached));
+            }
         } else {
-            newest
-        };
-        self.replace_preview(channel, newest);
+            self.replace_preview(channel, newest);
+        }
         self.mark_channel_read(channel);
         emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
     }
@@ -1161,6 +1171,9 @@ where
     }
 
     fn mark_read_only(&mut self, channel: &str) {
+        if let Some(live) = &mut self.live {
+            live.read_only.insert(channel.to_string());
+        }
         let Some(row) = self.channels.get(channel) else {
             return;
         };
