@@ -54,6 +54,9 @@ enum TdlibCommand {
         conversation_id: String,
         before_message_id: String,
     },
+    /// The chat the user looks at. `None` means they left Telegram.
+    /// This, not history load, owns `LiveInbox::open_chat`.
+    ViewChat(Option<String>),
     /// Ask TDLib to close. The worker exits after `authorizationStateClosed`.
     /// `cancel` is true for a Cancel (Disconnect): a client that already became
     /// Ready is then rolled back (see [`close_kind`]).
@@ -95,7 +98,8 @@ struct LiveInbox {
     ended_elsewhere: bool,
     directory: ChatDirectory,
     names: NameBook,
-    /// Chat the user has open. A live message there is marked viewed.
+    /// Chat `ViewChat` last named. A live message there is marked viewed.
+    /// History load does not set this: the user can leave that thread.
     open_chat: Option<i64>,
 }
 
@@ -213,6 +217,14 @@ impl TdlibRuntime {
             source,
             events,
         );
+    }
+
+    /// The chat the user looks at. `None` means they left.
+    /// A worker that is not running has no open chat, and this must not start one.
+    pub fn view_chat(&mut self, conversation_id: Option<String>) {
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(TdlibCommand::ViewChat(conversation_id));
+        }
     }
 
     pub fn send_text(
@@ -487,6 +499,9 @@ fn spawn_tdlib_worker(
                         TdlibCommand::OpenChat(conversation_id) => {
                             open_chat(client_id, &conversation_id, &mut live, &events).await;
                         }
+                        TdlibCommand::ViewChat(conversation_id) => {
+                            apply_viewed_chat(&mut live.open_chat, conversation_id.as_deref());
+                        }
                         TdlibCommand::SendText { conversation_id, body, request } => {
                             send_text(client_id, &conversation_id, &body, request, &live, &events).await;
                         }
@@ -719,15 +734,13 @@ fn live_read_of(update: &tdlib_rs::enums::Update, open_chat: Option<i64>) -> Opt
     if message.is_outgoing {
         return None;
     }
-    live_message_to_view(open_chat, message.chat_id, message.id)
+    inbox::live_message_to_view(open_chat, message.chat_id, message.id)
 }
 
-fn live_message_to_view(
-    open_chat: Option<i64>,
-    chat_id: i64,
-    message_id: i64,
-) -> Option<(i64, i64)> {
-    (open_chat == Some(chat_id)).then_some((chat_id, message_id))
+/// `ViewChat` names the chat the user looks at. `None`, or an id that is
+/// not a Telegram chat, leaves no chat open for live `viewMessages`.
+fn apply_viewed_chat(open_chat: &mut Option<i64>, conversation_id: Option<&str>) {
+    *open_chat = inbox::viewed_chat_id(conversation_id);
 }
 
 async fn mark_message_viewed(client_id: i32, chat_id: i64, message_id: i64) {
@@ -1219,7 +1232,8 @@ async fn open_chat(client_id: i32, conversation_id: &str, live: &mut LiveInbox, 
         );
         return;
     };
-    live.open_chat = Some(chat_id);
+    // `ViewChat` owns `live.open_chat`. Loading history is not a view:
+    // the user may already have left this thread.
     emit_status(
         events,
         ProtocolId::Telegram,
@@ -1727,8 +1741,8 @@ mod tests {
     }
 
     impl FakeTelegram {
-        fn open(&mut self, chat_id: i64) {
-            self.open_chat = Some(chat_id);
+        fn view(&mut self, conversation_id: Option<&str>) {
+            apply_viewed_chat(&mut self.open_chat, conversation_id);
         }
 
         fn view_messages(&mut self, chat_id: i64, message_id: i64) {
@@ -1740,7 +1754,8 @@ mod tests {
             if outgoing {
                 return None;
             }
-            let (chat_id, message_id) = live_message_to_view(self.open_chat, chat_id, message_id)?;
+            let (chat_id, message_id) =
+                inbox::live_message_to_view(self.open_chat, chat_id, message_id)?;
             self.view_messages(chat_id, message_id);
             Some(0)
         }
@@ -1752,7 +1767,7 @@ mod tests {
             open_chat: None,
             viewed: Vec::new(),
         };
-        fake.open(42);
+        fake.view(Some("telegram:42"));
         let mut directory = ChatDirectory::new();
         directory.upsert(
             42,
@@ -1781,5 +1796,22 @@ mod tests {
             panic!("unread upsert");
         };
         assert_eq!(row.unread, 0);
+
+        fake.view(None);
+        assert!(
+            fake.receive_live(42, 101, false).is_none(),
+            "leaving the thread stops viewMessages"
+        );
+        fake.view(Some("not-a-telegram-chat"));
+        assert!(
+            fake.receive_live(42, 102, false).is_none(),
+            "a foreign id does not keep the old chat open"
+        );
+        fake.view(Some("telegram:42"));
+        assert_eq!(
+            fake.receive_live(42, 103, false),
+            Some(0),
+            "focus names the chat again"
+        );
     }
 }

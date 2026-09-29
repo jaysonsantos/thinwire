@@ -318,6 +318,23 @@ pub fn parse_telegram_chat_id(conversation_id: &str) -> Option<i64> {
     rest.parse().ok()
 }
 
+/// Chat id from `ViewChat`. `None` means the user left, or the id is not a
+/// Telegram chat, so live `viewMessages` must not keep the previous chat.
+#[must_use]
+pub(super) fn viewed_chat_id(conversation_id: Option<&str>) -> Option<i64> {
+    conversation_id.and_then(parse_telegram_chat_id)
+}
+
+/// A live message is marked viewed only when `ViewChat` still names its chat.
+#[must_use]
+pub(super) fn live_message_to_view(
+    open_chat: Option<i64>,
+    chat_id: i64,
+    message_id: i64,
+) -> Option<(i64, i64)> {
+    (open_chat == Some(chat_id)).then_some((chat_id, message_id))
+}
+
 #[must_use]
 pub(super) fn message_id(chat_id: i64, message_id: i64) -> String {
     format!("telegram:{chat_id}:{message_id}")
@@ -582,6 +599,37 @@ mod tests {
             Some(ChatEffect::Upsert(row)) => row.muted,
             other => panic!("expected an upsert, got {other:?}"),
         }
+    }
+
+    /// Codex P1 on #177: leaving the thread clears the open chat, so a later
+    /// message is not marked viewed. Focus names it again.
+    #[test]
+    fn leaving_the_chat_stops_marking_live_messages_viewed() {
+        let mut open = viewed_chat_id(Some("telegram:42"));
+        assert_eq!(live_message_to_view(open, 42, 99), Some((42, 99)));
+        assert_eq!(
+            live_message_to_view(open, 7, 1),
+            None,
+            "a different chat stays unread"
+        );
+        open = viewed_chat_id(None);
+        assert_eq!(
+            live_message_to_view(open, 42, 100),
+            None,
+            "leaving stops viewMessages"
+        );
+        open = viewed_chat_id(Some("not-a-telegram-chat"));
+        assert_eq!(
+            live_message_to_view(open, 42, 101),
+            None,
+            "a foreign id does not keep the old chat"
+        );
+        open = viewed_chat_id(Some("telegram:42"));
+        assert_eq!(
+            live_message_to_view(open, 42, 103),
+            Some((42, 103)),
+            "returning names the chat again"
+        );
     }
 
     #[test]
