@@ -797,6 +797,7 @@ mod tests {
     fn history() -> LinkEvent {
         LinkEvent::History {
             chats: vec![inbox::HistoryChat {
+                mute: Default::default(),
                 jid: CHAT.into(),
                 name: Some("Ana".into()),
                 unread: 3,
@@ -1758,6 +1759,7 @@ mod tests {
         adapter.session.apply(
             LinkEvent::History {
                 chats: vec![inbox::HistoryChat {
+                    mute: Default::default(),
                     jid: CHAT.into(),
                     name: None,
                     unread: 0,
@@ -1974,6 +1976,7 @@ mod tests {
         let mut adapter = with_sender(Arc::new(FakeSender::default()));
         let chats: Vec<inbox::HistoryChat> = (0..450)
             .map(|n| inbox::HistoryChat {
+                mute: Default::default(),
                 jid: format!("{n}@s.whatsapp.net"),
                 name: None,
                 unread: 0,
