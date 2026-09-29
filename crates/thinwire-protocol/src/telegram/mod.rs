@@ -716,6 +716,15 @@ mod tests {
         );
         let view = fn_body(src, "fn apply_viewed_chat");
         assert!(view.contains("viewed_chat_id"));
+        let apply = fn_body(src, "async fn apply_update");
+        let refresh = apply
+            .find("live.open_chat = live.viewed.get()")
+            .expect("a queued update reads the published chat");
+        let live = apply.find("live_read_of").expect("live mark");
+        assert!(
+            refresh < live,
+            "a message that arrived after blur is not marked while ViewChat is queued"
+        );
         let start = src.find("pub fn view_chat(").expect("view_chat");
         let rest = &src[start..];
         let end = rest.find("\n    pub fn ").expect("next method");

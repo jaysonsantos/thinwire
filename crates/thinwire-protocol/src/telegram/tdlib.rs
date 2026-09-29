@@ -538,8 +538,14 @@ fn spawn_tdlib_worker(
                             conversation_id,
                             stamp,
                         } => {
-                            apply_viewed_chat(&mut live.open_chat, conversation_id.as_deref());
-                            live.viewed.sync(stamp, live.open_chat);
+                            let chat = inbox::viewed_chat_id(conversation_id.as_deref());
+                            if live.viewed.sync(stamp, chat) {
+                                apply_viewed_chat(&mut live.open_chat, conversation_id.as_deref());
+                            } else {
+                                // A newer blur or switch already won. Do not
+                                // put this command's chat back.
+                                live.open_chat = live.viewed.get();
+                            }
                         }
                         TdlibCommand::SendText { conversation_id, body, request } => {
                             send_text(client_id, &conversation_id, &body, request, &live, &events).await;
@@ -752,6 +758,9 @@ async fn apply_update(
             );
         }
         other => {
+            // `view_chat` published the cell while this update waited behind
+            // `getChatHistory`. `open_chat` is still the previous command.
+            live.open_chat = live.viewed.get();
             let mark_read = live_read_of(&other, live.open_chat);
             apply_chat_update(other, live, events);
             if let Some((chat_id, message_id)) = mark_read {

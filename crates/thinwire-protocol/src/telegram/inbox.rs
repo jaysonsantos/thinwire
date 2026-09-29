@@ -392,10 +392,14 @@ impl ViewedChat {
     }
 
     /// Worker side. Applies `chat` only while `generation` is still current.
-    pub(super) fn sync(&self, generation: u64, chat: Option<i64>) {
+    /// `false` means a newer publish already replaced this one.
+    pub(super) fn sync(&self, generation: u64, chat: Option<i64>) -> bool {
         let mut viewed = self.lock();
         if viewed.generation == generation {
             viewed.chat = chat;
+            true
+        } else {
+            false
         }
     }
 
@@ -717,12 +721,25 @@ mod tests {
         );
 
         // Blur, or leaving the thread, lands before the worker finishes the load.
+        // The worker's `open_chat` is still 42: `ViewChat(None)` is queued
+        // behind `OpenChat`. The cell is what the mark must read.
         let left = viewed.publish(None);
         assert!(
             !should_mark_history_viewed(viewed.get(), 42),
             "a queued ViewChat(None) skips viewMessages"
         );
-        viewed.sync(opened, Some(42));
+        assert!(
+            live_message_to_view(viewed.get(), 42, 11).is_none(),
+            "a message that arrived after the blur is not marked while ViewChat is queued"
+        );
+        assert!(
+            !viewed.sync(opened, Some(42)),
+            "the queued ViewChat for the old chat is stale"
+        );
+        assert!(
+            live_message_to_view(viewed.get(), 42, 12).is_none(),
+            "a stale ViewChat does not mark that message"
+        );
         assert!(
             !should_mark_history_viewed(viewed.get(), 42),
             "the queued ViewChat for the old chat does not undo the blur"
