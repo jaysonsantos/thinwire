@@ -174,10 +174,12 @@ impl TdlibRuntime {
     /// shutdown keeps the session.
     fn stop_client(&mut self, cancel: bool) {
         // Mark first: from now on the old client sends no login events, even
-        // before its worker reads `Close` (issue #42).
+        // before its worker reads `Close` (issue #42). The viewed chat goes
+        // with it, so a message that arrives while closing is not marked read.
         if let Some(closing) = self.current_closing.take() {
             closing.mark();
         }
+        self.viewed.clear();
         if let Some(commands) = self.commands.take() {
             let _ = commands.send(TdlibCommand::Close { cancel });
         }
@@ -546,6 +548,8 @@ fn spawn_tdlib_worker(
                             live.close_requested = true;
                             live.close_cancel = Some(cancel);
                             live.closing.mark();
+                            live.viewed.clear();
+                            live.open_chat = None;
                             let signed_in = live.authorized || live.late_ready;
                             match close_kind(signed_in, live.new_login, cancel) {
                                 CloseKind::LogOut => {
@@ -817,7 +821,7 @@ async fn apply_update(
             // `view_chat` published the cell while this update waited behind
             // `getChatHistory`. `open_chat` is still the previous command.
             live.open_chat = live.viewed.get();
-            let mark_read = live_read_of(&other, live.open_chat);
+            let mark_read = live_read_while_linked(live, &other);
             remember_unviewed(&other, live.open_chat, &mut live.unviewed);
             apply_chat_update(other, live, events);
             if let Some((chat_id, message_id)) = mark_read {
@@ -827,6 +831,18 @@ async fn apply_update(
         }
     }
     false
+}
+
+/// `viewMessages` for a live message. A client that is closing, or whose
+/// login epoch moved, is not linked and must not mark anything read.
+fn live_read_while_linked(
+    live: &LiveInbox,
+    update: &tdlib_rs::enums::Update,
+) -> Option<(i64, i64)> {
+    if !live.linked() {
+        return None;
+    }
+    live_read_of(update, live.open_chat)
 }
 
 /// A live incoming message in the open chat. History calls `viewMessages`
@@ -903,8 +919,8 @@ fn apply_requested_view(
 ) {
     let requested = requested.lock().unwrap_or_else(PoisonError::into_inner);
     let chat = inbox::viewed_chat_id(requested.as_deref());
-    // Still holding `requested`. A blur cannot store None and then lose the
-    // generation to this publish.
+    // Still holding `requested`. A blur cannot store None and then lose
+    // the race to this publish.
     let _ = viewed.publish(chat);
     *open_chat = chat;
 }
@@ -2174,6 +2190,45 @@ mod tests {
                 reply_markup: None,
             },
         })
+    }
+
+    #[test]
+    fn a_message_after_closing_starts_is_not_marked_viewed() {
+        let mut runtime = TdlibRuntime::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.commands = Some(tx);
+        let closing = ClosingFlag::new(Arc::clone(&runtime.login_epoch));
+        runtime.current_closing = Some(closing.clone());
+        let _ = runtime.viewed.publish(Some(42));
+        let mut live = LiveInbox {
+            authorized: true,
+            older: OlderHistory::new(),
+            new_login: false,
+            late_ready: false,
+            close_cancel: None,
+            closing: closing.clone(),
+            close_requested: false,
+            ended_elsewhere: false,
+            directory: ChatDirectory::new(),
+            names: NameBook::new(),
+            open_chat: Some(42),
+            viewed: runtime.viewed.clone(),
+            unviewed: HashMap::new(),
+        };
+        // Disconnect or Shutdown has marked closing. The cell can still name
+        // the chat until `stop_client` clears it.
+        live.closing.mark();
+        let update = live_message(42, 200, false);
+        assert!(
+            live_read_while_linked(&live, &update).is_none(),
+            "closing started, then a NewMessage: no viewMessages"
+        );
+
+        runtime.stop();
+        assert!(closing.is_set());
+        assert_eq!(runtime.viewed.get(), None, "closing clears the viewed chat");
+        live.open_chat = live.viewed.get();
+        assert!(live_read_while_linked(&live, &update).is_none());
     }
 
     #[test]
