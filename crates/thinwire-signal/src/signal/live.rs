@@ -58,8 +58,10 @@ const HISTORY_PAGE: usize = 50;
 /// One more tells the page that older rows exist. The store primary key is
 /// `(ts, thread_id)`, so a time window can still hold more rows than a page.
 const HISTORY_READ_LIMIT: usize = HISTORY_PAGE + 2;
-/// How many store rows one page may scan. Each read is still at most
-/// [`HISTORY_READ_LIMIT`]. A store of only corrupt rows stops here.
+/// How many distinct store rows one page may scan. Each read is still at
+/// most [`HISTORY_READ_LIMIT`]. A widened window does not count a row twice.
+/// At this cap the page stops with `more` still true, so the next page can
+/// continue. `more` is false only when a read returns fewer rows than asked.
 const HISTORY_SCAN_CAP: usize = HISTORY_READ_LIMIT * 4;
 
 pub(super) enum WorkerJob {
@@ -680,55 +682,64 @@ async fn fetch_history_page(
         let include_before = before_id.is_some();
         let mut page = NewestBound::new(HISTORY_PAGE);
         let mut good = 0usize;
-        let mut scanned = 0usize;
+        let mut seen = HashSet::new();
         let mut cursor_before = before;
         let mut cursor_inclusive = include_before;
-        let mut last_batch_len = 0usize;
-        let mut store_ended = false;
+        let mut hit_cap = false;
+        let mut exhausted = false;
         loop {
-            if scanned >= HISTORY_SCAN_CAP || good >= HISTORY_READ_LIMIT {
+            if seen.len() >= HISTORY_SCAN_CAP {
+                hit_cap = true;
+                break;
+            }
+            if good >= HISTORY_READ_LIMIT {
                 break;
             }
             let (start, reached_start) = history_window(cursor_before, span);
-            let ask = (HISTORY_SCAN_CAP - scanned).min(HISTORY_READ_LIMIT);
+            let ask = (HISTORY_SCAN_CAP - seen.len()).min(HISTORY_READ_LIMIT);
             let timestamps =
                 read_history_timestamps(&pool, thread, start, cursor_before, cursor_inclusive, ask)
                     .await?;
             // Each timestamp is one row (`message` loads that row). The timestamp
             // query stops at `ask`, which is at most `HISTORY_READ_LIMIT`.
             if timestamps.is_empty() {
-                match history_read_after(good, 0, scanned, reached_start) {
+                match history_read_after(good, 0, seen.len(), reached_start) {
                     HistoryRead::Widen => {
                         span = widen_history_span(cursor_before, span);
                         continue;
                     }
                     HistoryRead::Stop | HistoryRead::Older => {
-                        store_ended = true;
+                        exhausted = true;
                         break;
                     }
                 }
             }
-            last_batch_len = timestamps.len();
-            scanned += timestamps.len();
+            let fresh = observe_history_rows(&mut seen, &timestamps);
             let oldest = timestamps.last().copied();
-            for ts in timestamps {
+            for ts in fresh {
                 let loaded = manager.store().message(thread, ts).await.map_err(|_| ());
                 if note_history_row(&mut page, loaded, before, before_id, content_history_key) {
                     good += 1;
                 }
             }
-            match history_read_after(good, last_batch_len, scanned, reached_start) {
+            match history_read_after(good, timestamps.len(), seen.len(), reached_start) {
                 HistoryRead::Older => {
                     cursor_before = oldest.unwrap_or(cursor_before);
                     cursor_inclusive = false;
                 }
                 HistoryRead::Widen => span = widen_history_span(cursor_before, span),
-                HistoryRead::Stop => break,
+                HistoryRead::Stop => {
+                    if seen.len() >= HISTORY_SCAN_CAP && good < HISTORY_READ_LIMIT {
+                        hit_cap = true;
+                    } else if timestamps.len() < ask {
+                        exhausted = true;
+                    }
+                    break;
+                }
             }
         }
-        let (rows, _) = page.finish(true);
-        let batch_len = if store_ended { 0 } else { last_batch_len };
-        let more = history_page_more(rows.len(), good, batch_len);
+        let (rows, overflow) = page.finish(true);
+        let more = history_page_more(hit_cap, exhausted) || overflow;
         Ok((rows, more))
     }
     .await;
@@ -750,8 +761,9 @@ enum HistoryRead {
 }
 
 /// A skipped row does not end the page. A full limit means the store has
-/// older timestamps. A short batch ends the store only once the window
-/// reaches the start. The scan cap stops a fully corrupt store.
+/// older timestamps. A short batch widens the window until the start, and
+/// only then is the store exhausted. The scan cap stops this page; the next
+/// page can continue.
 fn history_read_after(
     good: usize,
     batch_len: usize,
@@ -769,10 +781,23 @@ fn history_read_after(
     }
 }
 
-/// `more` follows the store. A full limit batch, or more good rows than one
-/// page, means older rows exist. Skipped rows do not. An empty page ends.
-fn history_page_more(page_len: usize, good: usize, last_batch_len: usize) -> bool {
-    page_len > 0 && (good > HISTORY_PAGE || last_batch_len >= HISTORY_READ_LIMIT)
+/// Timestamps this page has not scanned yet. A widened read returns rows the
+/// page already counted; those are not scanned again.
+fn observe_history_rows(seen: &mut HashSet<u64>, timestamps: &[u64]) -> Vec<u64> {
+    let mut fresh = Vec::new();
+    for ts in timestamps {
+        if seen.insert(*ts) {
+            fresh.push(*ts);
+        }
+    }
+    fresh
+}
+
+/// `more` is false only when a read returned fewer rows than asked and the
+/// store is exhausted. The scan count does not hide older rows. At
+/// [`HISTORY_SCAN_CAP`] the next page can continue.
+fn history_page_more(hit_cap: bool, exhausted: bool) -> bool {
+    hit_cap || !exhausted
 }
 
 /// `true` when the row was kept as a newly seen page candidate.
@@ -1620,44 +1645,55 @@ mod tests {
     fn page_from_store(rows_newest_first: &[Result<Option<u64>, ()>]) -> (Vec<u64>, bool, usize) {
         let mut page = NewestBound::new(HISTORY_PAGE);
         let mut good = 0usize;
-        let mut scanned = 0usize;
+        let mut seen = HashSet::new();
         let mut index = 0usize;
-        let mut last_batch_len = 0usize;
+        let mut hit_cap = false;
+        let mut exhausted = false;
         loop {
-            if scanned >= HISTORY_SCAN_CAP || good >= HISTORY_READ_LIMIT {
+            if seen.len() >= HISTORY_SCAN_CAP {
+                hit_cap = true;
+                break;
+            }
+            if good >= HISTORY_READ_LIMIT {
                 break;
             }
             if index >= rows_newest_first.len() {
-                last_batch_len = 0;
+                exhausted = true;
                 break;
             }
-            let ask = (HISTORY_SCAN_CAP - scanned).min(HISTORY_READ_LIMIT);
+            let ask = (HISTORY_SCAN_CAP - seen.len()).min(HISTORY_READ_LIMIT);
             let end = (index + ask).min(rows_newest_first.len());
             let batch = &rows_newest_first[index..end];
             assert!(
                 batch.len() <= HISTORY_READ_LIMIT,
                 "each store read stays bounded"
             );
-            last_batch_len = batch.len();
-            scanned += batch.len();
-            index = end;
-            for row in batch {
-                if note_history_row(&mut page, *row, u64::MAX, None, |ts| {
+            let positions: Vec<u64> = (index as u64..end as u64).collect();
+            let fresh = observe_history_rows(&mut seen, &positions);
+            for pos in fresh {
+                let row = rows_newest_first[pos as usize];
+                if note_history_row(&mut page, row, u64::MAX, None, |ts| {
                     (*ts, format!("{ts}:a"))
                 }) {
                     good += 1;
                 }
             }
+            index = end;
             if matches!(
-                history_read_after(good, last_batch_len, scanned, true),
+                history_read_after(good, batch.len(), seen.len(), true),
                 HistoryRead::Stop
             ) {
+                if seen.len() >= HISTORY_SCAN_CAP && good < HISTORY_READ_LIMIT {
+                    hit_cap = true;
+                } else if batch.len() < ask {
+                    exhausted = true;
+                }
                 break;
             }
         }
-        let (rows, _) = page.finish(true);
-        let more = history_page_more(rows.len(), good, last_batch_len);
-        (rows, more, scanned)
+        let (rows, overflow) = page.finish(true);
+        let more = history_page_more(hit_cap, exhausted) || overflow;
+        (rows, more, seen.len())
     }
 
     #[test]
@@ -1680,9 +1716,47 @@ mod tests {
         let corrupt = vec![Err(()); HISTORY_SCAN_CAP + HISTORY_READ_LIMIT];
         let (page, more, scanned) = page_from_store(&corrupt);
         assert!(page.is_empty());
-        assert!(!more, "a store of only corrupt rows ends");
-        assert!(scanned <= HISTORY_SCAN_CAP);
         assert_eq!(scanned, HISTORY_SCAN_CAP);
+        assert!(more, "the scan cap lets the next page continue");
+    }
+
+    #[test]
+    fn a_short_batch_after_skips_does_not_hide_older_rows() {
+        let mut seen = HashSet::new();
+        let mut page = NewestBound::new(HISTORY_PAGE);
+        let mut good = 0usize;
+        let first: Vec<u64> = (100..152).collect();
+        let fresh = observe_history_rows(&mut seen, &first);
+        for (index, ts) in fresh.iter().enumerate() {
+            let row = if index < 10 { Err(()) } else { Ok(Some(*ts)) };
+            if note_history_row(&mut page, row, u64::MAX, None, |stamp| {
+                (*stamp, format!("{stamp}:a"))
+            }) {
+                good += 1;
+            }
+        }
+        assert_eq!(good, 42);
+        assert!(seen.len() < HISTORY_SCAN_CAP);
+        let widened = [146, 147, 148, 149, 150, 151, 90, 80];
+        let fresh = observe_history_rows(&mut seen, &widened);
+        assert_eq!(fresh.len(), 2, "a widened read counts each row once");
+        assert!(seen.len() < HISTORY_SCAN_CAP);
+        assert!(
+            matches!(
+                history_read_after(good, widened.len(), seen.len(), false),
+                HistoryRead::Widen
+            ),
+            "a short batch is not the end of the store"
+        );
+        assert!(history_page_more(false, false), "older rows stay reachable");
+        assert!(
+            !history_page_more(false, true),
+            "a short read ends the page only when the store is exhausted"
+        );
+        assert!(
+            history_page_more(true, true),
+            "the scan cap still lets the user page"
+        );
     }
 
     #[test]
