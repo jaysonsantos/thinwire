@@ -76,7 +76,6 @@ impl Default for SendTracker {
 
 impl SendTracker {
     /// The request id of this chat's send or retry in flight, if any.
-    #[cfg(test)]
     pub(crate) fn request_of(&self, protocol: ProtocolId, chat: &str) -> Option<u64> {
         self.open
             .get(&(protocol, chat.to_owned()))
@@ -220,6 +219,17 @@ impl SendTracker {
     pub(crate) fn prune_expired(&mut self, now: Instant) {
         self.expired
             .retain(|_, expired| now.saturating_duration_since(expired.at) < EXPIRED_KEEP);
+    }
+
+    /// This request is still open, or it expired and still waits for a late answer.
+    pub(crate) fn tracks(&self, protocol: ProtocolId, request: u64) -> bool {
+        self.open
+            .iter()
+            .any(|((owner, _), open)| *owner == protocol && open.pending.request() == request)
+            || self
+                .expired
+                .keys()
+                .any(|(owner, _, id)| *owner == protocol && *id == request)
     }
 
     /// A late answer for an entry that already expired. Returns and forgets
