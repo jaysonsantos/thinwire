@@ -14,7 +14,10 @@
 //! settled, `Unlinked` is pending), `revoked` (the owner queued `Unlinked`),
 //! and `retired`. The owner sets the first three. [`Session::retire`] sets
 //! `retired` before it returns, so a list or history result already queued
-//! publishes nothing.
+//! publishes nothing. A send result already queued is still this session's:
+//! a success Discord accepted stays accepted. The flag is not that
+//! retirement. Only a `Retire`, `Disconnect`, or shutdown the owner has
+//! already handled drops a later send.
 //!
 //! State diagram: `thinwire-team/discord.md`, section "Session owner".
 
@@ -151,8 +154,13 @@ enum Msg {
     },
     /// The user disconnected: settle the work in flight, then emit the
     /// disconnected state and publish nothing more.
+    ///
+    /// `attempt` is the generation [`Session::disconnect`] stored in
+    /// [`ActiveSession`]. The owner emits only while that generation is still
+    /// the newest, so a later connect or disconnect wins.
     Disconnect {
         detail: &'static str,
+        attempt: u64,
     },
     Shutdown {
         done: oneshot::Sender<()>,
@@ -180,9 +188,12 @@ struct Flags {
     revoked: AtomicBool,
     /// `Stopped` is queued. Whoever sets it first emits it, so it comes once.
     stopped: AtomicBool,
-    /// Set by [`Session::retire`] before it returns. A completion already
-    /// queued still sees it, so disconnect can emit `Unlinked` without a
-    /// later `Linked`, conversation, or history row (Codex r4131954091).
+    /// Set by [`Session::retire`] and [`Session::disconnect`] before they
+    /// return. A list or history result already queued still sees it, so
+    /// disconnect can emit `Unlinked` without a later `Linked`, conversation,
+    /// or history row (Codex r4131954091). A send result already queued does
+    /// not use this flag: the owner accepts it until it has handled the
+    /// retirement message (Codex r4132922551).
     retired: AtomicBool,
 }
 
@@ -194,11 +205,13 @@ impl Flags {
     }
 }
 
-/// The id of the adapter's newest session. A session start sets it and
-/// emits `Linking` under this lock. An owner emits its disconnected state
-/// under it too, and only while it is still the newest session. So an old
-/// owner's `Unlinked` never follows a newer session's `Linking` (Codex
-/// r4132725575). The lock is held only for that check and emit, never across
+/// The id of the newest connect or disconnect attempt. A session start sets
+/// it and emits `Linking` under this lock. Every connect and disconnect sets
+/// it too, including a connect that starts no session. An owner emits its
+/// disconnected state under the lock, and only while its attempt is still
+/// the newest. So an old disconnect cannot follow a newer `Linking` or
+/// overwrite a missing-token or refused status (Codex r4132725575,
+/// r4132922561). The lock is held only for that check and emit, never across
 /// an await.
 pub(crate) type ActiveSession = Arc<Mutex<u64>>;
 
@@ -369,7 +382,8 @@ impl Session {
     ///
     /// Retirement is visible before this returns. A [`Msg::ReloadDone`] or
     /// [`Msg::HistoryDone`] already queued publishes nothing, even though the
-    /// owner handles that message before [`Msg::Retire`].
+    /// owner handles that message before [`Msg::Retire`]. A [`Msg::SendDone`]
+    /// already queued is still accepted when the HTTP call succeeded.
     pub(crate) fn retire(self) -> oneshot::Receiver<Carried> {
         self.flags.retired.store(true, Ordering::SeqCst);
         let (carried, rx) = oneshot::channel();
@@ -382,9 +396,12 @@ impl Session {
     /// publishes nothing more. So no event of this session follows the
     /// disconnected state (Codex r4131954091). When the owner is gone, the
     /// handle emits that state itself.
-    pub(crate) fn disconnect(self, detail: &'static str, events: &EventTx) {
+    ///
+    /// `attempt` is the generation just stored in [`ActiveSession`]. The
+    /// owner emits only while that generation is still the newest.
+    pub(crate) fn disconnect(self, detail: &'static str, attempt: u64, events: &EventTx) {
         self.flags.retired.store(true, Ordering::SeqCst);
-        if self.tx.send(Msg::Disconnect { detail }).is_err() {
+        if self.tx.send(Msg::Disconnect { detail, attempt }).is_err() {
             emit_disconnected(events, detail);
         }
     }
@@ -623,7 +640,7 @@ impl Owner {
                 self.finish_shutdown_if_idle();
             }
             Msg::ShutdownLimit => self.close(),
-            Msg::Disconnect { detail } => self.disconnect(detail),
+            Msg::Disconnect { detail, attempt } => self.disconnect(detail, attempt),
             #[cfg(test)]
             Msg::Flush { done } => {
                 let _ = done.send(());
@@ -648,6 +665,9 @@ impl Owner {
 
     /// [`Session::retire`] or [`Session::disconnect`] has returned, or this
     /// task has handled `Retire`, `Disconnect`, or the end of a shutdown.
+    /// Inbox publications use this. A send result uses [`Self::retired`]
+    /// alone when the call succeeded, so one queued before the retirement
+    /// message is still accepted.
     fn replaced(&self) -> bool {
         self.retired || self.flags.retired.load(Ordering::SeqCst)
     }
@@ -1070,8 +1090,13 @@ impl Owner {
         let Some(tracked) = self.inflight.remove(&request) else {
             return;
         };
-        if self.replaced() {
-            // A later session replaced this one: the row does not stay pending.
+        // `flags.retired` is set before this task handles Retire or
+        // Disconnect, so a list or history result already queued publishes
+        // nothing. A send result already queued is earlier work. Discord
+        // accepted it, so accept it here. A failure still drops its row, and
+        // a result that arrives after this task has handled the retirement
+        // does too (Codex r4132922551).
+        if self.retired || (self.flags.retired.load(Ordering::SeqCst) && result.is_err()) {
             self.settle_row(&tracked);
             emit_send_rejected(
                 &self.events,
@@ -1248,7 +1273,7 @@ impl Owner {
     /// The user disconnected. Answer the sends in flight (settle their rows)
     /// and end the loads, then emit the disconnected state. Nothing of this
     /// session comes after it.
-    fn disconnect(&mut self, detail: &'static str) {
+    fn disconnect(&mut self, detail: &'static str, attempt: u64) {
         let mut sends: Vec<(u64, Inflight)> = self.inflight.drain().collect();
         sends.sort_by_key(|(request, _)| *request);
         for (request, tracked) in sends {
@@ -1267,10 +1292,12 @@ impl Owner {
         }
         self.retire();
         self.closed = true;
-        // A newer session may have started while this message waited. Then
-        // this old disconnect must not unlink it (Codex r4132725575).
+        // A later connect or disconnect may have claimed `active` while this
+        // message waited, including one that started no session. Then this
+        // old disconnect must not overwrite that status (Codex r4132725575,
+        // r4132922561).
         let newest = self.active.lock().unwrap_or_else(PoisonError::into_inner);
-        if *newest == self.id {
+        if *newest == attempt {
             emit_disconnected(&self.events, detail);
         }
     }
