@@ -118,7 +118,8 @@ impl Inbox {
 pub(crate) enum Next {
     /// Go on with the next command.
     Go,
-    /// Wait this long, then go on. The failed command is not tried again.
+    /// Wait this long, then go on. A failed `Dismiss` waits in the inbox for
+    /// its next try. A flush or the end of the `Notifier` ends the wait early.
     Wait(Duration),
     /// Too many failures in a row: stop for this run.
     Off,

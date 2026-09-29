@@ -15,7 +15,7 @@
 //! waits and tries the next command; notifications turn off for the run
 //! only after `MAX_FAILURES_IN_A_ROW` failures in a row.
 
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,10 @@ struct Shared {
     busy: bool,
     /// The `Notifier` is gone: the thread ends when the inbox is empty.
     closed: bool,
+    /// `flush` calls that wait now. While one waits, a failure does not
+    /// wait its backoff: at exit, the last commands and their retries go
+    /// out inside the flush limit (#168 item 19).
+    flushing: usize,
     /// Too many failures: the thread drops every command.
     off: bool,
 }
@@ -68,7 +72,7 @@ struct Pipe {
 }
 
 impl Pipe {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
+    fn lock(&self) -> MutexGuard<'_, Shared> {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -129,13 +133,16 @@ impl Notifier {
     pub fn flush(&self, limit: Duration) -> bool {
         let deadline = Instant::now() + limit;
         let mut shared = self.pipe.lock();
-        loop {
+        shared.flushing += 1;
+        // Wake the thread if it waits after a failure.
+        self.pipe.changed.notify_all();
+        let done = loop {
             if shared.off || (shared.inbox.is_empty() && !shared.busy) {
-                return true;
+                break true;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return false;
+                break false;
             }
             shared = self
                 .pipe
@@ -143,7 +150,9 @@ impl Notifier {
                 .wait_timeout(shared, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
-        }
+        };
+        shared.flushing -= 1;
+        done
     }
 }
 
@@ -183,11 +192,9 @@ fn run(pipe: &Pipe, mut backend: impl Backend) {
             tracing::debug!(kind, "desktop notification sent to the OS");
         }
         // A failed `Dismiss` goes back to the inbox, so its notification
-        // does not stay on screen after one busy D-Bus call (#165).
+        // does not stay on screen after one busy D-Bus call (#165). It goes
+        // back before the wait, so a flush waits for it (#168 item 19).
         let (next, retry) = policy.record(&command, result);
-        if let Next::Wait(wait) = next {
-            thread::sleep(wait);
-        }
         let mut shared = pipe.lock();
         shared.busy = false;
         if let Some(key) = retry
@@ -199,11 +206,37 @@ fn run(pipe: &Pipe, mut backend: impl Backend) {
             shared.off = true;
             while shared.inbox.pop().is_some() {}
         }
-        drop(shared);
         pipe.changed.notify_all();
-        if next == Next::Off {
-            return;
+        match next {
+            Next::Go => {}
+            Next::Wait(wait) => drop(back_off(pipe, shared, wait)),
+            Next::Off => return,
         }
+    }
+}
+
+/// Wait `wait` after a failed OS call. A flush ends the wait early, so the
+/// app's short exit flush still sends the last commands (#168 item 19). The
+/// end of the `Notifier` ends it too: nobody waits for the thread then.
+fn back_off<'a>(
+    pipe: &'a Pipe,
+    mut shared: MutexGuard<'a, Shared>,
+    wait: Duration,
+) -> MutexGuard<'a, Shared> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if shared.flushing > 0 || shared.closed {
+            return shared;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return shared;
+        }
+        shared = pipe
+            .changed
+            .wait_timeout(shared, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
     }
 }
 
@@ -414,6 +447,38 @@ mod tests {
         );
     }
 
+    /// #168 item 19: at exit the app flushes for 500 ms, less than one
+    /// failure wait. A flush ends that wait, so a dismiss that fails before
+    /// or during the flush is tried again inside the limit.
+    #[test]
+    fn a_dismiss_that_fails_at_exit_is_tried_again_inside_the_flush() {
+        let exit_limit = Duration::from_millis(500);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fake_seen = Arc::clone(&seen);
+        let notifier = Notifier::spawn_with(
+            move |clicks| Fake {
+                seen: fake_seen,
+                clicks,
+                fail_on_show: false,
+                fail_dismisses: 2,
+            },
+            |_| {},
+        );
+        // The first try fails before the flush: the thread waits.
+        notifier.send([NotifyCommand::Dismiss(key("telegram:1"))]);
+        thread::sleep(RETRY_AFTER / 4);
+        assert!(
+            seen.lock().expect("seen").is_empty(),
+            "with no flush, the retry waits"
+        );
+        // The second try fails during the flush; the third one works.
+        assert!(notifier.flush(exit_limit), "the retries ran in time");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![Seen::Dismiss(key("telegram:1"))]
+        );
+    }
+
     #[test]
     fn a_failed_dismiss_is_tried_again() {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -450,8 +515,8 @@ mod tests {
             |_| {},
         );
         notifier.send([NotifyCommand::Dismiss(key("telegram:1"))]);
-        // The failures in a row wait 1 s, 2 s, and 4 s; after the last try
-        // the thread gives up on this dismiss and goes idle.
+        // The flush ends each failure wait. After the last try the thread
+        // gives up on this dismiss and goes idle.
         assert!(notifier.flush(RETRY_AFTER * 10));
         assert!(seen.lock().expect("seen").is_empty());
         // The thread is still on: the next command works.
