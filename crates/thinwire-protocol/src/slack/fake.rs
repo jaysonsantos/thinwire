@@ -18,7 +18,9 @@ use super::credentials::SlackApiSource;
 use super::install::SlackInstalledWorkspace;
 use super::loopback::tests::get;
 use super::secrets::{MemorySlackVault, SlackSecretKey, SlackSecretVault};
-use super::session::{DEDUP_FRESH_SECS, HISTORY_LIMIT, MAX_CHANNEL_PAGES, SlackDeps, SlackInbox};
+use super::session::{
+    DEDUP_FRESH_SECS, HISTORY_LIMIT, MAX_CHANNEL_PAGES, SlackDeps, SlackInbox, unix_secs,
+};
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation,
     ProtocolAdapter, ProtocolId,
@@ -1720,7 +1722,7 @@ async fn a_retry_after_the_display_cache_fills_is_not_live() {
     // One original post, then enough newer posts to evict it from `shown`.
     // The whole flood sits inside the notification freshness window, which is
     // when a retried `Live` arrival would notify again.
-    let base = 1_700_000_200_i64;
+    let base = unix_secs();
     let extra = usize::from(HISTORY_LIMIT);
     let span = i64::try_from(extra).expect("flood span");
     assert!(
