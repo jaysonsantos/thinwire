@@ -23,8 +23,6 @@ mod twilight;
 
 use std::fmt;
 use std::sync::Arc;
-#[cfg(any(test, feature = "discord-bot"))]
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::adapter::{
     AccountState, AdapterCommand, AdapterError, AdapterStatus, DiscordAuthMode, EventTx,
@@ -87,12 +85,41 @@ pub struct DiscordAdapter {
     backend: Option<BackendFactory>,
     #[cfg(any(test, feature = "discord-bot"))]
     session: Option<session::Session>,
-    /// Session generation. A bump makes running tasks drop their results.
+    /// Session number. It moves when a session stops and when one starts,
+    /// as the old live counter did. Pending row ids carry it, so they stay
+    /// unique across sessions and keep their form.
     #[cfg(any(test, feature = "discord-bot"))]
-    live: Arc<AtomicU64>,
+    generation: u64,
+    /// The id of the newest connect or disconnect attempt, shared with the
+    /// owners. See `session::ActiveSession`.
+    #[cfg(any(test, feature = "discord-bot"))]
+    active: session::ActiveSession,
     /// The chat `ViewChat` last named. `None` means the user left Discord.
     viewed: Option<String>,
+    /// Longest wait at shutdown for the sends in flight. A test makes it short.
+    #[cfg(any(test, feature = "discord-bot"))]
+    shutdown_limit: std::time::Duration,
 }
+
+/// Time left between the Discord shutdown and the app close limit, so
+/// `Stopped` arrives before the app stops waiting (review of #157).
+#[cfg(any(test, feature = "discord-bot"))]
+const CLOSE_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Longest wait at shutdown for the sends in flight. With the owner margin
+/// and the slack, it stays under the app close limit: 5 s - 0.5 s - 0.5 s.
+#[cfg(any(test, feature = "discord-bot"))]
+const SHUTDOWN_LIMIT: std::time::Duration = super::adapter::APP_CLOSE_LIMIT
+    .saturating_sub(CLOSE_SLACK)
+    .saturating_sub(session::CLOSING_MARGIN);
+
+// The Discord shutdown, its margin, and the slack fit in the app close limit.
+#[cfg(any(test, feature = "discord-bot"))]
+const _: () = assert!(
+    SHUTDOWN_LIMIT.as_millis() + session::CLOSING_MARGIN.as_millis() + CLOSE_SLACK.as_millis()
+        <= super::adapter::APP_CLOSE_LIMIT.as_millis()
+        && !SHUTDOWN_LIMIT.is_zero()
+);
 
 impl DiscordAdapter {
     #[must_use]
@@ -108,8 +135,12 @@ impl DiscordAdapter {
             #[cfg(any(test, feature = "discord-bot"))]
             session: None,
             #[cfg(any(test, feature = "discord-bot"))]
-            live: Arc::new(AtomicU64::new(0)),
+            generation: 0,
+            #[cfg(any(test, feature = "discord-bot"))]
+            active: Arc::default(),
             viewed: None,
+            #[cfg(any(test, feature = "discord-bot"))]
+            shutdown_limit: SHUTDOWN_LIMIT,
         }
     }
 
@@ -168,20 +199,34 @@ impl DiscordAdapter {
     }
 
     fn connect_bot_inbox(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        // The old owner hands its channels, history ids, and row texts to the
+        // new one, after it handled every earlier message. A refused token
+        // drops this handoff: no session follows, so nothing would take it.
         #[cfg(any(test, feature = "discord-bot"))]
-        let (carried, history, bodies) = self
-            .session
-            .as_ref()
-            .map(|session| {
-                (
-                    session.carried_channels(),
-                    session.carried_history(),
-                    session.carried_bodies(),
-                )
-            })
-            .unwrap_or_default();
+        let handoff = self.session.take().map(session::Session::retire);
         self.stop_session(events);
-        let prepared = self.prepared_token()?;
+        // Claim this attempt before the token check. A missing token, a
+        // refused token, and the not-ready path then move `active` too, so a
+        // delayed disconnect cannot overwrite that status (Codex r4132922561).
+        #[cfg(any(test, feature = "discord-bot"))]
+        let attempt = self.advance_active();
+        // Do not return before an account event. `advance_active` already
+        // suppressed the old owner's `Unlinked`.
+        let prepared = match self.prepared_token() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                emit_status(
+                    events,
+                    ProtocolId::Discord,
+                    AdapterStatus::Refused,
+                    error.to_string(),
+                );
+                emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
+                // `start` and the host turn this `Err` into another Refused
+                // status. The duplicate is the same refusal.
+                return Err(error);
+            }
+        };
         #[cfg(any(test, feature = "discord-bot"))]
         if let Some(factory) = &self.backend {
             match prepared {
@@ -199,7 +244,11 @@ impl DiscordAdapter {
                 Some(token) => {
                     let api = factory(token);
                     self.session = Some(session::Session::start(
-                        api, &self.live, events, carried, history, bodies,
+                        api,
+                        events,
+                        attempt,
+                        handoff,
+                        &self.active,
                     ));
                 }
             }
@@ -221,13 +270,29 @@ impl DiscordAdapter {
         let _ = events;
         #[cfg(any(test, feature = "discord-bot"))]
         {
+            // `retire` marks the session retired before it returns, so a list
+            // or history result already queued publishes nothing. A send whose
+            // result is already queued is still accepted when Discord took it.
+            // A send still in flight is rejected when its HTTP call ends.
             if let Some(session) = self.session.take() {
-                // Generation and the live counter move together under the session lock.
-                session.retire();
-            } else {
-                self.live.fetch_add(1, Ordering::SeqCst);
+                drop(session.retire());
             }
+            self.generation += 1;
         }
+    }
+
+    /// Stores a new generation in [`session::ActiveSession`]. An old owner's
+    /// disconnect emits only while its own generation is still stored there.
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn advance_active(&mut self) -> u64 {
+        self.generation += 1;
+        let id = self.generation;
+        let mut newest = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *newest = id;
+        id
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
@@ -243,13 +308,15 @@ impl DiscordAdapter {
 
     #[cfg(any(test, feature = "discord-bot"))]
     fn load_chats(&mut self, events: &EventTx) -> Result<(), AdapterError> {
-        self.session_mut()?.reload(events);
+        let _ = events;
+        self.session_mut()?.reload();
         Ok(())
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
     fn open_chat(&mut self, conversation_id: String, events: &EventTx) -> Result<(), AdapterError> {
-        self.session_mut()?.open(conversation_id, events)
+        let _ = events;
+        self.session_mut()?.open(conversation_id)
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
@@ -314,21 +381,14 @@ impl DiscordAdapter {
 
     fn drop_if_revoked(&mut self, events: &EventTx) {
         #[cfg(any(test, feature = "discord-bot"))]
+        // Only after the owner queued `Unlinked`. While it is still pending,
+        // the session stays: retiring it would drop that `Unlinked`. Connect
+        // and Disconnect still retire through `stop_session`.
         if self
             .session
             .as_ref()
             .is_some_and(session::Session::is_revoked)
         {
-            // A pending unlink belongs to this generation. Retiring here would
-            // bump it and the seal would drop `Unlinked`. Connect and
-            // Disconnect still retire through `stop_session`.
-            if self
-                .session
-                .as_ref()
-                .is_some_and(session::Session::unlink_pending)
-            {
-                return;
-            }
             self.stop_session(events);
         }
         #[cfg(not(any(test, feature = "discord-bot")))]
@@ -384,29 +444,26 @@ impl ProtocolAdapter for DiscordAdapter {
     fn shutdown(&mut self, events: &EventTx) {
         #[cfg(any(test, feature = "discord-bot"))]
         {
-            const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
-            let session = self.session.take();
-            let pending = session.as_ref().map(session::Session::wait_for_sends);
+            // The owner emits `Stopped` when its sends end, or at the limit,
+            // and publishes nothing after it (Codex r4130981025).
+            let Some(session) = self.session.take() else {
+                super::adapter::emit_stopped(events, ProtocolId::Discord);
+                return;
+            };
+            let closing = session.shutdown(self.shutdown_limit);
             let events = events.clone();
-            tokio::spawn(async move {
-                if let Some(pending) = pending {
-                    let _ = tokio::time::timeout(SHUTDOWN_LIMIT, pending).await;
-                }
-                if let Some(session) = session {
-                    session.retire();
-                }
-                super::adapter::emit_stopped(&events, ProtocolId::Discord);
-            });
+            tokio::spawn(async move { closing.wait(&events).await });
         }
         #[cfg(not(any(test, feature = "discord-bot")))]
         super::adapter::emit_stopped(events, ProtocolId::Discord);
     }
 
     fn view_chat(&mut self, conversation_id: Option<&str>, events: &EventTx) {
+        // While `Unlinked` is pending, the owner answers with
+        // `CommandFailed`, and the viewed chat does not change.
         #[cfg(any(test, feature = "discord-bot"))]
-        if self.session.as_ref().is_some_and(|session| {
-            session.refuse_pending_unlink(events, conversation_id.map(str::to_owned))
-        }) {
+        if let Some(session) = self.session.as_ref().filter(|session| session.is_ending()) {
+            session.view(conversation_id.map(str::to_owned));
             return;
         }
         let _ = events;
@@ -433,6 +490,10 @@ impl ProtocolAdapter for DiscordAdapter {
             AdapterCommand::ConnectDiscord {
                 mode: DiscordAuthMode::UserAccount,
             } => {
+                // A refused connect is still an attempt. A delayed disconnect
+                // must not overwrite the refusal (Codex r4132922561).
+                #[cfg(any(test, feature = "discord-bot"))]
+                let _ = self.advance_active();
                 emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
                 Self::connect_user_account()
             }
@@ -445,12 +506,25 @@ impl ProtocolAdapter for DiscordAdapter {
             AdapterCommand::Disconnect {
                 protocol: ProtocolId::Discord,
             } => {
-                self.stop_session(events);
                 let detail = if Self::bot_inbox_compiled() {
                     "Discord bot inbox disconnected."
                 } else {
                     NOT_READY_DETAIL
                 };
+                // A live session emits the disconnected state from its
+                // owner, after the work in flight, so no event of it comes
+                // later (Codex r4131954091).
+                #[cfg(any(test, feature = "discord-bot"))]
+                if let Some(session) = self.session.take() {
+                    let attempt = self.advance_active();
+                    session.disconnect(detail, attempt, events);
+                    return Ok(());
+                }
+                self.stop_session(events);
+                // No owner will emit, but a previous owner's disconnect may
+                // still be queued. Move `active` so it cannot overwrite this.
+                #[cfg(any(test, feature = "discord-bot"))]
+                let _ = self.advance_active();
                 emit_status(events, ProtocolId::Discord, AdapterStatus::Stubbed, detail);
                 emit_account(events, ProtocolId::Discord, AccountState::Unlinked);
                 Ok(())
@@ -486,6 +560,7 @@ impl ProtocolAdapter for DiscordAdapter {
 mod tests {
     use std::time::Duration;
 
+    use super::api::SendResultPause;
     use super::fake_api::{
         BOT_ID, FakeDiscordApi, GENERAL, GUILD, LOCKED_GUILD, NEWS, SECRET, VOICE,
     };
@@ -496,6 +571,14 @@ mod tests {
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     const FIXTURE_TOKEN: &str = "fixture-bot-token";
+
+    /// Waits until the session owner handled every earlier command (#138).
+    /// A test that reads events right after `handle` calls this first.
+    async fn settled(adapter: &DiscordAdapter) {
+        if let Some(session) = &adapter.session {
+            session.flush().await;
+        }
+    }
 
     fn drain(rx: &mut UnboundedReceiver<AdapterEvent>) -> Vec<AdapterEvent> {
         let mut events = Vec::new();
@@ -1763,8 +1846,11 @@ mod tests {
         hold.notify_waiters();
     }
 
+    /// Codex r4132922551 on #157: a reconnect stops new work, but each send
+    /// in flight still gets its real result. Both sends went out, so both
+    /// end as `SendAccepted` and their rows are replaced, not removed.
     #[tokio::test]
-    async fn a_new_session_rejects_inflight_sends() {
+    async fn a_reconnect_keeps_the_results_of_sends_in_flight() {
         let hold = Arc::new(Notify::new());
         let mut fake = FakeDiscordApi::guild_fixture();
         fake.hold_send = Some(Arc::clone(&hold));
@@ -1802,18 +1888,21 @@ mod tests {
             "a live HTTP send stays pending until Discord answers"
         );
         hold.notify_waiters();
-        let events = until(&mut rx, |event| {
-            matches!(event, AdapterEvent::SendRejected { request: 9, .. })
+        let mut events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendAccepted { request: 9, .. })
         })
         .await;
-        let rejected: Vec<u64> = events
+        // The row of request 9 is replaced right after its `SendAccepted`.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        events.extend(drain(&mut rx));
+        let accepted: Vec<u64> = events
             .iter()
             .filter_map(|event| match event {
-                AdapterEvent::SendRejected { request, .. } => Some(*request),
+                AdapterEvent::SendAccepted { request, .. } => Some(*request),
                 _ => None,
             })
             .collect();
-        assert_eq!(rejected, vec![4, 9]);
+        assert_eq!(accepted, vec![4, 9]);
         let pending: Vec<&str> = early
             .iter()
             .filter_map(|event| match event {
@@ -1823,21 +1912,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let removed: Vec<&str> = events
+        let replaced: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                AdapterEvent::MessagesRemoved { message_ids, .. } => {
-                    Some(message_ids.iter().map(String::as_str))
-                }
+                AdapterEvent::MessageReplaced { old_id, .. } => Some(old_id.as_str()),
                 _ => None,
             })
-            .flatten()
             .collect();
         assert_eq!(pending, vec!["discord:pending:2:1", "discord:pending:2:2"]);
-        assert_eq!(removed, pending);
+        assert_eq!(replaced, pending);
         assert!(!events.iter().any(|event| matches!(
             event,
-            AdapterEvent::SendAccepted { .. } | AdapterEvent::MessageReplaced { .. }
+            AdapterEvent::SendRejected { .. } | AdapterEvent::MessagesRemoved { .. }
         )));
         adapter
             .handle(
@@ -1976,6 +2062,653 @@ mod tests {
                 .any(|event| matches!(event, AdapterEvent::SendAccepted { request: 4, .. }))
         );
         assert_eq!(api.state().sent, vec![(GENERAL, "try later".to_string())]);
+    }
+
+    /// Codex r4130981018 on #157: the owner gets a send after its handle is
+    /// gone (Disconnect right after SendText). The send gets `SendRejected`,
+    /// and no optimistic row stays pending.
+    #[tokio::test]
+    async fn a_send_right_before_a_disconnect_leaves_no_pending_row() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        // The previews are done, so no task holds the owner's sender.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "just before".into(),
+                    request: 3,
+                },
+                &tx,
+            )
+            .expect("send");
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        let mut events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 3, .. })
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        events.extend(drain(&mut rx));
+        let removed: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessagesRemoved { message_ids, .. } => Some(message_ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for row in messages(&events) {
+            assert!(
+                !row.id.contains(":pending:") || removed.contains(&row.id),
+                "the optimistic row {} stays pending",
+                row.id
+            );
+        }
+        let results = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AdapterEvent::SendAccepted { request: 3, .. }
+                        | AdapterEvent::SendRejected { request: 3, .. }
+                )
+            })
+            .count();
+        assert_eq!(results, 1, "the send has one result");
+    }
+
+    /// Codex r4131954091 on #157: Disconnect while a channel list and a
+    /// history page are in flight. The owner emits the disconnected state
+    /// after its work in flight, and no event of the old session follows it.
+    #[tokio::test]
+    async fn nothing_of_the_old_session_follows_a_disconnect() {
+        let channels = Arc::new(Notify::new());
+        let history = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_history = Some(Arc::clone(&history));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        api.state().hold_channels = Some(Arc::clone(&channels));
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                },
+                &tx,
+            )
+            .expect("open");
+        // Both calls wait at their holds.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        let _ = until(&mut rx, is_unlinked).await;
+        channels.notify_waiters();
+        history.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(late.is_empty(), "an event after the disconnect: {late:?}");
+    }
+
+    /// Codex r4132922551 on #157: a send result that is already queued when
+    /// a reconnect retires the session is still applied. The send went out,
+    /// so it ends as `SendAccepted`, not `SendRejected`.
+    #[tokio::test]
+    async fn a_send_result_queued_before_a_reconnect_is_accepted() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "went out".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        // The owner waits; the send's result goes into its queue.
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        hold.notify_waiters();
+        sends_at_hold(&api, 0).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The reconnect retires the session before the owner reads the result.
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        parked.release();
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::SendAccepted { request: 1, .. }
+                    | AdapterEvent::SendRejected { request: 1, .. }
+            )
+        })
+        .await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(AdapterEvent::SendAccepted { request: 1, .. })
+            ),
+            "a send that went out is accepted"
+        );
+    }
+
+    /// Codex r4132922551 on #157: a send that goes out while a disconnect
+    /// waits ends as `SendAccepted`, before `Unlinked`.
+    #[tokio::test]
+    async fn a_send_that_goes_out_during_a_disconnect_is_accepted() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "went out".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        hold.notify_waiters();
+        let events = until(&mut rx, is_unlinked).await;
+        let accepted = position(&events, |event| {
+            matches!(event, AdapterEvent::SendAccepted { request: 1, .. })
+        })
+        .expect("the send that went out is accepted");
+        assert!(accepted < position(&events, is_unlinked).expect("unlinked"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 1, .. }))
+        );
+    }
+
+    /// Codex r4132725575 on #157: Disconnect, then Connect before the old
+    /// owner handles the disconnect. The new session links, and the old
+    /// owner's disconnected state does not unlink it later.
+    #[tokio::test]
+    async fn a_stale_disconnect_does_not_unlink_the_new_session() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = inbox_loaded(&mut rx).await;
+        parked.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late.iter().any(is_unlinked),
+            "the old owner's disconnect unlinked the new session: {late:?}"
+        );
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("the new session stays linked");
+        let opened = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+            )
+        })
+        .await;
+        assert!(!opened.iter().any(is_unlinked));
+    }
+
+    /// Codex r4132922551 on #157: the HTTP call already succeeded and queued
+    /// `SendDone`. Disconnect then sets the shared retired flag before the
+    /// owner handles that result. The send stays accepted. `retire` on a
+    /// reconnect sets the same flag.
+    #[tokio::test]
+    async fn a_send_queued_before_disconnect_is_still_accepted() {
+        let hold = Arc::new(Notify::new());
+        let pause = Arc::new(SendResultPause::default());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        fake.send_result_pause = Some(Arc::clone(&pause));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let _ = drain(&mut rx);
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                    body: "already out".into(),
+                    request: 4,
+                },
+                &tx,
+            )
+            .expect("send");
+        let sent = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReceived { .. })
+        })
+        .await;
+        let row = messages(&sent)
+            .iter()
+            .find(|message| message.id.contains(":pending:"))
+            .map(|message| message.id.clone())
+            .expect("pending row");
+        sends_at_hold(&api, 1).await;
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        hold.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), pause.arrived.notified())
+            .await
+            .expect("SendDone is queued");
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        parked.release();
+        pause.release.notify_waiters();
+        let events = until(&mut rx, is_unlinked).await;
+        let accepted = position(&events, |event| {
+            matches!(event, AdapterEvent::SendAccepted { request: 4, .. })
+        })
+        .expect("a send Discord already accepted stays accepted");
+        assert!(accepted < position(&events, is_unlinked).expect("unlinked"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageReplaced { old_id, message, .. }
+                if old_id == &row && message.body == "already out"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 4, .. })),
+            "the accepted send was rejected: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::MessagesRemoved { message_ids, .. } if message_ids.contains(&row)
+            )),
+            "the accepted row was removed: {events:?}"
+        );
+    }
+
+    /// Codex r4132922551 on #157: same queued `SendDone`, then a reconnect.
+    /// `retire` sets the shared flag before the owner handles the result.
+    #[tokio::test]
+    async fn a_send_queued_before_reconnect_is_still_accepted() {
+        let hold = Arc::new(Notify::new());
+        let pause = Arc::new(SendResultPause::default());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        fake.send_result_pause = Some(Arc::clone(&pause));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let _ = drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "already out".into(),
+                    request: 4,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        hold.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), pause.arrived.notified())
+            .await
+            .expect("SendDone is queued");
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        parked.release();
+        pause.release.notify_waiters();
+        // `SendAccepted` is queued before `MessageReplaced`, so keep reading.
+        let mut events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::SendAccepted { request: 4, .. }
+                    | AdapterEvent::SendRejected { request: 4, .. }
+            )
+        })
+        .await;
+        events.extend(drain(&mut rx));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendAccepted { request: 4, .. })),
+            "a send Discord already accepted was rejected: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 4, .. })),
+            "a send Discord already accepted was rejected: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageReplaced { message, .. } if message.body == "already out"
+        )));
+    }
+
+    /// Codex r4132922561 on #157: Disconnect, then Connect with the bot token
+    /// gone, before the old owner handles the disconnect. The missing-token
+    /// status stays. The old owner does not overwrite it with "disconnected".
+    #[tokio::test]
+    async fn a_missing_token_connect_beats_a_stale_disconnect() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, vault) = fake_adapter(Arc::clone(&api), Some(FIXTURE_TOKEN));
+        let (tx, mut rx) = unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("connect");
+        let _ = inbox_loaded(&mut rx).await;
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        vault.set_bot_token("");
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let early = drain(&mut rx);
+        assert!(
+            early.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail.contains(BOT_TOKEN_MISSING)
+            )),
+            "missing-token status: {early:?}"
+        );
+        parked.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        let statuses: Vec<&str> = early
+            .iter()
+            .chain(late.iter())
+            .filter_map(|event| match event {
+                AdapterEvent::Status { detail, .. } => Some(detail.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            statuses
+                .last()
+                .is_some_and(|detail| detail.contains(BOT_TOKEN_MISSING)),
+            "the old owner overwrote the missing-token status: {statuses:?}"
+        );
+    }
+
+    /// Codex r4132922561 on #157: a refused connect after Disconnect also
+    /// moves the active generation. The delayed owner does not emit
+    /// "disconnected" over that refusal. The refusal emits its own `Unlinked`,
+    /// because that move suppressed the old owner's.
+    #[tokio::test]
+    async fn a_refused_connect_beats_a_stale_disconnect() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, vault) = fake_adapter(Arc::clone(&api), Some(FIXTURE_TOKEN));
+        let (tx, mut rx) = unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("connect");
+        let _ = inbox_loaded(&mut rx).await;
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        vault.set_bot_token("Bearer oauth-fixture");
+        let err = adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AdapterError::Refused {
+                protocol: ProtocolId::Discord,
+                reason,
+            } if reason == USER_TOKEN_REFUSAL
+        ));
+        let early = drain(&mut rx);
+        assert!(
+            early.iter().any(is_unlinked),
+            "a refused connect emits Unlinked before the old owner runs: {early:?}"
+        );
+        assert!(
+            early.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status {
+                    status: AdapterStatus::Refused,
+                    detail,
+                    ..
+                } if detail.contains(USER_TOKEN_REFUSAL)
+            )),
+            "a refused connect emits Refused: {early:?}"
+        );
+        parked.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Status { .. }) || is_unlinked(event)),
+            "the old owner overwrote the refusal: {late:?}"
+        );
+    }
+
+    /// Codex r4132922561 on #157: the user-account refusal is a connect that
+    /// starts no session. It still moves the active generation, and it emits
+    /// `Unlinked` itself so the delayed owner cannot be the only unlink.
+    #[tokio::test]
+    async fn a_user_account_connect_beats_a_stale_disconnect() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, _vault) = fake_adapter(Arc::clone(&api), Some(FIXTURE_TOKEN));
+        let (tx, mut rx) = unbounded_channel();
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("connect");
+        let _ = inbox_loaded(&mut rx).await;
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        let err = adapter
+            .handle(
+                AdapterCommand::ConnectDiscord {
+                    mode: DiscordAuthMode::UserAccount,
+                },
+                &tx,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AdapterError::Refused {
+                protocol: ProtocolId::Discord,
+                ..
+            }
+        ));
+        let early = drain(&mut rx);
+        assert!(
+            early.iter().any(is_unlinked),
+            "a user-account refusal emits Unlinked before the old owner runs: {early:?}"
+        );
+        parked.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Status { .. }) || is_unlinked(event)),
+            "the old owner overwrote the refusal: {late:?}"
+        );
+    }
+
+    /// Review of #157: the Discord shutdown bound, the owner margin, and
+    /// the slack stay below the app close limit.
+    #[test]
+    fn the_shutdown_bound_leaves_slack_under_the_app_close_limit() {
+        let total = SHUTDOWN_LIMIT + session::CLOSING_MARGIN;
+        assert!(total + CLOSE_SLACK <= crate::APP_CLOSE_LIMIT);
+        assert!(total < crate::APP_CLOSE_LIMIT);
+        assert_eq!(SHUTDOWN_LIMIT, Duration::from_secs(4));
+    }
+
+    /// Codex r4130981025 on #157: a shutdown that reaches its limit with a
+    /// send still in flight emits `Stopped` once, and the owner publishes
+    /// nothing after it.
+    #[tokio::test]
+    async fn a_late_send_publishes_nothing_after_stopped() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        adapter.shutdown_limit = Duration::from_millis(100);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "stuck".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        adapter.shutdown(&tx);
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Stopped { .. })
+        })
+        .await;
+        hold.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let late = drain(&mut rx);
+        assert!(
+            !late.iter().any(|event| matches!(
+                event,
+                AdapterEvent::SendAccepted { .. }
+                    | AdapterEvent::SendRejected { .. }
+                    | AdapterEvent::MessageReplaced { .. }
+                    | AdapterEvent::MessagesRemoved { .. }
+                    | AdapterEvent::Stopped { .. }
+            )),
+            "nothing after Stopped: {late:?}"
+        );
     }
 
     #[tokio::test]
@@ -2128,6 +2861,178 @@ mod tests {
             api.state().sent.is_empty(),
             "a revoked generation does not register the send"
         );
+    }
+
+    /// Waits until `count` sends are past the token check and at the hold.
+    async fn sends_at_hold(api: &FakeDiscordApi, count: usize) {
+        for _ in 0..100 {
+            if api.sends_at_hold.load(std::sync::atomic::Ordering::SeqCst) == count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{count} sends did not reach the hold");
+    }
+
+    fn position(events: &[AdapterEvent], test: impl Fn(&AdapterEvent) -> bool) -> Option<usize> {
+        events.iter().position(test)
+    }
+
+    fn is_unlinked(event: &AdapterEvent) -> bool {
+        matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Unlinked,
+                ..
+            }
+        )
+    }
+
+    /// A refused token emits Refused, then `Unlinked`, and starts no session.
+    fn assert_refused_unlink(rx: &mut UnboundedReceiver<AdapterEvent>) {
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AdapterEvent::Status {
+                protocol: ProtocolId::Discord,
+                status: AdapterStatus::Refused,
+                detail,
+            }) if detail.contains(USER_TOKEN_REFUSAL)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AdapterEvent::Account {
+                protocol: ProtocolId::Discord,
+                state: AccountState::Unlinked,
+            })
+        ));
+        assert!(rx.try_recv().is_err(), "refusal does not start a session");
+    }
+
+    /// Codex r4109120586 on #135 (#138): a send whose HTTP call succeeds
+    /// while the 401 step waits ends as `SendAccepted`, before `Unlinked`.
+    /// It went out, so the user must not send it again.
+    #[tokio::test]
+    async fn a_send_that_goes_out_during_the_401_step_is_accepted() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "went out".into(),
+                    request: 7,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        api.state().unauthorized = true;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                },
+                &tx,
+            )
+            .expect("open");
+        // The 401 step has finished the load and waits for the send.
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::HistoryLoaded { .. })
+        })
+        .await;
+        hold.notify_waiters();
+        let events = until(&mut rx, is_unlinked).await;
+        let accepted = position(&events, |event| {
+            matches!(event, AdapterEvent::SendAccepted { request: 7, .. })
+        })
+        .expect("the send that went out is accepted");
+        assert!(accepted < position(&events, is_unlinked).expect("unlinked"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendRejected { request: 7, .. })),
+            "a send that went out is not rejected"
+        );
+    }
+
+    /// qa Low on #135 (#138): a retry in flight during the 401 step sets its
+    /// row back to failed with its `SendRejected`, before `Unlinked`.
+    #[tokio::test]
+    async fn a_retry_during_the_401_step_fails_its_row_again() {
+        let hold = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_send = Some(Arc::clone(&hold));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        api.state().send_error = Some(api::DiscordApiError::Rejected);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "try again".into(),
+                    request: 1,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        hold.notify_one();
+        let failed = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 1, .. })
+        })
+        .await;
+        let row = messages(&failed)
+            .iter()
+            .find(|message| message.id.contains(":pending:"))
+            .map(|message| message.id.clone())
+            .expect("the failed row");
+        api.state().send_error = None;
+        adapter
+            .handle(
+                AdapterCommand::ResendMessage {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    message_id: row.clone(),
+                    request: 2,
+                },
+                &tx,
+            )
+            .expect("retry");
+        sends_at_hold(&api, 1).await;
+        api.state().unauthorized = true;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id,
+                },
+                &tx,
+            )
+            .expect("open");
+        let events = until(&mut rx, is_unlinked).await;
+        let failed_again = position(&events, |event| {
+            matches!(
+                event,
+                AdapterEvent::MessageDelivery { message_id, delivery: crate::Delivery::Failed, .. }
+                    if *message_id == row
+            )
+        })
+        .expect("the retried row is failed again");
+        let rejected = position(&events, |event| {
+            matches!(event, AdapterEvent::SendRejected { request: 2, .. })
+        })
+        .expect("the retry is rejected");
+        let unlinked = position(&events, is_unlinked).expect("unlinked");
+        assert!(failed_again < rejected && rejected < unlinked);
+        hold.notify_waiters();
     }
 
     /// Codex r4108983123: a 401 settles a send in flight. When a reconnect
@@ -2369,6 +3274,7 @@ mod tests {
             )
             .expect("open while unlink is pending");
         adapter.view_chat(Some(&id), &tx);
+        settled(&adapter).await;
         let during = drain(&mut rx);
         assert!(
             during.iter().any(|event| matches!(
@@ -2454,6 +3360,7 @@ mod tests {
                 &tx,
             )
             .expect("unknown channel is a note");
+        settled(&adapter).await;
         let events = drain(&mut rx);
         assert_eq!(
             events
@@ -3069,6 +3976,131 @@ mod tests {
         );
     }
 
+    /// An inbox event that would link or fill the shell after `Unlinked`.
+    fn repopulates(event: &AdapterEvent) -> bool {
+        matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Linked,
+                ..
+            } | AdapterEvent::ConversationUpsert { .. }
+                | AdapterEvent::ConversationRemoved { .. }
+                | AdapterEvent::ChatListLoaded { .. }
+                | AdapterEvent::MessageReceived { .. }
+                | AdapterEvent::MessagesRemoved { .. }
+                | AdapterEvent::HistoryLoaded { .. }
+                | AdapterEvent::Status {
+                    status: AdapterStatus::Ready,
+                    ..
+                }
+        )
+    }
+
+    /// Codex r4131954091 on #157: disconnect retires the owner before
+    /// `Unlinked`. A channel-list result already queued must not publish
+    /// `Linked` or conversations after that.
+    ///
+    /// `current_thread` keeps the resumed notify and the owner's `ReloadDone`
+    /// in one poll, so the result is queued before disconnect runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_channel_list_publishes_nothing_after_unlinked() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let resumed = Arc::new(Notify::new());
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let _ = drain(&mut rx);
+        api.state().hold_channels = Some(Arc::clone(&hold));
+        api.state().channels_at_barrier = Some(Arc::clone(&arrived));
+        api.state().channels_resumed = Some(Arc::clone(&resumed));
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reload");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("list is in flight");
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        hold.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), resumed.notified())
+            .await
+            .expect("list result is queued");
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        parked.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = drain(&mut rx);
+        let unlinked = events.iter().position(is_unlinked).expect("unlinked");
+        assert!(
+            events[unlinked + 1..]
+                .iter()
+                .all(|event| !repopulates(event)),
+            "queued list published after Unlinked: {:?}",
+            &events[unlinked + 1..]
+        );
+    }
+
+    /// Codex r4131954091 on #157: a history result already queued when
+    /// disconnect retires the owner must not publish rows after `Unlinked`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_history_publishes_nothing_after_unlinked() {
+        let hold = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let resumed = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_history = Some(Arc::clone(&hold));
+        fake.history_at_hold = Some(Arc::clone(&arrived));
+        fake.history_resumed = Some(Arc::clone(&resumed));
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        let _ = drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                },
+                &tx,
+            )
+            .expect("open");
+        tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+            .await
+            .expect("history is in flight");
+        let parked = adapter.session.as_ref().expect("session").park().await;
+        hold.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), resumed.notified())
+            .await
+            .expect("history result is queued");
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        parked.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = drain(&mut rx);
+        let unlinked = events.iter().position(is_unlinked).expect("unlinked");
+        assert!(
+            events[unlinked + 1..]
+                .iter()
+                .all(|event| !repopulates(event)),
+            "queued history published after Unlinked: {:?}",
+            &events[unlinked + 1..]
+        );
+    }
+
     #[tokio::test]
     async fn disconnect_drops_history_from_the_old_session() {
         let hold = Arc::new(Notify::new());
@@ -3155,7 +4187,7 @@ mod tests {
     }
 
     #[test]
-    fn unverified_bearer_in_the_vault_is_refused_without_events() {
+    fn unverified_bearer_in_the_vault_refuses_and_unlinks() {
         let vault = Arc::new(MemoryDiscordVault::new());
         vault.set_bot_token("Bearer oauth-fixture");
         let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
@@ -3172,17 +4204,17 @@ mod tests {
             err,
             AdapterError::Refused {
                 protocol: ProtocolId::Discord,
-                ..
-            }
+                reason,
+            } if reason == USER_TOKEN_REFUSAL
         ));
-        assert!(rx.try_recv().is_err());
+        assert_refused_unlink(&mut rx);
         let rendered = format!("{adapter:?}");
         assert!(!rendered.contains("oauth-fixture"));
         assert!(!rendered.to_ascii_lowercase().contains("bearer oauth"));
     }
 
     #[test]
-    fn user_token_in_the_vault_is_refused_without_events() {
+    fn user_token_in_the_vault_refuses_and_unlinks() {
         let vault = Arc::new(MemoryDiscordVault::new());
         vault.set_bot_token("User personal-token");
         let mut adapter = DiscordAdapter::new(Arc::clone(&vault) as Arc<dyn DiscordSecretVault>);
@@ -3199,10 +4231,10 @@ mod tests {
             err,
             AdapterError::Refused {
                 protocol: ProtocolId::Discord,
-                ..
-            }
+                reason,
+            } if reason == USER_TOKEN_REFUSAL
         ));
-        assert!(rx.try_recv().is_err());
+        assert_refused_unlink(&mut rx);
         let rendered = format!("{adapter:?}");
         assert!(!rendered.contains("personal-token"));
     }

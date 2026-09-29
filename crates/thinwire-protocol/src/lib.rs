@@ -15,12 +15,12 @@ mod telegram;
 mod whatsapp;
 
 pub use adapter::{
-    AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, Arrival, ChatMessage,
-    Conversation, Delivery, DiscordAuthMode, EventTx, ProtocolAdapter, ProtocolCapabilities,
-    ProtocolId, RedactedPairingSecret, SupportClass, TelegramAuthError, TelegramAuthPhase,
-    TelegramAuthStep, TelegramCodeVia, emit_account, emit_chat_list_loaded, emit_conversation,
-    emit_history_loaded, emit_message, emit_send_accepted, emit_send_rejected, emit_status,
-    emit_stopped,
+    APP_CLOSE_LIMIT, AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus,
+    Arrival, ChatMessage, Conversation, Delivery, DiscordAuthMode, EventTx, ProtocolAdapter,
+    ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, TelegramAuthError,
+    TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, emit_account, emit_chat_list_loaded,
+    emit_conversation, emit_history_loaded, emit_message, emit_send_accepted, emit_send_rejected,
+    emit_status, emit_stopped,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,

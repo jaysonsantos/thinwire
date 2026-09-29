@@ -9396,5 +9396,50 @@ mod tests {
         assert_eq!(snapshot.compose, "");
     }
 
+    /// qa Low on #135 (#138): a retry in flight when the session ends
+    /// keeps the text of its row as the chat's draft. The session end drops
+    /// the row itself.
+    #[test]
+    fn a_session_end_keeps_the_text_of_a_retry_in_flight() {
+        let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "slack:C1", true),
+        });
+        snapshot.select_conversation("slack:C1".into());
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Slack,
+                conversation_id: "slack:C1".into(),
+                id: "slack:C1:m1".into(),
+                sender: "You".into(),
+                body: "try again".into(),
+                outbound: true,
+                delivery: Delivery::Failed,
+                sent_at: 1,
+                arrival: thinwire_protocol::Arrival::History,
+            },
+        });
+        snapshot.retry_send("slack:C1:m1");
+        assert!(
+            snapshot
+                .sends
+                .request_of(ProtocolId::Slack, "slack:C1")
+                .is_some(),
+            "the retry is in flight"
+        );
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Slack,
+            state: AccountState::Unlinked,
+        });
+        assert_eq!(
+            snapshot
+                .drafts
+                .get(&(ProtocolId::Slack, "slack:C1".to_owned()))
+                .map(String::as_str),
+            Some("try again")
+        );
+    }
+
     // endregion: #135
 }
