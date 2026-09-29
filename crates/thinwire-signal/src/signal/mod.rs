@@ -22,12 +22,12 @@ mod owner;
 #[cfg(feature = "signal-local")]
 use std::sync::Arc;
 
-#[cfg(all(test, feature = "signal-local"))]
 use thinwire_protocol::AccountState;
 use thinwire_protocol::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
-    ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, emit_chat_list_loaded,
-    emit_conversation, emit_history_loaded, emit_message, emit_status, emit_stopped,
+    ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, emit_account,
+    emit_chat_list_loaded, emit_conversation, emit_history_loaded, emit_message, emit_status,
+    emit_stopped,
 };
 
 #[cfg(not(feature = "signal-local"))]
@@ -154,6 +154,7 @@ impl SignalAdapter {
                         code: RedactedPairingSecret::new(url),
                         generation,
                     });
+                    emit_account(events, ProtocolId::Signal, AccountState::Linked);
                     emit_status(
                         events,
                         ProtocolId::Signal,
@@ -163,6 +164,7 @@ impl SignalAdapter {
                     Ok(())
                 }
                 Ok(None) => {
+                    emit_account(events, ProtocolId::Signal, AccountState::Linked);
                     emit_status(
                         events,
                         ProtocolId::Signal,
@@ -192,6 +194,7 @@ impl SignalAdapter {
             self.owner_handle().cancel(events);
             return Ok(());
         }
+        emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
         emit_status(
             events,
             ProtocolId::Signal,
@@ -222,13 +225,9 @@ impl SignalAdapter {
                         reason: "Signal is not linked",
                     });
                 }
-                emit_status(
-                    events,
-                    ProtocolId::Signal,
-                    AdapterStatus::Ready,
-                    "Signal chat list is kept by the linked session.",
-                );
-                emit_chat_list_loaded(events, ProtocolId::Signal);
+                if !session.request_refresh() {
+                    emit_chat_list_loaded(events, ProtocolId::Signal);
+                }
                 Ok(())
             }
         }
@@ -242,24 +241,17 @@ impl SignalAdapter {
     ) -> Result<(), AdapterError> {
         #[cfg(feature = "signal-local")]
         if let Engine::Live(session) = &self.engine {
-            let session = Arc::clone(session);
-            let conversation_id = conversation_id.to_string();
-            let before_message_id = before_message_id.to_string();
-            let task_events = events.clone();
-            tokio::spawn(async move {
-                let queued = session
-                    .request_older(conversation_id.clone(), before_message_id.clone())
-                    .await;
-                if !queued {
-                    let _ = task_events.send(AdapterEvent::OlderHistoryLoaded {
-                        protocol: ProtocolId::Signal,
-                        conversation_id,
-                        before_message_id,
-                        more: false,
-                        note: Some("Signal is not linked".to_string()),
-                    });
-                }
-            });
+            let queued =
+                session.request_older(conversation_id.to_string(), before_message_id.to_string());
+            if !queued {
+                let _ = events.send(AdapterEvent::OlderHistoryLoaded {
+                    protocol: ProtocolId::Signal,
+                    conversation_id: conversation_id.to_string(),
+                    before_message_id: before_message_id.to_string(),
+                    more: true,
+                    note: Some("Signal is not linked".to_string()),
+                });
+            }
             return Ok(());
         }
         let _ = (conversation_id, before_message_id);
@@ -276,16 +268,21 @@ impl SignalAdapter {
     fn open_chat(&mut self, conversation_id: &str, events: &EventTx) -> Result<(), AdapterError> {
         match &mut self.engine {
             Engine::Sync(device) => {
-                let history = device.history(conversation_id).map_err(|reason| {
-                    AdapterError::Unavailable {
-                        protocol: ProtocolId::Signal,
-                        reason,
+                match device.history(conversation_id) {
+                    Ok(history) => {
+                        for message in history {
+                            emit_message(events, message);
+                        }
+                        emit_history_loaded(events, ProtocolId::Signal, conversation_id);
                     }
-                })?;
-                for message in history {
-                    emit_message(events, message);
+                    Err(reason) => {
+                        let _ = events.send(AdapterEvent::CommandFailed {
+                            protocol: ProtocolId::Signal,
+                            conversation_id: Some(conversation_id.to_string()),
+                            detail: reason.to_string(),
+                        });
+                    }
                 }
-                emit_history_loaded(events, ProtocolId::Signal, conversation_id);
                 Ok(())
             }
             #[cfg(feature = "signal-local")]
@@ -332,27 +329,19 @@ impl SignalAdapter {
             }
             #[cfg(feature = "signal-local")]
             Engine::Live(session) => {
-                let session = Arc::clone(session);
-                let conversation_id = conversation_id.to_string();
-                let body = body.to_string();
-                let task_events = events.clone();
-                tokio::spawn(async move {
-                    let queued = session
-                        .submit(live::Outbound {
-                            conversation_id: conversation_id.clone(),
-                            body,
-                            request,
-                        })
-                        .await;
-                    if !queued {
-                        thinwire_protocol::emit_send_rejected(
-                            &task_events,
-                            ProtocolId::Signal,
-                            conversation_id,
-                            request,
-                        );
-                    }
+                let queued = session.submit(live::Outbound {
+                    conversation_id: conversation_id.to_string(),
+                    body: body.to_string(),
+                    request,
                 });
+                if !queued {
+                    thinwire_protocol::emit_send_rejected(
+                        events,
+                        ProtocolId::Signal,
+                        conversation_id,
+                        request,
+                    );
+                }
                 Ok(())
             }
         }
@@ -402,13 +391,11 @@ impl SignalAdapter {
                         );
                         return;
                     };
-                    let queued = session
-                        .submit(live::Outbound {
-                            conversation_id: conversation_id.clone(),
-                            body,
-                            request,
-                        })
-                        .await;
+                    let queued = session.submit(live::Outbound {
+                        conversation_id: conversation_id.clone(),
+                        body,
+                        request,
+                    });
                     if !queued {
                         thinwire_protocol::emit_send_rejected(
                             &task_events,
@@ -599,6 +586,11 @@ impl ProtocolAdapter for SignalAdapter {
 
     fn view_chat(&mut self, conversation_id: Option<&str>, _events: &EventTx) {
         self.viewed = conversation_id.map(str::to_string);
+        #[cfg(feature = "signal-local")]
+        if let Engine::Live(session) = &self.engine {
+            session.set_viewed(self.viewed.clone());
+            session.request_viewed(self.viewed.clone());
+        }
     }
 }
 
@@ -660,6 +652,42 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    #[test]
+    fn signal_local_bundles_sqlite() {
+        let manifest = include_str!("../../Cargo.toml");
+        let signal_local = manifest
+            .lines()
+            .skip_while(|line| !line.contains("signal-local ="))
+            .take_while(|line| {
+                line.contains("signal-local =") || line.trim().ends_with(',') || line.trim() == "]"
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            signal_local.contains("libsqlite3-sys"),
+            "signal-local enables bundled sqlite"
+        );
+        assert!(manifest.contains("features = [\n  \"bundled\",\n]"));
+        assert!(
+            manifest.contains("presage-store-sqlite")
+                && manifest.contains("default-features = false"),
+            "SQLCipher stays off"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_signal_adapter_passes_the_contract_kit() {
+        let mut kit = thinwire_protocol::contract::Contract::new(Box::new(fake()));
+        kit.send(AdapterCommand::SignalAcknowledgeNotice);
+        kit.send(AdapterCommand::SignalBeginLink { generation: 1 });
+        kit.linked().await;
+        kit.send(AdapterCommand::LoadChats {
+            protocol: ProtocolId::Signal,
+        });
+        kit.settle().await;
+        kit.run_all().await;
     }
 
     #[test]
@@ -733,6 +761,27 @@ mod tests {
                 protocol: ProtocolId::Signal,
             }
         )));
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn live_load_chats_asks_the_worker_to_reread() {
+        let (tx, _rx) = unbounded_channel();
+        let mut adapter = SignalAdapter::new();
+        let Engine::Live(session) = &adapter.engine else {
+            panic!("live engine");
+        };
+        session.mark_active();
+        let mut job_rx = session.install_jobs_for_test();
+        adapter
+            .handle(
+                AdapterCommand::LoadChats {
+                    protocol: ProtocolId::Signal,
+                },
+                &tx,
+            )
+            .expect("chats");
+        assert!(matches!(job_rx.try_recv(), Ok(live::WorkerJob::Refresh)));
     }
 
     #[cfg(feature = "signal-local")]

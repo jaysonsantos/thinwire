@@ -12,7 +12,12 @@ description = "Local-only Signal adapter (AGPL-3.0-only). Not in release builds.
 default = []
 # Links Presage and libsignal. thinwire enables this only through its
 # `signal-local` feature. Default CI stays off.
-signal-local = ["dep:presage", "dep:presage-store-sqlite", "dep:futures"]
+signal-local = [
+  "dep:presage",
+  "dep:presage-store-sqlite",
+  "dep:futures",
+  "dep:libsqlite3-sys",
+]
 
 [dependencies]
 dirs.workspace = true
@@ -24,6 +29,11 @@ presage = { git = "https://github.com/whisperfish/presage", rev = "33dd149113079
 # Default features build SQLCipher and need OpenSSL headers. The session file
 # is mode 0700 under app-data, same as the old sled directory. No passphrase.
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb", optional = true, default-features = false }
+# Bundled SQLite, same 0.36 line as WhatsApp. A signal-local build does not
+# need a system libsqlite. SQLCipher stays off (no OpenSSL headers).
+libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
+  "bundled",
+] }
 futures = { version = "0.3", optional = true, default-features = false, features = [
   "std",
 ] }
