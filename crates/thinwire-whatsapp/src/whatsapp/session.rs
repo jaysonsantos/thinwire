@@ -396,6 +396,9 @@ impl Session {
         if let Some(detail) = stop {
             state.connected = false;
             state.stopped = Some(detail);
+            // Every terminal event ends the link here. The adapter's shutdown
+            // stops the timer through the same helper (Codex r4139171813).
+            Self::abort_mute_timer(&mut state);
             // Logout, ban, or a dead pairing ends the session.
             out.push(account(AccountState::Unlinked));
         }
@@ -758,6 +761,63 @@ mod tests {
         assert!(!row.muted);
         assert_eq!(row.unread, 1, "its unread counts in the title again");
         assert!(inbox::now_ms() >= end);
+    }
+
+    /// Codex r4139171813: every terminal link event stops a pending mute
+    /// timer, not only a logout. No event comes after `Unlinked`, and the
+    /// timer task lets go of the session.
+    #[tokio::test]
+    async fn every_terminal_event_stops_the_mute_timer() {
+        for terminal in [
+            LinkEvent::TemporaryBan,
+            LinkEvent::LoggedOut,
+            LinkEvent::PairFailed,
+            LinkEvent::PairThrottled,
+            LinkEvent::QrExhausted,
+        ] {
+            let name = format!("{terminal:?}");
+            let is_ban = matches!(terminal, LinkEvent::TemporaryBan);
+            let (session, tx, mut rx) = linked();
+            let owners = session.owners();
+            let end = inbox::now_ms() + 100;
+            let timed = LinkEvent::Mute {
+                jid: CHAT.into(),
+                mute: Mute::UntilMs(end),
+            };
+            session.apply(timed, 1, &tx);
+            assert!(session.has_mute_timer(), "{name}");
+            assert!(terminal.stops_link(), "{name}");
+
+            session.apply(terminal, 1, &tx);
+            assert!(!session.has_mute_timer(), "{name}: the timer stopped");
+            let mut last = None;
+            while let Ok(event) = rx.try_recv() {
+                last = Some(event);
+            }
+            assert!(
+                matches!(
+                    last,
+                    Some(AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    })
+                ),
+                "{name}: Unlinked is the last event"
+            );
+            if is_ban {
+                // Past the mute end: the stopped timer sends nothing.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(inbox::now_ms() > end);
+                assert!(rx.try_recv().is_err(), "no event after Unlinked");
+            }
+            for _ in 0..100 {
+                if session.owners() <= owners {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(session.owners() <= owners, "{name}: the task let go");
+        }
     }
 
     /// Codex r4139029620: `abort` cannot stop a timer task that already
