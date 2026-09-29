@@ -44,10 +44,10 @@ pub use slack::{
     SLACK_OAUTH_LOOPBACK_PORT, SLACK_SECRET_SERVICE, SlackAdapter, SlackApiError, SlackApiOrigin,
     SlackApiSource, SlackAppToken, SlackBotToken, SlackBrowser, SlackCallbackError, SlackChannel,
     SlackChannelKind, SlackChannelPage, SlackCodeExchange, SlackDeps, SlackEventSource,
-    SlackEventStream, SlackInbound, SlackInbox, SlackInstallGrant, SlackInstalledWorkspace,
-    SlackLoopback, SlackPost, SlackSecretKey, SlackSecretVault, SlackWebApi, WORKSPACE_BOT_SCOPES,
-    authorize_url, loopback_redirect_uri, new_oauth_state, parse_loopback_callback,
-    resolve_slack_app_token, resolve_slack_client,
+    SlackEventStream, SlackHistoryPage, SlackInbound, SlackInbox, SlackInstallGrant,
+    SlackInstalledWorkspace, SlackLoopback, SlackPost, SlackSecretKey, SlackSecretVault,
+    SlackWebApi, WORKSPACE_BOT_SCOPES, authorize_url, loopback_redirect_uri, new_oauth_state,
+    parse_loopback_callback, resolve_slack_app_token, resolve_slack_client,
 };
 #[cfg(feature = "slack-oauth")]
 pub use slack::{oauth_v2_access_request, socket_mode_config, workspace_bot_token};

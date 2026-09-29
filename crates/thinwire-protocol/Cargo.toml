@@ -26,6 +26,7 @@ slack-oauth = [
   "slack-morphism/hyper",
   "dep:webbrowser",
   "dep:rustls",
+  "dep:serde",
 ]
 # Experimental WhatsApp Web / linked-device client (MIT, oxidezap).
 # Git revision matches ZapFast 0.14 so the spike builds on stable Rust.
@@ -48,6 +49,7 @@ tdlib-rs = { version = "1.4", optional = true, default-features = false, feature
   "static",
 ] }
 slack-morphism = { version = "2.29", optional = true, default-features = false }
+serde = { version = "1", features = ["derive"], optional = true }
 webbrowser = { version = "1", optional = true }
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "008a68a4fa823e5a3f5e96715d7673dedd259e35", optional = true, default-features = false, features = [
   "sqlite-storage",
@@ -71,6 +73,9 @@ dirs.workspace = true
 getrandom = "0.4"
 tokio = { workspace = true, features = ["io-util", "net"] }
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
 
 [lints]
 workspace = true
