@@ -313,6 +313,7 @@ fn slack_sign_in_is_compiled_only_with_the_feature() {
         .expect("feature-off helper");
     let on_body = &ui[on..off];
     assert!(on_body.contains("Add Slack workspace"));
+    assert!(on_body.contains("Persistence::Loading"));
     assert!(on_body.contains("SlackIntent::Connect"));
     assert!(on_body.contains("SlackIntent::Cancel"));
     let off_body = &ui[off..];

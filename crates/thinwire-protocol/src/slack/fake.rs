@@ -41,6 +41,8 @@ struct ApiState {
     list_error: Option<SlackApiError>,
     /// Every list call returns another cursor. Used to prove the page cap.
     list_forever: bool,
+    /// Pages returned before `pages`, one call each.
+    script: Vec<SlackChannelPage>,
     history: HashMap<String, Vec<SlackPost>>,
     history_error: Option<SlackApiError>,
     post_error: Option<SlackApiError>,
@@ -106,6 +108,7 @@ fn channel(id: &str, name: &str, kind: SlackChannelKind, is_member: bool) -> Sla
         name: name.into(),
         kind,
         is_member,
+        can_post: is_member,
         dm_user: None,
     }
 }
@@ -169,6 +172,9 @@ impl SlackWebApi for FakeApi {
             ));
             if let Some(error) = state.list_error.clone() {
                 return Err(error);
+            }
+            if !state.script.is_empty() {
+                return Ok(state.script.remove(0));
             }
             if state.list_forever {
                 return Ok(SlackChannelPage {
@@ -610,6 +616,234 @@ async fn refresh_reloads_the_channel_list_and_sends_the_diff() {
         .filter(|call| call.starts_with("conversations.list"))
         .count();
     assert_eq!(listed_again, listed + 2);
+}
+
+#[tokio::test]
+async fn a_finished_channel_walk_drops_a_channel_from_an_earlier_page() {
+    let mut h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:G1").await;
+    assert!(
+        h.seen.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation } if conversation.id == "slack:C1"
+        )),
+        "the first list includes C1"
+    );
+    let mut script = Vec::new();
+    for index in 0..MAX_CHANNEL_PAGES {
+        script.push(SlackChannelPage {
+            channels: vec![channel("C1", "general", SlackChannelKind::Public, true)],
+            next_cursor: Some(format!("walk-{index}")),
+        });
+    }
+    script.push(SlackChannelPage {
+        channels: vec![channel("C1", "general", SlackChannelKind::Public, true)],
+        next_cursor: None,
+    });
+    h.api.with(|state| state.script = script);
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    h.status(AdapterStatus::Ready).await;
+    assert!(
+        h.seen.iter().all(|event| !matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if id == "slack:G1"
+        )),
+        "the walk is not finished, so G1 stays"
+    );
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    h.until("G1 left", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if id == "slack:G1"
+        )
+    })
+    .await;
+    assert!(
+        h.seen.iter().all(|event| !matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if id == "slack:C1"
+        )),
+        "C1 was on the first page of this walk"
+    );
+}
+
+#[tokio::test]
+async fn a_removed_channel_does_not_keep_its_old_preview() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:G1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "G1",
+        "1700000700.000100",
+        "U1",
+        "old preview",
+    )));
+    h.until("old preview", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:G1" && conversation.preview == "old preview"
+        )
+    })
+    .await;
+    h.api.with(|state| {
+        state.pages[1].channels.retain(|row| row.id != "G1");
+    });
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    h.until("G1 left", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if id == "slack:G1"
+        )
+    })
+    .await;
+    h.api.with(|state| {
+        state.pages[1].channels.push(channel(
+            "G1",
+            "mpdm-ana--bo-1",
+            SlackChannelKind::GroupMessage,
+            true,
+        ));
+    });
+    h.send(AdapterCommand::LoadChats {
+        protocol: ProtocolId::Slack,
+    });
+    h.conversation("slack:G1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "G1",
+        "1700000800.000100",
+        "U1",
+        "fresh",
+    )));
+    h.message("fresh").await;
+    h.socket.push(SlackInbound::Deleted {
+        channel: "G1".into(),
+        ts: "1700000800.000100".into(),
+    });
+    let row = h
+        .until("preview cleared", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:G1" && conversation.preview.is_empty()
+            )
+        })
+        .await;
+    let AdapterEvent::ConversationUpsert { conversation } = row else {
+        unreachable!();
+    };
+    assert_ne!(conversation.preview, "old preview");
+}
+
+#[tokio::test]
+async fn history_drops_posts_outside_the_latest_page() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1600000000.000100",
+        "U1",
+        "stale",
+    )));
+    h.message("stale").await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.until("stale dropped", |event| {
+        matches!(
+            event,
+            AdapterEvent::MessagesRemoved { message_ids, .. }
+                if message_ids.iter().any(|id| id.contains("1600000000"))
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn evicting_a_counted_post_lowers_the_badge() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    for index in 0..51 {
+        let ts = format!("170000{index:04}.000100");
+        h.socket.push(SlackInbound::Message(post(
+            "C1",
+            &ts,
+            "U1",
+            &format!("n{index}"),
+        )));
+        h.message(&format!("n{index}")).await;
+    }
+    h.until("badge stays at the shown cap", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1"
+                    && conversation.preview == "n50"
+                    && conversation.unread == 50
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_read_only_channel_is_not_writable() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.pages[0].channels[0].can_post = false;
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    let row = h.conversation("slack:C1").await;
+    assert!(!row.writable);
+}
+
+#[tokio::test]
+async fn a_rejected_post_marks_the_channel_read_only() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.post_error = Some(SlackApiError::api("not_in_channel"));
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.send(AdapterCommand::SendText {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        body: "nope".into(),
+        request: 7,
+    });
+    let row = h
+        .until("read only", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C1" && !conversation.writable
+            )
+        })
+        .await;
+    assert!(matches!(row, AdapterEvent::ConversationUpsert { .. }));
 }
 
 #[tokio::test]

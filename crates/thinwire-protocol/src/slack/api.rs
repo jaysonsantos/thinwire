@@ -96,6 +96,8 @@ pub struct SlackChannel {
     pub kind: SlackChannelKind,
     /// The bot is in the channel and can read its history.
     pub is_member: bool,
+    /// The bot can post. A read-only channel is `false`.
+    pub can_post: bool,
     /// Peer user id for a direct message.
     pub dm_user: Option<String>,
 }

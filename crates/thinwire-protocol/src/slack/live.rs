@@ -237,6 +237,7 @@ impl SlackWebApi for MorphismWebApi {
                 name: info.name.clone().unwrap_or_default(),
                 kind,
                 is_member,
+                can_post: is_member,
                 dm_user,
             });
         }
