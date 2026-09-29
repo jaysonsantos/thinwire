@@ -121,16 +121,18 @@ pub(crate) async fn load_channels(
     Ok((bot_id, list))
 }
 
-/// Newest visible message, or empty. A failure stays empty.
+/// Newest visible message, or empty. A per-channel failure stays empty.
+/// `Unauthorized` is returned so the session can unlink, as it does for history.
 pub(crate) async fn channel_preview(
     api: &dyn DiscordApi,
     channel_id: u64,
     pause: &PreviewPause,
-) -> String {
+) -> Result<String, DiscordApiError> {
     for attempt in 0..PREVIEW_RATE_LIMIT_ATTEMPTS {
         pause.wait().await;
         match api.history(channel_id, 1).await {
-            Ok(latest) => return preview_text(latest.first()),
+            Ok(latest) => return Ok(preview_text(latest.first())),
+            Err(DiscordApiError::Unauthorized) => return Err(DiscordApiError::Unauthorized),
             Err(DiscordApiError::RateLimited { retry_after }) => {
                 pause.push(retry_after);
                 if attempt + 1 == PREVIEW_RATE_LIMIT_ATTEMPTS {
@@ -138,7 +140,7 @@ pub(crate) async fn channel_preview(
                         reason = DiscordApiError::RateLimited { retry_after }.reason(),
                         "discord channel preview did not load"
                     );
-                    return String::new();
+                    return Ok(String::new());
                 }
             }
             Err(error) => {
@@ -146,11 +148,11 @@ pub(crate) async fn channel_preview(
                     reason = error.reason(),
                     "discord channel preview did not load"
                 );
-                return String::new();
+                return Ok(String::new());
             }
         }
     }
-    String::new()
+    Ok(String::new())
 }
 
 fn preview_text(latest: Option<&MessageSummary>) -> String {

@@ -1611,7 +1611,53 @@ mod tests {
         assert!(core.pump());
         assert_eq!(core.view().compose, "");
         assert!(core.view().error.is_none());
+        events_tx
+            .send(AdapterEvent::Status {
+                protocol: ProtocolId::Telegram,
+                status: AdapterStatus::Ready,
+                detail: "Message sent.".into(),
+            })
+            .expect("queue");
+        assert!(core.pump());
         core.state.age_sends_for_test(crate::sends::SEND_TIMEOUT);
         assert!(!core.state.expire_sends(), "nothing left to expire");
+    }
+
+    /// An accepted Telegram send is no longer in the tracker, but its 30 s
+    /// deadline still wakes a frontend that waits only on the change signal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_accepted_telegram_send_wakes_at_its_deadline() {
+        use crate::sends::SEND_TIMEOUT;
+        use crate::state::SENDING_STATUS;
+
+        let (mut core, events_tx, request) = core_with_unanswered_send();
+        events_tx.send(answer(true, request)).expect("queue");
+        events_tx
+            .send(AdapterEvent::ChatListLoaded {
+                protocol: ProtocolId::Telegram,
+            })
+            .expect("queue");
+        events_tx
+            .send(AdapterEvent::HistoryLoaded {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+            })
+            .expect("queue");
+        assert!(core.pump());
+        assert_eq!(core.state.status_line(), SENDING_STATUS);
+        assert!(
+            core.send_wake.is_some(),
+            "a wake is armed for the accepted send"
+        );
+
+        let mut signal = core.signal();
+        signal.mark_seen();
+        core.state.age_sends_for_test(SEND_TIMEOUT);
+        core.arm_send_wake();
+        let woke = tokio::time::timeout(WAIT, signal.changed()).await;
+        assert_eq!(woke.ok(), Some(true), "the wake fired the change signal");
+        assert!(core.pump(), "pump reports the expiry");
+        assert_ne!(core.state.status_line(), SENDING_STATUS);
+        assert!(core.send_wake.is_none(), "no send left, no wake");
     }
 }

@@ -854,6 +854,53 @@ mod tests {
         assert_preview_failure_keeps_channels(&reloaded);
     }
 
+    #[tokio::test]
+    async fn a_preview_401_unlinks_the_account() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let release = Arc::new(AtomicBool::new(false));
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_preview = Some(Arc::clone(&release));
+        let api = Arc::new(fake);
+        api.state()
+            .preview_failures
+            .insert(GENERAL, super::api::DiscordApiError::Unauthorized);
+        let (_adapter, _tx, mut rx, events) = connected(Arc::clone(&api)).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Linked,
+                ..
+            }
+        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                }
+            )),
+            "the list links before the preview 401"
+        );
+        release.store(true, Ordering::SeqCst);
+        let late = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::Notice { .. })
+        })
+        .await;
+        assert!(late.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Unlinked,
+                ..
+            }
+        )));
+        assert!(late.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Notice { text, .. } if text.contains("Replace discord.bot_token")
+        )));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn linked_before_preview_fetches_and_previews_stay_bounded() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2585,10 +2632,18 @@ mod tests {
 
     #[tokio::test]
     async fn an_old_reload_401_does_not_unlink_the_new_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let hold = Arc::new(Notify::new());
         let arrived = Arc::new(Notify::new());
-        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let preview_release = Arc::new(AtomicBool::new(true));
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_preview = Some(Arc::clone(&preview_release));
+        let api = Arc::new(fake);
         let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let previews_before = api.preview_calls.load(Ordering::SeqCst);
+        // Session 2's previews wait here so the global 401 hits only the old reload.
+        preview_release.store(false, Ordering::SeqCst);
         api.state().hold_load = Some(Arc::clone(&hold));
         api.state().hold_load_arrived = Some(Arc::clone(&arrived));
         adapter
@@ -2623,6 +2678,16 @@ mod tests {
         })
         .await;
         let _ = drain(&mut rx);
+        for _ in 0..400 {
+            if api.preview_calls.load(Ordering::SeqCst) >= previews_before + 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            api.preview_calls.load(Ordering::SeqCst) >= previews_before + 2,
+            "session 2's previews are past the token check and waiting"
+        );
         api.state().unauthorized = true;
         hold.notify_one();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2640,6 +2705,7 @@ mod tests {
             "session 1's 401 does not unlink session 2"
         );
         api.state().unauthorized = false;
+        preview_release.store(true, Ordering::SeqCst);
         let id = conversation_id(GUILD, GENERAL);
         adapter
             .handle(
