@@ -109,6 +109,7 @@ pub struct SlackChannel {
 /// (`chat:write.public`). A private channel, a DM, or a group DM requires
 /// membership.
 #[must_use]
+#[cfg(any(test, feature = "slack-oauth"))]
 pub(crate) fn channel_can_post(
     kind: SlackChannelKind,
     is_member: bool,
