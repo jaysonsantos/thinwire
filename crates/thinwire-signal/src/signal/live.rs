@@ -689,7 +689,8 @@ async fn fetch_history_page(
             // query stops at `HISTORY_READ_LIMIT`.
             let mut page = NewestBound::new(HISTORY_PAGE);
             for ts in timestamps {
-                let Some(content) = manager.store().message(thread, ts).await.map_err(|_| ())?
+                let Some(content) =
+                    keep_history_row(manager.store().message(thread, ts).await.map_err(|_| ()))
                 else {
                     continue;
                 };
@@ -707,6 +708,11 @@ async fn fetch_history_page(
     .await;
     pool.close().await;
     outcome
+}
+
+/// A missing or unreadable row is skipped. One bad row does not drop the page.
+fn keep_history_row<T>(row: Result<Option<T>, ()>) -> Option<T> {
+    row.ok().flatten()
 }
 
 fn history_store_url() -> Option<String> {
@@ -1533,6 +1539,13 @@ mod tests {
             Some(AdapterEvent::MessageReceived { message })
                 if message.body == "second line"
         ));
+    }
+
+    #[test]
+    fn a_malformed_history_row_is_skipped() {
+        assert!(keep_history_row::<u8>(Err(())).is_none());
+        assert!(keep_history_row(Ok(None::<u8>)).is_none());
+        assert_eq!(keep_history_row(Ok(Some(7))), Some(7));
     }
 
     #[test]
