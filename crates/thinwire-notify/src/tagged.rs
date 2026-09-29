@@ -1,6 +1,6 @@
 //! A backend for an OS service that knows each notification by a tag:
-//! Windows toasts (#161). The rules here have no OS code, so Linux CI
-//! tests them.
+//! Windows toasts and the macOS notification center (#161). The rules here
+//! have no OS code, so Linux CI tests them.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
