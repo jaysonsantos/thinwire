@@ -545,7 +545,7 @@ async fn publish_chats(
             continue;
         };
         let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
-        let Ok((messages, _)) = fetch_history_page(manager, &thread, before).await else {
+        let Ok((messages, _)) = fetch_history_page(manager, &thread, before, None).await else {
             continue;
         };
         for message in messages {
@@ -564,7 +564,7 @@ async fn publish_chats(
             continue;
         };
         let thread = Thread::Group(key);
-        let Ok((messages, _)) = fetch_history_page(manager, &thread, before).await else {
+        let Ok((messages, _)) = fetch_history_page(manager, &thread, before, None).await else {
             continue;
         };
         for message in messages {
@@ -591,7 +591,9 @@ async fn load_older_page(
     let loaded = async {
         let before = message_millis(before_message_id)?;
         let thread = thread_of(conversation_id, session.group_key(conversation_id).await)?;
-        fetch_history_page(manager, &thread, before).await.ok()
+        fetch_history_page(manager, &thread, before, Some(before_message_id))
+            .await
+            .ok()
     }
     .await;
     let (page, more, note) = older_page_outcome(loaded);
@@ -659,31 +661,127 @@ async fn fetch_history_page(
     manager: &Manager<SqliteStore, Registered>,
     thread: &Thread,
     before: u64,
+    before_id: Option<&str>,
 ) -> Result<(Vec<Content>, bool), ()> {
     let mut span = HISTORY_WINDOW_MS;
+    let include_before = before_id.is_some();
     loop {
         let (start, reached_start) = history_window(before, span);
         let messages = manager
             .store()
-            .messages(thread, start..before)
+            .messages(thread, history_bounds(start, before, include_before))
             .await
             .map_err(|_| ())?;
-        let collected: Vec<Content> = messages.flatten().collect();
-        if window_is_enough(collected.len(), HISTORY_PAGE, reached_start) {
-            return Ok(finish_history_page(collected, reached_start));
+        // The store returns the whole window. Keep only one page of rows.
+        let mut page = NewestBound::new(HISTORY_PAGE);
+        for content in messages.flatten() {
+            let (millis, id) = content_history_key(&content);
+            if is_on_history_page(millis, &id, before, before_id) {
+                page.consider(millis, id, content);
+            }
+        }
+        if window_is_enough(page.passing(), HISTORY_PAGE, reached_start) {
+            return Ok(page.finish(reached_start));
         }
         span = widen_history_span(before, span);
     }
 }
 
-fn finish_history_page(items: Vec<Content>, reached_start: bool) -> (Vec<Content>, bool) {
-    let (page, more_in_window) = newest_page(items, HISTORY_PAGE);
-    (page, more_in_window || !reached_start)
+/// Query bounds for one history window.
+/// An older page includes `before` so messages that share the cursor's
+/// millisecond are still returned. The page drops the cursor itself.
+fn history_bounds(
+    start: u64,
+    before: u64,
+    include_before: bool,
+) -> (std::ops::Bound<u64>, std::ops::Bound<u64>) {
+    let end = if include_before {
+        std::ops::Bound::Included(before)
+    } else {
+        std::ops::Bound::Excluded(before)
+    };
+    (std::ops::Bound::Included(start), end)
 }
 
-fn newest_page(mut items: Vec<Content>, page: usize) -> (Vec<Content>, bool) {
-    items.sort_by_key(content_millis);
-    last_page_more(items, page)
+/// `true` when this row is strictly older than the cursor.
+/// The id is `{millis}:{sender}`, so peers of one millisecond stay ordered.
+fn is_on_history_page(millis: u64, id: &str, before: u64, before_id: Option<&str>) -> bool {
+    match before_id {
+        Some(cursor) => millis < before || (millis == before && id < cursor),
+        None => millis < before,
+    }
+}
+
+/// The newest `limit` rows, ordered oldest first. The buffer never grows
+/// past `limit`, however many rows the window contains.
+struct NewestBound<T> {
+    rows: Vec<OrderedRow<T>>,
+    limit: usize,
+    overflow: bool,
+}
+
+struct OrderedRow<T> {
+    millis: u64,
+    id: String,
+    value: T,
+}
+
+impl<T> NewestBound<T> {
+    fn new(limit: usize) -> Self {
+        Self {
+            rows: Vec::new(),
+            limit,
+            overflow: false,
+        }
+    }
+
+    /// How many passing rows were seen, at least `limit + 1` once the page filled.
+    fn passing(&self) -> usize {
+        if self.overflow {
+            self.limit.saturating_add(1)
+        } else {
+            self.rows.len()
+        }
+    }
+
+    fn consider(&mut self, millis: u64, id: String, value: T) {
+        if self.limit == 0 {
+            self.overflow = true;
+            return;
+        }
+        if self.rows.iter().any(|row| row.id == id) {
+            return;
+        }
+        let newer_than_oldest = self
+            .rows
+            .first()
+            .is_none_or(|oldest| (millis, id.as_str()) > (oldest.millis, oldest.id.as_str()));
+        if self.rows.len() == self.limit && !newer_than_oldest {
+            self.overflow = true;
+            return;
+        }
+        if self.rows.len() == self.limit {
+            self.rows.remove(0);
+            self.overflow = true;
+        }
+        let index = self
+            .rows
+            .iter()
+            .position(|row| (row.millis, row.id.as_str()) > (millis, id.as_str()))
+            .unwrap_or(self.rows.len());
+        self.rows.insert(index, OrderedRow { millis, id, value });
+    }
+
+    fn finish(self, reached_start: bool) -> (Vec<T>, bool) {
+        let more = self.overflow || !reached_start;
+        (self.rows.into_iter().map(|row| row.value).collect(), more)
+    }
+}
+
+fn content_history_key(content: &Content) -> (u64, String) {
+    let millis = content_millis(content);
+    let id = signal_message_id(millis, &contact_id(&content.metadata.sender));
+    (millis, id)
 }
 
 fn content_millis(content: &Content) -> u64 {
@@ -786,22 +884,6 @@ fn sent_sync_body(sync: &presage::libsignal_service::proto::SyncMessage) -> Opti
         SyncContent::Sent(sent) => sent.message.as_ref()?.body.as_deref(),
         _ => None,
     }
-}
-
-fn last_page_more<T>(items: impl IntoIterator<Item = T>, page: usize) -> (Vec<T>, bool) {
-    let mut kept = std::collections::VecDeque::new();
-    let mut more = false;
-    for item in items {
-        if page == 0 {
-            return (Vec::new(), true);
-        }
-        if kept.len() == page {
-            kept.pop_front();
-            more = true;
-        }
-        kept.push_back(item);
-    }
-    (kept.into_iter().collect(), more)
 }
 
 async fn remember_group_title(
@@ -1309,13 +1391,19 @@ mod tests {
 
     #[test]
     fn a_history_page_keeps_only_the_newest_messages() {
-        let (page, more) = last_page_more(1..=60, 50);
-        assert!(more);
-        assert_eq!(page.first().copied(), Some(11));
-        assert_eq!(page.last().copied(), Some(60));
-        let (short, more) = last_page_more(1..=10, 50);
-        assert!(!more);
-        assert_eq!(short.len(), 10);
+        let mut page = NewestBound::new(50);
+        for n in 1..=60 {
+            page.consider(n, n.to_string(), n);
+        }
+        assert!(page.overflow);
+        assert_eq!(page.rows.first().map(|row| row.value), Some(11));
+        assert_eq!(page.rows.last().map(|row| row.value), Some(60));
+        let mut short = NewestBound::new(50);
+        for n in 1..=10 {
+            short.consider(n, n.to_string(), n);
+        }
+        assert!(!short.overflow);
+        assert_eq!(short.rows.len(), 10);
     }
 
     #[test]
@@ -1500,6 +1588,95 @@ mod tests {
         let wider = widen_history_span(before, HISTORY_WINDOW_MS);
         assert!(wider > HISTORY_WINDOW_MS);
         assert!(wider < before);
+    }
+
+    #[test]
+    fn messages_that_share_the_boundary_millisecond_stay_reachable() {
+        use std::ops::RangeBounds;
+
+        let rows: Vec<(u64, String)> = (0..120)
+            .map(|index| (5_000, format!("5000:s{index:03}")))
+            .collect();
+        assert!(!history_bounds(0, 5_001, false).contains(&5_001));
+        assert!(history_bounds(0, 5_000, true).contains(&5_000));
+        assert!(!history_bounds(0, 5_000, true).contains(&5_001));
+
+        let mut before = 5_001;
+        let mut before_id = None;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let (page, high_water) = select_history_ids(&rows, before, before_id.as_deref());
+            assert!(high_water <= HISTORY_PAGE);
+            assert!(!page.is_empty());
+            for id in &page {
+                assert!(!seen.contains(id), "{id} returned twice");
+            }
+            let oldest = page.first().expect("oldest").clone();
+            before = message_millis(&oldest).expect("cursor millis");
+            before_id = Some(oldest);
+            seen.extend(page);
+            if seen.len() == rows.len() {
+                break;
+            }
+        }
+        let mut expected: Vec<String> = rows.into_iter().map(|(_, id)| id).collect();
+        expected.sort();
+        let mut got = seen;
+        got.sort();
+        assert_eq!(got, expected);
+        assert_eq!(before_id.as_deref(), Some("5000:s000"));
+    }
+
+    #[test]
+    fn a_history_read_keeps_at_most_one_page_of_rows() {
+        let mut page = NewestBound::new(HISTORY_PAGE);
+        let mut high_water = 0;
+        for index in 0..10_000u64 {
+            let id = format!("{index}:sender");
+            page.consider(index, id, ());
+            high_water = high_water.max(page.rows.len());
+        }
+        assert!(high_water <= HISTORY_PAGE);
+        assert_eq!(page.rows.len(), HISTORY_PAGE);
+        assert!(page.overflow);
+        assert_eq!(
+            page.rows.first().expect("oldest").millis,
+            10_000 - HISTORY_PAGE as u64
+        );
+        assert_eq!(page.rows.last().expect("newest").millis, 9_999);
+
+        let mut burst = NewestBound::new(HISTORY_PAGE);
+        let mut burst_high = 0;
+        for index in 0..5_000 {
+            let id = format!("8000:s{index:04}");
+            if is_on_history_page(8_000, &id, 8_001, None) {
+                burst.consider(8_000, id, ());
+            }
+            burst_high = burst_high.max(burst.rows.len());
+        }
+        assert!(burst_high <= HISTORY_PAGE);
+        assert_eq!(burst.rows.len(), HISTORY_PAGE);
+        assert_eq!(
+            burst.rows.first().expect("oldest peer").id,
+            format!("8000:s{:04}", 5_000 - HISTORY_PAGE)
+        );
+    }
+
+    fn select_history_ids(
+        rows: &[(u64, String)],
+        before: u64,
+        before_id: Option<&str>,
+    ) -> (Vec<String>, usize) {
+        let mut page = NewestBound::new(HISTORY_PAGE);
+        let mut high_water = 0;
+        for (millis, id) in rows {
+            if is_on_history_page(*millis, id, before, before_id) {
+                page.consider(*millis, id.clone(), id.clone());
+            }
+            high_water = high_water.max(page.rows.len());
+        }
+        let ids = page.rows.iter().map(|row| row.id.clone()).collect();
+        (ids, high_water)
     }
 
     #[test]
