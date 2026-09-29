@@ -50,6 +50,10 @@ pub const DEDUP_FRESH_SECS: i64 = 300;
 /// exceeds it inside that window.
 const DEDUP_LIMIT: usize = 4096;
 
+/// Shortest gap between walks of every channel's dedup set. A job prunes
+/// only its own channel. This walk drops ids on quiet channels.
+const DEDUP_SWEEP_SECS: i64 = 30;
+
 /// Pages of `conversations.list` fetched in one load. Each page is one Web API
 /// call, so the live client's rate control applies between them. A later
 /// `LoadChats` continues from the saved cursor when this cap stops the walk.
@@ -299,6 +303,8 @@ where
     /// for at least `DEDUP_FRESH_SECS`. A Socket Mode retry stays `History`
     /// while its identity is here.
     deduped: HashMap<String, Vec<Deduped>>,
+    /// Wall time of the last walk of every channel in `deduped`.
+    dedup_swept_at: Option<i64>,
 }
 
 impl<A, S, B> Session<A, S, B>
@@ -320,14 +326,15 @@ where
             viewing: None,
             shown: HashMap::new(),
             deduped: HashMap::new(),
+            dedup_swept_at: None,
         }
     }
 
     async fn run(mut self, mut jobs: UnboundedReceiver<Job>) {
         while let Some(job) = jobs.recv().await {
-            // A quiet channel has no newer post to move a timestamp horizon.
-            // Wall time drops ids that have left the freshness window.
-            self.expire_deduped();
+            // Quiet channels have no post of their own to prune. The full
+            // walk is at most once per `DEDUP_SWEEP_SECS`.
+            self.sweep_deduped(unix_secs());
             match job {
                 Job::Command(command) => self.command(command).await,
                 Job::View(conversation_id) => self.set_view(conversation_id),
@@ -1082,6 +1089,9 @@ where
         let token = live.token.clone();
         let channel = post.channel.clone();
         let post_ts = post.ts.clone();
+        // Drop this channel's expired ids before the dedup check. Other
+        // channels wait for `sweep_deduped`.
+        self.prune_channel(&channel, unix_secs());
         let duplicate = self.already_seen(&post);
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
@@ -1249,12 +1259,18 @@ where
         prune_deduped(rows, now);
     }
 
-    fn expire_deduped(&mut self) {
-        let now = unix_secs();
-        for rows in self.deduped.values_mut() {
-            prune_deduped(rows, now);
+    fn prune_channel(&mut self, channel: &str, now: i64) {
+        let Some(rows) = self.deduped.get_mut(channel) else {
+            return;
+        };
+        prune_deduped(rows, now);
+        if rows.is_empty() {
+            self.deduped.remove(channel);
         }
-        self.deduped.retain(|_, rows| !rows.is_empty());
+    }
+
+    fn sweep_deduped(&mut self, now: i64) {
+        sweep_deduped_channels(&mut self.deduped, &mut self.dedup_swept_at, now);
     }
 
     /// Returns false when `post` is older than the kept window and was not shown.
@@ -1555,6 +1571,26 @@ struct Deduped {
 /// Drop identities older than `DEDUP_FRESH_SECS` before `now`, then enforce
 /// `DEDUP_LIMIT`. The cutoff is wall time. A quiet channel does not keep ids
 /// until a newer post arrives, and a future `ts` does not move the cutoff.
+/// Walk every channel when `now` is at least `DEDUP_SWEEP_SECS` after
+/// `swept_at`. Returns true when this call scanned. A burst of jobs inside
+/// the interval returns true once.
+fn sweep_deduped_channels(
+    deduped: &mut HashMap<String, Vec<Deduped>>,
+    swept_at: &mut Option<i64>,
+    now: i64,
+) -> bool {
+    let due = swept_at.is_none_or(|last| now.saturating_sub(last) >= DEDUP_SWEEP_SECS);
+    if !due {
+        return false;
+    }
+    *swept_at = Some(now);
+    for rows in deduped.values_mut() {
+        prune_deduped(rows, now);
+    }
+    deduped.retain(|_, rows| !rows.is_empty());
+    true
+}
+
 fn prune_deduped(rows: &mut Vec<Deduped>, now: i64) {
     let cutoff = now.saturating_sub(DEDUP_FRESH_SECS);
     // `sent_at == 0` is an unparsed timestamp. Notifications still allow it,
@@ -1870,6 +1906,60 @@ mod tests {
         }
         prune_deduped(&mut rows, 1_700_000_059);
         assert_eq!(rows.len(), DEDUP_LIMIT);
+    }
+
+    #[test]
+    fn a_global_dedup_sweep_runs_at_most_once_per_interval() {
+        let now = 1_700_000_000;
+        let channels = 40;
+        let jobs = 80;
+        let mut deduped = HashMap::new();
+        for index in 0..channels {
+            deduped.insert(
+                format!("C{index}"),
+                vec![
+                    Deduped {
+                        ts: "old".into(),
+                        client_msg_id: None,
+                        sent_at: now - DEDUP_FRESH_SECS - 1,
+                    },
+                    Deduped {
+                        ts: "fresh".into(),
+                        client_msg_id: None,
+                        sent_at: now,
+                    },
+                ],
+            );
+        }
+        let mut swept_at = None;
+        let mut scans = 0_u32;
+        for _ in 0..jobs {
+            if sweep_deduped_channels(&mut deduped, &mut swept_at, now) {
+                scans += 1;
+            }
+        }
+        assert_eq!(scans, 1, "a burst of jobs scans once");
+        assert!(
+            deduped
+                .values()
+                .all(|rows| rows.len() == 1 && rows[0].ts == "fresh")
+        );
+        for _ in 0..jobs {
+            if sweep_deduped_channels(&mut deduped, &mut swept_at, now + DEDUP_SWEEP_SECS - 1) {
+                scans += 1;
+            }
+        }
+        assert_eq!(scans, 1, "the next scan waits for the interval");
+        let later = now + DEDUP_SWEEP_SECS;
+        deduped.get_mut("C0").expect("channel").push(Deduped {
+            ts: "aged".into(),
+            client_msg_id: None,
+            sent_at: later - DEDUP_FRESH_SECS - 1,
+        });
+        assert!(sweep_deduped_channels(&mut deduped, &mut swept_at, later));
+        let quiet = deduped.get("C0").expect("channel");
+        assert!(quiet.iter().all(|row| row.ts != "aged"));
+        assert!(quiet.iter().any(|row| row.ts == "fresh"));
     }
 
     #[test]
