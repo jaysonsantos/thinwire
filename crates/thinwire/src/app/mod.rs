@@ -242,16 +242,34 @@ impl ThinwireApp {
         }
     }
 
-    /// Window focus changes and notification clicks become intents (#32).
-    fn notification_intents(&mut self, ctx: &egui::Context) {
-        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+    /// Send a window focus change to the core. `logic()` calls it before
+    /// `pump()`, so a live message of this frame sees the new focus
+    /// (#87 review).
+    fn update_focus(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|input| {
+            let event = input.events.iter().rev().find_map(|event| match event {
+                egui::Event::WindowFocused(focused) => Some(*focused),
+                _ => None,
+            });
+            resolve_focus(input.viewport().focused, event, self.last_focus)
+        });
         if self.last_focus != Some(focused) {
             self.last_focus = Some(focused);
-            self.intents.push(Intent::WindowFocus(focused));
+            self.core.dispatch(Intent::WindowFocus(focused));
         }
+    }
+
+    /// Notification clicks become intents (#32).
+    fn notification_intents(&mut self, ctx: &egui::Context) {
         let clicked = std::mem::take(&mut *lock(&self.clicks));
         for key in clicked {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            // `Focus` raises the window on X11, macOS, and Windows. On
+            // Wayland, winit 0.30 cannot raise it: ask for attention, so the
+            // taskbar entry highlights (thinwire-team/kwin-activation.md).
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
             self.intents.push(Intent::OpenFromNotification(key));
         }
     }
@@ -285,6 +303,17 @@ impl ThinwireApp {
     }
 }
 
+/// Longest wait at exit for the last notification dismisses.
+const NOTIFY_FLUSH_LIMIT: Duration = Duration::from_millis(500);
+
+/// Window focus for the notification rules. The platform value wins, then
+/// the last focus event of this frame, then the last known value. Unknown
+/// at start counts as unfocused, so the open chat still notifies where a
+/// platform reports no focus (qa L4).
+fn resolve_focus(reported: Option<bool>, event: Option<bool>, last: Option<bool>) -> bool {
+    reported.or(event).or(last).unwrap_or(false)
+}
+
 /// Window title with the unread count of chats that are not muted.
 fn window_title(unread: u32) -> String {
     if unread == 0 {
@@ -310,6 +339,7 @@ fn repaint_on_change(runtime: &tokio::runtime::Runtime, core: &Core, ctx: egui::
 
 impl eframe::App for ThinwireApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_focus(ctx);
         self.core.pump();
         self.handle_close(ctx);
         if theme_mode::follow_os_live(ctx, self.core.view().theme(), &mut self.last_os_theme) {
@@ -360,6 +390,10 @@ impl ThinwireApp {
     /// Last step at exit: try the keychain flush first, then stop the runtime
     /// within the close deadline instead of waiting for every blocking task.
     fn finish_exit(&mut self) {
+        // Shutdown queued a dismiss for each shown notification: send them,
+        // and give the OS a short time, so none stays after exit.
+        self.notifier.send(self.core.take_notify());
+        self.notifier.flush(NOTIFY_FLUSH_LIMIT);
         self.core.flush_keychain();
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(exit_budget(self.exit_deadline, Instant::now()));
