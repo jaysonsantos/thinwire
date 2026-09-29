@@ -307,21 +307,20 @@ fn resolve_focus(reported: Option<bool>, event: Option<bool>, last: Option<bool>
     reported.or(event).or(last).unwrap_or(false)
 }
 
-/// Window title with the unread count of chats that are not muted.
 /// The local-only AGPL clients of this build, in place of the MIT stubs
 /// (ADR 0011, #77). A release build turns on neither feature: no client.
 fn local_only_adapters(
-    phone: &Arc<thinwire_protocol::WhatsAppPhoneVault>,
+    _phone: &Arc<thinwire_protocol::WhatsAppPhoneVault>,
 ) -> Vec<Box<dyn thinwire_protocol::ProtocolAdapter>> {
-    let _ = phone;
     vec![
         #[cfg(feature = "whatsapp-web")]
-        Box::new(thinwire_whatsapp::WhatsAppAdapter::new(Arc::clone(phone))),
+        Box::new(thinwire_whatsapp::WhatsAppAdapter::new(Arc::clone(_phone))),
         #[cfg(feature = "signal-local")]
         Box::new(thinwire_signal::SignalAdapter::new()),
     ]
 }
 
+/// Window title with the unread count of chats that are not muted.
 fn window_title(unread: u32) -> String {
     if unread == 0 {
         "thinwire".into()
