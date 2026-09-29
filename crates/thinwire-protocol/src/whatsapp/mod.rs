@@ -1296,7 +1296,6 @@ mod tests {
         }
     }
 
-    /// The pending row, then `SendAccepted` for request 1.
     /// The pending row and its chat row. The answer comes with the network
     /// result (#98).
     async fn expect_pending(rx: &mut UnboundedReceiver<AdapterEvent>) -> String {
