@@ -254,8 +254,14 @@ struct Live<T> {
     /// pages from an earlier `LoadChats` that stopped at the page cap.
     list_seen: HashSet<String>,
     /// Channels a send already refused. A later list must not turn the
-    /// composer back on.
+    /// composer back on. Open and a successful post clear an id here.
     read_only: HashSet<String>,
+    /// `restricted_action` is a workspace policy. It is not one channel.
+    workspace_denied: bool,
+    /// Channels to turn back on when `workspace_denied` clears. The set starts
+    /// as the rows that were writable when the policy arrived, then gains a
+    /// channel learned during the denial when Slack would allow a post.
+    policy_writable: HashSet<String>,
 }
 
 struct Session<A, S, B>
@@ -538,6 +544,8 @@ where
             list_done: false,
             list_seen: HashSet::new(),
             read_only: HashSet::new(),
+            workspace_denied: false,
+            policy_writable: HashSet::new(),
         });
         // Linked before any inbox row. A later Linking is only a reconnect.
         self.account(AccountState::Linked);
@@ -692,6 +700,7 @@ where
             // app has left must not stick.
             if let Some(live) = &mut self.live {
                 live.read_only.remove(&id);
+                live.policy_writable.remove(&id);
             }
             if let Some(row) = self.channels.remove(&id) {
                 emit_conversation_removed(&self.events, ProtocolId::Slack, row.id);
@@ -733,10 +742,17 @@ where
                     live.list_seen.insert(channel.id.clone());
                 }
                 let title = self.channel_title(&token, &channel).await;
-                let denied = self
+                let (denied, workspace) = self
                     .live
                     .as_ref()
-                    .is_some_and(|live| live.read_only.contains(&channel.id));
+                    .map(|live| (live.read_only.contains(&channel.id), live.workspace_denied))
+                    .unwrap_or((false, false));
+                if workspace {
+                    // `can_post` is the list flag, not `restricted_action`. A
+                    // channel that shows up while the policy is on must be
+                    // restored with the snapshot when the policy lifts.
+                    self.note_writable_under_denial(&channel.id, channel.can_post && !denied);
+                }
                 let conversation = Conversation {
                     protocol: ProtocolId::Slack,
                     id: conversation_id(&channel.id),
@@ -747,7 +763,7 @@ where
                     order: 0,
                     last_at: 0,
                     is_group: is_group(channel.kind),
-                    writable: channel.can_post && !denied,
+                    writable: channel.can_post && !denied && !workspace,
                     muted: false,
                     placeholder: false,
                 };
@@ -833,7 +849,7 @@ where
     }
 
     async fn open_channel(&mut self, conversation: &str) {
-        let Some(channel) = channel_id(conversation) else {
+        let Some(channel) = channel_id(conversation).map(str::to_string) else {
             emit_command_failed(
                 &self.events,
                 ProtocolId::Slack,
@@ -852,7 +868,8 @@ where
             return;
         };
         let token = live.token.clone();
-        let page = match self.deps.api.history(&token, channel, HISTORY_LIMIT).await {
+        self.recheck_posting(&token, &channel).await;
+        let page = match self.deps.api.history(&token, &channel, HISTORY_LIMIT).await {
             Ok(page) => page,
             Err(error) => {
                 self.api_failed(&error).await;
@@ -872,23 +889,22 @@ where
         // that page covers, before `remember` can evict them without
         // `MessagesRemoved`.
         let keep_cached_preview = page.posts.is_empty() && !page.authoritative;
-        self.drop_posts_outside(channel, &page);
+        self.drop_posts_outside(&channel, &page);
         for post in page.posts.into_iter().rev() {
-            let message = self.chat_message(&token, post).await;
-            emit_message(&self.events, message);
-        }
-        // A dropped live post can be newer than every history row;
-        // `note_latest` would keep that stale preview. An empty page that
-        // is not the end of the channel keeps a remaining cached post.
-        // If that page removed every cached post, the older preview stays.
-        if keep_cached_preview {
-            if let Some(cached) = self.newest_shown(channel) {
-                self.replace_preview(channel, Some(cached));
+            if let Some(message) = self.chat_message(&token, post).await {
+                emit_message(&self.events, message);
             }
-        } else {
-            self.replace_preview(channel, newest);
         }
-        self.mark_channel_read(channel);
+        // A dropped live post can be newer than every history row.
+        // `note_latest` would keep that stale preview. An empty page that
+        // is not the end of the channel uses a remaining cached post.
+        // No cached post means the preview pointed at a removed message.
+        if keep_cached_preview {
+            self.replace_preview(&channel, self.newest_shown(&channel));
+        } else {
+            self.replace_preview(&channel, newest);
+        }
+        self.mark_channel_read(&channel);
         emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
     }
 
@@ -933,9 +949,15 @@ where
         let token = live.token.clone();
         match self.deps.api.post_message(&token, channel, body).await {
             Ok(post) => {
+                self.clear_posting_denial(channel);
                 let order = ts_rank(&post.ts);
                 let sent_at = ts_order(&post.ts);
-                let message = self.chat_message(&token, post).await;
+                let Some(message) = self.chat_message(&token, post).await else {
+                    // Slack accepted a post older than the cached window.
+                    // The send still counts; the row is not shown.
+                    emit_send_accepted(&self.events, ProtocolId::Slack, conversation, request);
+                    return;
+                };
                 let preview = message.body.clone();
                 emit_send_accepted(
                     &self.events,
@@ -949,7 +971,9 @@ where
                 self.note_latest(channel, order, sent_at, &preview);
             }
             Err(error) => {
-                if posting_denied(&error) {
+                if workspace_policy(&error) {
+                    self.mark_workspace_read_only();
+                } else if posting_denied(&error) {
                     self.mark_read_only(channel);
                 }
                 emit_send_rejected(&self.events, ProtocolId::Slack, conversation, request);
@@ -1035,7 +1059,11 @@ where
         let duplicate = self.already_seen(&post);
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
-        let message = self.chat_message(&token, post).await;
+        let Some(message) = self.chat_message(&token, post).await else {
+            // Older than every cached row. `remember` already dropped it
+            // without `MessagesRemoved`, so the thread stays at the cap.
+            return;
+        };
         let preview = message.body.clone();
         let outbound = message.outbound;
         let sender = message.sender.clone();
@@ -1048,6 +1076,7 @@ where
             } else {
                 format!("#{channel}")
             };
+            let workspace_denied = self.live.as_ref().is_some_and(|live| live.workspace_denied);
             let conversation = Conversation {
                 protocol: ProtocolId::Slack,
                 id: conversation_id(&channel),
@@ -1060,10 +1089,17 @@ where
                 order,
                 last_at: sent_at,
                 is_group: !channel.starts_with('D'),
-                writable: true,
+                writable: !workspace_denied,
                 muted: false,
                 placeholder: false,
             };
+            if workspace_denied {
+                let would_post = self
+                    .live
+                    .as_ref()
+                    .is_none_or(|live| !live.read_only.contains(&channel));
+                self.note_writable_under_denial(&channel, would_post);
+            }
             // The title is only the id. A later LoadChats walks the list again
             // and replaces it with the channel name.
             if let Some(live) = &mut self.live {
@@ -1134,8 +1170,9 @@ where
         })
     }
 
-    fn remember(&mut self, post: &SlackPost) {
-        let lost = {
+    /// Returns false when `post` is older than the kept window and was not shown.
+    fn remember(&mut self, post: &SlackPost) -> bool {
+        let dropped = {
             let rows = self.shown.entry(post.channel.clone()).or_default();
             if let Some(row) = rows.iter_mut().find(|row| {
                 row.ts == post.ts
@@ -1145,7 +1182,7 @@ where
                 if row.client_msg_id.is_none() {
                     row.client_msg_id.clone_from(&post.client_msg_id);
                 }
-                return;
+                return true;
             }
             rows.push(Shown {
                 ts: post.ts.clone(),
@@ -1155,15 +1192,44 @@ where
             });
             let cap = usize::from(HISTORY_LIMIT);
             if rows.len() > cap {
-                let extra = rows.len() - cap;
-                rows.drain(0..extra).filter(|row| row.counted).count() as u32
+                // A live post can sit at index 0. History then appends older
+                // rows. The cap drops the oldest `ts`, not the first insert.
+                take_oldest(rows, rows.len() - cap)
             } else {
-                0
+                Vec::new()
             }
         };
+        // The post just cached can be the oldest row. Do not emit
+        // `MessagesRemoved` for it: the UI has not seen it, and core applies
+        // the removal before the insert, so the row stays and the thread
+        // passes the cap.
+        let kept = !dropped.iter().any(|row| row.ts == post.ts);
+        let dropped: Vec<Shown> = if kept {
+            dropped
+        } else {
+            dropped
+                .into_iter()
+                .filter(|row| row.ts != post.ts)
+                .collect()
+        };
+        if dropped.is_empty() {
+            return kept;
+        }
+        let lost = dropped.iter().filter(|row| row.counted).count() as u32;
+        let ids = dropped
+            .iter()
+            .map(|row| message_id_of(&post.channel, &row.ts))
+            .collect();
+        emit_messages_removed(
+            &self.events,
+            ProtocolId::Slack,
+            conversation_id(&post.channel),
+            ids,
+        );
         if lost > 0 {
             self.forget_unread(&post.channel, lost);
         }
+        kept
     }
 
     fn forget_unread(&mut self, channel: &str, lost: u32) {
@@ -1179,6 +1245,32 @@ where
         if let Some(live) = &mut self.live {
             live.read_only.insert(channel.to_string());
         }
+        self.force_unwritable(channel);
+    }
+
+    /// `restricted_action` applies to every row. A later allow restores the
+    /// rows that were writable when the policy arrived, plus channels learned
+    /// during the denial that Slack would allow.
+    fn mark_workspace_read_only(&mut self) {
+        let writable: Vec<String> = self
+            .channels
+            .iter()
+            .filter(|(_, row)| row.writable)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let ids: Vec<String> = self.channels.keys().cloned().collect();
+        if let Some(live) = &mut self.live {
+            if !live.workspace_denied {
+                live.policy_writable = writable.into_iter().collect();
+            }
+            live.workspace_denied = true;
+        }
+        for id in ids {
+            self.force_unwritable(&id);
+        }
+    }
+
+    fn force_unwritable(&mut self, channel: &str) {
         let Some(row) = self.channels.get(channel) else {
             return;
         };
@@ -1188,6 +1280,100 @@ where
         let mut row = row.clone();
         row.writable = false;
         self.upsert(channel.to_string(), row);
+    }
+
+    fn set_writable(&mut self, channel: &str, writable: bool) {
+        let Some(row) = self.channels.get(channel) else {
+            return;
+        };
+        if row.writable == writable {
+            return;
+        }
+        let mut row = row.clone();
+        row.writable = writable;
+        self.upsert(channel.to_string(), row);
+    }
+
+    /// A successful post, or `conversations.info` that allows one, drops the
+    /// refusal. A workspace policy restores every row it turned off.
+    ///
+    /// `restricted_action` is treated as workspace policy, so one channel
+    /// clearing it lifts the denial everywhere. A successful post is the
+    /// strong signal. Channel-level `can_post` may not fully reflect that
+    /// policy.
+    fn clear_posting_denial(&mut self, channel: &str) {
+        let (workspace, restore) = {
+            let Some(live) = &mut self.live else {
+                return;
+            };
+            live.read_only.remove(channel);
+            let workspace = live.workspace_denied;
+            live.workspace_denied = false;
+            let restore = if workspace {
+                live.policy_writable.drain().collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            (workspace, restore)
+        };
+        if workspace {
+            for id in restore {
+                let denied = self
+                    .live
+                    .as_ref()
+                    .is_some_and(|live| live.read_only.contains(&id));
+                if !denied {
+                    self.set_writable(&id, true);
+                }
+            }
+        }
+        let denied = self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.read_only.contains(channel));
+        if !denied {
+            self.set_writable(channel, true);
+        }
+    }
+
+    async fn recheck_posting(&mut self, token: &SlackBotToken, channel: &str) {
+        let denied = self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.workspace_denied || live.read_only.contains(channel));
+        if !denied {
+            return;
+        }
+        match self.deps.api.posting_allowed(token, channel).await {
+            Ok(true) => self.clear_posting_denial(channel),
+            Ok(false) => self.mark_read_only(channel),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    channel,
+                    "slack posting recheck failed; composer stays disabled"
+                );
+            }
+        }
+    }
+
+    /// Record whether `channel` should be writable once a workspace denial lifts.
+    ///
+    /// `would_post` is `can_post && !read_only` from the channel list. A
+    /// socket-mode channel has no `can_post` yet; it is recorded unless a
+    /// channel-level refusal is already set.
+    fn note_writable_under_denial(&mut self, channel: &str, would_post: bool) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        if !live.workspace_denied {
+            return;
+        }
+        if would_post {
+            live.policy_writable.insert(channel.to_string());
+        } else {
+            live.policy_writable.remove(channel);
+        }
     }
 
     fn newest_shown(&self, channel: &str) -> Option<(i64, i64, String)> {
@@ -1222,8 +1408,14 @@ where
         );
     }
 
-    async fn chat_message(&mut self, token: &SlackBotToken, post: SlackPost) -> ChatMessage {
-        self.remember(&post);
+    async fn chat_message(
+        &mut self,
+        token: &SlackBotToken,
+        post: SlackPost,
+    ) -> Option<ChatMessage> {
+        if !self.remember(&post) {
+            return None;
+        }
         let outbound = self
             .live
             .as_ref()
@@ -1233,7 +1425,7 @@ where
             (Some(user), _) => self.user_name(token, user).await,
             (None, _) => "Slack".into(),
         };
-        ChatMessage {
+        Some(ChatMessage {
             protocol: ProtocolId::Slack,
             conversation_id: conversation_id(&post.channel),
             id: message_id_of(&post.channel, &post.ts),
@@ -1243,7 +1435,7 @@ where
             delivery: Delivery::Sent,
             sent_at: ts_order(&post.ts),
             arrival: crate::Arrival::History,
-        }
+        })
     }
 }
 
@@ -1343,11 +1535,27 @@ fn posting_denied(error: &SlackApiError) -> bool {
             code.as_str(),
             "not_in_channel"
                 | "is_archived"
-                | "restricted_action"
                 | "restricted_action_read_only_channel"
                 | "restricted_action_thread_only_channel"
         )
     )
+}
+
+/// `restricted_action` is a workspace policy. The channel-specific codes are not.
+fn workspace_policy(error: &SlackApiError) -> bool {
+    matches!(error, SlackApiError::Api(code) if code == "restricted_action")
+}
+
+/// Drop the `extra` rows with the smallest `ts_rank`.
+fn take_oldest(rows: &mut Vec<Shown>, extra: usize) -> Vec<Shown> {
+    let mut ranked: Vec<usize> = (0..rows.len()).collect();
+    ranked.sort_by_key(|&index| (ts_rank(&rows[index].ts), index));
+    let mut victims: Vec<usize> = ranked.into_iter().take(extra).collect();
+    victims.sort_unstable_by(|left, right| right.cmp(left));
+    victims
+        .into_iter()
+        .map(|index| rows.remove(index))
+        .collect()
 }
 
 /// Slack `ts` (`seconds.microseconds`) as the integer the shell sorts on.
@@ -1438,5 +1646,28 @@ mod tests {
             None,
             false
         ));
+    }
+
+    #[test]
+    fn take_oldest_drops_the_incoming_post_when_it_is_the_oldest() {
+        let mut rows: Vec<Shown> = (1..=50)
+            .map(|index| Shown {
+                ts: format!("170000{index:04}.000100"),
+                text: format!("n{index}"),
+                counted: false,
+                client_msg_id: None,
+            })
+            .collect();
+        rows.push(Shown {
+            ts: "1600000000.000100".into(),
+            text: "too old".into(),
+            counted: false,
+            client_msg_id: None,
+        });
+        let dropped = take_oldest(&mut rows, 1);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].ts, "1600000000.000100");
+        assert_eq!(rows.len(), 50);
+        assert!(rows.iter().all(|row| row.ts != "1600000000.000100"));
     }
 }
