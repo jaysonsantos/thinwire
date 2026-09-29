@@ -57,6 +57,74 @@ pub(super) struct HistoryChat {
     /// Unix seconds of the last activity.
     pub timestamp: i64,
     pub messages: Vec<WaMessage>,
+    /// The phone's mute setting for this chat, from the history sync.
+    pub mute: Mute,
+}
+
+/// A WhatsApp chat mute, as the phone set it (#32). A muted chat does not
+/// notify.
+#[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum Mute {
+    #[default]
+    Off,
+    Forever,
+    /// Muted until this Unix time in milliseconds.
+    UntilMs(i64),
+}
+
+/// A positive mute end below this is in seconds, not milliseconds. The
+/// history sync field names no unit; 10^11 s is the year 5138.
+#[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+const SECONDS_BELOW: i64 = 100_000_000_000;
+
+#[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+fn end_ms(end: i64) -> i64 {
+    if end < SECONDS_BELOW {
+        end.saturating_mul(1000)
+    } else {
+        end
+    }
+}
+
+impl Mute {
+    /// From an app-state `MuteAction`: `mute_end_timestamp` is -1 for no
+    /// end, 0 for unmuted, and a positive end time.
+    #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+    pub(super) fn from_action(muted: Option<bool>, end: Option<i64>) -> Self {
+        match (muted, end) {
+            (Some(false), _) | (None | Some(true), Some(0)) | (None, None) => Self::Off,
+            (Some(true), None) => Self::Forever,
+            (_, Some(end)) if end < 0 => Self::Forever,
+            (_, Some(end)) => Self::UntilMs(end_ms(end)),
+        }
+    }
+
+    /// From the history sync `Conversation.mute_end_time`: none or 0 is not
+    /// muted; a value past `i64::MAX` has no end.
+    #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+    pub(super) fn from_history(end: Option<u64>) -> Self {
+        match end {
+            None | Some(0) => Self::Off,
+            Some(end) => i64::try_from(end).map_or(Self::Forever, |end| Self::UntilMs(end_ms(end))),
+        }
+    }
+
+    pub(super) const fn is_on(self, now_ms: i64) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Forever => true,
+            Self::UntilMs(end) => end > now_ms,
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +158,10 @@ struct ChatRecord {
     /// Newest activity time from history sync. A dropped send falls back to
     /// it (Codex r4131089177).
     history_at: i64,
+    mute: Mute,
+    /// A live `MuteUpdate` set `mute`: an older history chunk does not
+    /// change it again.
+    mute_live: bool,
 }
 
 impl ChatRecord {
@@ -235,6 +307,9 @@ impl Inbox {
             }
             record.history_at = record.history_at.max(chat.timestamp);
             record.timestamp = record.timestamp.max(chat.timestamp);
+            if !record.mute_live {
+                record.mute = chat.mute;
+            }
             let mut added: u32 = 0;
             for message in chat.messages {
                 remember_name(&mut self.names, &message);
@@ -282,6 +357,9 @@ impl Inbox {
             // A live copy carries the server clock (Codex r4132341439).
             record.optimistic.remove(&message.id);
             let known = record.messages.iter().any(|row| row.id == message.id);
+            // A mute that ended by its time: the row goes first, so this
+            // message sees the chat as not muted.
+            let mute_ended = !known && matches!(record.mute, Mute::UntilMs(end) if end <= now_ms());
             // A repeat of a stored id is a refresh. Only the first sight of a
             // pushed message is live, so a history replay cannot notify (#32).
             let arrival = if known {
@@ -304,6 +382,9 @@ impl Inbox {
             insert_message(&mut record.messages, message.clone());
             if is_open {
                 record.mark_read();
+            }
+            if mute_ended && let Some(upsert) = self.upsert_event(&jid) {
+                events.push(upsert);
             }
             events.push(AdapterEvent::MessageReceived {
                 message: self.chat_message(&message, arrival),
@@ -549,6 +630,17 @@ impl Inbox {
         Some((body, delivery_event(jid, id, Delivery::Pending)))
     }
 
+    /// A live mute change from the phone. Returns the new row.
+    pub(super) fn apply_mute(&mut self, jid: &str, mute: Mute) -> Option<AdapterEvent> {
+        if !is_inbox_chat(jid) {
+            return None;
+        }
+        let record = self.chats.entry(jid.to_string()).or_default();
+        record.mute = mute;
+        record.mute_live = true;
+        self.upsert_event(jid)
+    }
+
     fn upsert_event(&self, jid: &str) -> Option<AdapterEvent> {
         let record = self.chats.get(jid)?;
         let title = self.title(jid, record);
@@ -574,7 +666,7 @@ impl Inbox {
                 is_group: is_group(jid),
                 writable: true,
                 placeholder: false,
-                muted: false,
+                muted: record.mute.is_on(now_ms()),
             },
         })
     }
@@ -749,11 +841,90 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn mute_values_follow_whatsapp_app_state() {
+        let now = 1_800_000_000_000;
+        assert_eq!(Mute::from_action(Some(false), Some(-1)), Mute::Off);
+        assert_eq!(
+            Mute::from_action(Some(true), Some(0)),
+            Mute::Off,
+            "0 is unmuted"
+        );
+        assert_eq!(Mute::from_action(Some(true), Some(-1)), Mute::Forever);
+        assert_eq!(Mute::from_action(Some(true), None), Mute::Forever);
+        assert_eq!(
+            Mute::from_action(Some(true), Some(now + 60_000)),
+            Mute::UntilMs(now + 60_000)
+        );
+        assert_eq!(Mute::from_history(None), Mute::Off);
+        assert_eq!(Mute::from_history(Some(0)), Mute::Off);
+        assert_eq!(Mute::from_history(Some(u64::MAX)), Mute::Forever);
+        // A small value is in seconds.
+        assert_eq!(
+            Mute::from_history(Some(1_800_000_060)),
+            Mute::UntilMs(1_800_000_060_000)
+        );
+        assert!(Mute::Forever.is_on(now));
+        assert!(Mute::UntilMs(now + 1).is_on(now));
+        assert!(!Mute::UntilMs(now).is_on(now), "the mute ended");
+        assert!(!Mute::Off.is_on(now));
+    }
+
+    #[test]
+    fn a_chat_muted_on_the_phone_is_a_muted_row() {
+        const CHAT: &str = "111@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        let rows = inbox.apply_history(
+            vec![HistoryChat {
+                mute: Mute::Forever,
+                jid: CHAT.into(),
+                name: None,
+                unread: 0,
+                timestamp: 10,
+                messages: vec![message(CHAT, "a", "hi", 10)],
+            }],
+            Vec::new(),
+        );
+        assert!(upserts(&rows)[0].muted, "from the history sync");
+
+        // The phone unmutes it: a live change.
+        let row = inbox.apply_mute(CHAT, Mute::Off).expect("row");
+        assert!(!upserts(&[row])[0].muted, "unmuted");
+        // An older history chunk does not mute it again.
+        let rows = inbox.apply_history(
+            vec![HistoryChat {
+                mute: Mute::Forever,
+                jid: CHAT.into(),
+                name: None,
+                unread: 0,
+                timestamp: 5,
+                messages: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        assert!(!upserts(&rows)[0].muted, "the live change wins");
+
+        // A mute that ended by its time: the row comes before the message.
+        inbox.apply_mute(CHAT, Mute::UntilMs(1));
+        let events = inbox.apply_messages(vec![message(CHAT, "b", "back", 20)]);
+        let first_row = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::ConversationUpsert { .. }))
+            .expect("row");
+        let the_message = events
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::MessageReceived { .. }))
+            .expect("message");
+        assert!(first_row < the_message);
+        assert!(!upserts(&events)[0].muted);
+    }
+
+    #[test]
     fn history_builds_titles_previews_and_order() {
         let mut inbox = Inbox::default();
         let events = inbox.apply_history(
             vec![
                 HistoryChat {
+                    mute: Default::default(),
                     jid: "111@s.whatsapp.net".into(),
                     name: None,
                     unread: 2,
@@ -761,6 +932,7 @@ pub(super) mod tests {
                     messages: vec![message("111@s.whatsapp.net", "a", "hi\nsecond line", 10)],
                 },
                 HistoryChat {
+                    mute: Default::default(),
                     jid: "g1@g.us".into(),
                     name: Some("Family".into()),
                     unread: 0,
@@ -768,6 +940,7 @@ pub(super) mod tests {
                     messages: Vec::new(),
                 },
                 HistoryChat {
+                    mute: Default::default(),
                     jid: "222@s.whatsapp.net".into(),
                     name: None,
                     unread: 0,
@@ -825,6 +998,7 @@ pub(super) mod tests {
             .collect();
         inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: chat.into(),
                 name: None,
                 unread: 4,
@@ -1006,6 +1180,7 @@ pub(super) mod tests {
         let mut inbox = Inbox::default();
         let chat = "111@s.whatsapp.net";
         let chunk = |unread: u32, messages: Vec<WaMessage>| HistoryChat {
+            mute: Default::default(),
             jid: chat.into(),
             name: None,
             unread,
@@ -1036,6 +1211,7 @@ pub(super) mod tests {
         let other = "222@s.whatsapp.net";
         let events = inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: other.into(),
                 name: None,
                 unread: 4,
@@ -1055,6 +1231,7 @@ pub(super) mod tests {
         let mut inbox = Inbox::default();
         let chat = "111@s.whatsapp.net";
         let chunk = |messages: Vec<WaMessage>| HistoryChat {
+            mute: Default::default(),
             jid: chat.into(),
             name: None,
             unread: 0,
@@ -1277,6 +1454,7 @@ pub(super) mod tests {
         assert_eq!(upserts(&events)[0].unread, 0);
         let events = inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: chat.into(),
                 name: None,
                 unread: 0,
@@ -1333,6 +1511,7 @@ pub(super) mod tests {
         inbox.view(None);
         let events = inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: chat.into(),
                 name: None,
                 unread: 0,
@@ -1364,6 +1543,7 @@ pub(super) mod tests {
         inbox.view(None);
         let events = inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: chat.into(),
                 name: None,
                 unread: 0,
@@ -1383,6 +1563,7 @@ pub(super) mod tests {
         inbox.view(None);
         let events = inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: chat.into(),
                 name: None,
                 unread: 0,
@@ -1443,6 +1624,7 @@ pub(super) mod tests {
         );
         let events = inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: chat.into(),
                 name: None,
                 unread: 0,
@@ -1468,6 +1650,7 @@ pub(super) mod tests {
         let chat = "111@s.whatsapp.net";
         inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: chat.into(),
                 name: None,
                 unread: 0,
@@ -1487,6 +1670,7 @@ pub(super) mod tests {
         let other = "222@s.whatsapp.net";
         inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: other.into(),
                 name: None,
                 unread: 0,
@@ -1512,6 +1696,7 @@ pub(super) mod tests {
         inbox.view(Some("222@s.whatsapp.net"));
         let events = inbox.apply_history(
             vec![HistoryChat {
+                mute: Default::default(),
                 jid: chat.into(),
                 name: None,
                 unread: 2,
@@ -1529,6 +1714,7 @@ pub(super) mod tests {
         let mut inbox = Inbox::default();
         let chat = "111@s.whatsapp.net";
         let chunk = |unread: u32| HistoryChat {
+            mute: Default::default(),
             jid: chat.into(),
             name: None,
             unread,
@@ -1552,6 +1738,7 @@ pub(super) mod tests {
     fn later_history_chunk_keeps_the_open_chat_read() {
         let mut inbox = Inbox::default();
         let chunk = |jid: &str, unread: u32| HistoryChat {
+            mute: Default::default(),
             jid: jid.into(),
             name: None,
             unread,
@@ -1635,6 +1822,7 @@ pub(super) mod tests {
         let total = CHAT_PAGE * 2 + 50;
         let chats: Vec<HistoryChat> = (0..total)
             .map(|n| HistoryChat {
+                mute: Default::default(),
                 jid: format!("{n}@s.whatsapp.net"),
                 name: None,
                 unread: 0,

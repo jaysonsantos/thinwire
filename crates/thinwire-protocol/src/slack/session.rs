@@ -1035,7 +1035,17 @@ where
         let duplicate = self.already_seen(&post);
         let order = ts_rank(&post.ts);
         let sent_at = ts_order(&post.ts);
-        let message = self.chat_message(&token, post).await;
+        // A Socket Mode post is live the first time only: a repeat (retry
+        // or a post the app already showed) cannot notify (#32).
+        let arrival = if duplicate {
+            crate::Arrival::History
+        } else {
+            crate::Arrival::Live
+        };
+        let message = ChatMessage {
+            arrival,
+            ..self.chat_message(&token, post).await
+        };
         let preview = message.body.clone();
         let outbound = message.outbound;
         let sender = message.sender.clone();
