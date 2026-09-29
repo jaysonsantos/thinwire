@@ -443,6 +443,10 @@ impl Drop for Parked {
     }
 }
 
+/// Extra time over the shutdown limit before the adapter stops waiting for
+/// a stuck owner. The owner's own timer at the limit is the real bound.
+pub(crate) const CLOSING_MARGIN: Duration = Duration::from_millis(500);
+
 /// The end of a shutdown. See [`Session::shutdown`].
 pub(crate) struct Closing {
     done: oneshot::Receiver<()>,
@@ -451,12 +455,8 @@ pub(crate) struct Closing {
 }
 
 impl Closing {
-    /// Extra time over the limit before the adapter stops waiting for a
-    /// stuck owner.
-    const MARGIN: Duration = Duration::from_secs(1);
-
     pub(crate) async fn wait(self, events: &EventTx) {
-        let closed = tokio::time::timeout(self.limit + Self::MARGIN, self.done).await;
+        let closed = tokio::time::timeout(self.limit + CLOSING_MARGIN, self.done).await;
         if !matches!(closed, Ok(Ok(()))) {
             // The owner is gone or stuck. `Stopped` still comes once.
             self.flags.emit_stopped_once(events);
@@ -596,6 +596,10 @@ impl Owner {
             }
             Msg::Shutdown { done, limit } => {
                 self.shutdown = Some(done);
+                // `spawn` needs a live strong sender. The session handle is
+                // gone now, but while a send is open its task holds one, so
+                // the timer starts. With no send open, the owner closes below
+                // at once and needs no timer.
                 self.spawn(async move {
                     tokio::time::sleep(limit).await;
                     Msg::ShutdownLimit
@@ -1099,6 +1103,8 @@ impl Owner {
                     &tracked.conversation_id,
                     request,
                 );
+                // Keep this order: the row and `SendRejected` of this send
+                // first, then the 401 step, which answers the other sends.
                 if error == DiscordApiError::Unauthorized {
                     self.settle_unauthorized(error, false);
                 } else if self.unlink.is_none() {

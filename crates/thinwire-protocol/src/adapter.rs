@@ -9,6 +9,11 @@ use tokio::sync::mpsc::UnboundedSender;
 /// Unbounded event sink from a worker into the UI poller.
 pub type EventTx = UnboundedSender<AdapterEvent>;
 
+/// How long the app waits at close for every adapter to emit `Stopped`.
+/// An adapter's own shutdown bound stays below it, with slack, so its
+/// `Stopped` comes in time.
+pub const APP_CLOSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Telegram login epoch. The host bumps it on the UI thread when it sends
 /// Telegram `Disconnect` or `Shutdown`; a worker stamps its login events with
 /// the value it started with. The host drops stale ones (issue #42).

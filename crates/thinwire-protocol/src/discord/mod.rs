@@ -97,10 +97,25 @@ pub struct DiscordAdapter {
     shutdown_limit: std::time::Duration,
 }
 
-/// Longest wait at shutdown for the sends in flight, below the 5 s close
-/// limit of the app.
+/// Time left between the Discord shutdown and the app close limit, so
+/// `Stopped` arrives before the app stops waiting (review of #157).
 #[cfg(any(test, feature = "discord-bot"))]
-const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
+const CLOSE_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Longest wait at shutdown for the sends in flight. With the owner margin
+/// and the slack, it stays under the app close limit: 5 s - 0.5 s - 0.5 s.
+#[cfg(any(test, feature = "discord-bot"))]
+const SHUTDOWN_LIMIT: std::time::Duration = super::adapter::APP_CLOSE_LIMIT
+    .saturating_sub(CLOSE_SLACK)
+    .saturating_sub(session::CLOSING_MARGIN);
+
+// The Discord shutdown, its margin, and the slack fit in the app close limit.
+#[cfg(any(test, feature = "discord-bot"))]
+const _: () = assert!(
+    SHUTDOWN_LIMIT.as_millis() + session::CLOSING_MARGIN.as_millis() + CLOSE_SLACK.as_millis()
+        <= super::adapter::APP_CLOSE_LIMIT.as_millis()
+        && !SHUTDOWN_LIMIT.is_zero()
+);
 
 impl DiscordAdapter {
     #[must_use]
@@ -2180,6 +2195,16 @@ mod tests {
             ),
             "a removed row has no text to post again"
         );
+    }
+
+    /// Review of #157: the Discord shutdown bound, the owner margin, and
+    /// the slack stay below the app close limit.
+    #[test]
+    fn the_shutdown_bound_leaves_slack_under_the_app_close_limit() {
+        let total = SHUTDOWN_LIMIT + session::CLOSING_MARGIN;
+        assert!(total + CLOSE_SLACK <= crate::APP_CLOSE_LIMIT);
+        assert!(total < crate::APP_CLOSE_LIMIT);
+        assert_eq!(SHUTDOWN_LIMIT, Duration::from_secs(4));
     }
 
     /// Codex r4130981025 on #157: a shutdown that reaches its limit with a
