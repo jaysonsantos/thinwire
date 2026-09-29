@@ -265,7 +265,7 @@ impl ThinwireApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             // `Focus` raises the window on X11, macOS, and Windows. On
             // Wayland, winit 0.30 cannot raise it: ask for attention, so the
-            // taskbar entry highlights (thinwire-team/kwin-activation.md).
+            // taskbar entry highlights (#173).
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));
