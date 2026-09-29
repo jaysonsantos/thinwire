@@ -372,6 +372,28 @@ impl Inbox {
     }
 
     /// Keep the row and mark it failed, so the user can resend it.
+    /// Remove the row of a new send that the server did not accept. The
+    /// text stays in the compose field (`SendRejected`), so no failed row
+    /// stays next to it (#98).
+    pub(super) fn drop_send(&mut self, jid: &str, pending: &str) -> Vec<AdapterEvent> {
+        let Some(record) = self.chats.get_mut(jid) else {
+            return Vec::new();
+        };
+        let before = record.messages.len();
+        record.messages.retain(|row| row.id != pending);
+        record.failed.remove(pending);
+        if record.messages.len() == before {
+            return Vec::new();
+        }
+        let mut events = vec![AdapterEvent::MessagesRemoved {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: conversation_id(jid),
+            message_ids: vec![pending.to_string()],
+        }];
+        events.extend(self.upsert_event(jid));
+        events
+    }
+
     pub(super) fn fail_send(&mut self, jid: &str, pending: &str) -> Vec<AdapterEvent> {
         let Some(record) = self.chats.get_mut(jid) else {
             return Vec::new();

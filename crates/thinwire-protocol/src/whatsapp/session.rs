@@ -334,7 +334,11 @@ impl Session {
         }
     }
 
-    /// Apply the result of a send that started on link `generation`.
+    /// Apply the result of a send that started on link `generation`, and
+    /// answer the shell's request only now, after the network result
+    /// (qaproto, #98): `SendAccepted` when the server accepted the message,
+    /// else `SendRejected`. A failed new send loses its row (the text stays
+    /// in the compose field); a failed retry keeps its row as Failed.
     ///
     /// A result from an older link is dropped: that link's inbox and sender
     /// are gone, and an `Unlinked` result must not reset the new link.
@@ -348,18 +352,31 @@ impl Session {
         jid: &str,
         pending: &str,
         result: Result<String, SendFailure>,
+        answer: &SendRequest,
         events: &EventTx,
     ) -> bool {
         let mut state = self.lock();
         if state.generation != generation {
+            // The link that sent it is gone, and its rows with it. Rule 4:
+            // answer also a request that a reconnect lost.
+            let _ = events.send(answer.rejected());
             return false;
         }
         let revoked = result == Err(SendFailure::Unlinked);
         let out = match result {
-            Ok(server_id) => state.inbox.confirm_send(jid, pending, server_id),
+            Ok(server_id) => {
+                let mut out = vec![answer.accepted()];
+                out.extend(state.inbox.confirm_send(jid, pending, server_id));
+                out
+            }
             Err(failure) => {
                 status(events, AdapterStatus::Error, failure.detail());
-                let mut out = state.inbox.fail_send(jid, pending);
+                let mut out = if answer.retry {
+                    state.inbox.fail_send(jid, pending)
+                } else {
+                    state.inbox.drop_send(jid, pending)
+                };
+                out.push(answer.rejected());
                 if failure == SendFailure::Unlinked {
                     out.extend(Self::reset_state(&mut state));
                     out.push(account(AccountState::Unlinked));
@@ -371,6 +388,33 @@ impl Session {
             let _ = events.send(event);
         }
         revoked
+    }
+}
+
+/// The shell's request of one send or retry (ADR 0010 rule 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SendRequest {
+    pub conversation_id: String,
+    pub request: u64,
+    /// A `ResendMessage` of a failed row, not a new `SendText`.
+    pub retry: bool,
+}
+
+impl SendRequest {
+    fn accepted(&self) -> AdapterEvent {
+        AdapterEvent::SendAccepted {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: self.conversation_id.clone(),
+            request: self.request,
+        }
+    }
+
+    fn rejected(&self) -> AdapterEvent {
+        AdapterEvent::SendRejected {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: self.conversation_id.clone(),
+            request: self.request,
+        }
     }
 }
 
