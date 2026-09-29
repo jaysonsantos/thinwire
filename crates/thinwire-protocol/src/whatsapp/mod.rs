@@ -17,8 +17,7 @@ use std::sync::Arc;
 use super::adapter::{
     AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx,
     ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_chat_list_loaded,
-    emit_history_loaded, emit_older_history_loaded, emit_send_accepted, emit_send_rejected,
-    emit_status,
+    emit_history_loaded, emit_older_history_loaded, emit_send_rejected, emit_status,
 };
 
 #[cfg(not(feature = "whatsapp-web"))]
@@ -313,12 +312,17 @@ impl WhatsAppAdapter {
             .session
             .with_inbox(|inbox| inbox.begin_send(&jid, &body, unix_now()));
         let _ = events.send(shown);
-        emit_send_accepted(events, ProtocolId::WhatsApp, conversation_id, request);
         // The sidebar preview and order come from the chat upsert.
         if let Some(upsert) = upsert {
             let _ = events.send(upsert);
         }
-        self.spawn_send(sender, jid, pending, body, events);
+        // SendAccepted or SendRejected comes with the network result.
+        let answer = session::SendRequest {
+            conversation_id: conversation_id.to_string(),
+            request,
+            retry: false,
+        };
+        self.spawn_send(sender, jid, pending, body, answer, events);
     }
 
     fn prepare_send(
@@ -391,8 +395,12 @@ impl WhatsAppAdapter {
             return;
         };
         let _ = events.send(event);
-        emit_send_accepted(events, ProtocolId::WhatsApp, conversation_id, request);
-        self.spawn_send(sender, jid, message_id.to_string(), body, events);
+        let answer = session::SendRequest {
+            conversation_id: conversation_id.to_string(),
+            request,
+            retry: true,
+        };
+        self.spawn_send(sender, jid, message_id.to_string(), body, answer, events);
     }
 
     fn spawn_send(
@@ -401,6 +409,7 @@ impl WhatsAppAdapter {
         jid: String,
         pending: String,
         body: String,
+        answer: session::SendRequest,
         events: &EventTx,
     ) {
         let session = self.session.clone();
@@ -408,7 +417,7 @@ impl WhatsAppAdapter {
         let owner = self.link.as_ref().map(|link| link.callbacks(generation));
         tokio::spawn(async move {
             let result = sender.send_text(&jid, &body).await;
-            let revoked = session.finish_send(generation, &jid, &pending, result, &events);
+            let revoked = session.finish_send(generation, &jid, &pending, result, &answer, &events);
             // The phone revoked the device, maybe with no LoggedOut callback.
             // The owner stops the client and deletes the revoked store.
             if revoked && let Some(owner) = owner {
@@ -1024,19 +1033,17 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         assert!(matches!(
-            rx.recv().await.expect("accepted"),
-            AdapterEvent::SendAccepted { request: 1, .. }
-        ));
-        assert!(matches!(
             rx.recv().await.expect("chat row"),
             AdapterEvent::ConversationUpsert { .. }
         ));
-        let replaced = rx.recv().await.expect("replaced");
-        assert!(matches!(
-            replaced,
+        // #98: SendAccepted comes only after the server accepted it.
+        let answer = answer_events(&mut rx).await;
+        assert!(accepted(&answer, 1));
+        assert!(answer.iter().any(|event| matches!(
+            event,
             AdapterEvent::MessageReplaced { old_id, message, .. }
-                if old_id == pending && message.id == "SRV1"
-        ));
+                if old_id == &pending && message.id == "SRV1"
+        )));
         assert_eq!(
             sender.sent.lock().expect("lock").as_slice(),
             &[(CHAT.to_string(), "hello".to_string())]
@@ -1044,7 +1051,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_send_failure_marks_the_row_failed_and_resend_retries() {
+    async fn fake_send_failure_rejects_the_send_and_a_retry_answers_later() {
         let (tx, mut rx) = unbounded_channel();
         let sender = Arc::new(FakeSender {
             fail: Some(session::SendFailure::Rejected),
@@ -1073,59 +1080,57 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         };
-        assert!(matches!(
-            rx.recv().await.expect("accepted"),
-            AdapterEvent::SendAccepted { request: 1, .. }
-        ));
-        assert!(matches!(
-            rx.recv().await.expect("chat row"),
-            AdapterEvent::ConversationUpsert { .. }
-        ));
-        let status = rx.recv().await.expect("status");
-        match status {
-            AdapterEvent::Status { status, detail, .. } => {
-                assert_eq!(status, AdapterStatus::Error);
+        let answer = answer_events(&mut rx).await;
+        for event in &answer {
+            if let AdapterEvent::Status { status, detail, .. } = event {
+                assert_eq!(*status, AdapterStatus::Error);
                 assert!(!detail.contains("secret body"));
                 assert!(!detail.contains("111"));
             }
-            other => panic!("unexpected {other:?}"),
         }
-        assert!(matches!(
-            rx.recv().await.expect("failed"),
-            AdapterEvent::MessageDelivery { message_id, delivery: Delivery::Failed, .. }
-                if message_id == pending
-        ));
+        // #98: no SendAccepted before the result; the row goes, the text
+        // stays in the compose field.
+        assert!(!accepted(&answer, 1));
+        assert!(rejected(&answer, 1));
+        assert!(answer.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessagesRemoved { message_ids, .. } if message_ids == &vec![pending.clone()]
+        )));
 
+        // A failed row (from an earlier failed retry) retries, and the retry
+        // is answered after its result: rejected, and the row stays Failed.
+        let failed = adapter.session.with_inbox(|inbox| {
+            let (id, _, _) = inbox.begin_send(CHAT, "old", 1);
+            let _ = inbox.fail_send(CHAT, &id);
+            id
+        });
         adapter
             .handle(
                 AdapterCommand::ResendMessage {
                     protocol: ProtocolId::WhatsApp,
                     conversation_id: "whatsapp:111@s.whatsapp.net".into(),
-                    message_id: pending.clone(),
+                    message_id: failed.clone(),
                     request: 2,
                 },
                 &tx,
             )
             .expect("resend");
+        let answer = answer_events(&mut rx).await;
         assert!(matches!(
-            rx.recv().await.expect("pending again"),
-            AdapterEvent::MessageDelivery {
+            answer.first(),
+            Some(AdapterEvent::MessageDelivery {
                 delivery: Delivery::Pending,
                 ..
-            }
+            })
         ));
-        assert!(matches!(
-            rx.recv().await.expect("retry accepted"),
-            AdapterEvent::SendAccepted { request: 2, .. }
-        ));
-        let _status = rx.recv().await.expect("status");
-        assert!(matches!(
-            rx.recv().await.expect("failed again"),
-            AdapterEvent::MessageDelivery {
-                delivery: Delivery::Failed,
-                ..
-            }
-        ));
+        assert!(!accepted(&answer, 2));
+        assert!(rejected(&answer, 2));
+        assert!(answer.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageDelivery { message_id, delivery: Delivery::Failed, .. }
+                if message_id == &failed
+        )));
+
         adapter
             .handle(
                 AdapterCommand::ResendMessage {
@@ -1146,6 +1151,35 @@ mod tests {
             }],
             "history rows are not failed sends"
         );
+    }
+
+    /// #98: a retry that the server accepts answers SendAccepted with the
+    /// replaced row.
+    #[tokio::test]
+    async fn an_accepted_retry_answers_after_the_server() {
+        let (mut adapter, mut rx, tx) = connected(Arc::new(FakeSender::default()));
+        let failed = adapter.session.with_inbox(|inbox| {
+            let (id, _, _) = inbox.begin_send(CHAT, "old", 1);
+            let _ = inbox.fail_send(CHAT, &id);
+            id
+        });
+        adapter
+            .handle(
+                AdapterCommand::ResendMessage {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    message_id: failed.clone(),
+                    request: 4,
+                },
+                &tx,
+            )
+            .expect("resend");
+        let answer = answer_events(&mut rx).await;
+        assert!(accepted(&answer, 4));
+        assert!(answer.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageReplaced { old_id, .. } if old_id == &failed
+        )));
     }
 
     #[test]
@@ -1262,21 +1296,52 @@ mod tests {
         }
     }
 
-    /// The pending row, then `SendAccepted` for request 1.
-    async fn expect_pending_and_accepted(rx: &mut UnboundedReceiver<AdapterEvent>) -> String {
+    /// The pending row and its chat row. The answer comes with the network
+    /// result (#98).
+    async fn expect_pending(rx: &mut UnboundedReceiver<AdapterEvent>) -> String {
         let pending = match rx.recv().await.expect("pending row") {
             AdapterEvent::MessageReceived { message } => message.id,
             other => panic!("unexpected {other:?}"),
         };
         assert!(matches!(
-            rx.recv().await.expect("accepted"),
-            AdapterEvent::SendAccepted { request: 1, .. }
-        ));
-        assert!(matches!(
             rx.recv().await.expect("chat row"),
             AdapterEvent::ConversationUpsert { .. }
         ));
         pending
+    }
+
+    /// Every event up to the answer of a send or retry, and the events that
+    /// came with it.
+    async fn answer_events(rx: &mut UnboundedReceiver<AdapterEvent>) -> Vec<AdapterEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("an answer in time")
+                .expect("open channel");
+            let answer = matches!(
+                event,
+                AdapterEvent::SendAccepted { .. } | AdapterEvent::SendRejected { .. }
+            );
+            events.push(event);
+            if answer {
+                break;
+            }
+        }
+        events.extend(drain(rx));
+        events
+    }
+
+    fn accepted(events: &[AdapterEvent], request: u64) -> bool {
+        events.iter().any(|event| {
+            matches!(event, AdapterEvent::SendAccepted { request: seen, .. } if *seen == request)
+        })
+    }
+
+    fn rejected(events: &[AdapterEvent], request: u64) -> bool {
+        events.iter().any(|event| {
+            matches!(event, AdapterEvent::SendRejected { request: seen, .. } if *seen == request)
+        })
     }
 
     fn only_send_rejected(events: &[AdapterEvent]) -> bool {
@@ -1294,24 +1359,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_error_on_send_marks_the_row_failed_and_keeps_the_link() {
+    async fn network_error_on_send_rejects_it_and_keeps_the_link() {
         let (mut adapter, mut rx, tx) = connected(failing(session::SendFailure::Network));
         adapter.handle(send_hi(), &tx).expect("queued");
-        let pending = expect_pending_and_accepted(&mut rx).await;
-        match rx.recv().await.expect("status") {
-            AdapterEvent::Status { status, detail, .. } => {
-                assert_eq!(status, AdapterStatus::Error);
-                assert_eq!(detail, session::SEND_NETWORK);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        assert!(matches!(
-            rx.recv().await.expect("failed"),
-            AdapterEvent::MessageDelivery { message_id, delivery: Delivery::Failed, .. }
-                if message_id == pending
-        ));
+        let pending = expect_pending(&mut rx).await;
+        let answer = answer_events(&mut rx).await;
+        assert!(answer.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { status: AdapterStatus::Error, detail, .. } if detail == session::SEND_NETWORK
+        )));
+        // #98: a failed new send loses its row; the text stays in compose.
+        assert!(answer.iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessagesRemoved { message_ids, .. } if message_ids == &vec![pending.clone()]
+        )));
+        assert!(rejected(&answer, 1));
+        assert!(!accepted(&answer, 1));
         assert!(adapter.session.is_connected());
-        assert!(drain(&mut rx).is_empty());
     }
 
     #[tokio::test]
@@ -1332,40 +1396,38 @@ mod tests {
         adapter
             .handle(send_hi(), &tx)
             .expect("send after reconnect");
-        let _pending = expect_pending_and_accepted(&mut rx).await;
-        assert!(matches!(
-            rx.recv().await.expect("replaced"),
-            AdapterEvent::MessageReplaced { .. }
-        ));
+        let _pending = expect_pending(&mut rx).await;
+        let answer = answer_events(&mut rx).await;
+        assert!(accepted(&answer, 1));
+        assert!(
+            answer
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::MessageReplaced { .. }))
+        );
     }
 
     #[tokio::test]
     async fn revoked_device_on_send_clears_the_inbox() {
         let (mut adapter, mut rx, tx) = connected(failing(session::SendFailure::Unlinked));
         adapter.handle(send_hi(), &tx).expect("queued");
-        let _pending = expect_pending_and_accepted(&mut rx).await;
-        match rx.recv().await.expect("status") {
-            AdapterEvent::Status { status, detail, .. } => {
-                assert_eq!(status, AdapterStatus::Error);
-                assert_eq!(detail, session::SEND_UNLINKED);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        let mut rest = Vec::new();
-        while rest.len() < 2 {
-            rest.push(rx.recv().await.expect("event"));
-        }
-        assert!(matches!(
-            rest[0],
-            AdapterEvent::MessageDelivery {
-                delivery: Delivery::Failed,
+        let _pending = expect_pending(&mut rx).await;
+        let answer = answer_events(&mut rx).await;
+        assert!(answer.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { status: AdapterStatus::Error, detail, .. } if detail == session::SEND_UNLINKED
+        )));
+        assert!(rejected(&answer, 1));
+        assert!(answer.iter().any(|event| matches!(
+            event,
+            AdapterEvent::ConversationRemoved { id, .. } if id == "whatsapp:111@s.whatsapp.net"
+        )));
+        assert!(answer.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Unlinked,
                 ..
             }
-        ));
-        assert!(matches!(
-            &rest[1],
-            AdapterEvent::ConversationRemoved { id, .. } if id == "whatsapp:111@s.whatsapp.net"
-        ));
+        )));
         assert!(!adapter.session.is_connected());
         drain(&mut rx);
         adapter
@@ -1572,11 +1634,14 @@ mod tests {
         drain(&mut rx);
         let mut adapter = adapter;
         adapter.handle(send_hi(), &tx).expect("send");
-        let _pending = expect_pending_and_accepted(&mut rx).await;
-        assert!(matches!(
-            rx.recv().await.expect("replaced"),
-            AdapterEvent::MessageReplaced { .. }
-        ));
+        let _pending = expect_pending(&mut rx).await;
+        let answer = answer_events(&mut rx).await;
+        assert!(accepted(&answer, 1));
+        assert!(
+            answer
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::MessageReplaced { .. }))
+        );
         assert_eq!(current.sent.lock().expect("lock").len(), 1);
         assert!(stale.sent.lock().expect("lock").is_empty());
     }
@@ -1642,7 +1707,7 @@ mod tests {
         adapter.session.apply(LinkEvent::Connected, 1, &tx);
         drain(&mut rx);
         adapter.handle(send_hi(), &tx).expect("send");
-        let _pending = expect_pending_and_accepted(&mut rx).await;
+        let _pending = expect_pending(&mut rx).await;
 
         // The user cancels and pairs again while the send is in flight.
         adapter
@@ -1660,16 +1725,24 @@ mod tests {
             tokio::task::yield_now().await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Rule 4: the lost request still gets its answer, and nothing else
+        // of the old link comes out.
         let late = drain(&mut rx);
-        assert!(late.is_empty(), "old send result leaked: {late:?}");
+        assert!(
+            late.len() == 1 && rejected(&late, 1),
+            "old send result leaked: {late:?}"
+        );
         assert!(adapter.session.is_connected());
 
         adapter.handle(send_hi(), &tx).expect("send on link 2");
-        let _pending = expect_pending_and_accepted(&mut rx).await;
-        assert!(matches!(
-            rx.recv().await.expect("replaced"),
-            AdapterEvent::MessageReplaced { .. }
-        ));
+        let _pending = expect_pending(&mut rx).await;
+        let answer = answer_events(&mut rx).await;
+        assert!(accepted(&answer, 1));
+        assert!(
+            answer
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::MessageReplaced { .. }))
+        );
         assert_eq!(current.sent.lock().expect("lock").len(), 1);
     }
 
