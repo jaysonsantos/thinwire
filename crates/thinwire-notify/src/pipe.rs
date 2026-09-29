@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::NotifyCommand;
+use crate::{NotifyCommand, NotifyKey};
 
 /// Most commands that wait for the backend thread. A slow or hung OS
 /// notification service does not grow memory (#87 review).
@@ -19,6 +19,10 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// Longest wait between two tries.
 pub const RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Tries of one `Dismiss` before the thread gives up on it (#165). The
+/// failed ids stay in the backend for a later dismiss of the chat.
+pub const MAX_DISMISS_TRIES: u32 = 3;
 
 /// Commands that wait for the backend. A new `Show` or `Update` of a chat
 /// replaces the queued one of that chat (an `Update` of a queued `Show`
@@ -81,6 +85,18 @@ impl Inbox {
             };
             self.commands.remove(index);
         }
+    }
+
+    /// Queue a failed `Dismiss` again. It never removes a newer command of
+    /// its chat: if the chat has a queued command, the retry is skipped
+    /// (the next dismiss of the chat closes the kept ids). Returns `true`
+    /// when queued.
+    pub(crate) fn retry_dismiss(&mut self, key: &NotifyKey) -> bool {
+        if self.commands.iter().any(|queued| queued.key() == key) {
+            return false;
+        }
+        self.commands.push_back(NotifyCommand::Dismiss(key.clone()));
+        true
     }
 
     pub(crate) fn pop(&mut self) -> Option<NotifyCommand> {
@@ -160,7 +176,7 @@ pub(crate) fn retry_wait(failures: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BackendError, Notification, NotifyKey};
+    use crate::{BackendError, Notification};
     use thinwire_core::ProtocolId;
 
     fn key(n: usize) -> NotifyKey {
@@ -235,6 +251,18 @@ mod tests {
         assert_eq!(inbox.len(), 1);
         inbox.push(show(2, 2));
         assert!(matches!(inbox.pop(), Some(NotifyCommand::Show(_))));
+        assert!(inbox.is_empty());
+    }
+
+    #[test]
+    fn a_retried_dismiss_never_removes_a_newer_command() {
+        let mut inbox = Inbox::default();
+        assert!(inbox.retry_dismiss(&key(1)));
+        assert_eq!(inbox.pop(), Some(NotifyCommand::Dismiss(key(1))));
+        // A newer Show of the chat is queued: no retry, the Show stays.
+        inbox.push(show(1, 2));
+        assert!(!inbox.retry_dismiss(&key(1)));
+        assert_eq!(inbox.pop(), Some(show(1, 2)));
         assert!(inbox.is_empty());
     }
 
