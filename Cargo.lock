@@ -6637,6 +6637,8 @@ dependencies = [
  "getrandom 0.4.3",
  "libsqlite3-sys",
  "rustls",
+ "serde",
+ "serde_json",
  "slack-morphism",
  "tdlib-rs",
  "tokio",

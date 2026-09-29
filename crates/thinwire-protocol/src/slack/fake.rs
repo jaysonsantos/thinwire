@@ -747,6 +747,83 @@ async fn a_removed_channel_does_not_keep_its_old_preview() {
 }
 
 #[tokio::test]
+async fn history_replaces_a_newer_cached_preview() {
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(FakeApi::workspace(), vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1800000000.000100",
+        "U1",
+        "newer than history",
+    )));
+    h.until("newer preview", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && conversation.preview == "newer than history"
+        )
+    })
+    .await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    let row = h
+        .until("preview follows history", |event| {
+            matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == "slack:C1"
+                        && conversation.preview == "second, from the app"
+            )
+        })
+        .await;
+    let AdapterEvent::ConversationUpsert { conversation } = row else {
+        unreachable!();
+    };
+    assert_ne!(conversation.preview, "newer than history");
+}
+
+#[tokio::test]
+async fn empty_history_clears_a_cached_preview() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.history.insert("C1".into(), Vec::new());
+    });
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(api, vault, true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.socket.push(SlackInbound::Message(post(
+        "C1",
+        "1800000000.000100",
+        "U1",
+        "only local",
+    )));
+    h.message("only local").await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.until("preview cleared", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1"
+                    && conversation.preview.is_empty()
+                    && conversation.order == 0
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn history_drops_posts_outside_the_latest_page() {
     let vault = installed_vault();
     vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
@@ -844,6 +921,32 @@ async fn a_rejected_post_marks_the_channel_read_only() {
         })
         .await;
     assert!(matches!(row, AdapterEvent::ConversationUpsert { .. }));
+}
+
+#[tokio::test]
+async fn a_read_only_post_error_marks_the_channel_read_only() {
+    let api = FakeApi::workspace();
+    api.with(|state| {
+        state.post_error = Some(SlackApiError::api("restricted_action_read_only_channel"));
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.conversation("slack:C1").await;
+    h.send(AdapterCommand::SendText {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        body: "nope".into(),
+        request: 8,
+    });
+    h.until("read only", |event| {
+        matches!(
+            event,
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.id == "slack:C1" && !conversation.writable
+        )
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -960,7 +1063,9 @@ async fn a_live_message_ranks_after_older_history() {
         }
         _ => None,
     });
-    assert_eq!(preview, Some("live hello"));
+    // The live post is not on the history page, so open drops it and the
+    // preview follows the newest fetched post.
+    assert_eq!(preview, Some("second, from the app"));
 }
 
 #[tokio::test]

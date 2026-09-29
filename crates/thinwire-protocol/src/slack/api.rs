@@ -96,10 +96,36 @@ pub struct SlackChannel {
     pub kind: SlackChannelKind,
     /// The bot is in the channel and can read its history.
     pub is_member: bool,
-    /// The bot can post. A read-only channel is `false`.
+    /// The bot can post a top-level message. Independent of `is_member`.
     pub can_post: bool,
     /// Peer user id for a direct message.
     pub dm_user: Option<String>,
+}
+
+/// Posting permission from the Slack conversation object.
+///
+/// `is_read_only`, `is_thread_only`, `is_frozen`, and `is_archived` block a
+/// top-level post. A public channel stays open to a non-member
+/// (`chat:write.public`). A private channel, a DM, or a group DM requires
+/// membership.
+#[must_use]
+pub(crate) fn channel_can_post(
+    kind: SlackChannelKind,
+    is_member: bool,
+    is_read_only: bool,
+    is_thread_only: bool,
+    is_frozen: bool,
+    is_archived: bool,
+) -> bool {
+    if is_read_only || is_thread_only || is_frozen || is_archived {
+        return false;
+    }
+    match kind {
+        SlackChannelKind::Public => true,
+        SlackChannelKind::Private
+        | SlackChannelKind::DirectMessage
+        | SlackChannelKind::GroupMessage => is_member,
+    }
 }
 
 /// One page of `conversations.list`.
@@ -274,6 +300,46 @@ mod tests {
         assert!(!shown.contains("code-test"));
         assert_eq!(bot.reveal(), "xoxb-test-bot");
         assert_eq!(app.reveal(), "xapp-test-app");
+    }
+
+    #[test]
+    fn posting_follows_slack_conversation_fields() {
+        use SlackChannelKind::{DirectMessage, GroupMessage, Private, Public};
+        assert!(
+            !channel_can_post(Public, true, true, false, false, false),
+            "a member of a read-only channel cannot post"
+        );
+        assert!(
+            !channel_can_post(Public, true, false, true, false, false),
+            "a thread-only channel refuses a top-level post"
+        );
+        assert!(!channel_can_post(Public, true, false, false, true, false));
+        assert!(!channel_can_post(Public, true, false, false, false, true));
+        assert!(
+            channel_can_post(Public, false, false, false, false, false),
+            "a non-member can post in a public channel"
+        );
+        assert!(!channel_can_post(
+            Private, false, false, false, false, false
+        ));
+        assert!(!channel_can_post(
+            DirectMessage,
+            false,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(!channel_can_post(
+            GroupMessage,
+            false,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(channel_can_post(Public, true, false, false, false, false));
+        assert!(channel_can_post(Private, true, false, false, false, false));
     }
 
     #[test]

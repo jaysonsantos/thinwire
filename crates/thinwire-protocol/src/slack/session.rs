@@ -754,6 +754,27 @@ where
         self.accumulated_seen()
     }
 
+    /// Set the inbox row from the history page. An empty page clears it.
+    fn replace_preview(&mut self, channel: &str, newest: Option<(i64, i64, String)>) {
+        let Some(row) = self.channels.get(channel) else {
+            return;
+        };
+        let mut row = row.clone();
+        match newest {
+            Some((order, sent_at, preview)) => {
+                row.preview = preview;
+                row.order = order;
+                row.last_at = sent_at;
+            }
+            None => {
+                row.preview.clear();
+                row.order = 0;
+                row.last_at = 0;
+            }
+        }
+        self.upsert(channel.to_string(), row);
+    }
+
     fn note_latest(&mut self, channel: &str, order: i64, sent_at: i64, preview: &str) {
         let Some(row) = self.channels.get(channel) else {
             return;
@@ -840,9 +861,9 @@ where
             let message = self.chat_message(&token, post).await;
             emit_message(&self.events, message);
         }
-        if let Some((order, sent_at, preview)) = newest {
-            self.note_latest(channel, order, sent_at, &preview);
-        }
+        // The fetched page is the thread. A dropped live post can be newer
+        // than every history row; `note_latest` would keep that stale preview.
+        self.replace_preview(channel, newest);
         self.mark_channel_read(channel);
         emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
     }
@@ -904,7 +925,7 @@ where
                 self.note_latest(channel, order, sent_at, &preview);
             }
             Err(error) => {
-                if matches!(&error, SlackApiError::Api(code) if code == "not_in_channel") {
+                if posting_denied(&error) {
                     self.mark_read_only(channel);
                 }
                 emit_send_rejected(&self.events, ProtocolId::Slack, conversation, request);
@@ -1258,6 +1279,21 @@ fn ts_order(ts: &str) -> i64 {
         .next()
         .and_then(|seconds| seconds.parse().ok())
         .unwrap_or(0)
+}
+
+/// Slack refused a top-level post in this channel. A transport error is not a refusal.
+fn posting_denied(error: &SlackApiError) -> bool {
+    matches!(
+        error,
+        SlackApiError::Api(code) if matches!(
+            code.as_str(),
+            "not_in_channel"
+                | "is_archived"
+                | "restricted_action"
+                | "restricted_action_read_only_channel"
+                | "restricted_action_thread_only_channel"
+        )
+    )
 }
 
 /// Slack `ts` (`seconds.microseconds`) as the integer the shell sorts on.
