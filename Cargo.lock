@@ -6661,6 +6661,7 @@ dependencies = [
  "presage",
  "presage-store-sqlite",
  "sha2 0.11.0",
+ "sqlx",
  "thinwire-protocol",
  "tokio",
  "tracing",

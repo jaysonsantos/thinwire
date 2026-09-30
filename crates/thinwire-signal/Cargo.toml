@@ -17,6 +17,7 @@ signal-local = [
   "dep:presage-store-sqlite",
   "dep:futures",
   "dep:libsqlite3-sys",
+  "dep:sqlx",
 ]
 
 [dependencies]
@@ -36,6 +37,13 @@ libsqlite3-sys = { version = "0.36", optional = true, default-features = false, 
 ] }
 futures = { version = "0.3", optional = true, default-features = false, features = [
   "std",
+] }
+# The history page query. presage `messages()` has no row limit. Same sqlx
+# 0.9 line presage-store-sqlite already builds.
+sqlx = { version = "0.9.0", optional = true, default-features = false, features = [
+  "runtime-tokio",
+  "sqlite",
+  "uuid",
 ] }
 
 [dev-dependencies]
