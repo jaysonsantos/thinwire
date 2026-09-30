@@ -309,8 +309,13 @@ impl Session {
                 vec![account(AccountState::Linking)]
             }
             LinkEvent::LoggedOut => {
-                let removed = Self::reset_state(&mut state);
+                let mut removed = Self::reset_state(&mut state);
                 status(events, AdapterStatus::Error, LOGGED_OUT);
+                // The phone removed this device: the account ended for good,
+                // and the shell drops its mutes (#153). Only a logout.
+                removed.push(AdapterEvent::AccountEnded {
+                    protocol: ProtocolId::WhatsApp,
+                });
                 removed
             }
             LinkEvent::TemporaryBan => {

@@ -9,6 +9,7 @@ mod clock;
 mod core;
 pub mod demo;
 mod intent;
+pub mod mutes;
 pub mod notify;
 mod secret_text;
 pub mod secrets;

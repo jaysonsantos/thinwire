@@ -296,6 +296,10 @@ impl Core {
                 applied = true;
             }
         }
+        for protocol in self.state.take_ended_accounts() {
+            // The next account must not get these mutes (#153 review).
+            self.settings.forget_chat_mutes(protocol);
+        }
         // Only after the queued answers: a late accept that was queued in
         // time still finds its send (#90 item 3).
         self.state.prune_late_answers();
@@ -327,6 +331,10 @@ impl Core {
             window_focused: self.notify.window_focused(),
             viewed: self.state.viewed(),
             has_session: self.state.has_session(message.protocol),
+            muted_here: self
+                .settings
+                .chat_mutes()
+                .contains(message.protocol, &message.conversation_id),
             now: unix_now(),
         };
         let chat = self
@@ -421,6 +429,21 @@ impl Core {
                 self.settings.set_notification_preview(on);
                 if !on {
                     self.notify.hide_previews();
+                }
+            }
+            Intent::SetChatMute {
+                protocol,
+                conversation_id,
+                muted,
+            } => {
+                self.settings
+                    .set_chat_muted(protocol, &conversation_id, muted);
+                if muted {
+                    // A notification of this chat on screen goes away.
+                    self.notify.dismiss(&crate::notify::NotifyKey {
+                        protocol,
+                        conversation_id,
+                    });
                 }
             }
             Intent::Telegram(intent) => self.telegram(intent),
@@ -605,6 +628,9 @@ impl Core {
             watch_keychain(&self.runtime, Arc::clone(&self.secrets), &self.notifier);
         }
         if let Some(job) = self.settings.take_persist_job() {
+            self.runtime.spawn_blocking(move || job.run());
+        }
+        if let Some(job) = self.settings.take_mutes_job() {
             self.runtime.spawn_blocking(move || job.run());
         }
         self.arm_send_wake();
@@ -1426,6 +1452,337 @@ mod tests {
         assert!(!core.view().notifications());
         core.notify_message(&live(1, "off"));
         assert!(core.take_notify().is_empty(), "the switch is off");
+    }
+
+    /// #153: a chat muted in thinwire does not notify, and its shown
+    /// notification goes. The mute stays when the adapter sends the row
+    /// again. A protocol mute wins: an unmute here does not unmute it. The
+    /// file is written off the caller thread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chat_muted_in_thinwire_does_not_notify() {
+        use crate::mutes::{ChatMute, ChatMutes};
+        use crate::notify::{NotifyCommand, NotifyKey};
+        use crate::state::test_support::ready_with_chats;
+        use thinwire_protocol::{Conversation, Delivery};
+
+        let path = std::env::temp_dir()
+            .join("thinwire-core-tests")
+            .join(format!("{}-mute", std::process::id()))
+            .join("muted_chats");
+        let _ = std::fs::remove_file(&path);
+        let settings = temp_settings().with_chat_mutes(ChatMutes::load_from(path.clone()));
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        core.state = ready_with_chats(&core.secrets);
+        core.dispatch(Intent::WindowFocus(false));
+        let live = ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+            id: "telegram:2:9".into(),
+            sender: "Bob".into(),
+            body: "hi".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+        };
+        let key = NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+        };
+        let mute = |muted| Intent::SetChatMute {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+            muted,
+        };
+        core.notify_message(&live);
+        assert_eq!(core.take_notify().len(), 1);
+
+        core.dispatch(mute(true));
+        assert_eq!(
+            core.take_notify(),
+            vec![NotifyCommand::Dismiss(key)],
+            "the shown notification goes"
+        );
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Here
+        );
+        core.notify_message(&live);
+        assert!(core.take_notify().is_empty(), "muted in thinwire");
+
+        // The written file has the mute. The write runs on a worker.
+        let deadline = Instant::now() + WAIT;
+        while !ChatMutes::load_from(path.clone()).contains(ProtocolId::Telegram, "telegram:2") {
+            assert!(Instant::now() < deadline, "the mute was not written");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The adapter sends the row again, with no protocol mute.
+        let row = core
+            .state
+            .conversation(ProtocolId::Telegram, "telegram:2")
+            .cloned()
+            .expect("row");
+        core.state.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                muted: false,
+                ..row.clone()
+            },
+        });
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Here,
+            "a row update keeps the thinwire mute"
+        );
+
+        // The protocol mutes it too, and wins over an unmute here.
+        core.state.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation { muted: true, ..row },
+        });
+        core.dispatch(mute(false));
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Protocol
+        );
+        core.notify_message(&live);
+        assert!(core.take_notify().is_empty(), "muted in the protocol");
+    }
+
+    /// A core whose thinwire mutes live in a file under the temp dir, with
+    /// Telegram ready, `telegram:2` and `slack:C1` muted, and the file
+    /// written. Events go in through the returned sender.
+    async fn core_with_written_mutes(
+        name: &str,
+    ) -> (
+        Core,
+        tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
+        std::path::PathBuf,
+    ) {
+        use crate::mutes::ChatMutes;
+        use crate::state::test_support::ready_with_chats;
+
+        let path = std::env::temp_dir()
+            .join("thinwire-core-tests")
+            .join(format!("{}-{name}", std::process::id()))
+            .join("muted_chats");
+        let _ = std::fs::remove_file(&path);
+        let settings = temp_settings().with_chat_mutes(ChatMutes::load_from(path.clone()));
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        core.state = ready_with_chats(&core.secrets);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        for (protocol, id) in [
+            (ProtocolId::Telegram, "telegram:2"),
+            (ProtocolId::Slack, "slack:C1"),
+        ] {
+            core.dispatch(Intent::SetChatMute {
+                protocol,
+                conversation_id: id.into(),
+                muted: true,
+            });
+        }
+        wait_for_mutes(&path, |mutes| {
+            mutes.contains(ProtocolId::Telegram, "telegram:2")
+                && mutes.contains(ProtocolId::Slack, "slack:C1")
+        })
+        .await;
+        (core, events_tx, path)
+    }
+
+    /// Wait until the mutes file on disk passes `check`. Writes run on a worker.
+    async fn wait_for_mutes(
+        path: &std::path::Path,
+        check: impl Fn(&crate::mutes::ChatMutes) -> bool,
+    ) {
+        let deadline = Instant::now() + WAIT;
+        while !check(&crate::mutes::ChatMutes::load_from(path.to_path_buf())) {
+            assert!(Instant::now() < deadline, "the mutes file did not change");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #153 review (Codex r4138993074, qa B): a Telegram session that ends
+    /// for good drops the Telegram mutes, on screen and in the file. The
+    /// next account must not get them. Other protocols keep theirs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_telegram_session_end_drops_the_telegram_mutes() {
+        use crate::mutes::ChatMute;
+
+        let (mut core, events_tx, path) = core_with_written_mutes("session-end").await;
+        events_tx
+            .send(AdapterEvent::TelegramSessionEnded)
+            .expect("queue");
+        assert!(core.pump());
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::None
+        );
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Slack, "slack:C1"),
+            ChatMute::Here
+        );
+        wait_for_mutes(&path, |mutes| {
+            !mutes.contains(ProtocolId::Telegram, "telegram:2")
+        })
+        .await;
+        let text = std::fs::read_to_string(&path).expect("file");
+        assert!(
+            !text.lines().any(|line| line.starts_with("telegram ")),
+            "no telegram line"
+        );
+        assert!(text.lines().any(|line| line == "slack slack:C1"));
+    }
+
+    /// #201 qa B: a WhatsApp logout on the phone (`AccountEnded`) drops the
+    /// WhatsApp mutes only, on screen and in the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ended_account_drops_only_its_protocol_mutes() {
+        use crate::mutes::ChatMute;
+
+        let (mut core, events_tx, path) = core_with_written_mutes("account-ended").await;
+        let jid = "whatsapp:4915550100@s.whatsapp.net";
+        core.dispatch(Intent::SetChatMute {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: jid.into(),
+            muted: true,
+        });
+        wait_for_mutes(&path, |mutes| mutes.contains(ProtocolId::WhatsApp, jid)).await;
+        events_tx
+            .send(AdapterEvent::AccountEnded {
+                protocol: ProtocolId::WhatsApp,
+            })
+            .expect("queue");
+        assert!(core.pump());
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::WhatsApp, jid),
+            ChatMute::None
+        );
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Here
+        );
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Slack, "slack:C1"),
+            ChatMute::Here
+        );
+        wait_for_mutes(&path, |mutes| !mutes.contains(ProtocolId::WhatsApp, jid)).await;
+        let text = std::fs::read_to_string(&path).expect("file");
+        assert!(
+            !text.lines().any(|line| line.starts_with("whatsapp ")),
+            "no whatsapp line"
+        );
+        assert!(text.lines().any(|line| line == "telegram telegram:2"));
+        assert!(text.lines().any(|line| line == "slack slack:C1"));
+    }
+
+    /// #201 review (Codex r4139252378): a saved Telegram session that ended
+    /// while the app was closed comes back as the phone step of a resume,
+    /// or as the phone step after a data reset. Both drop the Telegram
+    /// mutes, on screen and in the file. A Slack mute stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_that_ended_while_closed_drops_the_telegram_mutes() {
+        use crate::mutes::ChatMute;
+        use thinwire_protocol::TelegramAuthPhase;
+
+        for case in ["resume", "data-reset"] {
+            let (mut core, events_tx, path) =
+                core_with_written_mutes(&format!("closed-{case}")).await;
+            if case == "resume" {
+                core.state.resume_connecting_for_test();
+            } else {
+                events_tx
+                    .send(AdapterEvent::TelegramDataReset {
+                        moved_to: "tdlib.stale-1".into(),
+                    })
+                    .expect("queue");
+            }
+            events_tx
+                .send(AdapterEvent::TelegramAuth {
+                    phase: TelegramAuthPhase::NeedPhone,
+                })
+                .expect("queue");
+            assert!(core.pump());
+            assert_eq!(
+                core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+                ChatMute::None,
+                "{case}"
+            );
+            assert_eq!(
+                core.view().chat_mute(ProtocolId::Slack, "slack:C1"),
+                ChatMute::Here,
+                "{case}"
+            );
+            wait_for_mutes(&path, |mutes| {
+                !mutes.contains(ProtocolId::Telegram, "telegram:2")
+                    && mutes.contains(ProtocolId::Slack, "slack:C1")
+            })
+            .await;
+        }
+    }
+
+    /// #201 review: the phone step of a first login (no resume, no data
+    /// reset) keeps every mute.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_run_phone_step_keeps_the_mutes() {
+        use crate::mutes::ChatMute;
+        use thinwire_protocol::TelegramAuthPhase;
+
+        let (mut core, events_tx, path) = core_with_written_mutes("first-run").await;
+        events_tx
+            .send(AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::NeedPhone,
+            })
+            .expect("queue");
+        assert!(core.pump());
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Here
+        );
+        drop(core);
+        let mutes = crate::mutes::ChatMutes::load_from(path);
+        assert!(mutes.contains(ProtocolId::Telegram, "telegram:2"));
+        assert!(mutes.contains(ProtocolId::Slack, "slack:C1"));
+    }
+
+    /// #153 review: a reconnect, an adapter stop, and an app shutdown never
+    /// drop a mute.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnect_or_a_shutdown_keeps_the_mutes() {
+        use crate::mutes::ChatMute;
+        use thinwire_protocol::AccountState;
+
+        let (mut core, events_tx, path) = core_with_written_mutes("reconnect").await;
+        for protocol in [ProtocolId::Telegram, ProtocolId::Slack] {
+            for state in [AccountState::Linking, AccountState::Unlinked] {
+                events_tx
+                    .send(AdapterEvent::Account { protocol, state })
+                    .expect("queue");
+            }
+            events_tx
+                .send(AdapterEvent::Stopped { protocol })
+                .expect("queue");
+        }
+        assert!(core.pump());
+        core.dispatch(Intent::Shutdown);
+        core.pump();
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Telegram, "telegram:2"),
+            ChatMute::Here
+        );
+        assert_eq!(
+            core.view().chat_mute(ProtocolId::Slack, "slack:C1"),
+            ChatMute::Here
+        );
+        drop(core);
+        let mutes = crate::mutes::ChatMutes::load_from(path);
+        assert!(mutes.contains(ProtocolId::Telegram, "telegram:2"));
+        assert!(mutes.contains(ProtocolId::Slack, "slack:C1"));
     }
 
     /// qa L5 and #87 review: a click opens a chat only in its own protocol;

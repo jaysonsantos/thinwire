@@ -150,7 +150,13 @@ Desktop notifications (#32) show a new message when you do not look at its chat.
 | Discord (`discord-bot`) | No: the bot inbox has no gateway yet, so no message arrives live | No: the bot cannot see your personal mute |
 | Signal (`signal-local`, local only) | Yes (the receive stream) | No: the Signal library does not expose chat mute |
 
-- A chat whose mute the app cannot read notifies. Turn off "Show notifications" if that is too much.
+- You can also mute a chat in thinwire, in every protocol (#153). Use the "Mute" button in the chat header, or right-click the chat in the inbox. A thinwire mute works like a protocol mute: the chat does not notify and its unread count is not in the window title. The inbox row shows "muted".
+  - A protocol mute wins. A chat that the protocol mutes shows "Muted in Telegram" (or its protocol), and only that protocol can unmute it.
+  - The thinwire mute stays on this computer. It does not change the mute on your phone or in other apps.
+  - The muted chats are stored in `muted_chats` in the platform data dir (`~/.local/share/thinwire/muted_chats` on Linux), with file mode 0600. Chat ids can hold personal data (a WhatsApp id holds a phone number), so the file is not next to `settings.toml`.
+  - When the mutes go: the Telegram mutes go when the Telegram session ends for good (a logout from another device, or Telegram ended the session), also when it ended while the app was closed and the app then asks for the phone number again. The next account on this computer does not get them. The WhatsApp mutes go when the phone logs this device out (Linked devices → Log out). A reconnect, a ban, an app restart, or a stopped client keeps every mute. Slack, Discord, and Signal have no account removal in the app yet, so their mutes stay in the file until you unmute the chats or delete the file.
+  - If the app cannot read `muted_chats` (for example, no read permission), it does not change the file. New mutes then work until the app closes.
+- A chat whose mute the app cannot read notifies, unless you mute it in thinwire. Turn off "Show notifications" if that is too much.
 - The window title shows the unread count of chats that are not muted, for example "thinwire (3)".
 - Privacy: a notification sends the chat title, the sender in a group, and up to 120 characters of the message to the OS notification service. "Hide message text" sends "New message" only, with no sender. thinwire never writes message text to its log.
 - What each OS does today:

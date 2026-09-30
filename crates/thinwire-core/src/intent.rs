@@ -74,6 +74,13 @@ pub enum Intent {
     SetNotifications(bool),
     /// Settings: show the sender and the text in notifications (#32).
     SetNotificationPreview(bool),
+    /// Mute or unmute one chat in thinwire (#153). A protocol mute wins:
+    /// an unmute here never unmutes it. Disk I/O runs off the caller thread.
+    SetChatMute {
+        protocol: ProtocolId,
+        conversation_id: String,
+        muted: bool,
+    },
     /// Telegram login and account actions.
     Telegram(TelegramIntent),
     /// Experimental WhatsApp pairing. Only a `whatsapp-web` build acts on it.
