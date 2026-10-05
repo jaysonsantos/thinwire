@@ -110,7 +110,9 @@ impl TagService for Center {
         // Check again here, immediately before send. Tagged::update already
         // asked `has`, but the user can clear the notification in between.
         // send with this id then creates a new one. An update must not
-        // (Codex r4139322212).
+        // (Codex r4139322212). A small window remains between the second
+        // pending/delivered check and `send()`, so `update_sends` is not
+        // a guarantee.
         if quiet {
             let pending = block_on(un::get_pending_notification_ids());
             let delivered = block_on(un::get_delivered_notification_ids());
