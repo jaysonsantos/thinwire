@@ -167,6 +167,11 @@ pub(crate) enum IdleEnd {
 }
 
 impl AccountSends {
+    /// True while a send has not been answered.
+    pub(crate) fn busy(&self) -> bool {
+        !self.inflight.is_empty()
+    }
+
     /// Closes the account when nothing is in flight.
     pub(crate) fn take_idle(&mut self) -> IdleEnd {
         if !self.inflight.is_empty() {
@@ -520,7 +525,7 @@ impl Session {
     /// and message id), while the account stays open. `successor` is that
     /// generation. `None` ends the account: each send still in flight is
     /// answered, then `Unlinked` follows.
-    pub(crate) fn retire(self, successor: Option<u64>) -> oneshot::Receiver<Carried> {
+    pub(crate) fn retire(&self, successor: Option<u64>) -> oneshot::Receiver<Carried> {
         self.flags.retired.store(true, Ordering::SeqCst);
         let (carried, rx) = oneshot::channel();
         let _ = self.tx.send(Msg::Retire { carried, successor });
@@ -625,8 +630,10 @@ pub(crate) struct Closing {
 impl Closing {
     pub(crate) async fn wait(self, events: &EventTx) {
         let closed = tokio::time::timeout(self.limit + CLOSING_MARGIN, self.done).await;
-        if !matches!(closed, Ok(Ok(()))) {
-            // The owner is gone or stuck. `Stopped` still comes once.
+        // The owner emits `Stopped` before it signals, except when the account
+        // already ended and this close still has to report `Stopped`.
+        if !matches!(closed, Ok(Ok(()))) || !self.flags.stopped.load(Ordering::SeqCst) {
+            // The owner is gone, stuck, or already finished without `Stopped`.
             self.flags.emit_stopped_once(events);
         }
     }
@@ -713,10 +720,18 @@ impl Owner {
 
     fn handle(&mut self, msg: Msg) {
         if self.closed {
-            // After `Stopped`, nothing more is published.
-            #[cfg(test)]
-            if let Msg::Flush { done } = msg {
-                let _ = done.send(());
+            // After `Stopped` or `Unlinked`, nothing more is published.
+            // Shutdown still completes, and `Stopped` comes once from the waiter
+            // when this owner did not emit it.
+            match msg {
+                Msg::Shutdown { done, .. } => {
+                    let _ = done.send(());
+                }
+                #[cfg(test)]
+                Msg::Flush { done } => {
+                    let _ = done.send(());
+                }
+                _ => {}
             }
             return;
         }
@@ -1475,8 +1490,10 @@ impl Owner {
         if !self.generation_is_current(attempt) {
             // A newer session already owns the account. HistoryLoaded,
             // SendRejected, and MessagesRemoved from this disconnect would
-            // settle that session (Codex r4133411242).
+            // settle that session (Codex r4133411242). Send tasks keep their
+            // own senders. This hold must not pin the owner (Codex r4139429691).
             self.loads.clear();
+            self.tx_hold = None;
             return;
         }
         self.disconnecting = Some((detail, attempt));
@@ -1504,6 +1521,10 @@ impl Owner {
         };
         if self.seal(AccountEnd::Disconnect { detail, attempt }) {
             self.mark_closed();
+        } else {
+            // The wait outlived this disconnect. Send tasks keep their own
+            // senders until their results arrive (Codex r4139429691).
+            self.tx_hold = None;
         }
     }
 
@@ -1527,6 +1548,13 @@ impl Owner {
         let Some(end) = self.pending_end.take() else {
             return;
         };
+        if self.shutdown.is_some() && !matches!(end, AccountEnd::Stopped) {
+            // Shutdown is waiting on the real results. The unlink timer must
+            // not reject them or emit `Unlinked`. A `Stopped` settle still
+            // closes: that timer is the shutdown wait for a carried send.
+            self.finish_shutdown_if_idle();
+            return;
+        }
         match end {
             AccountEnd::Stopped => self.close(),
             end => {

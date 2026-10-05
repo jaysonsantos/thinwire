@@ -85,6 +85,11 @@ pub struct DiscordAdapter {
     backend: Option<BackendFactory>,
     #[cfg(any(test, feature = "discord-bot"))]
     session: Option<session::Session>,
+    /// Owner retired with no successor while a send is still in flight.
+    /// Shutdown waits for it. A later session drops the handle; send tasks
+    /// keep that owner alive until their results arrive (Codex r4139277704).
+    #[cfg(any(test, feature = "discord-bot"))]
+    retiring: Option<session::Session>,
     /// Session number. It moves when a session stops and when one starts,
     /// as the old live counter did. Pending row ids carry it, so they stay
     /// unique across sessions and keep their form.
@@ -137,6 +142,8 @@ impl DiscordAdapter {
             backend: None,
             #[cfg(any(test, feature = "discord-bot"))]
             session: None,
+            #[cfg(any(test, feature = "discord-bot"))]
+            retiring: None,
             #[cfg(any(test, feature = "discord-bot"))]
             generation: 0,
             #[cfg(any(test, feature = "discord-bot"))]
@@ -215,10 +222,11 @@ impl DiscordAdapter {
             Ok(prepared) => prepared,
             Err(error) => {
                 // Nothing replaces this session. A send still in flight is
-                // answered, then `Unlinked` follows.
+                // answered, then `Unlinked` follows. The owner stays
+                // reachable so shutdown waits for that send.
                 #[cfg(any(test, feature = "discord-bot"))]
                 if let Some(session) = self.session.take() {
-                    drop(session.retire(None));
+                    self.retire_without_successor(session);
                 }
                 self.stop_session(events);
                 emit_status(
@@ -268,6 +276,8 @@ impl DiscordAdapter {
                 }
                 Some(token) => {
                     let api = factory(token);
+                    // The previous handle's strong sender would pin that owner.
+                    self.retiring = None;
                     self.session = Some(session::Session::start(
                         api,
                         events,
@@ -326,9 +336,25 @@ impl DiscordAdapter {
             // follows this stop. The owner answers a send still in flight,
             // then emits `Unlinked`.
             if let Some(session) = self.session.take() {
-                drop(session.retire(None));
+                self.retire_without_successor(session);
             }
             self.generation += 1;
+        }
+    }
+
+    /// Retires `session` with no successor. While a send is in flight the
+    /// owner stays in [`Self::retiring`], so shutdown waits for it instead of
+    /// emitting `Stopped` with no session (Codex r4139277704).
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn retire_without_successor(&mut self, session: session::Session) {
+        drop(session.retire(None));
+        let busy = self
+            .sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .busy();
+        if busy {
+            self.retiring = Some(session);
         }
     }
 
@@ -489,11 +515,10 @@ impl ProtocolAdapter for DiscordAdapter {
         #[cfg(any(test, feature = "discord-bot"))]
         {
             // The owner emits `Stopped` when its sends end, or at the limit,
-            // and publishes nothing after it (Codex r4130981025).
-            let Some(session) = self.session.take() else {
-                // A retiring owner may still be settling a send. Answer it,
-                // then emit `Stopped`, under the gate. That owner seals nothing
-                // after this.
+            // and publishes nothing after it (Codex r4130981025). `or` always
+            // takes `retiring`: a live session must drop that handle, and a
+            // detached owner must be the one that waits (Codex r4139277704).
+            let Some(session) = self.session.take().or(self.retiring.take()) else {
                 self.sends
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -546,7 +571,7 @@ impl ProtocolAdapter for DiscordAdapter {
                 {
                     let _ = self.advance_active();
                     if let Some(session) = self.session.take() {
-                        drop(session.retire(None));
+                        self.retire_without_successor(session);
                     }
                     let _ = self.unlink_if_idle(events);
                 }
@@ -2332,6 +2357,103 @@ mod tests {
         assert!(!opened.iter().any(is_unlinked));
     }
 
+    /// Codex r4139429691: a disconnect that loses the race with reconnect
+    /// drops its channel hold. Repeated cycles do not accumulate owners.
+    #[tokio::test]
+    async fn a_stale_disconnect_drops_the_detached_owner() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let baseline = stable_api_users(&api).await;
+        for _ in 0..3 {
+            let parked = adapter.session.as_ref().expect("session").park().await;
+            adapter
+                .handle(
+                    AdapterCommand::Disconnect {
+                        protocol: ProtocolId::Discord,
+                    },
+                    &tx,
+                )
+                .expect("disconnect");
+            adapter
+                .handle(
+                    AdapterCommand::Connect {
+                        protocol: ProtocolId::Discord,
+                    },
+                    &tx,
+                )
+                .expect("reconnect");
+            let _ = inbox_loaded(&mut rx).await;
+            parked.release();
+        }
+        wait_for_api_users(&api, baseline).await;
+    }
+
+    /// Codex r4139429691: the disconnect was current, then a reconnect wins
+    /// before the settle wait ends. The old owner still releases its hold
+    /// once the in-flight send is answered.
+    #[tokio::test]
+    async fn a_disconnect_that_becomes_stale_drops_the_sender() {
+        let history = Arc::new(Notify::new());
+        let history_arrived = Arc::new(Notify::new());
+        let send = Arc::new(Notify::new());
+        let mut fake = FakeDiscordApi::guild_fixture();
+        fake.hold_history = Some(Arc::clone(&history));
+        fake.history_at_hold = Some(Arc::clone(&history_arrived));
+        fake.hold_send = Some(Arc::clone(&send));
+        let api = Arc::new(fake);
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let baseline = stable_api_users(&api).await;
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                },
+                &tx,
+            )
+            .expect("open");
+        tokio::time::timeout(Duration::from_secs(2), history_arrived.notified())
+            .await
+            .expect("history is in flight");
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: conversation_id(GUILD, GENERAL),
+                    body: "in flight".into(),
+                    request: 3,
+                },
+                &tx,
+            )
+            .expect("send");
+        sends_at_hold(&api, 1).await;
+        let _ = drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::Disconnect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("disconnect");
+        let _ = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::HistoryLoaded { .. })
+        })
+        .await;
+        adapter
+            .handle(
+                AdapterCommand::Connect {
+                    protocol: ProtocolId::Discord,
+                },
+                &tx,
+            )
+            .expect("reconnect");
+        let _ = inbox_loaded(&mut rx).await;
+        history.notify_waiters();
+        send.notify_waiters();
+        wait_for_api_users(&api, baseline).await;
+    }
+
     /// Codex r4132922551 on #157: the HTTP call already succeeded and queued
     /// `SendDone`. Disconnect then sets the shared retired flag before the
     /// owner handles that result. The send stays accepted. `retire` on a
@@ -3385,7 +3507,8 @@ mod tests {
     }
 
     /// Codex r4139277704: shutdown while a retiring owner still holds a send.
-    /// The send is answered before `Stopped`. Nothing follows `Stopped`.
+    /// `Stopped` waits for that owner. The send's real result comes first.
+    /// Nothing follows `Stopped`.
     #[tokio::test]
     async fn shutdown_with_a_retiring_owner_answers_before_stopped() {
         let hold = Arc::new(Notify::new());
@@ -3415,12 +3538,7 @@ mod tests {
             )
             .expect("send");
         sends_at_hold(&api, 1).await;
-        let pending = messages(&drain(&mut rx))
-            .into_iter()
-            .find(|message| message.delivery == crate::Delivery::Pending)
-            .expect("pending row")
-            .id
-            .clone();
+        let _ = drain(&mut rx);
         vault.set_bot_token("Bearer oauth-fixture");
         adapter
             .handle(
@@ -3430,31 +3548,40 @@ mod tests {
                 &tx,
             )
             .expect("refused");
+        let _ = drain(&mut rx);
         adapter.shutdown(&tx);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let early = drain(&mut rx);
+        assert!(
+            early.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::Stopped { .. }
+                    | AdapterEvent::SendAccepted { .. }
+                    | AdapterEvent::SendRejected { .. }
+                    | AdapterEvent::MessagesRemoved { .. }
+                    | AdapterEvent::Account { .. }
+            )),
+            "shutdown took the no-session path while the send was held: {early:?}"
+        );
+        hold.notify_waiters();
         let events = until(&mut rx, |event| {
             matches!(event, AdapterEvent::Stopped { .. })
         })
         .await;
-        let rejected = position(&events, |event| {
-            matches!(event, AdapterEvent::SendRejected { request: 1, .. })
+        let accepted = position(&events, |event| {
+            matches!(event, AdapterEvent::SendAccepted { request: 1, .. })
         })
-        .expect("the open send is rejected");
-        let removed = position(&events, |event| {
-            matches!(
-                event,
-                AdapterEvent::MessagesRemoved { message_ids, .. }
-                    if message_ids.contains(&pending)
-            )
-        })
-        .expect("the optimistic row is removed");
+        .expect("the retiring owner accepts the send");
         let stopped = position(&events, |event| {
             matches!(event, AdapterEvent::Stopped { .. })
         })
         .expect("stopped");
-        assert!(rejected < stopped && removed < stopped);
-        hold.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // The retiring owner may still be inside its 1 s wait.
+        assert!(accepted < stopped);
+        assert!(
+            !events.iter().any(is_unlinked),
+            "Unlinked replaced Stopped: {events:?}"
+        );
+        // The retire timer is 1 s. It must not publish after Stopped.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         let late = drain(&mut rx);
         assert!(
@@ -3740,6 +3867,39 @@ mod tests {
             api.state().sent.is_empty(),
             "a revoked generation does not register the send"
         );
+    }
+
+    /// Api strong count once in-flight HTTP tasks have finished.
+    async fn stable_api_users(api: &Arc<FakeDiscordApi>) -> usize {
+        let mut last = Arc::strong_count(api);
+        let mut steady = 0u8;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let now = Arc::strong_count(api);
+            if now == last {
+                steady += 1;
+                if steady == 3 {
+                    return now;
+                }
+            } else {
+                last = now;
+                steady = 0;
+            }
+        }
+        last
+    }
+
+    /// Fails when detached owners keep the API client alive.
+    async fn wait_for_api_users(api: &Arc<FakeDiscordApi>, expected: usize) {
+        let mut last = 0;
+        for _ in 0..50 {
+            last = Arc::strong_count(api);
+            if last == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("api users {last}, expected {expected}");
     }
 
     /// Waits until `count` sends are past the token check and at the hold.

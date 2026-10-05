@@ -165,6 +165,7 @@ pub(crate) struct RegisterPause {
 
 impl RegisterPause {
     /// Lets the owner register the send.
+    #[cfg(test)]
     pub(crate) fn release(&self) {
         let mut ready = self.ready.lock().unwrap_or_else(PoisonError::into_inner);
         *ready = true;
