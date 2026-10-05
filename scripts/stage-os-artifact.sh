@@ -2,7 +2,8 @@
 # Stage dist/, then write one mode-preserving thinwire-$ARTIFACT.tar.gz.
 # actions/upload-artifact wraps downloads in an outer zip and stores loose
 # files as 644. The tar.gz is what keeps executable bits and the .app tree.
-# macOS: Thinwire.app with an ad-hoc signature only (no Developer ID). Linux and Windows: flat binary plus notices.
+# macOS: Thinwire.app with an ad-hoc signature only (no Developer ID). Linux
+# and Windows: flat binary plus notices.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
