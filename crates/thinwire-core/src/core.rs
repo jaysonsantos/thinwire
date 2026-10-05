@@ -122,20 +122,18 @@ impl Core {
     /// Start the adapter host and the keychain attach on `runtime`.
     ///
     /// `THINWIRE_KEYRING=memory` keeps every secret in memory.
+    ///
+    /// It is [`Self::with_replacement_adapters`] with no replacement, so the
+    /// store choice and the phone vault setup have one copy (#186).
     #[must_use]
     pub fn new(runtime: &Handle, config: CoreConfig) -> Self {
-        let secrets = if config.memory_secrets {
-            Arc::new(SecretStore::memory())
-        } else {
-            SecretStore::for_ui(runtime)
-        };
-        let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
-        Self::with_store(runtime, config, secrets, whatsapp_phone, Vec::new())
+        Self::with_replacement_adapters(runtime, config, |_| Vec::new())
     }
 
-    /// Same as [`Self::new`], with local-only AGPL adapters in place of the
-    /// MIT stubs (ADR 0011): `thinwire-signal` with `signal-local`,
-    /// `thinwire-whatsapp` with `whatsapp-web`.
+    /// [`Self::new`] with local-only AGPL adapters in place of the MIT
+    /// stubs (ADR 0011): `thinwire-signal` with `signal-local`,
+    /// `thinwire-whatsapp` with `whatsapp-web`. It chooses the secret store
+    /// and makes the phone vault for both constructors.
     ///
     /// `build` gets the core's WhatsApp phone vault: the pairing screen writes
     /// it and the WhatsApp adapter reads it. Each adapter that `build`
@@ -1237,6 +1235,25 @@ mod tests {
             _events: &thinwire_protocol::EventTx,
         ) -> Result<(), thinwire_protocol::AdapterError> {
             Ok(())
+        }
+    }
+
+    /// #186: `Core::new` is `with_replacement_adapters` with no replacement:
+    /// the same account rows and a memory store.
+    #[tokio::test]
+    async fn new_matches_the_replacement_constructor_with_no_replacement() {
+        let config = || CoreConfig::new(temp_settings()).with_memory_secrets();
+        let plain = Core::new(&Handle::current(), config());
+        let empty = Core::with_replacement_adapters(&Handle::current(), config(), |_| Vec::new());
+        // `AccountRow` has no `PartialEq`: its debug text holds every field.
+        let rows = |core: &Core| format!("{:?}", core.state.accounts);
+        assert_eq!(rows(&plain), rows(&empty));
+        for core in [&plain, &empty] {
+            assert_eq!(core.secrets.backend_name(), "memory");
+            assert!(
+                core.secrets.attach_settled(),
+                "a memory store, not a keychain attach"
+            );
         }
     }
 
