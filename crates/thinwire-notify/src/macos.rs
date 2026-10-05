@@ -154,11 +154,13 @@ impl TagService for Center {
         Ok(listed(tag, &delivered, &pending))
     }
 
-    /// Cancel a pending request first: it can turn into a delivered one
-    /// before the close.
+    /// Cancel a pending request and wait for macOS to run that, then close
+    /// a delivered one. The blocking helpers return before the worker runs
+    /// them, so a close can miss a request that is still pending and leave
+    /// it behind once it is delivered (same as startup cleanup).
     fn remove(&mut self, tag: &str) -> Result<(), BackendError> {
-        un::blocking::cancel_pending(tag);
-        un::blocking::close_delivered(tag);
+        block_on(un::cancel_pending(tag));
+        block_on(un::close_delivered(tag));
         Ok(())
     }
 }
