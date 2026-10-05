@@ -272,10 +272,11 @@ fn platform_backend(clicks: ClickFn) -> impl Backend {
     }
 }
 
-/// The first macOS major version for the notification center backend.
-/// `mac-usernotifications` sets the interruption level of each request, a
-/// macOS 12 API, with no availability check: on macOS 11 the first
-/// notification aborts the app (Codex r4138724926).
+/// The first macOS major version for the notification center backend, and
+/// for `setInterruptionLevel:`. That selector is macOS 12+. On macOS 11 it
+/// aborts the process (Codex r4138724926). `LSMinimumSystemVersion` stays
+/// 11.0: the center is not selected before macOS 12, and
+/// [`interruption_level_on`] skips the selector as well.
 #[cfg(any(target_os = "macos", test))]
 const MIN_CENTER_MACOS: isize = 12;
 
@@ -296,6 +297,14 @@ const fn mac_choice(major: isize) -> MacChoice {
     } else {
         MacChoice::ShowOnly
     }
+}
+
+/// `true` when this major may call `setInterruptionLevel:`.
+/// The center path is macOS 12+, and the call itself is skipped before that
+/// so a macOS 11 process never dispatches the selector (Codex r4138724926).
+#[cfg(any(target_os = "macos", test))]
+const fn interruption_level_on(major: isize) -> bool {
+    matches!(mac_choice(major), MacChoice::Center)
 }
 
 #[cfg(target_os = "macos")]
@@ -616,6 +625,14 @@ mod tests {
         assert_eq!(mac_choice(11), MacChoice::ShowOnly);
         assert_eq!(mac_choice(12), MacChoice::Center);
         assert_eq!(mac_choice(26), MacChoice::Center);
+    }
+
+    #[test]
+    fn interruption_level_stays_off_on_macos_11() {
+        assert!(!interruption_level_on(10));
+        assert!(!interruption_level_on(11));
+        assert!(interruption_level_on(12));
+        assert!(interruption_level_on(26));
     }
 
     #[test]

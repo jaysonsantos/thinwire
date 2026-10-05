@@ -4,8 +4,9 @@
 //! replaces its notification. A dismiss removes it, and a click on the body
 //! opens the chat. The center needs a bundle id and a code signature (an
 //! ad-hoc one is enough): `Thinwire.app` has both (ADR 0003). `cargo run`
-//! has no bundle and keeps the show-only backend. macOS 11 also keeps it:
-//! the crate uses a macOS 12 API (see `MIN_CENTER_MACOS`).
+//! has no bundle and keeps the show-only backend. macOS 11 also keeps it.
+//! `setInterruptionLevel:` is a macOS 12 selector: the call is skipped
+//! there (`interruption_level_on`), because it aborts the process.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -79,16 +80,21 @@ impl TagService for Center {
         notification: &Notification,
         quiet: bool,
     ) -> Result<(), BackendError> {
-        let level = if quiet {
-            un::InterruptionLevel::Passive
-        } else {
-            un::InterruptionLevel::Active
-        };
         let mut request = un::Notification::new()
             .id(tag)
             .title(&notification.title)
-            .message(notification.body())
-            .interruption_level(level);
+            .message(notification.body());
+        // macOS 11 has no `setInterruptionLevel:`. Calling it aborts the
+        // process. `LSMinimumSystemVersion` stays 11.0, so the guard is
+        // here, at the call (Codex r4138724926).
+        if crate::interruption_level_on(os_major()) {
+            let level = if quiet {
+                un::InterruptionLevel::Passive
+            } else {
+                un::InterruptionLevel::Active
+            };
+            request = request.interruption_level(level);
+        }
         if !quiet {
             request = request.default_sound();
         }
