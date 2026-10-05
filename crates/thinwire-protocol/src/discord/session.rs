@@ -1476,15 +1476,15 @@ impl Owner {
         self.close();
     }
 
-    /// The user disconnected. Sends in flight get up to [`SEND_SETTLE_WAIT`]
-    /// for their real result (Codex r4132922551), then the disconnected state
-    /// follows. Loads end at once. A send carried from the previous session
-    /// counts: it is answered before `Unlinked`.
     fn generation_is_current(&self, generation: u64) -> bool {
         let newest = self.active.lock().unwrap_or_else(PoisonError::into_inner);
         *newest == generation
     }
 
+    /// The user disconnected. Sends in flight get up to [`SEND_SETTLE_WAIT`]
+    /// for their real result (Codex r4132922551), then the disconnected state
+    /// follows. Loads end at once. A send carried from the previous session
+    /// counts: it is answered before `Unlinked`.
     fn disconnect(&mut self, detail: &'static str, attempt: u64) {
         self.retire();
         if !self.generation_is_current(attempt) {
@@ -1663,13 +1663,13 @@ impl Owner {
         reject_open(&mut self.inflight, &self.carried, &events, &mut gate);
     }
 
-    /// Runs HTTP work off the owner. Its result comes back as a message. The
-    /// task holds a strong sender, so a retired owner still gets the result.
     fn mark_closed(&mut self) {
         self.closed = true;
         self.tx_hold = None;
     }
 
+    /// Runs HTTP work off the owner. Its result comes back as a message. The
+    /// task holds a strong sender, so a retired owner still gets the result.
     fn spawn(&self, work: impl Future<Output = Msg> + Send + 'static) {
         let Some(tx) = self.tx.upgrade().or_else(|| self.tx_hold.clone()) else {
             return;
