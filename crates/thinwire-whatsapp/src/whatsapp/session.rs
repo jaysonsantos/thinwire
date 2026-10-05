@@ -415,6 +415,9 @@ impl Session {
     /// replaces the timer.
     fn arm_mute_timer(&self, state: &mut State, generation: u64, events: &EventTx) {
         let Some(end) = state.inbox.next_mute_end() else {
+            // Off or Forever: no timed mute remains. The timer of the old
+            // end would keep the session until that end (Codex r4139365614).
+            Self::abort_mute_timer(state);
             return;
         };
         if let Some(timer) = &state.mute_timer {
@@ -817,6 +820,65 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             assert!(session.owners() <= owners, "{name}: the task let go");
+        }
+    }
+
+    /// Codex r4139365614: Off or Forever leaves no timed mute. The timer
+    /// that waited for the old end stops, and the task lets go of the
+    /// session. A later timed mute gets its own timer.
+    #[tokio::test]
+    async fn off_or_forever_stops_the_mute_timer() {
+        let cases = [
+            ("live off", false, Mute::Off),
+            ("live forever", false, Mute::Forever),
+            ("history off", true, Mute::Off),
+            ("history forever", true, Mute::Forever),
+        ];
+        for (name, from_history, mute) in cases {
+            let (session, tx, _rx) = linked();
+            let owners = session.owners();
+            let end = inbox::now_ms() + 60_000;
+            session.apply(
+                LinkEvent::Mute {
+                    jid: CHAT.into(),
+                    mute: Mute::UntilMs(end),
+                },
+                1,
+                &tx,
+            );
+            assert!(session.has_mute_timer(), "{name}");
+            if from_history {
+                session.apply(LinkEvent::Disconnected, 1, &tx);
+                session.apply(history(mute), 1, &tx);
+            } else {
+                session.apply(
+                    LinkEvent::Mute {
+                        jid: CHAT.into(),
+                        mute,
+                    },
+                    1,
+                    &tx,
+                );
+            }
+            assert!(!session.has_mute_timer(), "{name}");
+            for _ in 0..100 {
+                if session.owners() <= owners {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(session.owners() <= owners, "{name}: the task let go");
+
+            let again = inbox::now_ms() + 120_000;
+            session.apply(
+                LinkEvent::Mute {
+                    jid: CHAT.into(),
+                    mute: Mute::UntilMs(again),
+                },
+                1,
+                &tx,
+            );
+            assert_eq!(armed_end(&session), Some(again), "{name}: a new timer");
         }
     }
 
