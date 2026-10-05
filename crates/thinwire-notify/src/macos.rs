@@ -15,7 +15,7 @@ use std::thread;
 use mac_usernotifications as un;
 use mac_usernotifications::block_on;
 
-use crate::tagged::{TagService, listed};
+use crate::tagged::{StartupRemoval, TagService, listed, startup_removals};
 use crate::{BackendError, ClickFn, Notification};
 
 /// Most click-waiter threads at one time, as on Linux. Over the limit, a
@@ -40,14 +40,23 @@ impl Center {
             Err(_) => tracing::warn!("could not ask for notification permission"),
         }
         // Notifications of an earlier run that did not end cleanly: no
-        // waiter opens their chat now. Pending requests go too, first: one
-        // can turn into a delivered one before the close (Codex
-        // r4139073814).
-        for id in block_on(un::get_pending_notification_ids()) {
-            un::blocking::cancel_pending(&id);
-        }
-        for id in block_on(un::get_delivered_notification_ids()) {
-            un::blocking::close_delivered(&id);
+        // waiter opens their chat now. Pending requests are cancelled too,
+        // and each call finishes before the next: the blocking helpers
+        // return before macOS runs them, so a pending request could still
+        // be delivered after this function returned (Codex r4139073814).
+        for step in startup_removals() {
+            match step {
+                StartupRemoval::CancelPending => {
+                    for id in block_on(un::get_pending_notification_ids()) {
+                        block_on(un::cancel_pending(&id));
+                    }
+                }
+                StartupRemoval::CloseDelivered => {
+                    for id in block_on(un::get_delivered_notification_ids()) {
+                        block_on(un::close_delivered(&id));
+                    }
+                }
+            }
         }
         Some(Self {
             clicks,

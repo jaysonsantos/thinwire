@@ -25,6 +25,27 @@ pub(crate) fn listed<S: AsRef<str>>(tag: &str, delivered: &[S], pending: &[S]) -
     delivered.iter().chain(pending).any(|id| id.as_ref() == tag)
 }
 
+/// One removal at start, of notifications an earlier run left behind.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupRemoval {
+    /// Cancel requests macOS has not delivered yet.
+    CancelPending,
+    /// Close notifications already in Notification Center.
+    CloseDelivered,
+}
+
+/// A start removes both. Pending first: a request can be delivered before
+/// the close, and a pending-only cleanup would miss it after that
+/// (Codex r4139073814).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn startup_removals() -> [StartupRemoval; 2] {
+    [
+        StartupRemoval::CancelPending,
+        StartupRemoval::CloseDelivered,
+    ]
+}
+
 /// One OS notification service with tags.
 pub(crate) trait TagService: Send + 'static {
     /// Show `notification` under `tag`. It replaces a shown notification
@@ -171,6 +192,17 @@ mod tests {
         assert!(listed("a", &none, &["a"]), "pending right after a send");
         assert!(!listed("a", &["b"], &["c"]));
         assert!(!listed("a", &none, &none));
+    }
+
+    #[test]
+    fn a_start_cancels_pending_requests_before_it_closes_delivered_ones() {
+        assert_eq!(
+            startup_removals(),
+            [
+                StartupRemoval::CancelPending,
+                StartupRemoval::CloseDelivered,
+            ]
+        );
     }
 
     #[test]
