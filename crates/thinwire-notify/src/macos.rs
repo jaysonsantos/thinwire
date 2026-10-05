@@ -15,7 +15,7 @@ use std::thread;
 use mac_usernotifications as un;
 use mac_usernotifications::block_on;
 
-use crate::tagged::{StartupRemoval, TagService, listed, startup_removals};
+use crate::tagged::{StartupRemoval, TagService, listed, startup_removals, update_sends};
 use crate::{BackendError, ClickFn, Notification};
 
 /// Most click-waiter threads at one time, as on Linux. Over the limit, a
@@ -106,6 +106,17 @@ impl TagService for Center {
         }
         if !quiet {
             request = request.default_sound();
+        }
+        // Check again here, immediately before send. Tagged::update already
+        // asked `has`, but the user can clear the notification in between.
+        // send with this id then creates a new one. An update must not
+        // (Codex r4139322212).
+        if quiet {
+            let pending = block_on(un::get_pending_notification_ids());
+            let delivered = block_on(un::get_delivered_notification_ids());
+            if !update_sends(tag, &delivered, &pending) {
+                return Ok(());
+            }
         }
         let handle = match block_on(request.send()) {
             Ok(handle) => handle,

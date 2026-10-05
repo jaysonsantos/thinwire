@@ -46,6 +46,14 @@ pub(crate) fn startup_removals() -> [StartupRemoval; 2] {
     ]
 }
 
+/// An update may send only while the OS still lists `tag`. Sending with
+/// that id creates a notification when the id is gone, and an update must
+/// never show a new one (Codex r4139322212).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn update_sends<S: AsRef<str>>(tag: &str, delivered: &[S], pending: &[S]) -> bool {
+    listed(tag, delivered, pending)
+}
+
 /// One OS notification service with tags.
 pub(crate) trait TagService: Send + 'static {
     /// Show `notification` under `tag`. It replaces a shown notification
@@ -202,6 +210,17 @@ mod tests {
                 StartupRemoval::CancelPending,
                 StartupRemoval::CloseDelivered,
             ]
+        );
+    }
+
+    #[test]
+    fn an_update_does_not_send_after_the_user_clears_it() {
+        let none: [&str; 0] = [];
+        assert!(update_sends("a", &["a"], &none), "still delivered");
+        assert!(update_sends("a", &none, &["a"]), "still pending");
+        assert!(
+            !update_sends("a", &none, &none),
+            "cleared: send would create a notification"
         );
     }
 
