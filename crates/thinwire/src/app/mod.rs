@@ -453,7 +453,7 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:2".into(),
         };
-        let (raise, opens) = notification_clicks(&[key.clone()]);
+        let (raise, opens) = notification_clicks(std::slice::from_ref(&key));
         assert!(raise);
         assert_eq!(opens, vec![Intent::OpenFromNotification(key)]);
     }
