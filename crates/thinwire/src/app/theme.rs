@@ -130,6 +130,55 @@ impl Palette {
     }
 }
 
+/// Color behind an inbox row. A normal row is transparent and shows the
+/// sidebar. Hover paints `surface`. Selected paints `selected_row`, including
+/// when the pointer is also over that row.
+#[must_use]
+pub(crate) const fn inbox_row_backdrop(
+    palette: &Palette,
+    selected: bool,
+    hovered: bool,
+) -> Color32 {
+    if selected {
+        palette.selected_row
+    } else if hovered {
+        palette.surface
+    } else {
+        palette.sidebar
+    }
+}
+
+/// Outline of a muted unread count (#206).
+///
+/// WCAG 1.4.11 compares colors, so a thicker stroke of `border_strong` stays
+/// about 2.53:1 on the dark selected row. The row title uses `text`, which
+/// clears 3:1 on every [`inbox_row_backdrop`].
+#[must_use]
+pub(crate) const fn muted_badge_ring(palette: &Palette) -> Color32 {
+    palette.text
+}
+
+/// Ink for a disabled "Muted in {protocol}" control (#206).
+///
+/// Title and reason are full palette colors on `bg` (the menu popup and the
+/// thread). egui's 0.5 disabled fade is not part of this ink: in light that
+/// blend falls under 4.5:1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProtocolMuteInk {
+    pub title: Color32,
+    pub reason: Color32,
+    pub on: Color32,
+}
+
+#[must_use]
+pub(crate) const fn protocol_mute_ink(palette: &Palette) -> ProtocolMuteInk {
+    ProtocolMuteInk {
+        title: palette.text,
+        reason: palette.text2,
+        on: palette.bg,
+    }
+}
+
 /// Center a card. Dark uses `surface`. Light uses `bg` and a `border`.
 pub(crate) fn show_centered_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     let palette = palette(ui);
@@ -492,6 +541,36 @@ mod tests {
         let black_white = contrast(Color32::BLACK, Color32::WHITE);
         assert!((black_white - 21.0).abs() < 0.01, "{black_white}");
         assert!((contrast(hex(0x77_77_77), Color32::WHITE) - 4.48).abs() < 0.01);
+    }
+
+    #[test]
+    fn muted_unread_ring_clears_non_text_contrast_on_every_row_fill() {
+        for (theme, palette) in [("dark", Palette::DARK), ("light", Palette::LIGHT)] {
+            let ring = muted_badge_ring(&palette);
+            assert_eq!(ring, palette.text, "{theme} ring follows the row title");
+            for (state, selected, hovered) in [
+                ("normal", false, false),
+                ("hover", false, true),
+                ("selected", true, false),
+                ("selected hover", true, true),
+            ] {
+                let fill = inbox_row_backdrop(&palette, selected, hovered);
+                let ratio = contrast(ring, fill);
+                assert!(ratio >= UI_AA, "{theme} {state}: {ratio:.2} < {UI_AA}");
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_mute_text_stays_readable_on_the_menu_fill() {
+        for (theme, palette) in [("dark", Palette::DARK), ("light", Palette::LIGHT)] {
+            let ink = protocol_mute_ink(&palette);
+            assert_eq!(ink.on, palette.bg, "{theme} menu fill");
+            for (part, color) in [("title", ink.title), ("reason", ink.reason)] {
+                let ratio = contrast(color, ink.on);
+                assert!(ratio >= TEXT_AA, "{theme} {part}: {ratio:.2} < {TEXT_AA}");
+            }
+        }
     }
 
     #[test]

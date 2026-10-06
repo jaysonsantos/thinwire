@@ -154,6 +154,51 @@ shots! {
     muted_by_protocol => MutedByProtocol,
 }
 
+/// Row menus for Mute, Unmute, and a disabled "Muted in Telegram" (#206).
+/// Milo is the open chat, so the muted unread ring sits on the selected row.
+mod mute_menu {
+    use super::*;
+
+    fn shoot_menu(theme: ThemeMode, size: [f32; 2]) {
+        let name = format!(
+            "mute_menu-{}-{}x{}",
+            theme_slug(theme),
+            size[0] as u32,
+            size[1] as u32
+        );
+        let (runtime, mut built) = scene(Scenario::MutedHere, theme);
+        built.hints.show_open_mute_menus();
+        let mut harness = Harness::builder()
+            .with_size(size)
+            .wgpu()
+            .build_ui_state(draw, built);
+        harness.run();
+        harness.snapshot(&name);
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_1100x720() {
+        shoot_menu(ThemeMode::Light, [1100.0, 720.0]);
+    }
+
+    #[test]
+    fn light_800x600() {
+        shoot_menu(ThemeMode::Light, [800.0, 600.0]);
+    }
+
+    #[test]
+    fn dark_1100x720() {
+        shoot_menu(ThemeMode::Dark, [1100.0, 720.0]);
+    }
+
+    #[test]
+    fn dark_800x600() {
+        shoot_menu(ThemeMode::Dark, [800.0, 600.0]);
+    }
+}
+
 #[test]
 fn inbox_row_text_stays_inside_the_click_rect() {
     let (runtime, built) = scene(Scenario::LongChat, ThemeMode::Light);
