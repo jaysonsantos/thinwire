@@ -199,6 +199,89 @@ mod mute_menu {
     }
 }
 
+/// Header text, the account status dot, and inbox titles share one x.
+/// The account unread badge sits inside the highlight by [`theme::ROW_INSET`].
+#[test]
+fn sidebar_content_lines_up_and_the_account_badge_clears_the_highlight() {
+    for theme in [ThemeMode::Light, ThemeMode::Dark] {
+        let (runtime, built) = scene(Scenario::LongChat, theme);
+        let mut harness = Harness::builder()
+            .with_size([1100.0, 720.0])
+            .wgpu()
+            .build_ui_state(draw, built);
+        harness.run();
+        let header = harness
+            .get_by_role_and_label(Role::Label, "ACCOUNTS")
+            .rect();
+        let inbox_header = harness.get_by_role_and_label(Role::Label, "INBOX").rect();
+        let dot = harness
+            .get_by_role_and_label(Role::Label, "account status")
+            .rect();
+        let title = harness
+            .query_all(By::new().role(Role::Label).label("Ada Park"))
+            .map(|node| node.rect())
+            .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
+            .expect("inbox title");
+        assert!(
+            (header.min.x - dot.min.x).abs() < 0.5,
+            "{theme:?} header {} dot {}",
+            header.min.x,
+            dot.min.x
+        );
+        assert!(
+            (dot.min.x - title.min.x).abs() < 0.5,
+            "{theme:?} dot {} title {}",
+            dot.min.x,
+            title.min.x
+        );
+        assert!(
+            (header.min.x - inbox_header.min.x).abs() < 0.5,
+            "{theme:?} ACCOUNTS {} INBOX {}",
+            header.min.x,
+            inbox_header.min.x
+        );
+
+        let account = harness
+            .query_all(By::new().role(Role::Button).label("Telegram"))
+            .map(|node| node.rect())
+            .find(|rect| rect.intersects(dot))
+            .expect("account row");
+        let badge = harness
+            .query_all(By::new().role(Role::Label).label("unread 2"))
+            .map(|node| node.rect())
+            .find(|rect| account.intersects(*rect))
+            .expect("account badge");
+        let gap_x = account.right() - badge.right();
+        let gap_top = badge.top() - account.top();
+        let gap_bottom = account.bottom() - badge.bottom();
+        assert!(
+            (gap_x - theme::space::M).abs() < 1.0,
+            "{theme:?} badge horizontal clearance {gap_x}"
+        );
+        assert!(
+            gap_top + 0.5 >= theme::space::S,
+            "{theme:?} badge top clearance {gap_top}"
+        );
+        assert!(
+            gap_bottom + 0.5 >= theme::space::S,
+            "{theme:?} badge bottom clearance {gap_bottom}"
+        );
+
+        let search = harness
+            .query_all(By::new().role(Role::TextInput))
+            .map(|node| node.rect())
+            .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
+            .expect("search field");
+        assert!(
+            search.height() + 0.5 >= theme::MIN_TARGET,
+            "{theme:?} search height {}",
+            search.height()
+        );
+        drop(harness);
+        drop(runtime);
+    }
+}
+
 #[test]
 fn inbox_row_text_stays_inside_the_click_rect() {
     let (runtime, built) = scene(Scenario::LongChat, ThemeMode::Light);

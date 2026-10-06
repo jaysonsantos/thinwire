@@ -156,49 +156,48 @@ pub(crate) fn edited(
 }
 
 fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
-    egui::Panel::top("top").show(ui, |ui| {
-        let palette = theme::palette(ui);
-        ui.add_space(space::XS);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("thinwire")
-                    .text_style(egui::TextStyle::Heading)
-                    .color(palette.text),
-            );
-            ui.add_space(space::S);
-            for filter in InboxFilter::chrome_filters() {
-                let selected = snapshot.filter == *filter;
-                if filter_pill(ui, filter.label(), selected).clicked() {
-                    out.push(Intent::SetFilter(*filter));
+    egui::Panel::top("top")
+        .frame(theme::chrome_panel(ui.style()))
+        .show(ui, |ui| {
+            let palette = theme::palette(ui);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("thinwire")
+                        .text_style(egui::TextStyle::Heading)
+                        .color(palette.text),
+                );
+                ui.add_space(space::S);
+                for filter in InboxFilter::chrome_filters() {
+                    let selected = snapshot.filter == *filter;
+                    if filter_pill(ui, filter.label(), selected).clicked() {
+                        out.push(Intent::SetFilter(*filter));
+                    }
                 }
-            }
-            ui.add_space(space::S);
-            if let Some(text) = search_field(ui, &snapshot.search) {
-                out.push(Intent::SetSearch(text.into()));
-            }
-            if snapshot.can_add_account() && ui.button("Add account").clicked() {
-                out.push(Intent::Telegram(TelegramIntent::AddAccount));
-            }
-            add_slack_workspace(ui, snapshot, out);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("⋯", |ui| {
-                    if ui.button("Refresh").clicked() {
-                        out.push(Intent::Refresh);
-                        ui.close();
-                    }
-                    if snapshot.can_add_account() && ui.button("Advanced").clicked() {
-                        out.push(Intent::Telegram(TelegramIntent::OpenApiOverride));
-                        ui.close();
-                    }
-                    ui.separator();
-                    theme_control(ui, snapshot.theme(), out);
-                    ui.separator();
-                    notification_control(ui, snapshot, out);
+                if let Some(text) = search_field(ui, &snapshot.search) {
+                    out.push(Intent::SetSearch(text.into()));
+                }
+                if snapshot.can_add_account() && ui.button("Add account").clicked() {
+                    out.push(Intent::Telegram(TelegramIntent::AddAccount));
+                }
+                add_slack_workspace(ui, snapshot, out);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("⋯", |ui| {
+                        if ui.button("Refresh").clicked() {
+                            out.push(Intent::Refresh);
+                            ui.close();
+                        }
+                        if snapshot.can_add_account() && ui.button("Advanced").clicked() {
+                            out.push(Intent::Telegram(TelegramIntent::OpenApiOverride));
+                            ui.close();
+                        }
+                        ui.separator();
+                        theme_control(ui, snapshot.theme(), out);
+                        ui.separator();
+                        notification_control(ui, snapshot, out);
+                    });
                 });
             });
         });
-        ui.add_space(space::XS);
-    });
 }
 
 fn filter_pill(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
@@ -221,21 +220,32 @@ fn filter_pill(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response
     )
 }
 
+/// Glass drawn in the search field, to the right of [`theme::search_field_margin`].
+const SEARCH_ICON: f32 = 12.0;
+
 fn search_field(ui: &mut egui::Ui, search: &str) -> Option<String> {
     let palette = theme::palette(ui);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-    let center = rect.center() - egui::vec2(1.0, 1.0);
+    let mut text = search.to_owned();
+    let output = egui::TextEdit::singleline(&mut text)
+        .desired_width(200.0)
+        .min_size(egui::vec2(0.0, theme::MIN_TARGET))
+        .margin(theme::search_field_margin())
+        .hint_text(RichText::new("title / participant").color(palette.text3))
+        .prefix(egui::Atom::custom(
+            ui.id().with("search-icon"),
+            egui::vec2(SEARCH_ICON, SEARCH_ICON),
+        ))
+        .show(ui);
+    let rect = output.response.rect;
+    let center = egui::pos2(rect.min.x + space::S + SEARCH_ICON * 0.5, rect.center().y)
+        - egui::vec2(1.0, 1.0);
     let stroke = egui::Stroke::new(1.5, palette.text3);
     ui.painter().circle_stroke(center, 4.5, stroke);
     ui.painter().line_segment(
         [center + egui::vec2(3.2, 3.2), center + egui::vec2(6.0, 6.0)],
         stroke,
     );
-    edited(ui, search, |text| {
-        egui::TextEdit::singleline(text)
-            .desired_width(160.0)
-            .hint_text("title / participant")
-    })
+    output.response.changed().then_some(text)
 }
 
 fn theme_control(ui: &mut egui::Ui, current: ThemeMode, out: &mut Vec<Intent>) {
@@ -276,58 +286,61 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         return;
     }
     let mut dismiss = false;
-    egui::Panel::top("status").show(ui, |ui| {
-        let palette = theme::palette(ui);
-        // One line: a running load of any protocol first, never a finished
-        // Ready line while a load runs (#80).
-        if show_status && let Some(text) = public_status(&line) {
-            let color = if load_failure_text(&line).is_some() {
-                palette.error
-            } else if snapshot.status_line_loads() || text == "Refreshing…" {
-                palette.warn
-            } else {
-                palette.text2
-            };
-            ui.label(RichText::new(text).color(color));
-        }
-        if let Some(notice) = notice {
-            ui.colored_label(palette.warn, notice);
-        }
-        // A protocol note (`AdapterEvent::Notice`) for the selected protocol.
-        // Information, not an error.
-        if let Some(note) = snapshot.notice(snapshot.selected_protocol) {
-            ui.label(RichText::new(note).color(palette.text2));
-        }
-        if show_error && let Some(error) = &snapshot.error {
-            let happened = error.happened.clone();
-            let why = error.why.clone();
-            let next = error.next.clone();
-            egui::Frame::new()
-                .fill(palette.surface)
-                .inner_margin(egui::Margin::symmetric(space::S as i8, space::S as i8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (bar, _) =
-                            ui.allocate_exact_size(egui::vec2(3.0, 56.0), egui::Sense::hover());
-                        ui.painter().rect_filled(bar, 0.0, palette.error);
-                        ui.add_space(space::S);
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(format!("What happened: {happened}"))
-                                    .color(palette.error),
-                            );
-                            ui.label(RichText::new(format!("Why: {why}")).color(palette.text2));
-                            ui.label(
-                                RichText::new(format!("What to do: {next}")).color(palette.text2),
-                            );
-                            if ui.button("Dismiss").clicked() {
-                                dismiss = true;
-                            }
+    egui::Panel::top("status")
+        .frame(theme::chrome_panel(ui.style()))
+        .show(ui, |ui| {
+            let palette = theme::palette(ui);
+            // One line: a running load of any protocol first, never a finished
+            // Ready line while a load runs (#80).
+            if show_status && let Some(text) = public_status(&line) {
+                let color = if load_failure_text(&line).is_some() {
+                    palette.error
+                } else if snapshot.status_line_loads() || text == "Refreshing…" {
+                    palette.warn
+                } else {
+                    palette.text2
+                };
+                ui.label(RichText::new(text).color(color));
+            }
+            if let Some(notice) = notice {
+                ui.colored_label(palette.warn, notice);
+            }
+            // A protocol note (`AdapterEvent::Notice`) for the selected protocol.
+            // Information, not an error.
+            if let Some(note) = snapshot.notice(snapshot.selected_protocol) {
+                ui.label(RichText::new(note).color(palette.text2));
+            }
+            if show_error && let Some(error) = &snapshot.error {
+                let happened = error.happened.clone();
+                let why = error.why.clone();
+                let next = error.next.clone();
+                egui::Frame::new()
+                    .fill(palette.surface)
+                    .inner_margin(egui::Margin::symmetric(space::S as i8, space::S as i8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (bar, _) =
+                                ui.allocate_exact_size(egui::vec2(3.0, 56.0), egui::Sense::hover());
+                            ui.painter().rect_filled(bar, 0.0, palette.error);
+                            ui.add_space(space::S);
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(format!("What happened: {happened}"))
+                                        .color(palette.error),
+                                );
+                                ui.label(RichText::new(format!("Why: {why}")).color(palette.text2));
+                                ui.label(
+                                    RichText::new(format!("What to do: {next}"))
+                                        .color(palette.text2),
+                                );
+                                if ui.button("Dismiss").clicked() {
+                                    dismiss = true;
+                                }
+                            });
                         });
                     });
-                });
-        }
-    });
+            }
+        });
     if dismiss {
         out.push(Intent::DismissError);
     }
@@ -394,9 +407,9 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
         .resizable(true)
         .default_size(280.0)
         .size_range(220.0..=400.0)
+        .frame(theme::chrome_panel(ui.style()))
         .show(ui, |ui| {
             section_header(ui, "Accounts");
-            ui.separator();
 
             let unread_by_protocol: Vec<u32> = snapshot
                 .accounts
@@ -433,9 +446,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                 super::signal_gate::notice_entry(ui, out);
             }
 
-            ui.add_space(space::S);
             section_header(ui, "Inbox");
-            ui.separator();
             let inbox_list_id = ui.make_persistent_id("inbox");
             egui::ScrollArea::vertical()
                 .id_salt("inbox")
@@ -454,7 +465,11 @@ fn account_chip(
     let caps = account.caps;
     let palette = theme::palette(ui);
     let width = ui.available_width();
-    let (rect, hover) = ui.allocate_exact_size(egui::vec2(width, 44.0), egui::Sense::hover());
+    // Two lines used 36 px. [`theme::ROW_INSET`] adds 8 px above and below.
+    let (rect, hover) = ui.allocate_exact_size(
+        egui::vec2(width, 36.0 + space::S * 2.0),
+        egui::Sense::hover(),
+    );
     let fill = if selected {
         palette.selected_row
     } else if hover.hovered() {
@@ -466,14 +481,21 @@ fn account_chip(
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::same(radius::CONTROL), fill);
     }
-    let inner = rect.shrink2(egui::vec2(space::S, space::XS));
+    let inner = theme::row_content_rect(rect, 0.0);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(inner)
             .layout(egui::Layout::left_to_right(egui::Align::Center))
             .id_salt(("account-chip", caps.id)),
     );
-    let (dot, _) = child.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    let (dot, dot_response) =
+        child.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    // The dot is painted, so tests need a label to read its left edge.
+    #[cfg(test)]
+    dot_response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "account status"));
+    #[cfg(not(test))]
+    let _ = dot_response;
     child.painter().circle_filled(
         dot.center(),
         4.0,
@@ -499,14 +521,23 @@ fn account_chip(
         ui.label(RichText::new(label).small().color(color));
     });
     if let Some(text) = badge_text(unread) {
-        child.add_space(space::S);
-        unread_badge(&mut child, &text, false);
+        child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            unread_badge(ui, &text, false);
+        });
     }
     let response = ui.interact(
         rect,
         ui.id().with(("account-chip", caps.id)),
         egui::Sense::click(),
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            true,
+            selected,
+            caps.id.display_name(),
+        )
+    });
     if let Some(note) = account_footnote(caps.id, account.linked()) {
         ui.label(RichText::new(note).small().weak());
     }
@@ -514,12 +545,30 @@ fn account_chip(
 }
 
 /// "Accounts" and "Inbox": caption, uppercase, `text3`.
+///
+/// `space::S` above, the label centered in a 24 px row and indented to
+/// [`theme::ROW_INSET`], then the separator. Callers share this for both
+/// headers.
 fn section_header(ui: &mut egui::Ui, title: &str) {
-    ui.label(
+    ui.add_space(space::S);
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, space::XL), egui::Sense::hover());
+    let inner = egui::Rect::from_min_max(
+        egui::pos2(theme::sidebar_content_x(rect.min.x), rect.min.y),
+        rect.max,
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
+            .id_salt(("section", title)),
+    );
+    child.label(
         RichText::new(title.to_uppercase())
             .small()
             .color(theme::palette(ui).text3),
     );
+    ui.separator();
 }
 
 /// "No chats." is a finished load with zero rows. Before the selected
@@ -919,10 +968,7 @@ fn inbox_row(
             .rect_filled(rect, egui::CornerRadius::same(radius::CONTROL), fill);
     }
     let gutter = ui.spacing().scroll.bar_width;
-    let inner = egui::Rect::from_min_max(
-        rect.min + egui::vec2(space::M, space::S),
-        rect.max - egui::vec2(space::M + gutter, space::S),
-    );
+    let inner = theme::row_content_rect(rect, gutter);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(inner)
