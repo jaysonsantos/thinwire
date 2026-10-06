@@ -29,10 +29,11 @@ fn runtime() -> Runtime {
 }
 
 /// A spinner keeps requesting frames, so [`Harness::run`] never finishes.
+/// A send in flight shows the busy spinner in the top bar.
 fn keeps_repainting(scenario: Scenario) -> bool {
     matches!(
         scenario,
-        Scenario::LongChatLoadingOlder | Scenario::LoginError
+        Scenario::LongChatLoadingOlder | Scenario::LoginError | Scenario::PendingSend
     )
 }
 
@@ -196,6 +197,48 @@ mod mute_menu {
     #[test]
     fn dark_800x600() {
         shoot_menu(ThemeMode::Dark, [800.0, 600.0]);
+    }
+}
+
+/// A long chat scrolled up: the jump button sits over the bottom right of
+/// the messages. 480 high, so the chat is taller than the view.
+mod jump_to_latest {
+    use super::*;
+
+    fn shoot_scrolled(theme: ThemeMode) {
+        let size = [800.0, 480.0];
+        let name = format!("jump_to_latest-{}-800x480", theme_slug(theme));
+        let (runtime, built) = scene(Scenario::LongChat, theme);
+        let mut harness = Harness::builder()
+            .with_size(size)
+            .wgpu()
+            .build_ui_state(draw, built);
+        harness.run();
+        harness.hover_at(egui::pos2(size[0] * 0.65, size[1] * 0.5));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 5_000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        // egui spreads a wheel step over several frames.
+        harness.run_steps(12);
+        harness.remove_cursor();
+        harness.run();
+        harness.get_by_role_and_label(Role::Button, "Jump to latest message");
+        harness.snapshot(&name);
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_800x480() {
+        shoot_scrolled(ThemeMode::Light);
+    }
+
+    #[test]
+    fn dark_800x480() {
+        shoot_scrolled(ThemeMode::Dark);
     }
 }
 

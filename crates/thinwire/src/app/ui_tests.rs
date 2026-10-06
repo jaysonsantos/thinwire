@@ -441,7 +441,7 @@ fn hints_count_as_used_only_where_their_widget_draws() {
 
 #[test]
 fn a_ready_loading_line_stays_busy_until_the_history_loads() {
-    use super::ui::status_strip_visible;
+    use super::ui::{busy_line, status_strip_visible};
     let store = SecretStore::memory();
     let mut snapshot = ready_with_chats(&store);
     snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -462,9 +462,14 @@ fn a_ready_loading_line_stays_busy_until_the_history_loads() {
     snapshot.apply(status(AdapterStatus::Ready, "Loading recent messages."));
     assert!(snapshot.is_loading());
     assert!(!snapshot.status_is_idle(), "busy while the history loads");
+    assert_eq!(
+        busy_line(&snapshot).as_deref(),
+        Some(LOADING_MESSAGES_STATUS),
+        "the loading line shows beside the menu"
+    );
     assert!(
-        status_strip_visible(&snapshot, None),
-        "the loading line shows"
+        !status_strip_visible(&snapshot, None),
+        "a load does not push the window down"
     );
 
     snapshot.apply(AdapterEvent::HistoryLoaded {
@@ -474,6 +479,11 @@ fn a_ready_loading_line_stays_busy_until_the_history_loads() {
     assert!(!snapshot.is_loading());
     assert!(snapshot.status_is_idle());
     assert!(!status_strip_visible(&snapshot, None));
+    assert_eq!(
+        busy_line(&snapshot),
+        None,
+        "the spinner goes when the load ends"
+    );
 
     snapshot.apply(status(AdapterStatus::Ready, "Message sent."));
     assert!(snapshot.status_is_idle(), "a finished send is idle");
@@ -543,4 +553,56 @@ fn focus_is_known_before_live_messages_and_unknown_counts_as_unfocused() {
     let exit = &exit[..exit.find("\n    }\n").expect("end")];
     assert!(exit.contains("self.notifier.send(self.core.take_notify())"));
     assert!(exit.contains("self.notifier.flush(NOTIFY_FLUSH_LIMIT)"));
+}
+
+/// A signed-in snapshot with no load running.
+fn settled(store: &SecretStore) -> Snapshot {
+    let mut snapshot = ready_with_chats(store);
+    snapshot.apply(AdapterEvent::ChatListLoaded {
+        protocol: ProtocolId::Telegram,
+    });
+    snapshot.apply(AdapterEvent::HistoryLoaded {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+    });
+    assert!(!snapshot.is_loading());
+    snapshot
+}
+
+/// A send or a load shows beside the menu and takes no row, so the window
+/// does not move down and up for it. Failures and errors stay on the strip.
+#[test]
+fn busy_lines_leave_the_strip_and_failures_stay_on_it() {
+    use super::ui::{busy_line, status_strip_visible};
+    let store = SecretStore::memory();
+    let mut snapshot = settled(&store);
+    snapshot.compose = "hello".into();
+    snapshot.send_compose();
+    assert_eq!(busy_line(&snapshot).as_deref(), Some(SENDING_STATUS));
+    assert!(
+        !status_strip_visible(&snapshot, None),
+        "a send does not push the window down"
+    );
+
+    let mut refresh = settled(&store);
+    refresh.status_text = "Refreshing…".into();
+    assert_eq!(busy_line(&refresh).as_deref(), Some("Refreshing…"));
+    assert!(!status_strip_visible(&refresh, None));
+
+    let mut failed = settled(&store);
+    failed.status_text = "Could not load Telegram chats (TDLib 500).".into();
+    assert_eq!(busy_line(&failed), None, "a failure is not busy");
+    assert!(status_strip_visible(&failed, None));
+
+    let mut error = settled(&store);
+    error.error = Some(UserError {
+        happened: "Chat not loaded.".into(),
+        why: "Why.".into(),
+        next: "Next.".into(),
+    });
+    assert!(
+        status_strip_visible(&error, None),
+        "an error keeps the strip"
+    );
+    assert_eq!(busy_line(&error), None);
 }

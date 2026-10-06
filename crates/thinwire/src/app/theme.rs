@@ -133,6 +133,7 @@ impl Palette {
 /// Color behind an inbox row. A normal row is transparent and shows the
 /// sidebar. Hover paints `surface`. Selected paints `selected_row`, including
 /// when the pointer is also over that row.
+#[cfg(test)]
 #[must_use]
 pub(crate) const fn inbox_row_backdrop(
     palette: &Palette,
@@ -146,6 +147,15 @@ pub(crate) const fn inbox_row_backdrop(
     } else {
         palette.sidebar
     }
+}
+
+/// Inbox row and account chip highlight during a transition. `selected` and
+/// `hovered` go from 0 to 1. At 0 and 1 it is the row backdrop of that state:
+/// the sidebar, `surface` on hover, and `selected_row` when selected.
+#[must_use]
+pub(crate) fn inbox_row_fill(palette: &Palette, selected: f32, hovered: f32) -> Color32 {
+    let hover = super::motion::mix(palette.sidebar, palette.surface, hovered);
+    super::motion::mix(hover, palette.selected_row, selected)
 }
 
 /// Outline of a muted unread count (#206).
@@ -423,6 +433,7 @@ fn style(palette: &Palette, theme: Theme) -> egui::Style {
     let mut style = egui::Style {
         visuals: visuals(palette, theme),
         text_styles: text_styles(),
+        animation_time: super::motion::PANEL,
         ..egui::Style::default()
     };
     let spacing = &mut style.spacing;
@@ -592,6 +603,25 @@ mod tests {
                 let fill = inbox_row_backdrop(&palette, selected, hovered);
                 let ratio = contrast(ring, fill);
                 assert!(ratio >= UI_AA, "{theme} {state}: {ratio:.2} < {UI_AA}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_settled_row_fill_is_the_row_backdrop() {
+        for palette in [Palette::DARK, Palette::LIGHT] {
+            for selected in [false, true] {
+                for hovered in [false, true] {
+                    assert_eq!(
+                        inbox_row_fill(
+                            &palette,
+                            f32::from(u8::from(selected)),
+                            f32::from(u8::from(hovered))
+                        ),
+                        inbox_row_backdrop(&palette, selected, hovered),
+                        "selected {selected} hovered {hovered}"
+                    );
+                }
             }
         }
     }

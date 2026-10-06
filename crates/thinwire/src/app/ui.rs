@@ -8,6 +8,7 @@ use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{AdapterStatus, Delivery, ProtocolId};
 
 use super::auth;
+use super::motion;
 use super::theme::{self, radius, size, space};
 use super::theme_mode::ThemeModeEgui;
 use super::thread_layout::{RowLayout, list_time, thread_rows};
@@ -181,7 +182,7 @@ fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                 }
                 add_slack_workspace(ui, snapshot, out);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button("⋯", |ui| {
+                    more_menu(ui, |ui| {
                         if ui.button("Refresh").clicked() {
                             out.push(Intent::Refresh);
                             ui.close();
@@ -195,23 +196,77 @@ fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                         ui.separator();
                         notification_control(ui, snapshot, out);
                     });
+                    busy_indicator(ui, busy_line(snapshot).as_deref());
                 });
             });
         });
 }
 
+/// The settings menu button. Its three dots are painted: U+22EF is in
+/// neither Inter nor egui's fallback fonts, so a text glyph draws as a box.
+fn more_menu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let icon = egui::Atom::custom(ui.id().with("more-icon"), egui::vec2(16.0, 16.0));
+    let response = ui.menu_button(icon, add_contents).response;
+    let ink = ui.style().interact(&response).fg_stroke.color;
+    let center = response.rect.center();
+    for dx in [-5.0, 0.0, 5.0] {
+        ui.painter()
+            .circle_filled(center + egui::vec2(dx, 0.0), 1.75, ink);
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Menu"));
+}
+
+/// Side of the busy spinner in the top bar.
+const BUSY_SPINNER: f32 = 14.0;
+
+/// A running load or send, left of the menu. It takes no row of its own, so
+/// the inbox and the thread do not move down and up for each send. The
+/// spinner marks it as busy; a finished line or a failure stays on the strip.
+fn busy_indicator(ui: &mut egui::Ui, line: Option<&str>) {
+    let id = ui.id().with("busy-line");
+    let text = match line {
+        Some(text) => {
+            ui.data_mut(|data| data.insert_temp(id, text.to_owned()));
+            text.to_owned()
+        }
+        // The last line stays on screen while it fades out.
+        None => ui
+            .data(|data| data.get_temp::<String>(id))
+            .unwrap_or_default(),
+    };
+    let shown = motion::toggle(ui.ctx(), id, line.is_some(), motion::FADE);
+    if shown <= 0.0 || text.is_empty() {
+        return;
+    }
+    ui.scope(|ui| {
+        ui.multiply_opacity(shown);
+        let palette = theme::palette(ui);
+        let room = (ui.available_width() - BUSY_SPINNER - ui.spacing().item_spacing.x).max(0.0);
+        ui.scope(|ui| {
+            ui.set_max_width(room);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&text)
+                        .text_style(theme::secondary())
+                        .color(palette.text2),
+                )
+                .truncate(),
+            );
+        });
+        ui.add(egui::Spinner::new().size(BUSY_SPINNER).color(palette.text3));
+    });
+}
+
 fn filter_pill(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     let palette = theme::palette(ui);
-    let fill = if selected {
-        palette.selected_row
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    let color = if selected {
-        palette.text
-    } else {
-        palette.text2
-    };
+    let on = motion::toggle(
+        ui.ctx(),
+        ui.id().with(("filter-pill", label)),
+        selected,
+        motion::STATE,
+    );
+    let fill = motion::mix(egui::Color32::TRANSPARENT, palette.selected_row, on);
+    let color = motion::mix(palette.text2, palette.text, on);
     ui.add(
         egui::Button::new(RichText::new(label).color(color))
             .fill(fill)
@@ -276,74 +331,123 @@ fn notification_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<In
 }
 
 fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
-    let notice = keychain_notice(snapshot.persistence());
-    let show_error = snapshot.auth == AuthScreen::Idle && snapshot.error.is_some();
-    let line = snapshot.status_line();
-    let show_status = !snapshot.status_is_idle()
-        && public_status(&line).is_some_and(|text| !is_idle_status(text));
-    // Idle chrome with no notice and no error draws no panel, so the strip is 0 px.
-    if !status_strip_visible(snapshot, notice) {
-        return;
-    }
+    let content = StripContent::of(snapshot, keychain_notice(snapshot.persistence()));
+    let visible = !content.is_empty();
+    // While the strip slides away, it draws the last content it had.
+    let last = egui::Id::new("status-strip-content");
+    let shown = if visible {
+        ui.data_mut(|data| data.insert_temp(last, content.clone()));
+        content
+    } else {
+        ui.data(|data| data.get_temp::<StripContent>(last))
+            .unwrap_or_default()
+    };
+    let mut open = visible;
     let mut dismiss = false;
+    // Idle chrome with no notice and no error draws no panel, so the strip is 0 px.
     egui::Panel::top("status")
+        .resizable(false)
         .frame(theme::chrome_panel(ui.style()))
-        .show(ui, |ui| {
-            let palette = theme::palette(ui);
-            // One line: a running load of any protocol first, never a finished
-            // Ready line while a load runs (#80).
-            if show_status && let Some(text) = public_status(&line) {
-                let color = if load_failure_text(&line).is_some() {
-                    palette.error
-                } else if snapshot.status_line_loads() || text == "Refreshing…" {
-                    palette.warn
-                } else {
-                    palette.text2
-                };
-                ui.label(RichText::new(text).color(color));
-            }
-            if let Some(notice) = notice {
-                ui.colored_label(palette.warn, notice);
-            }
-            // A protocol note (`AdapterEvent::Notice`) for the selected protocol.
-            // Information, not an error.
-            if let Some(note) = snapshot.notice(snapshot.selected_protocol) {
-                ui.label(RichText::new(note).color(palette.text2));
-            }
-            if show_error && let Some(error) = &snapshot.error {
-                let happened = error.happened.clone();
-                let why = error.why.clone();
-                let next = error.next.clone();
-                egui::Frame::new()
-                    .fill(palette.surface)
-                    .inner_margin(egui::Margin::symmetric(space::S as i8, space::S as i8))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (bar, _) =
-                                ui.allocate_exact_size(egui::vec2(3.0, 56.0), egui::Sense::hover());
-                            ui.painter().rect_filled(bar, 0.0, palette.error);
-                            ui.add_space(space::S);
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new(format!("What happened: {happened}"))
-                                        .color(palette.error),
-                                );
-                                ui.label(RichText::new(format!("Why: {why}")).color(palette.text2));
-                                ui.label(
-                                    RichText::new(format!("What to do: {next}"))
-                                        .color(palette.text2),
-                                );
-                                if ui.button("Dismiss").clicked() {
-                                    dismiss = true;
-                                }
-                            });
-                        });
-                    });
-            }
-        });
-    if dismiss {
+        .show_collapsible(ui, &mut open, |ui| shown.draw(ui, &mut dismiss));
+    if dismiss && visible {
         out.push(Intent::DismissError);
     }
+}
+
+/// What the status strip draws. Owned, so the strip can draw it again while
+/// it slides away.
+#[derive(Debug, Clone, Default)]
+struct StripContent {
+    /// A status line that is not a running load, and whether it is a failure.
+    line: Option<(String, bool)>,
+    notice: Option<&'static str>,
+    /// A protocol note (`AdapterEvent::Notice`) for the selected protocol.
+    /// Information, not an error.
+    note: Option<String>,
+    error: Option<thinwire_core::state::UserError>,
+}
+
+impl StripContent {
+    fn of(snapshot: &Snapshot, notice: Option<&'static str>) -> Self {
+        let line = snapshot.status_line();
+        Self {
+            line: strip_status(snapshot, &line)
+                .map(|text| (text.to_owned(), load_failure_text(&line).is_some())),
+            notice,
+            note: snapshot
+                .notice(snapshot.selected_protocol)
+                .map(str::to_owned),
+            error: if snapshot.auth == AuthScreen::Idle {
+                snapshot.error.clone()
+            } else {
+                None
+            },
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.line.is_none() && self.notice.is_none() && self.note.is_none() && self.error.is_none()
+    }
+
+    fn draw(&self, ui: &mut egui::Ui, dismiss: &mut bool) {
+        let palette = theme::palette(ui);
+        if let Some((text, failed)) = &self.line {
+            let color = if *failed {
+                palette.error
+            } else {
+                palette.text2
+            };
+            ui.label(RichText::new(text).color(color));
+        }
+        if let Some(notice) = self.notice {
+            ui.colored_label(palette.warn, notice);
+        }
+        if let Some(note) = &self.note {
+            ui.label(RichText::new(note).color(palette.text2));
+        }
+        if let Some(error) = &self.error {
+            error_block(ui, error, dismiss);
+        }
+    }
+}
+
+/// Width of the error accent bar.
+const ERROR_BAR: f32 = 3.0;
+
+fn error_block(ui: &mut egui::Ui, error: &thinwire_core::state::UserError, dismiss: &mut bool) {
+    let palette = theme::palette(ui);
+    egui::Frame::new()
+        .fill(palette.surface)
+        .inner_margin(egui::Margin::symmetric(space::S as i8, space::S as i8))
+        .show(ui, |ui| {
+            let row = ui.horizontal(|ui| {
+                let (bar, _) =
+                    ui.allocate_exact_size(egui::vec2(ERROR_BAR, 0.0), egui::Sense::hover());
+                ui.add_space(space::S);
+                let text = ui
+                    .vertical(|ui| {
+                        ui.label(
+                            RichText::new(format!("What happened: {}", error.happened))
+                                .color(palette.error),
+                        );
+                        ui.label(RichText::new(format!("Why: {}", error.why)).color(palette.text2));
+                        ui.label(
+                            RichText::new(format!("What to do: {}", error.next))
+                                .color(palette.text2),
+                        );
+                        if ui.button("Dismiss").clicked() {
+                            *dismiss = true;
+                        }
+                    })
+                    .response
+                    .rect;
+                (bar.left(), text)
+            });
+            // The bar runs the full height of the text, however many lines wrap.
+            let (left, text) = row.inner;
+            let bar = egui::Rect::from_x_y_ranges(left..=left + ERROR_BAR, text.y_range());
+            ui.painter().rect_filled(bar, 0.0, palette.error);
+        });
 }
 
 /// A line the strip may show.
@@ -392,14 +496,39 @@ fn is_idle_status(text: &str) -> bool {
     }
 }
 
-/// True when the status strip draws a panel.
-pub(super) fn status_strip_visible(snapshot: &Snapshot, notice: Option<&str>) -> bool {
-    let show_error = snapshot.auth == AuthScreen::Idle && snapshot.error.is_some();
+/// The status line the window shows, if any: not idle, not a quiet line,
+/// and free of library names. A running load of any protocol comes first,
+/// never a finished Ready line while a load runs (#80).
+fn shown_status<'a>(snapshot: &Snapshot, line: &'a str) -> Option<&'a str> {
+    if snapshot.status_is_idle() {
+        return None;
+    }
+    public_status(line).filter(|text| !is_idle_status(text))
+}
+
+/// A running load, a send, or a refresh. The top bar shows it beside the
+/// menu. A failed load is not busy: it stays on the strip.
+fn is_busy_status(snapshot: &Snapshot, line: &str, text: &str) -> bool {
+    load_failure_text(line).is_none() && (snapshot.status_line_loads() || text == "Refreshing…")
+}
+
+/// The status line on the strip: shown, and not busy.
+fn strip_status<'a>(snapshot: &Snapshot, line: &'a str) -> Option<&'a str> {
+    shown_status(snapshot, line).filter(|text| !is_busy_status(snapshot, line, text))
+}
+
+/// The busy line beside the menu, if a load, a send, or a refresh runs.
+pub(super) fn busy_line(snapshot: &Snapshot) -> Option<String> {
     let line = snapshot.status_line();
-    let show_status = !snapshot.status_is_idle()
-        && public_status(&line).is_some_and(|text| !is_idle_status(text));
-    let note = snapshot.notice(snapshot.selected_protocol).is_some();
-    notice.is_some() || show_error || show_status || note
+    shown_status(snapshot, &line)
+        .filter(|text| is_busy_status(snapshot, &line, text))
+        .map(str::to_owned)
+}
+
+/// True when the status strip draws a panel.
+#[cfg(test)]
+pub(super) fn status_strip_visible(snapshot: &Snapshot, notice: Option<&'static str>) -> bool {
+    !StripContent::of(snapshot, notice).is_empty()
 }
 
 fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
@@ -470,17 +599,8 @@ fn account_chip(
         egui::vec2(width, 36.0 + space::S * 2.0),
         egui::Sense::hover(),
     );
-    let fill = if selected {
-        palette.selected_row
-    } else if hover.hovered() {
-        palette.surface
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    if fill != egui::Color32::TRANSPARENT {
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(radius::CONTROL), fill);
-    }
+    let chip_id = ui.id().with(("account-chip", caps.id));
+    row_backdrop(ui, chip_id, rect, selected, hover.hovered());
     let inner = theme::row_content_rect(rect, 0.0);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -525,11 +645,7 @@ fn account_chip(
             unread_badge(ui, &text, false);
         });
     }
-    let response = ui.interact(
-        rect,
-        ui.id().with(("account-chip", caps.id)),
-        egui::Sense::click(),
-    );
+    let response = ui.interact(rect, chip_id, egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::Button,
@@ -961,12 +1077,8 @@ fn inbox_row(
         egui::vec2(width, inbox_row_height(ui)),
         egui::Sense::hover(),
     );
-    let hovered = hover.hovered();
-    if selected || hovered {
-        let fill = theme::inbox_row_backdrop(palette, selected, hovered);
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(radius::CONTROL), fill);
-    }
+    let row_id = ui.id().with(("inbox-row", id));
+    row_backdrop(ui, row_id, rect, selected, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
     let mut child = ui.new_child(
@@ -1023,7 +1135,19 @@ fn inbox_row(
             }
         },
     );
-    ui.interact(rect, ui.id().with(("inbox-row", id)), egui::Sense::click())
+    ui.interact(rect, row_id, egui::Sense::click())
+}
+
+/// Highlight behind an inbox row or an account chip. Hover and selection
+/// fade, so a pointer sweep over the list or a chat switch does not flash.
+fn row_backdrop(ui: &egui::Ui, id: egui::Id, rect: egui::Rect, selected: bool, hovered: bool) {
+    let hovered = motion::toggle(ui.ctx(), id.with("hover"), hovered, motion::HOVER);
+    let selected = motion::toggle(ui.ctx(), id.with("selected"), selected, motion::STATE);
+    if hovered > 0.0 || selected > 0.0 {
+        let fill = theme::inbox_row_fill(theme::palette(ui), selected, hovered);
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(radius::CONTROL), fill);
+    }
 }
 
 /// Unread pill. `text` comes from [`badge_text`]. A muted chat gets an
@@ -1143,7 +1267,19 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: 
         } else if enter {
             out.push(Intent::Key(AuthKey::Enter));
         }
-        match snapshot.center_view() {
+        // Another view or another login step fades in. A chat switch keeps
+        // the view: the thread fades its own messages.
+        let view = snapshot.center_view();
+        ui.multiply_opacity(motion::fade_in_on_change(
+            ui.ctx(),
+            ui.id().with("center-fade"),
+            egui::Id::new((
+                std::mem::discriminant(&view),
+                std::mem::discriminant(&snapshot.auth),
+            )),
+            motion::FADE,
+        ));
+        match view {
             CenterView::Auth => auth::draw(ui, snapshot, out),
             CenterView::Resuming { connecting } => resuming(ui, snapshot, connecting),
             CenterView::FirstRun => first_run(ui, snapshot, out),
@@ -1301,6 +1437,21 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     let salt = snapshot.selected_conversation.clone().unwrap_or_default();
     let memo_id = ui.make_persistent_id(("thread-older", &salt));
     let memo: ThreadMemo = ui.data(|data| data.get_temp(memo_id)).unwrap_or_default();
+    let scroll_id = ui.make_persistent_id(("thread-scroll", &salt));
+    let scroll: ThreadScroll = ui.data(|data| data.get_temp(scroll_id)).unwrap_or_default();
+    // Another chat, or the first rows of this one, fade in. The pass that
+    // draws them first still paints at the old offset: `stick_to_bottom`
+    // reaches the newest message only at the end of that pass.
+    let fade = motion::fade_in_on_change(
+        ui.ctx(),
+        ui.id().with("thread-fade"),
+        egui::Id::new((
+            snapshot.selected_protocol,
+            &snapshot.selected_conversation,
+            state == ThreadState::Rows,
+        )),
+        motion::FADE,
+    );
     let mut area = egui::ScrollArea::vertical()
         .id_salt(("thread", salt))
         .auto_shrink([false, true])
@@ -1310,6 +1461,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         area = area.vertical_scroll_offset(offset);
     }
     let output = area.show(ui, |ui| {
+        ui.multiply_opacity(fade);
         match older {
             OlderState::Loading => {
                 ui.horizontal(|ui| {
@@ -1348,6 +1500,32 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
             bubble(ui, message, &mut retry, gap_before);
             gap_before = Some(message.layout.run_end);
         }
+        if scroll.jump {
+            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+        }
+    });
+    // `stick_to_bottom` moves the offset after this pass painted. Draw the
+    // next frame now, not at the idle tick, so a new message shows at once.
+    if (output.state.offset.y - scroll.offset).abs() > 0.01 {
+        ui.ctx().request_repaint();
+    }
+    let below = output.content_size.y - output.inner_rect.height() - output.state.offset.y;
+    let jump = jump_to_latest(
+        ui,
+        output.inner_rect,
+        state == ThreadState::Rows && below > JUMP_AFTER,
+    );
+    if jump {
+        ui.ctx().request_repaint();
+    }
+    ui.data_mut(|data| {
+        data.insert_temp(
+            scroll_id,
+            ThreadScroll {
+                offset: output.state.offset.y,
+                jump,
+            },
+        );
     });
     let first_id = messages.first().map(|message| message.id.clone());
     let step = older_step(
@@ -1399,6 +1577,73 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     }
 
     compose(ui, snapshot, hints, compose_height, out);
+}
+
+/// What the thread remembers between frames for its scroll motion.
+#[derive(Debug, Clone, Copy, Default)]
+struct ThreadScroll {
+    /// Scroll offset at the end of the last pass. The next pass paints at it.
+    offset: f32,
+    /// The jump button was clicked: scroll to the newest message this pass.
+    jump: bool,
+}
+
+/// Points above the newest message from which the thread offers a jump back.
+const JUMP_AFTER: f32 = 200.0;
+/// Diameter of the jump button.
+const JUMP_SIZE: f32 = 36.0;
+
+/// Round button over the bottom right of the messages. It fades in while the
+/// newest message is out of view. True on a click.
+fn jump_to_latest(ui: &mut egui::Ui, view: egui::Rect, offered: bool) -> bool {
+    let id = ui.id().with("jump-to-latest");
+    let shown = motion::toggle(ui.ctx(), id, offered, motion::FADE);
+    if shown <= 0.0 {
+        return false;
+    }
+    let palette = theme::palette(ui);
+    let radius = JUMP_SIZE * 0.5;
+    // It rises into place as it fades in.
+    let rise = (1.0 - shown) * space::S;
+    let center = egui::pos2(
+        view.right() - ui.spacing().scroll.bar_width - space::M - radius,
+        view.bottom() - space::M - radius + rise,
+    );
+    let rect = egui::Rect::from_center_size(center, egui::vec2(JUMP_SIZE, JUMP_SIZE));
+    // Fading out, it no longer takes clicks from the messages under it.
+    let sense = if offered {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let response = ui.interact(rect, id, sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, offered, "Jump to latest message")
+    });
+    let hover = motion::toggle(
+        ui.ctx(),
+        id.with("hover"),
+        offered && response.hovered(),
+        motion::HOVER,
+    );
+    let mut painter = ui.painter().clone();
+    painter.multiply_opacity(shown);
+    painter.circle(
+        center,
+        radius,
+        motion::mix(palette.surface, palette.hover, hover),
+        egui::Stroke::new(1.0, palette.border_strong),
+    );
+    let tip = center + egui::vec2(0.0, 3.0);
+    painter.add(egui::Shape::line(
+        vec![
+            tip + egui::vec2(-5.0, -5.0),
+            tip,
+            tip + egui::vec2(5.0, -5.0),
+        ],
+        egui::Stroke::new(2.0, palette.text),
+    ));
+    offered && response.clicked()
 }
 
 /// Distance from the top of the thread, in points, that asks for older
@@ -1859,15 +2104,12 @@ fn compose(
         egui::Stroke::new(1.0, palette.border),
     );
     let focused = ui.memory(|memory| memory.has_focus(compose_id));
+    let ring = motion::toggle(ui.ctx(), compose_id.with("ring"), focused, motion::STATE);
     let field = egui::Frame::new()
         .fill(palette.input)
         .stroke(egui::Stroke::new(
-            if focused { FIELD_STROKE_MAX } else { 1.0 },
-            if focused {
-                palette.accent
-            } else {
-                palette.border_strong
-            },
+            egui::lerp(1.0..=FIELD_STROKE_MAX, ring),
+            motion::mix(palette.border_strong, palette.accent, ring),
         ))
         .corner_radius(radius::FIELD)
         .inner_margin(egui::Margin::symmetric(space::M as i8, space::M as i8));
@@ -1907,13 +2149,16 @@ fn compose(
                         }
                     });
                 let can_send = snapshot.can_send();
+                let ready =
+                    motion::toggle(ui.ctx(), compose_id.with("send"), can_send, motion::STATE);
+                let label =
+                    motion::mix(send_label(false, palette), send_label(true, palette), ready);
+                let fill = motion::mix(send_fill(false, palette), send_fill(true, palette), ready);
                 if ui
                     .add_enabled(snapshot.can_send(), {
-                        egui::Button::new(
-                            RichText::new("Send").color(send_label(can_send, palette)),
-                        )
-                        .fill(send_fill(can_send, palette))
-                        .min_size(egui::vec2(send_width, SEND_MIN_HEIGHT))
+                        egui::Button::new(RichText::new("Send").color(label))
+                            .fill(fill)
+                            .min_size(egui::vec2(send_width, SEND_MIN_HEIGHT))
                     })
                     .clicked()
                     && let Some((protocol, conversation_id)) = chat.clone()
