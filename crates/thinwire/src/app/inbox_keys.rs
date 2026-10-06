@@ -185,6 +185,29 @@ fn the_row_menu_mutes_a_chat_and_a_protocol_mute_wins() {
         harness.query_by_label("Unmute").is_none(),
         "no thinwire unmute for a protocol mute"
     );
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Cy, muted")
+        .click_secondary();
+    harness.run();
+    let menu_items: Vec<_> = harness
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Button)
+                .label("Muted in Telegram"),
+        )
+        .collect();
+    assert!(
+        menu_items.len() >= 2,
+        "header and row menu both show the protocol mute"
+    );
+    for item in &menu_items {
+        assert!(
+            item.accesskit_node().is_disabled(),
+            "the row menu item stays disabled"
+        );
+    }
+    harness.get_by_label("Only Telegram can unmute it");
 }
 
 #[test]
