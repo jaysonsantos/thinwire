@@ -577,10 +577,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
 
             section_header(ui, "Inbox");
             let inbox_list_id = ui.make_persistent_id("inbox");
-            egui::ScrollArea::vertical()
-                .id_salt("inbox")
-                .auto_shrink([false, false])
-                .show(ui, |ui| inbox(ui, snapshot, hints, inbox_list_id, out));
+            inbox_scroll(ui, snapshot, hints, inbox_list_id, out);
         });
 }
 
@@ -705,13 +702,99 @@ fn view_list_time(at: i64, now: ViewNow) -> String {
     }
 }
 
-fn inbox(
+/// Rows last frame, and the row the pointer was on.
+///
+/// At the top of the list a new chat appears there and the rows below it
+/// shift down. Further down, the next frame keeps the anchor row on the
+/// same screen line so a click still hits that chat.
+#[derive(Clone)]
+struct InboxAnchor {
+    ids: Vec<String>,
+    offset: f32,
+    stride: f32,
+    anchor: Option<String>,
+}
+
+/// What one inbox frame painted, for the next frame's anchor.
+struct DrawnInbox {
+    anchor: Option<String>,
+    stride: f32,
+}
+
+/// An offset this close to the top still counts as the top.
+const INBOX_TOP: f32 = 1.0;
+
+/// Scroll offset that keeps `previous.anchor` on the same screen line.
+/// `None` at the top, or when that row did not move.
+fn anchored_inbox_offset(previous: &InboxAnchor, ids: &[String]) -> Option<f32> {
+    if previous.offset <= INBOX_TOP || previous.stride <= 0.0 {
+        return None;
+    }
+    let anchor = previous.anchor.as_deref()?;
+    let before = previous.ids.iter().position(|id| id == anchor)?;
+    let after = ids.iter().position(|id| id == anchor)?;
+    if before == after {
+        return None;
+    }
+    Some((previous.offset + (after as f32 - before as f32) * previous.stride).max(0.0))
+}
+
+fn inbox_row_stride(ui: &egui::Ui) -> f32 {
+    inbox_row_height(ui) + ui.spacing().item_spacing.y
+}
+
+/// The inbox list. A reorder anchors the scroll offset before the rows draw.
+fn inbox_scroll(
     ui: &mut egui::Ui,
     snapshot: &View<'_>,
     hints: &mut Hints,
     inbox_list_id: egui::Id,
     out: &mut Vec<Intent>,
 ) {
+    let ids: Vec<String> = snapshot
+        .visible_conversations()
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    let memo_id = ui.make_persistent_id("inbox-anchor");
+    let previous: Option<InboxAnchor> = ui.data(|data| data.get_temp(memo_id));
+    let forced = previous
+        .as_ref()
+        .and_then(|previous| anchored_inbox_offset(previous, &ids));
+    let mut area = egui::ScrollArea::vertical()
+        .id_salt("inbox")
+        .auto_shrink([false, false]);
+    if let Some(offset) = forced {
+        area = area.vertical_scroll_offset(offset);
+    }
+    let mut drawn = DrawnInbox {
+        anchor: None,
+        stride: 0.0,
+    };
+    let output = area.show(ui, |ui| {
+        drawn = inbox(ui, snapshot, hints, inbox_list_id, out);
+    });
+    ui.data_mut(|data| {
+        data.insert_temp(
+            memo_id,
+            InboxAnchor {
+                ids,
+                offset: output.state.offset.y,
+                stride: drawn.stride,
+                anchor: drawn.anchor,
+            },
+        );
+    });
+}
+
+fn inbox(
+    ui: &mut egui::Ui,
+    snapshot: &View<'_>,
+    hints: &mut Hints,
+    inbox_list_id: egui::Id,
+    out: &mut Vec<Intent>,
+) -> DrawnInbox {
+    let stride = inbox_row_stride(ui);
     let now = snapshot.now();
     let rows: Vec<InboxRow> = snapshot
         .visible_conversations()
@@ -734,13 +817,19 @@ fn inbox(
                 ui.spinner();
                 ui.label(RichText::new("Loading chats…").weak());
             });
-            return;
+            return DrawnInbox {
+                anchor: None,
+                stride,
+            };
         }
         InboxState::Empty => {
             if show_no_chats(snapshot) {
                 ui.label(RichText::new("No chats.").italics().weak());
             }
-            return;
+            return DrawnInbox {
+                anchor: None,
+                stride,
+            };
         }
         InboxState::NoMatch => {
             let query = snapshot.search.trim();
@@ -749,7 +838,10 @@ fn inbox(
                     .italics()
                     .weak(),
             );
-            return;
+            return DrawnInbox {
+                anchor: None,
+                stride,
+            };
         }
     }
 
@@ -757,8 +849,12 @@ fn inbox(
     let scroll_to_focused = hints.take_scroll_to_focused();
     let open_mute_menus = hints.open_mute_menus;
     let widget_focus = ui.ctx().memory(|memory| memory.focused());
+    let pointer = ui.input(|input| input.pointer.hover_pos());
+    let clip = ui.clip_rect();
     let mut clicked: Option<String> = None;
     let mut focus_from_widget: Option<String> = None;
+    let mut under_pointer = None;
+    let mut first_visible = None;
     let mut menu_state_open = [false; 3];
     for row in rows {
         let InboxRow {
@@ -823,6 +919,12 @@ fn inbox(
         if row_scrolls(selected, focused, scroll_to_selected, scroll_to_focused) {
             response.scroll_to_me(None);
         }
+        if under_pointer.is_none() && pointer.is_some_and(|pos| response.rect.contains(pos)) {
+            under_pointer = Some(id.clone());
+        }
+        if first_visible.is_none() && response.rect.intersects(clip) {
+            first_visible = Some(id.clone());
+        }
         if widget_focus == Some(response.id) && !focused {
             focus_from_widget = Some(id.clone());
         }
@@ -846,6 +948,12 @@ fn inbox(
     {
         let row_id = ui.id().with(("inbox-row", id));
         ui.memory_mut(|memory| memory.request_focus(row_id));
+    }
+    // The pointer's row wins. With the pointer elsewhere, the first visible
+    // row keeps the viewport from jumping when a chat moves to the top.
+    DrawnInbox {
+        anchor: under_pointer.or(first_visible),
+        stride,
     }
 }
 
@@ -2192,7 +2300,7 @@ fn send_label(can_send: bool, palette: &theme::Palette) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{account_label, badge_text, row_scrolls};
+    use super::{InboxAnchor, account_label, anchored_inbox_offset, badge_text, row_scrolls};
 
     #[test]
     fn both_scroll_requests_scroll_the_highlight() {
@@ -2200,6 +2308,39 @@ mod tests {
         assert!(!row_scrolls(true, false, true, true));
         assert!(row_scrolls(true, false, true, false));
         assert!(!row_scrolls(false, true, true, false));
+    }
+
+    fn anchor(ids: &[&str], offset: f32, stride: f32, held: &str) -> InboxAnchor {
+        InboxAnchor {
+            ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            offset,
+            stride,
+            anchor: Some(held.to_owned()),
+        }
+    }
+
+    #[test]
+    fn the_top_of_the_inbox_does_not_anchor_and_a_scrolled_row_does() {
+        let before = ["a", "b", "c"];
+        let after = ["c", "a", "b"];
+        assert!(
+            anchored_inbox_offset(&anchor(&before, 0.0, 48.0, "b"), &owned(&after)).is_none(),
+            "at the top the new chat appears there and the other rows shift down"
+        );
+        let held = anchored_inbox_offset(&anchor(&before, 120.0, 48.0, "b"), &owned(&after))
+            .expect("scrolled");
+        assert!((held - 168.0).abs() < 0.01, "b moved down one row: {held}");
+        assert!(
+            anchored_inbox_offset(&anchor(&before, 120.0, 48.0, "b"), &owned(&before)).is_none(),
+            "the same order does not scroll"
+        );
+        assert!(
+            anchored_inbox_offset(&anchor(&before, 120.0, 48.0, "gone"), &owned(&after)).is_none()
+        );
+    }
+
+    fn owned(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
     }
 
     #[test]
