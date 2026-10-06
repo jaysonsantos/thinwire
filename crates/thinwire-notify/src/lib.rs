@@ -366,6 +366,27 @@ mod tests {
         })
     }
 
+    /// macOS show ignores the click callback. Windows reports a click only
+    /// from `Activated`, which is a user click, not from `Show`.
+    #[test]
+    fn showing_a_notification_is_not_a_click_on_macos_or_windows() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("fn platform_backend(_clicks: ClickFn)"),
+            "macOS show has no click callback"
+        );
+        let winrt = include_str!("winrt.rs");
+        let post = &winrt[winrt.find("fn post(").expect("post")..];
+        let post = &post[..post.find("fn has(").expect("has")];
+        let activated = post.find("toast.Activated").expect("activated");
+        let clicks = post.find("clicks(").expect("clicks");
+        let show = post.find(".Show(").expect("show");
+        assert!(
+            activated < clicks && clicks < show,
+            "Show does not report a click; Activated does"
+        );
+    }
+
     #[test]
     fn the_thread_runs_commands_in_order_and_reports_clicks() {
         let seen = Arc::new(Mutex::new(Vec::new()));

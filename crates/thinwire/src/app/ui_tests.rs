@@ -27,7 +27,10 @@ fn inbox_and_thread_scroll_and_show_load_states() {
     let ui = include_str!("ui.rs");
     let left = &ui[ui.find("fn left_panel").expect("left panel")..];
     let left = &left[..left.find("\nfn ").expect("next fn")];
-    assert!(left.contains("ScrollArea::vertical()"));
+    assert!(left.contains("inbox_scroll("));
+    let scroll = &ui[ui.find("fn inbox_scroll(").expect("inbox scroll")..];
+    let scroll = &scroll[..scroll.find("\nfn inbox(").expect("inbox")];
+    assert!(scroll.contains("ScrollArea::vertical()"));
     assert!(ui.contains(".stick_to_bottom(true)"));
     assert!(ui.contains("scroll_to_me"));
     assert!(ui.contains("Loading chats…"));

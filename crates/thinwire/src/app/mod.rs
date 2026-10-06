@@ -254,18 +254,22 @@ impl ThinwireApp {
     }
 
     /// Notification clicks become intents (#32).
+    /// A show with no click leaves this empty: the window stays put.
     fn notification_intents(&mut self, ctx: &egui::Context) {
         let clicked = std::mem::take(&mut *lock(&self.clicks));
-        for key in clicked {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            // `Focus` raises the window on X11, macOS, and Windows. On
-            // Wayland, winit 0.30 cannot raise it: ask for attention, so the
-            // taskbar entry highlights (#173).
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                egui::UserAttentionType::Informational,
-            ));
-            self.intents.push(Intent::OpenFromNotification(key));
+        let (raise, opens) = notification_clicks(&clicked);
+        if raise {
+            for _ in &opens {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                // `Focus` raises the window on X11, macOS, and Windows. On
+                // Wayland, winit 0.30 cannot raise it: ask for attention, so the
+                // taskbar entry highlights (#173).
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
+            }
         }
+        self.intents.extend(opens);
     }
 
     /// "thinwire (3)" while unread messages wait in chats that are not
@@ -328,6 +332,20 @@ fn window_title(unread: u32) -> String {
     } else {
         format!("thinwire ({unread})")
     }
+}
+
+/// A click raises the window and opens that chat.
+/// No click: neither. Showing a notification does not fill `clicks`.
+fn notification_clicks(clicks: &[NotifyKey]) -> (bool, Vec<Intent>) {
+    if clicks.is_empty() {
+        return (false, Vec::new());
+    }
+    let open = clicks
+        .iter()
+        .cloned()
+        .map(Intent::OpenFromNotification)
+        .collect();
+    (true, open)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -421,7 +439,24 @@ impl Drop for ThinwireApp {
 mod tests {
     use std::time::Instant;
 
+    use thinwire_core::ProtocolId;
+
     use super::*;
+
+    #[test]
+    fn a_notification_show_without_a_click_does_not_raise_the_window() {
+        let (raise, opens) = notification_clicks(&[]);
+        assert!(!raise, "showing a notification does not raise the window");
+        assert!(opens.is_empty(), "and does not change the open chat");
+
+        let key = NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+        };
+        let (raise, opens) = notification_clicks(&[key.clone()]);
+        assert!(raise);
+        assert_eq!(opens, vec![Intent::OpenFromNotification(key)]);
+    }
 
     #[test]
     fn close_waits_for_stopped_then_allows_the_next_request() {

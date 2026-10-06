@@ -20,6 +20,8 @@ struct InboxUi {
     /// When set, a thread Retry control takes keyboard focus.
     focus_retry: bool,
     selects: u32,
+    /// Copy one-shot hints from the snapshot each frame, as the app does.
+    apply_hints: bool,
 }
 
 impl InboxUi {
@@ -50,6 +52,7 @@ impl InboxUi {
             hints: Hints::default(),
             focus_retry: false,
             selects: 0,
+            apply_hints: false,
         }
     }
 }
@@ -64,6 +67,9 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
     let mut out = Vec::new();
     {
         let view = View::from_parts(&state.snapshot, &state.store, &state.settings);
+        if state.apply_hints {
+            state.hints = Hints::from_view(&view);
+        }
         ui::draw(ui, &view, &mut state.hints, &mut out);
     }
     for intent in out {
@@ -832,4 +838,187 @@ fn the_thread_follows_new_messages_and_jumps_back_to_the_newest() {
         harness.query_by_label("Jump to latest message").is_none(),
         "back at the newest message the button goes"
     );
+}
+
+fn row_top(harness: &Harness<'_, InboxUi>, title: &str) -> f32 {
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, title)
+        .rect()
+        .top()
+}
+
+fn row_rect(harness: &Harness<'_, InboxUi>, title: &str) -> egui::Rect {
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, title)
+        .rect()
+}
+
+/// Bob is open. A message moves Ada to the top. Bob stays open, the composer
+/// keeps its text and focus, and Ada shows the unread badge. At the top of
+/// the list Ada appears there and Bob shifts down by one row.
+#[test]
+fn a_message_in_another_chat_keeps_the_open_chat_and_the_composer() {
+    let mut state = InboxUi::ready();
+    state.apply_hints = true;
+    state.snapshot.select_conversation("telegram:2".into());
+    assert!(state.snapshot.take_scroll_to_selected());
+    assert!(state.snapshot.take_focus_compose());
+    // Opening a chat loads its history. A spinner keeps requesting frames.
+    state.snapshot.apply(AdapterEvent::HistoryLoaded {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:2".into(),
+    });
+    // Bob starts above Ada, so her message has to move past him.
+    let mut bob_row = telegram_chat(2, "Bob", 20);
+    bob_row.preview = "seen from Bob".into();
+    state.snapshot.apply(AdapterEvent::ConversationUpsert {
+        conversation: bob_row,
+    });
+    let mut ada_row = telegram_chat(1, "Ada", 5);
+    ada_row.preview = "seen from Ada".into();
+    state.snapshot.apply(AdapterEvent::ConversationUpsert {
+        conversation: ada_row,
+    });
+    assert!(!state.snapshot.wants_scroll_to_selected());
+    state.snapshot.compose = "draft for Bob".into();
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .ctx
+        .memory_mut(|memory| memory.request_focus(egui::Id::new("thread-compose")));
+    harness.step();
+    let compose = egui::Id::new("thread-compose");
+    assert!(
+        harness.ctx.memory(|memory| memory.has_focus(compose)),
+        "the composer has focus"
+    );
+    let ada_before = row_top(&harness, "Ada");
+    let bob_before = row_top(&harness, "Bob");
+    assert!(bob_before < ada_before, "Bob starts above Ada");
+    let stride = ada_before - bob_before;
+
+    let mut ada = telegram_chat(1, "Ada", 40);
+    ada.unread = 2;
+    ada.preview = "new from Ada".into();
+    ada.last_at = 1_700_000_100;
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::ConversationUpsert { conversation: ada });
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:2")
+    );
+    assert_eq!(harness.state().snapshot.compose, "draft for Bob");
+    assert!(!harness.state().snapshot.wants_scroll_to_selected());
+    assert!(!harness.state().snapshot.wants_focus_compose());
+    harness.step();
+
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:2"),
+        "Ada's message does not open Ada"
+    );
+    assert_eq!(harness.state().snapshot.compose, "draft for Bob");
+    assert!(
+        harness.ctx.memory(|memory| memory.has_focus(compose)),
+        "the composer keeps focus"
+    );
+    assert!(row_top(&harness, "Ada") < row_top(&harness, "Bob"));
+    assert!(
+        (row_top(&harness, "Ada") - bob_before).abs() < 2.0,
+        "at the top, Ada takes the first row"
+    );
+    assert!(
+        (row_top(&harness, "Bob") - bob_before - stride).abs() < 2.0,
+        "Bob shifts down by one row"
+    );
+    assert!(
+        harness.query_all_by_label("unread 2").next().is_some(),
+        "Ada shows the unread badge"
+    );
+    harness.get_by_label("new from Ada");
+}
+
+/// Scrolled down, the row under the pointer stays on that screen line when
+/// another chat jumps to the top.
+#[test]
+fn a_scrolled_inbox_keeps_the_row_under_the_pointer() {
+    let mut state = InboxUi::ready();
+    state.apply_hints = true;
+    for n in 3_i64..=16 {
+        // Below Ada (order 10) and Bob (order 5), so Ada stays the open top row.
+        let mut conversation = telegram_chat(n, &format!("Row {n:02}"), 4 - n);
+        conversation.preview = format!("seen from row {n}");
+        state
+            .snapshot
+            .apply(AdapterEvent::ConversationUpsert { conversation });
+    }
+    state.snapshot.select_conversation("telegram:1".into());
+    assert!(state.snapshot.take_scroll_to_selected());
+    assert!(state.snapshot.take_focus_compose());
+    state.snapshot.apply(AdapterEvent::HistoryLoaded {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+    });
+    state.snapshot.compose = "draft for Ada".into();
+    let mut harness = harness(state);
+    harness.run();
+    let start = row_top(&harness, "Ada");
+    let inbox_point = egui::pos2(120.0, 480.0);
+    harness.hover_at(inbox_point);
+    harness.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -180.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run_steps(12);
+    harness.run();
+    assert!(
+        row_top(&harness, "Ada") < start - 40.0,
+        "the list is scrolled down, Ada moved up off the top rows"
+    );
+
+    let held = row_rect(&harness, "Row 08");
+    let point = held.center();
+    harness.hover_at(point);
+    harness.step();
+    let held = row_rect(&harness, "Row 08");
+    let point = held.center();
+    assert!(
+        held.contains(point),
+        "the pointer rests on Row 08 before the reorder"
+    );
+
+    let mut jumped = telegram_chat(16, "Row 16", 500);
+    jumped.unread = 1;
+    jumped.preview = "new from row 16".into();
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::ConversationUpsert {
+            conversation: jumped,
+        });
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:1")
+    );
+    assert_eq!(harness.state().snapshot.compose, "draft for Ada");
+    assert!(!harness.state().snapshot.wants_scroll_to_selected());
+    assert!(!harness.state().snapshot.wants_scroll_to_focused());
+    harness.hover_at(point);
+    harness.step();
+
+    let after = row_rect(&harness, "Row 08");
+    assert!(
+        after.contains(point),
+        "Row 08 stayed under the pointer: before {held:?}, after {after:?}, point {point:?}"
+    );
+    assert!((after.top() - held.top()).abs() < 2.0);
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:1")
+    );
+    assert_eq!(harness.state().snapshot.compose, "draft for Ada");
 }
