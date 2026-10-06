@@ -63,6 +63,8 @@ pub(crate) struct Hints {
     used_focus_compose: bool,
     used_scroll_to_selected: bool,
     used_scroll_to_focused: bool,
+    /// Snapshot only. See [`Hints::show_open_mute_menus`].
+    open_mute_menus: bool,
 }
 
 impl Hints {
@@ -107,6 +109,14 @@ impl Hints {
     /// The keyboard-highlight scroll hint was used this frame.
     pub(crate) const fn used_scroll_to_focused(self) -> bool {
         self.used_scroll_to_focused
+    }
+
+    /// Open the row menu once for each mute state. The app leaves this off.
+    /// The mute-menu snapshot turns it on (#206). egui keeps one memory popup,
+    /// so the snapshot cannot right-click three rows and keep every menu.
+    #[cfg_attr(not(all(test, feature = "ui-snapshots")), allow(dead_code))]
+    pub(crate) fn show_open_mute_menus(&mut self) {
+        self.open_mute_menus = true;
     }
 }
 
@@ -580,9 +590,11 @@ fn inbox(
 
     let scroll_to_selected = hints.take_scroll_to_selected();
     let scroll_to_focused = hints.take_scroll_to_focused();
+    let open_mute_menus = hints.open_mute_menus;
     let widget_focus = ui.ctx().memory(|memory| memory.focused());
     let mut clicked: Option<String> = None;
     let mut focus_from_widget: Option<String> = None;
+    let mut menu_state_open = [false; 3];
     for row in rows {
         let InboxRow {
             protocol,
@@ -605,12 +617,27 @@ fn inbox(
             selected,
             mute.is_muted(),
         );
-        response.context_menu(|ui| {
+        let force_open = open_mute_menus && claim_menu_state(&mut menu_state_open, mute);
+        let add_menu = |ui: &mut egui::Ui| {
             if let Some(intent) = mute_control(ui, protocol, &id, mute, "chat") {
                 out.push(intent);
                 ui.close();
             }
-        });
+        };
+        if force_open {
+            // Beside the row, not on the pointer: three states stay visible
+            // in one frame. `Popup::menu` is the context menu before it
+            // anchors to the pointer.
+            egui::Popup::menu(&response)
+                .open(true)
+                .align(egui::RectAlign::RIGHT_START)
+                .align_alternatives(&[])
+                .gap(space::S)
+                .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+                .show(add_menu);
+        } else {
+            response.context_menu(add_menu);
+        }
         if focused {
             ui.painter().rect_stroke(
                 response.rect,
@@ -668,10 +695,47 @@ struct InboxRow {
     mute: ChatMute,
 }
 
+/// First row of each mute state in a snapshot that shows every menu at once.
+fn claim_menu_state(seen: &mut [bool; 3], mute: ChatMute) -> bool {
+    let slot = match mute {
+        ChatMute::None => 0,
+        ChatMute::Here => 1,
+        ChatMute::Protocol => 2,
+    };
+    if seen[slot] {
+        false
+    } else {
+        seen[slot] = true;
+        true
+    }
+}
+
+/// Why a protocol mute cannot be toggled in thinwire.
+fn protocol_mute_reason(name: &str) -> String {
+    format!("Only {name} can unmute it")
+}
+
+/// Disabled "Muted in {protocol}" without egui's 0.5 fade (#206).
+///
+/// The fade blends the label into the fill. In light that drops under 4.5:1.
+/// Clicks stay off and AccessKit still reports the button disabled.
+fn protocol_mute_button(ui: &mut egui::Ui, title: &str) -> egui::Response {
+    let ink = theme::protocol_mute_ink(theme::palette(ui));
+    let previous = ui.style().visuals.disabled_alpha;
+    ui.style_mut().visuals.disabled_alpha = 1.0;
+    let response = ui.add_enabled(
+        false,
+        egui::Button::new(RichText::new(title).color(ink.title)),
+    );
+    ui.style_mut().visuals.disabled_alpha = previous;
+    response
+}
+
 /// The mute button of a chat (#153): Mute, Unmute, or a disabled "Muted in
 /// <protocol>" when the protocol mutes it. A protocol mute wins, so only
 /// the protocol can unmute it. `what` follows the verb: "chat" in the row
-/// menu, empty in the thread header. Returns the intent of a click.
+/// menu, empty in the thread header. The row menu puts the reason beside
+/// the disabled item. Returns the intent of a click.
 fn mute_control(
     ui: &mut egui::Ui,
     protocol: ProtocolId,
@@ -684,8 +748,24 @@ fn mute_control(
         ChatMute::Here => ("Unmute", false),
         ChatMute::Protocol => {
             let name = protocol.display_name();
-            ui.add_enabled(false, egui::Button::new(format!("Muted in {name}")))
-                .on_disabled_hover_text(format!("Unmute it in {name}."));
+            let title = format!("Muted in {name}");
+            let response = if what.is_empty() {
+                protocol_mute_button(ui, &title)
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = space::S;
+                    let response = protocol_mute_button(ui, &title);
+                    let ink = theme::protocol_mute_ink(theme::palette(ui));
+                    ui.label(
+                        RichText::new(protocol_mute_reason(name))
+                            .small()
+                            .color(ink.reason),
+                    );
+                    response
+                })
+                .inner
+            };
+            response.on_disabled_hover_text(format!("Unmute it in {name}."));
             return None;
         }
     };
@@ -832,14 +912,9 @@ fn inbox_row(
         egui::vec2(width, inbox_row_height(ui)),
         egui::Sense::hover(),
     );
-    let fill = if selected {
-        palette.selected_row
-    } else if hover.hovered() {
-        palette.surface
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    if fill != egui::Color32::TRANSPARENT {
+    let hovered = hover.hovered();
+    if selected || hovered {
+        let fill = theme::inbox_row_backdrop(palette, selected, hovered);
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::same(radius::CONTROL), fill);
     }
@@ -905,8 +980,8 @@ fn inbox_row(
     ui.interact(rect, ui.id().with(("inbox-row", id)), egui::Sense::click())
 }
 
-/// Unread pill. `text` comes from [`badge_text`]. A muted chat gets a
-/// quiet outline pill, not the accent fill (#153).
+/// Unread pill. `text` comes from [`badge_text`]. A muted chat gets an
+/// outline in the row title color, not the accent fill (#153, #206).
 fn unread_badge(ui: &mut egui::Ui, text: &str, muted: bool) {
     let palette = theme::palette(ui);
     let ink = if muted {
@@ -927,7 +1002,7 @@ fn unread_badge(ui: &mut egui::Ui, text: &str, muted: bool) {
         ui.painter().rect_stroke(
             rect,
             corner,
-            egui::Stroke::new(1.0, palette.border_strong),
+            egui::Stroke::new(1.0, theme::muted_badge_ring(palette)),
             egui::StrokeKind::Inside,
         );
     } else {
