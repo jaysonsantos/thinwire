@@ -3,6 +3,7 @@
 mod auth;
 #[cfg(test)]
 mod inbox_keys;
+mod motion;
 #[cfg(feature = "signal-local")]
 mod signal_gate;
 mod theme;
