@@ -751,3 +751,85 @@ fn tab_then_two_arrows_land_on_row_3_and_enter_opens_it() {
         Some("telegram:3")
     );
 }
+
+/// Top of the compose field: below the bottom edge of the message view.
+fn compose_top(harness: &Harness<'_, InboxUi>) -> f32 {
+    harness
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .rect()
+        .top()
+}
+
+fn bubble_rect(harness: &Harness<'_, InboxUi>, body: &str) -> egui::Rect {
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Pane, body)
+        .rect()
+}
+
+/// A long chat sits at its newest message. A new message is in view after
+/// one `run`: the thread asks for the next frame when `stick_to_bottom`
+/// moves, not only at the idle tick. Scrolled up, a button jumps back.
+#[test]
+fn the_thread_follows_new_messages_and_jumps_back_to_the_newest() {
+    let mut state = InboxUi::ready();
+    for n in 0..40 {
+        state.snapshot.apply(AdapterEvent::MessageReceived {
+            message: chat_message(
+                &format!("telegram:1:{n:02}"),
+                &format!("Message number {n}"),
+                1_790_000_000 + n * 60,
+            ),
+        });
+    }
+    let mut harness = harness(state);
+    harness.run();
+    let edge = compose_top(&harness);
+    assert!(bubble_rect(&harness, "Message number 39").bottom() <= edge);
+    assert!(
+        harness.query_by_label("Jump to latest message").is_none(),
+        "at the newest message there is no jump button"
+    );
+
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::MessageReceived {
+            message: chat_message("telegram:1:40", "Message number 40", 1_790_100_000),
+        });
+    harness.run();
+    assert!(
+        bubble_rect(&harness, "Message number 40").bottom() <= edge,
+        "the new message is in view"
+    );
+
+    let thread = bubble_rect(&harness, "Message number 40");
+    harness.hover_at(thread.center());
+    harness.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, 5_000.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    // egui spreads a wheel step over several frames.
+    harness.run_steps(12);
+    harness.run();
+    assert!(
+        bubble_rect(&harness, "Message number 40").top() > edge,
+        "scrolled up, the newest message is out of view"
+    );
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Jump to latest message")
+        .click();
+    // The click, then egui's animated scroll to the newest message.
+    harness.run_steps(6);
+    harness.run();
+    let newest = bubble_rect(&harness, "Message number 40");
+    assert!(
+        newest.bottom() <= edge && newest.top() < edge,
+        "the jump shows the newest message: {newest:?}, edge {edge}"
+    );
+    assert!(
+        harness.query_by_label("Jump to latest message").is_none(),
+        "back at the newest message the button goes"
+    );
+}
