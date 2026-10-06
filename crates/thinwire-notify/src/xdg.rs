@@ -402,7 +402,8 @@ impl Xdg {
                         .spawn(move || {
                             // Returns on a click, or when the notification closes.
                             handle.wait_for_action(|action| {
-                                if action == OPEN_ACTION
+                                // Show does not call this. A close passes `__closed`.
+                                if action_opens_chat(action)
                                     && let Some(key) = lock(&book).key_of(id)
                                 {
                                     tracing::info!(kind = "open", "desktop notification clicked");
@@ -480,6 +481,12 @@ impl Backend for Xdg {
     }
 }
 
+/// The body click is `default`. A close is `__closed`. Showing does not
+/// call the waiter at all.
+fn action_opens_chat(action: &str) -> bool {
+    action == OPEN_ACTION
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -528,6 +535,16 @@ mod tests {
         assert_eq!(book.forget(&ada).ids(), vec![601]);
         assert_eq!(book.replace_id(&ada), NEW_NOTIFICATION);
         assert!(book.forget(&ada).ids().is_empty());
+    }
+
+    #[test]
+    fn showing_or_closing_a_notification_does_not_open_the_chat() {
+        assert!(!action_opens_chat(""));
+        assert!(
+            !action_opens_chat("__closed"),
+            "expiry and dismiss are not clicks"
+        );
+        assert!(action_opens_chat(OPEN_ACTION));
     }
 
     #[test]

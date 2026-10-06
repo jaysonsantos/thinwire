@@ -1408,6 +1408,61 @@ mod tests {
         );
     }
 
+    /// Showing a notification does not open that chat or scroll the inbox.
+    /// A click does both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shown_notification_does_not_open_its_chat() {
+        use crate::notify::{NotifyCommand, NotifyKey};
+        use crate::state::test_support::ready_with_chats;
+        use thinwire_protocol::{Arrival, Delivery};
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        core.state.compose = "draft for Ada".into();
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        assert!(core.state.take_scroll_to_selected());
+        assert!(core.state.take_focus_compose());
+        let live = ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+            id: "telegram:2:9".into(),
+            sender: "Bob".into(),
+            body: "hello".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+        };
+        core.notify_message(&live);
+        assert!(
+            matches!(&core.take_notify()[..], [NotifyCommand::Show(_)]),
+            "the message is shown, not opened"
+        );
+        assert_eq!(
+            core.view().selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        assert_eq!(core.view().compose, "draft for Ada");
+        assert!(!core.view().wants_scroll_to_selected());
+        assert!(!core.view().wants_focus_compose());
+
+        let key = NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:2".into(),
+        };
+        core.dispatch(Intent::OpenFromNotification(key));
+        assert_eq!(
+            core.view().selected_conversation.as_deref(),
+            Some("telegram:2")
+        );
+        assert!(
+            core.view().wants_scroll_to_selected(),
+            "a click scrolls that chat into view"
+        );
+    }
+
     /// #32: a live message in a chat that the user does not look at queues a
     /// notification. A click opens that chat and dismisses it. The switch
     /// turns it off.

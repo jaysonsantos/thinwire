@@ -353,12 +353,14 @@ impl AccountRow {
     }
 }
 
-/// Why `sync_focused_row` runs. A search change or a key move always scrolls.
-/// A list change scrolls only when the highlight's visible index changes.
+/// Why `sync_focused_row` runs. A search change or a key move scrolls.
+/// A chat update does not: the list stays where the user left it.
 enum FocusFollow {
     Query,
     List,
     Moved,
+    /// A row was inserted, updated, or reordered. Keep the highlight id.
+    Upsert,
 }
 
 /// Text the adapter rejected for one chat. A compose send and a retry are
@@ -470,6 +472,8 @@ pub struct Snapshot {
     /// Chats whose last older page did not load, keyed by protocol and chat.
     /// A later success clears that chat. The thread shows plain text only (#57).
     older_note: HashSet<(ProtocolId, String)>,
+    /// Scroll the open chat into view once, after the user opens it.
+    /// A message that reorders the list does not set this.
     scroll_to_selected: bool,
     scroll_to_focused: bool,
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
@@ -781,29 +785,17 @@ impl Snapshot {
                     conversation.unread = 0;
                 }
                 let protocol = conversation.protocol;
-                let selected = (self.selected_protocol == protocol)
-                    .then(|| self.selected_conversation.clone())
-                    .flatten();
-                {
-                    let list = self.conversations.entry(protocol).or_default();
-                    let before = selected
-                        .as_ref()
-                        .and_then(|id| list.iter().position(|row| row.id == *id));
-                    if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
-                        *existing = conversation;
-                    } else {
-                        list.push(conversation);
-                    }
-                    sort_conversations(list);
-                    let after = selected
-                        .as_ref()
-                        .and_then(|id| list.iter().position(|row| row.id == *id));
-                    if before.is_some() && before != after {
-                        self.scroll_to_selected = true;
-                    }
+                let list = self.conversations.entry(protocol).or_default();
+                if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
+                    *existing = conversation;
+                } else {
+                    list.push(conversation);
                 }
+                sort_conversations(list);
+                // A message may move a row. The open chat stays the one the
+                // user is reading. This fallback only fills an empty selection.
                 self.ensure_conversation_selection();
-                self.sync_focused_row(FocusFollow::List);
+                self.sync_focused_row(FocusFollow::Upsert);
             }
             AdapterEvent::MessageDelivery {
                 protocol,
@@ -1108,10 +1100,14 @@ impl Snapshot {
         self.ensure_conversation_selection();
     }
 
+    /// Open `id`. The inbox scrolls that row into view.
+    /// A click, Enter on the highlight, and a notification click all come here.
+    /// A later message does not: the list stays where the user left it.
     pub fn select_conversation(&mut self, id: String) {
         self.focused_row = Some(id.clone());
         self.set_selected_conversation(Some(id));
         self.focus_compose = true;
+        self.scroll_to_selected = true;
         self.queue_open_chat();
     }
 
@@ -1628,7 +1624,7 @@ impl Snapshot {
         Some((id, oldest))
     }
 
-    /// True once after the selected row moved in the sorted list.
+    /// True once after the user opens a chat. The inbox scrolls that row into view.
     /// A scroll request waits for the inbox rows. Read-only; see `take_scroll_to_selected`.
     #[must_use]
     pub const fn wants_scroll_to_selected(&self) -> bool {
@@ -3037,8 +3033,8 @@ impl Snapshot {
 
     /// Keep the highlight on a visible row.
     ///
-    /// Set `scroll_to_focused` when the highlight moves by key, when the search
-    /// text changes, or when the highlight's visible index changes.
+    /// Set `scroll_to_focused` when the highlight moves by key or when the
+    /// search text changes. A chat update keeps the id and does not scroll.
     fn sync_focused_row(&mut self, reason: FocusFollow) {
         let ids = self.visible_ids();
         let kept = self
@@ -3057,6 +3053,7 @@ impl Snapshot {
         match reason {
             FocusFollow::Query | FocusFollow::Moved => true,
             FocusFollow::List => self.highlight_index_changed(ids),
+            FocusFollow::Upsert => false,
         }
     }
 
@@ -3813,7 +3810,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_row_requests_scroll_only_when_it_moves() {
+    fn picking_a_chat_scrolls_it_into_view_and_a_reorder_does_not() {
         let store = SecretStore::memory();
         let mut snapshot = Snapshot::new();
         complete_telegram(&mut snapshot, &store);
@@ -3823,26 +3820,102 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(2, "Bob", 5),
         });
+        assert!(
+            !snapshot.wants_scroll_to_selected(),
+            "the first row is not a pick"
+        );
         snapshot.select_conversation("telegram:2".into());
-        assert!(!snapshot.take_scroll_to_selected());
+        assert!(snapshot.take_scroll_to_selected());
+        assert!(!snapshot.wants_scroll_to_selected(), "one request per pick");
 
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(1, "Ada", 11),
         });
-        assert!(
-            !snapshot.take_scroll_to_selected(),
-            "selected row did not move"
-        );
-
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(3, "Cy", 99),
         });
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:2"),
+            "a row that jumps to the top does not become the open chat"
+        );
+        assert!(
+            !snapshot.wants_scroll_to_selected(),
+            "a reorder does not scroll to the open chat"
+        );
+        assert!(
+            !snapshot.wants_scroll_to_focused(),
+            "a reorder does not scroll to the highlight"
+        );
+    }
+
+    /// Chat B is open. A message in chat A moves A to the top. B stays open,
+    /// its draft stays, and A shows the unread badge. A message in B does not
+    /// mark B unread.
+    #[test]
+    fn a_message_in_another_chat_keeps_the_open_chat() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.select_conversation("telegram:2".into());
         assert!(snapshot.take_scroll_to_selected());
-        assert!(!snapshot.take_scroll_to_selected(), "one request per move");
+        assert!(snapshot.take_focus_compose());
+        snapshot.compose = "draft for Bob".into();
+        snapshot.sync_viewed();
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(2, "Bob", 20),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 5),
+        });
+        assert_eq!(
+            snapshot.visible_conversations()[0].id,
+            "telegram:2",
+            "Bob starts above Ada"
+        );
+        assert!(!snapshot.wants_scroll_to_selected());
+        assert!(!snapshot.wants_scroll_to_focused());
+
+        let mut ada = telegram_chat(1, "Ada", 40);
+        ada.unread = 2;
+        ada.preview = "new from Ada".into();
+        ada.last_at = 1_700_000_100;
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation: ada });
+
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:2")
+        );
+        assert_eq!(snapshot.compose, "draft for Bob");
+        assert!(!snapshot.wants_focus_compose());
+        assert!(!snapshot.wants_scroll_to_selected());
+        assert!(!snapshot.wants_scroll_to_focused());
+        let rows = snapshot.visible_conversations();
+        assert_eq!(rows[0].id, "telegram:1", "Ada moved to the top");
+        assert_eq!(rows[0].unread, 2);
+        assert_eq!(rows[0].preview, "new from Ada");
+        assert_eq!(rows[0].last_at, 1_700_000_100);
+        assert_eq!(rows[1].id, "telegram:2");
+
+        let mut bob = telegram_chat(2, "Bob", 5);
+        bob.unread = 4;
+        bob.preview = "while reading".into();
+        bob.last_at = 1_700_000_200;
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation: bob });
+        let bob = snapshot
+            .conversation(ProtocolId::Telegram, "telegram:2")
+            .expect("Bob");
+        assert_eq!(bob.unread, 0, "the open chat is not marked unread");
+        assert_eq!(bob.preview, "while reading");
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some("telegram:2")
+        );
+        assert_eq!(snapshot.compose, "draft for Bob");
+        assert!(!snapshot.wants_scroll_to_selected());
     }
 
     #[test]
-    fn a_resort_scrolls_the_highlighted_row_only_when_it_moves() {
+    fn a_reorder_does_not_scroll_the_highlight() {
         let store = SecretStore::memory();
         let mut snapshot = Snapshot::new();
         complete_telegram(&mut snapshot, &store);
@@ -3867,8 +3940,11 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(3, "Cy", 7),
         });
-        assert!(snapshot.take_scroll_to_focused());
-        assert!(!snapshot.wants_scroll_to_focused(), "one request per move");
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:2"));
+        assert!(
+            !snapshot.wants_scroll_to_focused(),
+            "a row inserted above the highlight does not scroll"
+        );
     }
 
     #[test]
@@ -3899,7 +3975,10 @@ mod tests {
             Some(2),
             "Bea joins the filtered list above Cara"
         );
-        assert!(snapshot.take_scroll_to_focused());
+        assert!(
+            !snapshot.wants_scroll_to_focused(),
+            "a row update does not scroll the highlight"
+        );
     }
 
     #[test]
@@ -3931,9 +4010,10 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: telegram_chat(1, "Ada", 5),
         });
+        assert_eq!(snapshot.focused_row.as_deref(), Some("telegram:1"));
         assert!(
-            snapshot.take_scroll_to_focused(),
-            "a resort that moves the highlight scrolls"
+            !snapshot.wants_scroll_to_focused(),
+            "a resort that moves the highlight does not scroll"
         );
 
         snapshot.set_search("Ada".into());
