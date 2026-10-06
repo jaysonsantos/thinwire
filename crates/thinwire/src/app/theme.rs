@@ -242,10 +242,45 @@ pub(crate) mod radius {
 
 /// Minimum height of a click target.
 pub(crate) const MIN_TARGET: f32 = 32.0;
-/// Inner margin of side and top panels.
-pub(crate) const PANEL_MARGIN: i8 = 12;
 /// Focus ring width.
 const FOCUS_WIDTH: f32 = 2.0;
+/// Content inset inside a full-width row highlight.
+///
+/// Section headers, account chips, and inbox rows share the x so the header
+/// text, the status dot, and the chat title start on one line. The highlight
+/// fill stays the full row; only the content moves in.
+pub(crate) const ROW_INSET: Vec2 = Vec2::new(space::M, space::S);
+
+/// Left edge of a section header and of row content, from the panel's inner left.
+#[must_use]
+pub(crate) fn sidebar_content_x(panel_inner_left: f32) -> f32 {
+    panel_inner_left + ROW_INSET.x
+}
+
+/// Content rect of a row highlight.
+///
+/// `right_gutter` is extra space on the right. Inbox rows pass the scroll
+/// bar width. Account chips pass `0`.
+#[must_use]
+pub(crate) fn row_content_rect(row: egui::Rect, right_gutter: f32) -> egui::Rect {
+    egui::Rect::from_min_max(
+        row.min + ROW_INSET,
+        row.max - ROW_INSET - egui::vec2(right_gutter, 0.0),
+    )
+}
+
+/// Frame for the top bar, the status strip, and the left panel.
+///
+/// [`egui::Frame::side_top_panel`] is 8 px by 2 px. Panels do not read
+/// `spacing.window_margin`, so the shell sets this frame itself.
+pub(crate) fn chrome_panel(style: &egui::Style) -> egui::Frame {
+    egui::Frame::side_top_panel(style).inner_margin(egui::Margin::same(space::S as i8))
+}
+
+/// Padding inside the top-bar search field. The vertical 6 matches button padding.
+pub(crate) fn search_field_margin() -> Margin {
+    Margin::symmetric(space::S as i8, 6)
+}
 
 /// Inter variable font (SIL OFL 1.1). Notice: `assets/fonts/OFL.txt`.
 const INTER: &[u8] = include_bytes!("../../assets/fonts/InterVariable.ttf");
@@ -394,7 +429,7 @@ fn style(palette: &Palette, theme: Theme) -> egui::Style {
     spacing.item_spacing = Vec2::new(space::S, 6.0);
     spacing.button_padding = Vec2::new(space::M, 6.0);
     spacing.interact_size.y = MIN_TARGET;
-    spacing.window_margin = Margin::same(PANEL_MARGIN);
+    spacing.window_margin = Margin::same(space::M as i8);
     spacing.menu_margin = Margin::same(space::S as i8);
     style
 }
@@ -611,6 +646,40 @@ mod tests {
             assert_eq!(style.visuals.panel_fill, Palette::of(theme).sidebar);
             assert!(style.spacing.interact_size.y >= MIN_TARGET);
         }
+    }
+
+    #[test]
+    fn header_account_and_inbox_content_share_a_left_edge() {
+        let panel_left = 8.0;
+        let row = egui::Rect::from_min_size(egui::pos2(panel_left, 20.0), egui::vec2(264.0, 52.0));
+        let header = sidebar_content_x(panel_left);
+        let account = row_content_rect(row, 0.0);
+        let inbox = row_content_rect(row, 10.0);
+        assert_eq!(header, account.min.x);
+        assert_eq!(account.min.x, inbox.min.x);
+        assert_eq!(account.min.y - row.min.y, space::S);
+        assert_eq!(inbox.min.y - row.min.y, space::S);
+        assert_eq!(row.max.x - account.max.x, space::M);
+        assert_eq!(row.max.x - inbox.max.x, space::M + 10.0);
+    }
+
+    #[test]
+    fn chrome_panel_insets_every_side_by_the_small_space() {
+        let frame = chrome_panel(&egui::Style::default());
+        let margin = frame.inner_margin;
+        assert_eq!(margin.left, space::S as i8);
+        assert_eq!(margin.right, space::S as i8);
+        assert_eq!(margin.top, space::S as i8);
+        assert_eq!(margin.bottom, space::S as i8);
+    }
+
+    #[test]
+    fn search_field_margin_insets_the_icon_and_the_hint() {
+        let margin = search_field_margin();
+        assert_eq!(margin.left, space::S as i8);
+        assert_eq!(margin.right, space::S as i8);
+        assert_eq!(margin.top, 6);
+        assert_eq!(margin.bottom, 6);
     }
 
     #[test]
