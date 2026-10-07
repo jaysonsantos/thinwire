@@ -24,7 +24,7 @@ dirs.workspace = true
 thinwire-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "a18fafe49301bc3693071822fc2a5992e100283a", optional = true, default-features = false, features = [
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "8ef8d106dc15160cfde6cf278307f164be4425c8", optional = true, default-features = false, features = [
   "sqlite-storage",
   "tokio-transport",
   "tokio-runtime",
