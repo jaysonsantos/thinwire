@@ -50,7 +50,7 @@ impl LinkBackend for LiveBackend {
             .and_then(Result::ok)
             .ok_or(StartError::Store)?;
         let db = path.to_str().ok_or(StartError::Store)?;
-        let backend = SqliteStore::new(db).await.map_err(|_| StartError::Store)?;
+        let backend = SqliteStore::open(db).await.map_err(|_| StartError::Store)?;
         let _ = restrict_store_file(&path);
         let bot = build_bot(backend, digits_only(phone), callbacks)
             .await
@@ -305,7 +305,7 @@ impl WhatsAppSender for LiveSender {
             self.client
                 .send_message(jid, wa::Message::text(body))
                 .await
-                .map(|sent| sent.message_id)
+                .map(|sent| sent.message_id.to_string())
                 .map_err(|error| classify_send_error(&error))
         })
     }
