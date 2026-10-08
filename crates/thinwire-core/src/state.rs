@@ -565,6 +565,10 @@ pub struct Snapshot {
     /// logout on the phone). The core drops their thinwire mutes (#153
     /// review). A reconnect or an app stop never adds one.
     ended_accounts: Vec<ProtocolId>,
+    /// What happened, why, and what to do for a helper that stopped, by
+    /// protocol. A full-screen gate shows it. The error block can hold the
+    /// error of another protocol by then.
+    helper_errors: HashMap<ProtocolId, UserError>,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_screen: WhatsAppScreen,
     #[cfg(feature = "whatsapp-web")]
@@ -761,6 +765,7 @@ impl Snapshot {
             pending: Vec::new(),
             keychain_flush: false,
             ended_accounts: Vec::new(),
+            helper_errors: HashMap::new(),
             #[cfg(feature = "whatsapp-web")]
             whatsapp_screen: WhatsAppScreen::Hidden,
             #[cfg(feature = "whatsapp-web")]
@@ -2938,6 +2943,8 @@ impl Snapshot {
         if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
             row.helper = Some(state);
         }
+        // The error of an older stop is not true for the new state.
+        self.helper_errors.remove(&protocol);
         if matches!(
             state,
             HelperState::Restarting | HelperState::Stopped(_) | HelperState::Missing
@@ -2979,6 +2986,14 @@ impl Snapshot {
                 ),
             };
             self.set_error(&happened, &why, &next);
+            self.helper_errors.insert(
+                protocol,
+                UserError {
+                    happened,
+                    why,
+                    next,
+                },
+            );
         }
     }
 
@@ -3009,7 +3024,9 @@ impl Snapshot {
         let label = row.helper_label()?;
         Some(HelperNotice {
             label,
-            error: self.error.as_ref().filter(|_| row.helper_stopped()),
+            // The helper's own error. The error block is one for the whole
+            // app, so another protocol can replace its content.
+            error: self.helper_errors.get(&protocol),
         })
     }
 
@@ -4023,6 +4040,35 @@ mod tests {
             Some("The WhatsApp helper stopped.")
         );
         assert_eq!(snapshot.helper_notice(ProtocolId::Telegram), None);
+
+        // PR #256 review: an error of another protocol takes the error
+        // block. The gate still shows the error of its own helper.
+        snapshot.apply(AdapterEvent::CommandFailed {
+            protocol: ProtocolId::Telegram,
+            conversation_id: None,
+            detail: "telegram-detail-fixture".into(),
+        });
+        assert!(
+            snapshot
+                .error
+                .as_ref()
+                .is_some_and(|error| error.why == "telegram-detail-fixture"),
+            "the error block now has the Telegram error"
+        );
+        let stopped = snapshot
+            .helper_notice(ProtocolId::WhatsApp)
+            .expect("a notice");
+        assert_eq!(
+            stopped.error.map(|error| error.happened.as_str()),
+            Some("The WhatsApp helper stopped.")
+        );
+
+        // A new helper state ends the old error.
+        helper(&mut snapshot, HelperState::Busy);
+        let busy = snapshot
+            .helper_notice(ProtocolId::WhatsApp)
+            .expect("a notice");
+        assert_eq!(busy.error, None);
         helper(&mut snapshot, HelperState::Running);
         assert_eq!(snapshot.helper_notice(ProtocolId::WhatsApp), None);
     }
