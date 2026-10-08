@@ -42,6 +42,18 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     pages_history: cfg!(feature = "whatsapp-web"),
 };
 
+/// Longest wait at shutdown for the sends in flight, before the client
+/// stops. With the link's own wait it stays under the app close limit, so a
+/// message sent just before the window closed still goes out.
+const SEND_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+// The send wait and the link stop fit in the app close limit, with time left
+// for `Stopped` to reach the app.
+const _: () = assert!(
+    SEND_DRAIN.as_millis() + link::SHUTDOWN_WAIT.as_millis()
+        < thinwire_protocol::APP_CLOSE_LIMIT.as_millis()
+);
+
 const STOP_TIMEOUT: &str =
     "The WhatsApp client did not stop in time. The app closes at its own limit.";
 
@@ -68,6 +80,42 @@ pub struct WhatsAppAdapter {
     /// The link lifecycle owner. Spawned on the first pairing. `None` means
     /// that no client ever ran. Tests put a fake backend here.
     link: Option<link::LinkHandle>,
+    /// Sends and retries whose network result has not come yet. Shutdown
+    /// waits for them, up to [`SEND_DRAIN`].
+    sends: SendsInFlight,
+}
+
+/// A count of the send tasks that still run.
+#[derive(Clone, Default)]
+struct SendsInFlight(Arc<tokio::sync::watch::Sender<usize>>);
+
+/// One running send. The count drops when the task ends or is dropped.
+struct SendGuard(Arc<tokio::sync::watch::Sender<usize>>);
+
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count = count.saturating_sub(1));
+    }
+}
+
+impl SendsInFlight {
+    fn begin(&self) -> SendGuard {
+        self.0.send_modify(|count| *count += 1);
+        SendGuard(Arc::clone(&self.0))
+    }
+
+    fn is_idle(&self) -> bool {
+        *self.0.borrow() == 0
+    }
+
+    /// `true` when every send ended within `limit`.
+    async fn wait_idle(&self, limit: std::time::Duration) -> bool {
+        let mut count = self.0.subscribe();
+        matches!(
+            tokio::time::timeout(limit, count.wait_for(|count| *count == 0)).await,
+            Ok(Ok(_))
+        )
+    }
 }
 
 impl WhatsAppAdapter {
@@ -78,6 +126,7 @@ impl WhatsAppAdapter {
             phone,
             session: session::Session::default(),
             link: None,
+            sends: SendsInFlight::default(),
         }
     }
 
@@ -372,7 +421,10 @@ impl WhatsAppAdapter {
         let session = self.session.clone();
         let events = events.clone();
         let owner = self.link.as_ref().map(|link| link.callbacks(generation));
+        // Counted before the spawn, so a shutdown right after sees it.
+        let running = self.sends.begin();
         tokio::spawn(async move {
+            let _running = running;
             let result = sender.send_text(&jid, &body).await;
             let revoked = session.finish_send(generation, &jid, &pending, result, &answer, &events);
             // The phone revoked the device, maybe with no LoggedOut callback.
@@ -431,20 +483,31 @@ impl ProtocolAdapter for WhatsAppAdapter {
         self.seed_status(&events);
     }
 
-    /// Stop pairing, close the linked-device bot and its SQLite session, then
-    /// `Stopped`. Without the spike feature nothing runs: `Stopped` at once.
+    /// Let the sends in flight finish (up to [`SEND_DRAIN`]), stop pairing,
+    /// close the linked-device bot and its SQLite session, then `Stopped`.
+    /// Without the spike feature nothing runs: `Stopped` at once.
     fn shutdown(&mut self, events: &EventTx) {
         self.risk_acknowledged = false;
-        let Some(link) = self.link.take() else {
+        let link = self.link.take();
+        if link.is_none() && self.sends.is_idle() {
             // No row comes after `Stopped` (Codex r4139029620).
             self.session.stop_mute_timer();
             thinwire_protocol::emit_stopped(events, ProtocolId::WhatsApp);
             return;
-        };
+        }
         let events = events.clone();
         let session = self.session.clone();
+        let sends = self.sends.clone();
         tokio::spawn(async move {
-            let stopped = link.shutdown().await;
+            // A message sent just before the close still goes out, and its
+            // answer comes before `Stopped`.
+            if !sends.wait_idle(SEND_DRAIN).await {
+                tracing::warn!("a whatsapp send did not finish before shutdown");
+            }
+            let stopped = match link {
+                Some(link) => link.shutdown().await,
+                None => true,
+            };
             // After the owner stops, no client event arms a new timer. No row
             // comes after `Stopped` (Codex r4139029620).
             session.stop_mute_timer();
@@ -1707,6 +1770,92 @@ mod tests {
                 Err(self.failure)
             })
         }
+    }
+
+    /// A message still sending when the app closes is not cut off: shutdown
+    /// waits for its result, and the answer comes before `Stopped`.
+    #[tokio::test]
+    async fn shutdown_waits_for_a_send_in_flight() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
+        let gated = Arc::new(GatedSender {
+            release: tokio::sync::Notify::new(),
+            failure: session::SendFailure::Unlinked,
+        });
+        adapter.session.begin(1);
+        assert!(adapter.session.attach_sender(1, Arc::clone(&gated) as _));
+        adapter.session.apply(history(), 1, &tx);
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        adapter.handle(send_hi(), &tx).expect("send");
+        let _pending = expect_pending(&mut rx).await;
+
+        adapter.shutdown(&tx);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::Stopped { .. })),
+            "no Stopped while the send runs"
+        );
+
+        gated.release.notify_one();
+        let mut seen = Vec::new();
+        while !seen
+            .iter()
+            .any(|event| matches!(event, AdapterEvent::Stopped { .. }))
+        {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("Stopped in time")
+                .expect("open channel");
+            seen.push(event);
+        }
+        let answer = seen
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::SendRejected { request: 1, .. }))
+            .expect("the send got its answer");
+        let stopped = seen
+            .iter()
+            .position(|event| matches!(event, AdapterEvent::Stopped { .. }))
+            .expect("Stopped");
+        assert!(
+            answer < stopped,
+            "the answer comes before Stopped: {seen:?}"
+        );
+    }
+
+    /// A send that never ends holds the shutdown only for [`SEND_DRAIN`].
+    #[tokio::test]
+    async fn shutdown_stops_waiting_for_a_hung_send() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
+        let gated = Arc::new(GatedSender {
+            release: tokio::sync::Notify::new(),
+            failure: session::SendFailure::Unlinked,
+        });
+        adapter.session.begin(1);
+        assert!(adapter.session.attach_sender(1, Arc::clone(&gated) as _));
+        adapter.session.apply(history(), 1, &tx);
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        adapter.handle(send_hi(), &tx).expect("send");
+        let _pending = expect_pending(&mut rx).await;
+
+        let start = std::time::Instant::now();
+        adapter.shutdown(&tx);
+        let stopped = loop {
+            let event = tokio::time::timeout(SEND_DRAIN * 2, rx.recv())
+                .await
+                .expect("Stopped in time")
+                .expect("open channel");
+            if matches!(event, AdapterEvent::Stopped { .. }) {
+                break std::time::Instant::now();
+            }
+        };
+        let waited = stopped - start;
+        assert!(waited >= SEND_DRAIN, "{waited:?}");
+        assert!(waited < SEND_DRAIN * 2, "{waited:?}");
     }
 
     /// Codex r4093192850: a send of link 1 that ends after link 2 connected

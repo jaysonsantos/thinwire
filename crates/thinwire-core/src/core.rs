@@ -497,12 +497,31 @@ impl Core {
         self.secrets.spawn_os_flush(&self.runtime);
     }
 
+    /// [`Self::flush_keychain`] for another thread, for example an exit
+    /// watchdog that runs while the frontend thread is stuck. The hook only
+    /// spawns the flush on the runtime; it does not wait for it.
+    pub fn keychain_flush_hook(&self) -> impl FnOnce() + Send + 'static {
+        let secrets = Arc::clone(&self.secrets);
+        let runtime = self.runtime.clone();
+        move || secrets.spawn_os_flush(&runtime)
+    }
+
     /// Every adapter answered [`Intent::Shutdown`] with `Stopped`.
     ///
     /// Frontend thread only. See [`Core`] "Threads".
     #[must_use]
     pub fn stopped(&self) -> bool {
         self.state.all_stopped()
+    }
+
+    /// A send or retry still waits for its adapter's answer, or a Telegram
+    /// send waits for the server's confirm. The app logs it when the close
+    /// deadline passes before the adapters stopped.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
+    #[must_use]
+    pub fn sending(&self) -> bool {
+        self.state.next_send_deadline().is_some()
     }
 
     /// Shut down and wait up to `timeout` for the clients to close.
@@ -2164,6 +2183,61 @@ mod tests {
         assert!(core.view().can_send(), "the chat is unlocked");
         assert_eq!(core.view().compose, "hello", "the text stays");
         assert!(core.send_wake.is_none(), "no send left, no wake");
+    }
+
+    /// Close while a message is sending. The send went to the host before
+    /// the Shutdown commands, so each adapter reads it first and finishes it
+    /// inside its own close limit. The text stays in the compose field until
+    /// the answer, and an answer that comes after Shutdown still settles it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_in_flight_at_close_reaches_the_adapter_first_and_still_settles() {
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        core.dispatch(Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            text: "hello".into(),
+        });
+        core.dispatch(Intent::SendDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+        });
+        assert!(core.sending());
+        core.dispatch(Intent::Shutdown);
+
+        let commands: Vec<AdapterCommand> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        let send_at = commands
+            .iter()
+            .position(|command| matches!(command, AdapterCommand::SendText { .. }))
+            .expect("a SendText");
+        let shutdown_at = commands
+            .iter()
+            .position(|command| matches!(command, AdapterCommand::Shutdown { .. }))
+            .expect("a Shutdown");
+        assert!(send_at < shutdown_at, "the send goes out before Shutdown");
+        let AdapterCommand::SendText { request, .. } = commands[send_at] else {
+            unreachable!("matched above");
+        };
+        assert!(core.sending(), "Shutdown does not drop the send");
+        assert_eq!(core.view().compose, "hello", "kept until the answer");
+
+        events_tx.send(answer(true, request)).expect("queue");
+        assert!(core.pump());
+        assert_eq!(
+            core.view().compose,
+            "",
+            "the accept after Shutdown settles it"
+        );
+        assert!(core.view().error.is_none());
     }
 
     /// Sends "hello" through a core with no adapter answers. Returns the
