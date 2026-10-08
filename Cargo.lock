@@ -1525,7 +1525,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1718,7 +1718,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2056,7 +2056,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3606,7 +3606,7 @@ dependencies = [
 [[package]]
 name = "libsignal-service"
 version = "0.1.0"
-source = "git+https://github.com/whisperfish/libsignal-service-rs?rev=9e6c08b8e6d413391831dc49065e5b05490d6c82#9e6c08b8e6d413391831dc49065e5b05490d6c82"
+source = "git+https://github.com/whisperfish/libsignal-service-rs?rev=7aa49095efc0627aa7a59c34ef9d98042c35731b#7aa49095efc0627aa7a59c34ef9d98042c35731b"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm",
@@ -4027,7 +4027,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4927,7 +4927,7 @@ dependencies = [
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=33dd1491130793390e356e15a5711f1e6ca14fdb#33dd1491130793390e356e15a5711f1e6ca14fdb"
+source = "git+https://github.com/whisperfish/presage?rev=26dd2dc472c4f834b91479da368dc40e8b7fb1ea#26dd2dc472c4f834b91479da368dc40e8b7fb1ea"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4949,7 +4949,7 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=33dd1491130793390e356e15a5711f1e6ca14fdb#33dd1491130793390e356e15a5711f1e6ca14fdb"
+source = "git+https://github.com/whisperfish/presage?rev=26dd2dc472c4f834b91479da368dc40e8b7fb1ea#26dd2dc472c4f834b91479da368dc40e8b7fb1ea"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5556,7 +5556,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5613,7 +5613,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6633,10 +6633,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8283,7 +8283,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
