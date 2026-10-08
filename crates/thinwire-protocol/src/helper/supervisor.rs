@@ -373,9 +373,10 @@ struct Supervisor {
     /// The app closes. No command and no restart after this.
     stopping: bool,
     replay: Replay,
-    /// A pairing start of the user that came while no helper ran: its
-    /// generation and the command, with its phone. It goes out one time,
-    /// after the replay of the start that it caused.
+    /// A pairing start of the user that no helper got yet: its generation
+    /// and the command, with its phone. It came while no helper ran, or the
+    /// helper ended before `Hello`. It goes out one time, after the replay
+    /// of the next start.
     wake_link: Option<(u64, WireCommand)>,
     /// Sends and retries with no answer yet: request id and chat. Each one
     /// gets `SendRejected` if the helper ends (ADR 0010 rule 4).
@@ -850,10 +851,11 @@ impl Supervisor {
             return;
         };
         let stable = link.started.elapsed() >= self.timing.stable_run;
+        self.keep_unsent_pairing(&link);
         // Dropping the link ends the process, if it still runs.
         drop(link);
         self.reject_open_sends();
-        if self.replay.is_empty() {
+        if self.replay.is_empty() && self.wake_link.is_none() {
             // The user has no link to keep: no restart.
             self.failures = 0;
             self.report(HelperState::Idle);
@@ -880,6 +882,24 @@ impl Supervisor {
             ),
         );
         self.restart_at = Some(Instant::now() + self.timing.backoff(self.failures));
+    }
+
+    /// A pairing start that waited for `Hello` never crossed the pipe. Keep
+    /// it, with its phone, for the next helper. Else the replay sends it
+    /// with no phone, and a pair-code pairing of the user becomes a QR
+    /// pairing though the helper never got the number.
+    fn keep_unsent_pairing(&mut self, link: &Link) {
+        if link.greeted {
+            return;
+        }
+        let unsent = link.held.iter().rev().find_map(|command| match command {
+            WireCommand::BeginLink { generation, .. } => Some((*generation, command.clone())),
+            _ => None,
+        });
+        if let Some(unsent) = unsent {
+            self.replay.link = None;
+            self.wake_link = Some(unsent);
+        }
     }
 
     /// Stop for good, until the user clicks Restart or passes the gate

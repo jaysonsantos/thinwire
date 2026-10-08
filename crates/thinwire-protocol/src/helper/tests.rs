@@ -92,6 +92,9 @@ enum Mode {
     SlowDeath,
     /// As [`Mode::SlowDeath`], but the process never ends.
     NeverDies,
+    /// The first process ends with no `Hello`. The next ones are
+    /// [`Mode::Serve`].
+    FirstDiesBeforeHello,
 }
 
 /// What the test set up, and what the fake helpers did.
@@ -201,7 +204,8 @@ async fn fake_process(lab: Arc<Lab>, stdin: DuplexStream, mut stdout: DuplexStre
         protocols: vec![WireProtocol::WhatsApp],
     };
     match lab.mode() {
-        Mode::Serve | Mode::DieOnBegin => {
+        Mode::FirstDiesBeforeHello if lab.launches() == 1 => {}
+        Mode::Serve | Mode::DieOnBegin | Mode::FirstDiesBeforeHello => {
             let phone = Arc::new(WhatsAppPhoneVault::new());
             let adapter = GatedFake::new(Arc::clone(&lab), Arc::clone(&phone));
             let config = ServeConfig {
@@ -613,6 +617,41 @@ async fn a_restart_does_not_send_the_phone_again() {
     };
     assert_eq!(code.reveal(), "qr:none", "the replay carries no phone");
     probe.until_account(AccountState::Linked).await;
+}
+
+/// PR #256 review: a pairing start that waited for `Hello` never crossed
+/// the pipe. If that helper ends, the next one gets the pairing with its
+/// phone. A pair-code pairing does not become a QR pairing without a word.
+#[tokio::test]
+async fn a_pairing_that_the_helper_never_got_keeps_its_phone() {
+    let mut probe = Probe::start(Mode::FirstDiesBeforeHello);
+    probe.phone.set_phone(PHONE);
+    probe.pair(1);
+    probe.until_helper(HelperState::Restarting).await;
+    let qr = probe
+        .until("QR from the second helper", |event| {
+            matches!(event, AdapterEvent::WhatsAppQr { generation: 1, .. })
+        })
+        .await;
+    let AdapterEvent::WhatsAppQr { code, .. } = qr else {
+        unreachable!("matched above");
+    };
+    assert_eq!(code.reveal(), format!("qr:{PHONE}"));
+    probe.until_account(AccountState::Linked).await;
+    assert_eq!(probe.lab.launches(), 2);
+
+    // That start crossed the pipe. A later restart sends no phone.
+    probe.lab.crash.notify_one();
+    probe.until_helper(HelperState::Restarting).await;
+    let replayed = probe
+        .until("QR of the replayed pairing", |event| {
+            matches!(event, AdapterEvent::WhatsAppQr { generation: 1, .. })
+        })
+        .await;
+    let AdapterEvent::WhatsAppQr { code, .. } = replayed else {
+        unreachable!("matched above");
+    };
+    assert_eq!(code.reveal(), "qr:none");
 }
 
 /// A pairing start of the user while no helper runs starts the helper. It
