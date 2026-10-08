@@ -78,6 +78,8 @@ pub struct HelperTiming {
     /// Longest wait for a killed helper process to end, before a new one
     /// starts.
     pub kill_wait: Duration,
+    /// Longest wait for the last lines of a helper process that ended.
+    pub drain_wait: Duration,
 }
 
 impl HelperTiming {
@@ -91,6 +93,7 @@ impl HelperTiming {
         stable_run: Duration::from_secs(60),
         stop_wait: HELPER_STOP_WAIT,
         kill_wait: Duration::from_secs(5),
+        drain_wait: Duration::from_secs(1),
     };
 
     /// The wait before restart number `failures` (1 for the first one).
@@ -342,6 +345,9 @@ struct Link {
     held: Vec<WireCommand>,
     /// Requests with no `Ack` yet, oldest first, with their send time.
     unacked: VecDeque<(u64, Instant)>,
+    /// The process ended, and its last lines can still be on the way. The
+    /// end of the output, or this time, ends the link.
+    drain_deadline: Option<Instant>,
 }
 
 struct Supervisor {
@@ -415,12 +421,14 @@ impl Supervisor {
             .filter(|link| link.greeted && self.reported == Some(HelperState::Running))
             .and_then(|link| link.unacked.front())
             .map(|(_, sent)| *sent + self.timing.busy_after);
+        let drain = link.and_then(|link| link.drain_deadline);
         [
             self.restart_at,
             self.stop_deadline,
             self.old_exit_deadline,
             hello,
             busy,
+            drain,
         ]
         .into_iter()
         .flatten()
@@ -451,6 +459,11 @@ impl Supervisor {
         let Some(link) = &self.link else {
             return;
         };
+        if link.drain_deadline.is_some_and(|at| at <= now) {
+            // The process ended, and its output did not end in time.
+            self.on_helper_gone();
+            return;
+        }
         if !link.greeted && link.hello_deadline <= now {
             tracing::warn!(protocol = %self.protocol, "helper sent no Hello in time");
             self.helper_ended();
@@ -477,9 +490,14 @@ impl Supervisor {
             }
             Msg::Exited { run } => {
                 self.alive.remove(&run);
-                if self.is_current(run) {
+                if let Some(link) = self.link.as_mut().filter(|link| link.run == run) {
+                    // The exit can come before the last lines of the
+                    // process, for example `Refused`. Those lines say why
+                    // it ended. So the end of its output ends the link, not
+                    // the exit. The output ends at once after the exit.
                     tracing::info!(protocol = %self.protocol, "helper process ended");
-                    self.on_helper_gone();
+                    link.drain_deadline
+                        .get_or_insert(Instant::now() + self.timing.drain_wait);
                 }
                 // A start that waited for this process can go now.
                 if self.start_waits && self.alive.is_empty() {
@@ -739,6 +757,7 @@ impl Supervisor {
             hello_deadline: now + self.timing.hello_wait,
             held: self.start_commands(),
             unacked: VecDeque::new(),
+            drain_deadline: None,
         });
         self.report(HelperState::Busy);
     }

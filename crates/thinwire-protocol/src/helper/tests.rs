@@ -62,6 +62,7 @@ const TIMING: HelperTiming = HelperTiming {
     stable_run: Duration::from_secs(60),
     stop_wait: Duration::from_millis(300),
     kill_wait: Duration::from_secs(2),
+    drain_wait: Duration::from_millis(500),
 };
 
 /// How long the fake process of [`Mode::SlowDeath`] takes to end. Longer
@@ -95,6 +96,11 @@ enum Mode {
     /// The first process ends with no `Hello`. The next ones are
     /// [`Mode::Serve`].
     FirstDiesBeforeHello,
+    /// The process ends, and the app learns it before the last line of the
+    /// process comes: `Refused { SessionInUse }`.
+    ExitBeforeRefusal,
+    /// The process ends, but its output never does.
+    ExitWithOpenOutput,
 }
 
 /// What the test set up, and what the fake helpers did.
@@ -173,6 +179,17 @@ impl HelperLauncher for FakeLauncher {
         let (helper_out, stdout) = tokio::io::duplex(PIPE_BYTES);
         let (exited_tx, exited) = oneshot::channel();
         let (kill, killed) = oneshot::channel::<()>();
+        if matches!(mode, Mode::ExitBeforeRefusal | Mode::ExitWithOpenOutput) {
+            tokio::spawn(exit_first(lab, mode, helper_out, exited_tx, killed));
+            return Ok(HelperProcess {
+                stdin: Box::new(stdin),
+                stdout: Box::new(stdout),
+                stderr: None,
+                exited,
+                kill,
+                pid: None,
+            });
+        }
         tokio::spawn(async move {
             tokio::select! {
                 () = fake_process(Arc::clone(&lab), helper_in, helper_out) => {}
@@ -198,6 +215,29 @@ impl HelperLauncher for FakeLauncher {
             pid: None,
         })
     }
+}
+
+/// A process whose exit the app sees before its output ends.
+async fn exit_first(
+    lab: Arc<Lab>,
+    mode: Mode,
+    mut stdout: DuplexStream,
+    exited: oneshot::Sender<()>,
+    killed: oneshot::Receiver<()>,
+) {
+    lab.ended.fetch_add(1, Ordering::SeqCst);
+    let _ = exited.send(());
+    if mode == Mode::ExitWithOpenOutput {
+        // The pipe stays open until the app drops the process.
+        let _ = killed.await;
+        return;
+    }
+    // The last line is still in the pipe when the exit arrives.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let line = HelperLine::Refused {
+        reason: HelperRefusal::SessionInUse,
+    };
+    let _ = write_line(&mut stdout, &line).await;
 }
 
 async fn fake_process(lab: Arc<Lab>, stdin: DuplexStream, mut stdout: DuplexStream) {
@@ -236,6 +276,8 @@ async fn fake_process(lab: Arc<Lab>, stdin: DuplexStream, mut stdout: DuplexStre
         Mode::SlowDeath | Mode::NeverDies => {
             let _ = write_line(&mut stdout, &hello(PROTOCOL_VERSION)).await;
         }
+        // The launcher runs these two modes itself (`exit_first`).
+        Mode::ExitBeforeRefusal | Mode::ExitWithOpenOutput => {}
         Mode::Stall | Mode::IgnoreShutdown => {
             let _ = write_line(&mut stdout, &hello(PROTOCOL_VERSION)).await;
             if lab.mode() == Mode::Stall {
@@ -1131,6 +1173,37 @@ async fn a_helper_whose_session_is_in_use_does_not_restart() {
         .await;
     tokio::time::sleep(NO_START_WAIT).await;
     assert_eq!(probe.lab.launches(), 1);
+}
+
+/// PR #256 review: the real helper writes `Refused` and ends at once. The
+/// app can learn of the exit before it reads that line. It reads the output
+/// to its end first, so the row gets the fault with the right fix, and no
+/// restart loop starts.
+#[tokio::test]
+async fn a_refusal_that_comes_after_the_exit_still_counts() {
+    let mut probe = Probe::start(Mode::ExitBeforeRefusal);
+    probe.pair(1);
+    probe
+        .until_helper(HelperState::Stopped(HelperFault::SessionInUse))
+        .await;
+    tokio::time::sleep(NO_START_WAIT).await;
+    assert_eq!(probe.lab.launches(), 1, "no restart for a refusal");
+    assert!(
+        !probe.helper_states().contains(&HelperState::Restarting),
+        "the exit was not taken for a crash"
+    );
+}
+
+/// A process that ended but whose output never ends is still a helper that
+/// ended: after a short wait the supervisor starts it again.
+#[tokio::test]
+async fn an_exit_with_an_output_that_stays_open_is_a_failure() {
+    let mut probe = Probe::start(Mode::ExitWithOpenOutput);
+    probe.pair(1);
+    probe.until_helper(HelperState::Restarting).await;
+    probe.lab.set_mode(Mode::Serve);
+    probe.until_account(AccountState::Linked).await;
+    assert_eq!(probe.lab.overlaps(), 0);
 }
 
 /// #246 UX: a slow helper shows a busy row, and the caller never waits.
