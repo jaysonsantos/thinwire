@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! WhatsApp unofficial linked-device adapter (ZapFast / whatsapp-rust).
+//! WhatsApp unofficial linked-device adapter (whatsapp-rust).
 //!
 //! Experimental. ToS / ban risk. Feature `whatsapp-web` may pair only after
 //! the UI has accepted the full-screen ban gate. Secrets never travel on
