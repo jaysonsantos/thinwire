@@ -264,11 +264,11 @@ pub(crate) fn failed(ui: &mut egui::Ui, path: &Path) -> Option<FailedChoice> {
                 "thinwire runs one copy at a time, so two copies never open the same chat data.",
             );
             ui.add_space(6.0);
-            ui.label(
-                "Close the other thinwire window, wait a few seconds, and try again. If no \
-                 thinwire window is open, end the thinwire process in your system monitor, \
-                 then try again.",
-            );
+            ui.label(concat!(
+                "Close the other thinwire window, wait a few seconds, and try again. ",
+                "If no thinwire window is open, end the thinwire process in your ",
+                "system monitor, then try again.",
+            ));
             ui.add_space(4.0);
             ui.small(format!("Lock file: {}", path.display()));
             ui.add_space(8.0);
