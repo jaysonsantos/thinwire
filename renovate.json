@@ -8,8 +8,8 @@
       "groupName": "all non-major updates"
     },
     {
-      "description": "whisperfish/presage crates share one git revision. Bumping only one duplicates presage and libsignal-service in Cargo.lock.",
-      "matchPackageNames": ["presage", "presage-store-sqlite"],
+      "description": "whisperfish/presage crates share one git revision. Bumping only one duplicates presage and libsignal-service in Cargo.lock. For a rev-pinned Cargo git dependency the packageName is the git URL; the crate name is the depName.",
+      "matchDepNames": ["presage", "presage-store-sqlite"],
       "groupName": "whisperfish/presage"
     },
     {
