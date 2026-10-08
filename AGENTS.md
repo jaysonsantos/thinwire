@@ -26,7 +26,7 @@
 - Helper process rules (`0013`, `0012` section 2 and 4):
     - The app talks to a helper only through `crates/thinwire-ipc`: one JSON object per line on the helper's stdin and stdout. A change that an older peer cannot read must raise `PROTOCOL_VERSION`.
     - `HelperAdapter` (`thinwire-protocol`, module `helper`) is the only code that starts and stops a helper. It holds one process at most. `handle` only queues a message, so no caller waits on the pipe.
-    - The helper starts when the user accepts the gate. It stops when the app closes. If it ends, the adapter starts it again (1 s, 2 s, 4 s, 8 s) and sends the gate and the pairing again. After 5 failures the account row shows "Helper stopped." and Restart.
+    - The helper starts when the user accepts the gate. It stops when the app closes. If it ends, the adapter starts it again (1 s, 2 s, 4 s, 8 s) and sends the gate and the pairing again. After 5 failures the account row shows "Helper stopped." and Restart. Restart links a linked account again. A pairing that did not link ends at that stop: the user starts it again.
     - One helper process holds the lock file of the session folder. A second process refuses to run.
     - The phone number for a pair code crosses the pipe one time, in the `BeginLink` of the user. A restart sends the pairing again with no phone. `Debug` of a wire value shows no user data. Neither side logs message text, phone numbers, QR data, or pair codes.
     - Only the wire protocol goes to the helper's stdout. Logs go to stderr.

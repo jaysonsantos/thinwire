@@ -839,7 +839,8 @@ async fn open_sends_are_rejected_when_the_helper_dies() {
 
 /// ADR 0013 decision 4: after the last failed start the supervisor stops.
 /// The row gets `Stopped`, the account unlinks, and no helper starts until
-/// the user clicks Restart. Restart starts it, and the account links again.
+/// the user clicks Restart. Restart starts the helper. The pairing did not
+/// link, so it ended: the user starts it again.
 #[tokio::test]
 async fn after_the_last_failure_the_helper_stays_stopped_until_restart() {
     let mut probe = Probe::start(Mode::DieOnBegin);
@@ -867,8 +868,69 @@ async fn after_the_last_failure_the_helper_stays_stopped_until_restart() {
     probe.lab.set_mode(Mode::Serve);
     probe.send(AdapterCommand::RestartHelper { protocol: PROTOCOL });
     probe.until_helper(HelperState::Running).await;
+    assert_eq!(probe.lab.launches(), TIMING.max_failures + 1);
+    probe.send(AdapterCommand::WhatsAppBeginLink { generation: 2 });
     probe.until_account(AccountState::Linked).await;
     assert_eq!(probe.lab.launches(), TIMING.max_failures + 1);
+}
+
+/// #246 UX: Restart starts the helper again, and an account that was linked
+/// links again from its session store.
+#[tokio::test]
+async fn restart_links_a_linked_account_again() {
+    let mut probe = Probe::start(Mode::Serve);
+    probe.pair(1);
+    probe.until_account(AccountState::Linked).await;
+    // The next helper has another wire version: the supervisor stops.
+    probe.lab.set_mode(Mode::WrongVersion);
+    probe.lab.crash.notify_one();
+    probe
+        .until_helper(HelperState::Stopped(HelperFault::VersionMismatch))
+        .await;
+
+    probe.lab.set_mode(Mode::Serve);
+    probe.send(AdapterCommand::RestartHelper { protocol: PROTOCOL });
+    probe.until_helper(HelperState::Running).await;
+    probe.until_account(AccountState::Linked).await;
+}
+
+/// PR #256 review: a pairing that stopped for good before it linked is over.
+/// Restart starts the helper, but it does not send that pairing again with
+/// no phone: a pair-code pairing never comes back as a QR pairing. The user
+/// starts the pairing again, with the phone.
+#[tokio::test]
+async fn restart_does_not_send_a_pairing_that_did_not_link() {
+    let mut probe = Probe::start(Mode::WrongVersion);
+    probe.phone.set_phone(PHONE);
+    probe.pair(1);
+    probe
+        .until_helper(HelperState::Stopped(HelperFault::VersionMismatch))
+        .await;
+
+    probe.lab.set_mode(Mode::Serve);
+    probe.send(AdapterCommand::RestartHelper { protocol: PROTOCOL });
+    probe.until_helper(HelperState::Running).await;
+    probe.settle().await;
+    assert!(
+        !probe.saw(|event| matches!(event, AdapterEvent::WhatsAppQr { .. })),
+        "no pairing without a new start of the user"
+    );
+    assert!(!probe.saw(|event| *event
+        == AdapterEvent::Account {
+            protocol: PROTOCOL,
+            state: AccountState::Linked,
+        }));
+
+    probe.send(AdapterCommand::WhatsAppBeginLink { generation: 2 });
+    let qr = probe
+        .until("QR of the new pairing", |event| {
+            matches!(event, AdapterEvent::WhatsAppQr { generation: 2, .. })
+        })
+        .await;
+    let AdapterEvent::WhatsAppQr { code, .. } = qr else {
+        unreachable!("matched above");
+    };
+    assert_eq!(code.reveal(), format!("qr:{PHONE}"));
 }
 
 /// A linked account whose helper stops for good is unlinked, so the shell

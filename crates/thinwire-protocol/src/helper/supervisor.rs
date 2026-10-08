@@ -209,6 +209,7 @@ impl ProtocolAdapter for HelperAdapter {
             wake_link: None,
             sends: HashMap::new(),
             account: AccountState::Unlinked,
+            linked_once: false,
             next_id: 1,
         };
         if !supervisor.launcher.installed() {
@@ -383,6 +384,10 @@ struct Supervisor {
     sends: HashMap<u64, String>,
     /// The last link state that the helper reported.
     account: AccountState,
+    /// The helper reported `Linked` for the pairing in the replay: the
+    /// session store has a device. A restart then links again from the
+    /// store, with no phone and no code.
+    linked_once: bool,
     next_id: u64,
 }
 
@@ -634,6 +639,7 @@ impl Supervisor {
                 // The user gave up the link: no restart, and no account.
                 self.restart_at = None;
                 self.wake_link = None;
+                self.linked_once = false;
                 if self.reported == Some(HelperState::Restarting) {
                     self.report(HelperState::Idle);
                 }
@@ -834,7 +840,14 @@ impl Supervisor {
             return;
         };
         match &event {
-            AdapterEvent::Account { state, .. } => self.account = *state,
+            AdapterEvent::Account { state, .. } => {
+                self.account = *state;
+                match state {
+                    AccountState::Linked => self.linked_once = true,
+                    AccountState::Unlinked => self.linked_once = false,
+                    AccountState::Linking => {}
+                }
+            }
             AdapterEvent::SendAccepted { request, .. }
             | AdapterEvent::SendRejected { request, .. } => {
                 self.sends.remove(request);
@@ -904,10 +917,19 @@ impl Supervisor {
 
     /// Stop for good, until the user clicks Restart or passes the gate
     /// again.
+    ///
+    /// A pairing that did not link ends here: the shell ends it too, and the
+    /// user starts it again. So Restart never sends that pairing again, and
+    /// a pair-code pairing never comes back as a QR pairing. An account that
+    /// was linked keeps its pairing in the replay: Restart links it again
+    /// from the session store.
     fn stop_for(&mut self, fault: HelperFault) {
         self.link = None;
         self.restart_at = None;
         self.wake_link = None;
+        if !self.linked_once {
+            self.replay.link = None;
+        }
         self.reject_open_sends();
         if self.account != AccountState::Unlinked {
             self.account = AccountState::Unlinked;
