@@ -1,6 +1,7 @@
 //! eframe application: draws the core view and sends user intents to the core.
 
 mod auth;
+mod dock;
 #[cfg(test)]
 mod inbox_keys;
 mod motion;
@@ -431,6 +432,9 @@ impl ThinwireApp {
                     let flush = core.keychain_flush_hook();
                     arm_exit_watchdog(watchdog, flush, deadline);
                 });
+                // The Dock icon and Cmd-Tab entry go now, not at the exit.
+                // `logic()` runs on the main thread, which AppKit needs.
+                dock::hide_icon();
             }
         }
         if self.close_gate.poll(Instant::now(), self.core.stopped()) {
