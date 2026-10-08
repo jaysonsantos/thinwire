@@ -45,9 +45,8 @@ const _: () =
 /// [`EXIT_FLOOR`]. The single-instance lock stays held until that exit, so
 /// [`startup::LOCK_WAIT`] includes this whole interval.
 const WATCHDOG_LOCK_HOLD: Duration = WATCHDOG_MARGIN.saturating_add(EXIT_FLOOR);
-const _: () = assert!(
-    WATCHDOG_LOCK_HOLD.as_millis() == WATCHDOG_MARGIN.as_millis() + EXIT_FLOOR.as_millis()
-);
+const _: () =
+    assert!(WATCHDOG_LOCK_HOLD.as_millis() == WATCHDOG_MARGIN.as_millis() + EXIT_FLOOR.as_millis());
 /// Exit code when the watchdog ends the process. The user asked to close,
 /// so it is a normal exit.
 const WATCHDOG_EXIT_CODE: i32 = 0;
@@ -218,6 +217,34 @@ fn sleep_until(at: Instant) {
             break;
         }
         std::thread::sleep(left);
+    }
+}
+
+/// The first close: one `Shutdown`, then the exit watchdog.
+fn begin_first_close(
+    core: &mut Core,
+    deadline: Instant,
+    start_watchdog: impl FnOnce(&mut Core, Instant),
+) {
+    core.dispatch(Intent::Shutdown);
+    start_watchdog(core, deadline);
+}
+
+/// Start the exit watchdog once. `flush` is the keychain hook from the core.
+/// The watchdog sleeps [`EXIT_FLOOR`] after `flush` returns, before it exits.
+fn arm_exit_watchdog(
+    armed: &mut bool,
+    flush: impl FnOnce() + Send + 'static,
+    close_deadline: Instant,
+) {
+    if std::mem::replace(armed, true) {
+        return;
+    }
+    let started = spawn_exit_watchdog(close_deadline, flush, || {
+        std::process::exit(WATCHDOG_EXIT_CODE);
+    });
+    if let Err(error) = started {
+        tracing::warn!(%error, "the exit watchdog did not start");
     }
 }
 
@@ -394,10 +421,16 @@ impl ThinwireApp {
                 ctx.send_viewport_cmd(command);
             }
             if action == CloseAction::HoldAndShutdown {
-                let deadline = self.close_gate.deadline().unwrap_or(now + SHUTDOWN_TIMEOUT);
+                let deadline = self
+                    .close_gate
+                    .deadline()
+                    .expect("HoldAndShutdown sets the close deadline");
                 self.exit_deadline = Some(deadline);
-                self.core.dispatch(Intent::Shutdown);
-                self.start_watchdog(deadline);
+                let watchdog = &mut self.watchdog;
+                begin_first_close(&mut self.core, deadline, |core, deadline| {
+                    let flush = core.keychain_flush_hook();
+                    arm_exit_watchdog(watchdog, flush, deadline);
+                });
             }
         }
         let stopped = self.core.stopped();
@@ -408,23 +441,6 @@ impl ThinwireApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             // The next pass reads the close: do not wait for the idle tick.
             ctx.request_repaint();
-        }
-    }
-
-    /// Start the exit watchdog once. Before the exit it starts the keychain
-    /// flush, as `finish_exit` does. The watchdog then waits [`EXIT_FLOOR`].
-    fn start_watchdog(&mut self, close_deadline: Instant) {
-        if std::mem::replace(&mut self.watchdog, true) {
-            return;
-        }
-        let flush = self.core.keychain_flush_hook();
-        let started = spawn_exit_watchdog(
-            close_deadline,
-            flush,
-            || std::process::exit(WATCHDOG_EXIT_CODE),
-        );
-        if let Err(error) = started {
-            tracing::warn!(%error, "the exit watchdog did not start");
         }
     }
 }
@@ -610,11 +626,26 @@ mod tests {
             ],
             "Wayland cannot hide a window: minimize it"
         );
-        let src = include_str!("mod.rs");
-        let handle = &src[src.find("fn handle_close(").expect("handle_close")..];
-        let handle = &handle[..handle.find("\n    }\n").expect("end")];
-        assert!(handle.contains("self.core.dispatch(Intent::Shutdown);"));
-        assert!(handle.contains("self.start_watchdog(deadline);"));
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut core = Core::new(
+            runtime.handle(),
+            CoreConfig::new(Settings::in_memory()).with_memory_secrets(),
+        );
+        let deadline = start + SHUTDOWN_TIMEOUT;
+        let mut watched = None;
+        begin_first_close(&mut core, deadline, |core, at| {
+            assert_eq!(
+                core.view().status_text,
+                "Closing…",
+                "Shutdown is dispatched before the watchdog starts"
+            );
+            watched = Some(at);
+        });
+        assert_eq!(watched, Some(deadline), "the watchdog starts once");
     }
 
     #[test]
