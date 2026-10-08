@@ -206,6 +206,7 @@ impl ProtocolAdapter for HelperAdapter {
             stop_deadline: None,
             stopping: false,
             replay: Replay::default(),
+            wake_link: None,
             sends: HashMap::new(),
             account: AccountState::Unlinked,
             next_id: 1,
@@ -298,7 +299,10 @@ impl std::fmt::Display for Ended {
 
 /// What the supervisor sends again after a restart, so the account links
 /// again. The helper keeps the session store, so no new pairing is necessary
-/// for a linked account.
+/// for a linked account. The phone of a pair-code pairing is not here: it
+/// crosses the pipe one time, with the pairing start of the user (ADR 0012
+/// "Secrets on the wire"). A pairing that a restart sends again has no
+/// phone, so the helper asks for a QR code.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Replay {
     /// The user accepted the gate.
@@ -369,6 +373,10 @@ struct Supervisor {
     /// The app closes. No command and no restart after this.
     stopping: bool,
     replay: Replay,
+    /// A pairing start of the user that came while no helper ran: its
+    /// generation and the command, with its phone. It goes out one time,
+    /// after the replay of the start that it caused.
+    wake_link: Option<(u64, WireCommand)>,
     /// Sends and retries with no answer yet: request id and chat. Each one
     /// gets `SendRejected` if the helper ends (ADR 0010 rule 4).
     sends: HashMap<u64, String>,
@@ -502,21 +510,31 @@ impl Supervisor {
         }) else {
             return;
         };
-        self.replay.note(&wire);
         if self.link.is_some() {
+            self.replay.note(&wire);
             self.request(wire);
             return;
         }
-        // The gate and a pairing start wake the helper. `launch` sends
-        // them from the replay, with every command the user sent before.
-        if matches!(
-            wire,
-            WireCommand::AcknowledgeGate | WireCommand::BeginLink { .. }
-        ) {
-            self.failures = 0;
-            self.launch();
-        } else {
-            self.answer_without_helper(&wire);
+        // The gate and a pairing start wake the helper.
+        match wire {
+            // `launch` sends the gate from the replay.
+            WireCommand::AcknowledgeGate => {
+                self.replay.note(&wire);
+                self.failures = 0;
+                self.launch();
+            }
+            // This pairing takes the place of the one in the replay.
+            // `launch` sends it after the replay, with its phone.
+            WireCommand::BeginLink { generation, .. } => {
+                self.replay.link = None;
+                self.wake_link = Some((generation, wire));
+                self.failures = 0;
+                self.launch();
+            }
+            other => {
+                self.replay.note(&other);
+                self.answer_without_helper(&other);
+            }
         }
     }
 
@@ -614,6 +632,7 @@ impl Supervisor {
             WireCommand::CancelLink | WireCommand::Disconnect => {
                 // The user gave up the link: no restart, and no account.
                 self.restart_at = None;
+                self.wake_link = None;
                 if self.reported == Some(HelperState::Restarting) {
                     self.report(HelperState::Idle);
                 }
@@ -662,6 +681,7 @@ impl Supervisor {
         self.start_waits = false;
         self.old_exit_deadline = None;
         if !self.launcher.installed() {
+            self.wake_link = None;
             self.report(HelperState::Missing);
             emit_status(
                 &self.events,
@@ -710,23 +730,29 @@ impl Supervisor {
             _kill: kill,
             greeted: false,
             hello_deadline: now + self.timing.hello_wait,
-            held: self.replay_commands(),
+            held: self.start_commands(),
             unacked: VecDeque::new(),
         });
         self.report(HelperState::Busy);
     }
 
-    fn replay_commands(&self) -> Vec<WireCommand> {
+    /// The first commands of a new helper: the replay, then the pairing
+    /// start of the user that woke it, if one did.
+    fn start_commands(&mut self) -> Vec<WireCommand> {
         let mut commands = Vec::new();
         if self.replay.acknowledged {
             commands.push(WireCommand::AcknowledgeGate);
         }
         if let Some(generation) = self.replay.link {
-            let phone = self.phone.as_ref().and_then(|vault| vault.phone());
+            // No phone: it crossed the pipe with the first start.
             commands.push(WireCommand::BeginLink {
                 generation,
-                phone: phone.map(thinwire_ipc::SecretText::new),
+                phone: None,
             });
+        }
+        if let Some((generation, command)) = self.wake_link.take() {
+            self.replay.link = Some(generation);
+            commands.push(command);
         }
         commands
     }
@@ -861,6 +887,7 @@ impl Supervisor {
     fn stop_for(&mut self, fault: HelperFault) {
         self.link = None;
         self.restart_at = None;
+        self.wake_link = None;
         self.reject_open_sends();
         if self.account != AccountState::Unlinked {
             self.account = AccountState::Unlinked;
@@ -895,6 +922,7 @@ impl Supervisor {
         }
         self.stopping = true;
         self.restart_at = None;
+        self.wake_link = None;
         self.start_waits = false;
         self.old_exit_deadline = None;
         let Some(link) = &self.link else {

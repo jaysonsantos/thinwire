@@ -583,6 +583,77 @@ async fn the_phone_crosses_only_with_the_pairing_start() {
     assert_eq!(code.reveal(), "qr:none", "the old phone is not used again");
 }
 
+/// PR #256 review: the phone crosses the pipe one time. A restart sends the
+/// pairing again, so the account links again from its session store, but
+/// with no phone.
+#[tokio::test]
+async fn a_restart_does_not_send_the_phone_again() {
+    let mut probe = Probe::start(Mode::Serve);
+    probe.phone.set_phone(PHONE);
+    probe.pair(1);
+    probe
+        .until("QR with the phone", |event| {
+            matches!(event, AdapterEvent::WhatsAppQr { code, generation: 1 }
+                if code.reveal() == format!("qr:{PHONE}"))
+        })
+        .await;
+    probe.until_account(AccountState::Linked).await;
+
+    // The phone is still in the vault of the app.
+    assert_eq!(probe.phone.phone().as_deref(), Some(PHONE));
+    probe.lab.crash.notify_one();
+    probe.until_helper(HelperState::Restarting).await;
+    let replayed = probe
+        .until("QR of the replayed pairing", |event| {
+            matches!(event, AdapterEvent::WhatsAppQr { generation: 1, .. })
+        })
+        .await;
+    let AdapterEvent::WhatsAppQr { code, .. } = replayed else {
+        unreachable!("matched above");
+    };
+    assert_eq!(code.reveal(), "qr:none", "the replay carries no phone");
+    probe.until_account(AccountState::Linked).await;
+}
+
+/// A pairing start of the user while no helper runs starts the helper. It
+/// is a new start, so it keeps its phone, and it takes the place of the old
+/// pairing in the replay.
+#[tokio::test]
+async fn a_pairing_start_that_wakes_the_helper_keeps_its_phone() {
+    let mut probe = Probe::start(Mode::Serve);
+    probe.pair(1);
+    probe.until_account(AccountState::Linked).await;
+    // The next helper has another wire version: the supervisor stops.
+    probe.lab.set_mode(Mode::WrongVersion);
+    probe.lab.crash.notify_one();
+    probe
+        .until_helper(HelperState::Stopped(HelperFault::VersionMismatch))
+        .await;
+    probe.settle().await;
+    let seen = probe.seen.len();
+
+    probe.lab.set_mode(Mode::Serve);
+    probe.phone.set_phone(PHONE);
+    probe.send(AdapterCommand::WhatsAppBeginLink { generation: 2 });
+    let qr = probe
+        .until("QR of the new pairing", |event| {
+            matches!(event, AdapterEvent::WhatsAppQr { generation: 2, .. })
+        })
+        .await;
+    let AdapterEvent::WhatsAppQr { code, .. } = qr else {
+        unreachable!("matched above");
+    };
+    assert_eq!(code.reveal(), format!("qr:{PHONE}"));
+    probe.until_account(AccountState::Linked).await;
+    probe.settle().await;
+    assert!(
+        !probe.seen[seen..]
+            .iter()
+            .any(|event| matches!(event, AdapterEvent::WhatsAppQr { generation: 1, .. })),
+        "the old pairing is not sent again next to the new one"
+    );
+}
+
 /// ADR 0013: the helper starts at the gate, not at app start. Before that,
 /// every command of the shell still ends (ADR 0010 rules 4, 5 and 9).
 #[tokio::test]
