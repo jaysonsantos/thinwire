@@ -29,7 +29,7 @@ tracing.workspace = true
 presage = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb", optional = true, default-features = false }
 # Default features build SQLCipher and need OpenSSL headers. The session file
 # is mode 0700 under app-data, same as the old sled directory. No passphrase.
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb", optional = true, default-features = false }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "26dd2dc472c4f834b91479da368dc40e8b7fb1ea", optional = true, default-features = false }
 # Bundled SQLite, same 0.36 line as WhatsApp. A signal-local build does not
 # need a system libsqlite. SQLCipher stays off (no OpenSSL headers).
 libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
