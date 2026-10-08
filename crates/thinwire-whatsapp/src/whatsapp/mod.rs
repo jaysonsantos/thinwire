@@ -532,7 +532,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
         let link = self.link.take();
         if link.is_none() && self.sends.is_idle() {
             // No row comes after `Stopped` (Codex r4139029620).
-            self.session.stop_mute_timer();
+            self.session.close();
             thinwire_protocol::emit_stopped(events, ProtocolId::WhatsApp);
             return;
         }
@@ -544,7 +544,8 @@ impl ProtocolAdapter for WhatsAppAdapter {
             // answer comes before `Stopped`.
             if !sends.wait_idle(SEND_DRAIN).await {
                 // The client stops now. Each send that still runs is named
-                // (chat id, no text). Its result, if any, still answers it.
+                // (redacted chat id, no text). A result that comes before
+                // `Stopped` still answers it; a later one is dropped.
                 for chat in sends.chats() {
                     tracing::warn!(chat = %thinwire_protocol::LogChatId(&chat), "whatsapp send still running at shutdown; stopping the client");
                 }
@@ -554,8 +555,9 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 None => true,
             };
             // After the owner stops, no client event arms a new timer. No row
-            // comes after `Stopped` (Codex r4139029620).
-            session.stop_mute_timer();
+            // comes after `Stopped` (Codex r4139029620). A send that is still
+            // running is sealed: its late result publishes nothing (#238).
+            session.close();
             Self::finish_shutdown(stopped, &events);
         });
     }
@@ -1960,6 +1962,69 @@ mod tests {
         assert!(line.contains("WARN"), "{line}");
         let shown = thinwire_protocol::LogChatId("whatsapp:111@s.whatsapp.net").to_string();
         assert!(line.contains(&shown), "{line}");
+        drop(guard);
+    }
+
+    /// #238 (Codex r4216328520): a send that outlives the drain and ends
+    /// after `Stopped` publishes nothing. Its late result is logged with the
+    /// redacted chat id, never the text.
+    #[tokio::test]
+    async fn a_send_that_ends_after_stopped_publishes_nothing() {
+        let (logs, guard) = capture_logs();
+        let (tx, mut rx) = unbounded_channel();
+        let mut adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
+        let gated = Arc::new(GatedSender {
+            release: tokio::sync::Notify::new(),
+            failure: session::SendFailure::Network,
+        });
+        adapter.session.begin(1);
+        assert!(adapter.session.attach_sender(1, Arc::clone(&gated) as _));
+        adapter.session.apply(history(), 1, &tx);
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        adapter.handle(send_hi(), &tx).expect("send");
+        let _pending = expect_pending(&mut rx).await;
+
+        adapter.shutdown(&tx);
+        loop {
+            let event = tokio::time::timeout(SEND_DRAIN * 2, rx.recv())
+                .await
+                .expect("Stopped in time")
+                .expect("open channel");
+            assert!(
+                !matches!(
+                    event,
+                    AdapterEvent::SendAccepted { .. } | AdapterEvent::SendRejected { .. }
+                ),
+                "the hung send has no answer before Stopped: {event:?}"
+            );
+            if matches!(event, AdapterEvent::Stopped { .. }) {
+                break;
+            }
+        }
+
+        fresh_interest();
+        gated.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !adapter.sends.is_idle() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the send task ends");
+        let late = drain(&mut rx);
+        assert!(late.is_empty(), "nothing after Stopped: {late:?}");
+        let log = logged(&logs);
+        let line = log
+            .lines()
+            .find(|line| line.contains("whatsapp send ended after shutdown"))
+            .unwrap_or_else(|| panic!("no log line: {log}"));
+        let shown = thinwire_protocol::LogChatId("whatsapp:111@s.whatsapp.net").to_string();
+        assert!(line.contains("WARN") && line.contains(&shown), "{line}");
+        assert!(
+            !log.contains("abandoned before its result"),
+            "the task ended normally: {log}"
+        );
         drop(guard);
     }
 
