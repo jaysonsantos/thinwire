@@ -5,6 +5,15 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(dirname "$script_dir")"
 
+# README hero images must stay present (paths under crates/thinwire/tests/snapshots/).
+mapfile -t readme_snaps < <(grep -oE 'crates/thinwire/tests/snapshots/[^"[:space:]]+\.png' README.md | sort -u)
+for snap in "${readme_snaps[@]}"; do
+  if [[ ! -f "$snap" ]]; then
+    echo "README references missing snapshot: $snap" >&2
+    exit 1
+  fi
+done
+
 if command -v prek >/dev/null; then
   prek run --all-files --show-diff-on-failure
   exit 0

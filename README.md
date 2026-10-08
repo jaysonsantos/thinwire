@@ -4,6 +4,13 @@ Thin, low-resource desktop messenger shell in **Rust + egui**.
 One UI for many protocols. Targets **Windows, macOS, and Linux**.
 The UI thread must never block; protocol I/O runs async off the main thread.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="crates/thinwire/tests/snapshots/several_protocols-dark-1100x720.png">
+  <img alt="thinwire inbox with an open chat" src="crates/thinwire/tests/snapshots/several_protocols-light-1100x720.png" width="880">
+</picture>
+
+The image is the UI snapshot test output, so it changes with every UI change.
+
 ## Status
 
 Inbox shell (account switcher + conversations on the left, thread in the center) with protocol adapters behind a tokio channel. The UI only polls events; workers must not call egui APIs.
