@@ -26,7 +26,7 @@ use crate::notify::{ChatNow, Notifications, NotifyCommand, NotifyContext};
 use crate::secrets::SecretStore;
 use crate::settings::Settings;
 use crate::signal::{ChangeNotifier, ChangeSignal, WeakNotifier, change_channel};
-use crate::state::{AuthScreen, Snapshot};
+use crate::state::{AuthScreen, SendStage, Snapshot};
 use crate::view::View;
 
 /// How often the keychain watch wakes frontends while attach runs. The
@@ -116,6 +116,32 @@ pub struct Core {
     send_wake: Option<(Instant, tokio::task::JoinHandle<()>)>,
     /// Desktop notification rules and queue (#32).
     notify: Notifications,
+}
+
+/// While the app closes, a send answer is logged: a failure as a warning.
+/// The protocol and the chat id only, never the text (#238).
+fn log_send_answer_at_close(event: &AdapterEvent) {
+    match event {
+        AdapterEvent::SendRejected {
+            protocol,
+            conversation_id,
+            ..
+        } => tracing::warn!(
+            protocol = %protocol,
+            chat = %conversation_id,
+            "send failed while closing"
+        ),
+        AdapterEvent::SendAccepted {
+            protocol,
+            conversation_id,
+            ..
+        } => tracing::info!(
+            protocol = %protocol,
+            chat = %conversation_id,
+            "send accepted while closing"
+        ),
+        _ => {}
+    }
 }
 
 impl Core {
@@ -279,6 +305,9 @@ impl Core {
             // The login epoch check runs here, on the thread that sends
             // Cancel, not in the forward task (issue #42, PR #49).
             if let Some(event) = self.commands.deliver(event) {
+                if self.closing {
+                    log_send_answer_at_close(&event);
+                }
                 let live = match &event {
                     AdapterEvent::MessageReceived { message }
                         if message.arrival == Arrival::Live =>
@@ -524,6 +553,28 @@ impl Core {
         self.state.next_send_deadline().is_some()
     }
 
+    /// Log each send that has no final answer yet: the protocol and the chat
+    /// id, never the text. Call it once at exit, after the last pump. A send
+    /// is then never lost without a trace (#238).
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
+    pub fn log_unfinished_sends(&self) {
+        for send in self.state.unfinished_sends() {
+            match send.stage {
+                SendStage::NoAnswer => tracing::warn!(
+                    protocol = %send.protocol,
+                    chat = %send.chat,
+                    "send abandoned at exit: the protocol did not answer before the close limit"
+                ),
+                SendStage::NotConfirmed => tracing::warn!(
+                    protocol = %send.protocol,
+                    chat = %send.chat,
+                    "send not confirmed by the server at exit; TDLib keeps it in its message database"
+                ),
+            }
+        }
+    }
+
     /// Shut down and wait up to `timeout` for the clients to close.
     ///
     /// Blocks the caller. Use it only after the window is gone. Never call
@@ -552,6 +603,13 @@ impl Core {
             return;
         }
         self.closing = true;
+        for send in self.state.unfinished_sends() {
+            tracing::info!(
+                protocol = %send.protocol,
+                chat = %send.chat,
+                "send in flight at close; waiting for its answer"
+            );
+        }
         self.notify.close();
         // Every adapter closes its sessions (TDLib, the WhatsApp session,
         // Discord, Slack) and answers `Stopped`. `stopped` waits for all.
@@ -2238,6 +2296,178 @@ mod tests {
             "the accept after Shutdown settles it"
         );
         assert!(core.view().error.is_none());
+    }
+
+    /// Log lines of this thread while the guard lives. Plain text, no ANSI.
+    fn capture_logs() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        #[derive(Clone)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Buf(std::sync::Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        fresh_interest();
+        (bytes, guard)
+    }
+
+    /// Another test thread may register a callsite at the same time as the
+    /// capture starts, and cache "no subscriber wants it". Read every
+    /// callsite's interest again right before the step that logs.
+    fn fresh_interest() {
+        tracing::callsite::rebuild_interest_cache();
+    }
+
+    fn logged(bytes: &std::sync::Mutex<Vec<u8>>) -> String {
+        String::from_utf8_lossy(
+            &bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+
+    /// #238: a send that fails or gets no answer while the app closes is
+    /// logged with its protocol and chat id, never with its text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_that_fails_or_is_abandoned_at_close_is_logged_without_its_text() {
+        use crate::state::test_support::ready_with_chats;
+
+        let (bytes, _guard) = capture_logs();
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        let mut requests = Vec::new();
+        for (chat, text) in [("telegram:1", "secret one"), ("telegram:2", "secret two")] {
+            core.dispatch(Intent::SelectConversation { id: chat.into() });
+            core.dispatch(Intent::SetDraft {
+                protocol: ProtocolId::Telegram,
+                conversation_id: chat.into(),
+                text: text.into(),
+            });
+            core.dispatch(Intent::SendDraft {
+                protocol: ProtocolId::Telegram,
+                conversation_id: chat.into(),
+            });
+            let request = std::iter::from_fn(|| sent.try_recv().ok())
+                .find_map(|command| match command {
+                    AdapterCommand::SendText { request, .. } => Some(request),
+                    _ => None,
+                })
+                .expect("a SendText");
+            requests.push(request);
+        }
+
+        fresh_interest();
+        core.dispatch(Intent::Shutdown);
+        let at_close = logged(&bytes);
+        assert!(
+            at_close.contains("send in flight at close") && at_close.contains("telegram:1"),
+            "{at_close}"
+        );
+        assert!(at_close.contains("telegram:2"), "{at_close}");
+
+        // The adapter rejects the first one while it closes.
+        events_tx
+            .send(AdapterEvent::SendRejected {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                request: requests[0],
+            })
+            .expect("queue");
+        fresh_interest();
+        core.pump();
+        let failed = logged(&bytes);
+        let line = failed
+            .lines()
+            .find(|line| line.contains("send failed while closing"))
+            .unwrap_or_else(|| panic!("no failure line: {failed}"));
+        assert!(
+            line.contains("WARN") && line.contains("telegram:1"),
+            "{line}"
+        );
+
+        // The second one never gets an answer: the exit names it.
+        fresh_interest();
+        core.log_unfinished_sends();
+        let exit = logged(&bytes);
+        let abandoned: Vec<&str> = exit
+            .lines()
+            .filter(|line| line.contains("send abandoned at exit"))
+            .collect();
+        assert_eq!(abandoned.len(), 1, "{exit}");
+        assert!(
+            abandoned[0].contains("WARN") && abandoned[0].contains("telegram:2"),
+            "{exit}"
+        );
+        assert!(!exit.contains("secret"), "never the text: {exit}");
+    }
+
+    /// A Telegram send that TDLib took but the server did not confirm is
+    /// named at exit too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unconfirmed_telegram_send_is_logged_at_exit() {
+        use crate::state::test_support::ready_with_chats;
+
+        let (bytes, _guard) = capture_logs();
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        core.dispatch(Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            text: "secret".into(),
+        });
+        core.dispatch(Intent::SendDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+        });
+        let request = std::iter::from_fn(|| sent.try_recv().ok())
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("a SendText");
+        events_tx.send(answer(true, request)).expect("queue");
+        core.pump();
+        assert!(core.sending(), "accepted, not yet confirmed");
+        core.dispatch(Intent::Shutdown);
+        fresh_interest();
+        core.log_unfinished_sends();
+        let exit = logged(&bytes);
+        let line = exit
+            .lines()
+            .find(|line| line.contains("not confirmed by the server at exit"))
+            .unwrap_or_else(|| panic!("no unconfirmed line: {exit}"));
+        assert!(line.contains("telegram:1"), "{line}");
+        assert!(!exit.contains("secret"), "never the text: {exit}");
     }
 
     /// Sends "hello" through a core with no adapter answers. Returns the

@@ -133,6 +133,14 @@ impl SendTracker {
         Some(request)
     }
 
+    /// Every chat with a send or retry in flight, oldest first. For the log
+    /// at close: it names the chat, never the text.
+    pub(crate) fn open_chats(&self) -> Vec<(ProtocolId, String)> {
+        let mut open: Vec<(&(ProtocolId, String), &Open)> = self.open.iter().collect();
+        open.sort_by_key(|(_, entry)| (entry.since, entry.pending.request()));
+        open.into_iter().map(|(key, _)| key.clone()).collect()
+    }
+
     /// No send or retry is in flight in any chat.
     pub(crate) fn is_empty(&self) -> bool {
         self.open.is_empty()

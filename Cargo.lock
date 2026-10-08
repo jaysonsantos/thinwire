@@ -6682,6 +6682,7 @@ dependencies = [
  "thinwire-protocol",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",
 ]
@@ -6713,6 +6714,7 @@ dependencies = [
  "tdlib-rs",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "twilight-http",
  "twilight-model",
  "webbrowser",
@@ -6744,6 +6746,7 @@ dependencies = [
  "thinwire-protocol",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "whatsapp-rust",
 ]
 

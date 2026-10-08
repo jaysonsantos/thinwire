@@ -85,34 +85,75 @@ pub struct WhatsAppAdapter {
     sends: SendsInFlight,
 }
 
-/// A count of the send tasks that still run.
+/// The send tasks that still run: a task id and the conversation id of
+/// each. Never the text.
 #[derive(Clone, Default)]
-struct SendsInFlight(Arc<tokio::sync::watch::Sender<usize>>);
+struct SendsInFlight(Arc<tokio::sync::watch::Sender<Running>>);
 
-/// One running send. The count drops when the task ends or is dropped.
-struct SendGuard(Arc<tokio::sync::watch::Sender<usize>>);
+#[derive(Default)]
+struct Running {
+    next: u64,
+    chats: std::collections::BTreeMap<u64, String>,
+}
+
+/// One running send. It leaves the set when the task ends or is dropped. A
+/// guard dropped before [`SendGuard::finish`] means the task was cut off
+/// (the runtime stopped at exit): that is logged, with the chat id only.
+struct SendGuard {
+    sends: Arc<tokio::sync::watch::Sender<Running>>,
+    id: u64,
+    finished: bool,
+}
+
+impl SendGuard {
+    /// The send has its network result. Call it after the answer went out.
+    fn finish(mut self) {
+        self.finished = true;
+    }
+}
 
 impl Drop for SendGuard {
     fn drop(&mut self) {
-        self.0.send_modify(|count| *count = count.saturating_sub(1));
+        let mut chat = None;
+        self.sends
+            .send_modify(|running| chat = running.chats.remove(&self.id));
+        if !self.finished
+            && let Some(chat) = chat
+        {
+            tracing::warn!(%chat, "whatsapp send abandoned before its result");
+        }
     }
 }
 
 impl SendsInFlight {
-    fn begin(&self) -> SendGuard {
-        self.0.send_modify(|count| *count += 1);
-        SendGuard(Arc::clone(&self.0))
+    fn begin(&self, conversation_id: &str) -> SendGuard {
+        let mut id = 0;
+        self.0.send_modify(|running| {
+            id = running.next;
+            running.next += 1;
+            running.chats.insert(id, conversation_id.to_string());
+        });
+        SendGuard {
+            sends: Arc::clone(&self.0),
+            id,
+            finished: false,
+        }
     }
 
     fn is_idle(&self) -> bool {
-        *self.0.borrow() == 0
+        self.0.borrow().chats.is_empty()
+    }
+
+    /// The conversation ids of the sends that still run, oldest first.
+    fn chats(&self) -> Vec<String> {
+        self.0.borrow().chats.values().cloned().collect()
     }
 
     /// `true` when every send ended within `limit`.
     async fn wait_idle(&self, limit: std::time::Duration) -> bool {
-        let mut count = self.0.subscribe();
+        let mut running = self.0.subscribe();
         matches!(
-            tokio::time::timeout(limit, count.wait_for(|count| *count == 0)).await,
+            tokio::time::timeout(limit, running.wait_for(|running| running.chats.is_empty())).await,
             Ok(Ok(_))
         )
     }
@@ -422,11 +463,11 @@ impl WhatsAppAdapter {
         let events = events.clone();
         let owner = self.link.as_ref().map(|link| link.callbacks(generation));
         // Counted before the spawn, so a shutdown right after sees it.
-        let running = self.sends.begin();
+        let running = self.sends.begin(&answer.conversation_id);
         tokio::spawn(async move {
-            let _running = running;
             let result = sender.send_text(&jid, &body).await;
             let revoked = session.finish_send(generation, &jid, &pending, result, &answer, &events);
+            running.finish();
             // The phone revoked the device, maybe with no LoggedOut callback.
             // The owner stops the client and deletes the revoked store.
             if revoked && let Some(owner) = owner {
@@ -502,7 +543,11 @@ impl ProtocolAdapter for WhatsAppAdapter {
             // A message sent just before the close still goes out, and its
             // answer comes before `Stopped`.
             if !sends.wait_idle(SEND_DRAIN).await {
-                tracing::warn!("a whatsapp send did not finish before shutdown");
+                // The client stops now. Each send that still runs is named
+                // (chat id, no text). Its result, if any, still answers it.
+                for chat in sends.chats() {
+                    tracing::warn!(%chat, "whatsapp send still running at shutdown; stopping the client");
+                }
             }
             let stopped = match link {
                 Some(link) => link.shutdown().await,
@@ -1825,9 +1870,59 @@ mod tests {
         );
     }
 
+    /// Log lines of this thread while the guard lives. Plain text, no ANSI.
+    fn capture_logs() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        #[derive(Clone)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Buf(std::sync::Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        fresh_interest();
+        (bytes, guard)
+    }
+
+    /// Another test thread may register a callsite at the same time as the
+    /// capture starts, and cache "no subscriber wants it". Read every
+    /// callsite's interest again right before the step that logs.
+    fn fresh_interest() {
+        tracing::callsite::rebuild_interest_cache();
+    }
+
+    fn logged(bytes: &std::sync::Mutex<Vec<u8>>) -> String {
+        String::from_utf8_lossy(
+            &bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+
     /// A send that never ends holds the shutdown only for [`SEND_DRAIN`].
+    /// #238: the send cut off at shutdown is logged with its chat id, never
+    /// its text.
     #[tokio::test]
     async fn shutdown_stops_waiting_for_a_hung_send() {
+        let (logs, guard) = capture_logs();
         let (tx, mut rx) = unbounded_channel();
         let mut adapter = WhatsAppAdapter::new(Arc::new(WhatsAppPhoneVault::new()));
         let gated = Arc::new(GatedSender {
@@ -1843,6 +1938,7 @@ mod tests {
         let _pending = expect_pending(&mut rx).await;
 
         let start = std::time::Instant::now();
+        fresh_interest();
         adapter.shutdown(&tx);
         let stopped = loop {
             let event = tokio::time::timeout(SEND_DRAIN * 2, rx.recv())
@@ -1856,6 +1952,46 @@ mod tests {
         let waited = stopped - start;
         assert!(waited >= SEND_DRAIN, "{waited:?}");
         assert!(waited < SEND_DRAIN * 2, "{waited:?}");
+        let log = logged(&logs);
+        let line = log
+            .lines()
+            .find(|line| line.contains("whatsapp send still running at shutdown"))
+            .unwrap_or_else(|| panic!("no log line: {log}"));
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("whatsapp:111@s.whatsapp.net"), "{line}");
+        drop(guard);
+    }
+
+    /// #238: a send task dropped before its result (the runtime stops at
+    /// exit) is logged with its chat id. A finished send is not.
+    #[test]
+    fn a_send_cut_off_before_its_result_is_logged() {
+        let (logs, _guard) = capture_logs();
+        let sends = SendsInFlight::default();
+        let running = sends.begin("whatsapp:222@s.whatsapp.net");
+        assert!(!sends.is_idle());
+        assert_eq!(
+            sends.chats(),
+            vec!["whatsapp:222@s.whatsapp.net".to_string()]
+        );
+        fresh_interest();
+        drop(running);
+        let log = logged(&logs);
+        let line = log
+            .lines()
+            .find(|line| line.contains("whatsapp send abandoned before its result"))
+            .unwrap_or_else(|| panic!("no log line: {log}"));
+        assert!(
+            line.contains("WARN") && line.contains("whatsapp:222@s.whatsapp.net"),
+            "{line}"
+        );
+        let finished = sends.begin("whatsapp:333@s.whatsapp.net");
+        finished.finish();
+        assert!(
+            !logged(&logs).contains("whatsapp:333"),
+            "a finished send is not logged"
+        );
+        assert!(sends.is_idle());
     }
 
     /// Codex r4093192850: a send of link 1 that ends after link 2 connected

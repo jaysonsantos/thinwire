@@ -192,6 +192,7 @@ impl AccountSends {
         self.open = false;
         self.epoch = self.epoch.saturating_add(1);
         for (request, tracked) in &sends {
+            log_abandoned_at_shutdown(tracked);
             settle_row(events, tracked);
             emit_send_rejected(
                 events,
@@ -1617,6 +1618,9 @@ impl Owner {
         if !gate.open || gate.epoch != self.epoch {
             return false;
         }
+        if let AccountEnd::Stopped = end {
+            gate.inflight.values().for_each(log_abandoned_at_shutdown);
+        }
         reject_open(&mut self.inflight, &self.carried, &events, &mut gate);
         gate.open = false;
         if let AccountEnd::Stopped = end {
@@ -1678,6 +1682,15 @@ impl Owner {
             let _ = tx.send(work.await);
         });
     }
+}
+
+/// The app closes before this send has its HTTP result: it is rejected.
+/// The log names the chat, never the text (#238).
+fn log_abandoned_at_shutdown(tracked: &Inflight) {
+    tracing::warn!(
+        chat = %tracked.conversation_id,
+        "discord send abandoned at shutdown: no result before the close limit"
+    );
 }
 
 /// Rejects every send still in the gate. The caller holds the gate.

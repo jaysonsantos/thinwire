@@ -45,6 +45,8 @@ windows-native-keyring-store.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# Reads the log lines in the tests of what is logged at close (#238).
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

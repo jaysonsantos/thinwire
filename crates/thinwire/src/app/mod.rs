@@ -433,11 +433,7 @@ impl ThinwireApp {
                 });
             }
         }
-        let stopped = self.core.stopped();
-        if self.close_gate.poll(Instant::now(), stopped) {
-            if !stopped && self.core.sending() {
-                tracing::warn!("a message was still sending when the close deadline passed");
-            }
+        if self.close_gate.poll(Instant::now(), self.core.stopped()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             // The next pass reads the close: do not wait for the idle tick.
             ctx.request_repaint();
@@ -559,6 +555,9 @@ impl ThinwireApp {
     /// Last step at exit: try the keychain flush first, then stop the runtime
     /// within the close deadline instead of waiting for every blocking task.
     fn finish_exit(&mut self) {
+        // Each send with no answer yet is named in the log (protocol and
+        // chat id, never the text), so none ends without a trace.
+        self.core.log_unfinished_sends();
         // Shutdown queued a dismiss for each shown notification: send them,
         // and give the OS a short time, so none stays after exit.
         self.notifier.send(self.core.take_notify());
