@@ -20,7 +20,7 @@
 
 - Rust 2024 workspace, egui/eframe, tokio for async adapters
 - Telegram: TDLib / tdlib-rs preferred
-- WhatsApp: unofficial linked-device path inspired by ZapFast (MIT) — ToS risk. Experimental spike is feature `whatsapp-web` (`whatsapp-rust`, git rev pinned). The feature is local-only because it links AGPL `wacore-libsignal` (`0011`). Release builds and OS zips never enable it. Not the default UI. Default CI stays feature-off. Full-screen ToS/ban gate before any QR or pair UI. Session file stays in app-data. Never call it reliable. The client is `crates/thinwire-whatsapp` (AGPL-3.0-only, #77). `thinwire-protocol` keeps an MIT stub and `WhatsAppPhoneVault`. It does not depend on the AGPL crate.
+- WhatsApp: unofficial linked-device path on `whatsapp-rust` (oxidezap) — ToS risk. Experimental spike is feature `whatsapp-web` (`whatsapp-rust`, git rev pinned). The feature is local-only because it links AGPL `wacore-libsignal` (`0011`). Release builds and OS zips never enable it. Not the default UI. Default CI stays feature-off. Full-screen ToS/ban gate before any QR or pair UI. Session file stays in app-data. Never call it reliable. The client is `crates/thinwire-whatsapp` (AGPL-3.0-only, #77). `thinwire-protocol` keeps an MIT stub and `WhatsAppPhoneVault`. It does not depend on the AGPL crate.
 - Discord: bot/OAuth guild inbox only — no self-bots / personal DMs / user tokens. Feature `discord-bot` (twilight HTTP) lists guild channels the bot can read, loads history, and sends as the bot. It runs in parallel with Telegram and does not wait for Telegram messages (lock change 2026-09-23; the code gate that waited is removed, `adfbb8c`, PR #40). Tests use a fake `DiscordApi`. ADR `0009-discord-bot-inbox-spike`. Default CI stays feature-off.
 - Slack: official OAuth only — workspace app, not a personal desktop clone
 - Signal: out of v1 release builds (S2, amended by `0011`). Feature `signal-local` (#39) is available and local-only. The client is `crates/thinwire-signal` (AGPL-3.0-only). It links Presage and libsignal. `thinwire-protocol` does not depend on it. Release builds and OS zips never enable it. Default CI stays feature-off.
@@ -35,7 +35,7 @@
 | --- | --- |
 | `crates/thinwire/` | Desktop binary: egui frontend. Draws the core view and sends intents |
 | `crates/thinwire-core/` | Frontend-independent core: state, `Intent`, view, change signal, secret store, settings, host wiring, notification rules (`notify`), chats muted in thinwire (`mutes`, #153), the single-instance lock (`instance`). No egui / eframe / winit (ADR `0010`) |
-| `crates/thinwire-notify/` | OS desktop notifications on their own thread: Linux D-Bus and macOS through `notify-rust`, Windows WinRT toasts through `windows` (#161). No egui (#32) |
+| `crates/thinwire-notify/` | OS desktop notifications on their own thread: Linux D-Bus through `notify-rust`, Windows WinRT toasts through `windows`, macOS UNUserNotificationCenter through `mac-usernotifications` inside `Thinwire.app` on macOS 12+ (show-only through `notify-rust` with no bundle or on macOS 11) (#161). No egui (#32) |
 | `crates/thinwire-protocol/` | `ProtocolAdapter` trait, host channel, capability metadata, Critic risk strings, and the Telegram / Slack / Discord adapters. Signal and WhatsApp here are MIT stubs |
 | `crates/thinwire-signal/` | AGPL-3.0-only Signal adapter. `thinwire` depends on it only with feature `signal-local`. `thinwire-protocol` does not depend on it |
 | `crates/thinwire-whatsapp/` | AGPL-3.0-only WhatsApp linked-device adapter (#77). `thinwire` depends on it only with feature `whatsapp-web`. `thinwire-protocol` does not depend on it |
@@ -44,7 +44,7 @@
 | `scripts/` | `lint.sh`, `test.sh`, `all.sh`, `release.sh`, `check-core-deps.sh`, `check-release-tree.sh`, `check-agpl-deps.sh` — CI calls the same scripts |
 | `flake.nix` | Dev shell. `.envrc` stays local (`source_up_if_exists` / `use flake` / `dotenv_if_exists .env`) |
 | `.pre-commit-config.yaml` | prek hooks (fmt, clippy, taplo, typos, nixfmt, shellcheck, gitleaks, zizmor) |
-| `.github/workflows/ci.yml` | Parallel lint/test/build plus the `check` guard. `notify-os` runs clippy and tests of `thinwire-notify` on Windows only when that crate, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, or `ci.yml` changes; `check` accepts its skip |
+| `.github/workflows/ci.yml` | Parallel lint/test/build plus the `check` guard. `notify-os` runs clippy and tests of `thinwire-notify` on Windows and macOS, and on macOS stages a signed `Thinwire.app` from a debug build, only when that crate, `scripts/stage-os-artifact.sh`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, or `ci.yml` changes; `check` accepts its skip |
 | `.github/workflows/os-zips.yml` | Main-only unsigned OS zips with `telegram-tdlib` and publisher secrets (ADR 0003, 0007) |
 | `.github/workflows/release-tag.yml` | Manual tag. No distroless GUI image |
 
