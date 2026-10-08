@@ -120,7 +120,7 @@ impl Drop for SendGuard {
         if !self.finished
             && let Some(chat) = chat
         {
-            tracing::warn!(%chat, "whatsapp send abandoned before its result");
+            tracing::warn!(chat = %thinwire_protocol::LogChatId(&chat), "whatsapp send abandoned before its result");
         }
     }
 }
@@ -546,7 +546,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 // The client stops now. Each send that still runs is named
                 // (chat id, no text). Its result, if any, still answers it.
                 for chat in sends.chats() {
-                    tracing::warn!(%chat, "whatsapp send still running at shutdown; stopping the client");
+                    tracing::warn!(chat = %thinwire_protocol::LogChatId(&chat), "whatsapp send still running at shutdown; stopping the client");
                 }
             }
             let stopped = match link {
@@ -1958,22 +1958,24 @@ mod tests {
             .find(|line| line.contains("whatsapp send still running at shutdown"))
             .unwrap_or_else(|| panic!("no log line: {log}"));
         assert!(line.contains("WARN"), "{line}");
-        assert!(line.contains("whatsapp:111@s.whatsapp.net"), "{line}");
+        let shown = thinwire_protocol::LogChatId("whatsapp:111@s.whatsapp.net").to_string();
+        assert!(line.contains(&shown), "{line}");
         drop(guard);
     }
 
     /// #238: a send task dropped before its result (the runtime stops at
-    /// exit) is logged with its chat id. A finished send is not.
+    /// exit) is logged with its redacted chat id. A finished send is not.
+    /// A 1:1 chat id holds the contact's phone number; the log line keeps
+    /// only its last four digits.
     #[test]
     fn a_send_cut_off_before_its_result_is_logged() {
+        const PHONE: &str = "4915550100";
+        let chat = format!("whatsapp:{PHONE}@s.whatsapp.net");
         let (logs, _guard) = capture_logs();
         let sends = SendsInFlight::default();
-        let running = sends.begin("whatsapp:222@s.whatsapp.net");
+        let running = sends.begin(&chat);
         assert!(!sends.is_idle());
-        assert_eq!(
-            sends.chats(),
-            vec!["whatsapp:222@s.whatsapp.net".to_string()]
-        );
+        assert_eq!(sends.chats(), vec![chat.clone()]);
         fresh_interest();
         drop(running);
         let log = logged(&logs);
@@ -1981,10 +1983,10 @@ mod tests {
             .lines()
             .find(|line| line.contains("whatsapp send abandoned before its result"))
             .unwrap_or_else(|| panic!("no log line: {log}"));
-        assert!(
-            line.contains("WARN") && line.contains("whatsapp:222@s.whatsapp.net"),
-            "{line}"
-        );
+        let shown = thinwire_protocol::LogChatId(&chat).to_string();
+        assert_eq!(shown, "whatsapp:…0100@s.whatsapp.net");
+        assert!(line.contains("WARN") && line.contains(&shown), "{line}");
+        assert!(!log.contains(PHONE), "never the full phone number: {log}");
         let finished = sends.begin("whatsapp:333@s.whatsapp.net");
         finished.finish();
         assert!(

@@ -3704,7 +3704,10 @@ mod tests {
             .find(|line| line.contains("discord send abandoned at shutdown"))
             .unwrap_or_else(|| panic!("no log line: {log}"));
         assert!(line.contains("WARN"), "{line}");
-        assert!(line.contains(&conversation_id(GUILD, GENERAL)), "{line}");
+        // The chat id is redacted (crate::LogChatId), never logged in full.
+        let id = conversation_id(GUILD, GENERAL);
+        assert!(line.contains(&crate::LogChatId(&id).to_string()), "{line}");
+        assert!(!log.contains(&id), "never the full chat id: {log}");
         assert!(!log.contains("stuck"), "never the text: {log}");
         hold.notify_waiters();
         tokio::time::sleep(Duration::from_millis(50)).await;

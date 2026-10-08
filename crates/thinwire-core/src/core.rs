@@ -128,7 +128,7 @@ fn log_send_answer_at_close(event: &AdapterEvent) {
             ..
         } => tracing::warn!(
             protocol = %protocol,
-            chat = %conversation_id,
+            chat = %thinwire_protocol::LogChatId(conversation_id),
             "send failed while closing"
         ),
         AdapterEvent::SendAccepted {
@@ -137,7 +137,7 @@ fn log_send_answer_at_close(event: &AdapterEvent) {
             ..
         } => tracing::info!(
             protocol = %protocol,
-            chat = %conversation_id,
+            chat = %thinwire_protocol::LogChatId(conversation_id),
             "send accepted while closing"
         ),
         _ => {}
@@ -563,12 +563,12 @@ impl Core {
             match send.stage {
                 SendStage::NoAnswer => tracing::warn!(
                     protocol = %send.protocol,
-                    chat = %send.chat,
+                    chat = %thinwire_protocol::LogChatId(&send.chat),
                     "send abandoned at exit: the protocol did not answer before the close limit"
                 ),
                 SendStage::NotConfirmed => tracing::warn!(
                     protocol = %send.protocol,
-                    chat = %send.chat,
+                    chat = %thinwire_protocol::LogChatId(&send.chat),
                     "send not confirmed by the server at exit; TDLib keeps it in its message database"
                 ),
             }
@@ -606,7 +606,7 @@ impl Core {
         for send in self.state.unfinished_sends() {
             tracing::info!(
                 protocol = %send.protocol,
-                chat = %send.chat,
+                chat = %thinwire_protocol::LogChatId(&send.chat),
                 "send in flight at close; waiting for its answer"
             );
         }
@@ -2347,6 +2347,11 @@ mod tests {
 
     /// #238: a send that fails or gets no answer while the app closes is
     /// logged with its protocol and chat id, never with its text.
+    /// A chat id as the shutdown log lines show it (redacted, #238).
+    fn shown(id: &str) -> String {
+        thinwire_protocol::LogChatId(id).to_string()
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_send_that_fails_or_is_abandoned_at_close_is_logged_without_its_text() {
         use crate::state::test_support::ready_with_chats;
@@ -2383,10 +2388,10 @@ mod tests {
         core.dispatch(Intent::Shutdown);
         let at_close = logged(&bytes);
         assert!(
-            at_close.contains("send in flight at close") && at_close.contains("telegram:1"),
+            at_close.contains("send in flight at close") && at_close.contains(&shown("telegram:1")),
             "{at_close}"
         );
-        assert!(at_close.contains("telegram:2"), "{at_close}");
+        assert!(at_close.contains(&shown("telegram:2")), "{at_close}");
 
         // The adapter rejects the first one while it closes.
         events_tx
@@ -2404,7 +2409,7 @@ mod tests {
             .find(|line| line.contains("send failed while closing"))
             .unwrap_or_else(|| panic!("no failure line: {failed}"));
         assert!(
-            line.contains("WARN") && line.contains("telegram:1"),
+            line.contains("WARN") && line.contains(&shown("telegram:1")),
             "{line}"
         );
 
@@ -2418,7 +2423,7 @@ mod tests {
             .collect();
         assert_eq!(abandoned.len(), 1, "{exit}");
         assert!(
-            abandoned[0].contains("WARN") && abandoned[0].contains("telegram:2"),
+            abandoned[0].contains("WARN") && abandoned[0].contains(&shown("telegram:2")),
             "{exit}"
         );
         assert!(!exit.contains("secret"), "never the text: {exit}");
@@ -2466,7 +2471,7 @@ mod tests {
             .lines()
             .find(|line| line.contains("not confirmed by the server at exit"))
             .unwrap_or_else(|| panic!("no unconfirmed line: {exit}"));
-        assert!(line.contains("telegram:1"), "{line}");
+        assert!(line.contains(&shown("telegram:1")), "{line}");
         assert!(!exit.contains("secret"), "never the text: {exit}");
     }
 

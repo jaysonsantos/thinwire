@@ -1688,7 +1688,7 @@ impl Owner {
 /// The log names the chat, never the text (#238).
 fn log_abandoned_at_shutdown(tracked: &Inflight) {
     tracing::warn!(
-        chat = %tracked.conversation_id,
+        chat = %crate::LogChatId(&tracked.conversation_id),
         "discord send abandoned at shutdown: no result before the close limit"
     );
 }
