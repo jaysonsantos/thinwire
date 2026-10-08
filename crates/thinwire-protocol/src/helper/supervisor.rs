@@ -875,8 +875,16 @@ impl Supervisor {
         self.end_unsent(&unsent);
         self.reject_open_sends();
         if self.replay.is_empty() && self.wake_link.is_none() {
-            // The user has no link to keep: no restart.
+            // The user has no link to keep: no restart. The user gave the
+            // link up with a cancel or a log out. If this helper ended
+            // before it confirmed that, the account is unlinked here. Else
+            // the row stays linked with no helper behind it.
             self.failures = 0;
+            if self.account != AccountState::Unlinked {
+                self.account = AccountState::Unlinked;
+                self.linked_once = false;
+                emit_account(&self.events, self.protocol, AccountState::Unlinked);
+            }
             self.report(HelperState::Idle);
             return;
         }

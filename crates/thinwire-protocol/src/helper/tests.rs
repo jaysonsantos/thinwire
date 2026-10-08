@@ -103,6 +103,8 @@ struct Lab {
     mode: Mutex<Mode>,
     /// The fake adapter keeps a send open: no answer.
     hold_sends: AtomicBool,
+    /// The fake process ends when a cancel comes, with no answer.
+    die_on_cancel: AtomicBool,
     launches: AtomicU32,
     /// Helper tasks that ended.
     ended: AtomicU32,
@@ -122,6 +124,7 @@ impl Lab {
             installed: AtomicBool::new(true),
             mode: Mutex::new(mode),
             hold_sends: AtomicBool::new(false),
+            die_on_cancel: AtomicBool::new(false),
             launches: AtomicU32::new(0),
             ended: AtomicU32::new(0),
             overlaps: AtomicU32::new(0),
@@ -407,6 +410,10 @@ impl ProtocolAdapter for GatedFake {
                 None,
             ),
             AdapterCommand::Disconnect { .. } | AdapterCommand::WhatsAppCancelLink => {
+                if self.lab.die_on_cancel.load(Ordering::SeqCst) {
+                    self.lab.crash.notify_one();
+                    return Ok(());
+                }
                 self.acknowledged = false;
                 self.linked = false;
                 emit_account(events, PROTOCOL, AccountState::Unlinked);
@@ -1035,6 +1042,22 @@ async fn a_helper_process_that_never_ends_stops_the_restart() {
         .await;
     assert_eq!(probe.lab.launches(), 1);
     assert_eq!(probe.lab.overlaps(), 0);
+}
+
+/// PR #256 review: the user cancels a linked account, and the helper ends
+/// before it confirms the cancel. The account still unlinks. Else the row
+/// stays linked with no helper behind it and no Restart.
+#[tokio::test]
+async fn a_cancel_that_the_helper_did_not_confirm_still_unlinks_the_account() {
+    let mut probe = Probe::start(Mode::Serve);
+    probe.pair(1);
+    probe.until_account(AccountState::Linked).await;
+    probe.lab.die_on_cancel.store(true, Ordering::SeqCst);
+    probe.send(AdapterCommand::WhatsAppCancelLink);
+    probe.until_account(AccountState::Unlinked).await;
+    probe.until_helper(HelperState::Idle).await;
+    tokio::time::sleep(NO_START_WAIT).await;
+    assert_eq!(probe.lab.launches(), 1, "no restart for a cancelled link");
 }
 
 /// The user cancelled the link: a helper that dies after that does not start

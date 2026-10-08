@@ -2936,7 +2936,8 @@ impl Snapshot {
     }
 
     /// New state of a helper process (ADR 0013). A helper that is gone
-    /// answers no load: stop the spinners of its protocol. `Account`
+    /// answers no load: stop the spinners of its protocol. `Idle` counts
+    /// too: the adapter sends it when a helper ended and none starts. `Account`
     /// events, not this one, change the link state. A helper that stopped
     /// for good shows what happened, why, and what to do.
     fn set_helper(&mut self, protocol: ProtocolId, state: HelperState) {
@@ -2947,7 +2948,10 @@ impl Snapshot {
         self.helper_errors.remove(&protocol);
         if matches!(
             state,
-            HelperState::Restarting | HelperState::Stopped(_) | HelperState::Missing
+            HelperState::Idle
+                | HelperState::Restarting
+                | HelperState::Stopped(_)
+                | HelperState::Missing
         ) {
             self.stop_spinners(protocol, None);
         }
@@ -3978,6 +3982,7 @@ mod tests {
     #[test]
     fn a_helper_that_is_gone_ends_the_loads_of_its_protocol() {
         for state in [
+            HelperState::Idle,
             HelperState::Restarting,
             HelperState::Stopped(HelperFault::Crashed),
             HelperState::Missing,
