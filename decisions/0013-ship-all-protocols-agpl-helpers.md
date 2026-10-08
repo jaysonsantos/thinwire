@@ -31,16 +31,16 @@ ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answer
 5. The UI never waits on IPC. A slow helper shows a busy account row, not a frozen window.
 6. Distribution (replaces 0012 section 3):
     - The release archive for each OS contains the app and both helpers. The user does not install a helper as a separate step.
-    - The app looks for each helper next to its own binary first (`Contents/MacOS/` in `Thinwire.app`). A setting can name another path.
+    - The app looks for each helper next to its own binary first (`Contents/MacOS/` in `Thinwire.app`). A setting can name another path. That path gets the same 0012 section 4 checks as the default path.
     - If a helper is missing, the app does not hide its protocol. In the add-account picker, that protocol shows as disabled, with the reason. An existing account of that protocol keeps its row and shows "<Protocol> helper missing. Reinstall thinwire." The start error says what failed, why, and what to do.
     - Signing follows ADR 0003: on macOS each helper gets the same ad-hoc signature as the app. There is no Developer ID and no notarization. Linux and Windows helpers are unsigned.
 7. CI builds and tests every protocol feature that a release ships. This starts in the first PR of #246.
     - `scripts/check-agpl-deps.sh` and `scripts/check-release-tree.sh` change: they allow AGPL crates in the helper crates only, and they still fail if the MIT app binary links AGPL code.
 8. Each release contains:
-    - The AGPL-3.0 text for each helper, and the Corresponding Source (AGPL-3.0 section 1) through the same place as the binaries (section 6(d)). Each release attaches `thinwire-helpers-<tag>-source.tar.gz` next to the binaries. It holds the thinwire source of the tag and the dependencies of both helper crates from `cargo vendor`, including `whatsapp-rust`, `wacore-libsignal`, presage and libsignal. The tarball stays on the release as long as the binaries do. The release never depends on an outside git rev for the source offer.
+    - The AGPL-3.0 text for each helper, and the Corresponding Source (AGPL-3.0 section 1) through the same place as the binaries (section 6(d)). Each release attaches `thinwire-helpers-<tag>-source.tar.gz` next to the binaries. It holds the whole thinwire workspace of the tag, including `Cargo.lock` and the build scripts, and the `cargo vendor` output for the dependencies of both helper crates, including `whatsapp-rust`, `wacore-libsignal`, presage and libsignal. The tarball stays on the release as long as the binaries do. The release never depends on an outside git rev for the source offer.
     - The Apache-2.0 text and NOTICE for tdlib-rs, BSL-1.0 for TDLib, ISC for twilight.
     - The licenses of `egui_extras` and `image` (with the jpeg, png and webp decoders) once #244 adds them.
-9. README: ToS and ban-risk bullets for every protocol in the release build. Signal gets its line again: no supported third-party API, expect breakage. The Signal gate screen shows the same text. The WhatsApp ban gate stays in the app, before any QR or pair code goes to the helper.
+9. README: ToS and ban-risk bullets for every protocol in the release build. Signal gets its line again: no supported third-party API, expect breakage. The Signal gate screen shows the same text. The WhatsApp ban gate stays in the app. The user accepts it before the app sends any pairing command or phone number to the helper, so no QR or pair code is requested before the gate.
 
 ## Order
 
@@ -55,8 +55,8 @@ ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answer
 
 ## Consequences
 
-- Release builds offer WhatsApp and Signal. The MIT app binary still contains no AGPL code.
+- Release builds offer WhatsApp and Signal. WhatsApp ships with #246; Signal ships only with #248, so until then the release archive contains only the WhatsApp helper. The MIT app binary still contains no AGPL code.
 - Each release has three binaries per OS and more license files.
 - CI builds libsignal on three OSes. This adds CI minutes to every run that builds the helpers.
-- AGENTS.md, ROADMAP.md and README follow this ADR in the same PR.
+- AGENTS.md and ROADMAP.md follow this ADR in the same PR. README follows with the #246 implementation PR.
 - Mark 0004, 0011 and 0012 with a "Superseded by 0013" line. Do not change their other text.
