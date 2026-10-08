@@ -55,7 +55,7 @@ ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answer
 
 ## Consequences
 
-- Release builds offer WhatsApp and Signal. WhatsApp ships with #246; Signal ships only with #248, so until then the release archive contains only the WhatsApp helper. The MIT app binary still contains no AGPL code.
+- Release builds offer WhatsApp and Signal. WhatsApp ships with #246; Signal ships only with #248. Until then the release archive contains only the WhatsApp helper, the app does not offer Signal, and the "helper missing" path of decision 6 does not fire for Signal. The MIT app binary still contains no AGPL code.
 - Each release has three binaries per OS and more license files.
 - CI builds libsignal on three OSes. This adds CI minutes to every run that builds the helpers.
 - AGENTS.md and ROADMAP.md follow this ADR in the same PR. README follows with the #246 implementation PR.
