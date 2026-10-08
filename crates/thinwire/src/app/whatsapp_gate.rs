@@ -9,20 +9,30 @@ use thinwire_protocol::CRITIC_RISK_BULLETS;
 use super::theme;
 use super::ui::edited;
 use thinwire_core::state::{Snapshot, WhatsAppScreen};
-use thinwire_core::{Intent, SecretText, View, WhatsAppIntent};
+use thinwire_core::{Intent, ProtocolId, SecretText, View, WhatsAppIntent};
 
-pub(crate) fn risk_entry(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
+/// The WhatsApp entry under the accounts. With no helper program the entry
+/// stays, disabled, with the reason (ADR 0013 decision 6).
+pub(crate) fn risk_entry(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
     ui.add_space(8.0);
     ui.label(
         RichText::new("WhatsApp spike — experimental, ban risk")
             .small()
             .color(theme::palette(ui).warn),
     );
-    if ui.button("Review WhatsApp ban risk").clicked() {
+    let missing = snapshot.helper_missing(ProtocolId::WhatsApp);
+    let entry = ui.add_enabled(!missing, egui::Button::new("Review WhatsApp ban risk"));
+    if missing {
+        entry.on_disabled_hover_text(HELPER_MISSING_REASON);
+        ui.label(RichText::new(HELPER_MISSING_REASON).small().weak());
+    } else if entry.clicked() {
         out.push(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate));
         ui.ctx().request_repaint();
     }
 }
+
+/// Why the WhatsApp entry is disabled.
+const HELPER_MISSING_REASON: &str = "Needs the WhatsApp helper. Reinstall thinwire.";
 
 pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     egui::CentralPanel::default().show(ui, |ui| {

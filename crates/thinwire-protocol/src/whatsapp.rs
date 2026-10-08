@@ -1,11 +1,15 @@
-//! MIT stub for WhatsApp, and the phone vault that the UI and the worker share.
+//! MIT side of WhatsApp: the stub, the helper adapter, and the phone vault
+//! that the UI and the worker share.
 //!
 //! The linked-device client links whatsapp-rust and its AGPL
-//! `wacore-libsignal`. It lives in `thinwire-whatsapp` (AGPL-3.0-only, #77).
-//! This crate does not depend on it. A `whatsapp-web` build replaces this stub
-//! in the host. The stub answers every command the same way as that client
+//! `wacore-libsignal`. It lives in `thinwire-whatsapp` (AGPL-3.0-only, #77),
+//! and it runs in the `thinwire-whatsapp-helper` process (ADR 0013). This
+//! crate does not depend on it. A `whatsapp-web` build replaces this stub in
+//! the host with [`whatsapp_helper_adapter`], which talks to that process
+//! over a pipe. The stub answers every command the same way as that client
 //! with the feature off.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::adapter::{
@@ -28,6 +32,45 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: false,
     pages_history: false,
 };
+
+/// File name of the WhatsApp helper program, without `.exe`.
+pub const WHATSAPP_HELPER_PROGRAM: &str = "thinwire-whatsapp-helper";
+
+/// The capabilities of the client in the helper. The account row shows them
+/// also while no helper runs.
+const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
+    id: ProtocolId::WhatsApp,
+    support: SupportClass::Experimental,
+    short_label: "Experimental · ban risk",
+    detail: "Unofficial Web / linked-device client in the thinwire-whatsapp-helper process. Experimental. Ban risk. Not a supported messenger.",
+    official_api: false,
+    allows_user_account_automation: false,
+    sends_text: true,
+    pages_history: true,
+};
+
+/// The WhatsApp adapter of a `whatsapp-web` build: it runs the AGPL client
+/// in the `thinwire-whatsapp-helper` process (ADR 0013).
+///
+/// `phone` is the vault of the pairing screen. `configured` is the helper
+/// path from the settings, used when no helper is next to the app binary.
+#[must_use]
+pub fn whatsapp_helper_adapter(
+    phone: Arc<WhatsAppPhoneVault>,
+    configured: Option<PathBuf>,
+) -> crate::helper::HelperAdapter {
+    crate::helper::HelperAdapter::new(
+        crate::helper::HelperSpec {
+            protocol: ProtocolId::WhatsApp,
+            capabilities: HELPER_CAPABILITIES,
+        },
+        Arc::new(crate::helper::ProcessLauncher::new(
+            WHATSAPP_HELPER_PROGRAM,
+            configured,
+        )),
+        Some(phone),
+    )
+}
 
 const NOT_CONNECTED: &str = "WhatsApp is not connected. Pass the ban gate and pair a device first.";
 

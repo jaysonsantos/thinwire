@@ -3,9 +3,13 @@
 use egui_kittest::Harness;
 use egui_kittest::kittest::{By, NodeT, Queryable};
 use thinwire_core::state::Snapshot;
-use thinwire_core::state::test_support::{ready_with_chats, telegram_chat};
+use thinwire_core::state::test_support::{
+    ready_with_chats, show_only, show_protocol, telegram_chat,
+};
 use thinwire_core::{Intent, View};
-use thinwire_protocol::{AdapterEvent, ChatMessage, Delivery, ProtocolId};
+use thinwire_protocol::{
+    AdapterEvent, ChatMessage, Delivery, HelperFault, HelperState, ProtocolId,
+};
 
 use super::theme;
 use super::ui::{self, Hints};
@@ -22,12 +26,17 @@ struct InboxUi {
     selects: u32,
     /// Copy one-shot hints from the snapshot each frame, as the app does.
     apply_hints: bool,
+    /// Protocols whose Restart the user clicked (#246).
+    restarts: Vec<ProtocolId>,
 }
 
 impl InboxUi {
     fn ready() -> Self {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
+        // These tests are about the Telegram inbox. The account rows of the
+        // other protocols change the layout, so hide them in every build.
+        show_only(&mut snapshot, &[ProtocolId::Telegram]);
         for (id, title, order, preview) in [
             (1, "Ada", 10, "seen from Ada"),
             (2, "Bob", 5, "seen from Bob"),
@@ -53,7 +62,19 @@ impl InboxUi {
             focus_retry: false,
             selects: 0,
             apply_hints: false,
+            restarts: Vec::new(),
         }
+    }
+
+    /// The inbox with a WhatsApp account row whose helper has this state.
+    fn with_whatsapp_helper(helper: HelperState) -> Self {
+        let mut state = Self::ready();
+        show_protocol(&mut state.snapshot, ProtocolId::WhatsApp);
+        state.snapshot.apply(AdapterEvent::Helper {
+            protocol: ProtocolId::WhatsApp,
+            state: helper,
+        });
+        state
     }
 }
 
@@ -78,6 +99,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
                 state.selects += 1;
                 state.snapshot.select_conversation(id);
             }
+            Intent::RestartHelper(protocol) => state.restarts.push(protocol),
             Intent::MoveInbox { delta } => state.snapshot.move_inbox_selection(delta),
             Intent::FocusInbox { id } => state.snapshot.focus_inbox_row(id),
             Intent::SetChatMute {
@@ -108,6 +130,57 @@ fn harness(state: InboxUi) -> Harness<'static, InboxUi> {
         .build_ui_state(draw, state);
     theme::install(&harness.ctx);
     harness
+}
+
+/// #246 UX: when the helper stopped for good, the WhatsApp account row
+/// reads "Helper stopped." and has Restart. A click asks the core once.
+#[test]
+fn a_stopped_helper_row_reads_helper_stopped_with_restart() {
+    let mut harness = harness(InboxUi::with_whatsapp_helper(HelperState::Stopped(
+        HelperFault::Crashed,
+    )));
+    harness.run();
+    harness.get_by_label("Helper stopped.");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Restart")
+        .click();
+    harness.run();
+    assert_eq!(harness.state().restarts, [ProtocolId::WhatsApp]);
+}
+
+/// #246 UX: a slow helper shows a busy row. The window stays in use: the
+/// Telegram inbox next to it still draws.
+#[test]
+fn a_busy_helper_row_reads_busy_and_has_no_restart() {
+    let mut harness = harness(InboxUi::with_whatsapp_helper(HelperState::Busy));
+    harness.run();
+    harness.get_by_label("Helper is busy…");
+    assert!(harness.query_by_label("Restart").is_none());
+    assert!(
+        harness.query_all_by_label_contains("Ada").next().is_some(),
+        "the Telegram inbox still draws"
+    );
+}
+
+/// ADR 0013 decision 6: with no helper program the account keeps its row
+/// and shows "WhatsApp helper missing. Reinstall thinwire."
+#[test]
+fn a_missing_helper_row_says_reinstall() {
+    let mut harness = harness(InboxUi::with_whatsapp_helper(HelperState::Missing));
+    harness.run();
+    harness.get_by_label("Helper missing");
+    harness.get_by_label("WhatsApp helper missing. Reinstall thinwire.");
+    assert!(harness.query_by_label("Restart").is_none());
+}
+
+/// A helper that runs changes nothing on the row.
+#[test]
+fn a_running_helper_row_shows_its_normal_state() {
+    let mut harness = harness(InboxUi::with_whatsapp_helper(HelperState::Running));
+    harness.run();
+    assert!(harness.query_by_label("Helper stopped.").is_none());
+    assert!(harness.query_by_label("Helper is busy…").is_none());
+    assert!(harness.query_by_label("Restart").is_none());
 }
 
 /// #153: the thread header mutes and unmutes the open chat in thinwire.

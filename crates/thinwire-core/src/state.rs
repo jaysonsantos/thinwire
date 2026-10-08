@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery,
-    DiscordAdapter, ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthError,
-    TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, TelegramSecretVault, catalog,
-    telegram_api_available,
+    DiscordAdapter, HelperFault, HelperState, ProtocolCapabilities, ProtocolId, TelegramApiSource,
+    TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, TelegramSecretVault,
+    catalog, telegram_api_available,
 };
 
 use crate::mutes::{ChatMute, ChatMutes};
@@ -343,6 +343,9 @@ pub struct AccountRow {
     /// Link state. Only `AdapterEvent::Account` (and the Telegram login,
     /// which maps onto it) changes it. A `Status` never does.
     pub state: AccountState,
+    /// State of the protocol's helper process (ADR 0013). `None` for a
+    /// protocol that runs in the app, and before its helper reports.
+    pub helper: Option<HelperState>,
 }
 
 impl AccountRow {
@@ -351,7 +354,52 @@ impl AccountRow {
     pub fn linked(&self) -> bool {
         self.state == AccountState::Linked
     }
+
+    /// The helper stopped and does not start again by itself. The row
+    /// shows "Helper stopped." and Restart.
+    #[must_use]
+    pub const fn helper_stopped(&self) -> bool {
+        matches!(self.helper, Some(HelperState::Stopped(_)))
+    }
+
+    /// The helper program is not installed. The protocol stays visible, and
+    /// its entry in Add account is disabled.
+    #[must_use]
+    pub const fn helper_missing(&self) -> bool {
+        matches!(self.helper, Some(HelperState::Missing))
+    }
+
+    /// The line of the account row for the helper state. `None`: the row
+    /// shows its normal state.
+    #[must_use]
+    pub const fn helper_label(&self) -> Option<&'static str> {
+        match self.helper {
+            Some(HelperState::Busy) => Some(HELPER_BUSY),
+            Some(HelperState::Restarting) => Some(HELPER_RESTARTING),
+            Some(HelperState::Stopped(_)) => Some(HELPER_STOPPED),
+            Some(HelperState::Missing) => Some(HELPER_MISSING),
+            Some(HelperState::Idle | HelperState::Running) | None => None,
+        }
+    }
+
+    /// "<Protocol> helper missing. Reinstall thinwire." (ADR 0013).
+    #[must_use]
+    pub fn helper_missing_text(&self) -> String {
+        format!(
+            "{} helper missing. Reinstall thinwire.",
+            self.caps.id.display_name()
+        )
+    }
 }
+
+/// Account row line while the helper starts or does not answer in time.
+pub const HELPER_BUSY: &str = "Helper is busy…";
+/// Account row line while the core waits to start the helper again.
+pub const HELPER_RESTARTING: &str = "Helper stopped. Restarting…";
+/// Account row line after the last restart failed. Restart is next to it.
+pub const HELPER_STOPPED: &str = "Helper stopped.";
+/// Account row line when the helper program is not installed.
+pub const HELPER_MISSING: &str = "Helper missing";
 
 /// Why `sync_focused_row` runs. A search change or a key move scrolls.
 /// A chat update does not: the list stays where the user left it.
@@ -455,7 +503,7 @@ pub struct Snapshot {
     pub(crate) extra_visible: HashSet<ProtocolId>,
     /// Test hook: protocols the shell hides even with their feature on, so a
     /// test holds in every feature build (qa on #111).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     hidden_for_test: HashSet<ProtocolId>,
     /// Chats with a request for older messages in flight (#30), keyed by
     /// protocol and chat. One request at a time for each chat.
@@ -617,6 +665,7 @@ impl Snapshot {
                 status: AdapterStatus::Stubbed,
                 detail: caps.detail.to_string(),
                 state: AccountState::Unlinked,
+                helper: None,
             })
             .collect();
         Self {
@@ -665,7 +714,7 @@ impl Snapshot {
             open_on_link: None,
             sessions: HashSet::new(),
             extra_visible: HashSet::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             hidden_for_test: HashSet::new(),
             older_note: HashSet::new(),
             scroll_to_selected: false,
@@ -822,6 +871,7 @@ impl Snapshot {
                 self.stopped.insert(protocol);
             }
             AdapterEvent::Account { protocol, state } => self.set_account(protocol, state),
+            AdapterEvent::Helper { protocol, state } => self.set_helper(protocol, state),
             AdapterEvent::CommandFailed {
                 protocol,
                 conversation_id,
@@ -1335,7 +1385,7 @@ impl Snapshot {
     /// when their cargo features are on.
     #[must_use]
     pub fn account_surface_visible(&self, protocol: ProtocolId) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if self.hidden_for_test.contains(&protocol) {
             return false;
         }
@@ -2827,6 +2877,71 @@ impl Snapshot {
         }
     }
 
+    /// New state of a helper process (ADR 0013). A helper that is gone
+    /// answers no load: stop the spinners of its protocol. `Account`
+    /// events, not this one, change the link state. A helper that stopped
+    /// for good shows what happened, why, and what to do.
+    fn set_helper(&mut self, protocol: ProtocolId, state: HelperState) {
+        if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
+            row.helper = Some(state);
+        }
+        if matches!(
+            state,
+            HelperState::Restarting | HelperState::Stopped(_) | HelperState::Missing
+        ) {
+            self.stop_spinners(protocol, None);
+        }
+        if let HelperState::Stopped(fault) = state {
+            let name = protocol.display_name();
+            let happened = format!("The {name} helper stopped.");
+            let (why, next) = match fault {
+                HelperFault::Crashed => (
+                    "It stopped again each time thinwire started it.".to_owned(),
+                    format!(
+                        "Click Restart on the {name} account. If it stops again, reinstall thinwire."
+                    ),
+                ),
+                HelperFault::StartFailed => (
+                    "The system did not start the helper program.".to_owned(),
+                    format!("Reinstall thinwire, then click Restart on the {name} account."),
+                ),
+                HelperFault::VersionMismatch => (
+                    "The helper is from another thinwire version than this app.".to_owned(),
+                    "Reinstall thinwire, so the app and the helper have the same version."
+                        .to_owned(),
+                ),
+                HelperFault::SessionInUse => (
+                    format!("Another thinwire uses the {name} session on this computer."),
+                    format!("Close the other thinwire, then click Restart on the {name} account."),
+                ),
+            };
+            self.set_error(&happened, &why, &next);
+        }
+    }
+
+    /// The user clicked Restart on an account row. It acts only while the
+    /// helper of that protocol is stopped.
+    pub fn restart_helper(&mut self, protocol: ProtocolId) {
+        let stopped = self
+            .accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.helper_stopped());
+        if !stopped {
+            return;
+        }
+        self.error = None;
+        self.pending
+            .push(AdapterCommand::RestartHelper { protocol });
+    }
+
+    /// The helper program of this protocol is not installed.
+    #[must_use]
+    pub fn helper_missing(&self, protocol: ProtocolId) -> bool {
+        self.accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.helper_missing())
+    }
+
     /// A reconnect starts (`Linking` after `Linked`). An `OpenChat` of this
     /// protocol that is still queued waits for `Linked`, and one in flight
     /// can be lost (#90 items 2 and 7). Mark the selected chat to load on
@@ -3208,7 +3323,7 @@ impl Snapshot {
     #[cfg(feature = "whatsapp-web")]
     #[must_use]
     pub fn whatsapp_pairing_available(&self) -> bool {
-        protocol_chrome_enabled(ProtocolId::WhatsApp)
+        self.account_surface_visible(ProtocolId::WhatsApp)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3219,7 +3334,9 @@ impl Snapshot {
 
     #[cfg(feature = "whatsapp-web")]
     pub fn open_whatsapp_risk_gate(&mut self) {
-        if !self.whatsapp_pairing_available() {
+        // With no helper program, no pairing can start: the entry is
+        // disabled, and a frontend cannot open the gate another way.
+        if !self.whatsapp_pairing_available() || self.helper_missing(ProtocolId::WhatsApp) {
             return;
         }
         if self.whatsapp_started {
@@ -3336,7 +3453,7 @@ impl Snapshot {
     #[cfg(feature = "signal-local")]
     #[must_use]
     pub fn signal_linking_available(&self) -> bool {
-        protocol_chrome_enabled(ProtocolId::Signal)
+        self.account_surface_visible(ProtocolId::Signal)
     }
 
     #[cfg(feature = "signal-local")]
@@ -3554,6 +3671,28 @@ pub mod test_support {
         }
     }
 
+    /// Show the account row of `protocol` in a build with its feature off,
+    /// as the demo does.
+    pub fn show_protocol(snapshot: &mut Snapshot, protocol: ProtocolId) {
+        snapshot.hidden_for_test.remove(&protocol);
+        snapshot.extra_visible.insert(protocol);
+    }
+
+    /// Show the account chrome of these protocols only, also in a build
+    /// with other protocol features on. A test of one protocol then has the
+    /// same layout in every feature build (ADR 0013: one CI job turns on
+    /// every release feature).
+    pub fn show_only(snapshot: &mut Snapshot, protocols: &[ProtocolId]) {
+        for protocol in ProtocolId::ALL {
+            if protocols.contains(&protocol) {
+                snapshot.hidden_for_test.remove(&protocol);
+            } else {
+                snapshot.extra_visible.remove(&protocol);
+                snapshot.hidden_for_test.insert(protocol);
+            }
+        }
+    }
+
     pub fn ready_with_chats(store: &SecretStore) -> Snapshot {
         let mut snapshot = Snapshot::new();
         complete_telegram(&mut snapshot, store);
@@ -3584,6 +3723,203 @@ pub mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// End the start-up resume with no saved session. A `telegram-tdlib`
+    /// build shows the resume screen until the keychain read settles, so a
+    /// test of the first-run screen settles it first. The test then holds in
+    /// every feature build (ADR 0013: one CI job turns on every release
+    /// feature).
+    fn settle_resume(snapshot: &mut Snapshot) {
+        snapshot.poll_resume(&SecretStore::memory());
+    }
+
+    // region: helper process (ADR 0013)
+
+    fn helper(snapshot: &mut Snapshot, state: HelperState) {
+        snapshot.apply(AdapterEvent::Helper {
+            protocol: ProtocolId::WhatsApp,
+            state,
+        });
+    }
+
+    fn whatsapp_row(snapshot: &Snapshot) -> &AccountRow {
+        snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::WhatsApp)
+            .expect("whatsapp row")
+    }
+
+    /// #246 UX: when the helper stops for good, the account row shows
+    /// "Helper stopped." with Restart, and the error block says what
+    /// happened, why, and what to do.
+    #[test]
+    fn a_stopped_helper_shows_on_the_account_row_with_what_to_do() {
+        let mut snapshot = Snapshot::new();
+        assert_eq!(whatsapp_row(&snapshot).helper_label(), None);
+        helper(&mut snapshot, HelperState::Stopped(HelperFault::Crashed));
+        let row = whatsapp_row(&snapshot);
+        assert!(row.helper_stopped());
+        assert_eq!(row.helper_label(), Some("Helper stopped."));
+        let error = snapshot.error.clone().expect("error block");
+        assert_eq!(error.happened, "The WhatsApp helper stopped.");
+        assert_eq!(error.why, "It stopped again each time thinwire started it.");
+        assert_eq!(
+            error.next,
+            "Click Restart on the WhatsApp account. If it stops again, reinstall thinwire."
+        );
+        // No other row changes.
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .filter(|row| row.caps.id != ProtocolId::WhatsApp)
+                .all(|row| row.helper.is_none())
+        );
+    }
+
+    #[test]
+    fn each_helper_fault_names_its_own_fix() {
+        for (fault, next) in [
+            (
+                HelperFault::StartFailed,
+                "Reinstall thinwire, then click Restart on the WhatsApp account.",
+            ),
+            (
+                HelperFault::VersionMismatch,
+                "Reinstall thinwire, so the app and the helper have the same version.",
+            ),
+            (
+                HelperFault::SessionInUse,
+                "Close the other thinwire, then click Restart on the WhatsApp account.",
+            ),
+        ] {
+            let mut snapshot = Snapshot::new();
+            helper(&mut snapshot, HelperState::Stopped(fault));
+            assert_eq!(snapshot.error.expect("error block").next, next);
+        }
+    }
+
+    /// #246 UX: Restart sends one command, and only while the helper is
+    /// stopped. A frontend cannot restart a helper that runs.
+    #[test]
+    fn restart_acts_only_while_the_helper_is_stopped() {
+        let mut snapshot = Snapshot::new();
+        let restart = AdapterCommand::RestartHelper {
+            protocol: ProtocolId::WhatsApp,
+        };
+        for state in [
+            HelperState::Idle,
+            HelperState::Busy,
+            HelperState::Running,
+            HelperState::Restarting,
+            HelperState::Missing,
+        ] {
+            helper(&mut snapshot, state);
+            snapshot.restart_helper(ProtocolId::WhatsApp);
+            assert!(snapshot.take_commands().is_empty(), "{state:?}");
+        }
+        helper(&mut snapshot, HelperState::Stopped(HelperFault::Crashed));
+        snapshot.restart_helper(ProtocolId::Telegram);
+        assert!(snapshot.take_commands().is_empty(), "another protocol");
+        snapshot.restart_helper(ProtocolId::WhatsApp);
+        assert_eq!(snapshot.take_commands(), vec![restart]);
+        assert_eq!(snapshot.error, None, "the old error block is gone");
+        // The adapter reports the new start.
+        helper(&mut snapshot, HelperState::Busy);
+        assert_eq!(
+            whatsapp_row(&snapshot).helper_label(),
+            Some("Helper is busy…")
+        );
+        helper(&mut snapshot, HelperState::Running);
+        assert_eq!(whatsapp_row(&snapshot).helper_label(), None);
+    }
+
+    /// #246 UX: a slow helper shows a busy row. It is not an error, and it
+    /// changes no link state.
+    #[test]
+    fn a_busy_or_restarting_helper_is_a_row_state_not_an_error() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        for (state, label) in [
+            (HelperState::Busy, "Helper is busy…"),
+            (HelperState::Restarting, "Helper stopped. Restarting…"),
+        ] {
+            helper(&mut snapshot, state);
+            assert_eq!(whatsapp_row(&snapshot).helper_label(), Some(label));
+            assert_eq!(snapshot.error, None);
+            assert!(
+                whatsapp_row(&snapshot).linked(),
+                "a helper state never unlinks"
+            );
+        }
+    }
+
+    /// ADR 0013 open question: a helper that is gone answers no load. Its
+    /// state ends the loading markers of its protocol, and of no other.
+    #[test]
+    fn a_helper_that_is_gone_ends_the_loads_of_its_protocol() {
+        for state in [
+            HelperState::Restarting,
+            HelperState::Stopped(HelperFault::Crashed),
+            HelperState::Missing,
+        ] {
+            let mut snapshot = Snapshot::new();
+            let chat = "whatsapp:111@s.whatsapp.net".to_owned();
+            snapshot.chat_list_loading.insert(ProtocolId::WhatsApp);
+            snapshot
+                .history_loading
+                .insert((ProtocolId::WhatsApp, chat.clone()));
+            snapshot
+                .older_loading
+                .insert((ProtocolId::WhatsApp, chat.clone()));
+            snapshot.chat_list_loading.insert(ProtocolId::Telegram);
+            helper(&mut snapshot, state);
+            assert!(!snapshot.chat_list_loading.contains(&ProtocolId::WhatsApp));
+            assert!(snapshot.history_loading.is_empty(), "{state:?}");
+            assert!(snapshot.older_loading.is_empty(), "{state:?}");
+            assert!(snapshot.chat_list_loading.contains(&ProtocolId::Telegram));
+        }
+    }
+
+    /// ADR 0013 decision 6: a missing helper keeps the account row, with
+    /// the reason. It shows no error block at start.
+    #[test]
+    fn a_missing_helper_keeps_the_row_and_names_the_reason() {
+        let mut snapshot = Snapshot::new();
+        helper(&mut snapshot, HelperState::Missing);
+        let row = whatsapp_row(&snapshot);
+        assert!(row.helper_missing());
+        assert_eq!(row.helper_label(), Some("Helper missing"));
+        assert_eq!(
+            row.helper_missing_text(),
+            "WhatsApp helper missing. Reinstall thinwire."
+        );
+        assert!(snapshot.helper_missing(ProtocolId::WhatsApp));
+        assert!(!snapshot.helper_missing(ProtocolId::Signal));
+        assert_eq!(snapshot.error, None, "no error for a user with no WhatsApp");
+    }
+
+    /// ADR 0013 decision 6: with no helper program, the WhatsApp entry is
+    /// disabled. The core refuses the gate too, so no frontend can open it.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn the_whatsapp_gate_stays_closed_while_the_helper_is_missing() {
+        let mut snapshot = Snapshot::new();
+        helper(&mut snapshot, HelperState::Missing);
+        snapshot.open_whatsapp_risk_gate();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        assert!(snapshot.take_commands().is_empty());
+        // The helper is back (a reinstall while the app runs).
+        helper(&mut snapshot, HelperState::Idle);
+        snapshot.open_whatsapp_risk_gate();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::RiskGate);
+    }
+
+    // endregion: helper process (ADR 0013)
 
     fn resume_commands(snapshot: &mut Snapshot) -> usize {
         snapshot
@@ -5039,6 +5375,7 @@ mod tests {
         let store = SecretStore::memory();
         seed_override(&store);
         let mut snapshot = Snapshot::new();
+        settle_resume(&mut snapshot);
         assert_eq!(snapshot.center_view(), CenterView::FirstRun);
         snapshot.center_key(AuthKey::Enter, &store);
         assert_eq!(
@@ -5061,6 +5398,7 @@ mod tests {
 
         let missing = SecretStore::memory();
         let mut no_api = Snapshot::with_api_source(TelegramApiSource::empty());
+        settle_resume(&mut no_api);
         no_api.center_key(AuthKey::Enter, &missing);
         assert_eq!(no_api.auth, AuthScreen::NeedCredentials);
         no_api.center_key(AuthKey::Enter, &missing);
@@ -6879,6 +7217,7 @@ mod tests {
         let store = SecretStore::memory();
         seed_override(&store);
         let mut snapshot = Snapshot::new();
+        settle_resume(&mut snapshot);
         snapshot.telegram_authorized = true;
         assert_eq!(snapshot.center_view(), CenterView::FirstRun);
         assert!(!snapshot.can_add_account());
@@ -7249,6 +7588,7 @@ mod tests {
     #[test]
     fn a_first_non_telegram_account_shows_its_inbox() {
         let mut snapshot = shell_with(&[ProtocolId::Slack]);
+        settle_resume(&mut snapshot);
         assert_eq!(snapshot.center_view(), CenterView::FirstRun);
         link(&mut snapshot, ProtocolId::Slack);
         assert_eq!(

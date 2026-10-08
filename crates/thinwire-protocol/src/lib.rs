@@ -6,6 +6,7 @@ pub mod contract;
 pub mod demo;
 mod discord;
 mod fake;
+pub mod helper;
 mod host;
 mod risk;
 mod secrets;
@@ -16,17 +17,18 @@ mod whatsapp;
 
 pub use adapter::{
     APP_CLOSE_LIMIT, AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus,
-    Arrival, ChatMessage, Conversation, Delivery, DiscordAuthMode, EventTx, ProtocolAdapter,
-    ProtocolCapabilities, ProtocolId, RedactedPairingSecret, SupportClass, TelegramAuthError,
-    TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, emit_account, emit_chat_list_loaded,
-    emit_conversation, emit_history_loaded, emit_message, emit_older_history_loaded,
-    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
+    Arrival, ChatMessage, Conversation, Delivery, DiscordAuthMode, EventTx, HelperFault,
+    HelperState, ProtocolAdapter, ProtocolCapabilities, ProtocolId, RedactedPairingSecret,
+    SupportClass, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia,
+    emit_account, emit_chat_list_loaded, emit_conversation, emit_history_loaded, emit_message,
+    emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
     DiscordSecretVault, MemoryDiscordVault,
 };
 pub use fake::FakeAdapter;
+pub use helper::{HelperAdapter, HelperLauncher, HelperSpec, ProcessLauncher};
 pub use host::{AdapterHost, HostSender};
 pub use risk::{
     CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3, CRITIC_RISK_BULLETS, critic_bullets_for,
@@ -55,7 +57,9 @@ pub use telegram::{
     TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,
     resolve_telegram_api, telegram_api_available,
 };
-pub use whatsapp::{WhatsAppAdapter, WhatsAppPhoneVault};
+pub use whatsapp::{
+    WHATSAPP_HELPER_PROGRAM, WhatsAppAdapter, WhatsAppPhoneVault, whatsapp_helper_adapter,
+};
 
 /// Shell protocols in display order. Signal is local-only and hidden unless `signal-local` is on.
 pub fn catalog() -> [ProtocolCapabilities; 5] {
@@ -222,6 +226,9 @@ mod tests {
         }
     }
 
+    /// ADR 0013: a release ships WhatsApp and Discord, and the MIT app still
+    /// links no AGPL crate. The AGPL WhatsApp client is in the helper program,
+    /// which the release workflow builds as its own package.
     #[test]
     fn v1_does_not_depend_on_agpl_signal_client_or_presage() {
         let protocol = include_str!("../Cargo.toml");
@@ -244,7 +251,16 @@ mod tests {
         let release = include_str!("../../../.github/workflows/os-zips.yml");
         let build = parse_release_build(release).expect("release command");
         assert_eq!(build.package, "thinwire");
-        assert_eq!(build.features, vec!["telegram-tdlib".to_string()]);
+        assert_eq!(
+            build.features,
+            ["telegram-tdlib", "whatsapp-web", "discord-bot"].map(str::to_string)
+        );
+        assert!(
+            release.contains(
+                "cargo build --release -p thinwire-whatsapp --features whatsapp-web --bin thinwire-whatsapp-helper"
+            ),
+            "the release builds the WhatsApp helper as its own program"
+        );
         assert!(
             build.targets.len() >= 3,
             "each OS zip is covered by the lock walk"
@@ -252,9 +268,10 @@ mod tests {
         assert!(build.targets.iter().any(|os| os.contains("ubuntu")));
         assert!(build.targets.iter().any(|os| os.contains("macos")));
         assert!(build.targets.iter().any(|os| os.contains("windows")));
+        // `signal-local` links the AGPL Signal client into the app: a
+        // release never turns it on (#248 moves Signal to its own helper).
         for name in [
             "signal-local",
-            "whatsapp-web",
             "presage",
             "libsignal",
             "libsignal-service",
@@ -271,11 +288,18 @@ mod tests {
             &build.package,
             &release_skipped_deps(&[app, core, protocol], &build.features),
         );
+        assert!(
+            closure.contains("thinwire-ipc"),
+            "the app reaches the helper through the MIT wire crate"
+        );
         for name in [
             "presage",
             "libsignal",
             "libsignal-service",
             "wacore-libsignal",
+            "whatsapp-rust",
+            "thinwire-whatsapp",
+            "thinwire-signal",
         ] {
             assert!(
                 !closure.iter().any(|pkg| pkg == name),
@@ -826,7 +850,19 @@ dependencies = [
         let release = include_str!("../../../.github/workflows/os-zips.yml");
         assert!(release.contains("--features telegram-tdlib"));
         assert!(!release.contains("signal-local"));
-        assert!(!release.contains("whatsapp-web"));
+        // ADR 0013: no MIT manifest names the AGPL WhatsApp crate as a
+        // dependency. The app's `whatsapp-web` is the MIT helper adapter.
+        for manifest in [protocol, app, core] {
+            assert!(
+                !manifest
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("thinwire-whatsapp")),
+                "an MIT crate must not depend on thinwire-whatsapp"
+            );
+        }
+        let whatsapp = include_str!("../../thinwire-whatsapp/Cargo.toml");
+        assert!(whatsapp.contains("AGPL-3.0-only"));
+        assert!(whatsapp.contains("name = \"thinwire-whatsapp-helper\""));
     }
 
     fn manifest_default_enables(manifest: &str, feature: &str) -> bool {

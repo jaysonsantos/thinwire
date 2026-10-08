@@ -14,6 +14,8 @@ mod session;
 #[cfg(feature = "whatsapp-web")]
 mod live;
 
+pub use path::{SessionLock, SessionLockError, lock_session, set_session_dir};
+
 use std::sync::Arc;
 
 use thinwire_protocol::{

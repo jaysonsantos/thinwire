@@ -461,7 +461,8 @@ fn event_protocol(event: &AdapterEvent) -> Option<ProtocolId> {
         | AdapterEvent::Stopped { protocol }
         | AdapterEvent::Account { protocol, .. }
         | AdapterEvent::CommandFailed { protocol, .. }
-        | AdapterEvent::Notice { protocol, .. } => Some(*protocol),
+        | AdapterEvent::Notice { protocol, .. }
+        | AdapterEvent::Helper { protocol, .. } => Some(*protocol),
         other => other.inbox_protocol(),
     }
 }

@@ -127,24 +127,25 @@ impl Core {
     /// store choice and the phone vault setup have one copy (#186).
     #[must_use]
     pub fn new(runtime: &Handle, config: CoreConfig) -> Self {
-        Self::with_replacement_adapters(runtime, config, |_| Vec::new())
+        Self::with_replacement_adapters(runtime, config, |_, _| Vec::new())
     }
 
-    /// [`Self::new`] with local-only AGPL adapters in place of the MIT
-    /// stubs (ADR 0011): `thinwire-signal` with `signal-local`,
-    /// `thinwire-whatsapp` with `whatsapp-web`. It chooses the secret store
-    /// and makes the phone vault for both constructors.
+    /// [`Self::new`] with other adapters in place of the MIT stubs: the
+    /// helper adapter of `thinwire-protocol` with `whatsapp-web` (ADR 0013),
+    /// and the local-only `thinwire-signal` with `signal-local` (ADR 0011).
+    /// It chooses the secret store and makes the phone vault for both
+    /// constructors.
     ///
-    /// `build` gets the core's WhatsApp phone vault: the pairing screen writes
-    /// it and the WhatsApp adapter reads it. Each adapter that `build`
-    /// returns replaces the stub with the same protocol id, and its
-    /// capabilities replace the account row's. The core crate does not
-    /// depend on the AGPL crates.
+    /// `build` gets the core's WhatsApp phone vault and the settings: the
+    /// pairing screen writes the vault and the WhatsApp adapter reads it. Each
+    /// adapter that `build` returns replaces the stub with the same protocol
+    /// id, and its capabilities replace the account row's. The core crate
+    /// does not depend on the AGPL crates.
     #[must_use]
     pub fn with_replacement_adapters(
         runtime: &Handle,
         config: CoreConfig,
-        build: impl FnOnce(&Arc<WhatsAppPhoneVault>) -> Vec<Box<dyn ProtocolAdapter>>,
+        build: impl FnOnce(&Arc<WhatsAppPhoneVault>, &Settings) -> Vec<Box<dyn ProtocolAdapter>>,
     ) -> Self {
         let secrets = if config.memory_secrets {
             Arc::new(SecretStore::memory())
@@ -152,7 +153,7 @@ impl Core {
             SecretStore::for_ui(runtime)
         };
         let whatsapp_phone = Arc::new(WhatsAppPhoneVault::new());
-        let replacements = build(&whatsapp_phone);
+        let replacements = build(&whatsapp_phone, &config.settings);
         let caps: Vec<_> = replacements
             .iter()
             .map(|adapter| adapter.capabilities())
@@ -444,6 +445,7 @@ impl Core {
                     });
                 }
             }
+            Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
             Intent::Telegram(intent) => self.telegram(intent),
             Intent::WhatsApp(intent) => self.whatsapp(intent),
             Intent::Discord(DiscordIntent::Connect) => {
@@ -1157,6 +1159,31 @@ mod tests {
         }
     }
 
+    /// #246 UX: Restart on a stopped helper's account row sends one
+    /// `RestartHelper` to that protocol's adapter, and nothing while the
+    /// helper runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_helper_reaches_the_adapter_only_for_a_stopped_helper() {
+        let mut core = memory_core();
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let protocol = ProtocolId::WhatsApp;
+
+        core.dispatch(Intent::RestartHelper(protocol));
+        assert!(sent.try_recv().is_err(), "no helper stopped");
+
+        core.state.apply(AdapterEvent::Helper {
+            protocol,
+            state: thinwire_protocol::HelperState::Stopped(thinwire_protocol::HelperFault::Crashed),
+        });
+        core.dispatch(Intent::RestartHelper(protocol));
+        assert_eq!(
+            sent.try_recv().ok(),
+            Some(AdapterCommand::RestartHelper { protocol })
+        );
+        assert!(sent.try_recv().is_err(), "one command for one click");
+    }
+
     /// A frontend that skips the Signal notice cannot start linking.
     /// Acknowledge only while the notice shows. Link only after that.
     #[tokio::test(flavor = "multi_thread")]
@@ -1244,7 +1271,8 @@ mod tests {
     async fn new_matches_the_replacement_constructor_with_no_replacement() {
         let config = || CoreConfig::new(temp_settings()).with_memory_secrets();
         let plain = Core::new(&Handle::current(), config());
-        let empty = Core::with_replacement_adapters(&Handle::current(), config(), |_| Vec::new());
+        let empty =
+            Core::with_replacement_adapters(&Handle::current(), config(), |_, _| Vec::new());
         // `AccountRow` has no `PartialEq`: its debug text holds every field.
         let rows = |core: &Core| format!("{:?}", core.state.accounts);
         assert_eq!(rows(&plain), rows(&empty));
@@ -1266,7 +1294,7 @@ mod tests {
         let core = Core::with_replacement_adapters(
             &Handle::current(),
             CoreConfig::new(temp_settings()).with_memory_secrets(),
-            move |phone| {
+            move |phone, _settings| {
                 *seen_in_build.lock().expect("lock") = Some(Arc::clone(phone));
                 let caps = thinwire_protocol::ProtocolCapabilities {
                     detail: "local-only replacement",
