@@ -37,5 +37,13 @@ windows = { version = "0.62", features = [
 ] }
 windows-registry = "0.100"
 
+# macOS: UNUserNotificationCenter with a safe API: the workspace forbids
+# unsafe (#161). It needs a bundle id and a code signature; `cargo run`
+# keeps notify-rust. MIT or Apache-2.0, by the notify-rust author.
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-usernotifications = "0.3"
+# The running macOS version (NSProcessInfo), safe API. Already in the lock.
+objc2-foundation = { version = "0.3", features = ["NSProcessInfo"] }
+
 [lints]
 workspace = true

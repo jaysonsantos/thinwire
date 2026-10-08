@@ -1,6 +1,6 @@
 //! A backend for an OS service that knows each notification by a tag:
-//! Windows toasts (#161). The rules here have no OS code, so Linux CI
-//! tests them.
+//! Windows toasts and the macOS notification center (#161). The rules here
+//! have no OS code, so Linux CI tests them.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -14,6 +14,44 @@ pub(crate) fn tag(key: &NotifyKey) -> String {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// The OS still has `tag`: delivered (on the screen or in the list), or
+/// still pending right after a send. A check of the delivered ids only
+/// misses a pending one, so a dismiss or a hide-text update does nothing
+/// and its text stays (Codex r4138691845).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn listed<S: AsRef<str>>(tag: &str, delivered: &[S], pending: &[S]) -> bool {
+    delivered.iter().chain(pending).any(|id| id.as_ref() == tag)
+}
+
+/// One removal at start, of notifications an earlier run left behind.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupRemoval {
+    /// Cancel requests macOS has not delivered yet.
+    CancelPending,
+    /// Close notifications already in Notification Center.
+    CloseDelivered,
+}
+
+/// A start removes both. Pending first: a request can be delivered before
+/// the close, and a pending-only cleanup would miss it after that
+/// (Codex r4139073814).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn startup_removals() -> [StartupRemoval; 2] {
+    [
+        StartupRemoval::CancelPending,
+        StartupRemoval::CloseDelivered,
+    ]
+}
+
+/// An update may send only while the OS still lists `tag`. Sending with
+/// that id creates a notification when the id is gone, and an update must
+/// never show a new one (Codex r4139322212).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn update_sends<S: AsRef<str>>(tag: &str, delivered: &[S], pending: &[S]) -> bool {
+    listed(tag, delivered, pending)
 }
 
 /// One OS notification service with tags.
@@ -153,6 +191,37 @@ mod tests {
         let long = key(ProtocolId::Slack, &"x".repeat(500));
         assert!(tag(&long).len() <= 64);
         assert!(!tag(&chat).contains("12345"), "no chat id in the OS store");
+    }
+
+    #[test]
+    fn a_pending_notification_counts_as_shown() {
+        let none: [&str; 0] = [];
+        assert!(listed("a", &["a"], &none), "delivered");
+        assert!(listed("a", &none, &["a"]), "pending right after a send");
+        assert!(!listed("a", &["b"], &["c"]));
+        assert!(!listed("a", &none, &none));
+    }
+
+    #[test]
+    fn a_start_cancels_pending_requests_before_it_closes_delivered_ones() {
+        assert_eq!(
+            startup_removals(),
+            [
+                StartupRemoval::CancelPending,
+                StartupRemoval::CloseDelivered,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_update_does_not_send_after_the_user_clears_it() {
+        let none: [&str; 0] = [];
+        assert!(update_sends("a", &["a"], &none), "still delivered");
+        assert!(update_sends("a", &none, &["a"]), "still pending");
+        assert!(
+            !update_sends("a", &none, &none),
+            "cleared: send would create a notification"
+        );
     }
 
     #[test]
