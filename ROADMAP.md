@@ -1,6 +1,6 @@
 # Thinwire roadmap
 
-Ordered work from product-council ADRs (`decisions/0001`–`0013`; `0013` ships every protocol, with WhatsApp and Signal in AGPL helper processes, and supersedes `0004`, `0011` and the Later part of `0012`; implementation pending in #246 and #248). ADRs are decisions; this file is the todo list.
+Ordered work from product-council ADRs (`decisions/0001`–`0013`; `0013` ships every protocol, with WhatsApp and Signal in AGPL helper processes, and supersedes `0004`, `0011` and the Later part of `0012`; the WhatsApp helper is #246, the Signal helper is pending in #248). ADRs are decisions; this file is the todo list.
 
 Rule: an ADR accepted is not Done until the matching change is on `main`.
 
@@ -53,25 +53,31 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 
 ### Other protocols (parallel with Telegram)
 
-- [ ] #34 — WhatsApp experimental linked-device inbox (feature `whatsapp-web`, `0001`). Local-only AGPL until the `0013` WhatsApp helper ships (#246). Release builds and OS zips never enable it in the app. Honest ToS labels. Full-screen ToS/ban gate before QR or pair. Never call it reliable.
+- [ ] #34 — WhatsApp experimental linked-device inbox (feature `whatsapp-web`, `0001`). The AGPL client runs in the WhatsApp helper program (`0013`, #246). Release builds turn it on. Honest ToS labels. Full-screen ToS/ban gate before QR or pair. Never call it reliable.
 - [ ] #36 — Slack workspace-app OAuth inbox (feature `slack-oauth`, `0008`). Official OAuth v2 only. Not a personal desktop clone.
 
 ### AGPL helpers (`0013`)
 
-`0013` (accepted 2026-10-08) supersedes `0011`: release builds ship WhatsApp and Signal in AGPL-3.0-only helper binaries over IPC. The MIT app binary never links AGPL code. Until the helpers land, `whatsapp-web` and `signal-local` stay local-only.
+`0013` (accepted 2026-10-08) supersedes `0011`: release builds ship WhatsApp and Signal in AGPL-3.0-only helper binaries over IPC. The MIT app binary never links AGPL code. Until the Signal helper lands, `signal-local` stays local-only.
 
-- [ ] #246 — the CI job and the WhatsApp helper.
+- [x] #246 — the `release-features` CI job and the WhatsApp helper.
+    - `crates/thinwire-ipc`: the wire protocol.
+    - `HelperAdapter` in `thinwire-protocol`: start, restart, "Helper stopped." with Restart, and the missing-helper state.
+    - `thinwire-whatsapp-helper` in `crates/thinwire-whatsapp`, with a lock on the session folder.
+    - OS zips ship the helper, the AGPL text, the source offer, and the source tarball.
 - [ ] #248 — the Signal helper.
+- [ ] Slack in the OS zips. `0013` names `slack-oauth` as a release feature. The zips need the publisher `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_APP_TOKEN` secrets first.
+- [ ] A live test of WhatsApp through the helper on Linux, macOS, and Windows (a spare number only).
 
 ## Spike (scaffold, not the default UI)
 
-- `whatsapp-web` — experimental linked-device scaffold on `whatsapp-rust` (oxidezap), pinned to a git revision. Local-only AGPL (`wacore-libsignal`) until the `0013` WhatsApp helper ships (#246). Off unless that cargo feature is enabled. Default CI does not enable it. Release builds and OS zips never enable it. No ready WhatsApp account in the default build. Full-screen ToS/ban gate before QR or pair. Work continues in #34.
+- `whatsapp-web` — experimental linked-device scaffold on `whatsapp-rust` (oxidezap), pinned to a git revision. The AGPL code (`wacore-libsignal`) runs in the helper program `thinwire-whatsapp-helper`, not in the app (`0013`, #246). Off unless that cargo feature is enabled. The default CI jobs do not enable it. Release builds and OS zips enable it. No ready WhatsApp account in the default build. Full-screen ToS/ban gate before QR or pair. Work continues in #34.
 - `discord-bot` — bot/OAuth guild inbox on twilight HTTP (`0009`). Off by default. Shows when the feature is compiled. Not a personal Discord client. On `main` via #35.
 - `slack-oauth` — workspace-app OAuth v2 / Socket Mode scaffold on `slack-morphism` (`0008`). Off by default. No Slack auth UI in the default shell. Work continues in #36.
 
 ## Explicitly not next
 
-- AGPL code in the MIT app binary. Features `whatsapp-web` and `signal-local` stay off in release builds of the app; WhatsApp and Signal ship only as helper binaries (`0013`).
+- AGPL code in the MIT app binary. WhatsApp and Signal ship only as helper binaries (`0013`). Feature `signal-local` stays off in release builds.
 - gpui / gpui-ce toolkit switch — parked until thinwire-shaped measurements exist (`0002`).
 
 ## Pointers
