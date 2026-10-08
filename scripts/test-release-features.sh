@@ -26,6 +26,11 @@ cargo test "${app_packages[@]}" --features "$app_features"
 cargo clippy -p thinwire-whatsapp --features whatsapp-web --all-targets -- -D warnings
 cargo test -p thinwire-whatsapp --features whatsapp-web
 
+# ADR 0012 section 4: check the dependencies of the helper against the
+# RustSec advisory database. The graph is the helper with its client, as a
+# release builds it.
+cargo deny --manifest-path crates/thinwire-whatsapp/Cargo.toml --features whatsapp-web check advisories
+
 # Stage the helper next to an app binary, as a release does: notices, the
 # source offer, the client check, and the check that the app has no AGPL code.
 cargo build "${app_packages[@]}" --features "$app_features"

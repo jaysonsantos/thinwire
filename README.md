@@ -119,6 +119,7 @@ One more job, `release-features`, runs `scripts/test-release-features.sh` (ADR `
 
 - It runs clippy and the tests of the app with `telegram-tdlib`, `slack-oauth`, `discord-bot`, and `whatsapp-web` on. It sets no publisher secret.
 - It runs clippy and the tests of the WhatsApp helper with its client. The tests start the real helper process. No test starts a pairing.
+- It runs `cargo deny check advisories` on the dependency graph of the helper (config `deny.toml`).
 - It stages the helper next to an app binary with `scripts/stage-helper.sh`, and it runs the two AGPL guard scripts.
 
 Job `helper-os` does the helper steps on Windows and macOS. It runs only when the helper code or the dependencies change.
