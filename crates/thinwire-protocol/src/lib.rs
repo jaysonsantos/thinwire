@@ -91,8 +91,10 @@ pub(crate) fn registry(
         slack::registry_adapter(slack),
         Box::new(signal::SignalAdapter::new()),
     ];
-    // A local-only build puts its AGPL clients (Signal, WhatsApp) in place of
-    // the MIT stubs. This crate does not depend on those crates (ADR 0011).
+    // A build with a protocol feature puts another adapter in place of an
+    // MIT stub: the MIT helper adapter for WhatsApp (ADR 0013), and the
+    // local-only AGPL client for Signal. This crate does not depend on the
+    // AGPL crates.
     for replacement in replacements {
         let id = replacement.id();
         if let Some(slot) = adapters.iter_mut().find(|adapter| adapter.id() == id) {
@@ -106,7 +108,7 @@ pub(crate) fn registry(
 mod tests {
     use super::*;
 
-    /// A stand-in for a local-only AGPL client: only its id and caps matter.
+    /// A stand-in for a replacement adapter: only its id and caps matter.
     struct Replacement(ProtocolCapabilities);
 
     impl ProtocolAdapter for Replacement {

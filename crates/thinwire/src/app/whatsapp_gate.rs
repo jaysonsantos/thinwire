@@ -1,7 +1,9 @@
 //! Full-screen experimental WhatsApp gate.
 //!
 //! Compiled only with `whatsapp-web`. The QR and pair screen is unreachable
-//! until the ban acknowledgement. This is not a supported messenger.
+//! until the ban acknowledgement. This is not a supported messenger. The
+//! client runs in the WhatsApp helper process (ADR 0013), which starts only
+//! after that acknowledgement.
 
 use eframe::egui::{self, RichText};
 use thinwire_protocol::CRITIC_RISK_BULLETS;
@@ -92,6 +94,19 @@ fn pair_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
         .clicked()
     {
         out.push(Intent::WhatsApp(WhatsAppIntent::BeginLink));
+    }
+    // This screen draws no account row and no error block. Show the helper
+    // state here: a start that takes long, a restart, or a helper that
+    // stopped, with what to do.
+    if let Some(notice) = snapshot.helper_notice(ProtocolId::WhatsApp) {
+        ui.add_space(8.0);
+        ui.colored_label(theme::palette(ui).warn, notice.label);
+        if let Some(error) = notice.error {
+            ui.label(format!("What happened: {}", error.happened));
+            ui.label(format!("Why: {}", error.why));
+            ui.label(format!("What to do: {}", error.next));
+            ui.label("You can also start the pairing again here.");
+        }
     }
     if let Some(qr) = &snapshot.whatsapp_qr {
         ui.add_space(8.0);

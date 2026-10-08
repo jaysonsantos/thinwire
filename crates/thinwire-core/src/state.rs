@@ -392,6 +392,15 @@ impl AccountRow {
     }
 }
 
+/// What a full-screen gate shows about the helper of its protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelperNotice<'a> {
+    /// The line of the account row, for example "Helper stopped."
+    pub label: &'static str,
+    /// What happened, why, and what to do, when the helper stopped.
+    pub error: Option<&'a UserError>,
+}
+
 /// Account row line while the helper starts or does not answer in time.
 pub const HELPER_BUSY: &str = "Helper is busy…";
 /// Account row line while the core waits to start the helper again.
@@ -2891,6 +2900,10 @@ impl Snapshot {
         ) {
             self.stop_spinners(protocol, None);
         }
+        #[cfg(feature = "whatsapp-web")]
+        if protocol == ProtocolId::WhatsApp {
+            self.note_whatsapp_helper(state);
+        }
         if let HelperState::Stopped(fault) = state {
             let name = protocol.display_name();
             let happened = format!("The {name} helper stopped.");
@@ -2917,6 +2930,37 @@ impl Snapshot {
             };
             self.set_error(&happened, &why, &next);
         }
+    }
+
+    /// A QR or pair code of a helper that is gone is not valid. While the
+    /// helper starts again, the pair screen drops it: the new helper sends a
+    /// new one for the same pairing. When the helper stopped for good, the
+    /// pairing ends, so the user can start it again from the pair screen.
+    #[cfg(feature = "whatsapp-web")]
+    fn note_whatsapp_helper(&mut self, state: HelperState) {
+        match state {
+            HelperState::Restarting => {
+                self.whatsapp_qr = None;
+                self.whatsapp_pair_code = None;
+            }
+            HelperState::Stopped(_) | HelperState::Missing => {
+                self.end_pairing();
+                self.whatsapp_started = false;
+            }
+            HelperState::Idle | HelperState::Busy | HelperState::Running => {}
+        }
+    }
+
+    /// The helper line and the helper error for a full-screen gate, which
+    /// draws no account row and no error block. `None`: nothing to show.
+    #[must_use]
+    pub fn helper_notice(&self, protocol: ProtocolId) -> Option<HelperNotice<'_>> {
+        let row = self.accounts.iter().find(|row| row.caps.id == protocol)?;
+        let label = row.helper_label()?;
+        Some(HelperNotice {
+            label,
+            error: self.error.as_ref().filter(|_| row.helper_stopped()),
+        })
     }
 
     /// The user clicked Restart on an account row. It acts only while the
@@ -3901,6 +3945,72 @@ mod tests {
         assert!(snapshot.helper_missing(ProtocolId::WhatsApp));
         assert!(!snapshot.helper_missing(ProtocolId::Signal));
         assert_eq!(snapshot.error, None, "no error for a user with no WhatsApp");
+    }
+
+    /// The pair screen draws no account row and no error block. It gets the
+    /// helper line, and the error of a helper that stopped, from the core.
+    #[test]
+    fn a_gate_screen_gets_the_helper_line_and_its_error() {
+        let mut snapshot = Snapshot::new();
+        assert_eq!(snapshot.helper_notice(ProtocolId::WhatsApp), None);
+        helper(&mut snapshot, HelperState::Busy);
+        let busy = snapshot
+            .helper_notice(ProtocolId::WhatsApp)
+            .expect("a notice");
+        assert_eq!(busy.label, "Helper is busy…");
+        assert_eq!(busy.error, None, "busy is not an error");
+        helper(&mut snapshot, HelperState::Stopped(HelperFault::Crashed));
+        let stopped = snapshot
+            .helper_notice(ProtocolId::WhatsApp)
+            .expect("a notice");
+        assert_eq!(stopped.label, "Helper stopped.");
+        assert_eq!(
+            stopped.error.map(|error| error.happened.as_str()),
+            Some("The WhatsApp helper stopped.")
+        );
+        assert_eq!(snapshot.helper_notice(ProtocolId::Telegram), None);
+        helper(&mut snapshot, HelperState::Running);
+        assert_eq!(snapshot.helper_notice(ProtocolId::WhatsApp), None);
+    }
+
+    /// The QR of a helper that is gone is not valid. While the helper starts
+    /// again, the pair screen drops it and the pairing stays. When the helper
+    /// stopped for good, the pairing ends and the user can start it again.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_helper_failure_during_pairing_drops_the_code_and_allows_a_new_start() {
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.begin_whatsapp_link(&phone);
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::WhatsAppBeginLink { generation }) = commands.last() else {
+            panic!("no pairing start: {commands:?}");
+        };
+        let qr = |generation| AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("qr-one"),
+            generation,
+        };
+        snapshot.apply(qr(*generation));
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("qr-one"));
+
+        helper(&mut snapshot, HelperState::Restarting);
+        assert_eq!(snapshot.whatsapp_qr, None, "the old QR is not valid");
+        assert!(snapshot.whatsapp_started, "the pairing stays");
+        // The new helper sends a QR for the same pairing.
+        snapshot.apply(qr(*generation));
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("qr-one"));
+
+        helper(&mut snapshot, HelperState::Stopped(HelperFault::Crashed));
+        assert_eq!(snapshot.whatsapp_qr, None);
+        assert!(!snapshot.whatsapp_started, "Start pairing is enabled again");
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(matches!(
+            snapshot.take_commands().as_slice(),
+            [AdapterCommand::WhatsAppBeginLink { .. }]
+        ));
     }
 
     /// ADR 0013 decision 6: with no helper program, the WhatsApp entry is

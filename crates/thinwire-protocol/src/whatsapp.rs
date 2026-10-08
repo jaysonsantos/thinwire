@@ -28,7 +28,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     detail: CAPABILITY_DETAIL,
     official_api: false,
     allows_user_account_automation: false,
-    // Only the local-only client can send or page history.
+    // Only the client in the helper process can send or page history.
     sends_text: false,
     pages_history: false,
 };
@@ -131,7 +131,7 @@ pub struct WhatsAppAdapter {
 }
 
 impl WhatsAppAdapter {
-    /// The vault stays with the host. Only the local-only client reads it.
+    /// The vault stays with the host. Only the helper adapter reads it.
     #[must_use]
     pub fn new(phone: Arc<WhatsAppPhoneVault>) -> Self {
         let _ = phone;

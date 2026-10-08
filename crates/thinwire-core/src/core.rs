@@ -1245,7 +1245,7 @@ mod tests {
         assert!(!store.attach_settled(), "the watch had no end but the drop");
     }
 
-    /// A stand-in for a local-only AGPL client: only its id and caps matter.
+    /// A stand-in for a replacement adapter: only its id and caps matter.
     struct Replacement(thinwire_protocol::ProtocolCapabilities);
 
     impl ProtocolAdapter for Replacement {
