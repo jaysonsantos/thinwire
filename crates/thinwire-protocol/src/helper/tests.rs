@@ -61,7 +61,12 @@ const TIMING: HelperTiming = HelperTiming {
     max_failures: 3,
     stable_run: Duration::from_secs(60),
     stop_wait: Duration::from_millis(300),
+    kill_wait: Duration::from_secs(2),
 };
+
+/// How long the fake process of [`Mode::SlowDeath`] takes to end. Longer
+/// than the first restart wait.
+const SLOW_DEATH: Duration = Duration::from_millis(200);
 
 // region: fake helper
 
@@ -82,6 +87,11 @@ enum Mode {
     Stall,
     /// `Hello` and `Ack` lines, but no answer to `Shutdown`.
     IgnoreShutdown,
+    /// `Hello`, then the output closes. The process ends [`SLOW_DEATH`]
+    /// later, also after a kill.
+    SlowDeath,
+    /// As [`Mode::SlowDeath`], but the process never ends.
+    NeverDies,
 }
 
 /// What the test set up, and what the fake helpers did.
@@ -93,6 +103,8 @@ struct Lab {
     launches: AtomicU32,
     /// Helper tasks that ended.
     ended: AtomicU32,
+    /// Starts while an older helper process still ran.
+    overlaps: AtomicU32,
     /// Ends the helper that runs, like a crash.
     crash: Notify,
     /// Lets a stalled helper read again.
@@ -109,6 +121,7 @@ impl Lab {
             hold_sends: AtomicBool::new(false),
             launches: AtomicU32::new(0),
             ended: AtomicU32::new(0),
+            overlaps: AtomicU32::new(0),
             crash: Notify::new(),
             release: Notify::new(),
             adapter_shut_down: AtomicBool::new(false),
@@ -130,6 +143,10 @@ impl Lab {
     fn ended(&self) -> u32 {
         self.ended.load(Ordering::SeqCst)
     }
+
+    fn overlaps(&self) -> u32 {
+        self.overlaps.load(Ordering::SeqCst)
+    }
 }
 
 struct FakeLauncher(Arc<Lab>);
@@ -141,6 +158,10 @@ impl HelperLauncher for FakeLauncher {
 
     fn launch(&self) -> std::io::Result<HelperProcess> {
         let lab = Arc::clone(&self.0);
+        if lab.launches() > lab.ended() {
+            lab.overlaps.fetch_add(1, Ordering::SeqCst);
+        }
+        let mode = lab.mode();
         lab.launches.fetch_add(1, Ordering::SeqCst);
         let (stdin, helper_in) = tokio::io::duplex(PIPE_BYTES);
         let (helper_out, stdout) = tokio::io::duplex(PIPE_BYTES);
@@ -151,6 +172,13 @@ impl HelperLauncher for FakeLauncher {
                 () = fake_process(Arc::clone(&lab), helper_in, helper_out) => {}
                 () = lab.crash.notified() => {}
                 _ = killed => {}
+            }
+            // The pipes of the process are closed here. The process itself
+            // can take longer to end.
+            match mode {
+                Mode::SlowDeath => tokio::time::sleep(SLOW_DEATH).await,
+                Mode::NeverDies => std::future::pending::<()>().await,
+                _ => {}
             }
             lab.ended.fetch_add(1, Ordering::SeqCst);
             let _ = exited_tx.send(());
@@ -196,6 +224,10 @@ async fn fake_process(lab: Arc<Lab>, stdin: DuplexStream, mut stdout: DuplexStre
             let _ = write_line(&mut stdout, &hello(PROTOCOL_VERSION)).await;
             let _ = stdout.write_all(b"this is not a wire line\n").await;
             std::future::pending::<()>().await;
+        }
+        // The output closes at the return. The launcher keeps the process.
+        Mode::SlowDeath | Mode::NeverDies => {
+            let _ = write_line(&mut stdout, &hello(PROTOCOL_VERSION)).await;
         }
         Mode::Stall | Mode::IgnoreShutdown => {
             let _ = write_line(&mut stdout, &hello(PROTOCOL_VERSION)).await;
@@ -652,6 +684,7 @@ async fn a_helper_that_dies_starts_again_and_the_account_links_again() {
         1,
         "the first helper ended before the next one started"
     );
+    assert_eq!(probe.lab.overlaps(), 0, "one process at a time");
     // The new helper answers.
     probe.send(AdapterCommand::LoadChats { protocol: PROTOCOL });
     probe
@@ -761,6 +794,42 @@ async fn a_bad_line_from_the_helper_counts_as_a_failure() {
         TIMING.max_failures,
         "each broken helper was ended"
     );
+}
+
+/// PR #256 review: a helper that closes its output can still run and hold
+/// the lock of the session store. The next helper starts only after the old
+/// process ended. Else it finds the lock, and a crash that the app can
+/// repair becomes "Helper stopped."
+#[tokio::test]
+async fn a_new_helper_starts_only_after_the_old_process_ended() {
+    let mut probe = Probe::start(Mode::SlowDeath);
+    probe.pair(1);
+    probe.until_helper(HelperState::Restarting).await;
+    assert_eq!(probe.lab.ended(), 0, "the old process still runs");
+    // The restart wait is shorter than the death of the old process.
+    tokio::time::sleep(TIMING.restart_base * 3).await;
+    assert_eq!(probe.lab.launches(), 1, "no second process next to it");
+
+    probe.lab.set_mode(Mode::Serve);
+    probe.until_helper(HelperState::Running).await;
+    probe.until_account(AccountState::Linked).await;
+    assert_eq!(probe.lab.launches(), 2);
+    assert_eq!(probe.lab.overlaps(), 0, "one process at a time");
+}
+
+/// A helper process that does not end after its kill blocks the next start.
+/// The supervisor then stops and says so. It never starts a second process
+/// on the same session store.
+#[tokio::test]
+async fn a_helper_process_that_never_ends_stops_the_restart() {
+    let mut probe = Probe::start(Mode::NeverDies);
+    probe.pair(1);
+    probe.until_helper(HelperState::Restarting).await;
+    probe
+        .until_helper(HelperState::Stopped(HelperFault::StillRunning))
+        .await;
+    assert_eq!(probe.lab.launches(), 1);
+    assert_eq!(probe.lab.overlaps(), 0);
 }
 
 /// The user cancelled the link: a helper that dies after that does not start

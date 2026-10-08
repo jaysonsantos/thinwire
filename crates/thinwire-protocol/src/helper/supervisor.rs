@@ -2,8 +2,9 @@
 //!
 //! One supervisor owns the helper of one protocol (ADR 0013). It is the only
 //! code that starts and stops that helper, and it holds at most one process:
-//! a new start waits until the old process is gone. `handle` only sends a
-//! message to the supervisor, so no caller ever waits on the pipe.
+//! a new start waits until the old process ended, also after a kill. Two
+//! processes on one session store break it. `handle` only sends a message
+//! to the supervisor, so no caller ever waits on the pipe.
 //!
 //! Lifetime of the helper:
 //!
@@ -15,7 +16,7 @@
 //!   account links again from its session store. After the last try the
 //!   account row shows "Helper stopped." and Restart.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,6 +75,9 @@ pub struct HelperTiming {
     pub stable_run: Duration,
     /// Longest wait for `Stopped` after `Shutdown`.
     pub stop_wait: Duration,
+    /// Longest wait for a killed helper process to end, before a new one
+    /// starts.
+    pub kill_wait: Duration,
 }
 
 impl HelperTiming {
@@ -86,6 +90,7 @@ impl HelperTiming {
         max_failures: 5,
         stable_run: Duration::from_secs(60),
         stop_wait: HELPER_STOP_WAIT,
+        kill_wait: Duration::from_secs(5),
     };
 
     /// The wait before restart number `failures` (1 for the first one).
@@ -194,6 +199,9 @@ impl ProtocolAdapter for HelperAdapter {
             runs: 0,
             reported: None,
             failures: 0,
+            alive: HashSet::new(),
+            start_waits: false,
+            old_exit_deadline: None,
             restart_at: None,
             stop_deadline: None,
             stopping: false,
@@ -259,16 +267,20 @@ enum Msg {
         run: u64,
         line: HelperLine,
     },
-    /// The helper process number `run` ended, or its output broke.
+    /// The output of the helper process number `run` ended or broke. The
+    /// process can still run.
     Ended {
         run: u64,
         why: Ended,
     },
+    /// The helper process number `run` ended. The OS dropped its lock on
+    /// the session store.
+    Exited {
+        run: u64,
+    },
 }
 
 enum Ended {
-    /// The process ended.
-    Exited,
     /// The process closed its output.
     Closed,
     /// A line that is not in the protocol.
@@ -278,7 +290,6 @@ enum Ended {
 impl std::fmt::Display for Ended {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Exited => f.write_str("the process ended"),
             Self::Closed => f.write_str("the process closed its output"),
             Self::BadLine(error) => write!(f, "bad line: {error}"),
         }
@@ -341,6 +352,14 @@ struct Supervisor {
     link: Option<Link>,
     /// Number of helper processes started. It names the current one.
     runs: u64,
+    /// Helper processes that did not end yet, by number. Dropping a link
+    /// only sends the kill. A new process starts when this is empty, so no
+    /// two processes use the session store, and the new one finds no lock.
+    alive: HashSet<u64>,
+    /// A start waits for the old process to end.
+    start_waits: bool,
+    /// When the wait for the old process ends without a start.
+    old_exit_deadline: Option<Instant>,
     /// The last helper state sent to the shell.
     reported: Option<HelperState>,
     /// Failed runs in a row.
@@ -382,10 +401,16 @@ impl Supervisor {
             .filter(|link| link.greeted && self.reported == Some(HelperState::Running))
             .and_then(|link| link.unacked.front())
             .map(|(_, sent)| *sent + self.timing.busy_after);
-        [self.restart_at, self.stop_deadline, hello, busy]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.restart_at,
+            self.stop_deadline,
+            self.old_exit_deadline,
+            hello,
+            busy,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn on_timer(&mut self, now: Instant) {
@@ -393,6 +418,15 @@ impl Supervisor {
             // The helper did not confirm in time. Ending the process ends
             // every client in it, so `Stopped` is true.
             self.finish_stop();
+            return;
+        }
+        if self.old_exit_deadline.is_some_and(|at| at <= now) {
+            // The old process got its kill and still runs. A second process
+            // on its session store is not safe: stop, and let the user try.
+            tracing::warn!(protocol = %self.protocol, "the old helper process did not end");
+            self.start_waits = false;
+            self.old_exit_deadline = None;
+            self.stop_for(HelperFault::StillRunning);
             return;
         }
         if self.restart_at.is_some_and(|at| at <= now) {
@@ -424,15 +458,31 @@ impl Supervisor {
             Msg::Shutdown => self.on_shutdown(),
             Msg::Line { run, line } if self.is_current(run) => self.on_line(line),
             Msg::Ended { run, why } if self.is_current(run) => {
-                tracing::info!(protocol = %self.protocol, %why, "helper ended");
-                if self.stopping {
-                    self.finish_stop();
-                } else {
-                    self.helper_ended();
+                tracing::info!(protocol = %self.protocol, %why, "helper output ended");
+                self.on_helper_gone();
+            }
+            Msg::Exited { run } => {
+                self.alive.remove(&run);
+                if self.is_current(run) {
+                    tracing::info!(protocol = %self.protocol, "helper process ended");
+                    self.on_helper_gone();
+                }
+                // A start that waited for this process can go now.
+                if self.start_waits && self.alive.is_empty() {
+                    self.launch();
                 }
             }
             // From a process that the supervisor already dropped.
             Msg::Line { .. } | Msg::Ended { .. } => {}
+        }
+    }
+
+    /// The current helper ended, or its output did.
+    fn on_helper_gone(&mut self) {
+        if self.stopping {
+            self.finish_stop();
+        } else {
+            self.helper_ended();
         }
     }
 
@@ -600,6 +650,17 @@ impl Supervisor {
         if self.link.is_some() || self.stopping {
             return;
         }
+        if !self.alive.is_empty() {
+            // The old process got its kill, but the OS did not report its
+            // end yet. It can still hold the lock of the session store.
+            // `Exited` starts the new process.
+            self.start_waits = true;
+            self.old_exit_deadline
+                .get_or_insert(Instant::now() + self.timing.kill_wait);
+            return;
+        }
+        self.start_waits = false;
+        self.old_exit_deadline = None;
         if !self.launcher.installed() {
             self.report(HelperState::Missing);
             emit_status(
@@ -620,6 +681,7 @@ impl Supervisor {
         };
         self.runs += 1;
         let run = self.runs;
+        self.alive.insert(run);
         let HelperProcess {
             stdin,
             stdout,
@@ -638,13 +700,7 @@ impl Supervisor {
         let inbox = self.inbox.clone();
         tokio::spawn(async move {
             let _ = exited.await;
-            notify(
-                &inbox,
-                Msg::Ended {
-                    run,
-                    why: Ended::Exited,
-                },
-            );
+            notify(&inbox, Msg::Exited { run });
         });
         let now = Instant::now();
         self.link = Some(Link {
@@ -839,6 +895,8 @@ impl Supervisor {
         }
         self.stopping = true;
         self.restart_at = None;
+        self.start_waits = false;
+        self.old_exit_deadline = None;
         let Some(link) = &self.link else {
             self.finish_stop();
             return;

@@ -141,6 +141,9 @@ pub enum HelperFault {
     VersionMismatch,
     /// Another helper process uses the session store.
     SessionInUse,
+    /// The last helper process got its kill but did not end, so a new one
+    /// cannot start: two processes on one session store break it.
+    StillRunning,
 }
 
 /// Live adapter state reported to the UI over the event channel.

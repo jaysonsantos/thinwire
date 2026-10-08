@@ -2971,6 +2971,12 @@ impl Snapshot {
                     format!("Another thinwire uses the {name} session on this computer."),
                     format!("Close the other thinwire, then click Restart on the {name} account."),
                 ),
+                HelperFault::StillRunning => (
+                    "The last helper process did not end.".to_owned(),
+                    format!(
+                        "Wait a moment, then click Restart on the {name} account. If it stays, restart thinwire."
+                    ),
+                ),
             };
             self.set_error(&happened, &why, &next);
         }
@@ -3880,6 +3886,10 @@ mod tests {
             (
                 HelperFault::SessionInUse,
                 "Close the other thinwire, then click Restart on the WhatsApp account.",
+            ),
+            (
+                HelperFault::StillRunning,
+                "Wait a moment, then click Restart on the WhatsApp account. If it stays, restart thinwire.",
             ),
         ] {
             let mut snapshot = Snapshot::new();

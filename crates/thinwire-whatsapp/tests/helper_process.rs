@@ -42,6 +42,7 @@ const TIMING: HelperTiming = HelperTiming {
     max_failures: 2,
     stable_run: Duration::from_secs(600),
     stop_wait: Duration::from_secs(4),
+    kill_wait: Duration::from_secs(5),
 };
 
 /// A new, empty session folder for one test.
