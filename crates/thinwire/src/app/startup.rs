@@ -1,9 +1,10 @@
 //! Startup: take the single-instance lock before any protocol starts.
 //!
 //! A new launch right after a close often finds the old process still
-//! closing its clients (the window hides at once, the process stays up to
-//! the close limit). So a held lock means "wait": try again until
-//! [`LOCK_WAIT`]. A short wait shows no window. After [`NOTE_AFTER`] a small
+//! closing its clients (the window hides at once, the process stays up
+//! through the close limit and the watchdog's last sleep). So a held lock
+//! means "wait": try again until [`LOCK_WAIT`]. A short wait shows no window.
+//! After [`NOTE_AFTER`] a small
 //! window says that thinwire is still closing. If the lock is still held at
 //! the end, the window explains what happened instead of starting a second
 //! copy.
@@ -16,12 +17,29 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use thinwire_core::instance::{InstanceLock, LockError, RETRY_STEP};
 
-use super::{SHUTDOWN_TIMEOUT, Settings, ThinwireApp, WATCHDOG_MARGIN};
+use super::{SHUTDOWN_TIMEOUT, Settings, ThinwireApp, WATCHDOG_LOCK_HOLD};
 
-/// How long a new launch waits for the old one to quit. An old process
-/// ends at most [`SHUTDOWN_TIMEOUT`] plus the watchdog margin after its
-/// close, so this covers a launch at any time after that close.
-pub const LOCK_WAIT: Duration = SHUTDOWN_TIMEOUT.saturating_add(WATCHDOG_MARGIN);
+/// Slack past the old process's worst-case exit. Covers the time from the
+/// user launching this process until the wait starts, and the OS dropping
+/// the lock after `process::exit`.
+const LOCK_START_SLACK: Duration = Duration::from_millis(250);
+
+/// How long a new launch waits for the old one to quit.
+///
+/// The old process holds the lock until the watchdog exits, which is
+/// [`SHUTDOWN_TIMEOUT`] plus [`WATCHDOG_LOCK_HOLD`] after the close
+/// ([`WATCHDOG_MARGIN`](super::WATCHDOG_MARGIN) and then [`EXIT_FLOOR`](super::EXIT_FLOOR)).
+/// [`LOCK_START_SLACK`] keeps a launch that starts during that exit from
+/// giving up first.
+pub const LOCK_WAIT: Duration = SHUTDOWN_TIMEOUT
+    .saturating_add(WATCHDOG_LOCK_HOLD)
+    .saturating_add(LOCK_START_SLACK);
+const _: () = assert!(
+    LOCK_WAIT.as_millis()
+        >= SHUTDOWN_TIMEOUT.as_millis()
+            + WATCHDOG_LOCK_HOLD.as_millis()
+            + LOCK_START_SLACK.as_millis()
+);
 /// A wait up to this long shows no window.
 pub const NOTE_AFTER: Duration = Duration::from_secs(1);
 
@@ -154,15 +172,25 @@ impl Shell {
     }
 
     fn poll_wait(&mut self, ctx: &egui::Context) {
-        let Stage::Waiting(wait) = &self.stage else {
-            return;
+        let (path, recv) = {
+            let Stage::Waiting(wait) = &self.stage else {
+                return;
+            };
+            (wait.path.clone(), wait.result.try_recv())
         };
-        let path = wait.path.clone();
-        let result = match wait.result.try_recv() {
+        let result = match recv {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return,
-            // The thread did not start or died: treat it as held.
-            Err(TryRecvError::Disconnected) => Err(LockError::Held),
+            Err(TryRecvError::Disconnected) => {
+                // The wait thread did not start or died. That is not a lock
+                // timeout: say so, then show the same failure window.
+                tracing::error!(
+                    "the instance wait thread ended without a result; not starting a second copy"
+                );
+                self.stage = Stage::Failed { path };
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(FAILED_SIZE.into()));
+                return;
+            }
         };
         match result {
             Ok(lock) => {
@@ -307,7 +335,7 @@ mod tests {
 
     #[test]
     fn the_wait_covers_the_longest_close_of_the_old_copy() {
-        assert!(LOCK_WAIT >= SHUTDOWN_TIMEOUT + WATCHDOG_MARGIN);
+        assert!(LOCK_WAIT >= SHUTDOWN_TIMEOUT + WATCHDOG_LOCK_HOLD + LOCK_START_SLACK);
         assert!(NOTE_AFTER < LOCK_WAIT);
         assert_eq!(NOTE_AFTER, Duration::from_secs(1));
     }

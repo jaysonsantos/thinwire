@@ -33,13 +33,21 @@ pub use thinwire_core::settings::Settings;
 /// Longest wait for TDLib to close before the window closes anyway. The
 /// adapters derive their own shutdown bounds from this limit.
 const SHUTDOWN_TIMEOUT: Duration = thinwire_protocol::APP_CLOSE_LIMIT;
-/// Time after the close deadline before the exit watchdog ends the process.
-/// The normal exit path needs at most the notification flush and the
-/// runtime floor in `finish_exit` after the deadline.
+/// Wait after the close deadline before the watchdog flushes and exits.
+/// The normal exit path needs at most the notification flush and
+/// [`EXIT_FLOOR`] inside this window, so the watchdog does not cut it short.
 const WATCHDOG_MARGIN: Duration = Duration::from_millis(1500);
 // The watchdog never cuts the normal exit path short.
 const _: () =
     assert!(WATCHDOG_MARGIN.as_millis() > NOTIFY_FLUSH_LIMIT.as_millis() + EXIT_FLOOR.as_millis());
+/// From the close deadline until the watchdog calls `process::exit`.
+/// It waits [`WATCHDOG_MARGIN`], runs the keychain flush, then sleeps
+/// [`EXIT_FLOOR`]. The single-instance lock stays held until that exit, so
+/// [`startup::LOCK_WAIT`] includes this whole interval.
+const WATCHDOG_LOCK_HOLD: Duration = WATCHDOG_MARGIN.saturating_add(EXIT_FLOOR);
+const _: () = assert!(
+    WATCHDOG_LOCK_HOLD.as_millis() == WATCHDOG_MARGIN.as_millis() + EXIT_FLOOR.as_millis()
+);
 /// Exit code when the watchdog ends the process. The user asked to close,
 /// so it is a normal exit.
 const WATCHDOG_EXIT_CODE: i32 = 0;
@@ -174,7 +182,7 @@ fn is_wayland(frame: &eframe::Frame) -> bool {
         .is_ok_and(|handle| matches!(handle.as_raw(), RawWindowHandle::Wayland(_)))
 }
 
-/// End the process at `close_deadline + WATCHDOG_MARGIN` if it still runs.
+/// End the process at `close_deadline + WATCHDOG_LOCK_HOLD` if it still runs.
 ///
 /// The close gate is polled only in `logic()`, and `logic()` runs only on a
 /// repaint. A hidden or minimized window may get no repaint: on Wayland,
@@ -183,6 +191,10 @@ fn is_wayland(frame: &eframe::Frame) -> bool {
 /// neither the stopped check nor the deadline would fire, and a hidden
 /// process would stay forever. This thread needs no repaint. In the normal
 /// case the process exits first and the thread dies with it.
+///
+/// The thread wakes after [`WATCHDOG_MARGIN`], runs `before_exit`, then
+/// sleeps [`EXIT_FLOOR`] before `exit`. That last sleep is part of
+/// [`WATCHDOG_LOCK_HOLD`]: the lock is still held while it runs.
 fn spawn_exit_watchdog(
     close_deadline: Instant,
     before_exit: impl FnOnce() + Send + 'static,
@@ -191,18 +203,22 @@ fn spawn_exit_watchdog(
     std::thread::Builder::new()
         .name("thinwire-exit-watchdog".into())
         .spawn(move || {
-            let at = close_deadline + WATCHDOG_MARGIN;
-            loop {
-                let left = at.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                std::thread::sleep(left);
-            }
+            sleep_until(close_deadline + WATCHDOG_MARGIN);
             tracing::warn!("the window did not finish closing in time; ending the process");
             before_exit();
+            std::thread::sleep(EXIT_FLOOR);
             exit();
         })
+}
+
+fn sleep_until(at: Instant) {
+    loop {
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left);
+    }
 }
 
 /// Holds the window open until TDLib closed cleanly, or until a deadline.
@@ -396,7 +412,7 @@ impl ThinwireApp {
     }
 
     /// Start the exit watchdog once. Before the exit it starts the keychain
-    /// flush, as `finish_exit` does, and gives it [`EXIT_FLOOR`].
+    /// flush, as `finish_exit` does. The watchdog then waits [`EXIT_FLOOR`].
     fn start_watchdog(&mut self, close_deadline: Instant) {
         if std::mem::replace(&mut self.watchdog, true) {
             return;
@@ -404,10 +420,7 @@ impl ThinwireApp {
         let flush = self.core.keychain_flush_hook();
         let started = spawn_exit_watchdog(
             close_deadline,
-            move || {
-                flush();
-                std::thread::sleep(EXIT_FLOOR);
-            },
+            flush,
             || std::process::exit(WATCHDOG_EXIT_CODE),
         );
         if let Err(error) = started {
@@ -641,7 +654,9 @@ mod tests {
         let at = exit.recv_timeout(Duration::from_secs(5)).expect("exit ran");
         let flushed_at = flush.try_recv().expect("the flush runs before the exit");
         assert!(flushed_at <= at);
-        assert!(at >= deadline + Duration::from_millis(20) + WATCHDOG_MARGIN);
+        // The exit is the margin plus the final EXIT_FLOOR sleep. Dropping
+        // that sleep makes this fail, and LOCK_WAIT is tied to the same sum.
+        assert!(at >= deadline + Duration::from_millis(20) + WATCHDOG_LOCK_HOLD);
         handle.join().expect("watchdog ends");
     }
 

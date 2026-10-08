@@ -69,6 +69,8 @@ impl InstanceLock {
             create_private_dir_all(dir).map_err(LockError::Io)?;
         }
         // Never truncate: the file has no content, and the holder keeps it open.
+        // Rust opens this with O_CLOEXEC (a non-inheritable handle on Windows),
+        // so a helper child does not inherit the lock.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
