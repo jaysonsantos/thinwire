@@ -2,6 +2,8 @@
 
 **Status:** accepted
 
+**Superseded by:** [0013](0013-ship-all-protocols-agpl-helpers.md)
+
 **Amends:** [0004](0004-signal-out-of-v1.md)
 
 **Date:** 2026-09-24
