@@ -654,6 +654,39 @@ async fn a_pairing_that_the_helper_never_got_keeps_its_phone() {
     assert_eq!(code.reveal(), "qr:none");
 }
 
+/// PR #256 review: a cancel that came after the pairing start, while both
+/// waited for `Hello`, wins. When that helper ends, the pairing is not sent
+/// to a next helper, and the cancel and the other commands that waited get
+/// their answers.
+#[tokio::test]
+async fn a_cancel_before_hello_wins_over_the_pairing_that_waited() {
+    let mut probe = Probe::start(Mode::FirstDiesBeforeHello);
+    probe.phone.set_phone(PHONE);
+    probe.pair(1);
+    probe.send(AdapterCommand::LoadChats { protocol: PROTOCOL });
+    probe.send(AdapterCommand::WhatsAppCancelLink);
+    probe.until_helper(HelperState::Idle).await;
+    tokio::time::sleep(NO_START_WAIT).await;
+    probe.settle().await;
+    assert_eq!(probe.lab.launches(), 1, "no helper for a cancelled pairing");
+    assert!(
+        !probe.saw(|event| matches!(event, AdapterEvent::WhatsAppQr { .. })),
+        "the cancelled pairing never ran"
+    );
+    assert!(
+        probe.saw(|event| *event
+            == AdapterEvent::Account {
+                protocol: PROTOCOL,
+                state: AccountState::Unlinked,
+            }),
+        "the cancel got its answer"
+    );
+    assert!(
+        probe.saw(|event| *event == AdapterEvent::ChatListLoaded { protocol: PROTOCOL }),
+        "the load that waited ended"
+    );
+}
+
 /// A pairing start of the user while no helper runs starts the helper. It
 /// is a new start, so it keeps its phone, and it takes the place of the old
 /// pairing in the replay.

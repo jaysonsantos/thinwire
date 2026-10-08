@@ -860,13 +860,19 @@ impl Supervisor {
     /// The helper ended by itself, or it broke the protocol (ADR 0012
     /// "Failure").
     fn helper_ended(&mut self) {
-        let Some(link) = self.link.take() else {
+        let Some(mut link) = self.link.take() else {
             return;
         };
         let stable = link.started.elapsed() >= self.timing.stable_run;
-        self.keep_unsent_pairing(&link);
+        // Commands that waited for `Hello` never crossed the pipe.
+        let unsent = if link.greeted {
+            Vec::new()
+        } else {
+            std::mem::take(&mut link.held)
+        };
         // Dropping the link ends the process, if it still runs.
         drop(link);
+        self.end_unsent(&unsent);
         self.reject_open_sends();
         if self.replay.is_empty() && self.wake_link.is_none() {
             // The user has no link to keep: no restart.
@@ -897,21 +903,36 @@ impl Supervisor {
         self.restart_at = Some(Instant::now() + self.timing.backoff(self.failures));
     }
 
-    /// A pairing start that waited for `Hello` never crossed the pipe. Keep
-    /// it, with its phone, for the next helper. Else the replay sends it
-    /// with no phone, and a pair-code pairing of the user becomes a QR
-    /// pairing though the helper never got the number.
-    fn keep_unsent_pairing(&mut self, link: &Link) {
-        if link.greeted {
-            return;
+    /// End the commands that waited for `Hello` when their helper ended:
+    /// they never crossed the pipe.
+    ///
+    /// - A load, a send, or a cancel gets the answer that it gets with no
+    ///   helper, so no spinner and no send stays open.
+    /// - A pairing start stays for the next helper, with its phone. Else the
+    ///   replay sends it with no phone, and a pair-code pairing of the user
+    ///   becomes a QR pairing though the helper never got the number.
+    /// - A cancel that came after the pairing start wins: that pairing is
+    ///   not kept.
+    fn end_unsent(&mut self, unsent: &[WireCommand]) {
+        for command in unsent {
+            // The gate is in the replay. The pairing is handled below.
+            if !matches!(
+                command,
+                WireCommand::AcknowledgeGate | WireCommand::BeginLink { .. }
+            ) {
+                self.answer_without_helper(command);
+            }
         }
-        let unsent = link.held.iter().rev().find_map(|command| match command {
-            WireCommand::BeginLink { generation, .. } => Some((*generation, command.clone())),
-            _ => None,
+        // The last word of the user on the pairing: a start, or a cancel.
+        let last = unsent.iter().rev().find(|command| {
+            matches!(
+                command,
+                WireCommand::BeginLink { .. } | WireCommand::CancelLink | WireCommand::Disconnect
+            )
         });
-        if let Some(unsent) = unsent {
+        if let Some(command @ WireCommand::BeginLink { generation, .. }) = last {
             self.replay.link = None;
-            self.wake_link = Some(unsent);
+            self.wake_link = Some((*generation, command.clone()));
         }
     }
 
