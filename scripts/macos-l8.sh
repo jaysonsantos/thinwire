@@ -3,6 +3,10 @@
 #
 #   ./scripts/macos-l8.sh
 #
+# Only the keychain check (part 2), no notification build or run:
+#
+#   SKIP_NOTIFY=1 ./scripts/macos-l8.sh
+#
 # Part 1: UNUserNotificationCenter inside an ad-hoc signed Thinwire.app.
 # Part 2: keychain. Build A (ad-hoc signed) saves a test secret. Build B is a
 # rebuild with a different binary hash. B reads the secret: does macOS ask?
@@ -126,7 +130,7 @@ log "arch: $(uname -m)"
 log "commit: $(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 log "rustc: $(rustc -V 2>&1 || echo missing)"
 log "cargo: $(command -v cargo || echo missing)"
-log "nix shell: ${IN_NIX_SHELL:-no}, interactive: $INTERACTIVE"
+log "nix shell: ${IN_NIX_SHELL:-no}, interactive: $INTERACTIVE, skip notify: ${SKIP_NOTIFY:-0}"
 
 WORK=$ROOT/target/l8
 mkdir -p "$WORK"
@@ -138,7 +142,9 @@ WAIT_CLICK=60
 if [[ $INTERACTIVE == 0 ]]; then
   WAIT_CLICK=0
 fi
-if build notify cargo build -p thinwire-notify --example macos_probe --locked &&
+if [[ ${SKIP_NOTIFY:-} == 1 ]]; then
+  step notify "skipped (SKIP_NOTIFY=1)"
+elif build notify cargo build -p thinwire-notify --example macos_probe --locked &&
   make_bundle "$WORK/notify" target/debug/examples/macos_probe; then
   say "Part 1: notifications." \
     "1. If macOS asks whether Thinwire may send notifications, click Allow." \
