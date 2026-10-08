@@ -221,31 +221,66 @@ fn sleep_until(at: Instant) {
     }
 }
 
-/// The first close: one `Shutdown`, then the exit watchdog.
+/// The first close: one `Shutdown`, then the exit watchdog. Returns `true`
+/// when the watchdog runs.
 fn begin_first_close(
     core: &mut Core,
     deadline: Instant,
-    start_watchdog: impl FnOnce(&mut Core, Instant),
-) {
+    start_watchdog: impl FnOnce(&mut Core, Instant) -> bool,
+) -> bool {
     core.dispatch(Intent::Shutdown);
-    start_watchdog(core, deadline);
+    start_watchdog(core, deadline)
 }
 
 /// Start the exit watchdog once. `flush` is the keychain hook from the core.
 /// The watchdog sleeps [`EXIT_FLOOR`] after `flush` returns, before it exits.
+/// Returns `true` when a watchdog runs.
 fn arm_exit_watchdog(
     armed: &mut bool,
     flush: impl FnOnce() + Send + 'static,
     close_deadline: Instant,
-) {
-    if std::mem::replace(armed, true) {
-        return;
+) -> bool {
+    arm_watchdog_with(armed, || {
+        spawn_exit_watchdog(close_deadline, flush, || {
+            std::process::exit(WATCHDOG_EXIT_CODE);
+        })
+    })
+}
+
+/// `armed` is set only when the thread started. If the thread cannot start
+/// (the process is out of threads), log it and return `false`: the caller
+/// then keeps the window on screen (see [`window_action`]).
+fn arm_watchdog_with(
+    armed: &mut bool,
+    spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> bool {
+    if *armed {
+        return true;
     }
-    let started = spawn_exit_watchdog(close_deadline, flush, || {
-        std::process::exit(WATCHDOG_EXIT_CODE);
-    });
-    if let Err(error) = started {
-        tracing::warn!(%error, "the exit watchdog did not start");
+    match spawn() {
+        Ok(_) => {
+            *armed = true;
+            true
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "the exit watchdog did not start; the window stays open until the clients stop"
+            );
+            false
+        }
+    }
+}
+
+/// The close action the window shows. A hidden window may get no repaint
+/// (Wayland), and then only the watchdog ends the process. Without a
+/// watchdog the first close does not hide the window: it stays on screen,
+/// `logic()` keeps running, and the close gate closes it when the clients
+/// stopped or at its deadline, as before #238 (Codex r4216328525).
+const fn window_action(action: CloseAction, watchdog: bool) -> CloseAction {
+    match action {
+        CloseAction::HoldAndShutdown if !watchdog => CloseAction::Hold,
+        action => action,
     }
 }
 
@@ -417,10 +452,7 @@ impl ThinwireApp {
         if ctx.input(|input| input.viewport().close_requested()) {
             let now = Instant::now();
             let action = self.close_gate.on_close_requested(now);
-            let wayland = action == CloseAction::HoldAndShutdown && is_wayland(frame);
-            for command in close_commands(action, wayland) {
-                ctx.send_viewport_cmd(command);
-            }
+            let mut watchdog_runs = true;
             if action == CloseAction::HoldAndShutdown {
                 let deadline = self
                     .close_gate
@@ -428,10 +460,17 @@ impl ThinwireApp {
                     .expect("HoldAndShutdown sets the close deadline");
                 self.exit_deadline = Some(deadline);
                 let watchdog = &mut self.watchdog;
-                begin_first_close(&mut self.core, deadline, |core, deadline| {
+                watchdog_runs = begin_first_close(&mut self.core, deadline, |core, deadline| {
                     let flush = core.keychain_flush_hook();
-                    arm_exit_watchdog(watchdog, flush, deadline);
+                    arm_exit_watchdog(watchdog, flush, deadline)
                 });
+            }
+            let shown = window_action(action, watchdog_runs);
+            let wayland = shown == CloseAction::HoldAndShutdown && is_wayland(frame);
+            for command in close_commands(shown, wayland) {
+                ctx.send_viewport_cmd(command);
+            }
+            if shown == CloseAction::HoldAndShutdown {
                 // The Dock icon and Cmd-Tab entry go now, not at the exit.
                 // `logic()` runs on the main thread, which AppKit needs.
                 dock::hide_icon();
@@ -647,8 +686,67 @@ mod tests {
                 "Shutdown is dispatched before the watchdog starts"
             );
             watched = Some(at);
+            true
         });
         assert_eq!(watched, Some(deadline), "the watchdog starts once");
+    }
+
+    /// Codex r4216328525: a watchdog thread that cannot start is logged, and
+    /// the first close then keeps the window on screen, so `logic()` keeps
+    /// polling the close gate and the deadline still closes the window.
+    #[test]
+    fn a_watchdog_that_cannot_start_keeps_the_window_open() {
+        let mut armed = false;
+        let started = arm_watchdog_with(&mut armed, || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "no thread",
+            ))
+        });
+        assert!(!started);
+        assert!(!armed, "no watchdog runs");
+
+        let start = Instant::now();
+        let mut gate = CloseGate::Open;
+        let action = gate.on_close_requested(start);
+        assert_eq!(action, CloseAction::HoldAndShutdown);
+        let shown = window_action(action, started);
+        assert_eq!(shown, CloseAction::Hold);
+        for wayland in [false, true] {
+            assert_eq!(
+                close_commands(shown, wayland),
+                vec![egui::ViewportCommand::CancelClose],
+                "no hide, no minimize: the window keeps its repaints"
+            );
+        }
+        // The window-driven close path still ends the process.
+        assert!(!gate.poll(start + SHUTDOWN_TIMEOUT / 2, false));
+        assert!(
+            gate.poll(start + SHUTDOWN_TIMEOUT, false),
+            "the deadline closes it"
+        );
+
+        // A watchdog that starts hides the window as before.
+        assert_eq!(
+            window_action(CloseAction::HoldAndShutdown, true),
+            CloseAction::HoldAndShutdown
+        );
+        assert_eq!(window_action(CloseAction::Hold, false), CloseAction::Hold);
+        assert_eq!(window_action(CloseAction::Allow, false), CloseAction::Allow);
+    }
+
+    #[test]
+    fn a_started_watchdog_is_armed_once() {
+        let mut armed = false;
+        let mut spawns = 0;
+        for _ in 0..2 {
+            assert!(arm_watchdog_with(&mut armed, || {
+                spawns += 1;
+                std::thread::Builder::new().spawn(|| {})
+            }));
+        }
+        assert!(armed);
+        assert_eq!(spawns, 1, "one watchdog thread");
     }
 
     #[test]
