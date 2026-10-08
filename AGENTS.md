@@ -5,14 +5,14 @@
 - v1 protocols: Telegram, WhatsApp (experimental), Discord (bot/OAuth inbox only), Slack OAuth, Signal (experimental; ships with #248 as an AGPL helper process, ADR `0013`)
 - Accepted plan, ADR `0013-ship-all-protocols-agpl-helpers` (2026-10-08): release builds ship every protocol, with WhatsApp and Signal in AGPL-3.0-only helper binaries over IPC. It supersedes `0004` (Signal out of v1) and `0011` (AGPL protocols local-only). Implementation is pending: the WhatsApp helper in #246, the Signal helper in #248. Until they land, feature `signal-local` (#39) is the only Signal path and stays local-only. It links Presage and libsignal
 - WhatsApp feature `whatsapp-web` can link AGPL `wacore-libsignal`. The MIT app binary never links AGPL code: release builds and OS zips never enable `whatsapp-web` or `signal-local` in the app. Under `0013` they get WhatsApp and Signal only through the helper binaries
-- Public CI can download AGPL source. Cargo fetches every git dependency in `Cargo.lock`, including optional ones. Until #246 lands, public CI does not build or link that code, and releases do not contain it. Under `0013`, CI builds and tests every protocol feature that a release ships, and the helper crates are the only place AGPL code may link
+- Public CI can download AGPL source. Cargo fetches every git dependency in `Cargo.lock`, including optional ones. Until #246 lands, public CI does not build or link that code, and releases do not contain it. Under `0013`, the default public CI jobs stay feature-off, and one separate release-feature job builds and tests every feature that a release ships (`telegram-tdlib`, `slack-oauth`, `discord-bot` and the helper crates). Its workflow change needs an owner push, because the bot token has no workflow scope. The helper crates are the only place AGPL code may link
 - Code that links an AGPL library moves into an AGPL-licensed crate folder in this repo (#77). The root license stays MIT
 - README must keep the three risk bullets
 - Never claim WhatsApp or Discord personal clients are “reliable”
 - Discord: no self-bots / user-account automation
 - UI: egui + eframe; protocol work off the UI thread
 - WhatsApp, Discord, and Slack work runs in parallel with Telegram (lock change 2026-09-23). It does not wait for "Telegram feels usable"
-- Default build: First-run / Add account offer Telegram only. WA / Discord / Slack auth UI exists only when its cargo feature is on. Default and public CI stay feature-off
+- Default build: First-run / Add account offer Telegram only. WA / Discord / Slack auth UI exists only when its cargo feature is on. Default and public CI jobs stay feature-off, except the release-feature job of `0013`
 - Theme default is System (follow OS light/dark live via egui `system_theme`; persist System \| Light \| Dark)
 - Ordered next work: see `ROADMAP.md`
 

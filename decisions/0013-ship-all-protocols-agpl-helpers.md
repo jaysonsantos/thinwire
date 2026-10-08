@@ -18,7 +18,7 @@ The thinwire app is MIT. Licenses of the protocol stacks:
 - Signal: presage, presage-store-sqlite and libsignal are AGPL-3.0.
 - Discord: twilight-http and twilight-model 0.17.1 are ISC.
 - Slack: slack-morphism 2.29.0 is Apache-2.0.
-- Telegram: tdlib-rs 1.4.0 is Apache-2.0. TDLib is BSL-1.0. ADR 0006 does not change.
+- Telegram: tdlib-rs 1.4.0 is MIT OR Apache-2.0. TDLib is BSL-1.0. ADR 0006 does not change.
 
 ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answered its section 1 questions. The owner chose to start now, before a legal review. This ADR is an engineering decision. It is not legal advice. The section 1 questions of 0012 stay open.
 
@@ -34,7 +34,7 @@ ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answer
     - The app looks for each helper next to its own binary first (`Contents/MacOS/` in `Thinwire.app`). A setting can name another path. That path gets the same 0012 section 4 checks as the default path.
     - If a helper is missing, the app does not hide its protocol. In the add-account picker, that protocol shows as disabled, with the reason. An existing account of that protocol keeps its row and shows "<Protocol> helper missing. Reinstall thinwire." The start error says what failed, why, and what to do.
     - Signing follows ADR 0003: on macOS each helper gets the same ad-hoc signature as the app. There is no Developer ID and no notarization. Linux and Windows helpers are unsigned.
-7. CI builds and tests every protocol feature that a release ships. This starts in the first PR of #246.
+7. The default public CI jobs stay feature-off. One separate, explicit release-feature job builds and tests every feature that a release ships: `telegram-tdlib`, `slack-oauth`, `discord-bot` and the helper crates. This starts in the first PR of #246. The workflow change needs an owner push, because the bot token has no workflow scope.
     - `scripts/check-agpl-deps.sh` and `scripts/check-release-tree.sh` change: they allow AGPL crates in the helper crates only, and they still fail if the MIT app binary links AGPL code.
 8. Each release contains:
     - The AGPL-3.0 text for each helper, and the Corresponding Source (AGPL-3.0 section 1) through the same place as the binaries (section 6(d)). Each release attaches `thinwire-helpers-<tag>-source.tar.gz` next to the binaries. It holds the whole thinwire workspace of the tag, including `Cargo.lock` and the build scripts, and the `cargo vendor` output for the dependencies of both helper crates, including `whatsapp-rust`, `wacore-libsignal`, presage and libsignal. The tarball stays on the release as long as the binaries do. The release never depends on an outside git rev for the source offer.
