@@ -30,16 +30,16 @@ ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answer
 4. The IPC design of 0012 section 2 applies (transport, wire types, ADR 0010 mapping, secrets on the wire, failure), and so does its section 4 (security). Exception: when the restart backoff of 0012 stops, each account row of that helper shows "Helper stopped. Restart". A click on Restart starts the helper again.
 5. The UI never waits on IPC. A slow helper shows a busy account row, not a frozen window.
 6. Distribution (replaces 0012 section 3):
-   - The release archive for each OS contains the app and both helpers. The user does not install a helper as a separate step.
-   - The app looks for each helper next to its own binary first (`Contents/MacOS/` in `Thinwire.app`). A setting can name another path.
-   - If a helper is missing, the app does not hide its protocol. In the add-account picker, that protocol shows as disabled, with the reason. An existing account of that protocol keeps its row and shows "<Protocol> helper missing. Reinstall thinwire." The start error says what failed, why, and what to do.
-   - Signing follows ADR 0003: on macOS each helper gets the same ad-hoc signature as the app. There is no Developer ID and no notarization. Linux and Windows helpers are unsigned.
+    - The release archive for each OS contains the app and both helpers. The user does not install a helper as a separate step.
+    - The app looks for each helper next to its own binary first (`Contents/MacOS/` in `Thinwire.app`). A setting can name another path.
+    - If a helper is missing, the app does not hide its protocol. In the add-account picker, that protocol shows as disabled, with the reason. An existing account of that protocol keeps its row and shows "<Protocol> helper missing. Reinstall thinwire." The start error says what failed, why, and what to do.
+    - Signing follows ADR 0003: on macOS each helper gets the same ad-hoc signature as the app. There is no Developer ID and no notarization. Linux and Windows helpers are unsigned.
 7. CI builds and tests every protocol feature that a release ships. This starts in the first PR of #246.
-   - `scripts/check-agpl-deps.sh` and `scripts/check-release-tree.sh` change: they allow AGPL crates in the helper crates only, and they still fail if the MIT app binary links AGPL code.
+    - `scripts/check-agpl-deps.sh` and `scripts/check-release-tree.sh` change: they allow AGPL crates in the helper crates only, and they still fail if the MIT app binary links AGPL code.
 8. Each release contains:
-   - The AGPL-3.0 text for each helper, and the Corresponding Source (AGPL-3.0 section 1) through the same place as the binaries (section 6(d)). Each release attaches `thinwire-helpers-<tag>-source.tar.gz` next to the binaries. It holds the thinwire source of the tag and the dependencies of both helper crates from `cargo vendor`, including `whatsapp-rust`, `wacore-libsignal`, presage and libsignal. The tarball stays on the release as long as the binaries do. The release never depends on an outside git rev for the source offer.
-   - The Apache-2.0 text and NOTICE for tdlib-rs, BSL-1.0 for TDLib, ISC for twilight.
-   - The licenses of `egui_extras` and `image` (with the jpeg, png and webp decoders) once #244 adds them.
+    - The AGPL-3.0 text for each helper, and the Corresponding Source (AGPL-3.0 section 1) through the same place as the binaries (section 6(d)). Each release attaches `thinwire-helpers-<tag>-source.tar.gz` next to the binaries. It holds the thinwire source of the tag and the dependencies of both helper crates from `cargo vendor`, including `whatsapp-rust`, `wacore-libsignal`, presage and libsignal. The tarball stays on the release as long as the binaries do. The release never depends on an outside git rev for the source offer.
+    - The Apache-2.0 text and NOTICE for tdlib-rs, BSL-1.0 for TDLib, ISC for twilight.
+    - The licenses of `egui_extras` and `image` (with the jpeg, png and webp decoders) once #244 adds them.
 9. README: ToS and ban-risk bullets for every protocol in the release build. Signal gets its line again: no supported third-party API, expect breakage. The Signal gate screen shows the same text. The WhatsApp ban gate stays in the app, before any QR or pair code goes to the helper.
 
 ## Order
