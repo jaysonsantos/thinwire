@@ -1,11 +1,13 @@
 //! eframe application: draws the core view and sends user intents to the core.
 
 mod auth;
+mod dock;
 #[cfg(test)]
 mod inbox_keys;
 mod motion;
 #[cfg(feature = "signal-local")]
 mod signal_gate;
+pub mod startup;
 mod theme;
 mod theme_mode;
 mod thread_layout;
@@ -32,6 +34,23 @@ pub use thinwire_core::settings::Settings;
 /// Longest wait for TDLib to close before the window closes anyway. The
 /// adapters derive their own shutdown bounds from this limit.
 const SHUTDOWN_TIMEOUT: Duration = thinwire_protocol::APP_CLOSE_LIMIT;
+/// Wait after the close deadline before the watchdog flushes and exits.
+/// The normal exit path needs at most the notification flush and
+/// [`EXIT_FLOOR`] inside this window, so the watchdog does not cut it short.
+const WATCHDOG_MARGIN: Duration = Duration::from_millis(1500);
+// The watchdog never cuts the normal exit path short.
+const _: () =
+    assert!(WATCHDOG_MARGIN.as_millis() > NOTIFY_FLUSH_LIMIT.as_millis() + EXIT_FLOOR.as_millis());
+/// From the close deadline until the watchdog calls `process::exit`.
+/// It waits [`WATCHDOG_MARGIN`], runs the keychain flush, then sleeps
+/// [`EXIT_FLOOR`]. The single-instance lock stays held until that exit, so
+/// [`startup::LOCK_WAIT`] includes this whole interval.
+const WATCHDOG_LOCK_HOLD: Duration = WATCHDOG_MARGIN.saturating_add(EXIT_FLOOR);
+const _: () =
+    assert!(WATCHDOG_LOCK_HOLD.as_millis() == WATCHDOG_MARGIN.as_millis() + EXIT_FLOOR.as_millis());
+/// Exit code when the watchdog ends the process. The user asked to close,
+/// so it is a normal exit.
+const WATCHDOG_EXIT_CODE: i32 = 0;
 /// Idle repaint step (10 Hz). The change signal wakes the window at once for
 /// core changes. This timer covers what the core does not see: the OS
 /// light/dark switch in System mode (ADR 0005) and the close deadline.
@@ -127,9 +146,142 @@ impl StopSignals {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseAction {
     Allow,
-    /// Keep the window open and send `Shutdown` once.
+    /// Hide the window, keep the process, and send `Shutdown` once.
     HoldAndShutdown,
     Hold,
+}
+
+/// The window commands for a close request.
+///
+/// The first close hides the window at once, so nobody clicks close again
+/// while the clients close. winit cannot hide a window on Wayland
+/// (`set_visible` does nothing there), so on Wayland the window is
+/// minimized instead. A later close only cancels the close again.
+fn close_commands(action: CloseAction, wayland: bool) -> Vec<egui::ViewportCommand> {
+    match action {
+        CloseAction::Allow => Vec::new(),
+        CloseAction::HoldAndShutdown => {
+            let mut commands = vec![
+                egui::ViewportCommand::CancelClose,
+                egui::ViewportCommand::Visible(false),
+            ];
+            if wayland {
+                commands.push(egui::ViewportCommand::Minimized(true));
+            }
+            commands
+        }
+        CloseAction::Hold => vec![egui::ViewportCommand::CancelClose],
+    }
+}
+
+/// The window is a Wayland surface. Only there `Visible(false)` does nothing.
+fn is_wayland(frame: &eframe::Frame) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    frame
+        .window_handle()
+        .is_ok_and(|handle| matches!(handle.as_raw(), RawWindowHandle::Wayland(_)))
+}
+
+/// End the process at `close_deadline + WATCHDOG_LOCK_HOLD` if it still runs.
+///
+/// The close gate is polled only in `logic()`, and `logic()` runs only on a
+/// repaint. A hidden or minimized window may get no repaint: on Wayland,
+/// winit holds `RedrawRequested` until the compositor sends a frame
+/// callback, and a compositor may send none to a hidden surface. Then
+/// neither the stopped check nor the deadline would fire, and a hidden
+/// process would stay forever. This thread needs no repaint. In the normal
+/// case the process exits first and the thread dies with it.
+///
+/// The thread wakes after [`WATCHDOG_MARGIN`], runs `before_exit`, then
+/// sleeps [`EXIT_FLOOR`] before `exit`. That last sleep is part of
+/// [`WATCHDOG_LOCK_HOLD`]: the lock is still held while it runs.
+fn spawn_exit_watchdog(
+    close_deadline: Instant,
+    before_exit: impl FnOnce() + Send + 'static,
+    exit: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("thinwire-exit-watchdog".into())
+        .spawn(move || {
+            sleep_until(close_deadline + WATCHDOG_MARGIN);
+            tracing::warn!("the window did not finish closing in time; ending the process");
+            before_exit();
+            std::thread::sleep(EXIT_FLOOR);
+            exit();
+        })
+}
+
+fn sleep_until(at: Instant) {
+    loop {
+        let left = at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left);
+    }
+}
+
+/// The first close: one `Shutdown`, then the exit watchdog. Returns `true`
+/// when the watchdog runs.
+fn begin_first_close(
+    core: &mut Core,
+    deadline: Instant,
+    start_watchdog: impl FnOnce(&mut Core, Instant) -> bool,
+) -> bool {
+    core.dispatch(Intent::Shutdown);
+    start_watchdog(core, deadline)
+}
+
+/// Start the exit watchdog once. `flush` is the keychain hook from the core.
+/// The watchdog sleeps [`EXIT_FLOOR`] after `flush` returns, before it exits.
+/// Returns `true` when a watchdog runs.
+fn arm_exit_watchdog(
+    armed: &mut bool,
+    flush: impl FnOnce() + Send + 'static,
+    close_deadline: Instant,
+) -> bool {
+    arm_watchdog_with(armed, || {
+        spawn_exit_watchdog(close_deadline, flush, || {
+            std::process::exit(WATCHDOG_EXIT_CODE);
+        })
+    })
+}
+
+/// `armed` is set only when the thread started. If the thread cannot start
+/// (the process is out of threads), log it and return `false`: the caller
+/// then keeps the window on screen (see [`window_action`]).
+fn arm_watchdog_with(
+    armed: &mut bool,
+    spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> bool {
+    if *armed {
+        return true;
+    }
+    match spawn() {
+        Ok(_) => {
+            *armed = true;
+            true
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "the exit watchdog did not start; the window stays open until the clients stop"
+            );
+            false
+        }
+    }
+}
+
+/// The close action the window shows. A hidden window may get no repaint
+/// (Wayland), and then only the watchdog ends the process. Without a
+/// watchdog the first close does not hide the window: it stays on screen,
+/// `logic()` keeps running, and the close gate closes it when the clients
+/// stopped or at its deadline, as before #238 (Codex r4216328525).
+const fn window_action(action: CloseAction, watchdog: bool) -> CloseAction {
+    match action {
+        CloseAction::HoldAndShutdown if !watchdog => CloseAction::Hold,
+        action => action,
+    }
 }
 
 /// Holds the window open until TDLib closed cleanly, or until a deadline.
@@ -153,6 +305,14 @@ impl CloseGate {
             }
             Self::Waiting { .. } => CloseAction::Hold,
             Self::Done => CloseAction::Allow,
+        }
+    }
+
+    /// The close deadline while the gate waits.
+    const fn deadline(&self) -> Option<Instant> {
+        match *self {
+            Self::Waiting { deadline } => Some(deadline),
+            Self::Open | Self::Done => None,
         }
     }
 
@@ -199,6 +359,8 @@ pub struct ThinwireApp {
     intents: Vec<Intent>,
     last_os_theme: Option<egui::Theme>,
     close_gate: CloseGate,
+    /// The exit watchdog runs. Started once, on the first close.
+    watchdog: bool,
     /// OS notifications on their own thread (#32).
     notifier: Notifier,
     /// Chats of clicked notifications. The notifier thread fills it.
@@ -229,6 +391,7 @@ impl ThinwireApp {
             intents: Vec::new(),
             last_os_theme: None,
             close_gate: CloseGate::Open,
+            watchdog: false,
             notifier,
             clicks,
             last_focus: None,
@@ -282,21 +445,41 @@ impl ThinwireApp {
         }
     }
 
-    /// Hold a close request until Telegram stopped, then close the window.
-    fn handle_close(&mut self, ctx: &egui::Context) {
+    /// Hide the window on the first close and hold the process until the
+    /// clients stopped, then close. The watchdog ends the process if this
+    /// never runs again while the window is hidden.
+    fn handle_close(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if ctx.input(|input| input.viewport().close_requested()) {
-            match self.close_gate.on_close_requested(Instant::now()) {
-                CloseAction::Allow => {}
-                CloseAction::HoldAndShutdown => {
-                    self.exit_deadline = Some(Instant::now() + SHUTDOWN_TIMEOUT);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    self.core.dispatch(Intent::Shutdown);
-                }
-                CloseAction::Hold => ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose),
+            let now = Instant::now();
+            let action = self.close_gate.on_close_requested(now);
+            let mut watchdog_runs = true;
+            if action == CloseAction::HoldAndShutdown {
+                let deadline = self
+                    .close_gate
+                    .deadline()
+                    .expect("HoldAndShutdown sets the close deadline");
+                self.exit_deadline = Some(deadline);
+                let watchdog = &mut self.watchdog;
+                watchdog_runs = begin_first_close(&mut self.core, deadline, |core, deadline| {
+                    let flush = core.keychain_flush_hook();
+                    arm_exit_watchdog(watchdog, flush, deadline)
+                });
+            }
+            let shown = window_action(action, watchdog_runs);
+            let wayland = shown == CloseAction::HoldAndShutdown && is_wayland(frame);
+            for command in close_commands(shown, wayland) {
+                ctx.send_viewport_cmd(command);
+            }
+            if shown == CloseAction::HoldAndShutdown {
+                // The Dock icon and Cmd-Tab entry go now, not at the exit.
+                // `logic()` runs on the main thread, which AppKit needs.
+                dock::hide_icon();
             }
         }
         if self.close_gate.poll(Instant::now(), self.core.stopped()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            // The next pass reads the close: do not wait for the idle tick.
+            ctx.request_repaint();
         }
     }
 }
@@ -363,10 +546,10 @@ fn repaint_on_change(runtime: &tokio::runtime::Runtime, core: &Core, ctx: egui::
 }
 
 impl eframe::App for ThinwireApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_focus(ctx);
         self.core.pump();
-        self.handle_close(ctx);
+        self.handle_close(ctx, frame);
         if theme_mode::follow_os_live(ctx, self.core.view().theme(), &mut self.last_os_theme) {
             ctx.request_repaint();
         }
@@ -415,6 +598,9 @@ impl ThinwireApp {
     /// Last step at exit: try the keychain flush first, then stop the runtime
     /// within the close deadline instead of waiting for every blocking task.
     fn finish_exit(&mut self) {
+        // Each send with no answer yet is named in the log (protocol and
+        // chat id, never the text), so none ends without a trace.
+        self.core.log_unfinished_sends();
         // Shutdown queued a dismiss for each shown notification: send them,
         // and give the OS a short time, so none stays after exit.
         self.notifier.send(self.core.take_notify());
@@ -456,6 +642,171 @@ mod tests {
         let (raise, opens) = notification_clicks(std::slice::from_ref(&key));
         assert!(raise);
         assert_eq!(opens, vec![Intent::OpenFromNotification(key)]);
+    }
+
+    #[test]
+    fn the_first_close_hides_the_window_and_starts_the_shutdown() {
+        let start = Instant::now();
+        let mut gate = CloseGate::Open;
+        let action = gate.on_close_requested(start);
+        assert_eq!(action, CloseAction::HoldAndShutdown);
+        assert_eq!(gate.deadline(), Some(start + SHUTDOWN_TIMEOUT));
+        assert_eq!(
+            close_commands(action, false),
+            vec![
+                egui::ViewportCommand::CancelClose,
+                egui::ViewportCommand::Visible(false),
+            ],
+            "the process stays, the window goes"
+        );
+        assert_eq!(
+            close_commands(action, true),
+            vec![
+                egui::ViewportCommand::CancelClose,
+                egui::ViewportCommand::Visible(false),
+                egui::ViewportCommand::Minimized(true),
+            ],
+            "Wayland cannot hide a window: minimize it"
+        );
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut core = Core::new(
+            runtime.handle(),
+            CoreConfig::new(Settings::in_memory()).with_memory_secrets(),
+        );
+        let deadline = start + SHUTDOWN_TIMEOUT;
+        let mut watched = None;
+        begin_first_close(&mut core, deadline, |core, at| {
+            assert_eq!(
+                core.view().status_text,
+                "Closing…",
+                "Shutdown is dispatched before the watchdog starts"
+            );
+            watched = Some(at);
+            true
+        });
+        assert_eq!(watched, Some(deadline), "the watchdog starts once");
+    }
+
+    /// Codex r4216328525: a watchdog thread that cannot start is logged, and
+    /// the first close then keeps the window on screen, so `logic()` keeps
+    /// polling the close gate and the deadline still closes the window.
+    #[test]
+    fn a_watchdog_that_cannot_start_keeps_the_window_open() {
+        let mut armed = false;
+        let started = arm_watchdog_with(&mut armed, || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "no thread",
+            ))
+        });
+        assert!(!started);
+        assert!(!armed, "no watchdog runs");
+
+        let start = Instant::now();
+        let mut gate = CloseGate::Open;
+        let action = gate.on_close_requested(start);
+        assert_eq!(action, CloseAction::HoldAndShutdown);
+        let shown = window_action(action, started);
+        assert_eq!(shown, CloseAction::Hold);
+        for wayland in [false, true] {
+            assert_eq!(
+                close_commands(shown, wayland),
+                vec![egui::ViewportCommand::CancelClose],
+                "no hide, no minimize: the window keeps its repaints"
+            );
+        }
+        // The window-driven close path still ends the process.
+        assert!(!gate.poll(start + SHUTDOWN_TIMEOUT / 2, false));
+        assert!(
+            gate.poll(start + SHUTDOWN_TIMEOUT, false),
+            "the deadline closes it"
+        );
+
+        // A watchdog that starts hides the window as before.
+        assert_eq!(
+            window_action(CloseAction::HoldAndShutdown, true),
+            CloseAction::HoldAndShutdown
+        );
+        assert_eq!(window_action(CloseAction::Hold, false), CloseAction::Hold);
+        assert_eq!(window_action(CloseAction::Allow, false), CloseAction::Allow);
+    }
+
+    #[test]
+    fn a_started_watchdog_is_armed_once() {
+        let mut armed = false;
+        let mut spawns = 0;
+        for _ in 0..2 {
+            assert!(arm_watchdog_with(&mut armed, || {
+                spawns += 1;
+                std::thread::Builder::new().spawn(|| {})
+            }));
+        }
+        assert!(armed);
+        assert_eq!(spawns, 1, "one watchdog thread");
+    }
+
+    #[test]
+    fn a_second_close_is_a_no_op() {
+        let start = Instant::now();
+        let mut gate = CloseGate::Open;
+        gate.on_close_requested(start);
+        let later = start + SHUTDOWN_TIMEOUT / 2;
+        let action = gate.on_close_requested(later);
+        assert_eq!(action, CloseAction::Hold);
+        assert_eq!(
+            close_commands(action, false),
+            vec![egui::ViewportCommand::CancelClose],
+            "no second hide, no second Shutdown"
+        );
+        assert_eq!(
+            gate.deadline(),
+            Some(start + SHUTDOWN_TIMEOUT),
+            "the deadline does not move"
+        );
+        assert_eq!(close_commands(CloseAction::Allow, true), Vec::new());
+    }
+
+    #[test]
+    fn the_watchdog_ends_the_process_after_the_deadline_and_margin() {
+        let (exited, exit) = std::sync::mpsc::channel();
+        let (flushed, flush) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        // A deadline already behind us: only the margin is left.
+        let deadline = start.checked_sub(WATCHDOG_MARGIN).unwrap_or(start);
+        let handle = spawn_exit_watchdog(
+            deadline + Duration::from_millis(20),
+            move || flushed.send(Instant::now()).expect("flush"),
+            move || exited.send(Instant::now()).expect("exit"),
+        )
+        .expect("watchdog thread");
+        let at = exit.recv_timeout(Duration::from_secs(5)).expect("exit ran");
+        let flushed_at = flush.try_recv().expect("the flush runs before the exit");
+        assert!(flushed_at <= at);
+        // The exit is the margin plus the final EXIT_FLOOR sleep. Dropping
+        // that sleep makes this fail, and LOCK_WAIT is tied to the same sum.
+        assert!(at >= deadline + Duration::from_millis(20) + WATCHDOG_LOCK_HOLD);
+        handle.join().expect("watchdog ends");
+    }
+
+    #[test]
+    fn the_watchdog_waits_past_the_normal_exit_path() {
+        let (exited, exit) = std::sync::mpsc::channel::<()>();
+        let _handle = spawn_exit_watchdog(
+            Instant::now(),
+            || {},
+            move || exited.send(()).expect("exit"),
+        )
+        .expect("watchdog thread");
+        assert!(
+            exit.recv_timeout(NOTIFY_FLUSH_LIMIT + EXIT_FLOOR).is_err(),
+            "no exit while finish_exit may still run"
+        );
+        exit.recv_timeout(Duration::from_secs(5))
+            .expect("exit after the margin");
     }
 
     #[test]

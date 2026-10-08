@@ -7,6 +7,7 @@ pub mod demo;
 mod discord;
 mod fake;
 mod host;
+mod log_id;
 mod risk;
 mod secrets;
 mod signal;
@@ -28,6 +29,7 @@ pub use discord::{
 };
 pub use fake::FakeAdapter;
 pub use host::{AdapterHost, HostSender};
+pub use log_id::LogChatId;
 pub use risk::{
     CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3, CRITIC_RISK_BULLETS, critic_bullets_for,
     requires_experimental_gate,

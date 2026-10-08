@@ -3600,8 +3600,56 @@ mod tests {
 
     /// #165 item 1: a send still in flight at the shutdown limit is rejected
     /// before `Stopped`. The module doc says the close answers that send.
+    /// Log lines of this thread while the guard lives. Plain text, no ANSI.
+    fn capture_logs() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        #[derive(Clone)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Buf(std::sync::Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        fresh_interest();
+        (bytes, guard)
+    }
+
+    /// Another test thread may register a callsite at the same time as the
+    /// capture starts, and cache "no subscriber wants it". Read every
+    /// callsite's interest again right before the step that logs.
+    fn fresh_interest() {
+        tracing::callsite::rebuild_interest_cache();
+    }
+
+    fn logged(bytes: &std::sync::Mutex<Vec<u8>>) -> String {
+        String::from_utf8_lossy(
+            &bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+
     #[tokio::test]
     async fn a_stuck_send_at_shutdown_is_rejected() {
+        let (logs, _guard) = capture_logs();
         let hold = Arc::new(Notify::new());
         let mut fake = FakeDiscordApi::guild_fixture();
         fake.hold_send = Some(Arc::clone(&hold));
@@ -3626,6 +3674,7 @@ mod tests {
             .expect("pending row")
             .id
             .clone();
+        fresh_interest();
         adapter.shutdown(&tx);
         let events = until(&mut rx, |event| {
             matches!(event, AdapterEvent::Stopped { .. })
@@ -3648,6 +3697,18 @@ mod tests {
         })
         .expect("stopped");
         assert!(rejected < stopped && removed < stopped);
+        // #238: the abandoned send is logged with its chat id, not its text.
+        let log = logged(&logs);
+        let line = log
+            .lines()
+            .find(|line| line.contains("discord send abandoned at shutdown"))
+            .unwrap_or_else(|| panic!("no log line: {log}"));
+        assert!(line.contains("WARN"), "{line}");
+        // The chat id is redacted (crate::LogChatId), never logged in full.
+        let id = conversation_id(GUILD, GENERAL);
+        assert!(line.contains(&crate::LogChatId(&id).to_string()), "{line}");
+        assert!(!log.contains(&id), "never the full chat id: {log}");
+        assert!(!log.contains("stuck"), "never the text: {log}");
         hold.notify_waiters();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let late = drain(&mut rx);

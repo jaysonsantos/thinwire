@@ -50,6 +50,17 @@ tracing-subscriber.workspace = true
 # QR for the Signal provisioning URI. Feature `signal-local` only.
 qrcode = { version = "0.14", optional = true, default-features = false }
 
+# The Dock icon goes while the app closes in the background. Same versions
+# as eframe's AppKit bindings in Cargo.lock: no second copy.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSApplication",
+  "NSResponder",
+  "NSRunningApplication",
+] }
+
 [dev-dependencies]
 # A zone with daylight saving time for the layout tests (#122).
 chrono-tz = "0.10"

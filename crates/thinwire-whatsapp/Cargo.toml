@@ -39,6 +39,8 @@ libsqlite3-sys = { version = "0.36", optional = true, default-features = false, 
 [dev-dependencies]
 # The adapter contract kit (ADR 0010) for the tests.
 thinwire-protocol = { workspace = true, features = ["contract-kit"] }
+# Reads the log lines in the tests of what is logged at close (#238).
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

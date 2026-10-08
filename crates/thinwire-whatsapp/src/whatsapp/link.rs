@@ -544,6 +544,8 @@ pub(super) mod tests {
         }
 
         async fn delete_store(&self) -> Result<(), ()> {
+            // Rust 1.99 renames this to `try_update`. The nix CI shell is 1.98.
+            #[allow(deprecated)]
             let failed = self
                 .0
                 .delete_failures

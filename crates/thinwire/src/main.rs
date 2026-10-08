@@ -6,9 +6,16 @@ use tracing_subscriber::prelude::*;
 fn main() -> eframe::Result<()> {
     init_tracing();
 
+    // One thinwire at a time. Taken before the window, the core, and any
+    // protocol start. A copy that is still closing gets time to quit.
+    let startup = app::startup::first_try(
+        thinwire_core::instance::InstanceLock::default_path(),
+        std::time::Instant::now(),
+    );
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 720.0])
+            .with_inner_size(startup.window_size())
             .with_title("thinwire"),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -22,7 +29,11 @@ fn main() -> eframe::Result<()> {
             let settings = app::Settings::load();
             // First paint follows the stored mode. Missing file → System (ADR 0005).
             app::apply_theme(&cc.egui_ctx, settings.theme());
-            Ok(Box::new(app::ThinwireApp::new(settings, &cc.egui_ctx)))
+            Ok(Box::new(app::startup::Shell::new(
+                startup,
+                settings,
+                &cc.egui_ctx,
+            )))
         }),
     )
 }

@@ -584,6 +584,24 @@ impl Default for Snapshot {
 }
 
 /// One accepted Telegram send still waiting for its own end.
+/// A send with no final answer, for the log at close. No text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnfinishedSend {
+    pub protocol: ProtocolId,
+    pub chat: String,
+    pub stage: SendStage,
+}
+
+/// How far an unfinished send got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendStage {
+    /// The adapter has not answered `SendText` or `ResendMessage`.
+    NoAnswer,
+    /// Telegram only: TDLib took the message, the server has not confirmed
+    /// it. TDLib keeps it in its message database.
+    NotConfirmed,
+}
+
 struct TelegramHold {
     request: u64,
     chat: String,
@@ -1974,6 +1992,32 @@ impl Snapshot {
             (Some(open), Some(held)) => Some(open.min(held)),
             (open, held) => open.or(held),
         }
+    }
+
+    /// Every send that has no final answer yet, oldest first: sends and
+    /// retries the adapter has not answered, then Telegram sends that TDLib
+    /// took but the server has not confirmed. For the log at close (#238).
+    pub(crate) fn unfinished_sends(&self) -> Vec<UnfinishedSend> {
+        let mut out: Vec<UnfinishedSend> = self
+            .sends
+            .open_chats()
+            .into_iter()
+            .map(|(protocol, chat)| UnfinishedSend {
+                protocol,
+                chat,
+                stage: SendStage::NoAnswer,
+            })
+            .collect();
+        out.extend(
+            self.telegram_send_unconfirmed
+                .iter()
+                .map(|hold| UnfinishedSend {
+                    protocol: ProtocolId::Telegram,
+                    chat: hold.chat.clone(),
+                    stage: SendStage::NotConfirmed,
+                }),
+        );
+        out
     }
 
     /// Test hook: a saved Telegram session resumes now (`Resume::Connecting`).
