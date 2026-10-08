@@ -17,13 +17,14 @@ The thinwire app is MIT. Licenses of the protocol stacks:
 - WhatsApp: `whatsapp-rust` is MIT. It links `wacore-libsignal`. That crate's `Cargo.toml` says MIT, but 31 files in `wacore/libsignal/src` carry `SPDX-License-Identifier: AGPL-3.0-only`. We treat it as AGPL-3.0-only. `cargo deny` cannot find this from metadata.
 - Signal: presage, presage-store-sqlite and libsignal are AGPL-3.0.
 - Discord: twilight-http and twilight-model 0.17.1 are ISC.
+- Slack: slack-morphism 2.29.0 is Apache-2.0.
 - Telegram: tdlib-rs 1.4.0 is Apache-2.0. TDLib is BSL-1.0. ADR 0006 does not change.
 
 ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answered its section 1 questions. The owner chose to start now, before a legal review. This ADR is an engineering decision. It is not legal advice. The section 1 questions of 0012 stay open.
 
 ## Decision
 
-1. Telegram and Discord run in-process in the MIT app.
+1. Telegram, Slack and Discord run in-process in the MIT app.
 2. WhatsApp runs in its own helper binary, `thinwire-whatsapp-helper` (AGPL-3.0-only). Signal runs in a second helper binary, `thinwire-signal-helper` (AGPL-3.0-only). A crash of one helper does not stop the other. This replaces the single helper of 0012.
 3. The MIT app talks to the helpers only over IPC. The MIT app crates never depend on a helper crate or on an AGPL crate.
 4. The IPC design of 0012 section 2 applies (transport, wire types, ADR 0010 mapping, secrets on the wire, failure), and so does its section 4 (security). Exception: when the restart backoff of 0012 stops, each account row of that helper shows "Helper stopped. Restart". A click on Restart starts the helper again.
