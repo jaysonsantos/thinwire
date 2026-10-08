@@ -20,5 +20,5 @@ mod tests;
 
 pub use launch::{HelperInput, HelperLauncher, HelperOutput, HelperProcess, ProcessLauncher};
 pub use serve::{ServeConfig, ServeEnd, refuse, serve};
-pub use supervisor::{HelperAdapter, HelperSpec, HelperTiming};
+pub use supervisor::{ADAPTER_STOP_WAIT, HelperAdapter, HelperSpec, HelperTiming};
 pub use thinwire_ipc::HelperRefusal;

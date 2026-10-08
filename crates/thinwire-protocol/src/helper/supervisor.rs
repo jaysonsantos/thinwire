@@ -40,12 +40,21 @@ use crate::whatsapp::WhatsAppPhoneVault;
 
 // region: timing
 
-/// Slack between the helper's own stop and the app's close limit.
-const STOP_MARGIN: Duration = Duration::from_secs(1);
+/// Longest wait of a helper for its adapter to close its sessions. An
+/// adapter keeps its own shutdown bound below this wait: the WhatsApp
+/// client takes 4 s at most (1 s for sends in flight, 3 s for the link).
+pub const ADAPTER_STOP_WAIT: Duration = APP_CLOSE_LIMIT.saturating_sub(Duration::from_millis(500));
 
-/// Longest wait for a helper to close its sessions. Below the app's close
-/// limit, so `Stopped` still comes in time.
-pub(crate) const HELPER_STOP_WAIT: Duration = APP_CLOSE_LIMIT.saturating_sub(STOP_MARGIN);
+/// Longest wait of the app for `Stopped` from a helper. After the helper's
+/// own wait, so a helper that gives up ends by itself first. Before the
+/// app's close limit, so `Stopped` still comes in time.
+pub(crate) const HELPER_STOP_WAIT: Duration =
+    APP_CLOSE_LIMIT.saturating_sub(Duration::from_millis(250));
+
+const _: () = assert!(
+    ADAPTER_STOP_WAIT.as_millis() < HELPER_STOP_WAIT.as_millis()
+        && HELPER_STOP_WAIT.as_millis() < APP_CLOSE_LIMIT.as_millis()
+);
 
 /// Waits and limits of the supervisor. Tests use short ones.
 #[derive(Debug, Clone, Copy)]

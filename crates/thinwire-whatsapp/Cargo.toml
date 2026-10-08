@@ -34,6 +34,7 @@ thinwire-protocol.workspace = true
 # `io-std`: the helper talks over its stdin and stdout.
 tokio = { workspace = true, features = ["io-std"] }
 tracing.workspace = true
+# The log of the helper program. The tests also read log lines with it (#238).
 tracing-subscriber.workspace = true
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "edaa64b68d0de24bdb6848b98a824a32e276c55c", optional = true, default-features = false, features = [
   "sqlite-storage",

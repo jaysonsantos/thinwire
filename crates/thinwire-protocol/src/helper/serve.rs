@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use super::convert::{command_from_wire, event_to_wire, wire_protocol};
-use super::supervisor::HELPER_STOP_WAIT;
+use super::supervisor::ADAPTER_STOP_WAIT;
 use crate::adapter::{
     AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter, ProtocolId,
 };
@@ -201,7 +201,7 @@ async fn stop<W: AsyncWrite + Unpin>(
     mut writer: Option<&mut W>,
 ) {
     adapter.shutdown(events);
-    let stopped = wait_stopped(protocol, wire, event_rx, &mut writer, HELPER_STOP_WAIT).await;
+    let stopped = wait_stopped(protocol, wire, event_rx, &mut writer, ADAPTER_STOP_WAIT).await;
     if stopped && let Some(writer) = writer {
         let _ = write_line(writer, &HelperLine::Stopped { protocol: wire }).await;
     }

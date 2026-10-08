@@ -8,6 +8,7 @@
 mod clock;
 mod core;
 pub mod demo;
+pub mod instance;
 mod intent;
 pub mod mutes;
 pub mod notify;

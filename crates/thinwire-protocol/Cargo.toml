@@ -61,6 +61,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 serde_json = "1"
+# Reads the log lines in the tests of what is logged at close (#238).
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

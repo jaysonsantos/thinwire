@@ -119,6 +119,9 @@ struct State {
     mute_timer: Option<MuteTimer>,
     /// Number of the last mute timer.
     mute_timers: u64,
+    /// The adapter shut down. A send result that comes later is dropped, so
+    /// no `SendAccepted`, `SendRejected` or row follows `Stopped` (#238).
+    closed: bool,
 }
 
 /// The timer for the next timed mute end (#168 item 13).
@@ -260,11 +263,18 @@ impl Session {
         state.inbox.new_connection();
     }
 
-    /// Stop the mute timer. The adapter calls it before `Stopped`, so no row
-    /// comes after it, and the task lets go of the session and the event
-    /// sender (Codex r4139029620).
-    pub(super) fn stop_mute_timer(&self) {
-        Self::abort_mute_timer(&mut self.lock());
+    /// The adapter shuts down. The adapter calls it right before `Stopped`.
+    ///
+    /// It stops the mute timer, so no row comes after `Stopped` and the task
+    /// lets go of the session and the event sender (Codex r4139029620). It
+    /// also seals the sends: a send that outlived the shutdown drain and
+    /// ends later publishes nothing (#238). [`Self::finish_send`] checks the
+    /// seal under the same lock, so a result is either out before `Stopped`
+    /// or never.
+    pub(super) fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        Self::abort_mute_timer(&mut state);
     }
 
     fn abort_mute_timer(state: &mut State) {
@@ -486,6 +496,15 @@ impl Session {
         events: &EventTx,
     ) -> bool {
         let mut state = self.lock();
+        if state.closed {
+            // `Stopped` is out: the core is past this adapter. Its exit log
+            // names the send as abandoned.
+            tracing::warn!(
+                chat = %thinwire_protocol::LogChatId(&answer.conversation_id),
+                "whatsapp send ended after shutdown; its result is dropped"
+            );
+            return false;
+        }
         if state.generation != generation {
             // The link that sent it is gone, and its rows with it. Rule 4:
             // answer also a request that a reconnect lost.
@@ -882,6 +901,45 @@ mod tests {
         }
     }
 
+    /// #238 (Codex r4216328520): a send result that comes after `close`
+    /// publishes nothing: no `SendAccepted`, no `SendRejected`, no row.
+    #[test]
+    fn a_send_result_after_close_publishes_nothing() {
+        let (session, tx, mut rx) = linked();
+        let answer = SendRequest {
+            conversation_id: format!("whatsapp:{CHAT}"),
+            request: 7,
+            retry: false,
+        };
+        // Before the close a result answers its request.
+        assert!(!session.finish_send(1, CHAT, "local-1", Ok("server-1".into()), &answer, &tx));
+        let before: Vec<AdapterEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            before
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendAccepted { request: 7, .. })),
+            "{before:?}"
+        );
+
+        session.close();
+        for result in [
+            Ok("server-2".to_string()),
+            Err(SendFailure::Network),
+            Err(SendFailure::Unlinked),
+        ] {
+            let revoked = session.finish_send(1, CHAT, "local-2", result, &answer, &tx);
+            assert!(!revoked, "a sealed send never reports a revoke");
+        }
+        // A stale generation answers with SendRejected while open; once
+        // closed it publishes nothing either.
+        assert!(!session.finish_send(9, CHAT, "local-3", Err(SendFailure::Rejected), &answer, &tx));
+        assert!(rx.try_recv().is_err(), "nothing after close");
+        assert!(
+            session.is_connected(),
+            "a sealed Unlinked result resets nothing"
+        );
+    }
+
     /// Codex r4139029620: `abort` cannot stop a timer task that already
     /// waits for the lock. The task of a stopped timer does nothing when it
     /// runs late.
@@ -901,7 +959,7 @@ mod tests {
             .as_ref()
             .map(|timer| timer.id)
             .expect("armed");
-        session.stop_mute_timer();
+        session.close();
         session.end_mutes(1, id, &tx);
         assert!(last_row(&mut rx).is_none(), "no row from a stopped timer");
     }
