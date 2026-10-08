@@ -60,7 +60,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 
 `0013` (accepted 2026-10-08) supersedes `0011`: release builds ship WhatsApp and Signal in AGPL-3.0-only helper binaries over IPC. The MIT app binary never links AGPL code. Until the Signal helper lands, `signal-local` stays local-only.
 
-- [x] #246 — the `release-features` CI job and the WhatsApp helper.
+- [x] #246 — the `release-features` CI job and the WhatsApp helper. PR #256.
     - `crates/thinwire-ipc`: the wire protocol.
     - `HelperAdapter` in `thinwire-protocol`: start, restart, "Helper stopped." with Restart, and the missing-helper state.
     - `thinwire-whatsapp-helper` in `crates/thinwire-whatsapp`, with a lock on the session folder.
