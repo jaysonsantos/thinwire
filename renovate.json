@@ -8,9 +8,8 @@
       "groupName": "all non-major updates"
     },
     {
-      "description": "whisperfish/presage crates share one git revision. A store-only bump has no package to resolve.",
-      "matchDatasources": ["git-refs"],
-      "matchSourceUrls": ["https://github.com/whisperfish/presage"],
+      "description": "whisperfish/presage crates share one git revision. Bumping only one duplicates presage and libsignal-service in Cargo.lock.",
+      "matchPackageNames": ["presage", "presage-store-sqlite"],
       "groupName": "whisperfish/presage"
     },
     {
