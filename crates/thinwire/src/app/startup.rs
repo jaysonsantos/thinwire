@@ -9,7 +9,7 @@
 //! the end, the window explains what happened instead of starting a second
 //! copy.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use thinwire_core::instance::{InstanceLock, LockError, RETRY_STEP};
 
-use super::{SHUTDOWN_TIMEOUT, Settings, ThinwireApp, WATCHDOG_LOCK_HOLD};
+use super::{SHUTDOWN_TIMEOUT, Settings, ThinwireApp, WATCHDOG_LOCK_HOLD, theme};
 
 /// Slack past the old process's worst-case exit. Covers the time from the
 /// user launching this process until the wait starts, and the OS dropping
@@ -52,6 +52,17 @@ pub const MAIN_SIZE: [f32; 2] = [1120.0, 720.0];
 
 pub(crate) const CLOSING_NOTE: &str = "thinwire is still closing…";
 pub(crate) const FAILED_TITLE: &str = "thinwire did not start";
+/// What happened, why, and what to do. The tool that ends a process has a
+/// different name on each platform.
+#[cfg(target_os = "macos")]
+pub(crate) const FAILED_HELP: &str = "thinwire is still closing from last time. It usually takes a \
+    few seconds. Try again, or quit the old thinwire in Activity Monitor.";
+#[cfg(windows)]
+pub(crate) const FAILED_HELP: &str = "thinwire is still closing from last time. It usually takes a \
+    few seconds. Try again, or quit the old thinwire in Task Manager.";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) const FAILED_HELP: &str = "thinwire is still closing from last time. It usually takes a \
+    few seconds. Try again, or quit the old thinwire in your system monitor.";
 pub(crate) const TRY_AGAIN: &str = "Try again";
 pub(crate) const QUIT: &str = "Quit";
 
@@ -202,7 +213,10 @@ impl Shell {
                 self.start_main(ctx);
             }
             Err(LockError::Held) => {
-                tracing::warn!("another thinwire still holds the lock; not starting");
+                tracing::warn!(
+                    path = %path.display(),
+                    "another thinwire still holds the lock; not starting"
+                );
                 self.stage = Stage::Failed { path };
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(FAILED_SIZE.into()));
             }
@@ -234,7 +248,7 @@ impl eframe::App for Shell {
         match &mut self.stage {
             Stage::Running(app) => app.ui(ui, frame),
             Stage::Waiting(_) => waiting(ui),
-            Stage::Failed { path } => match failed(ui, path) {
+            Stage::Failed { path } => match failed(ui) {
                 Some(FailedChoice::TryAgain) => {
                     let path = path.clone();
                     let deadline = Instant::now() + LOCK_WAIT;
@@ -277,31 +291,21 @@ pub(crate) enum FailedChoice {
 }
 
 /// The lock is still held after [`LOCK_WAIT`]: what happened, why, and what
-/// to do.
-pub(crate) fn failed(ui: &mut egui::Ui, path: &Path) -> Option<FailedChoice> {
+/// to do. Try again is the main action, Quit the second one.
+pub(crate) fn failed(ui: &mut egui::Ui) -> Option<FailedChoice> {
     let mut choice = None;
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading(FAILED_TITLE);
             ui.add_space(6.0);
-            ui.label(format!(
-                "Another thinwire is still running, or did not finish closing within {:.1} seconds.",
-                LOCK_WAIT.as_secs_f32()
-            ));
-            ui.label(
-                "thinwire runs one copy at a time, so two copies never open the same chat data.",
-            );
-            ui.add_space(6.0);
-            ui.label(concat!(
-                "Close the other thinwire window, wait a few seconds, and try again. ",
-                "If no thinwire window is open, end the thinwire process in your ",
-                "system monitor, then try again.",
-            ));
-            ui.add_space(4.0);
-            ui.small(format!("Lock file: {}", path.display()));
-            ui.add_space(8.0);
+            ui.label(FAILED_HELP);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button(TRY_AGAIN).clicked() {
+                let palette = theme::palette(ui);
+                let try_again =
+                    egui::Button::new(egui::RichText::new(TRY_AGAIN).color(palette.on_accent))
+                        .fill(palette.accent);
+                if ui.add(try_again).clicked() {
                     choice = Some(FailedChoice::TryAgain);
                 }
                 if ui.button(QUIT).clicked() {
@@ -401,12 +405,11 @@ mod tests {
 
     #[test]
     fn the_failure_window_explains_and_offers_try_again_and_quit() {
-        let path = PathBuf::from("/tmp/thinwire/instance.lock");
         let mut harness = Harness::builder()
             .with_size(egui::vec2(FAILED_SIZE[0], FAILED_SIZE[1]))
             .build_ui_state(
-                move |ui, choice: &mut Option<FailedChoice>| {
-                    if let Some(clicked) = failed(ui, &path) {
+                |ui, choice: &mut Option<FailedChoice>| {
+                    if let Some(clicked) = failed(ui) {
                         *choice = Some(clicked);
                     }
                 },
@@ -414,8 +417,10 @@ mod tests {
             );
         harness.run();
         harness.get_by_label(FAILED_TITLE);
-        harness.get_by_label_contains("one copy at a time");
-        harness.get_by_label_contains("end the thinwire process");
+        // What happened, why, and what to do.
+        harness.get_by_label_contains("is still closing from last time");
+        harness.get_by_label_contains("usually takes a few seconds");
+        harness.get_by_label_contains("Try again, or quit the old thinwire in");
         harness
             .get_by_role_and_label(Role::Button, TRY_AGAIN)
             .click();
@@ -424,5 +429,37 @@ mod tests {
         harness.get_by_role_and_label(Role::Button, QUIT).click();
         harness.run();
         assert_eq!(*harness.state(), Some(FailedChoice::Quit));
+    }
+
+    #[test]
+    fn the_failure_text_names_the_process_tool_of_this_platform() {
+        let tool = if cfg!(target_os = "macos") {
+            "in Activity Monitor."
+        } else if cfg!(windows) {
+            "in Task Manager."
+        } else {
+            "in your system monitor."
+        };
+        assert!(FAILED_HELP.ends_with(tool), "{FAILED_HELP}");
+        assert!(FAILED_HELP.starts_with(
+            "thinwire is still closing from last time. It usually takes a few seconds. \
+            Try again, or quit the old thinwire "
+        ));
+    }
+
+    /// Try again comes first and is filled, Quit second.
+    #[test]
+    fn try_again_is_the_main_action() {
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(FAILED_SIZE[0], FAILED_SIZE[1]))
+            .build_ui(|ui| {
+                let _ = failed(ui);
+            });
+        harness.run();
+        let try_again = harness
+            .get_by_role_and_label(Role::Button, TRY_AGAIN)
+            .rect();
+        let quit = harness.get_by_role_and_label(Role::Button, QUIT).rect();
+        assert!(try_again.max.x <= quit.min.x, "Try again left of Quit");
     }
 }
