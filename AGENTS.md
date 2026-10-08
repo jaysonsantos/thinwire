@@ -14,6 +14,7 @@
 - WhatsApp, Discord, and Slack work runs in parallel with Telegram (lock change 2026-09-23). It does not wait for "Telegram feels usable"
 - Default build: First-run / Add account offer Telegram only. WA / Discord / Slack auth UI exists only when its cargo feature is on. Default and public CI stay feature-off
 - Theme default is System (follow OS light/dark live via egui `system_theme`; persist System \| Light \| Dark)
+- README image points at `several_protocols-{light,dark}-1100x720.png` in `crates/thinwire/tests/snapshots/`; if that test is renamed or removed, update the README link
 - Ordered next work: see `ROADMAP.md`
 
 ## Stack
