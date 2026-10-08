@@ -43,5 +43,11 @@ windows-registry = "0.6"
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-usernotifications = "0.3"
 
+# L8 spike: `examples/macos_keychain_probe.rs` uses the same keychain store
+# as thinwire-core, so the A/B rebuild check matches the real app.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+keyring-core.workspace = true
+apple-native-keyring-store.workspace = true
+
 [lints]
 workspace = true

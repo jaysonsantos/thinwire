@@ -6673,6 +6673,8 @@ dependencies = [
 name = "thinwire-notify"
 version = "0.1.0"
 dependencies = [
+ "apple-native-keyring-store",
+ "keyring-core",
  "mac-usernotifications",
  "notify-rust",
  "thinwire-core",
