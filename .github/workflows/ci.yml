@@ -127,7 +127,9 @@ jobs:
           fi
           shared='Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$'
           notify="^(crates/thinwire-notify/|scripts/stage-os-artifact\.sh$|scripts/stage-helper\.sh$|${shared})"
-          helpers="^(crates/thinwire-ipc/|crates/thinwire-whatsapp/|crates/thinwire-protocol/src/helper/|crates/thinwire-protocol/src/whatsapp\.rs$|scripts/stage-helper\.sh$|${shared})"
+          # The helper adapter is in thinwire-protocol: its manifest (tokio
+          # process support), the adapter contract, and the helper module.
+          helpers="^(crates/thinwire-ipc/|crates/thinwire-whatsapp/|crates/thinwire-protocol/Cargo\.toml$|crates/thinwire-protocol/src/(helper/|adapter\.rs$|lib\.rs$|whatsapp\.rs$)|scripts/stage-helper\.sh$|${shared})"
           changed="$(git diff --name-only "$BASE" HEAD)"
           if grep -Eq "$notify" <<<"$changed"; then
             echo "notify=true" >> "$GITHUB_OUTPUT"
