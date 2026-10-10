@@ -166,6 +166,8 @@ cargo run -p thinwire --features whatsapp-web
 
 The helper writes its log to stderr. The app writes those lines at level `debug` with the prefix `helper:`.
 
+A plain `cargo build` also builds the helper, but with no WhatsApp client. That helper refuses to run, and the account row shows "Helper stopped." with the reason. Build it with `--features whatsapp-web`, as above.
+
 Telegram `api_id`, `api_hash`, and session material go to the OS secret store (`keyring`):
 
 | Platform | Store |

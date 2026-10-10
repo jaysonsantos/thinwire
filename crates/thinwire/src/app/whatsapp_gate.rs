@@ -86,6 +86,9 @@ fn pair_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
             value,
         ))));
     }
+    if let Some(note) = snapshot.whatsapp_phone_note {
+        ui.colored_label(theme::palette(ui).warn, note);
+    }
     if ui
         .add_enabled(
             !snapshot.whatsapp_started,

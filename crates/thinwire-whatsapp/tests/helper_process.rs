@@ -5,7 +5,8 @@
 //! Each test starts the helper program as a child process, as the app does.
 //! No test starts a pairing: a pairing opens a network session. Each test
 //! has its own session folder (`--session-dir`), so no test touches the
-//! WhatsApp session of the user.
+//! WhatsApp session of the user. The default test build has no WhatsApp
+//! client, so each test also passes `--allow-no-client`.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -32,6 +33,11 @@ const CHAT: &str = "whatsapp:111@s.whatsapp.net";
 const WAIT: Duration = Duration::from_secs(20);
 /// Exit code of the helper for a line that is not in the protocol.
 const EXIT_BAD_LINE: i32 = 4;
+/// Exit code of the helper when it refuses to run.
+#[cfg(not(feature = "whatsapp-web"))]
+const EXIT_REFUSED: i32 = 3;
+/// Lets a test build with no WhatsApp client run as a helper.
+const ALLOW_NO_CLIENT: &str = "--allow-no-client";
 
 /// Short restart waits. Two failures in a row stop the helper for good.
 const TIMING: HelperTiming = HelperTiming {
@@ -93,10 +99,22 @@ impl App {
     }
 
     fn start_in(dir: PathBuf) -> Self {
+        Self::start_with_args(
+            dir.clone(),
+            [
+                "--session-dir".to_owned(),
+                dir.display().to_string(),
+                ALLOW_NO_CLIENT.to_owned(),
+            ],
+        )
+    }
+
+    /// The adapter over a helper that starts with these arguments.
+    fn start_with_args(dir: PathBuf, args: impl IntoIterator<Item = String>) -> Self {
         let pids = Arc::new(Mutex::new(Vec::new()));
         let launcher = Recording {
             inner: ProcessLauncher::new(WHATSAPP_HELPER_PROGRAM, Some(PathBuf::from(HELPER)))
-                .with_args(["--session-dir".to_owned(), dir.display().to_string()]),
+                .with_args(args),
             pids: Arc::clone(&pids),
         };
         let mut adapter = HelperAdapter::new(
@@ -333,6 +351,7 @@ fn spawn_helper(dir: &std::path::Path) -> Child {
     Command::new(HELPER)
         .arg("--session-dir")
         .arg(dir)
+        .arg(ALLOW_NO_CLIENT)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -398,6 +417,48 @@ fn the_helper_closes_on_a_bad_line() {
         .expect("write");
     stdin.flush().expect("flush");
     assert_eq!(exit_code(&mut child), Some(EXIT_BAD_LINE));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// PR #256 review: a helper that was built with no WhatsApp client does not
+/// say that it carries WhatsApp. It refuses to run, and the app shows the
+/// fault with its fix. Else the row says that the helper runs, and every
+/// pairing fails.
+#[cfg(not(feature = "whatsapp-web"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_helper_with_no_client_refuses_to_run() {
+    let dir = session_dir("no-client");
+    let mut app = App::start_with_args(
+        dir.clone(),
+        ["--session-dir".to_owned(), dir.display().to_string()],
+    );
+    app.send(AdapterCommand::WhatsAppAcknowledgeRisk);
+    app.until_helper(HelperState::Stopped(HelperFault::NoClient))
+        .await;
+    tokio::time::sleep(TIMING.restart_max * 2).await;
+    assert_eq!(app.pids().len(), 1, "no restart: the build does not change");
+    app.shut_down().await;
+
+    // On its own: the first line is the refusal, then the process ends.
+    let mut child = Command::new(HELPER)
+        .arg("--session-dir")
+        .arg(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the helper started");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("the first line");
+    let refused: HelperLine = thinwire_ipc::decode(line.trim_end()).expect("a wire line");
+    assert_eq!(
+        refused,
+        HelperLine::Refused {
+            reason: thinwire_ipc::HelperRefusal::NoClient,
+        }
+    );
+    assert_eq!(exit_code(&mut child), Some(EXIT_REFUSED));
     let _ = std::fs::remove_dir_all(dir);
 }
 

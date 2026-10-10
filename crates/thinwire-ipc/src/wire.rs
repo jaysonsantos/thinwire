@@ -71,6 +71,8 @@ pub enum HelperRefusal {
     SessionInUse,
     /// The helper found no place for its session store.
     NoDataDir,
+    /// The helper program was built with no client for its protocol.
+    NoClient,
 }
 
 /// A command for the adapter in the helper. It is a wire copy of the
@@ -421,6 +423,9 @@ mod tests {
             },
             HelperLine::Refused {
                 reason: HelperRefusal::SessionInUse,
+            },
+            HelperLine::Refused {
+                reason: HelperRefusal::NoClient,
             },
             HelperLine::Ack { id: 9 },
             HelperLine::Event {

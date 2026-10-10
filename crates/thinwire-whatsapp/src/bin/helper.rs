@@ -22,6 +22,7 @@ use thinwire_whatsapp::{SessionLockError, WhatsAppAdapter, lock_session, set_ses
 /// Names of the environment variables of this program.
 mod env {
     pub const SESSION_DIR: &str = "THINWIRE_WHATSAPP_SESSION_DIR";
+    pub const ALLOW_NO_CLIENT: &str = "THINWIRE_WHATSAPP_ALLOW_NO_CLIENT";
 }
 
 /// Exit codes of this program.
@@ -51,6 +52,10 @@ struct Cli {
     /// Keep the session store in this folder, not under the app-data folder.
     #[arg(long, env = env::SESSION_DIR)]
     session_dir: Option<PathBuf>,
+    /// Run a build that has no WhatsApp client. Only for the process tests:
+    /// such a build cannot pair, so without this flag it refuses to run.
+    #[arg(long, env = env::ALLOW_NO_CLIENT)]
+    allow_no_client: bool,
 }
 
 fn main() {
@@ -82,6 +87,13 @@ fn init_tracing() {
 
 async fn run(cli: Cli) -> i32 {
     let mut stdout = tokio::io::stdout();
+    // A build with no client must not say that it carries WhatsApp: the app
+    // would show the helper as running, and every pairing would fail.
+    if !cfg!(feature = "whatsapp-web") && !cli.allow_no_client {
+        tracing::error!("this helper was built without whatsapp-web: it has no client");
+        refuse(&mut stdout, HelperRefusal::NoClient).await;
+        return exit::REFUSED;
+    }
     if let Some(dir) = cli.session_dir {
         // The first and only call: `main` runs once.
         let _ = set_session_dir(dir);

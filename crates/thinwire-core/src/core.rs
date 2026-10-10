@@ -656,7 +656,7 @@ impl Core {
             WhatsAppIntent::CloseGate => self.state.close_whatsapp_gate(phone),
             WhatsAppIntent::AcknowledgeRisk => self.state.acknowledge_whatsapp_risk(),
             WhatsAppIntent::SetPhone(value) => {
-                self.state.whatsapp_phone = value.expose().to_owned()
+                self.state.set_whatsapp_phone(value.expose().to_owned());
             }
             WhatsAppIntent::BeginLink => self.state.begin_whatsapp_link(phone),
             WhatsAppIntent::CancelLink => self.state.cancel_whatsapp_link(phone),

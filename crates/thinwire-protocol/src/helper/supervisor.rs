@@ -603,9 +603,33 @@ impl Supervisor {
                 let AppLine::Request { command, .. } = line else {
                     return;
                 };
-                self.answer_without_helper(&command);
+                if matches!(command, WireCommand::BeginLink { .. }) {
+                    self.fail_unsent_pairing();
+                } else {
+                    self.answer_without_helper(&command);
+                }
             }
         }
+    }
+
+    /// A pairing start did not fit in one wire line: its phone text is too
+    /// long. The helper never got it, so the pairing ends here with an
+    /// error. It is not in the replay any more: a restart must not send it
+    /// with no phone. The core bounds the phone text, so this is a backstop.
+    fn fail_unsent_pairing(&mut self) {
+        self.replay.link = None;
+        self.wake_link = None;
+        self.account = AccountState::Unlinked;
+        emit_account(&self.events, self.protocol, AccountState::Unlinked);
+        emit_status(
+            &self.events,
+            self.protocol,
+            AdapterStatus::Error,
+            format!(
+                "{} pairing did not start: the phone number is too long.",
+                self.protocol
+            ),
+        );
     }
 
     /// End a command that no helper takes (ADR 0010 rules 4, 5 and 9): a
@@ -819,6 +843,7 @@ impl Supervisor {
                 self.stop_for(match reason {
                     HelperRefusal::SessionInUse => HelperFault::SessionInUse,
                     HelperRefusal::NoDataDir => HelperFault::StartFailed,
+                    HelperRefusal::NoClient => HelperFault::NoClient,
                 });
             }
             HelperLine::Ack { id } if greeted => self.on_ack(id),

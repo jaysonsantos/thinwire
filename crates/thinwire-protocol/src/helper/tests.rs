@@ -62,12 +62,18 @@ const TIMING: HelperTiming = HelperTiming {
     stable_run: Duration::from_secs(60),
     stop_wait: Duration::from_millis(300),
     kill_wait: Duration::from_secs(2),
-    drain_wait: Duration::from_millis(500),
+    // Long, so a slow test computer does not end the wait too early.
+    drain_wait: Duration::from_secs(2),
 };
 
-/// How long the fake process of [`Mode::SlowDeath`] takes to end. Longer
-/// than the first restart wait.
-const SLOW_DEATH: Duration = Duration::from_millis(200);
+/// A wait in which every restart timer of [`TIMING`] fires, also on a slow
+/// test computer. A test that uses it does not depend on the end of a
+/// process in that time: the process ends only when the test says so.
+const TIMERS_FIRED: Duration = Duration::from_millis(400);
+
+/// Longest time that 100 calls of `handle` can take on a slow test
+/// computer. A call that waits on the pipe of a stalled helper never ends.
+const HANDLE_BOUND: Duration = Duration::from_secs(2);
 
 // region: fake helper
 
@@ -88,10 +94,10 @@ enum Mode {
     Stall,
     /// `Hello` and `Ack` lines, but no answer to `Shutdown`.
     IgnoreShutdown,
-    /// `Hello`, then the output closes. The process ends [`SLOW_DEATH`]
-    /// later, also after a kill.
-    SlowDeath,
-    /// As [`Mode::SlowDeath`], but the process never ends.
+    /// `Hello`, then the output closes. The process ends only when the
+    /// test releases it, also after a kill.
+    DiesOnRelease,
+    /// As [`Mode::DiesOnRelease`], but the process never ends.
     NeverDies,
     /// The first process ends with no `Hello`. The next ones are
     /// [`Mode::Serve`].
@@ -206,7 +212,7 @@ impl HelperLauncher for FakeLauncher {
             // The pipes of the process are closed here. The process itself
             // can take longer to end.
             match mode {
-                Mode::SlowDeath => tokio::time::sleep(SLOW_DEATH).await,
+                Mode::DiesOnRelease => lab.release.notified().await,
                 Mode::NeverDies => std::future::pending::<()>().await,
                 _ => {}
             }
@@ -280,7 +286,7 @@ async fn fake_process(lab: Arc<Lab>, stdin: DuplexStream, mut stdout: DuplexStre
             std::future::pending::<()>().await;
         }
         // The output closes at the return. The launcher keeps the process.
-        Mode::SlowDeath | Mode::NeverDies => {
+        Mode::DiesOnRelease | Mode::NeverDies => {
             let _ = write_line(&mut stdout, &hello(PROTOCOL_VERSION)).await;
         }
         // The launcher runs these two modes itself (`exit_first`).
@@ -755,6 +761,39 @@ async fn a_cancel_before_hello_wins_over_the_pairing_that_waited() {
     );
 }
 
+/// PR #256 review: a phone text that does not fit in one wire line ends the
+/// pairing with an error. The pairing does not stay open with no answer, and
+/// a restart does not send it with no phone.
+#[tokio::test]
+async fn a_pairing_start_that_is_too_long_ends_with_an_error() {
+    let mut probe = Probe::start(Mode::Serve);
+    probe
+        .phone
+        .set_phone(&"1".repeat(thinwire_ipc::MAX_LINE_BYTES));
+    probe.pair(1);
+    probe.until_account(AccountState::Unlinked).await;
+    probe
+        .until("the pairing error", |event| {
+            matches!(event, AdapterEvent::Status {
+                status: AdapterStatus::Error,
+                detail,
+                ..
+            } if detail == "WhatsApp pairing did not start: the phone number is too long.")
+        })
+        .await;
+    assert_eq!(probe.lab.launches(), 1, "the helper stays up");
+
+    probe.phone.clear();
+    probe.lab.crash.notify_one();
+    probe.until_helper(HelperState::Restarting).await;
+    probe.until_helper(HelperState::Running).await;
+    probe.settle().await;
+    assert!(
+        !probe.saw(|event| matches!(event, AdapterEvent::WhatsAppQr { .. })),
+        "the failed pairing is not sent again"
+    );
+}
+
 /// A pairing start of the user while no helper runs starts the helper. It
 /// is a new start, so it keeps its phone, and it takes the place of the old
 /// pairing in the replay.
@@ -1075,15 +1114,17 @@ async fn a_bad_line_from_the_helper_counts_as_a_failure() {
 /// repair becomes "Helper stopped."
 #[tokio::test]
 async fn a_new_helper_starts_only_after_the_old_process_ended() {
-    let mut probe = Probe::start(Mode::SlowDeath);
+    let mut probe = Probe::start(Mode::DiesOnRelease);
     probe.pair(1);
     probe.until_helper(HelperState::Restarting).await;
+    // The restart wait is over, and the old process still runs.
+    tokio::time::sleep(TIMERS_FIRED).await;
     assert_eq!(probe.lab.ended(), 0, "the old process still runs");
-    // The restart wait is shorter than the death of the old process.
-    tokio::time::sleep(TIMING.restart_base * 3).await;
     assert_eq!(probe.lab.launches(), 1, "no second process next to it");
 
+    // The old process ends: the start that waited goes now.
     probe.lab.set_mode(Mode::Serve);
+    probe.lab.release.notify_one();
     probe.until_helper(HelperState::Running).await;
     probe.until_account(AccountState::Linked).await;
     assert_eq!(probe.lab.launches(), 2);
@@ -1096,16 +1137,20 @@ async fn a_new_helper_starts_only_after_the_old_process_ended() {
 /// account that the user gave up.
 #[tokio::test]
 async fn a_cancel_ends_a_start_that_waits_for_the_old_process() {
-    let mut probe = Probe::start(Mode::SlowDeath);
+    let mut probe = Probe::start(Mode::DiesOnRelease);
     probe.pair(1);
     probe.until_helper(HelperState::Restarting).await;
-    // The restart wait is over, and the old process still runs.
-    tokio::time::sleep(TIMING.restart_base * 3).await;
+    // The restart wait is over, and the old process still runs: the start
+    // waits for its end.
+    tokio::time::sleep(TIMERS_FIRED).await;
     assert_eq!(probe.lab.ended(), 0);
+    assert_eq!(probe.lab.launches(), 1);
     probe.send(AdapterCommand::WhatsAppCancelLink);
     probe.until_helper(HelperState::Idle).await;
 
-    tokio::time::sleep(SLOW_DEATH + NO_START_WAIT).await;
+    // The old process ends now. No start waits for it any more.
+    probe.lab.release.notify_one();
+    tokio::time::sleep(NO_START_WAIT).await;
     probe.settle().await;
     assert_eq!(probe.lab.ended(), 1, "the old process ended");
     assert_eq!(probe.lab.launches(), 1, "no helper after the cancel");
@@ -1325,7 +1370,7 @@ async fn a_slow_helper_makes_the_row_busy_and_no_caller_waits() {
         probe.send(AdapterCommand::LoadChats { protocol: PROTOCOL });
     }
     assert!(
-        before.elapsed() < TIMING.busy_after,
+        before.elapsed() < HANDLE_BOUND,
         "handle waited on the pipe: {:?}",
         before.elapsed()
     );

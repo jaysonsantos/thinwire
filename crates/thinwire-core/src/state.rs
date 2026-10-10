@@ -300,6 +300,17 @@ fn older_wait(tries: u32) -> Duration {
 /// Center panel copy while a saved session reconnects.
 pub const RESUME_CONNECTING: &str = "Connecting to Telegram…";
 
+/// Longest text of the phone field that a pairing start takes. A phone
+/// number has 15 digits at most (E.164). This bound leaves room for "+",
+/// spaces, and separators.
+#[cfg(feature = "whatsapp-web")]
+pub const WHATSAPP_PHONE_MAX_CHARS: usize = 32;
+
+/// The note under the phone field when its text is too long.
+#[cfg(feature = "whatsapp-web")]
+pub const WHATSAPP_PHONE_TOO_LONG: &str =
+    "This phone number is too long. Type the country code and the number, digits only.";
+
 /// Experimental WhatsApp screens. Only the `whatsapp-web` build can enter them.
 #[cfg(feature = "whatsapp-web")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,6 +584,9 @@ pub struct Snapshot {
     pub whatsapp_screen: WhatsAppScreen,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_phone: String,
+    /// Why the last pairing start did not go out, for the phone field.
+    #[cfg(feature = "whatsapp-web")]
+    pub whatsapp_phone_note: Option<&'static str>,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_qr: Option<String>,
     #[cfg(feature = "whatsapp-web")]
@@ -770,6 +784,8 @@ impl Snapshot {
             whatsapp_screen: WhatsAppScreen::Hidden,
             #[cfg(feature = "whatsapp-web")]
             whatsapp_phone: String::new(),
+            #[cfg(feature = "whatsapp-web")]
+            whatsapp_phone_note: None,
             #[cfg(feature = "whatsapp-web")]
             whatsapp_qr: None,
             #[cfg(feature = "whatsapp-web")]
@@ -2988,6 +3004,11 @@ impl Snapshot {
                         "Wait a moment, then click Restart on the {name} account. If it stays, restart thinwire."
                     ),
                 ),
+                HelperFault::NoClient => (
+                    format!("This helper program has no {name} client."),
+                    "Reinstall thinwire. In a local build, build the helper with its client feature."
+                        .to_owned(),
+                ),
             };
             self.set_error(&happened, &why, &next);
             self.helper_errors.insert(
@@ -3462,6 +3483,7 @@ impl Snapshot {
         self.whatsapp_started = false;
         self.whatsapp_risk_acknowledged = false;
         self.whatsapp_phone.clear();
+        self.whatsapp_phone_note = None;
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -3478,6 +3500,7 @@ impl Snapshot {
         }
         self.whatsapp_screen = WhatsAppScreen::Hidden;
         self.whatsapp_phone.clear();
+        self.whatsapp_phone_note = None;
         phone.clear();
     }
 
@@ -3495,6 +3518,13 @@ impl Snapshot {
         self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
     }
 
+    /// New text in the phone field of the pair screen.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn set_whatsapp_phone(&mut self, value: String) {
+        self.whatsapp_phone = value;
+        self.whatsapp_phone_note = None;
+    }
+
     #[cfg(feature = "whatsapp-web")]
     pub fn begin_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
         // Pairing starts only from the pair screen, after the gate was accepted.
@@ -3505,6 +3535,14 @@ impl Snapshot {
         if self.whatsapp_started {
             return;
         }
+        // A phone number has 15 digits at most. A longer text is not one,
+        // and it must not go to the helper. The text stays, so the user can
+        // correct it.
+        if self.whatsapp_phone.chars().count() > WHATSAPP_PHONE_MAX_CHARS {
+            self.whatsapp_phone_note = Some(WHATSAPP_PHONE_TOO_LONG);
+            return;
+        }
+        self.whatsapp_phone_note = None;
         phone.set_phone(&self.whatsapp_phone);
         self.whatsapp_phone.clear();
         self.whatsapp_started = true;
@@ -3553,6 +3591,7 @@ impl Snapshot {
     pub fn cancel_whatsapp_link(&mut self, phone: &WhatsAppPhoneVault) {
         phone.clear();
         self.whatsapp_phone.clear();
+        self.whatsapp_phone_note = None;
         self.end_pairing();
         self.whatsapp_started = false;
         self.whatsapp_risk_acknowledged = false;
@@ -3912,6 +3951,10 @@ mod tests {
                 HelperFault::StillRunning,
                 "Wait a moment, then click Restart on the WhatsApp account. If it stays, restart thinwire.",
             ),
+            (
+                HelperFault::NoClient,
+                "Reinstall thinwire. In a local build, build the helper with its client feature.",
+            ),
         ] {
             let mut snapshot = Snapshot::new();
             helper(&mut snapshot, HelperState::Stopped(fault));
@@ -4112,6 +4155,39 @@ mod tests {
         assert!(!snapshot.whatsapp_started, "Start pairing is enabled again");
         assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
         snapshot.begin_whatsapp_link(&phone);
+        assert!(matches!(
+            snapshot.take_commands().as_slice(),
+            [AdapterCommand::WhatsAppBeginLink { .. }]
+        ));
+    }
+
+    /// PR #256 review: a phone text that is too long does not start a
+    /// pairing. The pair screen says why, the text stays, and Start stays
+    /// enabled. So no pairing stays open with no answer.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_phone_text_that_is_too_long_does_not_start_a_pairing() {
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.take_commands();
+
+        let long = "1".repeat(WHATSAPP_PHONE_MAX_CHARS + 1);
+        snapshot.set_whatsapp_phone(long.clone());
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(snapshot.take_commands().is_empty(), "no pairing command");
+        assert!(!snapshot.whatsapp_started, "Start stays enabled");
+        assert_eq!(snapshot.whatsapp_phone_note, Some(WHATSAPP_PHONE_TOO_LONG));
+        assert_eq!(snapshot.whatsapp_phone, long, "the text stays");
+        assert_eq!(phone.phone(), None, "nothing went to the vault");
+
+        // The user corrects the text: the note goes, and the pairing starts.
+        snapshot.set_whatsapp_phone("+49 1555 0100".into());
+        assert_eq!(snapshot.whatsapp_phone_note, None);
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(snapshot.whatsapp_started);
+        assert_eq!(phone.phone().as_deref(), Some("+49 1555 0100"));
         assert!(matches!(
             snapshot.take_commands().as_slice(),
             [AdapterCommand::WhatsAppBeginLink { .. }]
