@@ -1090,6 +1090,34 @@ async fn a_new_helper_starts_only_after_the_old_process_ended() {
     assert_eq!(probe.lab.overlaps(), 0, "one process at a time");
 }
 
+/// PR #256 review: the restart waits for the old process to end, and the
+/// user cancels the link in that time. The cancel also ends that wait: no
+/// helper starts when the old process ends, and no fault shows for an
+/// account that the user gave up.
+#[tokio::test]
+async fn a_cancel_ends_a_start_that_waits_for_the_old_process() {
+    let mut probe = Probe::start(Mode::SlowDeath);
+    probe.pair(1);
+    probe.until_helper(HelperState::Restarting).await;
+    // The restart wait is over, and the old process still runs.
+    tokio::time::sleep(TIMING.restart_base * 3).await;
+    assert_eq!(probe.lab.ended(), 0);
+    probe.send(AdapterCommand::WhatsAppCancelLink);
+    probe.until_helper(HelperState::Idle).await;
+
+    tokio::time::sleep(SLOW_DEATH + NO_START_WAIT).await;
+    probe.settle().await;
+    assert_eq!(probe.lab.ended(), 1, "the old process ended");
+    assert_eq!(probe.lab.launches(), 1, "no helper after the cancel");
+    assert!(
+        !probe
+            .helper_states()
+            .iter()
+            .any(|state| matches!(state, HelperState::Stopped(_))),
+        "no fault for a link that the user gave up"
+    );
+}
+
 /// A helper process that does not end after its kill blocks the next start.
 /// The supervisor then stops and says so. It never starts a second process
 /// on the same session store.

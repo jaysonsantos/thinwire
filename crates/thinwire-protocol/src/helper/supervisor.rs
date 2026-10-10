@@ -654,8 +654,11 @@ impl Supervisor {
                 emit_send_rejected(events, protocol, conversation_id.clone(), *request);
             }
             WireCommand::CancelLink | WireCommand::Disconnect => {
-                // The user gave up the link: no restart, and no account.
+                // The user gave up the link: no restart, and no account. A
+                // start that waits for the old process to end is off too.
                 self.restart_at = None;
+                self.start_waits = false;
+                self.old_exit_deadline = None;
                 self.wake_link = None;
                 self.linked_once = false;
                 if self.reported == Some(HelperState::Restarting) {
