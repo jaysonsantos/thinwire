@@ -4927,7 +4927,7 @@ dependencies = [
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=24ce1c84e9f16b242b926c04681f7ee222b4fd21#24ce1c84e9f16b242b926c04681f7ee222b4fd21"
+source = "git+https://github.com/whisperfish/presage?rev=a90ef33dc0024e71919cc14c7efa546c9ec75880#a90ef33dc0024e71919cc14c7efa546c9ec75880"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4949,7 +4949,7 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=24ce1c84e9f16b242b926c04681f7ee222b4fd21#24ce1c84e9f16b242b926c04681f7ee222b4fd21"
+source = "git+https://github.com/whisperfish/presage?rev=a90ef33dc0024e71919cc14c7efa546c9ec75880#a90ef33dc0024e71919cc14c7efa546c9ec75880"
 dependencies = [
  "async-trait",
  "bytes",
