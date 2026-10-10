@@ -863,10 +863,15 @@ impl Supervisor {
                 self.account = *state;
                 match state {
                     AccountState::Linked => self.linked_once = true,
-                    AccountState::Unlinked => self.linked_once = false,
+                    // The helper ended the link for good: a failed pairing,
+                    // a ban, or a log out on the phone. A reconnect is
+                    // `Linking`, never `Unlinked`.
+                    AccountState::Unlinked => self.end_pairing(),
                     AccountState::Linking => {}
                 }
             }
+            // The user removed this device on the phone.
+            AdapterEvent::AccountEnded { .. } => self.end_pairing(),
             AdapterEvent::SendAccepted { request, .. }
             | AdapterEvent::SendRejected { request, .. } => {
                 self.sends.remove(request);
@@ -912,11 +917,18 @@ impl Supervisor {
             self.stop_for(HelperFault::Crashed);
             return;
         }
-        // A session that was up reconnects. The shell keeps its rows, ends
-        // its loads, and asks again after `Linked` (#163).
         if self.account != AccountState::Unlinked {
-            self.account = AccountState::Linking;
-            emit_account(&self.events, self.protocol, AccountState::Linking);
+            // A session that was up reconnects when the next helper gets its
+            // pairing again. The shell keeps its rows, ends its loads, and
+            // asks again after `Linked` (#163). With no pairing to send, no
+            // helper links this account again: it is unlinked.
+            let relinks = self.replay.link.is_some() || self.wake_link.is_some();
+            self.account = if relinks {
+                AccountState::Linking
+            } else {
+                AccountState::Unlinked
+            };
+            emit_account(&self.events, self.protocol, self.account);
         }
         self.report(HelperState::Restarting);
         emit_notice(
@@ -961,6 +973,15 @@ impl Supervisor {
             self.replay.link = None;
             self.wake_link = Some((*generation, command.clone()));
         }
+    }
+
+    /// The pairing in the replay is over: the helper said that the account
+    /// is unlinked or ended. A later restart must not send that pairing
+    /// again. Else a new QR pairing starts with no request of the user, for
+    /// a pairing that the shell already ended. The gate stays accepted.
+    fn end_pairing(&mut self) {
+        self.linked_once = false;
+        self.replay.link = None;
     }
 
     /// Stop for good, until the user clicks Restart or passes the gate

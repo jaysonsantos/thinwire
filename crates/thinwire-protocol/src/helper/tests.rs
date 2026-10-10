@@ -111,6 +111,11 @@ struct Lab {
     hold_sends: AtomicBool,
     /// The fake process ends when a cancel comes, with no answer.
     die_on_cancel: AtomicBool,
+    /// A pairing start fails: the fake adapter reports `Unlinked`.
+    fail_pairing: AtomicBool,
+    /// A pairing start reports `AccountEnded`, then the fake process ends
+    /// before it reports `Unlinked`.
+    end_account: AtomicBool,
     launches: AtomicU32,
     /// Helper tasks that ended.
     ended: AtomicU32,
@@ -131,6 +136,8 @@ impl Lab {
             mode: Mutex::new(mode),
             hold_sends: AtomicBool::new(false),
             die_on_cancel: AtomicBool::new(false),
+            fail_pairing: AtomicBool::new(false),
+            end_account: AtomicBool::new(false),
             launches: AtomicU32::new(0),
             ended: AtomicU32::new(0),
             overlaps: AtomicU32::new(0),
@@ -381,6 +388,18 @@ impl ProtocolAdapter for GatedFake {
                     });
                 }
                 if self.lab.mode() == Mode::DieOnBegin {
+                    self.lab.crash.notify_one();
+                    return Ok(());
+                }
+                if self.lab.fail_pairing.load(Ordering::SeqCst) {
+                    emit_account(events, PROTOCOL, AccountState::Linking);
+                    emit_account(events, PROTOCOL, AccountState::Unlinked);
+                    emit_status(events, PROTOCOL, AdapterStatus::Error, "pairing failed");
+                    return Ok(());
+                }
+                if self.lab.end_account.load(Ordering::SeqCst) {
+                    emit_account(events, PROTOCOL, AccountState::Linking);
+                    let _ = events.send(AdapterEvent::AccountEnded { protocol: PROTOCOL });
                     self.lab.crash.notify_one();
                     return Ok(());
                 }
@@ -1084,6 +1103,67 @@ async fn a_helper_process_that_never_ends_stops_the_restart() {
         .await;
     assert_eq!(probe.lab.launches(), 1);
     assert_eq!(probe.lab.overlaps(), 0);
+}
+
+/// PR #256 review: the helper says that the pairing failed (`Unlinked`).
+/// That pairing is over. If the helper ends later, the next helper gets the
+/// gate only. It does not get the old pairing again, so no QR pairing starts
+/// with no request of the user.
+#[tokio::test]
+async fn a_pairing_that_the_helper_ended_is_not_sent_again() {
+    let mut probe = Probe::start(Mode::Serve);
+    probe.lab.fail_pairing.store(true, Ordering::SeqCst);
+    probe.pair(1);
+    probe.until_account(AccountState::Unlinked).await;
+    probe.settle().await;
+    let seen = probe.seen.len();
+
+    // A new pairing start would link at once now.
+    probe.lab.fail_pairing.store(false, Ordering::SeqCst);
+    probe.lab.crash.notify_one();
+    probe.until_helper(HelperState::Restarting).await;
+    probe.until_helper(HelperState::Running).await;
+    probe.settle().await;
+    assert_eq!(probe.lab.launches(), 2, "the gate is still accepted");
+    let after = &probe.seen[seen..];
+    assert!(
+        !after
+            .iter()
+            .any(|event| matches!(event, AdapterEvent::WhatsAppQr { .. })),
+        "no pairing with no request of the user"
+    );
+    assert!(!after.contains(&AdapterEvent::Account {
+        protocol: PROTOCOL,
+        state: AccountState::Linked,
+    }));
+}
+
+/// The phone removed this device (`AccountEnded`), and the helper ends
+/// before it reports `Unlinked`. The account is unlinked all the same, and
+/// the next helper does not pair it again.
+#[tokio::test]
+async fn an_account_that_ended_is_not_paired_again_after_a_crash() {
+    let mut probe = Probe::start(Mode::Serve);
+    probe.lab.end_account.store(true, Ordering::SeqCst);
+    probe.pair(1);
+    probe
+        .until("AccountEnded", |event| {
+            *event == AdapterEvent::AccountEnded { protocol: PROTOCOL }
+        })
+        .await;
+    probe.lab.end_account.store(false, Ordering::SeqCst);
+    probe.until_account(AccountState::Unlinked).await;
+    probe.until_helper(HelperState::Running).await;
+    probe.settle().await;
+    assert!(
+        !probe.saw(|event| matches!(event, AdapterEvent::WhatsAppQr { .. })),
+        "the ended account is not paired again"
+    );
+    assert!(!probe.saw(|event| *event
+        == AdapterEvent::Account {
+            protocol: PROTOCOL,
+            state: AccountState::Linked,
+        }));
 }
 
 /// PR #256 review: the user cancels a linked account, and the helper ends
