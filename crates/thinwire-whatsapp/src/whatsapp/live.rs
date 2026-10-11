@@ -340,12 +340,9 @@ mod tests {
     #[test]
     fn body_uses_text_caption_or_media_label() {
         assert_eq!(body_of(&wa::Message::text("  hi ")).as_deref(), Some("hi"));
-        let image = wa::Message {
-            image_message: whatsapp_rust::waproto::buffa::MessageField::some(
-                wa::message::ImageMessage::default(),
-            ),
-            ..Default::default()
-        };
+        let mut image = wa::Message::default();
+        image.image_message =
+            whatsapp_rust::waproto::buffa::MessageField::some(wa::message::ImageMessage::default());
         assert_eq!(body_of(&image).as_deref(), Some("[photo]"));
         assert_eq!(body_of(&wa::Message::default()), None);
     }
