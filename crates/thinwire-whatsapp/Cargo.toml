@@ -6,24 +6,36 @@ license = "AGPL-3.0-only"
 rust-version.workspace = true
 publish.workspace = true
 repository.workspace = true
-description = "Local-only WhatsApp linked-device adapter (AGPL-3.0-only). Not in release builds."
+description = "WhatsApp linked-device adapter and its helper program (AGPL-3.0-only)."
+
+# The helper program of ADR 0013. The MIT app starts it as a child process
+# and talks to it over stdin and stdout. Without `whatsapp-web` it has no
+# client: that build is only for the process tests in default CI.
+[[bin]]
+name = "thinwire-whatsapp-helper"
+path = "src/bin/helper.rs"
 
 [features]
 default = []
 # Experimental WhatsApp Web / linked-device client (oxidezap whatsapp-rust).
-# It links the AGPL `wacore-libsignal`. thinwire enables this only through
-# its `whatsapp-web` feature. Default CI stays off (ADR 0011). The git
-# revision is pinned so the spike builds on stable Rust. Not a supported
+# It links the AGPL `wacore-libsignal`. Release builds turn it on for the
+# helper program only (ADR 0013). No MIT crate depends on this crate. The
+# git revision is pinned so the spike builds on stable Rust. Not a supported
 # messenger. `sqlite-storage` (not `sqlite-storage-bundled`) so the lock can
 # use libsqlite3-sys 0.36. The 0.38 pin cannot share the graph with the
 # Signal sqlite store. The bundled build is the direct dependency below.
 whatsapp-web = ["dep:whatsapp-rust", "dep:libsqlite3-sys"]
 
 [dependencies]
+# The command line of the helper program.
+clap.workspace = true
 dirs.workspace = true
 thinwire-protocol.workspace = true
-tokio.workspace = true
+# `io-std`: the helper talks over its stdin and stdout.
+tokio = { workspace = true, features = ["io-std"] }
 tracing.workspace = true
+# The log of the helper program. The tests also read log lines with it (#238).
+tracing-subscriber.workspace = true
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "edaa64b68d0de24bdb6848b98a824a32e276c55c", optional = true, default-features = false, features = [
   "sqlite-storage",
   "tokio-transport",
@@ -39,8 +51,8 @@ libsqlite3-sys = { version = "0.36", optional = true, default-features = false, 
 [dev-dependencies]
 # The adapter contract kit (ADR 0010) for the tests.
 thinwire-protocol = { workspace = true, features = ["contract-kit"] }
-# Reads the log lines in the tests of what is logged at close (#238).
-tracing-subscriber.workspace = true
+# The wire lines, for the tests that talk to the helper process directly.
+thinwire-ipc.workspace = true
 
 [lints]
 workspace = true

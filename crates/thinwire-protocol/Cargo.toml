@@ -53,7 +53,10 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 ] }
 dirs.workspace = true
 getrandom = "0.4"
-tokio = { workspace = true, features = ["io-util", "net"] }
+# The wire lines to a helper process (ADR 0013). MIT, no AGPL code.
+thinwire-ipc.workspace = true
+# `process`: the app starts a helper process as a child.
+tokio = { workspace = true, features = ["io-util", "net", "process"] }
 tracing.workspace = true
 
 [dev-dependencies]

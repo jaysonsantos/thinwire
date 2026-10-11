@@ -3,6 +3,11 @@
 # one mode-preserving .tar.gz so executable bits and the macOS .app survive.
 # pull_request never triggers this workflow, and the job also refuses non-main pushes.
 #
+# Each archive holds the MIT app and the AGPL-3.0-only WhatsApp helper
+# program (ADR 0013). The app does not link the helper: it starts it as a
+# child process. The helper-source job uploads the Corresponding Source of
+# the helper from the same run, with the same retention as the archives.
+#
 # TELEGRAM_API_ID and TELEGRAM_API_HASH are publisher Telegram app credentials.
 # This main-only workflow reads them from GitHub Actions repository secrets and
 # passes them to cargo so option_env! can bake them in. Never add these secrets
@@ -96,21 +101,58 @@ jobs:
             exit 1
           fi
 
+      # scripts/check-release-tree.sh reads the feature list of this line.
       - name: Build release binary
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-        run: cargo build --release -p thinwire --features telegram-tdlib
+        run: cargo build --release -p thinwire --features telegram-tdlib,whatsapp-web,discord-bot
+
+      # The AGPL helper is its own program. It gets no publisher secret.
+      - name: Build the WhatsApp helper
+        run: cargo build --release -p thinwire-whatsapp --features whatsapp-web --bin thinwire-whatsapp-helper
 
       - name: Stage and archive unsigned payload
         shell: bash
         env:
           ARTIFACT: ${{ matrix.artifact }}
+          SOURCE_REF: ${{ github.sha }}
         run: scripts/stage-os-artifact.sh
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: thinwire-${{ matrix.artifact }}
           path: thinwire-${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # AGPL-3.0 section 6(d): the Corresponding Source of the helper programs
+  # comes from the same place as the binaries. One tarball holds the thinwire
+  # source of this commit and every dependency from `cargo vendor`, so it
+  # needs no outside git revision.
+  helper-source:
+    name: helper-source
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Build the helper source tarball
+        env:
+          SOURCE_REF: ${{ github.sha }}
+        run: scripts/helper-source.sh "$SOURCE_REF"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: thinwire-helpers-source
+          path: thinwire-helpers-${{ github.sha }}-source.tar.gz
           if-no-files-found: error
           retention-days: 7

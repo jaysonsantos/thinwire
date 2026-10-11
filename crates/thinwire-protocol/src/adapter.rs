@@ -108,6 +108,47 @@ pub enum AccountState {
     Linked,
 }
 
+/// State of the helper process of a protocol that runs out of process
+/// (ADR 0013). Only [`AdapterEvent::Helper`] reports it. A protocol that
+/// runs in the app never sends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperState {
+    /// No helper runs, and none is necessary: the user has no link to
+    /// keep. The account row shows its normal state.
+    Idle,
+    /// The helper starts, or it does not answer in time. The account row
+    /// shows a busy state. The window never waits.
+    Busy,
+    /// The helper runs and answers.
+    Running,
+    /// The helper stopped. The adapter starts it again after a wait.
+    Restarting,
+    /// The helper stopped, and the adapter does not start it again by
+    /// itself. The account row shows "Helper stopped." and Restart.
+    Stopped(HelperFault),
+    /// The helper program is not installed. The protocol stays visible.
+    Missing,
+}
+
+/// Why a helper stopped for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperFault {
+    /// It stopped again and again. The restart backoff ended.
+    Crashed,
+    /// The system did not start the program.
+    StartFailed,
+    /// Its wire protocol version is not the version of this app.
+    VersionMismatch,
+    /// Another helper process uses the session store.
+    SessionInUse,
+    /// The last helper process got its kill but did not end, so a new one
+    /// cannot start: two processes on one session store break it.
+    StillRunning,
+    /// The helper program has no client for its protocol: it was built
+    /// without it.
+    NoClient,
+}
+
 /// Live adapter state reported to the UI over the event channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterStatus {
@@ -331,6 +372,11 @@ pub enum AdapterCommand {
     },
     /// Stops local-only linking and clears the in-memory notice acknowledgement.
     SignalCancelLink,
+    /// Start the helper process of this protocol again after it stopped
+    /// (ADR 0013). A protocol that runs in the app refuses it.
+    RestartHelper {
+        protocol: ProtocolId,
+    },
 }
 
 impl AdapterCommand {
@@ -345,7 +391,8 @@ impl AdapterCommand {
             | Self::LoadOlderMessages { protocol, .. }
             | Self::SendText { protocol, .. }
             | Self::ResendMessage { protocol, .. }
-            | Self::ViewChat { protocol, .. } => protocol,
+            | Self::ViewChat { protocol, .. }
+            | Self::RestartHelper { protocol } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
             Self::WhatsAppAcknowledgeRisk
@@ -525,6 +572,12 @@ pub enum AdapterEvent {
         code: RedactedPairingSecret,
         /// Link generation that produced this payload. Stale generations are dropped.
         generation: u64,
+    },
+    /// New state of this protocol's helper process (ADR 0013). It never
+    /// changes the link state: an `Account` event does that.
+    Helper {
+        protocol: ProtocolId,
+        state: HelperState,
     },
 }
 
@@ -849,6 +902,10 @@ pub(crate) fn emit_notice(events: &EventTx, protocol: ProtocolId, text: impl Int
         protocol,
         text: text.into(),
     });
+}
+
+pub(crate) fn emit_helper(events: &EventTx, protocol: ProtocolId, state: HelperState) {
+    let _ = events.send(AdapterEvent::Helper { protocol, state });
 }
 
 pub fn emit_stopped(events: &EventTx, protocol: ProtocolId) {

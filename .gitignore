@@ -21,3 +21,8 @@ crates/thinwire/tests/snapshots/**/*.old.png
 # WhatsApp linked-device store (app-data only; never the repo)
 device.sqlite
 device.sqlite-*
+
+# Local output of scripts/helper-source.sh and scripts/stage-os-artifact.sh
+/thinwire-helpers-*-source.tar.gz
+/thinwire-*.tar.gz
+/dist/
