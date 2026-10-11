@@ -6863,10 +6863,12 @@ dependencies = [
  "clap",
  "dirs 7.0.0",
  "libsqlite3-sys",
+ "log",
  "thinwire-ipc",
  "thinwire-protocol",
  "tokio",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "whatsapp-rust",
 ]

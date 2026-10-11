@@ -164,7 +164,7 @@ cargo build -p thinwire-whatsapp --features whatsapp-web --bin thinwire-whatsapp
 cargo run -p thinwire --features whatsapp-web
 ```
 
-The helper writes its log to stderr. The app writes those lines at level `debug` with the prefix `helper:`.
+The helper writes its log to stderr. The app writes those lines at level `debug` with the prefix `helper:`. The helper writes only the log lines of thinwire code. `RUST_LOG` sets their level. It cannot turn on the log of `whatsapp-rust`, because that library logs the pair code.
 
 A plain `cargo build` also builds the helper, but with no WhatsApp client. That helper refuses to run, and the account row shows "Helper stopped." with the reason. Build it with `--features whatsapp-web`, as above.
 

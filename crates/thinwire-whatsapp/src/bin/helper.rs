@@ -9,7 +9,8 @@
 //!
 //! The program ends when the app sends `Shutdown`, when the app closes the
 //! pipe, or on a line that is not in the protocol. It never logs message
-//! text, phone numbers, QR data, or pair codes.
+//! text, phone numbers, QR data, or pair codes: it writes the log lines of
+//! thinwire code only, because whatsapp-rust logs the pair code.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,12 +78,27 @@ fn main() {
 }
 
 /// Logs go to stderr only: stdout carries the wire protocol.
+///
+/// `RUST_LOG` sets the level of thinwire targets. It cannot turn on the log
+/// of a library: see [`own_targets`].
 fn init_tracing() {
-    tracing_subscriber::fmt()
+    use tracing_subscriber::filter::FilterExt;
+    use tracing_subscriber::prelude::*;
+    let layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+        .with_filter(tracing_subscriber::EnvFilter::from_default_env().and(own_targets()));
+    tracing_subscriber::registry().with(layer).init();
+}
+
+/// Only the log lines of thinwire code. whatsapp-rust logs "Pair code
+/// generated: ..." at level `info`, and the app logs each stderr line of
+/// this program again. A more specific `RUST_LOG` directive wins on an
+/// `EnvFilter`, so this filter drops the other targets on its own.
+fn own_targets() -> tracing_subscriber::filter::FilterFn<impl Fn(&tracing::Metadata<'_>) -> bool> {
+    tracing_subscriber::filter::filter_fn(|metadata: &tracing::Metadata<'_>| {
+        thinwire_protocol::helper::helper_log_target(metadata.target())
+    })
 }
 
 async fn run(cli: Cli) -> i32 {
@@ -124,5 +140,78 @@ async fn run(cli: Cli) -> i32 {
             exit::BAD_LINE
         }
         ServeEnd::NotAHelperProtocol => exit::REFUSED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::filter::FilterExt;
+    use tracing_subscriber::prelude::*;
+
+    use super::own_targets;
+
+    #[derive(Clone)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Buf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What the helper writes for these log lines, with and without the
+    /// filter of the helper. `RUST_LOG` asks for every level.
+    fn logged(own_only: bool) -> String {
+        // The bridge that `init_tracing` installs for `log` records. It is
+        // set one time for the process: a second call fails, and that is
+        // fine.
+        let _ = tracing_log::LogTracer::init();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Buf(Arc::clone(&bytes));
+        let env = tracing_subscriber::EnvFilter::new("trace,whatsapp_rust=trace");
+        let fmt = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(move || writer.clone());
+        let emit = || {
+            // whatsapp-rust uses the `log` crate, with this target and text.
+            log::info!(target: "Bot/PairCode", "Pair code generated: ABCD-1234");
+            log::debug!(target: "whatsapp_rust::pair", "qr ref 2@do-not-log");
+            tracing::trace!(target: "wacore::libsignal", "frame do-not-log");
+            tracing::info!(target: "thinwire_whatsapp::whatsapp::link", "the link worker is up");
+        };
+        if own_only {
+            let subscriber =
+                tracing_subscriber::registry().with(fmt.with_filter(env.and(own_targets())));
+            tracing::subscriber::with_default(subscriber, emit);
+        } else {
+            let subscriber = tracing_subscriber::registry().with(fmt.with_filter(env));
+            tracing::subscriber::with_default(subscriber, emit);
+        }
+        String::from_utf8(bytes.lock().expect("log buffer").clone()).expect("utf8")
+    }
+
+    /// whatsapp-rust logs the pair code at level `info`, with the target
+    /// "Bot/PairCode". The app logs each stderr line of the helper again, so
+    /// that line must never reach stderr, also when `RUST_LOG` asks for
+    /// every level. The log lines of thinwire code stay.
+    #[test]
+    fn the_helper_does_not_log_the_pair_code_of_the_library() {
+        // With `RUST_LOG` only, the pair code is in the log: the test sends
+        // the record on the path of the library.
+        let open = logged(false);
+        assert!(open.contains("ABCD-1234"), "{open}");
+
+        let output = logged(true);
+        assert!(!output.contains("ABCD-1234"), "{output}");
+        assert!(!output.contains("do-not-log"), "{output}");
+        assert!(output.contains("the link worker is up"), "{output}");
     }
 }
