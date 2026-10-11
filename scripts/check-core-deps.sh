@@ -14,6 +14,6 @@ if grep -E '^(egui|eframe|winit|epaint|egui-winit|egui_glow)[ @]' <<<"$tree"; th
   exit 1
 fi
 if grep -E '^thinwire-(signal|whatsapp)[ @]' <<<"$tree"; then
-  echo "thinwire-core depends on an AGPL protocol crate (ADR 0011)" >&2
+  echo "thinwire-core depends on an AGPL protocol crate (ADR 0013)" >&2
   exit 1
 fi

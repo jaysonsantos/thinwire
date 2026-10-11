@@ -56,7 +56,8 @@ repos:
         name: editorconfig
         entry: editorconfig-checker
         language: system
-        args: ["-exclude", "crates/thinwire-(signal|whatsapp)/LICENSE"]
+        # License texts are copies of the upstream files. Do not format them.
+        args: ["-exclude", "crates/thinwire-(signal|whatsapp)/LICENSE|third_party/"]
 
       - id: gitleaks
         name: gitleaks

@@ -5373,12 +5373,12 @@ mod tests {
         assert!(toml.contains("discord-bot"));
         assert!(toml.contains("default = []"));
         assert!(!toml.contains(concat!("seren", "ity")));
-        let ci = include_str!("../../../../.github/workflows/ci.yml");
+        // ADR 0013: a release ships the bot inbox, and the release-features
+        // job tests it. The default test script stays feature-off.
         let tests = include_str!("../../../../scripts/test.sh");
         let zips = include_str!("../../../../.github/workflows/os-zips.yml");
-        assert!(!ci.contains("discord-bot"));
         assert!(!tests.contains("discord-bot"));
-        assert!(!zips.contains("discord-bot"));
+        assert!(zips.contains("discord-bot"));
         let lock = include_str!("../../../../Cargo.lock");
         assert!(!lock.contains(concat!("seren", "ity")));
         assert!(lock.contains("name = \"twilight-http\""));
