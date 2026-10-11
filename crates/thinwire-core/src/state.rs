@@ -3182,6 +3182,10 @@ impl Snapshot {
         #[cfg(feature = "whatsapp-web")]
         if protocol == ProtocolId::WhatsApp {
             self.end_pairing();
+            // The adapter ended the pairing itself (a pair code that
+            // failed, no QR left, a ban). No pairing runs, so the pair
+            // screen can start a new one.
+            self.whatsapp_started = false;
         }
         #[cfg(feature = "signal-local")]
         if protocol == ProtocolId::Signal {
@@ -4165,6 +4169,51 @@ mod tests {
             snapshot.take_commands().as_slice(),
             [AdapterCommand::WhatsAppBeginLink { .. }]
         ));
+    }
+
+    /// PR #256 review: the adapter ends a pairing itself (`Linking`, then
+    /// `Unlinked`: a pair code that failed, no QR left, a ban), and the
+    /// helper stays `Running`. The pair screen stays open, the old QR goes,
+    /// and Start is enabled again. A new start sends a new pairing.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_pairing_that_the_adapter_ended_enables_start_again() {
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.begin_whatsapp_link(&phone);
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::WhatsAppBeginLink { generation }) = commands.last() else {
+            panic!("no pairing start: {commands:?}");
+        };
+        let first = *generation;
+        helper(&mut snapshot, HelperState::Running);
+        let account = |state| AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state,
+        };
+        snapshot.apply(account(AccountState::Linking));
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("qr-one"),
+            generation: first,
+        });
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("qr-one"));
+        assert!(snapshot.whatsapp_started);
+
+        snapshot.apply(account(AccountState::Unlinked));
+        assert_eq!(snapshot.whatsapp_qr, None, "the old QR is not valid");
+        assert!(!snapshot.whatsapp_started, "Start is enabled again");
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        assert!(snapshot.take_commands().is_empty(), "no command by itself");
+
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(snapshot.whatsapp_started);
+        let commands = snapshot.take_commands();
+        let [AdapterCommand::WhatsAppBeginLink { generation }] = commands.as_slice() else {
+            panic!("no new pairing start: {commands:?}");
+        };
+        assert_ne!(*generation, first, "a new pairing, not the old one");
     }
 
     /// PR #256 review: a phone text that is too long does not start a
