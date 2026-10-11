@@ -14,6 +14,8 @@ mod session;
 #[cfg(feature = "whatsapp-web")]
 mod live;
 
+pub use path::{SessionLock, SessionLockError, lock_session, set_session_dir};
+
 use std::sync::Arc;
 
 use thinwire_protocol::{
@@ -52,6 +54,14 @@ const SEND_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
 const _: () = assert!(
     SEND_DRAIN.as_millis() + link::SHUTDOWN_WAIT.as_millis()
         < thinwire_protocol::APP_CLOSE_LIMIT.as_millis()
+);
+
+// The adapter runs in the helper process (ADR 0013). The helper waits
+// `ADAPTER_STOP_WAIT` for `Stopped`, so the adapter's own bound must be
+// below it. Else the helper ends before the client closed its store.
+const _: () = assert!(
+    SEND_DRAIN.as_millis() + link::SHUTDOWN_WAIT.as_millis()
+        < thinwire_protocol::helper::ADAPTER_STOP_WAIT.as_millis()
 );
 
 const STOP_TIMEOUT: &str =

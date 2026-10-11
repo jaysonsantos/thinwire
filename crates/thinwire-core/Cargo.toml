@@ -15,8 +15,9 @@ default = []
 # Protocol features live here. The frontend crate forwards them.
 telegram-tdlib = ["thinwire-protocol/telegram-tdlib"]
 slack-oauth = ["thinwire-protocol/slack-oauth"]
-# Local-only WhatsApp chrome. The AGPL client is `thinwire-whatsapp`, not
-# this crate (#77). Default CI and the default UI stay feature-off.
+# WhatsApp chrome. The AGPL client is in the `thinwire-whatsapp-helper`
+# process, not in this crate (#77, ADR 0013). The default CI jobs and the
+# default UI stay feature-off. Release builds turn it on.
 whatsapp-web = []
 discord-bot = ["thinwire-protocol/discord-bot"]
 # Local-only Signal chrome. The AGPL client is `thinwire-signal`, not this crate.

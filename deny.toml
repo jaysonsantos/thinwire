@@ -1,0 +1,12 @@
+# cargo-deny: advisory check of the dependency graphs that a release ships
+# (ADR 0012 section 4, ADR 0013). `scripts/test-release-features.sh` runs
+# `cargo deny check advisories` for the app and for the WhatsApp helper.
+#
+# Licenses are not checked here: `wacore-libsignal` says MIT in its manifest
+# but has AGPL files, so metadata cannot find it. `scripts/check-agpl-deps.sh`
+# and `scripts/check-release-tree.sh` are the license guards.
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = []
