@@ -26,10 +26,10 @@ sha2 = "0.11.0"
 thinwire-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-presage = { git = "https://github.com/whisperfish/presage", rev = "a90ef33dc0024e71919cc14c7efa546c9ec75880", optional = true, default-features = false }
+presage = { git = "https://github.com/whisperfish/presage", rev = "b44d0129348fffde7455214bc081859dcf2fd242", optional = true, default-features = false }
 # Default features build SQLCipher and need OpenSSL headers. The session file
 # is mode 0700 under app-data, same as the old sled directory. No passphrase.
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "a90ef33dc0024e71919cc14c7efa546c9ec75880", optional = true, default-features = false }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "b44d0129348fffde7455214bc081859dcf2fd242", optional = true, default-features = false }
 # Bundled SQLite, same 0.36 line as WhatsApp. A signal-local build does not
 # need a system libsqlite. SQLCipher stays off (no OpenSSL headers).
 libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
