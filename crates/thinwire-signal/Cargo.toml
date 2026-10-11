@@ -6,12 +6,20 @@ license = "AGPL-3.0-only"
 rust-version.workspace = true
 publish.workspace = true
 repository.workspace = true
-description = "Local-only Signal adapter (AGPL-3.0-only). Not in release builds."
+description = "Signal linked-device adapter and its helper program (AGPL-3.0-only)."
+
+# The helper program of ADR 0013. The MIT app starts it as a child process
+# and talks to it over stdin and stdout. Without `signal-local` it has no
+# client: that build is only for the process tests in default CI.
+[[bin]]
+name = "thinwire-signal-helper"
+path = "src/bin/helper.rs"
 
 [features]
 default = []
-# Links Presage and libsignal. thinwire enables this only through its
-# `signal-local` feature. Default CI stays off.
+# Links Presage and libsignal (AGPL-3.0). Release builds turn it on for the
+# helper program only (ADR 0013, #248). No MIT crate depends on this crate.
+# Default CI stays off.
 signal-local = [
   "dep:presage",
   "dep:presage-store-sqlite",
@@ -21,11 +29,16 @@ signal-local = [
 ]
 
 [dependencies]
+# The command line of the helper program.
+clap.workspace = true
 dirs.workspace = true
 sha2 = "0.11.0"
 thinwire-protocol.workspace = true
-tokio.workspace = true
+# `io-std`: the helper talks over its stdin and stdout.
+tokio = { workspace = true, features = ["io-std"] }
 tracing.workspace = true
+# The log of the helper program.
+tracing-subscriber.workspace = true
 presage = { git = "https://github.com/whisperfish/presage", rev = "96f5e925c45b2d7a1c09afd0aee44733a2c3e671", optional = true, default-features = false }
 # Default features build SQLCipher and need OpenSSL headers. The session file
 # is mode 0700 under app-data, same as the old sled directory. No passphrase.
@@ -50,6 +63,12 @@ sqlx = { version = "0.9.0", optional = true, default-features = false, features 
 chrono.workspace = true
 # The adapter contract kit (ADR 0010) for the tests.
 thinwire-protocol = { workspace = true, features = ["contract-kit"] }
+# The wire lines, for the tests that talk to the helper process directly.
+thinwire-ipc.workspace = true
+# The helper test sends a `log` record through the same bridge as the
+# helper program.
+log = "0.4"
+tracing-log = "0.2"
 
 [lints]
 workspace = true

@@ -6771,7 +6771,6 @@ dependencies = [
  "thinwire-core",
  "thinwire-notify",
  "thinwire-protocol",
- "thinwire-signal",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6844,16 +6843,21 @@ name = "thinwire-signal"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "clap",
  "dirs 7.0.0",
  "futures",
  "libsqlite3-sys",
+ "log",
  "presage",
  "presage-store-sqlite",
  "sha2 0.11.0",
  "sqlx",
+ "thinwire-ipc",
  "thinwire-protocol",
  "tokio",
  "tracing",
+ "tracing-log",
+ "tracing-subscriber",
 ]
 
 [[package]]

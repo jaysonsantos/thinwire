@@ -173,6 +173,45 @@ fn a_missing_helper_row_says_reinstall() {
     assert!(harness.query_by_label("Restart").is_none());
 }
 
+/// #248 UX: the Signal helper stopped for good, and the WhatsApp helper
+/// runs. Only the Signal row reads "Helper stopped." and has Restart. A
+/// click asks the core to start the Signal helper, not the WhatsApp one.
+#[test]
+fn a_stopped_signal_helper_row_has_restart_and_the_whatsapp_row_does_not() {
+    let mut state = InboxUi::with_whatsapp_helper(HelperState::Running);
+    show_protocol(&mut state.snapshot, ProtocolId::Signal);
+    state.snapshot.apply(AdapterEvent::Helper {
+        protocol: ProtocolId::Signal,
+        state: HelperState::Stopped(HelperFault::Crashed),
+    });
+    let mut harness = harness(state);
+    harness.run();
+    // One row only: `get_by_label` fails on two matches.
+    harness.get_by_label("Helper stopped.");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Restart")
+        .click();
+    harness.run();
+    assert_eq!(harness.state().restarts, [ProtocolId::Signal]);
+}
+
+/// ADR 0013 decision 6 for Signal: with no helper program the account
+/// keeps its row and shows "Signal helper missing. Reinstall thinwire."
+#[test]
+fn a_missing_signal_helper_row_says_reinstall() {
+    let mut state = InboxUi::ready();
+    show_protocol(&mut state.snapshot, ProtocolId::Signal);
+    state.snapshot.apply(AdapterEvent::Helper {
+        protocol: ProtocolId::Signal,
+        state: HelperState::Missing,
+    });
+    let mut harness = harness(state);
+    harness.run();
+    harness.get_by_label("Helper missing");
+    harness.get_by_label("Signal helper missing. Reinstall thinwire.");
+    assert!(harness.query_by_label("Restart").is_none());
+}
+
 /// A helper that runs changes nothing on the row.
 #[test]
 fn a_running_helper_row_shows_its_normal_state() {

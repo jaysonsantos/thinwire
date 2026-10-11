@@ -68,19 +68,27 @@ mod tests {
         assert!(roadmap.contains("No ready WhatsApp account"));
     }
 
+    /// ADR 0013 supersedes "Signal out of v1": Signal ships with its helper
+    /// (#248). The README lists it as experimental, never as a supported
+    /// goal, and it keeps the Signal risk line.
     #[test]
-    fn readme_does_not_list_signal_as_v1_protocol() {
+    fn readme_lists_signal_as_experimental_with_its_risk_line() {
         let readme = include_str!("../../../README.md");
+        let row = readme
+            .lines()
+            .find(|line| line.starts_with("| Signal |"))
+            .expect("README protocol table lists Signal");
         assert!(
-            !readme.contains("| Signal |"),
-            "README protocol table must not list Signal as a v1 protocol"
+            row.contains("**Experimental**") && !row.contains("Supported goal"),
+            "the Signal row must say Experimental: {row}"
         );
-        // ADR 0013 supersedes "Signal out of v1": Signal ships with its
-        // helper in #248. Until then the README says that no release has it,
-        // and it keeps the Signal risk line.
         assert!(
-            readme.contains("Signal is not in release builds yet"),
-            "README must state that no release build has Signal yet"
+            row.contains("thinwire-signal-helper"),
+            "the Signal row must name the helper process: {row}"
+        );
+        assert!(
+            !readme.contains("Signal is not in release builds yet"),
+            "release builds ship Signal after #248"
         );
         assert!(
             readme.contains("Signal: no supported third-party API, expect breakage."),

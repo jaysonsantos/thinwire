@@ -1,6 +1,6 @@
 # Thinwire roadmap
 
-Ordered work from product-council ADRs (`decisions/0001`–`0013`; `0013` ships every protocol, with WhatsApp and Signal in AGPL helper processes, and supersedes `0004`, `0011` and the Later part of `0012`; the WhatsApp helper is #246, the Signal helper is pending in #248). ADRs are decisions; this file is the todo list.
+Ordered work from product-council ADRs (`decisions/0001`–`0013`; `0013` ships every protocol, with WhatsApp and Signal in AGPL helper processes, and supersedes `0004`, `0011` and the Later part of `0012`; the WhatsApp helper is #246, the Signal helper is #248). ADRs are decisions; this file is the todo list.
 
 Rule: an ADR accepted is not Done until the matching change is on `main`.
 
@@ -58,14 +58,19 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 
 ### AGPL helpers (`0013`)
 
-`0013` (accepted 2026-10-08) supersedes `0011`: release builds ship WhatsApp and Signal in AGPL-3.0-only helper binaries over IPC. The MIT app binary never links AGPL code. Until the Signal helper lands, `signal-local` stays local-only.
+`0013` (accepted 2026-10-08) supersedes `0011`: release builds ship WhatsApp and Signal in AGPL-3.0-only helper binaries over IPC. The MIT app binary never links AGPL code.
 
 - [x] #246 — the `release-features` CI job and the WhatsApp helper. PR #256.
     - `crates/thinwire-ipc`: the wire protocol.
     - `HelperAdapter` in `thinwire-protocol`: start, restart, "Helper stopped." with Restart, and the missing-helper state.
     - `thinwire-whatsapp-helper` in `crates/thinwire-whatsapp`, with a lock on the session folder.
     - OS zips ship the helper, the AGPL text, the source offer, and the source tarball.
-- [ ] #248 — the Signal helper.
+- [x] #248 — the Signal helper. PR #281.
+    - `thinwire-signal-helper` in `crates/thinwire-signal`, with a lock on the session folder. The session folder stays `thinwire/signal/` in the app-data directory.
+    - `signal_helper_adapter` in `thinwire-protocol`. Feature `signal-local` of the app adds the screens and this adapter, with no AGPL code.
+    - A stop of the Signal helper does not stop the WhatsApp helper. Each protocol has its own pairing generation in the core.
+    - OS zips ship both helpers, each with the AGPL text and the source offer. The source tarball has presage and libsignal.
+- [ ] A live test of Signal through the helper on Linux, macOS, and Windows.
 - [ ] Slack in the OS zips. `0013` names `slack-oauth` as a release feature. The zips need the publisher `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, and `SLACK_APP_TOKEN` secrets first.
 - [ ] A live test of WhatsApp through the helper on Linux, macOS, and Windows (a spare number only).
 
@@ -77,7 +82,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 
 ## Explicitly not next
 
-- AGPL code in the MIT app binary. WhatsApp and Signal ship only as helper binaries (`0013`). Feature `signal-local` stays off in release builds.
+- AGPL code in the MIT app binary. WhatsApp and Signal ship only as helper binaries (`0013`). No MIT crate depends on an AGPL crate.
 - gpui / gpui-ce toolkit switch — parked until thinwire-shaped measurements exist (`0002`).
 
 ## Pointers

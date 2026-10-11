@@ -113,10 +113,15 @@ pub struct Settings {
     /// Path of the WhatsApp helper program (ADR 0013). The app uses it when
     /// no helper is next to its own binary. Only the file sets it.
     whatsapp_helper: Option<PathBuf>,
+    /// Path of the Signal helper program (ADR 0013, #248). Same rules as
+    /// [`Self::whatsapp_helper`].
+    signal_helper: Option<PathBuf>,
 }
 
 /// Settings key of the WhatsApp helper path.
 const WHATSAPP_HELPER_KEY: &str = "whatsapp_helper";
+/// Settings key of the Signal helper path.
+const SIGNAL_HELPER_KEY: &str = "signal_helper";
 
 impl Settings {
     /// Load from the platform config dir, and the muted chats from the
@@ -138,6 +143,7 @@ impl Settings {
     pub fn load_from(path: PathBuf) -> Self {
         let theme = read_theme(&path).unwrap_or(ThemeMode::System);
         let whatsapp_helper = read_path(&path, WHATSAPP_HELPER_KEY);
+        let signal_helper = read_path(&path, SIGNAL_HELPER_KEY);
         Self {
             theme,
             notifications: read_bool(&path, "notifications").unwrap_or(true),
@@ -150,6 +156,7 @@ impl Settings {
             in_memory: false,
             mutes: ChatMutes::in_memory(),
             whatsapp_helper,
+            signal_helper,
         }
     }
 
@@ -169,6 +176,7 @@ impl Settings {
             in_memory: true,
             mutes: ChatMutes::in_memory(),
             whatsapp_helper: None,
+            signal_helper: None,
         }
     }
 
@@ -177,6 +185,13 @@ impl Settings {
     #[must_use]
     pub fn whatsapp_helper(&self) -> Option<&std::path::Path> {
         self.whatsapp_helper.as_deref()
+    }
+
+    /// The path of the Signal helper program from the settings file, if the
+    /// user set one. The app looks next to its own binary first.
+    #[must_use]
+    pub fn signal_helper(&self) -> Option<&std::path::Path> {
+        self.signal_helper.as_deref()
     }
 
     #[must_use]
@@ -284,12 +299,17 @@ impl Settings {
             self.notifications,
             self.notification_preview,
         );
-        // Keep the helper path of the user when another setting changes.
-        if let Some(path) = &self.whatsapp_helper {
-            text.push_str(&format!(
-                "{WHATSAPP_HELPER_KEY} = \"{}\"\n",
-                escape_toml(&path.to_string_lossy())
-            ));
+        // Keep the helper paths of the user when another setting changes.
+        for (key, path) in [
+            (WHATSAPP_HELPER_KEY, &self.whatsapp_helper),
+            (SIGNAL_HELPER_KEY, &self.signal_helper),
+        ] {
+            if let Some(path) = path {
+                text.push_str(&format!(
+                    "{key} = \"{}\"\n",
+                    escape_toml(&path.to_string_lossy())
+                ));
+            }
         }
         text
     }

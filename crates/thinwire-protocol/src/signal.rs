@@ -1,20 +1,25 @@
-//! MIT stub for Signal.
+//! MIT side of Signal: the stub and the helper adapter.
 //!
 //! The client that links Presage and libsignal is `thinwire-signal`
-//! (AGPL-3.0-only). This crate does not depend on it. A `signal-local` build
-//! replaces this stub in the host.
+//! (AGPL-3.0-only). It runs in the `thinwire-signal-helper` process
+//! (ADR 0013, #248). This crate does not depend on it. A `signal-local`
+//! build replaces this stub in the host with [`signal_helper_adapter`],
+//! which talks to that process over a pipe.
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::adapter::{
     AdapterCommand, AdapterError, AdapterStatus, EventTx, ProtocolAdapter, ProtocolCapabilities,
     ProtocolId, SupportClass, emit_status, emit_stopped,
 };
 
-const CAPABILITY_DETAIL: &str = "Local-only secondary device (presage). The signal-local feature is off in this build. Not in release builds.";
+const CAPABILITY_DETAIL: &str = "Linked secondary device (presage). The signal-local feature is off in this build. No supported third-party API, expect breakage.";
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Signal,
     support: SupportClass::Experimental,
-    short_label: "Local only · AGPL · not in releases",
+    short_label: "Experimental · expect breakage",
     detail: CAPABILITY_DETAIL,
     official_api: false,
     allows_user_account_automation: false,
@@ -23,10 +28,47 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     pages_history: true,
 };
 
+/// File name of the Signal helper program, without `.exe`.
+pub const SIGNAL_HELPER_PROGRAM: &str = "thinwire-signal-helper";
+
+/// The capabilities of the client in the helper. The account row shows them
+/// also while no helper runs.
+const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
+    id: ProtocolId::Signal,
+    support: SupportClass::Experimental,
+    short_label: "Experimental · expect breakage",
+    detail: "Linked secondary device (presage) in the thinwire-signal-helper process. Experimental. No supported third-party API, expect breakage.",
+    official_api: false,
+    allows_user_account_automation: false,
+    sends_text: true,
+    pages_history: true,
+};
+
+/// The Signal adapter of a `signal-local` build: it runs the AGPL client in
+/// the `thinwire-signal-helper` process (ADR 0013).
+///
+/// `configured` is the helper path from the settings, used when no helper is
+/// next to the app binary. Signal links with a QR only, so no phone number
+/// goes to this helper.
+#[must_use]
+pub fn signal_helper_adapter(configured: Option<PathBuf>) -> crate::helper::HelperAdapter {
+    crate::helper::HelperAdapter::new(
+        crate::helper::HelperSpec {
+            protocol: ProtocolId::Signal,
+            capabilities: HELPER_CAPABILITIES,
+        },
+        Arc::new(crate::helper::ProcessLauncher::new(
+            SIGNAL_HELPER_PROGRAM,
+            configured,
+        )),
+        None,
+    )
+}
+
 const FEATURE_OFF: &str = "signal-local is off in this build. No Signal session is started.";
 
 const NOTICE_REQUIRED: &str =
-    "Signal linking is refused until the full-screen local-build notice is accepted";
+    "Signal linking is refused until the full-screen Signal notice is accepted";
 
 /// Feature-off Signal adapter. It never opens a session.
 pub struct SignalAdapter {
@@ -52,7 +94,7 @@ impl SignalAdapter {
             events,
             ProtocolId::Signal,
             AdapterStatus::Stubbed,
-            "Signal local-build notice accepted. No session has started.",
+            "Signal notice accepted. No session has started.",
         );
         Ok(())
     }

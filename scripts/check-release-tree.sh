@@ -6,7 +6,9 @@
 # crate, the WhatsApp libsignal fork, or an AGPL protocol crate of this
 # repository (thinwire-signal, thinwire-whatsapp; #77).
 # The release features come from the app build line of os-zips.yml, so this
-# guard checks what a release builds. `signal-local` is never one of them.
+# guard checks what a release builds. It also checks the app with every
+# helper feature (`whatsapp-web`, `signal-local`): those features add the
+# screens and the MIT helper adapter, never the AGPL client (#246, #248).
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,23 +84,24 @@ check_tree() {
 }
 
 # Self-test (#246 "Guard test"): the check must fail when the app links an
-# AGPL crate. A small workspace gives `thinwire` a dependency on
-# `thinwire-whatsapp`. The check must fail on it, also when a feature turns
-# the dependency on, and pass once the dependency is gone.
+# AGPL crate. A small workspace gives `thinwire` a dependency on an AGPL
+# crate of this repository (`thinwire-whatsapp` by default). The check must
+# fail on it, also when a feature turns the dependency on, and pass once the
+# dependency is gone.
 fixture_workspace() {
-  local root="$1" dep="$2"
-  mkdir -p "$root/crates/thinwire/src" "$root/crates/thinwire-whatsapp/src"
+  local root="$1" dep="$2" agpl="${3:-thinwire-whatsapp}" feature="${4:-whatsapp-web}"
+  mkdir -p "$root/crates/thinwire/src" "$root/crates/$agpl/src"
   printf '[workspace]\nmembers = ["crates/*"]\nresolver = "2"\n' >"$root/Cargo.toml"
-  printf '[package]\nname = "thinwire-whatsapp"\nversion = "0.1.0"\nedition = "2021"\nlicense = "AGPL-3.0-only"\n' \
-    >"$root/crates/thinwire-whatsapp/Cargo.toml"
-  printf '[package]\nname = "thinwire"\nversion = "0.1.0"\nedition = "2021"\nlicense = "MIT"\n\n[features]\nwhatsapp-web = [%s]\n\n[dependencies]\n' \
-    "$([[ "$dep" == optional ]] && printf '"dep:thinwire-whatsapp"')" >"$root/crates/thinwire/Cargo.toml"
+  printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\nlicense = "AGPL-3.0-only"\n' "$agpl" \
+    >"$root/crates/$agpl/Cargo.toml"
+  printf '[package]\nname = "thinwire"\nversion = "0.1.0"\nedition = "2021"\nlicense = "MIT"\n\n[features]\n%s = [%s]\n\n[dependencies]\n' \
+    "$feature" "$([[ "$dep" == optional ]] && printf '"dep:%s"' "$agpl")" >"$root/crates/thinwire/Cargo.toml"
   case "$dep" in
-    linked) printf 'thinwire-whatsapp = { path = "../thinwire-whatsapp" }\n' >>"$root/crates/thinwire/Cargo.toml" ;;
-    optional) printf 'thinwire-whatsapp = { path = "../thinwire-whatsapp", optional = true }\n' >>"$root/crates/thinwire/Cargo.toml" ;;
+    linked) printf '%s = { path = "../%s" }\n' "$agpl" "$agpl" >>"$root/crates/thinwire/Cargo.toml" ;;
+    optional) printf '%s = { path = "../%s", optional = true }\n' "$agpl" "$agpl" >>"$root/crates/thinwire/Cargo.toml" ;;
   esac
   : >"$root/crates/thinwire/src/lib.rs"
-  : >"$root/crates/thinwire-whatsapp/src/lib.rs"
+  : >"$root/crates/$agpl/src/lib.rs"
 }
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
@@ -110,6 +113,12 @@ fi
 fixture_workspace "$fixture/optional" optional
 if CARGO_NET_OFFLINE=true check_tree "self-test" "$fixture/optional/Cargo.toml" -p thinwire --features whatsapp-web >/dev/null 2>&1; then
   echo "check-release-tree self-test: an app whose release feature links thinwire-whatsapp passed" >&2
+  exit 1
+fi
+# The Signal crate, as `signal-local` linked it before #248.
+fixture_workspace "$fixture/signal" optional thinwire-signal signal-local
+if CARGO_NET_OFFLINE=true check_tree "self-test" "$fixture/signal/Cargo.toml" -p thinwire --features signal-local >/dev/null 2>&1; then
+  echo "check-release-tree self-test: an app whose release feature links thinwire-signal passed" >&2
   exit 1
 fi
 fixture_workspace "$fixture/clean" none
@@ -129,18 +138,23 @@ if [[ -z "$features" ]]; then
   echo "the app build line of ${release_workflow} names no feature" >&2
   exit 1
 fi
-if grep -qE '(^|,)signal-local(,|$)' <<<"$features"; then
-  echo "a release must not turn on signal-local: it links the AGPL Signal client into the app (#248)" >&2
-  exit 1
-fi
 
 check_tree "default features" Cargo.toml -p thinwire
 check_tree "release features: ${features}" Cargo.toml -p thinwire --features "$features"
+# The helper features of the app, also when a release does not name one.
+check_tree "helper features" Cargo.toml -p thinwire --features whatsapp-web,signal-local
 
-# The guard must be able to see the AGPL code that it keeps out: the helper
+# The guard must be able to see the AGPL code that it keeps out: each helper
 # with its release feature has it.
 helper_tree="$(cargo tree -p thinwire-whatsapp --features whatsapp-web --prefix none | sed -E 's/ \(.*$//')"
 if ! grep -qE '^wacore-libsignal ' <<<"$helper_tree"; then
   echo "the WhatsApp helper tree has no wacore-libsignal: the release guard pattern is out of date" >&2
   exit 1
 fi
+helper_tree="$(cargo tree -p thinwire-signal --features signal-local --prefix none | sed -E 's/ \(.*$//')"
+for needed in presage libsignal-protocol; do
+  if ! grep -qE "^${needed} " <<<"$helper_tree"; then
+    echo "the Signal helper tree has no ${needed}: the release guard pattern is out of date" >&2
+    exit 1
+  fi
+done

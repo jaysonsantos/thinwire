@@ -146,7 +146,7 @@ impl Owner {
             events,
             ProtocolId::Signal,
             AdapterStatus::Connecting,
-            "Signal linking was queued on the worker. This build is local only.",
+            "Signal linking was queued on the worker.",
         );
     }
 

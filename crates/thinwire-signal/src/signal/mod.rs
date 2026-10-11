@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Local-only Signal adapter (presage / libsignal, AGPL).
+//! Signal adapter (presage / libsignal, AGPL).
 //!
-//! The default build keeps a stub and does not open a network session.
-//! Feature `signal-local` may link a secondary device only after the UI has
-//! accepted the full-screen notice. Secrets and message text never travel on
-//! commands and are not logged.
+//! The adapter runs in the `thinwire-signal-helper` process (ADR 0013). The
+//! default build keeps a stub and does not open a network session. Feature
+//! `signal-local` may link a secondary device only after the UI has accepted
+//! the full-screen notice. Secrets and message text never travel on commands
+//! and are not logged.
 
 mod device;
 mod group;
 mod message;
 mod path;
+pub use path::{SessionLock, SessionLockError, lock_session, set_session_dir};
 mod reconnect;
 mod time;
 mod wake;
@@ -35,15 +37,15 @@ use device::FeatureOff;
 use device::SignalDevice;
 
 #[cfg(not(feature = "signal-local"))]
-const CAPABILITY_DETAIL: &str = "Local-only secondary device (presage). The signal-local feature is off in this build. Not in release builds.";
+const CAPABILITY_DETAIL: &str = "Linked secondary device (presage). The signal-local feature is off in this build. No supported third-party API, expect breakage.";
 
 #[cfg(feature = "signal-local")]
-const CAPABILITY_DETAIL: &str = "Local-only secondary device via presage. AGPL. Experimental. Not in release builds or OS zips.";
+const CAPABILITY_DETAIL: &str = "Linked secondary device (presage) in the thinwire-signal-helper process. Experimental. No supported third-party API, expect breakage.";
 
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     id: ProtocolId::Signal,
     support: SupportClass::Experimental,
-    short_label: "Local only · AGPL · not in releases",
+    short_label: "Experimental · expect breakage",
     detail: CAPABILITY_DETAIL,
     official_api: false,
     allows_user_account_automation: false,
@@ -53,7 +55,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 };
 
 const NOTICE_REQUIRED: &str =
-    "Signal linking is refused until the full-screen local-build notice is accepted";
+    "Signal linking is refused until the full-screen Signal notice is accepted";
 
 pub(crate) const FEATURE_OFF: &str =
     "signal-local is off in this build. No Signal session is started.";
@@ -61,6 +63,13 @@ pub(crate) const FEATURE_OFF: &str =
 /// Join budget for the Signal thread. The app closes the window at 5 seconds.
 #[cfg(feature = "signal-local")]
 const SHUTDOWN_LIMIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+// The adapter runs in the helper process (ADR 0013). The helper waits
+// `ADAPTER_STOP_WAIT` for `Stopped`, so the adapter's own bound must be
+// below it. Else the helper ends before the client closed its store.
+#[cfg(feature = "signal-local")]
+const _: () =
+    assert!(SHUTDOWN_LIMIT.as_millis() < thinwire_protocol::helper::ADAPTER_STOP_WAIT.as_millis());
 
 enum Engine {
     /// Test double and the feature-off stub. A `signal-local` library build
@@ -71,7 +80,7 @@ enum Engine {
     Live(Arc<live::Session>),
 }
 
-/// Local-only Signal adapter. Network linking exists only with `signal-local`
+/// Signal adapter. Network linking exists only with `signal-local`
 /// and only after [`AdapterCommand::SignalAcknowledgeNotice`].
 pub struct SignalAdapter {
     notice_accepted: bool,
@@ -119,7 +128,7 @@ impl SignalAdapter {
             events,
             ProtocolId::Signal,
             AdapterStatus::Stubbed,
-            "Signal local-build notice accepted. No session has started.",
+            "Signal notice accepted. No session has started.",
         );
         Ok(())
     }
@@ -656,7 +665,8 @@ mod tests {
 
     #[test]
     fn signal_local_bundles_sqlite() {
-        let manifest = include_str!("../../Cargo.toml");
+        // A Windows checkout can have CRLF line ends.
+        let manifest = include_str!("../../Cargo.toml").replace("\r\n", "\n");
         let signal_local = manifest
             .lines()
             .skip_while(|line| !line.contains("signal-local ="))

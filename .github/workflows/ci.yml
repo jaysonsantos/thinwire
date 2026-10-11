@@ -64,8 +64,8 @@ jobs:
         run: nix develop --command scripts/check-release-tree.sh
 
   # ADR 0013: CI builds and tests the protocol features that a release
-  # ships, and the AGPL WhatsApp helper with its client. The other jobs stay
-  # feature-off.
+  # ships, and the AGPL WhatsApp and Signal helpers with their clients. The
+  # other jobs stay feature-off.
   release-features:
     name: release-features
     runs-on: ubuntu-26.04
@@ -76,7 +76,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
-      - name: Build and test the release protocol features and the WhatsApp helper
+      - name: Build and test the release protocol features and the helpers
         run: nix develop --command scripts/test-release-features.sh
 
   ui-snapshots:
@@ -126,10 +126,10 @@ jobs:
             exit 0
           fi
           shared='Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$'
-          notify="^(crates/thinwire-notify/|scripts/stage-os-artifact\.sh$|scripts/stage-helper\.sh$|${shared})"
+          notify="^(crates/thinwire-notify/|scripts/stage-os-artifact\.sh$|scripts/stage-helper\.sh$|scripts/install-protoc\.sh$|${shared})"
           # The helper adapter is in thinwire-protocol: its manifest (tokio
           # process support), the adapter contract, and the helper module.
-          helpers="^(crates/thinwire-ipc/|crates/thinwire-whatsapp/|crates/thinwire-protocol/Cargo\.toml$|crates/thinwire-protocol/src/(helper/|adapter\.rs$|lib\.rs$|whatsapp\.rs$)|scripts/stage-helper\.sh$|${shared})"
+          helpers="^(crates/thinwire-ipc/|crates/thinwire-whatsapp/|crates/thinwire-signal/|crates/thinwire-protocol/Cargo\.toml$|crates/thinwire-protocol/src/(helper/|adapter\.rs$|lib\.rs$|whatsapp\.rs$|signal\.rs$)|scripts/stage-helper\.sh$|scripts/install-protoc\.sh$|${shared})"
           changed="$(git diff --name-only "$BASE" HEAD)"
           if grep -Eq "$notify" <<<"$changed"; then
             echo "notify=true" >> "$GITHUB_OUTPUT"
@@ -167,7 +167,12 @@ jobs:
       # The notification center needs a signed bundle. Stage Thinwire.app
       # from a debug build (no publisher secrets) with the release script,
       # so its signature step is proven before main (#161). The bundle also
-      # holds the WhatsApp helper, with the same ad-hoc signature (ADR 0013).
+      # holds the WhatsApp and Signal helpers, with the same ad-hoc
+      # signature (ADR 0013). The Signal helper needs `protoc` to build.
+      - name: Install protoc
+        if: runner.os == 'macOS'
+        shell: bash
+        run: scripts/install-protoc.sh
       - name: Stage and check Thinwire.app
         if: runner.os == 'macOS'
         shell: bash
@@ -175,28 +180,31 @@ jobs:
           ARTIFACT: macos-arm64-check
           THINWIRE_BIN: target/debug/thinwire
           THINWIRE_WHATSAPP_HELPER_BIN: target/debug/thinwire-whatsapp-helper
+          THINWIRE_SIGNAL_HELPER_BIN: target/debug/thinwire-signal-helper
         run: |
           cargo build -p thinwire --locked
           cargo build -p thinwire-whatsapp --features whatsapp-web --bin thinwire-whatsapp-helper --locked
+          cargo build -p thinwire-signal --features signal-local --bin thinwire-signal-helper --locked
           scripts/stage-os-artifact.sh
           mkdir -p unpacked
           tar -xzf thinwire-macos-arm64-check.tar.gz -C unpacked
           codesign --verify --strict --verbose=2 unpacked/Thinwire.app
           codesign --verify --strict --verbose=2 unpacked/Thinwire.app/Contents/MacOS/thinwire-whatsapp-helper
+          codesign --verify --strict --verbose=2 unpacked/Thinwire.app/Contents/MacOS/thinwire-signal-helper
           codesign --display --verbose=2 unpacked/Thinwire.app 2>&1 | tee codesign.txt
           grep -qx 'Identifier=dev.jaysonsantos.thinwire' codesign.txt
           grep -q '^Info.plist entries=' codesign.txt
 
-  # ADR 0013: each release archive holds the WhatsApp helper for its OS. The
-  # app starts it as a child process, and that differs by OS. So Windows and
-  # macOS build the helper with its client, run the process tests, and stage
-  # it, before main.
+  # ADR 0013: each release archive holds the WhatsApp helper and the Signal
+  # helper for its OS. The app starts each one as a child process, and that
+  # differs by OS. So Windows and macOS build each helper with its client,
+  # run the process tests, and stage both, before main.
   helper-os:
     name: helper-${{ matrix.os }}
     needs: changes
     if: needs.changes.outputs.helpers == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
     strategy:
@@ -209,24 +217,32 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         run: rustup show
+      # The Signal client compiles `.proto` files when it builds.
+      - name: Install protoc
+        shell: bash
+        run: scripts/install-protoc.sh
       - name: Test the wire protocol
         run: cargo test -p thinwire-ipc --locked
       - name: Test the helper adapter
         run: cargo test -p thinwire-protocol --locked -- helper
       - name: Test the WhatsApp helper process
         run: cargo test -p thinwire-whatsapp --features whatsapp-web --locked
-      - name: Stage the helper next to a debug app
+      - name: Test the Signal helper process
+        run: cargo test -p thinwire-signal --features signal-local --locked
+      - name: Stage the helpers next to a debug app
         shell: bash
         env:
           REQUIRE_AGPL_MARKER: "1"
         run: |
-          cargo build -p thinwire --features whatsapp-web,discord-bot --locked
+          cargo build -p thinwire --features whatsapp-web,signal-local,discord-bot --locked
           cargo build -p thinwire-whatsapp --features whatsapp-web --bin thinwire-whatsapp-helper --locked
+          cargo build -p thinwire-signal --features signal-local --bin thinwire-signal-helper --locked
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             suffix=".exe"
           fi
           THINWIRE_WHATSAPP_HELPER_BIN="target/debug/thinwire-whatsapp-helper${suffix}" \
+            THINWIRE_SIGNAL_HELPER_BIN="target/debug/thinwire-signal-helper${suffix}" \
             scripts/stage-helper.sh "$RUNNER_TEMP/payload" "target/debug/thinwire${suffix}"
 
   ui-snapshot-comment:

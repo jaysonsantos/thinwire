@@ -45,6 +45,9 @@
                 pkgs.rust-analyzer
                 pkgs.cmake
                 pkgs.pkg-config
+                # `protoc` for the Signal helper: presage and libsignal
+                # compile `.proto` files when they build (#248).
+                pkgs.protobuf
                 pkgs.git-cliff
                 # Advisory check of the helper dependencies (ADR 0012 section 4).
                 pkgs.cargo-deny

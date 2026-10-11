@@ -93,7 +93,7 @@ pub enum Intent {
     Discord(DiscordIntent),
     /// Slack workspace app. Only a `slack-oauth` build acts on it.
     Slack(SlackIntent),
-    /// Local-only Signal linking. Only a `signal-local` build acts on it.
+    /// Signal linking. Only a `signal-local` build acts on it.
     Signal(SignalIntent),
 }
 
@@ -151,7 +151,7 @@ pub enum WhatsAppIntent {
     CancelLink,
 }
 
-/// Local-only Signal linking. The notice comes before any link.
+/// Signal linking. The notice comes before any link.
 ///
 /// The core checks the order: `AcknowledgeNotice` only while the notice is
 /// on screen, and `BeginLink` only after that. Any other order is dropped.
@@ -159,12 +159,12 @@ pub enum WhatsAppIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SignalIntent {
-    /// Show the full-screen local-build notice.
+    /// Show the full-screen Signal notice.
     OpenNotice,
     /// Leave the notice or the link screen. On the link screen this is
     /// `CancelLink`: linking stops and the acknowledgement resets.
     CloseGate,
-    /// The user accepted the local-build notice.
+    /// The user accepted the Signal notice.
     AcknowledgeNotice,
     /// Start secondary-device linking.
     BeginLink,

@@ -330,7 +330,7 @@ struct TimedOut {
     retry: bool,
 }
 
-/// Local-only Signal screens. Only the `signal-local` build can enter them.
+/// Signal screens. Only the `signal-local` build can enter them.
 #[cfg(feature = "signal-local")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalScreen {
@@ -562,10 +562,12 @@ pub struct Snapshot {
     /// The shell's id for the next pairing (WhatsApp or Signal).
     #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
     next_pairing_generation: u64,
-    /// The id of the pairing that runs now. A QR or pair code of any other
-    /// pairing is dropped (shell plan 12). `None`: no pairing runs.
+    /// The id of the pairing that runs now, for each protocol. A QR or pair
+    /// code of any other pairing is dropped (shell plan 12). No entry: no
+    /// pairing of that protocol runs. One entry for each protocol: the end
+    /// of a WhatsApp pairing must not end a Signal link, and the reverse.
     #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
-    pairing_generation: Option<u64>,
+    pairing_generation: HashMap<ProtocolId, u64>,
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
     api_source: TelegramApiSource,
@@ -607,7 +609,7 @@ pub struct Snapshot {
     /// Startup and linking failures happen before this and keep the link error.
     #[cfg(feature = "signal-local")]
     signal_inbox_open: bool,
-    /// The user accepted the full-screen local-build notice in this session.
+    /// The user accepted the full-screen Signal notice in this session.
     /// Linking needs it; showing the notice again or cancelling clears it.
     #[cfg(feature = "signal-local")]
     signal_notice_acknowledged: bool,
@@ -773,7 +775,7 @@ impl Snapshot {
             #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
             next_pairing_generation: 1,
             #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
-            pairing_generation: None,
+            pairing_generation: HashMap::new(),
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
@@ -1038,7 +1040,7 @@ impl Snapshot {
             }
             AdapterEvent::WhatsAppQr { code, generation } => {
                 #[cfg(feature = "whatsapp-web")]
-                if self.current_pairing(generation) {
+                if self.current_pairing(ProtocolId::WhatsApp, generation) {
                     self.whatsapp_qr = Some(code.reveal().to_string());
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
@@ -1048,7 +1050,7 @@ impl Snapshot {
             }
             AdapterEvent::WhatsAppPairCode { code, generation } => {
                 #[cfg(feature = "whatsapp-web")]
-                if self.current_pairing(generation) {
+                if self.current_pairing(ProtocolId::WhatsApp, generation) {
                     self.whatsapp_pair_code = Some(code.reveal().to_string());
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
@@ -1058,7 +1060,7 @@ impl Snapshot {
             }
             AdapterEvent::SignalQr { code, generation } => {
                 #[cfg(feature = "signal-local")]
-                if self.current_pairing(generation) {
+                if self.current_pairing(ProtocolId::Signal, generation) {
                     self.signal_qr = Some(code.reveal().to_string());
                 }
                 #[cfg(not(feature = "signal-local"))]
@@ -2975,6 +2977,10 @@ impl Snapshot {
         if protocol == ProtocolId::WhatsApp {
             self.note_whatsapp_helper(state);
         }
+        #[cfg(feature = "signal-local")]
+        if protocol == ProtocolId::Signal {
+            self.note_signal_helper(state);
+        }
         if let HelperState::Stopped(fault) = state {
             let name = protocol.display_name();
             let happened = format!("The {name} helper stopped.");
@@ -3036,6 +3042,23 @@ impl Snapshot {
             HelperState::Stopped(_) | HelperState::Missing => {
                 self.end_pairing();
                 self.whatsapp_started = false;
+            }
+            HelperState::Idle | HelperState::Busy | HelperState::Running => {}
+        }
+    }
+
+    /// The QR of a Signal helper that is gone is not valid. While the helper
+    /// starts again, the link screen drops it: the new helper sends a new
+    /// one for the same link. When the helper stopped for good, the link
+    /// ends, so the user can start it again from the link screen.
+    #[cfg(feature = "signal-local")]
+    fn note_signal_helper(&mut self, state: HelperState) {
+        match state {
+            HelperState::Restarting => self.signal_qr = None,
+            HelperState::Stopped(_) | HelperState::Missing => {
+                self.end_signal_pairing();
+                self.signal_started = false;
+                self.signal_inbox_open = false;
             }
             HelperState::Idle | HelperState::Busy | HelperState::Running => {}
         }
@@ -3191,7 +3214,7 @@ impl Snapshot {
         if protocol == ProtocolId::Signal {
             self.signal_started = false;
             self.signal_inbox_open = false;
-            self.signal_qr = None;
+            self.end_signal_pairing();
             self.signal_notice_acknowledged = false;
             self.signal_screen = SignalScreen::Hidden;
         }
@@ -3560,7 +3583,8 @@ impl Snapshot {
         self.status_text = "WhatsApp pairing requested.".into();
         let generation = self.next_pairing_generation;
         self.next_pairing_generation += 1;
-        self.pairing_generation = Some(generation);
+        self.pairing_generation
+            .insert(ProtocolId::WhatsApp, generation);
         self.pending
             .push(AdapterCommand::WhatsAppBeginLink { generation });
     }
@@ -3582,15 +3606,15 @@ impl Snapshot {
     /// later payload of the old pairing.
     #[cfg(feature = "whatsapp-web")]
     fn end_pairing(&mut self) {
-        self.pairing_generation = None;
+        self.pairing_generation.remove(&ProtocolId::WhatsApp);
         self.whatsapp_qr = None;
         self.whatsapp_pair_code = None;
     }
 
-    /// A pairing payload belongs to the pairing that runs now.
+    /// A pairing payload belongs to the pairing of `protocol` that runs now.
     #[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
-    fn current_pairing(&self, generation: u64) -> bool {
-        let current = self.pairing_generation == Some(generation);
+    fn current_pairing(&self, protocol: ProtocolId, generation: u64) -> bool {
+        let current = self.pairing_generation.get(&protocol) == Some(&generation);
         if !current {
             tracing::warn!("pairing payload dropped: it is from an older pairing");
         }
@@ -3626,9 +3650,19 @@ impl Snapshot {
         self.signal_linking_available() && !matches!(self.signal_screen, SignalScreen::Hidden)
     }
 
+    /// No Signal link runs any more: drop the shown QR, and every later
+    /// payload of the old link.
+    #[cfg(feature = "signal-local")]
+    fn end_signal_pairing(&mut self) {
+        self.pairing_generation.remove(&ProtocolId::Signal);
+        self.signal_qr = None;
+    }
+
     #[cfg(feature = "signal-local")]
     pub fn open_signal_notice(&mut self) {
-        if !self.signal_linking_available() {
+        // With no helper program the entry is disabled (ADR 0013 decision
+        // 6), and a frontend cannot open the notice another way.
+        if !self.signal_linking_available() || self.helper_missing(ProtocolId::Signal) {
             return;
         }
         if self.protocol_linked(ProtocolId::Signal) {
@@ -3681,7 +3715,7 @@ impl Snapshot {
         self.signal_notice_acknowledged = true;
         self.signal_screen = SignalScreen::Link;
         self.error = None;
-        self.status_text = "Signal local-build notice accepted. Linking has not started.".into();
+        self.status_text = "Signal notice accepted. Linking has not started.".into();
         self.pending.push(AdapterCommand::SignalAcknowledgeNotice);
     }
 
@@ -3689,10 +3723,16 @@ impl Snapshot {
     pub fn begin_signal_link(&mut self) {
         // Linking starts only from the link screen, after the notice was accepted.
         if self.signal_screen != SignalScreen::Link || !self.signal_notice_acknowledged {
-            tracing::warn!("signal linking dropped: the local-build notice was not accepted");
+            tracing::warn!("signal linking dropped: the notice was not accepted");
             return;
         }
         if self.signal_started {
+            return;
+        }
+        // The helper program can go away while the link screen is open. No
+        // helper can take the link then, and no answer would end it: do not
+        // start. The link screen shows the reason.
+        if self.helper_missing(ProtocolId::Signal) {
             return;
         }
         self.signal_started = true;
@@ -3701,7 +3741,8 @@ impl Snapshot {
         self.status_text = "Signal linking requested.".into();
         let generation = self.next_pairing_generation;
         self.next_pairing_generation += 1;
-        self.pairing_generation = Some(generation);
+        self.pairing_generation
+            .insert(ProtocolId::Signal, generation);
         self.pending
             .push(AdapterCommand::SignalBeginLink { generation });
     }
@@ -3714,16 +3755,14 @@ impl Snapshot {
             return;
         }
         self.signal_screen = SignalScreen::Hidden;
-        self.pairing_generation = None;
-        self.signal_qr = None;
-        self.status_text = "Signal is linked on this local build.".into();
+        self.end_signal_pairing();
+        self.status_text = "Signal is linked.".into();
         self.select_protocol(ProtocolId::Signal);
     }
 
     #[cfg(feature = "signal-local")]
     pub fn cancel_signal_link(&mut self) {
-        self.pairing_generation = None;
-        self.signal_qr = None;
+        self.end_signal_pairing();
         self.signal_started = false;
         self.signal_inbox_open = false;
         self.signal_notice_acknowledged = false;
@@ -4056,6 +4095,228 @@ mod tests {
             assert!(snapshot.older_loading.is_empty(), "{state:?}");
             assert!(snapshot.chat_list_loading.contains(&ProtocolId::Telegram));
         }
+    }
+
+    fn helper_of(snapshot: &mut Snapshot, protocol: ProtocolId, state: HelperState) {
+        snapshot.apply(AdapterEvent::Helper { protocol, state });
+    }
+
+    fn row_of(snapshot: &Snapshot, protocol: ProtocolId) -> &AccountRow {
+        snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == protocol)
+            .expect("account row")
+    }
+
+    /// #248 UX: when the Signal helper stops for good, the Signal account
+    /// row shows "Helper stopped." with Restart, and the error block names
+    /// Signal. The WhatsApp helper is another process: its row does not
+    /// change, and Restart on it does nothing.
+    #[test]
+    fn a_stopped_signal_helper_shows_restart_and_keeps_the_whatsapp_row() {
+        let mut snapshot = Snapshot::new();
+        helper_of(&mut snapshot, ProtocolId::WhatsApp, HelperState::Running);
+        helper_of(&mut snapshot, ProtocolId::Signal, HelperState::Running);
+        helper_of(
+            &mut snapshot,
+            ProtocolId::Signal,
+            HelperState::Stopped(HelperFault::Crashed),
+        );
+
+        let signal = row_of(&snapshot, ProtocolId::Signal);
+        assert!(signal.helper_stopped());
+        assert_eq!(signal.helper_label(), Some("Helper stopped."));
+        let error = snapshot.error.clone().expect("error block");
+        assert_eq!(error.happened, "The Signal helper stopped.");
+        assert_eq!(
+            error.next,
+            "Click Restart on the Signal account. If it stops again, reinstall thinwire."
+        );
+        let whatsapp = row_of(&snapshot, ProtocolId::WhatsApp);
+        assert_eq!(whatsapp.helper, Some(HelperState::Running));
+        assert_eq!(whatsapp.helper_label(), None);
+
+        snapshot.restart_helper(ProtocolId::WhatsApp);
+        assert!(snapshot.take_commands().is_empty(), "WhatsApp runs");
+        snapshot.restart_helper(ProtocolId::Signal);
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![AdapterCommand::RestartHelper {
+                protocol: ProtocolId::Signal,
+            }]
+        );
+    }
+
+    /// ADR 0013 decision 6 for Signal: a missing helper keeps the row with
+    /// the reason, and the core opens no notice and starts no link.
+    #[test]
+    fn a_missing_signal_helper_keeps_the_row_and_names_the_reason() {
+        let mut snapshot = Snapshot::new();
+        helper_of(&mut snapshot, ProtocolId::Signal, HelperState::Missing);
+        let row = row_of(&snapshot, ProtocolId::Signal);
+        assert!(row.helper_missing());
+        assert_eq!(
+            row.helper_missing_text(),
+            "Signal helper missing. Reinstall thinwire."
+        );
+        assert!(snapshot.helper_missing(ProtocolId::Signal));
+        assert!(!snapshot.helper_missing(ProtocolId::WhatsApp));
+        assert_eq!(snapshot.error, None, "no error for a user with no Signal");
+    }
+
+    /// #248: with no Signal helper program the notice does not open. When
+    /// the helper goes away while the link screen is open, a link start
+    /// does nothing, and Start does not stay disabled with no answer. When
+    /// the helper is back, the same screen starts the link.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_signal_link_does_not_start_while_the_helper_is_missing() {
+        let mut snapshot = Snapshot::new();
+        helper_of(&mut snapshot, ProtocolId::Signal, HelperState::Missing);
+        snapshot.open_signal_notice();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+        assert!(snapshot.take_commands().is_empty());
+
+        helper_of(&mut snapshot, ProtocolId::Signal, HelperState::Idle);
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Link);
+        snapshot.take_commands();
+
+        helper_of(&mut snapshot, ProtocolId::Signal, HelperState::Missing);
+        snapshot.begin_signal_link();
+        assert!(snapshot.take_commands().is_empty(), "no link command");
+        assert!(!snapshot.signal_started, "Start is not held");
+        assert_eq!(
+            snapshot
+                .helper_notice(ProtocolId::Signal)
+                .map(|notice| notice.label),
+            Some("Helper missing"),
+            "the link screen shows the reason"
+        );
+
+        helper_of(&mut snapshot, ProtocolId::Signal, HelperState::Idle);
+        snapshot.begin_signal_link();
+        assert!(snapshot.signal_started);
+        assert!(matches!(
+            snapshot.take_commands().as_slice(),
+            [AdapterCommand::SignalBeginLink { .. }]
+        ));
+    }
+
+    /// #248: the provisioning URL of a Signal helper that is gone is not
+    /// valid. While the helper starts again, the link screen drops it and
+    /// the link stays. When the helper stopped for good, the link ends, the
+    /// screen shows the helper error, and the user can start again.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_signal_helper_failure_during_linking_drops_the_qr_and_allows_a_new_start() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::SignalBeginLink { generation }) = commands.last() else {
+            panic!("no link start: {commands:?}");
+        };
+        let first = *generation;
+        let qr = |generation| AdapterEvent::SignalQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("sgnl://one"),
+            generation,
+        };
+        snapshot.apply(qr(first));
+        assert_eq!(snapshot.signal_qr.as_deref(), Some("sgnl://one"));
+
+        helper_of(&mut snapshot, ProtocolId::Signal, HelperState::Restarting);
+        assert_eq!(snapshot.signal_qr, None, "the old URL is not valid");
+        assert!(snapshot.signal_started, "the link stays");
+        // The new helper sends a URL for the same link.
+        snapshot.apply(qr(first));
+        assert_eq!(snapshot.signal_qr.as_deref(), Some("sgnl://one"));
+
+        helper_of(
+            &mut snapshot,
+            ProtocolId::Signal,
+            HelperState::Stopped(HelperFault::Crashed),
+        );
+        assert_eq!(snapshot.signal_qr, None);
+        assert!(!snapshot.signal_started, "Start linking is enabled again");
+        assert_eq!(snapshot.signal_screen, SignalScreen::Link);
+        let notice = snapshot
+            .helper_notice(ProtocolId::Signal)
+            .expect("the link screen shows the helper");
+        assert_eq!(notice.label, "Helper stopped.");
+        assert_eq!(
+            notice.error.map(|error| error.happened.as_str()),
+            Some("The Signal helper stopped.")
+        );
+        // A URL of the old link does not come back.
+        snapshot.apply(qr(first));
+        assert_eq!(snapshot.signal_qr, None);
+
+        snapshot.begin_signal_link();
+        let commands = snapshot.take_commands();
+        let [AdapterCommand::SignalBeginLink { generation }] = commands.as_slice() else {
+            panic!("no new link start: {commands:?}");
+        };
+        assert_ne!(*generation, first, "a new link, not the old one");
+    }
+
+    /// #248: a release build has WhatsApp and Signal. Each has its own
+    /// pairing. The end of a WhatsApp pairing, or of the WhatsApp helper,
+    /// must not drop the provisioning URL of a Signal link that runs. The
+    /// reverse holds too.
+    #[cfg(all(feature = "signal-local", feature = "whatsapp-web"))]
+    #[test]
+    fn the_end_of_one_pairing_keeps_the_pairing_of_the_other_protocol() {
+        let signal_qr = |generation| AdapterEvent::SignalQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("sgnl://one"),
+            generation,
+        };
+        let whatsapp_qr = |generation| AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("qr-one"),
+            generation,
+        };
+        let phone = WhatsAppPhoneVault::new();
+
+        // A Signal link runs. The WhatsApp helper stops for good.
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::SignalBeginLink { generation }) = commands.last() else {
+            panic!("no link start: {commands:?}");
+        };
+        let link = *generation;
+        helper_of(
+            &mut snapshot,
+            ProtocolId::WhatsApp,
+            HelperState::Stopped(HelperFault::Crashed),
+        );
+        assert!(snapshot.signal_started, "the Signal link stays");
+        snapshot.apply(signal_qr(link));
+        assert_eq!(snapshot.signal_qr.as_deref(), Some("sgnl://one"));
+
+        // A WhatsApp pairing runs. The Signal helper stops for good.
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.begin_whatsapp_link(&phone);
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::WhatsAppBeginLink { generation }) = commands.last() else {
+            panic!("no pairing start: {commands:?}");
+        };
+        let pairing = *generation;
+        helper_of(
+            &mut snapshot,
+            ProtocolId::Signal,
+            HelperState::Stopped(HelperFault::Crashed),
+        );
+        assert!(snapshot.whatsapp_started, "the WhatsApp pairing stays");
+        snapshot.apply(whatsapp_qr(pairing));
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("qr-one"));
     }
 
     /// ADR 0013 decision 6: a missing helper keeps the account row, with
@@ -6103,7 +6364,7 @@ mod tests {
         snapshot.apply(AdapterEvent::Status {
             protocol: ProtocolId::Signal,
             status: AdapterStatus::Ready,
-            detail: "Signal is linked on this local build. This binary is not a release.".into(),
+            detail: "Signal is linked. Experimental client: expect breakage.".into(),
         });
         assert!(snapshot.signal_inbox_open);
         snapshot

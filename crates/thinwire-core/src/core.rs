@@ -157,10 +157,9 @@ impl Core {
     }
 
     /// [`Self::new`] with other adapters in place of the MIT stubs: the
-    /// helper adapter of `thinwire-protocol` with `whatsapp-web` (ADR 0013),
-    /// and the local-only `thinwire-signal` with `signal-local` (ADR 0011).
-    /// It chooses the secret store and makes the phone vault for both
-    /// constructors.
+    /// helper adapters of `thinwire-protocol` with `whatsapp-web` and with
+    /// `signal-local` (ADR 0013). It chooses the secret store and makes the
+    /// phone vault for both constructors.
     ///
     /// `build` gets the core's WhatsApp phone vault and the settings: the
     /// pairing screen writes the vault and the WhatsApp adapter reads it. Each

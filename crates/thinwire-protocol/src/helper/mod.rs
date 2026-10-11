@@ -14,6 +14,8 @@
 mod convert;
 mod launch;
 mod serve;
+#[cfg(test)]
+mod signal_tests;
 mod supervisor;
 #[cfg(test)]
 mod tests;

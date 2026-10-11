@@ -497,10 +497,10 @@ fn resolve_focus(reported: Option<bool>, event: Option<bool>, last: Option<bool>
 
 /// The adapters of this build that take the place of the MIT stubs.
 ///
-/// WhatsApp (`whatsapp-web`) is the MIT helper adapter: the AGPL client runs
-/// in the `thinwire-whatsapp-helper` process, and this app does not link it
-/// (ADR 0013). Signal (`signal-local`) is still the local-only AGPL client
-/// (ADR 0011) until it gets its own helper (#248).
+/// WhatsApp (`whatsapp-web`) and Signal (`signal-local`) are MIT helper
+/// adapters: each AGPL client runs in its own helper process
+/// (`thinwire-whatsapp-helper`, `thinwire-signal-helper`), and this app does
+/// not link it (ADR 0013).
 fn replacement_adapters(
     _phone: &Arc<thinwire_protocol::WhatsAppPhoneVault>,
     _settings: &Settings,
@@ -514,7 +514,9 @@ fn replacement_adapters(
                 .map(std::path::Path::to_path_buf),
         )),
         #[cfg(feature = "signal-local")]
-        Box::new(thinwire_signal::SignalAdapter::new()),
+        Box::new(thinwire_protocol::signal_helper_adapter(
+            _settings.signal_helper().map(std::path::Path::to_path_buf),
+        )),
     ]
 }
 

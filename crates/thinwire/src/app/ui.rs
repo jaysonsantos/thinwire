@@ -573,7 +573,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
 
             #[cfg(feature = "signal-local")]
             if snapshot.signal_linking_available() {
-                super::signal_gate::notice_entry(ui, out);
+                super::signal_gate::notice_entry(ui, snapshot, out);
             }
 
             section_header(ui, "Inbox");
@@ -1338,7 +1338,7 @@ fn badge_text(unread: u32) -> Option<String> {
 #[must_use]
 fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
     if id == ProtocolId::Signal && cfg!(feature = "signal-local") {
-        return Some("local build only — not in releases");
+        return Some("experimental — expect breakage");
     }
     if id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web") {
         return Some("experimental spike — ban risk");

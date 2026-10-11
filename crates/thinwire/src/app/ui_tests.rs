@@ -367,6 +367,40 @@ fn auth_ui_is_telegram_only_this_beat() {
     assert!(ui.contains("stub_banner"));
 }
 
+/// #248: the Signal screens are behind `signal-local`, the notice shows
+/// the Signal risk line of the README, and the app names no AGPL crate.
+#[test]
+fn signal_ui_is_feature_gated_and_uses_the_helper() {
+    let app = include_str!("mod.rs");
+    assert!(app.contains("#[cfg(feature = \"signal-local\")]\nmod signal_gate;"));
+    let ui = include_str!("ui.rs");
+    assert!(ui.contains("signal_linking_available"));
+    assert!(ui.contains("signal_gate::notice_entry"));
+    let gate = include_str!("signal_gate.rs");
+    // ADR 0013 decision 9: the gate shows the same text as the README.
+    assert!(gate.contains("Signal: no supported third-party API, expect breakage."));
+    let readme = include_str!("../../../../README.md");
+    assert!(readme.contains("Signal: no supported third-party API, expect breakage."));
+    assert!(gate.contains("No provisioning URL is shown on this screen."));
+    assert!(!gate.contains("local build"), "Signal is in release builds");
+    // With no helper program the entry stays, disabled, with the reason.
+    assert!(gate.contains("helper_missing(ProtocolId::Signal)"));
+    assert!(gate.contains("Needs the Signal helper. Reinstall thinwire."));
+    // The app names no AGPL Signal crate: the adapter is the MIT one.
+    assert!(app.contains("thinwire_protocol::signal_helper_adapter("));
+    assert!(!app.contains("thinwire_signal::"));
+    // A comment can name a helper program. No other line names an AGPL crate.
+    let manifest = include_str!("../../Cargo.toml");
+    let names = |agpl: &str| {
+        manifest
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .any(|line| line.contains(agpl))
+    };
+    assert!(!names("thinwire-signal"), "no AGPL dependency");
+    assert!(!names("thinwire-whatsapp"), "no AGPL dependency");
+}
+
 #[test]
 fn whatsapp_spike_ui_is_feature_gated() {
     let app = include_str!("mod.rs");
