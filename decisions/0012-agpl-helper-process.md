@@ -2,6 +2,8 @@
 
 **Status:** accepted (2026-09-25)
 
+**Superseded by:** [0013](0013-ship-all-protocols-agpl-helpers.md), for the "Later" recommendation, the "Revisit when" list and section 3 "Distribution". The other sections still apply.
+
 **Refs:** issue #38, issue #77, ADR [0004](0004-signal-out-of-v1.md), ADR [0010](0010-frontend-independent-core.md), ADR [0011](0011-agpl-protocols-local-only.md)
 
 **Date:** 2026-09-25

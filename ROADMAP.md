@@ -1,12 +1,12 @@
 # Thinwire roadmap
 
-Ordered work from product-council ADRs (`decisions/0001`–`0012`; `0011` is the local-only AGPL lock; `0012` is the helper, accepted as Later). ADRs are decisions; this file is the todo list.
+Ordered work from product-council ADRs (`decisions/0001`–`0013`; `0013` ships every protocol, with WhatsApp and Signal in AGPL helper processes, and supersedes `0004`, `0011` and the Later part of `0012`; implementation pending in #246 and #248). ADRs are decisions; this file is the todo list.
 
 Rule: an ADR accepted is not Done until the matching change is on `main`.
 
 ## Done (locks landed)
 
-- Multi-protocol option B without Signal in v1 release builds — `0001`, `0004`, amended for local builds by `0011`
+- Multi-protocol option B without Signal in v1 release builds — `0001`, `0004`, amended for local builds by `0011`. Superseded by `0013` (see AGPL helpers below)
 - egui + eframe + glow (no wgpu) — `0002`
 - Main-only unsigned CI artifacts + caveat — `0003`
 - System light/dark by default — `0005`
@@ -28,7 +28,7 @@ Rule: an ADR accepted is not Done until the matching change is on `main`.
 - Protocol-independent shell — on `main` via #68.
 - Desktop notifications for new messages — #32, on `main` via #87.
 - Discord bot/OAuth guild inbox — #35, on `main` via #51.
-- AGPL helper decision is Later — #38, ADR `0012`, on `main` via #75.
+- AGPL helper decision is Later — #38, ADR `0012`, on `main` via #75. The Later part is superseded by `0013`.
 - Signal inbox, feature `signal-local`, local-only — #39, on `main` via #66.
 - WhatsApp close during startup — #44, on `main` via #53.
 - A send with no answer — #69, on `main` via #81.
@@ -53,25 +53,26 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 
 ### Other protocols (parallel with Telegram)
 
-- [ ] #34 — WhatsApp experimental linked-device inbox (feature `whatsapp-web`, `0001`). Local-only AGPL (`0011`). Release builds and OS zips never enable it. Honest ToS labels. Full-screen ToS/ban gate before QR or pair. Never call it reliable.
+- [ ] #34 — WhatsApp experimental linked-device inbox (feature `whatsapp-web`, `0001`). Local-only AGPL until the `0013` WhatsApp helper ships (#246). Release builds and OS zips never enable it in the app. Honest ToS labels. Full-screen ToS/ban gate before QR or pair. Never call it reliable.
 - [ ] #36 — Slack workspace-app OAuth inbox (feature `slack-oauth`, `0008`). Official OAuth v2 only. Not a personal desktop clone.
 
-### Local-only AGPL
+### AGPL helpers (`0013`)
 
-`0011` (2026-09-24). Release builds and OS zips never enable these features. The helper decision is Later (`0012`, #38).
+`0013` (accepted 2026-10-08) supersedes `0011`: release builds ship WhatsApp and Signal in AGPL-3.0-only helper binaries over IPC. The MIT app binary never links AGPL code. Until the helpers land, `whatsapp-web` and `signal-local` stay local-only.
+
+- [ ] #246 — the CI job and the WhatsApp helper.
+- [ ] #248 — the Signal helper.
 
 ## Spike (scaffold, not the default UI)
 
-- `whatsapp-web` — experimental linked-device scaffold on `whatsapp-rust` (oxidezap), pinned to a git revision. Local-only AGPL (`wacore-libsignal`, `0011`). Off unless that cargo feature is enabled. Default CI does not enable it. Release builds and OS zips never enable it. No ready WhatsApp account in the default build. Full-screen ToS/ban gate before QR or pair. Work continues in #34.
+- `whatsapp-web` — experimental linked-device scaffold on `whatsapp-rust` (oxidezap), pinned to a git revision. Local-only AGPL (`wacore-libsignal`) until the `0013` WhatsApp helper ships (#246). Off unless that cargo feature is enabled. Default CI does not enable it. Release builds and OS zips never enable it. No ready WhatsApp account in the default build. Full-screen ToS/ban gate before QR or pair. Work continues in #34.
 - `discord-bot` — bot/OAuth guild inbox on twilight HTTP (`0009`). Off by default. Shows when the feature is compiled. Not a personal Discord client. On `main` via #35.
 - `slack-oauth` — workspace-app OAuth v2 / Socket Mode scaffold on `slack-morphism` (`0008`). Off by default. No Slack auth UI in the default shell. Work continues in #36.
 
 ## Explicitly not next
 
-- AGPL crates in release builds and in OS zips. Features `whatsapp-web` and `signal-local` stay off there (`0011`).
+- AGPL code in the MIT app binary. Features `whatsapp-web` and `signal-local` stay off in release builds of the app; WhatsApp and Signal ship only as helper binaries (`0013`).
 - gpui / gpui-ce toolkit switch — parked until thinwire-shaped measurements exist (`0002`).
-- A Signal path in the release binary. Feature `signal-local` is on `main` and stays local-only (#39, #66).
-- The AGPL helper stays unbuilt. ADR `0012` is Later (#38, #75).
 
 ## Pointers
 

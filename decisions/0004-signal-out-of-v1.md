@@ -2,6 +2,8 @@
 
 **Status:** accepted
 
+**Superseded by:** [0013](0013-ship-all-protocols-agpl-helpers.md)
+
 ## Context
 
 Option B ([0001](0001-option-b-multi-protocol.md)) chose a multi-protocol shell with honest ToS language over Telegram-only. The original option B list included Signal. A public MIT binary that talks to Signal would pull AGPL libsignal / Presage into the product.
