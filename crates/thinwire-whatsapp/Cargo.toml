@@ -53,6 +53,10 @@ libsqlite3-sys = { version = "0.36", optional = true, default-features = false, 
 thinwire-protocol = { workspace = true, features = ["contract-kit"] }
 # The wire lines, for the tests that talk to the helper process directly.
 thinwire-ipc.workspace = true
+# whatsapp-rust logs with the `log` crate. The helper test sends a `log`
+# record through the same bridge as the helper program.
+log = "0.4"
+tracing-log = "0.2"
 
 [lints]
 workspace = true
