@@ -559,6 +559,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                 ) {
                     clicked = Some(account.caps.id);
                 }
+                helper_actions(ui, account, out);
                 ui.add_space(4.0);
             }
             if let Some(protocol) = clicked {
@@ -567,7 +568,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
 
             #[cfg(feature = "whatsapp-web")]
             if snapshot.whatsapp_pairing_available() {
-                super::whatsapp_gate::risk_entry(ui, out);
+                super::whatsapp_gate::risk_entry(ui, snapshot, out);
             }
 
             #[cfg(feature = "signal-local")]
@@ -655,6 +656,34 @@ fn account_chip(
         ui.label(RichText::new(note).small().weak());
     }
     response.clicked()
+}
+
+/// Under the chip of a protocol that runs in a helper process (ADR 0013).
+/// A stopped helper gets Restart: with the chip line it reads "Helper
+/// stopped. Restart". A missing helper gets the full reason.
+fn helper_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
+    let protocol = account.caps.id;
+    if account.helper_stopped() {
+        ui.horizontal(|ui| {
+            ui.add_space(theme::ROW_INSET.x);
+            let restart = ui.small_button("Restart").on_hover_text(format!(
+                "Start the {} helper again",
+                protocol.display_name()
+            ));
+            if restart.clicked() {
+                out.push(Intent::RestartHelper(protocol));
+            }
+        });
+    } else if account.helper_missing() {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(theme::ROW_INSET.x);
+            ui.label(
+                RichText::new(account.helper_missing_text())
+                    .small()
+                    .color(theme::palette(ui).warn),
+            );
+        });
+    }
 }
 
 /// "Accounts" and "Inbox": caption, uppercase, `text3`.
@@ -1326,6 +1355,10 @@ fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
 /// "Not signed in" until a login or a resume starts.
 #[must_use]
 fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
+    // The helper state wins: with no helper, the adapter status is old.
+    if let Some(label) = account.helper_label() {
+        return label;
+    }
     let session_moving = snapshot.auth != AuthScreen::Idle
         || matches!(snapshot.center_view(), CenterView::Resuming { .. });
     if account.caps.id == ProtocolId::Telegram
@@ -2785,6 +2818,9 @@ mod tests {
         use thinwire_protocol::ProtocolId;
 
         let mut snapshot = Snapshot::new();
+        // No saved session: the start-up resume ends at once. A build with
+        // `telegram-tdlib` waits for this before it says "Not signed in".
+        snapshot.poll_resume(&thinwire_core::secrets::SecretStore::memory());
         snapshot
             .accounts
             .iter_mut()

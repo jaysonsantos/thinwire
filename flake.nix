@@ -46,6 +46,8 @@
                 pkgs.cmake
                 pkgs.pkg-config
                 pkgs.git-cliff
+                # Advisory check of the helper dependencies (ADR 0012 section 4).
+                pkgs.cargo-deny
                 pkgs.prek
                 pkgs.taplo
                 pkgs.shellcheck

@@ -110,7 +110,13 @@ pub struct Settings {
     in_memory: bool,
     /// Chats muted in thinwire (#153). Their own file in the data dir.
     mutes: ChatMutes,
+    /// Path of the WhatsApp helper program (ADR 0013). The app uses it when
+    /// no helper is next to its own binary. Only the file sets it.
+    whatsapp_helper: Option<PathBuf>,
 }
+
+/// Settings key of the WhatsApp helper path.
+const WHATSAPP_HELPER_KEY: &str = "whatsapp_helper";
 
 impl Settings {
     /// Load from the platform config dir, and the muted chats from the
@@ -131,6 +137,7 @@ impl Settings {
     #[must_use]
     pub fn load_from(path: PathBuf) -> Self {
         let theme = read_theme(&path).unwrap_or(ThemeMode::System);
+        let whatsapp_helper = read_path(&path, WHATSAPP_HELPER_KEY);
         Self {
             theme,
             notifications: read_bool(&path, "notifications").unwrap_or(true),
@@ -142,6 +149,7 @@ impl Settings {
             persist_lock: Arc::new(Mutex::new(())),
             in_memory: false,
             mutes: ChatMutes::in_memory(),
+            whatsapp_helper,
         }
     }
 
@@ -160,7 +168,15 @@ impl Settings {
             persist_lock: Arc::new(Mutex::new(())),
             in_memory: true,
             mutes: ChatMutes::in_memory(),
+            whatsapp_helper: None,
         }
+    }
+
+    /// The path of the WhatsApp helper program from the settings file, if
+    /// the user set one. The app looks next to its own binary first.
+    #[must_use]
+    pub fn whatsapp_helper(&self) -> Option<&std::path::Path> {
+        self.whatsapp_helper.as_deref()
     }
 
     #[must_use]
@@ -262,12 +278,20 @@ impl Settings {
     }
 
     fn render(&self) -> String {
-        format!(
+        let mut text = format!(
             "# thinwire settings. Missing file means System theme, notifications on.\ntheme = {}\nnotifications = {}\nnotification_preview = {}\n",
             self.theme.as_str(),
             self.notifications,
             self.notification_preview,
-        )
+        );
+        // Keep the helper path of the user when another setting changes.
+        if let Some(path) = &self.whatsapp_helper {
+            text.push_str(&format!(
+                "{WHATSAPP_HELPER_KEY} = \"{}\"\n",
+                escape_toml(&path.to_string_lossy())
+            ));
+        }
+        text
     }
 }
 
@@ -292,6 +316,47 @@ fn read_bool(path: &std::path::Path, wanted: &str) -> Option<bool> {
             _ => None,
         }
     })
+}
+
+/// A `key = "path"` line: a TOML basic string or a literal string
+/// (`'path'`). An empty or a bare value is `None`.
+fn read_path(path: &std::path::Path, wanted: &str) -> Option<PathBuf> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        if key.trim() != wanted {
+            return None;
+        }
+        let value = value.trim();
+        let text = if let Some(literal) = value
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+        {
+            literal.to_owned()
+        } else {
+            unescape_toml(value.strip_prefix('"')?.strip_suffix('"')?)
+        };
+        (!text.is_empty()).then(|| PathBuf::from(text))
+    })
+}
+
+/// Escape a value for a TOML basic string: backslash and double quote.
+fn escape_toml(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Undo [`escape_toml`].
+fn unescape_toml(value: &str) -> String {
+    let mut text = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            text.extend(chars.next());
+        } else {
+            text.push(ch);
+        }
+    }
+    text
 }
 
 fn read_theme(path: &std::path::Path) -> Option<ThemeMode> {
@@ -322,6 +387,50 @@ mod tests {
             .join("thinwire-theme-tests")
             .join(format!("{}-{n}", std::process::id()))
             .join("settings.toml")
+    }
+
+    /// ADR 0013: a setting can name the path of the WhatsApp helper. Only
+    /// the file sets it, and a write of another setting keeps it.
+    #[test]
+    fn the_whatsapp_helper_path_is_read_and_survives_a_write() {
+        let path = temp_settings_path();
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        for (line, want) in [
+            (
+                "whatsapp_helper = \"/opt/thinwire/thinwire-whatsapp-helper\"",
+                "/opt/thinwire/thinwire-whatsapp-helper",
+            ),
+            (
+                "whatsapp_helper = 'C:\\Tools\\thinwire-whatsapp-helper.exe'",
+                "C:\\Tools\\thinwire-whatsapp-helper.exe",
+            ),
+            (
+                "whatsapp_helper = \"C:\\\\Tools\\\\helper \\\"x\\\".exe\"",
+                "C:\\Tools\\helper \"x\".exe",
+            ),
+        ] {
+            fs::write(&path, format!("theme = dark\n{line}\n")).expect("write");
+            let mut settings = Settings::load_from(path.clone());
+            assert_eq!(settings.whatsapp_helper(), Some(std::path::Path::new(want)));
+            settings.set_theme(ThemeMode::Light);
+            settings.persist_now().expect("persist");
+            let again = Settings::load_from(path.clone());
+            assert_eq!(again.theme(), ThemeMode::Light);
+            assert_eq!(
+                again.whatsapp_helper(),
+                Some(std::path::Path::new(want)),
+                "the path survives a write: {line}"
+            );
+        }
+        for line in [
+            "whatsapp_helper = \"\"",
+            "whatsapp_helper = bare",
+            "theme = dark",
+        ] {
+            fs::write(&path, format!("{line}\n")).expect("write");
+            assert_eq!(Settings::load_from(path.clone()).whatsapp_helper(), None);
+        }
+        assert_eq!(Settings::in_memory().whatsapp_helper(), None);
     }
 
     #[test]

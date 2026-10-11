@@ -75,9 +75,16 @@ mod tests {
             !readme.contains("| Signal |"),
             "README protocol table must not list Signal as a v1 protocol"
         );
+        // ADR 0013 supersedes "Signal out of v1": Signal ships with its
+        // helper in #248. Until then the README says that no release has it,
+        // and it keeps the Signal risk line.
         assert!(
-            readme.contains("Signal is out of v1"),
-            "README must state that Signal is out of v1"
+            readme.contains("Signal is not in release builds yet"),
+            "README must state that no release build has Signal yet"
+        );
+        assert!(
+            readme.contains("Signal: no supported third-party API, expect breakage."),
+            "README must keep the Signal risk line (ADR 0013 decision 9)"
         );
         assert!(
             readme.contains("bot/OAuth inbox only"),

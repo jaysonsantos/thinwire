@@ -49,8 +49,16 @@ ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answer
 
 ## Open questions
 
-- From 0012: which part starts and stops each helper, and how to prevent a second spawn on the same session store. Resolve in the #246 PR.
-- From 0012: a helper restart must also end open `LoadChats` and `OpenChat` requests and clear their loading markers.
+- From 0012: which part starts and stops each helper, and how to prevent a second spawn on the same session store. Resolved in #246:
+    - The MIT `HelperAdapter` of each protocol owns its helper. One supervisor task is the only code that starts and stops the process, and it holds one process at most. It drops the old process before it starts a new one.
+    - The helper starts when the user accepts the gate of the protocol. It does not start at app start. It stops when the app closes. If the app closes the pipe or ends, the helper ends by itself.
+    - The helper takes a lock file in its session folder before it opens the store. A second process (a second app, or a helper that an app left behind) finds the lock, sends `Refused`, and ends. The app then shows "Helper stopped." and does not start it again by itself.
+- From 0012: a helper restart must also end open `LoadChats` and `OpenChat` requests and clear their loading markers. Resolved in #246:
+    - The adapter sends a helper state with each change (`AdapterEvent::Helper`). On "restarting", "stopped", and "missing", the core ends every loading marker of that protocol.
+    - For a session that was up, the adapter sends `Account { Linking }` first. The core then asks for the chat list and the open chat again after `Linked` (#163).
+    - Each open send and retry gets `SendRejected`.
+- New in #246: ADR 0012 section 4 names the folder `<data_dir>/thinwire-helper/<protocol>/` for the session stores. The WhatsApp helper keeps the folder `<data_dir>/thinwire/whatsapp/` of the local feature, so a linked device stays linked. Decide in #248 if Signal moves.
+- New in #246: decision 7 names `slack-oauth` as a release feature. The `release-features` job builds and tests it. The OS zips do not turn it on yet, because the repository has no publisher Slack secrets.
 - The legal questions of 0012 section 1.
 
 ## Consequences
