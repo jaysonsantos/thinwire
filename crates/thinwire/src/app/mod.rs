@@ -374,7 +374,7 @@ impl ThinwireApp {
     pub fn new(settings: Settings, ctx: &egui::Context) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime for protocol adapters");
         let config = CoreConfig::new(settings);
-        let core = Core::with_replacement_adapters(runtime.handle(), config, local_only_adapters);
+        let core = Core::with_replacement_adapters(runtime.handle(), config, replacement_adapters);
         repaint_on_change(&runtime, &core, ctx.clone());
         close_on_stop_signal(runtime.handle(), ctx.clone());
         let clicks = Arc::new(Mutex::new(Vec::new()));
@@ -495,14 +495,24 @@ fn resolve_focus(reported: Option<bool>, event: Option<bool>, last: Option<bool>
     reported.or(event).or(last).unwrap_or(false)
 }
 
-/// The local-only AGPL clients of this build, in place of the MIT stubs
-/// (ADR 0011, #77). A release build turns on neither feature: no client.
-fn local_only_adapters(
+/// The adapters of this build that take the place of the MIT stubs.
+///
+/// WhatsApp (`whatsapp-web`) is the MIT helper adapter: the AGPL client runs
+/// in the `thinwire-whatsapp-helper` process, and this app does not link it
+/// (ADR 0013). Signal (`signal-local`) is still the local-only AGPL client
+/// (ADR 0011) until it gets its own helper (#248).
+fn replacement_adapters(
     _phone: &Arc<thinwire_protocol::WhatsAppPhoneVault>,
+    _settings: &Settings,
 ) -> Vec<Box<dyn thinwire_protocol::ProtocolAdapter>> {
     vec![
         #[cfg(feature = "whatsapp-web")]
-        Box::new(thinwire_whatsapp::WhatsAppAdapter::new(Arc::clone(_phone))),
+        Box::new(thinwire_protocol::whatsapp_helper_adapter(
+            Arc::clone(_phone),
+            _settings
+                .whatsapp_helper()
+                .map(std::path::Path::to_path_buf),
+        )),
         #[cfg(feature = "signal-local")]
         Box::new(thinwire_signal::SignalAdapter::new()),
     ]

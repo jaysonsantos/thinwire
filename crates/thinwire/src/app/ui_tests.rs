@@ -384,12 +384,18 @@ fn whatsapp_spike_ui_is_feature_gated() {
             .split(|ch: char| !ch.is_ascii_alphabetic())
             .any(|word| word.eq_ignore_ascii_case("reliable"))
     );
-    let ci = include_str!("../../../../.github/workflows/ci.yml");
-    assert!(!ci.contains("whatsapp-web"));
+    // ADR 0013: a release turns the feature on, and the helper carries the
+    // client. The default test script stays feature-off.
     let os_zips = include_str!("../../../../.github/workflows/os-zips.yml");
-    assert!(!os_zips.contains("whatsapp-web"));
+    assert!(os_zips.contains("whatsapp-web"));
     let test_sh = include_str!("../../../../scripts/test.sh");
     assert!(!test_sh.contains("whatsapp-web"));
+    // With no helper program the entry stays, disabled, with the reason.
+    assert!(gate.contains("helper_missing(ProtocolId::WhatsApp)"));
+    assert!(gate.contains("Needs the WhatsApp helper. Reinstall thinwire."));
+    // The app names no AGPL WhatsApp crate: the adapter is the MIT one.
+    assert!(app.contains("thinwire_protocol::whatsapp_helper_adapter("));
+    assert!(!app.contains("thinwire_whatsapp::"));
 }
 
 /// Try again on a failed keychain read goes through the core, and the core

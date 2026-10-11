@@ -60,8 +60,24 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
-      - name: Release cargo tree excludes AGPL Signal and wacore-libsignal
+      - name: The app's release cargo tree has no AGPL crate
         run: nix develop --command scripts/check-release-tree.sh
+
+  # ADR 0013: CI builds and tests the protocol features that a release
+  # ships, and the AGPL WhatsApp helper with its client. The other jobs stay
+  # feature-off.
+  release-features:
+    name: release-features
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Build and test the release protocol features and the WhatsApp helper
+        run: nix develop --command scripts/test-release-features.sh
 
   ui-snapshots:
     runs-on: ubuntu-26.04
@@ -83,20 +99,22 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-  # The OS notification backends compile only on their own OS (#161). Run
-  # them only when their code or the dependencies change, so most merge
-  # queue runs skip them.
+  # The OS notification backends compile only on their own OS (#161). The
+  # helper programs start as child processes, which differs by OS (ADR
+  # 0013). Run these OS jobs only when their code or the dependencies
+  # change, so most merge queue runs skip them.
   changes:
     runs-on: ubuntu-26.04
     permissions:
       contents: read
     outputs:
       notify: ${{ steps.diff.outputs.notify }}
+      helpers: ${{ steps.diff.outputs.helpers }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Find notification backend changes
+      - name: Find notification backend and helper changes
         id: diff
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -104,13 +122,24 @@ jobs:
           # An unknown base runs the OS jobs.
           if [[ -z "$BASE" || "$BASE" =~ ^0+$ ]] || ! git fetch --depth=1 --no-tags origin "$BASE"; then
             echo "notify=true" >> "$GITHUB_OUTPUT"
+            echo "helpers=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          paths='^(crates/thinwire-notify/|scripts/stage-os-artifact\.sh$|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
-          if git diff --name-only "$BASE" HEAD | grep -Eq "$paths"; then
+          shared='Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$'
+          notify="^(crates/thinwire-notify/|scripts/stage-os-artifact\.sh$|scripts/stage-helper\.sh$|${shared})"
+          # The helper adapter is in thinwire-protocol: its manifest (tokio
+          # process support), the adapter contract, and the helper module.
+          helpers="^(crates/thinwire-ipc/|crates/thinwire-whatsapp/|crates/thinwire-protocol/Cargo\.toml$|crates/thinwire-protocol/src/(helper/|adapter\.rs$|lib\.rs$|whatsapp\.rs$)|scripts/stage-helper\.sh$|${shared})"
+          changed="$(git diff --name-only "$BASE" HEAD)"
+          if grep -Eq "$notify" <<<"$changed"; then
             echo "notify=true" >> "$GITHUB_OUTPUT"
           else
             echo "notify=false" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -Eq "$helpers" <<<"$changed"; then
+            echo "helpers=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "helpers=false" >> "$GITHUB_OUTPUT"
           fi
 
   notify-os:
@@ -137,22 +166,68 @@ jobs:
         run: cargo test -p thinwire-notify --locked
       # The notification center needs a signed bundle. Stage Thinwire.app
       # from a debug build (no publisher secrets) with the release script,
-      # so its signature step is proven before main (#161).
+      # so its signature step is proven before main (#161). The bundle also
+      # holds the WhatsApp helper, with the same ad-hoc signature (ADR 0013).
       - name: Stage and check Thinwire.app
         if: runner.os == 'macOS'
         shell: bash
         env:
           ARTIFACT: macos-arm64-check
           THINWIRE_BIN: target/debug/thinwire
+          THINWIRE_WHATSAPP_HELPER_BIN: target/debug/thinwire-whatsapp-helper
         run: |
           cargo build -p thinwire --locked
+          cargo build -p thinwire-whatsapp --features whatsapp-web --bin thinwire-whatsapp-helper --locked
           scripts/stage-os-artifact.sh
           mkdir -p unpacked
           tar -xzf thinwire-macos-arm64-check.tar.gz -C unpacked
           codesign --verify --strict --verbose=2 unpacked/Thinwire.app
+          codesign --verify --strict --verbose=2 unpacked/Thinwire.app/Contents/MacOS/thinwire-whatsapp-helper
           codesign --display --verbose=2 unpacked/Thinwire.app 2>&1 | tee codesign.txt
           grep -qx 'Identifier=dev.jaysonsantos.thinwire' codesign.txt
           grep -q '^Info.plist entries=' codesign.txt
+
+  # ADR 0013: each release archive holds the WhatsApp helper for its OS. The
+  # app starts it as a child process, and that differs by OS. So Windows and
+  # macOS build the helper with its client, run the process tests, and stage
+  # it, before main.
+  helper-os:
+    name: helper-${{ matrix.os }}
+    needs: changes
+    if: needs.changes.outputs.helpers == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Test the wire protocol
+        run: cargo test -p thinwire-ipc --locked
+      - name: Test the helper adapter
+        run: cargo test -p thinwire-protocol --locked -- helper
+      - name: Test the WhatsApp helper process
+        run: cargo test -p thinwire-whatsapp --features whatsapp-web --locked
+      - name: Stage the helper next to a debug app
+        shell: bash
+        env:
+          REQUIRE_AGPL_MARKER: "1"
+        run: |
+          cargo build -p thinwire --features whatsapp-web,discord-bot --locked
+          cargo build -p thinwire-whatsapp --features whatsapp-web --bin thinwire-whatsapp-helper --locked
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            suffix=".exe"
+          fi
+          THINWIRE_WHATSAPP_HELPER_BIN="target/debug/thinwire-whatsapp-helper${suffix}" \
+            scripts/stage-helper.sh "$RUNNER_TEMP/payload" "target/debug/thinwire${suffix}"
 
   ui-snapshot-comment:
     needs: ui-snapshots
@@ -193,7 +268,7 @@ jobs:
   check:
     name: check
     if: always()
-    needs: [lint, test, build, release-tree, ui-snapshots, changes, notify-os]
+    needs: [lint, test, build, release-tree, release-features, ui-snapshots, changes, notify-os, helper-os]
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -203,5 +278,6 @@ jobs:
           RESULTS: ${{ toJSON(needs) }}
         run: |
           echo "$RESULTS"
-          # Only notify-os can skip: no notification backend change.
-          echo "$RESULTS" | jq --exit-status 'to_entries | all(.value.result == "success" or (.key == "notify-os" and .value.result == "skipped"))' > /dev/null
+          # Only the OS jobs can skip: no notification backend change, or
+          # no helper change.
+          echo "$RESULTS" | jq --exit-status 'to_entries | all(.value.result == "success" or ((.key == "notify-os" or .key == "helper-os") and .value.result == "skipped"))' > /dev/null

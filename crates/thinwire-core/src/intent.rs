@@ -81,9 +81,13 @@ pub enum Intent {
         conversation_id: String,
         muted: bool,
     },
+    /// Start the helper process of this protocol again (ADR 0013). It acts
+    /// only while the account row shows "Helper stopped."
+    RestartHelper(ProtocolId),
     /// Telegram login and account actions.
     Telegram(TelegramIntent),
     /// Experimental WhatsApp pairing. Only a `whatsapp-web` build acts on it.
+    /// The client runs in the WhatsApp helper process (ADR 0013).
     WhatsApp(WhatsAppIntent),
     /// Discord bot inbox. Only a `discord-bot` build acts on it.
     Discord(DiscordIntent),
