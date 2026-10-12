@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
 # ADR 0013, #77: MIT crates must not depend on the AGPL protocol crates.
 # AGPL code runs in helper programs, and the MIT app talks to them over a
-# pipe. One exception stays until Signal has its helper (#248): the binary
-# `thinwire` may name `thinwire-signal` as an optional dependency behind the
-# local-only feature `signal-local`. No MIT crate may name `thinwire-whatsapp`.
+# pipe. No MIT crate may name `thinwire-whatsapp` or `thinwire-signal`, also
+# not as an optional dependency (#246, #248).
 # This guard keeps AGPL code out of the MIT app. It is not optional.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(dirname "$script_dir")"
-
-# The MIT crate that may name an AGPL crate, and that crate. Only as an
-# optional dependency.
-optional_from="thinwire"
-optional_to="thinwire-signal"
 
 # True if a Cargo `license` value names an AGPL license: every AGPL SPDX id
 # (AGPL-3.0, AGPL-3.0-only, AGPL-3.0-or-later), also inside an OR / AND
@@ -81,10 +75,6 @@ check_workspace() {
       continue
     fi
     while IFS= read -r line; do
-      if [[ "$name" == "$optional_from" && "$line" == *"optional = true"* ]] &&
-        grep -qE "^${optional_to}( |=|\.)" <<<"$line"; then
-        continue
-      fi
       echo "${manifest}: MIT crate depends on an AGPL crate: ${line}" >&2
       status=1
     done < <(grep -E "^(${pattern})( |=|\.)" "$manifest" || true)
@@ -166,21 +156,16 @@ if ! CARGO_NET_OFFLINE=true check_workspace "$fixture/good" 1; then
   echo "check-agpl-deps self-test: a clean fixture workspace failed" >&2
   exit 1
 fi
-# ADR 0013: the app must not name the WhatsApp crate, also not as an
-# optional dependency. Only `thinwire-signal` has that exception (#248).
+# ADR 0013: the app must not name an AGPL crate, also not as an optional
+# dependency. The Signal crate had that exception until #248.
 fixture_workspace "$fixture/optional-whatsapp" optional "" thinwire thinwire-whatsapp
 if CARGO_NET_OFFLINE=true check_workspace "$fixture/optional-whatsapp" 0 >/dev/null 2>&1; then
   echo "check-agpl-deps self-test: thinwire with an optional thinwire-whatsapp dependency passed" >&2
   exit 1
 fi
 fixture_workspace "$fixture/optional-signal" optional "" thinwire thinwire-signal
-if ! CARGO_NET_OFFLINE=true check_workspace "$fixture/optional-signal" 1; then
-  echo "check-agpl-deps self-test: thinwire with an optional thinwire-signal dependency failed" >&2
-  exit 1
-fi
-fixture_workspace "$fixture/optional-other" optional "" thinwire-core thinwire-signal
-if CARGO_NET_OFFLINE=true check_workspace "$fixture/optional-other" 0 >/dev/null 2>&1; then
-  echo "check-agpl-deps self-test: thinwire-core with an optional thinwire-signal dependency passed" >&2
+if CARGO_NET_OFFLINE=true check_workspace "$fixture/optional-signal" 0 >/dev/null 2>&1; then
+  echo "check-agpl-deps self-test: thinwire with an optional thinwire-signal dependency passed" >&2
   exit 1
 fi
 

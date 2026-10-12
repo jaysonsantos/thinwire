@@ -332,7 +332,7 @@ async fn run_linked(
         &events,
         ProtocolId::Signal,
         AdapterStatus::Ready,
-        "Signal is linked on this local build. This binary is not a release.",
+        "Signal is linked. Experimental client: expect breakage.",
     );
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -366,7 +366,7 @@ async fn run_linked(
                 &events,
                 ProtocolId::Signal,
                 AdapterStatus::Ready,
-                "Signal is linked on this local build. This binary is not a release.",
+                "Signal is linked. Experimental client: expect breakage.",
             );
         }
         let mut pending: Option<WorkerJob> = None;

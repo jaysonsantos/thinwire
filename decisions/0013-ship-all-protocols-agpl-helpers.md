@@ -57,13 +57,15 @@ ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answer
     - The adapter sends a helper state with each change (`AdapterEvent::Helper`). On "restarting", "stopped", and "missing", the core ends every loading marker of that protocol.
     - For a session that was up, the adapter sends `Account { Linking }` first. The core then asks for the chat list and the open chat again after `Linked` (#163).
     - Each open send and retry gets `SendRejected`.
-- New in #246: ADR 0012 section 4 names the folder `<data_dir>/thinwire-helper/<protocol>/` for the session stores. The WhatsApp helper keeps the folder `<data_dir>/thinwire/whatsapp/` of the local feature, so a linked device stays linked. Decide in #248 if Signal moves.
+- New in #246: ADR 0012 section 4 names the folder `<data_dir>/thinwire-helper/<protocol>/` for the session stores. The WhatsApp helper keeps the folder `<data_dir>/thinwire/whatsapp/` of the local feature, so a linked device stays linked. Resolved in #248: the Signal helper keeps `<data_dir>/thinwire/signal/` for the same reason.
+- New in #248: the app keeps the feature name `signal-local` for Signal. In the app it adds the screens and the MIT helper adapter. In `thinwire-signal` it links presage and libsignal into the helper. The exception of `scripts/check-agpl-deps.sh` for an optional `thinwire-signal` dependency of the app is gone.
+- New in #248: the Signal client needs `protoc` when it builds. The nix shell has it. The CI jobs with no nix get one pinned release with a SHA-256 check (`scripts/install-protoc.sh`).
 - New in #246: decision 7 names `slack-oauth` as a release feature. The `release-features` job builds and tests it. The OS zips do not turn it on yet, because the repository has no publisher Slack secrets.
 - The legal questions of 0012 section 1.
 
 ## Consequences
 
-- Release builds offer WhatsApp and Signal. WhatsApp ships with #246; Signal ships only with #248. Until then the release archive contains only the WhatsApp helper, the app does not offer Signal, and the "helper missing" path of decision 6 does not fire for Signal. The MIT app binary still contains no AGPL code.
+- Release builds offer WhatsApp and Signal. WhatsApp ships with #246, and Signal ships with #248. The MIT app binary contains no AGPL code.
 - Each release has three binaries per OS and more license files.
 - CI builds libsignal on three OSes. This adds CI minutes to every run that builds the helpers.
 - AGENTS.md and ROADMAP.md follow this ADR in the same PR. README follows with the #246 implementation PR.

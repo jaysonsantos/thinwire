@@ -19,7 +19,7 @@ pub const APP_CLOSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 /// the value it started with. The host drops stale ones (issue #42).
 pub(crate) type LoginEpoch = std::sync::Arc<std::sync::atomic::AtomicU64>;
 
-/// Protocol identifiers. Signal is local-only (`signal-local`) and stays out of release builds.
+/// Protocol identifiers. Signal runs in its helper process and needs feature `signal-local`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtocolId {
     Telegram,
@@ -361,16 +361,16 @@ pub enum AdapterCommand {
     },
     /// Stops experimental pairing and clears the in-memory risk acknowledgement.
     WhatsAppCancelLink,
-    /// Records that the full-screen Signal local-build notice was accepted.
+    /// Records that the full-screen Signal notice was accepted.
     /// Carries no secrets and does not open a network session.
     SignalAcknowledgeNotice,
-    /// Asks the worker to start local-only secondary-device linking.
+    /// Asks the worker to start secondary-device linking.
     /// The provisioning URL is not a field. It leaves later as a redacted event.
     /// `generation` is the pairing the core assigned. The QR carries the same value.
     SignalBeginLink {
         generation: u64,
     },
-    /// Stops local-only linking and clears the in-memory notice acknowledgement.
+    /// Stops the linking and clears the in-memory notice acknowledgement.
     SignalCancelLink,
     /// Start the helper process of this protocol again after it stopped
     /// (ADR 0013). A protocol that runs in the app refuses it.
@@ -566,7 +566,7 @@ pub enum AdapterEvent {
         /// Link generation that produced this payload. Stale generations are dropped.
         generation: u64,
     },
-    /// Local-only Signal provisioning URL. Debug output is redacted.
+    /// Signal provisioning URL. Debug output is redacted.
     /// Never log [`RedactedPairingSecret::reveal`].
     SignalQr {
         code: RedactedPairingSecret,

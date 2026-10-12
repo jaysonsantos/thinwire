@@ -1,26 +1,40 @@
-//! Full-screen local-only Signal notice.
+//! Full-screen experimental Signal notice.
 //!
 //! Compiled only with `signal-local`. The provisioning URL is unreachable
-//! until the notice is accepted. Release builds do not include this screen.
+//! until the notice is accepted. The client runs in the Signal helper
+//! process (ADR 0013), which starts only after that acknowledgement.
 
 use eframe::egui::{self, RichText};
 
 use super::theme;
 use thinwire_core::state::{SignalScreen, Snapshot};
-use thinwire_core::{Intent, SignalIntent, View};
+use thinwire_core::{Intent, ProtocolId, SignalIntent, View};
 
-pub(crate) fn notice_entry(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
+/// The Signal entry under the accounts. With no helper program the entry
+/// stays, disabled, with the reason (ADR 0013 decision 6).
+pub(crate) fn notice_entry(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
     ui.add_space(8.0);
     ui.label(
-        RichText::new("Signal — local build only, not in releases")
+        RichText::new("Signal — experimental, expect breakage")
             .small()
             .color(theme::palette(ui).warn),
     );
-    if ui.button("Review Signal local-build notice").clicked() {
+    let missing = snapshot.helper_missing(ProtocolId::Signal);
+    let entry = ui.add_enabled(!missing, egui::Button::new("Review Signal notice"));
+    if missing {
+        entry.on_disabled_hover_text(HELPER_MISSING_REASON);
+        ui.label(RichText::new(HELPER_MISSING_REASON).small().weak());
+    } else if entry.clicked() {
         out.push(Intent::Signal(SignalIntent::OpenNotice));
         ui.ctx().request_repaint();
     }
 }
+
+/// Why the Signal entry is disabled.
+const HELPER_MISSING_REASON: &str = "Needs the Signal helper. Reinstall thinwire.";
+
+/// The Signal risk line of the README (ADR 0013 decision 9).
+const SIGNAL_RISK: &str = "Signal: no supported third-party API, expect breakage.";
 
 pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     egui::CentralPanel::default().show(ui, |ui| {
@@ -33,16 +47,21 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>
 }
 
 fn notice(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
-    ui.heading("Signal local build");
-    ui.colored_label(
-        theme::palette(ui).warn,
-        "This build links AGPL presage and libsignal. It is experimental and local only. Release builds and OS zips do not include Signal.",
+    ui.heading("Signal experimental client");
+    ui.colored_label(theme::palette(ui).warn, SIGNAL_RISK);
+    ui.add_space(8.0);
+    ui.label(
+        "thinwire links as a secondary device with presage and libsignal. Signal can change its service at any time, and this client can then stop.",
+    );
+    ui.add_space(6.0);
+    ui.label(
+        "The Signal client is AGPL-3.0 code. It runs in a separate program, thinwire-signal-helper, which starts after you accept this notice.",
     );
     ui.add_space(8.0);
     ui.label("No provisioning URL is shown on this screen.");
     ui.add_space(12.0);
     if ui
-        .button("I understand — this is a local build, not a release")
+        .button("I understand — Signal can break at any time")
         .clicked()
     {
         out.push(Intent::Signal(SignalIntent::AcknowledgeNotice));
@@ -69,14 +88,32 @@ fn link_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
         ui.label(&error.next);
         ui.add_space(8.0);
     }
+    // With no helper program no link can start. The core refuses it too.
+    // Show the reason next to the disabled button.
+    let missing = snapshot.helper_missing(ProtocolId::Signal);
+    if missing {
+        ui.colored_label(theme::palette(ui).warn, HELPER_MISSING_REASON);
+    }
     if ui
         .add_enabled(
-            !snapshot.signal_started,
+            !snapshot.signal_started && !missing,
             egui::Button::new("Start Signal linking"),
         )
         .clicked()
     {
         out.push(Intent::Signal(SignalIntent::BeginLink));
+    }
+    // This screen draws no account row. Show the helper state here: a start
+    // that takes long, a restart, or a helper that stopped, with what to do.
+    if let Some(notice) = snapshot.helper_notice(ProtocolId::Signal) {
+        ui.add_space(8.0);
+        ui.colored_label(theme::palette(ui).warn, notice.label);
+        if let Some(error) = notice.error {
+            ui.label(format!("What happened: {}", error.happened));
+            ui.label(format!("Why: {}", error.why));
+            ui.label(format!("What to do: {}", error.next));
+            ui.label("You can also start the link again here.");
+        }
     }
     if let Some(qr) = &snapshot.signal_qr {
         ui.add_space(8.0);

@@ -6,10 +6,11 @@
 #
 # It writes thinwire-helpers-<ref>-source.tar.gz in the repository root. The
 # tarball holds the thinwire source of <ref>, not of the checkout, and every
-# dependency of that source from `cargo vendor`, also whatsapp-rust and
-# wacore-libsignal. So the name and the content always agree. A build from it
-# needs no network and no outside git revision. Publish it next to the
-# binaries, and keep it as long as they stay.
+# dependency of that source from `cargo vendor`, also whatsapp-rust,
+# wacore-libsignal, presage, and libsignal. So the name and the content
+# always agree. A build from it needs no network and no outside git
+# revision. Publish it next to the binaries, and keep it as long as they
+# stay.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,13 +57,15 @@ cat >"${tree}/HELPER-SOURCE.md" <<SOURCE_README
 
 This tarball is the Corresponding Source of the helper programs of thinwire
 at ${ref} (commit ${commit}). The helper programs are AGPL-3.0-only. The
-license text is in crates/thinwire-whatsapp/LICENSE.
+license text is in crates/thinwire-whatsapp/LICENSE and in
+crates/thinwire-signal/LICENSE.
 
 It holds:
 
-- The thinwire source of ${ref}. The helper crate is crates/thinwire-whatsapp.
-- Every dependency in vendor/, from cargo vendor. This includes whatsapp-rust
-  and wacore-libsignal.
+- The thinwire source of ${ref}. The helper crates are
+  crates/thinwire-whatsapp and crates/thinwire-signal.
+- Every dependency in vendor/, from cargo vendor. This includes whatsapp-rust,
+  wacore-libsignal, presage, and libsignal.
 - .cargo/config.toml, which points cargo at vendor/.
 
 Build the WhatsApp helper with the Rust toolchain of rust-toolchain.toml:
@@ -73,16 +76,28 @@ Build the WhatsApp helper with the Rust toolchain of rust-toolchain.toml:
 The program is target/release/thinwire-whatsapp-helper. Put it next to the
 thinwire binary (Contents/MacOS in Thinwire.app), or name its path in the
 thinwire settings file with the key whatsapp_helper.
+
+Build the Signal helper with the same toolchain. This build also needs the
+protobuf compiler protoc on the PATH:
+
+    cargo build --release --offline -p thinwire-signal \\
+      --features signal-local --bin thinwire-signal-helper
+
+The program is target/release/thinwire-signal-helper. Put it next to the
+thinwire binary, or name its path in the thinwire settings file with the key
+signal_helper.
 SOURCE_README
 
 rm -f "$archive"
 tar -czf "$archive" -C "$work" "$name"
 
-# The tarball must have the helper crate and the AGPL dependency source.
+# The tarball must have the helper crates and the AGPL dependency source.
 listing="$(tar -tzf "$archive")"
 for needed in \
   "${name}/crates/thinwire-whatsapp/LICENSE" \
   "${name}/crates/thinwire-whatsapp/src/bin/helper.rs" \
+  "${name}/crates/thinwire-signal/LICENSE" \
+  "${name}/crates/thinwire-signal/src/bin/helper.rs" \
   "${name}/HELPER-SOURCE.md" \
   "${name}/Cargo.lock"; do
   if ! grep -qxF "$needed" <<<"$listing"; then
@@ -90,7 +105,7 @@ for needed in \
     exit 1
   fi
 done
-for vendored in wacore-libsignal whatsapp-rust; do
+for vendored in wacore-libsignal whatsapp-rust presage presage-store-sqlite libsignal-protocol libsignal-service; do
   if ! grep -qE "^${name}/vendor/${vendored}-[^/]+/Cargo\.toml$" <<<"$listing"; then
     echo "the source tarball is missing the vendored ${vendored} crate" >&2
     exit 1

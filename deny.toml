@@ -1,6 +1,7 @@
 # cargo-deny: advisory check of the dependency graphs that a release ships
 # (ADR 0012 section 4, ADR 0013). `scripts/test-release-features.sh` runs
-# `cargo deny check advisories` for the app and for the WhatsApp helper.
+# `cargo deny check advisories` for the WhatsApp helper and for the Signal
+# helper.
 #
 # Licenses are not checked here: `wacore-libsignal` says MIT in its manifest
 # but has AGPL files, so metadata cannot find it. `scripts/check-agpl-deps.sh`
@@ -9,4 +10,13 @@
 [advisories]
 version = 2
 yanked = "warn"
-ignore = []
+# "Unmaintained" notices in the graph of the Signal helper (#248). Each crate
+# comes from libsignal or libsignal-service, which the pinned presage needs.
+# thinwire cannot change the version. Not one of them is a vulnerability
+# notice: a vulnerability still fails the check. Remove an entry when the
+# pinned presage does not need the crate any more.
+ignore = [
+  { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill: from heapless, postcard, and phonenumber in libsignal-service" },
+  { id = "RUSTSEC-2025-0141", reason = "bincode 1: a direct dependency of libsignal-service and zkgroup" },
+  { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: a build-time macro crate, from libcrux-ml-kem in libsignal-protocol" },
+]

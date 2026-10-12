@@ -42,7 +42,7 @@ pub use secrets::{
     TELEGRAM_SECRET_PHONE, TELEGRAM_SECRET_SERVICE, TELEGRAM_SECRET_SESSION, TelegramSecretKey,
     TelegramSecretVault,
 };
-pub use signal::SignalAdapter;
+pub use signal::{SIGNAL_HELPER_PROGRAM, SignalAdapter, signal_helper_adapter};
 pub use slack::{
     DEDUP_FRESH_SECS, MemorySlackVault, SLACK_CONVERSATION_PREFIX, SLACK_OAUTH_CALLBACK_PATH,
     SLACK_OAUTH_LOOPBACK_PORT, SLACK_SECRET_SERVICE, SlackAdapter, SlackApiError, SlackApiOrigin,
@@ -63,7 +63,7 @@ pub use whatsapp::{
     WHATSAPP_HELPER_PROGRAM, WhatsAppAdapter, WhatsAppPhoneVault, whatsapp_helper_adapter,
 };
 
-/// Shell protocols in display order. Signal is local-only and hidden unless `signal-local` is on.
+/// Shell protocols in display order. Signal is hidden unless `signal-local` is on.
 pub fn catalog() -> [ProtocolCapabilities; 5] {
     [
         telegram::TelegramAdapter::capabilities(),
@@ -94,9 +94,8 @@ pub(crate) fn registry(
         Box::new(signal::SignalAdapter::new()),
     ];
     // A build with a protocol feature puts another adapter in place of an
-    // MIT stub: the MIT helper adapter for WhatsApp (ADR 0013), and the
-    // local-only AGPL client for Signal. This crate does not depend on the
-    // AGPL crates.
+    // MIT stub: the MIT helper adapters for WhatsApp and for Signal (ADR
+    // 0013). This crate does not depend on the AGPL crates.
     for replacement in replacements {
         let id = replacement.id();
         if let Some(slot) = adapters.iter_mut().find(|adapter| adapter.id() == id) {
@@ -230,9 +229,10 @@ mod tests {
         }
     }
 
-    /// ADR 0013: a release ships WhatsApp and Discord, and the MIT app still
-    /// links no AGPL crate. The AGPL WhatsApp client is in the helper program,
-    /// which the release workflow builds as its own package.
+    /// ADR 0013: a release ships WhatsApp, Signal, and Discord, and the MIT
+    /// app still links no AGPL crate. The AGPL WhatsApp and Signal clients
+    /// are in the helper programs, which the release workflow builds as
+    /// their own packages.
     #[test]
     fn v1_does_not_depend_on_agpl_signal_client_or_presage() {
         let protocol = include_str!("../Cargo.toml");
@@ -257,7 +257,13 @@ mod tests {
         assert_eq!(build.package, "thinwire");
         assert_eq!(
             build.features,
-            ["telegram-tdlib", "whatsapp-web", "discord-bot"].map(str::to_string)
+            [
+                "telegram-tdlib",
+                "whatsapp-web",
+                "signal-local",
+                "discord-bot"
+            ]
+            .map(str::to_string)
         );
         assert!(
             release.contains(
@@ -266,16 +272,23 @@ mod tests {
             "the release builds the WhatsApp helper as its own program"
         );
         assert!(
+            release.contains(
+                "cargo build --release -p thinwire-signal --features signal-local --bin thinwire-signal-helper"
+            ),
+            "the release builds the Signal helper as its own program"
+        );
+        assert!(
             build.targets.len() >= 3,
             "each OS zip is covered by the lock walk"
         );
         assert!(build.targets.iter().any(|os| os.contains("ubuntu")));
         assert!(build.targets.iter().any(|os| os.contains("macos")));
         assert!(build.targets.iter().any(|os| os.contains("windows")));
-        // `signal-local` links the AGPL Signal client into the app: a
-        // release never turns it on (#248 moves Signal to its own helper).
+        // The release names the helper crates of this repository, never
+        // an AGPL library. In the app, `signal-local` and `whatsapp-web`
+        // are the MIT helper adapters (#246, #248): the lock walk below
+        // proves that they add no AGPL crate.
         for name in [
-            "signal-local",
             "presage",
             "libsignal",
             "libsignal-service",
@@ -845,24 +858,26 @@ dependencies = [
             !protocol.contains("presage"),
             "thinwire-protocol must not depend on the AGPL Signal crate"
         );
-        assert!(app.contains("thinwire-signal"));
         assert!(app.contains("signal-local"));
         assert!(core.contains("signal-local"));
         let signal = include_str!("../../thinwire-signal/Cargo.toml");
         assert!(signal.contains("AGPL-3.0-only"));
         assert!(signal.contains("presage"));
+        assert!(signal.contains("name = \"thinwire-signal-helper\""));
         let release = include_str!("../../../.github/workflows/os-zips.yml");
         assert!(release.contains("--features telegram-tdlib"));
-        assert!(!release.contains("signal-local"));
-        // ADR 0013: no MIT manifest names the AGPL WhatsApp crate as a
-        // dependency. The app's `whatsapp-web` is the MIT helper adapter.
+        // ADR 0013: no MIT manifest names an AGPL crate of this repository
+        // as a dependency. The app's `whatsapp-web` and `signal-local` are
+        // the MIT helper adapters.
         for manifest in [protocol, app, core] {
-            assert!(
-                !manifest
-                    .lines()
-                    .any(|line| line.trim_start().starts_with("thinwire-whatsapp")),
-                "an MIT crate must not depend on thinwire-whatsapp"
-            );
+            for agpl in ["thinwire-whatsapp", "thinwire-signal"] {
+                assert!(
+                    !manifest
+                        .lines()
+                        .any(|line| line.trim_start().starts_with(agpl)),
+                    "an MIT crate must not depend on {agpl}"
+                );
+            }
         }
         let whatsapp = include_str!("../../thinwire-whatsapp/Cargo.toml");
         assert!(whatsapp.contains("AGPL-3.0-only"));

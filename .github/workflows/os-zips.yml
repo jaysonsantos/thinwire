@@ -3,10 +3,11 @@
 # one mode-preserving .tar.gz so executable bits and the macOS .app survive.
 # pull_request never triggers this workflow, and the job also refuses non-main pushes.
 #
-# Each archive holds the MIT app and the AGPL-3.0-only WhatsApp helper
-# program (ADR 0013). The app does not link the helper: it starts it as a
-# child process. The helper-source job uploads the Corresponding Source of
-# the helper from the same run, with the same retention as the archives.
+# Each archive holds the MIT app and two AGPL-3.0-only helper programs: the
+# WhatsApp helper and the Signal helper (ADR 0013). The app does not link a
+# helper: it starts each one as a child process. The helper-source job
+# uploads the Corresponding Source of the helpers from the same run, with
+# the same retention as the archives.
 #
 # TELEGRAM_API_ID and TELEGRAM_API_HASH are publisher Telegram app credentials.
 # This main-only workflow reads them from GitHub Actions repository secrets and
@@ -35,7 +36,7 @@ jobs:
     name: artifact-${{ matrix.artifact }}
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 75
     permissions:
       contents: read
     strategy:
@@ -77,6 +78,11 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
+      # The Signal helper compiles `.proto` files when it builds.
+      - name: Install protoc
+        shell: bash
+        run: scripts/install-protoc.sh
+
       - name: Require publisher Telegram credentials
         shell: bash
         env:
@@ -106,11 +112,14 @@ jobs:
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-        run: cargo build --release -p thinwire --features telegram-tdlib,whatsapp-web,discord-bot
+        run: cargo build --release -p thinwire --features telegram-tdlib,whatsapp-web,signal-local,discord-bot
 
-      # The AGPL helper is its own program. It gets no publisher secret.
+      # Each AGPL helper is its own program. It gets no publisher secret.
       - name: Build the WhatsApp helper
         run: cargo build --release -p thinwire-whatsapp --features whatsapp-web --bin thinwire-whatsapp-helper
+
+      - name: Build the Signal helper
+        run: cargo build --release -p thinwire-signal --features signal-local --bin thinwire-signal-helper
 
       - name: Stage and archive unsigned payload
         shell: bash
