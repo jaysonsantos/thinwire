@@ -21,7 +21,7 @@ notify-rust = { version = "4.18", default-features = false, features = ["z"] }
 # `CloseNotification` by id: notify-rust closes only through the handle
 # that the click waiter owns. Same zbus as the keychain; no new major.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "5", default-features = false, features = [
+zbus = { version = "6", default-features = false, features = [
   "async-io",
   "blocking-api",
 ] }
