@@ -13,6 +13,11 @@
       "groupName": "whisperfish/presage"
     },
     {
+      "description": "whatsapp-rust sqlite-storage needs diesel ^2.3.14 and sqlite-wasm-rs 0.6. diesel 2.3.13 accepts only sqlite-wasm-rs <0.6, and both sqlite-wasm-rs versions set links = \"wsqlite3\", so Cargo refuses a lock that keeps both. diesel 2.3.14 still accepts the older sqlite-wasm-rs, so the lock keeps it unless sqlite-wasm-rs is updated in the same change. Group diesel and sqlite-wasm-rs with the whatsapp-rust updates.",
+      "matchDepNames": ["whatsapp-rust", "diesel", "sqlite-wasm-rs"],
+      "groupName": "whatsapp-rust"
+    },
+    {
       "description": "libsqlite3-sys must match presage-store-sqlite and whatsapp-rust. Only one version can link.",
       "matchPackageNames": ["libsqlite3-sys"],
       "allowedVersions": "<0.37"
