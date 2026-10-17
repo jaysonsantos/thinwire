@@ -1552,6 +1552,8 @@ where
             sent_at: ts_order(&post.ts),
             arrival: crate::Arrival::History,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         })
     }
 }

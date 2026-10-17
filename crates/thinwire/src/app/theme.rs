@@ -40,8 +40,10 @@ pub(crate) struct Palette {
     pub text2: Color32,
     /// Times, hints, meta, day breaks.
     pub text3: Color32,
-    /// Links, focus, primary button.
+    /// Focus and the primary button.
     pub accent: Color32,
+    /// Underlined links. 4.5:1 on a bubble and on an outbound bubble.
+    pub link: Color32,
     /// Text on the primary button.
     pub on_accent: Color32,
     /// Selected chat row.
@@ -83,6 +85,7 @@ impl Palette {
         text2: hex(0xB3_B7_BF),
         text3: hex(0x9C_A1_AB),
         accent: hex(0x5A_A2_FF),
+        link: hex(0xB7_D4_FF),
         on_accent: hex(0x0B_1A_2E),
         selected_row: hex(0x26_34_4A),
         out: hex(0x2B_52_78),
@@ -108,6 +111,7 @@ impl Palette {
         text2: hex(0x45_4A_53),
         text3: hex(0x5E_63_6D),
         accent: hex(0x1A_63_D6),
+        link: hex(0x0B_3D_91),
         on_accent: hex(0xFF_FF_FF),
         selected_row: hex(0xDD_E8_FA),
         out: hex(0xD6_E8_FF),
@@ -423,6 +427,8 @@ fn fonts() -> FontDefinitions {
 /// Register the fonts and the light and dark styles. Call once when the
 /// app starts. The font bytes are static, so this does no file I/O.
 pub fn install(ctx: &egui::Context) {
+    // Still images only. The loader decodes off the UI thread.
+    egui_extras::install_image_loaders(ctx);
     ctx.set_fonts(fonts());
     for theme in [Theme::Dark, Theme::Light] {
         ctx.set_style_of(theme, style(Palette::of(theme), theme));
@@ -556,6 +562,8 @@ mod tests {
             ("text3/input", p.text3, p.input),
             ("on_out/out", p.on_out, p.out),
             ("out_meta/out", p.out_meta, p.out),
+            ("link/surface", p.link, p.surface),
+            ("link/out", p.link, p.out),
             ("accent/bg", p.accent, p.bg),
             ("accent/sidebar", p.accent, p.sidebar),
             ("accent/input", p.accent, p.input),

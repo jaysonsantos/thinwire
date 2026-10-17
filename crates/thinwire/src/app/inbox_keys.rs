@@ -481,6 +481,8 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         sent_at,
         arrival: thinwire_protocol::Arrival::History,
         topic: None,
+        links: Vec::new(),
+        photo: None,
     }
 }
 

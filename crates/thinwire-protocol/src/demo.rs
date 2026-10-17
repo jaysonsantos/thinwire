@@ -369,6 +369,8 @@ impl DemoAdapter {
                     sent_at: self.script.now,
                     arrival: crate::Arrival::History,
                     topic,
+                    links: Vec::new(),
+                    photo: None,
                 },
             },
         );
@@ -568,6 +570,8 @@ mod tests {
             sent_at: NOW + i64::try_from(index).unwrap_or_default(),
             arrival: crate::Arrival::History,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         }
     }
 

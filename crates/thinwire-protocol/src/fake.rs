@@ -99,6 +99,8 @@ impl ProtocolAdapter for FakeAdapter {
                         sent_at: FAKE_SENT_AT,
                         arrival: crate::Arrival::History,
                         topic: None,
+                        links: Vec::new(),
+                        photo: None,
                     },
                 );
                 Ok(())

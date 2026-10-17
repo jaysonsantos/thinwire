@@ -41,6 +41,30 @@ if [[ ! -f "$inter_license" ]]; then
   exit 1
 fi
 cp "$inter_license" dist/THIRD_PARTY_NOTICES/Inter-OFL.txt
+# Chat photos (ADR 0013 decision 8, issue #244). egui_extras and image,
+# plus the jpeg, png, and webp decoders those crates link.
+copy_app_notice() {
+  local notice_source="$1" notice_name="$2"
+  if [[ ! -f "$notice_source" ]]; then
+    echo "::error::Missing notice at ${notice_source}."
+    exit 1
+  fi
+  cp "$notice_source" "dist/THIRD_PARTY_NOTICES/${notice_name}"
+}
+copy_app_notice third_party/egui_extras/LICENSE-MIT egui_extras-LICENSE-MIT.txt
+copy_app_notice third_party/egui_extras/LICENSE-APACHE egui_extras-LICENSE-APACHE.txt
+copy_app_notice third_party/image/LICENSE-MIT image-LICENSE-MIT.txt
+copy_app_notice third_party/image/LICENSE-APACHE image-LICENSE-APACHE.txt
+copy_app_notice third_party/png/LICENSE-MIT png-LICENSE-MIT.txt
+copy_app_notice third_party/png/LICENSE-APACHE png-LICENSE-APACHE.txt
+copy_app_notice third_party/image-webp/LICENSE-MIT image-webp-LICENSE-MIT.txt
+copy_app_notice third_party/image-webp/LICENSE-APACHE image-webp-LICENSE-APACHE.txt
+copy_app_notice third_party/zune-jpeg/LICENSE-MIT zune-jpeg-LICENSE-MIT.txt
+copy_app_notice third_party/zune-jpeg/LICENSE-APACHE zune-jpeg-LICENSE-APACHE.txt
+copy_app_notice third_party/zune-jpeg/LICENSE-ZLIB zune-jpeg-LICENSE-ZLIB.txt
+copy_app_notice third_party/zune-core/LICENSE-MIT zune-core-LICENSE-MIT.txt
+copy_app_notice third_party/zune-core/LICENSE-APACHE zune-core-LICENSE-APACHE.txt
+copy_app_notice third_party/zune-core/LICENSE-ZLIB zune-core-LICENSE-ZLIB.txt
 
 copy_llvm_notice() {
   local lib="$1"
@@ -188,6 +212,27 @@ EOF
     echo "::error::Thinwire.app Resources are missing LICENSE, the TDLib notice, or the Inter OFL."
     exit 1
   fi
+  for notice in \
+    egui_extras-LICENSE-MIT.txt \
+    egui_extras-LICENSE-APACHE.txt \
+    image-LICENSE-MIT.txt \
+    image-LICENSE-APACHE.txt \
+    png-LICENSE-MIT.txt \
+    png-LICENSE-APACHE.txt \
+    image-webp-LICENSE-MIT.txt \
+    image-webp-LICENSE-APACHE.txt \
+    zune-jpeg-LICENSE-MIT.txt \
+    zune-jpeg-LICENSE-APACHE.txt \
+    zune-jpeg-LICENSE-ZLIB.txt \
+    zune-core-LICENSE-MIT.txt \
+    zune-core-LICENSE-APACHE.txt \
+    zune-core-LICENSE-ZLIB.txt
+  do
+    if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${notice}" ]]; then
+      echo "::error::Thinwire.app Resources are missing the image notice ${notice}."
+      exit 1
+    fi
+  done
   for helper_name in "${helper_names[@]}"; do
     if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${helper_name}-AGPL-3.0.txt" || ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${helper_name}-SOURCE.md" ]]; then
       echo "::error::Thinwire.app Resources are missing the AGPL text or the source offer of ${helper_name}."
@@ -335,6 +380,20 @@ with tarfile.open(archive, "r:gz") as tf:
         "whatsapp-rust-LICENSE-MIT.txt",
         "tdlib-rs-LICENSE-APACHE.txt",
         "twilight-LICENSE-ISC.md",
+        "egui_extras-LICENSE-MIT.txt",
+        "egui_extras-LICENSE-APACHE.txt",
+        "image-LICENSE-MIT.txt",
+        "image-LICENSE-APACHE.txt",
+        "png-LICENSE-MIT.txt",
+        "png-LICENSE-APACHE.txt",
+        "image-webp-LICENSE-MIT.txt",
+        "image-webp-LICENSE-APACHE.txt",
+        "zune-jpeg-LICENSE-MIT.txt",
+        "zune-jpeg-LICENSE-APACHE.txt",
+        "zune-jpeg-LICENSE-ZLIB.txt",
+        "zune-core-LICENSE-MIT.txt",
+        "zune-core-LICENSE-APACHE.txt",
+        "zune-core-LICENSE-ZLIB.txt",
     ):
         if not any(name.endswith(f"THIRD_PARTY_NOTICES/{notice}") for name in names):
             raise SystemExit(f"{archive} is missing the notice {notice}")

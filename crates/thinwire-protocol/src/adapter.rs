@@ -405,6 +405,14 @@ pub enum AdapterCommand {
     RestartHelper {
         protocol: ProtocolId,
     },
+    /// Download one Telegram photo file. `secret` means the file is deleted
+    /// after the bytes are read, and the UI does not open the full view.
+    /// The file id is not a secret.
+    DownloadFile {
+        protocol: ProtocolId,
+        file_id: i32,
+        secret: bool,
+    },
 }
 
 impl AdapterCommand {
@@ -424,7 +432,8 @@ impl AdapterCommand {
             | Self::ResendMessage { protocol, .. }
             | Self::ViewChat { protocol, .. }
             | Self::ViewTopic { protocol, .. }
-            | Self::RestartHelper { protocol } => protocol,
+            | Self::RestartHelper { protocol }
+            | Self::DownloadFile { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
             Self::WhatsAppAcknowledgeRisk
@@ -513,6 +522,37 @@ pub enum AdapterEvent {
         conversation_id: String,
         message_id: String,
         body: String,
+    },
+    /// Replace the caption, the links, and the photo of a message. A text
+    /// edit sets `photo` to `None`.
+    MessageMedia {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        body: String,
+        links: Vec<crate::media::MessageLink>,
+        photo: Option<crate::media::MessagePhoto>,
+    },
+    /// Links found after the message was shown. Does not change the body.
+    MessageLinks {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        links: Vec<crate::media::MessageLink>,
+    },
+    /// A photo file finished downloading.
+    PhotoReady {
+        protocol: ProtocolId,
+        file_id: i32,
+        /// Set for a normal photo. A secret photo leaves this empty.
+        path: Option<crate::media::ImagePath>,
+        /// Set for a secret photo. The file is not kept.
+        bytes: Option<crate::media::ImageBytes>,
+    },
+    /// A photo file did not download.
+    PhotoFailed {
+        protocol: ProtocolId,
+        file_id: i32,
     },
     /// Drop messages TDLib deleted. They stay gone for this session.
     MessagesRemoved {
@@ -634,6 +674,10 @@ impl AdapterEvent {
             Self::ConversationRemoved { protocol, .. }
             | Self::MessageReplaced { protocol, .. }
             | Self::MessageBody { protocol, .. }
+            | Self::MessageMedia { protocol, .. }
+            | Self::MessageLinks { protocol, .. }
+            | Self::PhotoReady { protocol, .. }
+            | Self::PhotoFailed { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }
@@ -788,6 +832,10 @@ pub struct ChatMessage {
     pub arrival: Arrival,
     /// The forum topic or bot thread this message belongs to.
     pub topic: Option<MessageTopic>,
+    /// Links inside [`Self::body`]. Empty when the text has none.
+    pub links: Vec<crate::media::MessageLink>,
+    /// A photo. [`Self::body`] is the caption, and it can be empty.
+    pub photo: Option<crate::media::MessagePhoto>,
 }
 
 /// How a message reached the app.
@@ -949,6 +997,63 @@ pub(crate) fn emit_message_body(
         message_id: message_id.into(),
         body: body.into(),
     });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_message_media(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    message_id: impl Into<String>,
+    body: impl Into<String>,
+    links: Vec<crate::media::MessageLink>,
+    photo: Option<crate::media::MessagePhoto>,
+) {
+    let _ = events.send(AdapterEvent::MessageMedia {
+        protocol,
+        conversation_id: conversation_id.into(),
+        message_id: message_id.into(),
+        body: body.into(),
+        links,
+        photo,
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_message_links(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    message_id: impl Into<String>,
+    links: Vec<crate::media::MessageLink>,
+) {
+    let _ = events.send(AdapterEvent::MessageLinks {
+        protocol,
+        conversation_id: conversation_id.into(),
+        message_id: message_id.into(),
+        links,
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_photo_ready(
+    events: &EventTx,
+    protocol: ProtocolId,
+    file_id: i32,
+    path: Option<crate::media::ImagePath>,
+    bytes: Option<crate::media::ImageBytes>,
+) {
+    let _ = events.send(AdapterEvent::PhotoReady {
+        protocol,
+        file_id,
+        path,
+        bytes,
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_photo_failed(events: &EventTx, protocol: ProtocolId, file_id: i32) {
+    let _ = events.send(AdapterEvent::PhotoFailed { protocol, file_id });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]

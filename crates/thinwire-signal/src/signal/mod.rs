@@ -646,6 +646,8 @@ mod tests {
             sent_at: 0,
             arrival: thinwire_protocol::Arrival::History,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         }
     }
 

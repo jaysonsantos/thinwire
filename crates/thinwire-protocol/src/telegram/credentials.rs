@@ -276,6 +276,21 @@ mod tests {
             stage.contains("dist/THIRD_PARTY_NOTICES"),
             "os-zips must place third-party notices in the payload tree"
         );
+        for notice in [
+            "egui_extras-LICENSE-MIT.txt",
+            "egui_extras-LICENSE-APACHE.txt",
+            "image-LICENSE-MIT.txt",
+            "image-LICENSE-APACHE.txt",
+            "png-LICENSE-MIT.txt",
+            "image-webp-LICENSE-MIT.txt",
+            "zune-jpeg-LICENSE-ZLIB.txt",
+            "zune-core-LICENSE-APACHE.txt",
+        ] {
+            assert!(
+                stage.contains(notice),
+                "os-zips must ship the chat-photo notice {notice}"
+            );
+        }
         assert!(
             stage.contains("/usr/share/doc/"),
             "Linux payloads must attach the LLVM runtime package copyright files"

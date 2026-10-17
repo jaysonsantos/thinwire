@@ -32,6 +32,17 @@ ui-snapshots = ["egui_kittest/snapshot", "egui_kittest/wgpu"]
 chrono.workspace = true
 eframe.workspace = true
 egui.workspace = true
+# Image decode for chat photos. jpeg, png, and webp only. eframe stays on
+# glow (ADR 0002): do not enable wgpu here.
+egui_extras = { version = "0.36", default-features = false, features = [
+  "image",
+] }
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+] }
+webbrowser = "1"
 thinwire-core.workspace = true
 thinwire-notify.workspace = true
 thinwire-protocol.workspace = true
