@@ -16,6 +16,11 @@
       "description": "libsqlite3-sys must match presage-store-sqlite and whatsapp-rust. Only one version can link.",
       "matchPackageNames": ["libsqlite3-sys"],
       "allowedVersions": "<0.37"
+    },
+    {
+      "description": "notify-rust 4.18.2, zbus-secret-service-keyring-store 1.0.1, and secret-service 5.2.0 require zbus ^5. crates/thinwire-notify must use the same zbus major as the keychain.",
+      "matchPackageNames": ["zbus"],
+      "allowedVersions": "<6"
     }
   ]
 }
