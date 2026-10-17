@@ -29,7 +29,7 @@ todo = "deny"
 # Glow only (council GUI A). Do not enable wgpu or wgpu_no_default_features.
 # Cargo rejects `winit/default` on a consumer of eframe; thinwire depends on
 # `winit` with default features so unification matches eframe's default set.
-eframe = { version = "0.36", default-features = false, features = [
+eframe = { version = "0.37", default-features = false, features = [
   "accesskit",
   "default_fonts",
   "glow",
@@ -37,7 +37,7 @@ eframe = { version = "0.36", default-features = false, features = [
   "wayland",
   "x11",
 ] }
-egui = "0.36"
+egui = "0.37"
 # Local time for message timestamps. `clock` reads the OS time zone.
 chrono = { version = "0.4", default-features = false, features = [
   "clock",
