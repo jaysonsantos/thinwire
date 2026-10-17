@@ -93,6 +93,14 @@ pub enum Intent {
     /// Start the helper process of this protocol again (ADR 0013). It acts
     /// only while the account row shows "Helper stopped."
     RestartHelper(ProtocolId),
+    /// Download one photo that is on screen. The core sends one request
+    /// until that file finishes or fails.
+    LoadPhoto {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        file_id: i32,
+    },
     /// Telegram login and account actions.
     Telegram(TelegramIntent),
     /// Experimental WhatsApp pairing. Only a `whatsapp-web` build acts on it.

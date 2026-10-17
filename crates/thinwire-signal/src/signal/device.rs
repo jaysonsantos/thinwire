@@ -127,6 +127,8 @@ impl SignalDevice for FakeDevice {
             sent_at: 0,
             arrival: thinwire_protocol::Arrival::History,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         };
         self.history
             .entry(conversation_id.to_string())

@@ -15,6 +15,8 @@ mod lifecycle;
 mod router;
 
 #[cfg(feature = "telegram-tdlib")]
+mod media_map;
+#[cfg(feature = "telegram-tdlib")]
 mod tdlib;
 
 use std::fmt;
@@ -483,6 +485,11 @@ impl ProtocolAdapter for TelegramAdapter {
                 }
                 result
             }
+            AdapterCommand::DownloadFile {
+                protocol: ProtocolId::Telegram,
+                file_id,
+                secret,
+            } => self.dispatch_live(events, LiveCall::DownloadFile { file_id, secret }),
             other => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Telegram,
                 reason: command_mismatch(other),
@@ -552,6 +559,10 @@ enum LiveCall {
         topic: MessageTopic,
         body: String,
         request: u64,
+    },
+    DownloadFile {
+        file_id: i32,
+        secret: bool,
     },
 }
 
@@ -637,6 +648,10 @@ impl TelegramAdapter {
                         source,
                         events,
                     );
+                }
+                LiveCall::DownloadFile { file_id, secret } => {
+                    self.tdlib
+                        .download_file(file_id, secret, secrets, source, events);
                 }
             }
             Ok(())
@@ -1271,7 +1286,7 @@ mod tests {
             "not ready, bad chat id, empty text, and TDLib error each name the send"
         );
         let pending = send
-            .find("emit_mapped_message(events, &message")
+            .find("emit_mapped_message(client_id, events, &message, live, None)")
             .expect("pending row");
         let accepted = send
             .find("emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request)")

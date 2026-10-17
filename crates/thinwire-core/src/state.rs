@@ -590,6 +590,8 @@ pub struct Snapshot {
     /// Name of the folder the worker moved aside. Shown on the next phone step.
     data_reset: Option<String>,
     api_source: TelegramApiSource,
+    /// Telegram photo downloads in flight, keyed by protocol and file id.
+    photo_downloads: HashSet<(ProtocolId, i32)>,
     pending: Vec<AdapterCommand>,
     keychain_flush: bool,
     /// Accounts that ended for good in this pump: a Telegram session that
@@ -816,6 +818,7 @@ impl Snapshot {
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
+            photo_downloads: HashSet::new(),
             keychain_flush: false,
             ended_accounts: Vec::new(),
             helper_errors: HashMap::new(),
@@ -1060,6 +1063,34 @@ impl Snapshot {
                 message_id,
                 body,
             } => self.patch_message_body(protocol, &conversation_id, &message_id, body),
+            AdapterEvent::MessageMedia {
+                protocol,
+                conversation_id,
+                message_id,
+                body,
+                links,
+                photo,
+            } => self.patch_message_media(
+                protocol,
+                &conversation_id,
+                &message_id,
+                body,
+                links,
+                photo,
+            ),
+            AdapterEvent::MessageLinks {
+                protocol,
+                conversation_id,
+                message_id,
+                links,
+            } => self.patch_message_links(protocol, &conversation_id, &message_id, links),
+            AdapterEvent::PhotoReady {
+                protocol,
+                file_id,
+                path,
+                bytes,
+            } => self.photo_ready(protocol, file_id, path, bytes),
+            AdapterEvent::PhotoFailed { protocol, file_id } => self.photo_failed(protocol, file_id),
             AdapterEvent::MessagesRemoved {
                 protocol,
                 conversation_id,
@@ -3904,6 +3935,150 @@ impl Snapshot {
         }
     }
 
+    fn patch_message_media(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        body: String,
+        links: Vec<thinwire_protocol::MessageLink>,
+        photo: Option<thinwire_protocol::MessagePhoto>,
+    ) {
+        let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
+            return;
+        };
+        message.body = body;
+        message.links = links;
+        message.photo = photo;
+    }
+
+    fn patch_message_links(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        links: Vec<thinwire_protocol::MessageLink>,
+    ) {
+        let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
+            return;
+        };
+        message.links = links;
+    }
+
+    /// Download one photo that is on screen. A second request while the first
+    /// is in flight does nothing. `PhotoFailed` lets a later request try again.
+    pub(crate) fn load_photo(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        file_id: i32,
+    ) {
+        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+            return;
+        }
+        let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
+            return;
+        };
+        if key.2 != self.selected_topic {
+            return;
+        }
+        let (known, ready, secret) = {
+            let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
+                return;
+            };
+            let Some(photo) = message.photo.as_mut() else {
+                return;
+            };
+            let known = photo.sizes.iter().any(|size| size.file_id == Some(file_id));
+            let ready = photo
+                .sizes
+                .iter()
+                .any(|size| size.file_id == Some(file_id) && size.ready());
+            if known && !ready {
+                photo.failed = false;
+            }
+            (known, ready, photo.is_secret)
+        };
+        if !known || ready || !self.photo_downloads.insert((protocol, file_id)) {
+            return;
+        }
+        self.queue(AdapterCommand::DownloadFile {
+            protocol,
+            file_id,
+            secret,
+        });
+    }
+
+    fn photo_ready(
+        &mut self,
+        protocol: ProtocolId,
+        file_id: i32,
+        path: Option<thinwire_protocol::ImagePath>,
+        bytes: Option<thinwire_protocol::ImageBytes>,
+    ) {
+        self.photo_downloads.remove(&(protocol, file_id));
+        for list in self.messages.values_mut() {
+            for message in list.iter_mut() {
+                if message.protocol != protocol {
+                    continue;
+                }
+                let Some(photo) = message.photo.as_mut() else {
+                    continue;
+                };
+                let mut hit = false;
+                for size in &mut photo.sizes {
+                    if size.file_id != Some(file_id) {
+                        continue;
+                    }
+                    hit = true;
+                    if photo.is_secret {
+                        size.path = None;
+                        size.bytes = bytes.clone();
+                    } else {
+                        size.path = path.clone();
+                        if bytes.is_some() {
+                            size.bytes = bytes.clone();
+                        }
+                    }
+                }
+                if hit {
+                    photo.failed = false;
+                }
+            }
+        }
+    }
+
+    fn photo_failed(&mut self, protocol: ProtocolId, file_id: i32) {
+        self.photo_downloads.remove(&(protocol, file_id));
+        for list in self.messages.values_mut() {
+            for message in list.iter_mut() {
+                if message.protocol != protocol {
+                    continue;
+                }
+                let Some(photo) = message.photo.as_mut() else {
+                    continue;
+                };
+                if photo.sizes.iter().any(|size| size.file_id == Some(file_id)) {
+                    photo.failed = true;
+                }
+            }
+        }
+    }
+
+    fn message_mut(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Option<&mut ChatMessage> {
+        let key = self.message_bucket(protocol, conversation_id, message_id)?;
+        self.messages
+            .get_mut(&key)?
+            .iter_mut()
+            .find(|row| row.id == message_id)
+    }
+
     /// WhatsApp pairing chrome when feature `whatsapp-web` is compiled.
     ///
     /// The entry does not wait for a linked Telegram account. The default
@@ -5147,7 +5322,153 @@ mod tests {
             sent_at: 0,
             arrival: thinwire_protocol::Arrival::History,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         }
+    }
+
+    #[test]
+    fn a_photo_download_is_queued_once_until_it_fails() {
+        use thinwire_protocol::{MessagePhoto, PhotoSize};
+
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:1".into(),
+                title: "Ada".into(),
+                participant: "Ada".into(),
+                preview: String::new(),
+                unread: 0,
+                order: 1,
+                last_at: 1,
+                is_group: false,
+                writable: true,
+                placeholder: false,
+                muted: false,
+                has_topics: false,
+            },
+        });
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        let mut message = telegram_text(1, 2, "");
+        message.photo = Some(MessagePhoto {
+            width: 100,
+            height: 80,
+            mini: None,
+            sizes: vec![PhotoSize {
+                width: 100,
+                height: 80,
+                file_id: Some(7),
+                path: None,
+                bytes: None,
+            }],
+            has_spoiler: false,
+            is_secret: false,
+            failed: false,
+        });
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        let chat = "telegram:1";
+        let id = "telegram:1:2";
+        snapshot.load_photo(ProtocolId::Telegram, chat, id, 7);
+        snapshot.load_photo(ProtocolId::Telegram, chat, id, 7);
+        let downloads = |commands: &[AdapterCommand]| {
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(command, AdapterCommand::DownloadFile { file_id: 7, .. })
+                })
+                .count()
+        };
+        assert_eq!(downloads(&snapshot.take_commands()), 1);
+        snapshot.apply(AdapterEvent::PhotoFailed {
+            protocol: ProtocolId::Telegram,
+            file_id: 7,
+        });
+        snapshot.load_photo(ProtocolId::Telegram, chat, id, 7);
+        assert_eq!(downloads(&snapshot.take_commands()), 1);
+    }
+
+    #[test]
+    fn a_secret_photo_stores_bytes_and_drops_the_path() {
+        use thinwire_protocol::{ImageBytes, ImagePath, MessagePhoto, PhotoSize};
+
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:1".into(),
+                title: "Ada".into(),
+                participant: "Ada".into(),
+                preview: String::new(),
+                unread: 0,
+                order: 1,
+                last_at: 1,
+                is_group: false,
+                writable: true,
+                placeholder: false,
+                muted: false,
+                has_topics: false,
+            },
+        });
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        let mut message = telegram_text(1, 2, "");
+        message.photo = Some(MessagePhoto {
+            width: 80,
+            height: 80,
+            mini: None,
+            sizes: vec![PhotoSize {
+                width: 80,
+                height: 80,
+                file_id: Some(9),
+                path: None,
+                bytes: None,
+            }],
+            has_spoiler: false,
+            is_secret: true,
+            failed: false,
+        });
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        snapshot.load_photo(ProtocolId::Telegram, "telegram:1", "telegram:1:2", 9);
+        let queued = snapshot.take_commands();
+        assert!(queued.iter().any(|command| matches!(
+            command,
+            AdapterCommand::DownloadFile {
+                file_id: 9,
+                secret: true,
+                ..
+            }
+        )));
+        snapshot.apply(AdapterEvent::PhotoReady {
+            protocol: ProtocolId::Telegram,
+            file_id: 9,
+            path: Some(ImagePath::new("/tmp/secret-photo")),
+            bytes: Some(ImageBytes::new(b"jpeg-bytes".to_vec())),
+        });
+        let photo = snapshot
+            .messages
+            .values()
+            .flatten()
+            .find(|message| message.id == "telegram:1:2")
+            .and_then(|message| message.photo.clone())
+            .expect("photo");
+        let size = &photo.sizes[0];
+        assert!(size.path.is_none());
+        assert_eq!(
+            size.bytes.as_ref().map(ImageBytes::as_slice),
+            Some(b"jpeg-bytes".as_slice())
+        );
+        assert!(!format!("{photo:?}").contains("secret-photo"));
+        assert!(!format!("{photo:?}").contains("jpeg-bytes"));
     }
 
     fn forum_row(
@@ -5797,6 +6118,8 @@ mod tests {
             sent_at: 0,
             arrival: thinwire_protocol::Arrival::History,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         }
     }
 
@@ -6076,6 +6399,8 @@ mod tests {
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.apply(AdapterEvent::OlderHistoryLoaded {
@@ -6108,6 +6433,8 @@ mod tests {
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -7986,6 +8313,8 @@ mod tests {
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         assert_eq!(
@@ -8308,6 +8637,8 @@ mod tests {
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -8322,6 +8653,8 @@ mod tests {
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -8336,6 +8669,8 @@ mod tests {
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -8359,6 +8694,8 @@ mod tests {
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -8397,6 +8734,8 @@ mod tests {
                     sent_at: 0,
                     arrival: thinwire_protocol::Arrival::History,
                     topic: None,
+                    links: Vec::new(),
+                    photo: None,
                 },
             });
         }
@@ -8452,6 +8791,8 @@ mod tests {
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         let _ = snapshot.take_commands();
@@ -8637,6 +8978,8 @@ mod tests {
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -8914,6 +9257,8 @@ mod tests {
                     sent_at: 1,
                     arrival: thinwire_protocol::Arrival::History,
                     topic: None,
+                    links: Vec::new(),
+                    photo: None,
                 },
             });
             snapshot.apply(AdapterEvent::HistoryLoaded {
@@ -8989,6 +9334,8 @@ mod tests {
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageDelivery {
@@ -9905,6 +10252,8 @@ mod tests {
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.take_commands();
@@ -9949,6 +10298,8 @@ mod tests {
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.take_commands();
@@ -10489,6 +10840,8 @@ mod tests {
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.retry_send("discord:pending:2:1");
@@ -10556,6 +10909,8 @@ mod tests {
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.retry_send("discord:row-b");
@@ -11718,6 +12073,8 @@ mod tests {
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         });
         snapshot.retry_send("slack:C1:m1");

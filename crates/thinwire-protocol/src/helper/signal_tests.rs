@@ -234,6 +234,8 @@ impl ProtocolAdapter for FakeClient {
                         sent_at: 1_790_000_000,
                         arrival: Arrival::History,
                         topic: None,
+                        links: Vec::new(),
+                        photo: None,
                     },
                 );
                 emit_send_accepted(events, protocol, conversation_id, request);

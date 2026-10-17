@@ -4,7 +4,9 @@ mod auth;
 mod dock;
 #[cfg(test)]
 mod inbox_keys;
+mod links;
 mod motion;
+mod photos;
 mod reduce_motion;
 #[cfg(feature = "signal-local")]
 mod signal_gate;
