@@ -237,22 +237,57 @@ mod tests {
         assert_eq!(ctx.global_style().animation_time, PANEL);
     }
 
-    /// Every spinner in the shell is this helper. A direct call outside
-    /// this file would keep turning when the OS asks for less motion.
+    /// Every spinner in the shell is this helper. A direct call in any
+    /// source file would keep turning when the OS asks for less motion.
     #[test]
     fn every_spinner_goes_through_the_reduce_motion_helper() {
         let call = concat!("ui.", "spinner()");
-        let widget = concat!("Spinner::", "new()");
-        let here = include_str!("motion.rs");
-        assert_eq!(here.matches(call).count(), 1);
-        assert_eq!(here.matches(widget).count(), 1);
-        for src in [
-            include_str!("ui.rs"),
-            include_str!("auth.rs"),
-            include_str!("startup.rs"),
-        ] {
-            assert_eq!(src.matches(call).count(), 0);
-            assert_eq!(src.matches(widget).count(), 0);
+        let constructed = concat!("Spinner::", "new");
+        let defaulted = concat!("Spinner::", "default");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_sources(&root, &mut files);
+        let helper = std::path::Path::new("app").join("motion.rs");
+        let mut saw_helper = false;
+        for path in &files {
+            let src = std::fs::read_to_string(path).expect("shell source");
+            assert!(!imports_spinner(&src), "{}", path.display());
+            if path.ends_with(&helper) {
+                saw_helper = true;
+                assert_eq!(src.matches(call).count(), 1, "{}", path.display());
+                assert_eq!(src.matches(constructed).count(), 1, "{}", path.display());
+                assert_eq!(src.matches(defaulted).count(), 0, "{}", path.display());
+            } else {
+                assert_eq!(src.matches(call).count(), 0, "{}", path.display());
+                assert_eq!(src.matches(constructed).count(), 0, "{}", path.display());
+                assert_eq!(src.matches(defaulted).count(), 0, "{}", path.display());
+            }
+        }
+        assert!(saw_helper, "the scan includes the motion helper");
+        assert!(files.len() > 1, "the scan includes every shell source");
+    }
+
+    /// A `use` of `Spinner`, including `use egui::Spinner`.
+    fn imports_spinner(src: &str) -> bool {
+        let name = concat!("::", "Spinner");
+        src.lines().any(|line| {
+            let code = line.split("//").next().unwrap_or(line);
+            code.contains("use ") && code.contains(name)
+        })
+    }
+
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
+            panic!("read {}: {error}", dir.display());
+        });
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
         }
     }
 

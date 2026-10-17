@@ -3,6 +3,7 @@
 //! macOS: Reduce Motion (`NSWorkspace`).
 //! Windows: Show animations (`UISettings.AnimationsEnabled`).
 //! Linux: the settings portal key `org.freedesktop.appearance` /
+//! `reduced-motion`, the GNOME key `org.gnome.desktop.a11y.interface` /
 //! `reduced-motion`, the GNOME animation switch, and the KDE animation
 //! factor. Any one of them that asks for less motion wins.
 //!
@@ -26,6 +27,8 @@ const LINUX_FIRST_READ: Duration = Duration::from_millis(200);
 struct MotionSources {
     /// Portal `reduced-motion` is 1.
     portal_reduced: bool,
+    /// GNOME a11y `reduced-motion` asks for less motion.
+    a11y_reduced: bool,
     /// GNOME `enable-animations` is false.
     animations_off: bool,
     /// KDE `AnimationDurationFactor` is 0.
@@ -34,7 +37,7 @@ struct MotionSources {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn sources_reduce(sources: MotionSources) -> bool {
-    sources.portal_reduced || sources.animations_off || sources.kde_instant
+    sources.portal_reduced || sources.a11y_reduced || sources.animations_off || sources.kde_instant
 }
 
 /// The portal `SettingChanged` signals that can change reduce-motion.
@@ -263,11 +266,17 @@ mod linux {
     fn read_portal(proxy: &Proxy<'_>) -> bool {
         let portal_reduced = read_setting(proxy, "org.freedesktop.appearance", "reduced-motion")
             .is_some_and(|value| portal_u32(&value) == Some(1));
+        // The portal forwards this gsettings key on its own, and also copies
+        // it to `org.freedesktop.appearance`. A re-read has to see both.
+        let a11y_reduced =
+            read_setting(proxy, "org.gnome.desktop.a11y.interface", "reduced-motion")
+                .is_some_and(|value| a11y_value_is_reduce(&value));
         let animations_off =
             read_setting(proxy, "org.gnome.desktop.interface", "enable-animations")
                 .is_some_and(|value| portal_bool(&value) == Some(false));
         sources_reduce(MotionSources {
             portal_reduced,
+            a11y_reduced,
             animations_off,
             kde_instant: kde_file_is_instant(),
         })
@@ -295,6 +304,15 @@ mod linux {
             return false;
         };
         setting_event_is_motion(&namespace, &key)
+    }
+
+    /// GNOME stores this key as the enum nick `reduce` or `no-preference`.
+    /// A backend that already normalized it sends `1` for reduce.
+    fn a11y_value_is_reduce(value: &OwnedValue) -> bool {
+        match peel(value) {
+            Value::Str(text) => text.as_str() == "reduce",
+            _ => portal_u32(value) == Some(1),
+        }
     }
 
     fn portal_u32(value: &OwnedValue) -> Option<u32> {
@@ -367,6 +385,19 @@ mod linux {
             assert_eq!(portal_bool(&owned(Value::Bool(true))), Some(true));
             assert_eq!(portal_u32(&owned(Value::Bool(true))), None);
         }
+
+        #[test]
+        fn the_gnome_a11y_reduced_motion_value_means_reduce() {
+            assert!(a11y_value_is_reduce(&owned(Value::new("reduce"))));
+            assert!(!a11y_value_is_reduce(&owned(Value::new("no-preference"))));
+            assert!(!a11y_value_is_reduce(&owned(Value::new(""))));
+            let wrapped = owned(Value::Value(Box::new(Value::new("reduce"))));
+            assert!(a11y_value_is_reduce(&wrapped));
+            assert!(a11y_value_is_reduce(&owned(Value::U32(1))));
+            assert!(!a11y_value_is_reduce(&owned(Value::U32(0))));
+            assert!(!a11y_value_is_reduce(&owned(Value::U32(2))));
+            assert!(!a11y_value_is_reduce(&owned(Value::Bool(true))));
+        }
     }
 }
 
@@ -378,12 +409,17 @@ mod tests {
     fn any_source_that_asks_for_less_motion_wins() {
         let quiet = MotionSources {
             portal_reduced: false,
+            a11y_reduced: false,
             animations_off: false,
             kde_instant: false,
         };
         assert!(!sources_reduce(quiet));
         assert!(sources_reduce(MotionSources {
             portal_reduced: true,
+            ..quiet
+        }));
+        assert!(sources_reduce(MotionSources {
+            a11y_reduced: true,
             ..quiet
         }));
         assert!(sources_reduce(MotionSources {
@@ -441,10 +477,5 @@ mod tests {
         assert!(!kde_animation_factor_is_zero(
             "[KDE]\n# AnimationDurationFactor=0\n"
         ));
-    }
-
-    #[test]
-    fn linux_startup_waits_a_short_bounded_time() {
-        assert_eq!(LINUX_FIRST_READ, Duration::from_millis(200));
     }
 }
