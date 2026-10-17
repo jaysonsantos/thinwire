@@ -6,7 +6,7 @@
 
 #![cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::adapter::{ChatMessage, ChatTopic, Conversation, Delivery, MessageTopic, ProtocolId};
@@ -499,6 +499,10 @@ impl TopicListCursor {
 
 /// Store one forum topic. A topic that was not loaded yet is inserted.
 /// A later row replaces unread and the last-message time.
+///
+/// `false` only when the row is not a forum topic this cache can store.
+/// An identical row is stored again and returns true, so the caller still
+/// tells the core.
 #[must_use]
 pub(super) fn cache_topic(topics: &mut HashMap<(i64, i32), ChatTopic>, row: &ChatTopic) -> bool {
     let MessageTopic::Forum(id) = row.topic else {
@@ -512,6 +516,21 @@ pub(super) fn cache_topic(topics: &mut HashMap<(i64, i32), ChatTopic>, row: &Cha
     };
     topics.insert((chat_id, forum_topic_id), row.clone());
     true
+}
+
+/// Drop the cached topics of a chat that left the list.
+///
+/// The core drops those rows with the conversation. Leaving them here would
+/// make the next live message skip `getForumTopic`, and the core would not
+/// see the row. The whole map also dies with the worker, which is how an
+/// account end clears it.
+pub(super) fn forget_chat_topics(
+    topics: &mut HashMap<(i64, i32), ChatTopic>,
+    topic_lists: &mut HashSet<i64>,
+    chat_id: i64,
+) {
+    topics.retain(|(id, _), _| *id != chat_id);
+    topic_lists.remove(&chat_id);
 }
 
 /// The chat the user looks at, shared by the UI thread and the TDLib worker.
@@ -1090,6 +1109,53 @@ mod tests {
         assert_eq!(row.last_at, 30);
         assert!(row.muted);
         assert_eq!(topics.len(), 1);
+        assert!(
+            cache_topic(&mut topics, &read),
+            "an identical row is stored again, so the caller still tells the core"
+        );
+    }
+
+    /// The core drops a chat's topics when the conversation leaves. The
+    /// worker cache must drop them too, or the next message never fetches
+    /// the row.
+    #[test]
+    fn a_removed_chat_drops_its_cached_topics() {
+        let mut topics = HashMap::new();
+        let mut lists = HashSet::new();
+        let row = |chat: i64, id: i64, name: &str| ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: conversation_id(chat),
+            topic: MessageTopic::Forum(id),
+            name: name.into(),
+            unread: 1,
+            last_at: id,
+            general: id == 1,
+            hidden: id == 1,
+            closed: id == 1,
+            muted: false,
+        };
+        assert!(cache_topic(&mut topics, &row(9, 1, "General")));
+        assert!(cache_topic(&mut topics, &row(9, 4, "Trail")));
+        assert!(cache_topic(&mut topics, &row(8, 2, "Other")));
+        lists.insert(9);
+        lists.insert(8);
+        forget_chat_topics(&mut topics, &mut lists, 9);
+        assert!(
+            topics.keys().all(|(chat, _)| *chat != 9),
+            "chat 9 left the cache"
+        );
+        assert!(!lists.contains(&9));
+        assert!(lists.contains(&8));
+        assert_eq!(topics.len(), 1);
+        let again = row(9, 4, "Trail");
+        assert!(
+            cache_topic(&mut topics, &again),
+            "the next fetch stores the row, so the core is told"
+        );
+        assert_eq!(
+            topics.get(&(9, 4)).map(|topic| topic.name.as_str()),
+            Some("Trail")
+        );
     }
 
     #[test]

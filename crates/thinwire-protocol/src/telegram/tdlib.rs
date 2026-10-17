@@ -132,7 +132,10 @@ struct LiveInbox {
     /// The topic `ViewTopic` last named. `None` is the topic list or a normal chat.
     open_topic: Option<MessageTopic>,
     /// Forum topics already loaded, so a later update can keep the name,
-    /// the unread count, and the last message.
+    /// the unread count, and the last message. This map lives only as long
+    /// as the worker: an account end drops it with [`LiveInbox`]. A chat
+    /// that leaves the list drops its rows here too, because the core drops
+    /// them with the conversation.
     topics: HashMap<(i64, i32), ChatTopic>,
     /// Main-list forums whose topic list loaded. A failed load stays out,
     /// so the next chat-list pass tries again.
@@ -1021,7 +1024,14 @@ async fn apply_update(
                     .note_topic_bot(update.user.id, bot.has_topics);
                 let emit = live.linked();
                 for effect in effects {
-                    publish(events, emit, &mut live.older, Some(effect));
+                    publish(
+                        events,
+                        emit,
+                        &mut live.older,
+                        &mut live.topics,
+                        &mut live.topic_lists,
+                        Some(effect),
+                    );
                 }
             }
             load_due_forum_topics(client_id, live, events).await;
@@ -1290,6 +1300,8 @@ async fn apply_chat_update(
                 events,
                 emit,
                 &mut live.older,
+                &mut live.topics,
+                &mut live.topic_lists,
                 note_chat(&mut live.directory, &update.chat),
             );
         }
@@ -1298,6 +1310,8 @@ async fn apply_chat_update(
                 events,
                 emit,
                 &mut live.older,
+                &mut live.topics,
+                &mut live.topic_lists,
                 live.directory.set_title(update.chat_id, &update.title),
             );
         }
@@ -1307,6 +1321,8 @@ async fn apply_chat_update(
                     events,
                     emit,
                     &mut live.older,
+                    &mut live.topics,
+                    &mut live.topic_lists,
                     live.directory
                         .set_main_order(update.chat_id, update.position.order),
                 );
@@ -1317,6 +1333,8 @@ async fn apply_chat_update(
                 events,
                 emit,
                 &mut live.older,
+                &mut live.topics,
+                &mut live.topic_lists,
                 live.directory
                     .set_mute(update.chat_id, chat_mute(&update.notification_settings)),
             );
@@ -1327,7 +1345,14 @@ async fn apply_chat_update(
                 .directory
                 .set_scope_mute(mute_scope(&update.scope), muted)
             {
-                publish(events, emit, &mut live.older, Some(effect));
+                publish(
+                    events,
+                    emit,
+                    &mut live.older,
+                    &mut live.topics,
+                    &mut live.topic_lists,
+                    Some(effect),
+                );
             }
         }
         tdlib_rs::enums::Update::ChatReadInbox(update) => {
@@ -1335,6 +1360,8 @@ async fn apply_chat_update(
                 events,
                 emit,
                 &mut live.older,
+                &mut live.topics,
+                &mut live.topic_lists,
                 live.directory
                     .set_unread(update.chat_id, update.unread_count),
             );
@@ -1346,6 +1373,8 @@ async fn apply_chat_update(
                 events,
                 emit,
                 &mut live.older,
+                &mut live.topics,
+                &mut live.topic_lists,
                 live.directory
                     .set_main_position(update.chat_id, main_order(&update.positions)),
             );
@@ -1355,6 +1384,8 @@ async fn apply_chat_update(
                     events,
                     emit,
                     &mut live.older,
+                    &mut live.topics,
+                    &mut live.topic_lists,
                     live.directory
                         .set_preview(update.chat_id, &preview, i64::from(message.date)),
                 );
@@ -1366,6 +1397,8 @@ async fn apply_chat_update(
                     events,
                     emit,
                     &mut live.older,
+                    &mut live.topics,
+                    &mut live.topic_lists,
                     live.directory.set_preview(update.chat_id, "", 0),
                 );
             }
@@ -1391,6 +1424,8 @@ async fn apply_chat_update(
                 events,
                 emit,
                 &mut live.older,
+                &mut live.topics,
+                &mut live.topic_lists,
                 live.directory.set_preview(chat_id, &preview, at),
             );
         }
@@ -1460,6 +1495,8 @@ async fn apply_chat_update(
                 events,
                 emit,
                 &mut live.older,
+                &mut live.topics,
+                &mut live.topic_lists,
                 live.directory
                     .set_view_as_topics(update.chat_id, update.view_as_topics),
             );
@@ -1513,10 +1550,23 @@ async fn apply_chat_update(
     }
 }
 
-fn publish(events: &EventTx, emit: bool, older: &mut OlderHistory, effect: Option<ChatEffect>) {
+fn publish(
+    events: &EventTx,
+    emit: bool,
+    older: &mut OlderHistory,
+    topics: &mut HashMap<(i64, i32), ChatTopic>,
+    topic_lists: &mut HashSet<i64>,
+    effect: Option<ChatEffect>,
+) {
     // A chat that leaves the list drops its paging state too, even before
-    // Ready (PR #52 review).
+    // Ready (PR #52 review). Its cached topics go with it: the core drops
+    // those rows, and the next message has to fetch them again.
     older.follow(effect.as_ref());
+    if let Some(ChatEffect::Remove(id)) = effect.as_ref()
+        && let Some(chat_id) = inbox::parse_telegram_chat_id(id)
+    {
+        inbox::forget_chat_topics(topics, topic_lists, chat_id);
+    }
     if emit {
         emit_effect(events, effect);
     }
@@ -1849,6 +1899,11 @@ async fn load_due_forum_topics(client_id: i32, live: &mut LiveInbox, events: &Ev
 
 /// One topic, including one that was not in `live.topics`. Unread and the
 /// last message come from the fetched row.
+///
+/// A hidden General topic comes back the same way. `getForumTopic` fills
+/// `is_hidden` on the row and does not fail because the topic is hidden,
+/// so the core can still apply that topic's mute. The center pane hides
+/// that row; this fetch still emits it.
 async fn refresh_forum_topic(
     client_id: i32,
     chat_id: i64,
