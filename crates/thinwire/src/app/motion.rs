@@ -3,7 +3,8 @@
 //! A transition here never holds input and never moves the layout on its
 //! own. The first frame of a widget shows its end state, so a new window and
 //! each pixel snapshot start settled. `Style::animation_time` of 0 turns
-//! every transition off: they then jump to the end state.
+//! every transition off: they then jump to the end state. OS reduce-motion
+//! sets that time to 0.
 
 use eframe::egui::{self, Color32, emath::easing};
 
@@ -17,9 +18,68 @@ pub(crate) const FADE: f32 = 0.16;
 /// `Style::animation_time`.
 pub(crate) const PANEL: f32 = 0.18;
 
-/// Motion is on unless the style turns it off.
-fn enabled(ctx: &egui::Context) -> bool {
+/// Motion is on unless the style turns it off. OS reduce-motion sets
+/// [`animation_time`] to 0.
+pub(crate) fn enabled(ctx: &egui::Context) -> bool {
     ctx.global_style().animation_time > 0.0
+}
+
+/// Still text in place of a spinner when the OS asks for less motion.
+pub(crate) const WORKING: &str = "Working…";
+
+/// A spinner, or the still text [`WORKING`] when motion is off.
+///
+/// [`egui::Spinner`] asks for another frame on every paint and turns from
+/// the clock. `Style::animation_time` does not stop it, so every loading
+/// spinner in the shell goes through here.
+pub(crate) fn spinner(ui: &mut egui::Ui) {
+    paint_spinner(ui, None);
+}
+
+/// The top-bar spinner: a fixed size and color, or [`WORKING`] when motion
+/// is off.
+pub(crate) fn busy_spinner(ui: &mut egui::Ui, size: f32, color: Color32) {
+    paint_spinner(ui, Some((size, color)));
+}
+
+fn paint_spinner(ui: &mut egui::Ui, look: Option<(f32, Color32)>) {
+    if !enabled(ui.ctx()) {
+        ui.label(egui::RichText::new(WORKING).weak());
+        return;
+    }
+    match look {
+        Some((size, color)) => {
+            ui.add(egui::Spinner::new().size(size).color(color));
+        }
+        None => {
+            ui.spinner();
+        }
+    }
+}
+
+/// Seconds for one egui transition. `0` when the OS asks for less motion.
+pub(crate) fn animation_time(reduce_motion: bool) -> f32 {
+    if reduce_motion { 0.0 } else { PANEL }
+}
+
+/// Write [`animation_time`] into the light style and the dark style.
+pub(crate) fn apply(ctx: &egui::Context, reduce_motion: bool) {
+    let time = animation_time(reduce_motion);
+    if ctx.style_of(egui::Theme::Light).animation_time == time
+        && ctx.style_of(egui::Theme::Dark).animation_time == time
+    {
+        return;
+    }
+    ctx.all_styles_mut(|style| style.animation_time = time);
+}
+
+/// Apply the latest OS value. `true` when it changed since `last`, so the
+/// caller can repaint at once. The first value is stored and applied.
+pub(crate) fn follow(ctx: &egui::Context, last: &mut Option<bool>, reduce_motion: bool) -> bool {
+    apply(ctx, reduce_motion);
+    let changed = last.is_some_and(|prev| prev != reduce_motion);
+    *last = Some(reduce_motion);
+    changed
 }
 
 /// 0 → 1 when `on` turns true, 1 → 0 when it turns false. Starts fast and
@@ -148,6 +208,87 @@ mod tests {
             seen.1 = toggle(ctx, id.with("t"), true, HOVER);
         });
         assert!(!repaint, "no motion, no extra frames");
+    }
+
+    #[test]
+    fn reduce_motion_sets_animation_time_to_zero_on_both_themes() {
+        let ctx = egui::Context::default();
+        apply(&ctx, false);
+        assert_eq!(ctx.style_of(egui::Theme::Light).animation_time, PANEL);
+        assert_eq!(ctx.style_of(egui::Theme::Dark).animation_time, PANEL);
+        apply(&ctx, true);
+        assert_eq!(ctx.style_of(egui::Theme::Light).animation_time, 0.0);
+        assert_eq!(ctx.style_of(egui::Theme::Dark).animation_time, 0.0);
+        assert!(!enabled(&ctx));
+    }
+
+    /// The OS value can change while the window is open. The next follow
+    /// applies it.
+    #[test]
+    fn a_later_reduce_motion_value_applies_without_a_restart() {
+        let ctx = egui::Context::default();
+        let mut last = None;
+        assert!(!follow(&ctx, &mut last, false));
+        assert_eq!(ctx.global_style().animation_time, PANEL);
+        assert!(follow(&ctx, &mut last, true));
+        assert_eq!(ctx.global_style().animation_time, 0.0);
+        assert!(!follow(&ctx, &mut last, true));
+        assert!(follow(&ctx, &mut last, false));
+        assert_eq!(ctx.global_style().animation_time, PANEL);
+    }
+
+    /// Every spinner in the shell is this helper. A direct call in any
+    /// source file would keep turning when the OS asks for less motion.
+    #[test]
+    fn every_spinner_goes_through_the_reduce_motion_helper() {
+        let call = concat!("ui.", "spinner()");
+        let constructed = concat!("Spinner::", "new");
+        let defaulted = concat!("Spinner::", "default");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_sources(&root, &mut files);
+        let helper = std::path::Path::new("app").join("motion.rs");
+        let mut saw_helper = false;
+        for path in &files {
+            let src = std::fs::read_to_string(path).expect("shell source");
+            assert!(!imports_spinner(&src), "{}", path.display());
+            if path.ends_with(&helper) {
+                saw_helper = true;
+                assert_eq!(src.matches(call).count(), 1, "{}", path.display());
+                assert_eq!(src.matches(constructed).count(), 1, "{}", path.display());
+                assert_eq!(src.matches(defaulted).count(), 0, "{}", path.display());
+            } else {
+                assert_eq!(src.matches(call).count(), 0, "{}", path.display());
+                assert_eq!(src.matches(constructed).count(), 0, "{}", path.display());
+                assert_eq!(src.matches(defaulted).count(), 0, "{}", path.display());
+            }
+        }
+        assert!(saw_helper, "the scan includes the motion helper");
+        assert!(files.len() > 1, "the scan includes every shell source");
+    }
+
+    /// A `use` of `Spinner`, including `use egui::Spinner`.
+    fn imports_spinner(src: &str) -> bool {
+        let name = concat!("::", "Spinner");
+        src.lines().any(|line| {
+            let code = line.split("//").next().unwrap_or(line);
+            code.contains("use ") && code.contains(name)
+        })
+    }
+
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
+            panic!("read {}: {error}", dir.display());
+        });
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
     }
 
     #[test]
