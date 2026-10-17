@@ -240,6 +240,7 @@ mod tests {
         NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: format!("telegram:{n}"),
+            topic: None,
         }
     }
 

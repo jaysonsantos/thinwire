@@ -259,6 +259,7 @@ impl SignalAdapter {
                     before_message_id: before_message_id.to_string(),
                     more: true,
                     note: Some("Signal is not linked".to_string()),
+                    topic: None,
                 });
             }
             return Ok(());
@@ -270,6 +271,7 @@ impl SignalAdapter {
             before_message_id: before_message_id.to_string(),
             more: false,
             note: None,
+            topic: None,
         });
         Ok(())
     }
@@ -628,6 +630,7 @@ mod tests {
             writable: true,
             muted: false,
             placeholder: false,
+            has_topics: false,
         }
     }
 
@@ -642,6 +645,7 @@ mod tests {
             delivery: thinwire_protocol::Delivery::Sent,
             sent_at: 0,
             arrival: thinwire_protocol::Arrival::History,
+            topic: None,
         }
     }
 

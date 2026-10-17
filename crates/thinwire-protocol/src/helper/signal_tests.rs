@@ -151,6 +151,7 @@ impl FakeClient {
             writable: true,
             placeholder: false,
             muted: false,
+            has_topics: false,
         }
     }
 
@@ -232,6 +233,7 @@ impl ProtocolAdapter for FakeClient {
                         delivery: Delivery::Sent,
                         sent_at: 1_790_000_000,
                         arrival: Arrival::History,
+                        topic: None,
                     },
                 );
                 emit_send_accepted(events, protocol, conversation_id, request);

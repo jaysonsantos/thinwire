@@ -6,7 +6,7 @@
 //! one match. Typed secrets use [`SecretText`], so `Debug` stays clean.
 
 use crate::notify::NotifyKey;
-use thinwire_protocol::ProtocolId;
+use thinwire_protocol::{MessageTopic, ProtocolId};
 
 use crate::state::{AuthKey, InboxFilter};
 use crate::{SecretText, ThemeMode};
@@ -19,6 +19,12 @@ pub enum Intent {
     SelectProtocol(ProtocolId),
     /// Open a chat of the selected protocol and load its recent messages.
     SelectConversation { id: String },
+    /// Open one topic of a chat. The chat id is named so a click in the
+    /// same frame cannot apply to another chat.
+    SelectTopic {
+        conversation_id: String,
+        topic: MessageTopic,
+    },
     /// Move the inbox highlight by `delta` rows. Down is positive.
     /// This does not open the chat and does not focus the compose field.
     MoveInbox { delta: i32 },
@@ -42,6 +48,7 @@ pub enum Intent {
     SetDraft {
         protocol: ProtocolId,
         conversation_id: String,
+        topic: Option<MessageTopic>,
         text: SecretText,
     },
     /// Send the draft of this chat. Dropped when the chat is no longer the
@@ -49,6 +56,7 @@ pub enum Intent {
     SendDraft {
         protocol: ProtocolId,
         conversation_id: String,
+        topic: Option<MessageTopic>,
     },
     /// Send a failed outgoing message again.
     Retry { message_id: String },
@@ -58,6 +66,7 @@ pub enum Intent {
     LoadOlderMessages {
         protocol: ProtocolId,
         conversation_id: String,
+        topic: Option<MessageTopic>,
     },
     /// Read the OS keychain again after a failed read. The read runs off the caller thread.
     RetryKeychain,
@@ -209,6 +218,7 @@ mod tests {
             Intent::SetDraft {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
+                topic: None,
                 text: SecretText::new("draft-fixture-3b7"),
             },
             Intent::SetSearch(SecretText::new("search-fixture-6e5")),

@@ -718,6 +718,7 @@ impl Inbox {
                 writable: true,
                 placeholder: false,
                 muted: record.mute.is_on(now_ms()),
+                has_topics: false,
             },
         })
     }
@@ -768,6 +769,7 @@ impl Inbox {
             delivery,
             sent_at: message.timestamp,
             arrival,
+            topic: None,
         }
     }
 }

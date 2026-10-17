@@ -92,10 +92,15 @@ pub(crate) fn command_to_wire(
             WireCommand::CancelLink
         }
         // The app answers these itself. They never cross the pipe.
+        // Topic commands are Telegram-only. A helper never sees them.
         AdapterCommand::Shutdown { .. }
         | AdapterCommand::RestartHelper { .. }
         | AdapterCommand::ConnectDiscord { .. }
-        | AdapterCommand::TelegramAuth { .. } => return None,
+        | AdapterCommand::TelegramAuth { .. }
+        | AdapterCommand::OpenTopic { .. }
+        | AdapterCommand::LoadOlderTopic { .. }
+        | AdapterCommand::SendTopicText { .. }
+        | AdapterCommand::ViewTopic { .. } => return None,
     })
 }
 
@@ -282,6 +287,7 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
             before_message_id,
             more,
             note,
+            topic: _,
         } if own(seen) => WireEvent::OlderHistoryLoaded {
             conversation_id,
             before_message_id,
@@ -408,6 +414,7 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
             before_message_id,
             more,
             note,
+            topic: None,
         },
         WireEvent::Qr { code, generation } => {
             let code = RedactedPairingSecret::new(code.expose());
@@ -527,6 +534,7 @@ fn conversation_from_wire(protocol: ProtocolId, conversation: WireConversation) 
         writable: conversation.writable,
         placeholder: conversation.placeholder,
         muted: conversation.muted,
+        has_topics: false,
     }
 }
 
@@ -554,6 +562,7 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
         delivery: delivery_from_wire(message.delivery),
         sent_at: message.sent_at,
         arrival: arrival_from_wire(message.arrival),
+        topic: None,
     }
 }
 
@@ -576,6 +585,7 @@ mod tests {
             delivery: Delivery::Pending,
             sent_at: 1_790_000_000,
             arrival: Arrival::Live,
+            topic: None,
         }
     }
 
@@ -593,6 +603,7 @@ mod tests {
             writable: true,
             placeholder: false,
             muted: true,
+            has_topics: false,
         }
     }
 
@@ -674,6 +685,7 @@ mod tests {
                 before_message_id: "m1".into(),
                 more: true,
                 note: Some("try again".into()),
+                topic: None,
             },
             AdapterEvent::WhatsAppQr {
                 code: RedactedPairingSecret::new("qr-fixture"),

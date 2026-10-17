@@ -20,9 +20,9 @@ use thinwire_protocol::demo::{
     DemoAdapter, DemoCounters, DemoLogin, DemoOlder, DemoScript, DemoSend,
 };
 use thinwire_protocol::{
-    AdapterEvent, AdapterHost, AdapterStatus, ChatMessage, Conversation, Delivery, ProtocolAdapter,
-    ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthError, TelegramAuthPhase,
-    TelegramAuthStep, WhatsAppPhoneVault,
+    AdapterEvent, AdapterHost, AdapterStatus, ChatMessage, ChatTopic, Conversation, Delivery,
+    MessageTopic, ProtocolAdapter, ProtocolCapabilities, ProtocolId, TelegramApiSource,
+    TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, WhatsAppPhoneVault, topic_mute_id,
 };
 use tokio::runtime::Handle;
 
@@ -50,6 +50,7 @@ const ADA: &str = "telegram:demo-ada";
 const BOOK_CLUB: &str = "telegram:demo-book-club";
 const MILO: &str = "telegram:demo-milo";
 const NORA: &str = "telegram:demo-nora";
+const CAMP: &str = "telegram:demo-camp";
 const SLACK_GENERAL: &str = "slack:demo-general";
 const SLACK_DESIGN: &str = "slack:demo-design";
 
@@ -113,11 +114,17 @@ pub enum Scenario {
     /// The chat muted in Telegram is open: its header shows a disabled
     /// "Muted in Telegram".
     MutedByProtocol,
+    /// A forum is one sidebar row. The center pane lists its topics.
+    ForumTopics,
+    /// One topic of the forum is open.
+    OpenForumTopic,
+    /// A closed topic: a lock, and the compose box does not take text.
+    ClosedTopic,
 }
 
 impl Scenario {
     /// Every scenario, in a fixed order.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 22] = [
         Self::FirstRun,
         Self::EmptyInbox,
         Self::LongChat,
@@ -137,6 +144,9 @@ impl Scenario {
         Self::MutedInbox,
         Self::MutedHere,
         Self::MutedByProtocol,
+        Self::ForumTopics,
+        Self::OpenForumTopic,
+        Self::ClosedTopic,
     ];
 
     /// A stable snake_case name, for example for a snapshot file.
@@ -162,6 +172,9 @@ impl Scenario {
             Self::MutedInbox => "muted_inbox",
             Self::MutedHere => "muted_here",
             Self::MutedByProtocol => "muted_by_protocol",
+            Self::ForumTopics => "forum_topics",
+            Self::OpenForumTopic => "open_topic",
+            Self::ClosedTopic => "closed_topic",
         }
     }
 
@@ -280,6 +293,27 @@ impl Scenario {
                     _ => ADA,
                 }));
             }
+            Self::ForumTopics | Self::OpenForumTopic | Self::ClosedTopic => {
+                telegram = forum_script();
+                setup.intents.push(Intent::SetChatMute {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id: topic_mute_id(CAMP, MessageTopic::Forum(3)),
+                    muted: true,
+                });
+                setup.intents.push(select(CAMP));
+                let topic = match self {
+                    Self::OpenForumTopic => Some(MessageTopic::Forum(2)),
+                    Self::ClosedTopic => Some(MessageTopic::Forum(4)),
+                    Self::ForumTopics => None,
+                    _ => None,
+                };
+                if let Some(topic) = topic {
+                    setup.intents.push(Intent::SelectTopic {
+                        conversation_id: CAMP.into(),
+                        topic,
+                    });
+                }
+            }
         }
         setup.scripts.insert(0, telegram);
         // Every catalog protocol has an adapter, so Shutdown gets a Stopped
@@ -395,6 +429,7 @@ fn older(id: &str) -> Intent {
     Intent::LoadOlderMessages {
         protocol: ProtocolId::Telegram,
         conversation_id: id.into(),
+        topic: None,
     }
 }
 
@@ -404,11 +439,13 @@ fn send(id: &str, text: &str) -> [Intent; 3] {
         Intent::SetDraft {
             protocol: ProtocolId::Telegram,
             conversation_id: id.into(),
+            topic: None,
             text: SecretText::new(text),
         },
         Intent::SendDraft {
             protocol: ProtocolId::Telegram,
             conversation_id: id.into(),
+            topic: None,
         },
     ]
 }
@@ -551,6 +588,63 @@ fn muted_rows() -> Vec<Conversation> {
         .collect()
 }
 
+fn forum_script() -> DemoScript {
+    let mut camp = row(
+        ProtocolId::Telegram,
+        CAMP,
+        "Camp forum",
+        "Meet at the ridge.",
+        4,
+        true,
+    );
+    camp.has_topics = true;
+    let mut script = telegram_linked(vec![camp]);
+    script.start.extend([
+        forum_topic(1, "General", 1, NOW - 5 * HOUR, true, false),
+        forum_topic(2, "Trail", 2, NOW - HOUR, false, false),
+        forum_topic(3, "Food", 4, NOW - 2 * HOUR, false, false),
+        forum_topic(4, "Archive", 0, NOW - 6 * HOUR, false, true),
+    ]);
+    script.history.insert(CAMP.into(), forum_messages());
+    script
+}
+
+fn forum_topic(
+    id: i64,
+    name: &str,
+    unread: u32,
+    last_at: i64,
+    general: bool,
+    closed: bool,
+) -> AdapterEvent {
+    AdapterEvent::TopicUpsert {
+        topic: ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: CAMP.into(),
+            topic: MessageTopic::Forum(id),
+            name: name.into(),
+            unread,
+            last_at,
+            general,
+            hidden: false,
+            closed,
+            muted: false,
+        },
+    }
+}
+
+fn forum_messages() -> Vec<ChatMessage> {
+    let mut welcome = message(CAMP, 1, "Ada", "Welcome to camp.", NOW - 5 * HOUR);
+    welcome.topic = Some(MessageTopic::Forum(1));
+    let mut meet = message(CAMP, 2, "Ada", "Meet at the ridge.", NOW - HOUR);
+    meet.topic = Some(MessageTopic::Forum(2));
+    let mut map = message(CAMP, 3, "You", "I will bring the map.", NOW - HOUR + MINUTE);
+    map.topic = Some(MessageTopic::Forum(2));
+    let mut packed = message(CAMP, 4, "Ada", "The box is packed.", NOW - 6 * HOUR);
+    packed.topic = Some(MessageTopic::Forum(4));
+    vec![welcome, meet, map, packed]
+}
+
 fn row(
     protocol: ProtocolId,
     id: &str,
@@ -572,6 +666,7 @@ fn row(
         writable: true,
         muted: false,
         placeholder: false,
+        has_topics: false,
     }
 }
 
@@ -591,6 +686,7 @@ fn message(chat: &str, index: usize, sender: &str, body: &str, sent_at: i64) -> 
         delivery: Delivery::Sent,
         sent_at,
         arrival: thinwire_protocol::Arrival::History,
+        topic: None,
     }
 }
 
@@ -786,6 +882,36 @@ mod tests {
                         ChatMute::Protocol,
                         "{name}"
                     );
+                }
+                Scenario::ForumTopics | Scenario::OpenForumTopic | Scenario::ClosedTopic => {
+                    assert!(
+                        view.showing_topic_list() || view.open_topic().is_some(),
+                        "{name}"
+                    );
+                    let rows = view.visible_conversations();
+                    let row = rows.iter().find(|row| row.id == CAMP).expect("forum row");
+                    match scenario {
+                        Scenario::ForumTopics => {
+                            assert!(view.showing_topic_list(), "{name}");
+                            assert_eq!(view.selected_topics().len(), 4, "{name}");
+                            assert_eq!(view.display_unread(row), 3, "{name}");
+                            assert_eq!(view.selected_topics()[0].name, "General", "{name}");
+                            assert_eq!(view.selected_topics()[1].name, "Trail", "{name}");
+                        }
+                        Scenario::OpenForumTopic => {
+                            let topic = view.open_topic().expect("topic");
+                            assert_eq!(topic.name, "Trail", "{name}");
+                            assert_eq!(view.compose_hint(), "Message in Trail", "{name}");
+                            assert!(!view.selected_messages().is_empty(), "{name}");
+                            assert_eq!(view.display_unread(row), 1, "{name}");
+                        }
+                        Scenario::ClosedTopic => {
+                            assert!(view.topic_closed(), "{name}");
+                            assert!(!view.can_send(), "{name}");
+                            assert_eq!(view.display_unread(row), 3, "{name}");
+                        }
+                        _ => {}
+                    }
                 }
             }
             if scenario == Scenario::SeveralProtocols {

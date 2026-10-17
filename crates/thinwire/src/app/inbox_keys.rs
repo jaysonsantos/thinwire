@@ -480,6 +480,7 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         delivery: Delivery::Sent,
         sent_at,
         arrival: thinwire_protocol::Arrival::History,
+        topic: None,
     }
 }
 

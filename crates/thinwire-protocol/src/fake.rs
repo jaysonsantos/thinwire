@@ -83,6 +83,7 @@ impl ProtocolAdapter for FakeAdapter {
                         writable: true,
                         placeholder: false,
                         muted: false,
+                        has_topics: false,
                     },
                 );
                 emit_message(
@@ -97,6 +98,7 @@ impl ProtocolAdapter for FakeAdapter {
                         delivery: Delivery::Sent,
                         sent_at: FAKE_SENT_AT,
                         arrival: crate::Arrival::History,
+                        topic: None,
                     },
                 );
                 Ok(())

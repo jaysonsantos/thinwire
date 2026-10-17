@@ -670,6 +670,7 @@ impl Supervisor {
                 before_message_id.clone(),
                 false,
                 None,
+                None,
             ),
             WireCommand::SendText {
                 conversation_id,

@@ -8,7 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use thinwire_protocol::{Arrival, ChatMessage, Conversation, ProtocolId};
+use thinwire_protocol::{Arrival, ChatMessage, Conversation, ProtocolId, topic_mute_id};
 
 use crate::mutes::ChatMute;
 
@@ -31,6 +31,8 @@ pub const HIDDEN_PREVIEW: &str = "New message";
 pub struct NotifyKey {
     pub protocol: ProtocolId,
     pub conversation_id: String,
+    /// The forum topic or bot thread. `None` is the whole chat.
+    pub topic: Option<thinwire_protocol::MessageTopic>,
 }
 
 /// What a frontend shows. A new message in the same chat replaces it.
@@ -112,9 +114,15 @@ pub(crate) struct NotifyContext<'a> {
     pub preview: bool,
     pub window_focused: bool,
     pub viewed: Option<(ProtocolId, &'a str)>,
+    /// The open topic, when `viewed` is a forum or a bot chat.
+    pub viewed_topic: Option<thinwire_protocol::MessageTopic>,
     pub has_session: bool,
     /// The chat of the message is muted in thinwire (#153).
     pub muted_here: bool,
+    /// This topic is muted in the protocol or in thinwire.
+    pub topic_muted: bool,
+    /// Name of the message's topic, for the notification title.
+    pub topic_name: Option<&'a str>,
     /// Unix seconds.
     pub now: i64,
 }
@@ -155,10 +163,11 @@ pub(crate) fn decide(
         return Err(SkipReason::UnknownChat);
     };
     // A thinwire mute counts like a protocol mute (#153).
-    if ChatMute::of(chat.muted, ctx.muted_here).is_muted() {
+    if ChatMute::of(chat.muted, ctx.muted_here).is_muted() || ctx.topic_muted {
         return Err(SkipReason::Muted);
     }
-    let seen = ctx.viewed == Some((message.protocol, message.conversation_id.as_str()));
+    let seen = ctx.viewed == Some((message.protocol, message.conversation_id.as_str()))
+        && message.topic == ctx.viewed_topic;
     if ctx.window_focused && seen {
         return Err(SkipReason::Viewed);
     }
@@ -234,6 +243,11 @@ impl Notifications {
         let key = NotifyKey {
             protocol: message.protocol,
             conversation_id: message.conversation_id.clone(),
+            topic: message.topic,
+        };
+        let title = match ctx.topic_name {
+            Some(name) if message.topic.is_some() => format!("{} › {name}", chat.title),
+            _ => chat.title.clone(),
         };
         let count = self
             .pending
@@ -242,7 +256,7 @@ impl Notifications {
             + 1;
         let notification = Notification {
             key: key.clone(),
-            title: chat.title.clone(),
+            title,
             sender: (ctx.preview && chat.is_group).then(|| message.sender.clone()),
             preview: if ctx.preview {
                 message.body.chars().take(PREVIEW_CHARS).collect()
@@ -320,6 +334,25 @@ impl Notifications {
         keys
     }
 
+    /// Remove notifications of this chat, or of the topic named by a mute id.
+    pub(crate) fn dismiss_muted(&mut self, protocol: ProtocolId, conversation_id: &str) {
+        let keys: Vec<NotifyKey> = self
+            .pending
+            .keys()
+            .filter(|key| {
+                key.protocol == protocol
+                    && (key.conversation_id == conversation_id
+                        || key.topic.is_some_and(|topic| {
+                            topic_mute_id(&key.conversation_id, topic) == conversation_id
+                        }))
+            })
+            .cloned()
+            .collect();
+        for key in keys {
+            self.dismiss(&key);
+        }
+    }
+
     /// Remove the notification of this chat, if one shows.
     pub(crate) fn dismiss(&mut self, key: &NotifyKey) {
         if self.pending.remove(key).is_none() {
@@ -335,14 +368,16 @@ impl Notifications {
     /// chat was read on another device. Runs after each state change.
     pub(crate) fn sync(
         &mut self,
-        viewed: Option<(ProtocolId, &str)>,
+        viewed: Option<(ProtocolId, &str, Option<thinwire_protocol::MessageTopic>)>,
         has_session: impl Fn(ProtocolId) -> bool,
         chat_now: impl Fn(&NotifyKey) -> ChatNow,
     ) {
         let mut gone = Vec::new();
         for key in self.pending_keys() {
-            let seen =
-                self.window_focused && viewed == Some((key.protocol, key.conversation_id.as_str()));
+            let seen = self.window_focused
+                && viewed.is_some_and(|(protocol, chat, topic)| {
+                    protocol == key.protocol && chat == key.conversation_id && topic == key.topic
+                });
             let read_elsewhere = match chat_now(&key) {
                 ChatNow::Gone => true,
                 ChatNow::Listed { unread: 0 } => self
@@ -413,6 +448,7 @@ mod tests {
             writable: true,
             muted: false,
             placeholder: false,
+            has_topics: false,
         }
     }
 
@@ -427,6 +463,7 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: NOW,
             arrival: Arrival::Live,
+            topic: None,
         }
     }
 
@@ -439,6 +476,9 @@ mod tests {
             has_session: true,
             muted_here: false,
             now: NOW,
+            viewed_topic: None,
+            topic_muted: false,
+            topic_name: None,
         }
     }
 
@@ -605,20 +645,21 @@ mod tests {
 
         // Focus with the chat open dismisses it.
         notes.sync(
-            Some((ProtocolId::Telegram, "telegram:1")),
+            Some((ProtocolId::Telegram, "telegram:1", None)),
             |_| true,
             |_| ChatNow::Listed { unread: 1 },
         );
         assert_eq!(notes.take(), vec![]);
         notes.set_focus(true);
         notes.sync(
-            Some((ProtocolId::Telegram, "telegram:1")),
+            Some((ProtocolId::Telegram, "telegram:1", None)),
             |_| true,
             |_| ChatNow::Listed { unread: 1 },
         );
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            topic: None,
         };
         assert_eq!(notes.take(), vec![NotifyCommand::Dismiss(key)]);
         // The session ends: its notifications go.
@@ -797,6 +838,7 @@ mod tests {
         let key = |n: u8| NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: format!("telegram:{n}"),
+            topic: None,
         };
         // Chat 2 still shows a stale zero: no dismiss yet.
         let now = |unread_2: u32, listed_3: bool| {

@@ -797,6 +797,7 @@ where
                     writable: channel.can_post && !denied && !workspace,
                     muted: false,
                     placeholder: false,
+                    has_topics: false,
                 };
                 if let Some(existing) = self.channels.get(&channel.id) {
                     // Keep live preview, unread, order, and time from Socket Mode.
@@ -1146,6 +1147,7 @@ where
                 writable: !workspace_denied,
                 muted: false,
                 placeholder: false,
+                has_topics: false,
             };
             if workspace_denied {
                 let would_post = self
@@ -1549,6 +1551,7 @@ where
             delivery: Delivery::Sent,
             sent_at: ts_order(&post.ts),
             arrival: crate::Arrival::History,
+            topic: None,
         })
     }
 }

@@ -164,6 +164,7 @@ mod tests {
                 key: crate::NotifyKey {
                     protocol: ProtocolId::Telegram,
                     conversation_id: "telegram:1".into(),
+                    topic: None,
                 },
                 title: "Ada <&>".into(),
                 sender: None,

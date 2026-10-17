@@ -9,14 +9,20 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use thinwire_protocol::ProtocolId;
+use thinwire_protocol::{MessageTopic, ProtocolId};
 
 /// What is in flight for one chat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Pending {
     /// New text from the compose field. `body` is the trimmed text, so an
     /// accepted send clears the matching draft only.
-    Send { request: u64, body: String },
+    Send {
+        request: u64,
+        body: String,
+        /// The topic the text was typed in. `None` is a chat with no topic.
+        /// An accept clears only this thread's compose or draft.
+        topic: Option<MessageTopic>,
+    },
     /// A failed message sent again.
     Retry { request: u64, message_id: String },
 }
@@ -88,11 +94,13 @@ impl SendTracker {
         protocol: ProtocolId,
         chat: &str,
         body: &str,
+        topic: Option<MessageTopic>,
         now: Instant,
     ) -> Option<u64> {
         self.begin(protocol, chat, now, |request| Pending::Send {
             request,
             body: body.to_owned(),
+            topic,
         })
     }
 
@@ -303,11 +311,11 @@ mod tests {
     fn one_send_per_chat_and_the_same_chat_id_in_two_protocols_does_not_block() {
         let mut sends = SendTracker::default();
         let first = sends
-            .begin_send(ProtocolId::Slack, "c1", "hi", Instant::now())
+            .begin_send(ProtocolId::Slack, "c1", "hi", None, Instant::now())
             .expect("first");
         assert!(
             sends
-                .begin_send(ProtocolId::Slack, "c1", "again", Instant::now())
+                .begin_send(ProtocolId::Slack, "c1", "again", None, Instant::now())
                 .is_none()
         );
         assert!(
@@ -316,7 +324,7 @@ mod tests {
                 .is_none()
         );
         let other = sends
-            .begin_send(ProtocolId::Discord, "c1", "hi", Instant::now())
+            .begin_send(ProtocolId::Discord, "c1", "hi", None, Instant::now())
             .expect("another protocol");
         assert_ne!(first, other, "request ids are unique for the app");
         assert!(sends.in_flight(ProtocolId::Slack, "c1"));
@@ -327,7 +335,13 @@ mod tests {
     fn only_the_matching_request_settles() {
         let mut sends = SendTracker::default();
         let request = sends
-            .begin_send(ProtocolId::Telegram, "telegram:1", "hi", Instant::now())
+            .begin_send(
+                ProtocolId::Telegram,
+                "telegram:1",
+                "hi",
+                None,
+                Instant::now(),
+            )
             .expect("send");
         assert_eq!(
             sends.settle(ProtocolId::Telegram, "telegram:1", request + 7),
@@ -338,7 +352,8 @@ mod tests {
             sends.settle(ProtocolId::Telegram, "telegram:1", request),
             Some(Pending::Send {
                 request,
-                body: "hi".into()
+                body: "hi".into(),
+                topic: None,
             })
         );
         assert!(!sends.in_flight(ProtocolId::Telegram, "telegram:1"));
@@ -356,7 +371,7 @@ mod tests {
             .expect("retry");
         assert!(
             sends
-                .begin_send(ProtocolId::WhatsApp, "wa:1", "new", Instant::now())
+                .begin_send(ProtocolId::WhatsApp, "wa:1", "new", None, Instant::now())
                 .is_none()
         );
         assert_eq!(
@@ -371,9 +386,15 @@ mod tests {
     #[test]
     fn drop_protocol_clears_only_that_protocol() {
         let mut sends = SendTracker::default();
-        sends.begin_send(ProtocolId::Slack, "c1", "a", Instant::now());
+        sends.begin_send(ProtocolId::Slack, "c1", "a", None, Instant::now());
         sends.begin_retry(ProtocolId::Slack, "c2", "m", Instant::now());
-        sends.begin_send(ProtocolId::Telegram, "telegram:1", "b", Instant::now());
+        sends.begin_send(
+            ProtocolId::Telegram,
+            "telegram:1",
+            "b",
+            None,
+            Instant::now(),
+        );
         sends.drop_protocol(ProtocolId::Slack);
         assert!(!sends.in_flight(ProtocolId::Slack, "c1"));
         assert!(!sends.in_flight(ProtocolId::Slack, "c2"));
@@ -387,7 +408,7 @@ mod tests {
         let start = Instant::now();
         let mut sends = SendTracker::default();
         let request = sends
-            .begin_send(ProtocolId::Telegram, "telegram:1", "hi", start)
+            .begin_send(ProtocolId::Telegram, "telegram:1", "hi", None, start)
             .expect("send");
         sends
             .begin_retry(ProtocolId::Slack, "c1", "m1", start + SEND_TIMEOUT / 2)
@@ -411,7 +432,8 @@ mod tests {
             sends.settle_expired(ProtocolId::Telegram, "telegram:1", request),
             Some(Pending::Send {
                 request,
-                body: "hi".into()
+                body: "hi".into(),
+                topic: None,
             })
         );
         assert_eq!(
@@ -428,7 +450,7 @@ mod tests {
         let start = Instant::now();
         let mut sends = SendTracker::default();
         let request = sends
-            .begin_send(ProtocolId::Telegram, "telegram:1", "hi", start)
+            .begin_send(ProtocolId::Telegram, "telegram:1", "hi", None, start)
             .expect("send");
         let expired_at = start + SEND_TIMEOUT;
         assert_eq!(sends.expire(expired_at).len(), 1);
@@ -458,7 +480,7 @@ mod tests {
         assert!(!sends.in_flight(ProtocolId::Telegram, "telegram:1"));
 
         sends
-            .begin_send(ProtocolId::Telegram, "telegram:1", "m1", now)
+            .begin_send(ProtocolId::Telegram, "telegram:1", "m1", None, now)
             .expect("send");
         sends.drop_retry_of(ProtocolId::Telegram, "telegram:1", "m1");
         assert!(
