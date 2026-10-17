@@ -582,6 +582,10 @@ pub enum AdapterEvent {
         /// Why this page did not load, for this chat only. Not an account
         /// error. `None` on success, so a later success clears it (#57).
         note: Option<String>,
+        /// The topic this page belongs to. `None` is a chat that has no topic.
+        /// Paging state is per topic, so an answer for one topic does not end
+        /// another topic of the same chat.
+        topic: Option<MessageTopic>,
     },
     /// A history load for one chat ended. The UI stops "Loading messages…".
     HistoryLoaded {
@@ -1030,6 +1034,7 @@ pub fn emit_older_history_loaded(
     before_message_id: impl Into<String>,
     more: bool,
     note: Option<String>,
+    topic: Option<MessageTopic>,
 ) {
     let _ = events.send(AdapterEvent::OlderHistoryLoaded {
         protocol,
@@ -1037,6 +1042,7 @@ pub fn emit_older_history_loaded(
         before_message_id: before_message_id.into(),
         more,
         note,
+        topic,
     });
 }
 

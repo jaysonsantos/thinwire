@@ -259,6 +259,7 @@ impl SignalAdapter {
                     before_message_id: before_message_id.to_string(),
                     more: true,
                     note: Some("Signal is not linked".to_string()),
+                    topic: None,
                 });
             }
             return Ok(());
@@ -270,6 +271,7 @@ impl SignalAdapter {
             before_message_id: before_message_id.to_string(),
             more: false,
             note: None,
+            topic: None,
         });
         Ok(())
     }

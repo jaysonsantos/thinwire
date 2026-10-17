@@ -277,6 +277,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
                     before_message_id,
                     false,
                     None,
+                    None,
                 );
                 Ok(())
             }

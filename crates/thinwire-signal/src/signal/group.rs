@@ -292,6 +292,7 @@ mod tests {
                 before_message_id: "1000".into(),
                 more: false,
                 note: Some(id.clone()),
+                topic: None,
             },
             AdapterEvent::HistoryLoaded {
                 protocol,

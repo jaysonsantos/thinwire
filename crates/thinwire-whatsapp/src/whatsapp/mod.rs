@@ -428,6 +428,7 @@ impl WhatsAppAdapter {
             before,
             more,
             None,
+            None,
         );
     }
 
@@ -2197,6 +2198,7 @@ mod tests {
                 before_message_id: "nope".into(),
                 more: false,
                 note: None,
+                topic: None,
             }]
         );
         // Codex r4103931208: a short drop does not end paging. The retained

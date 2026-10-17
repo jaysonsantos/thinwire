@@ -287,6 +287,7 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
             before_message_id,
             more,
             note,
+            topic: _,
         } if own(seen) => WireEvent::OlderHistoryLoaded {
             conversation_id,
             before_message_id,
@@ -413,6 +414,7 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
             before_message_id,
             more,
             note,
+            topic: None,
         },
         WireEvent::Qr { code, generation } => {
             let code = RedactedPairingSecret::new(code.expose());
@@ -683,6 +685,7 @@ mod tests {
                 before_message_id: "m1".into(),
                 more: true,
                 note: Some("try again".into()),
+                topic: None,
             },
             AdapterEvent::WhatsAppQr {
                 code: RedactedPairingSecret::new("qr-fixture"),

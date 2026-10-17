@@ -482,6 +482,7 @@ impl ProtocolAdapter for GatedFake {
                 before_message_id,
                 false,
                 None,
+                None,
             ),
             AdapterCommand::Disconnect { .. } | AdapterCommand::WhatsAppCancelLink => {
                 if self.lab.die_on_cancel.load(Ordering::SeqCst) {

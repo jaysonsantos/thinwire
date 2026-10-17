@@ -3,7 +3,7 @@
 //! FFI and network I/O stay on a dedicated receive thread plus tokio tasks.
 //! Credential values are read from the vault and never logged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -131,8 +131,12 @@ struct LiveInbox {
     open_chat: Option<i64>,
     /// The topic `ViewTopic` last named. `None` is the topic list or a normal chat.
     open_topic: Option<MessageTopic>,
-    /// Forum topics already loaded, so a later update can keep the name.
+    /// Forum topics already loaded, so a later update can keep the name,
+    /// the unread count, and the last message.
     topics: HashMap<(i64, i32), ChatTopic>,
+    /// Main-list forums whose topic list loaded. A failed load stays out,
+    /// so the next chat-list pass tries again.
+    topic_lists: HashSet<i64>,
     /// Same fact, published by `view_chat` before this worker dequeues
     /// `ViewChat`. History `viewMessages` reads this, not `open_chat`.
     viewed: inbox::ViewedChat,
@@ -637,6 +641,7 @@ fn spawn_tdlib_worker(
             open_chat: None,
             open_topic: None,
             topics: HashMap::new(),
+            topic_lists: HashSet::new(),
             viewed: view.viewed,
             unviewed: HashMap::new(),
         };
@@ -683,6 +688,7 @@ fn spawn_tdlib_worker(
                         }
                         TdlibCommand::LoadChats => {
                             load_main_chats(client_id, live.linked(), &events).await;
+                            load_due_forum_topics(client_id, &mut live, &events).await;
                         }
                         TdlibCommand::OpenChat(conversation_id) => {
                             open_chat(client_id, &conversation_id, &mut live, &events).await;
@@ -999,6 +1005,7 @@ async fn apply_update(
             .await;
             if ready && live.authorized {
                 apply_requested_view(requested_view, &live.viewed, &mut live.open_chat);
+                load_due_forum_topics(client_id, live, events).await;
             }
             return closed;
         }
@@ -1017,6 +1024,7 @@ async fn apply_update(
                     publish(events, emit, &mut live.older, Some(effect));
                 }
             }
+            load_due_forum_topics(client_id, live, events).await;
         }
         other => {
             // `view_chat` published the cell while this update waited behind
@@ -1024,7 +1032,8 @@ async fn apply_update(
             live.open_chat = live.viewed.get();
             let mark_read = live_read_while_linked(live, &other);
             remember_unviewed(&other, live.open_chat, &mut live.unviewed);
-            apply_chat_update(other, live, events);
+            apply_chat_update(client_id, other, live, events).await;
+            load_due_forum_topics(client_id, live, events).await;
             if let Some((chat_id, message_id)) = mark_read {
                 // A round trip here would stall every later update.
                 tokio::spawn(mark_message_viewed(client_id, chat_id, message_id));
@@ -1267,7 +1276,12 @@ async fn apply_authorization(
     }
 }
 
-fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, events: &EventTx) {
+async fn apply_chat_update(
+    client_id: i32,
+    update: tdlib_rs::enums::Update,
+    live: &mut LiveInbox,
+    events: &EventTx,
+) {
     // No inbox event from a closing client or a cancelled epoch (PR #49 review).
     let emit = live.linked();
     match update {
@@ -1361,6 +1375,15 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
             let chat_id = update.message.chat_id;
             let at = i64::from(update.message.date);
             if emit {
+                // A topic that is not loaded yet is fetched before the message,
+                // so a mute and the "Group › Topic" title are known.
+                if let Some(MessageTopic::Forum(id)) =
+                    update.message.topic_id.as_ref().and_then(app_topic)
+                    && let Ok(forum_topic_id) = i32::try_from(id)
+                    && !live.topics.contains_key(&(chat_id, forum_topic_id))
+                {
+                    refresh_forum_topic(client_id, chat_id, forum_topic_id, live, events).await;
+                }
                 emit_mapped_message_as(events, &update.message, live, None, Arrival::Live);
             }
             publish(
@@ -1442,25 +1465,47 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
         }
         tdlib_rs::enums::Update::ForumTopicInfo(update) => {
             let key = (update.info.chat_id, update.info.forum_topic_id);
-            let Some(topic) = live.topics.get_mut(&key) else {
-                return;
-            };
-            topic.name.clone_from(&update.info.name);
-            topic.general = update.info.is_general;
-            topic.hidden = update.info.is_hidden;
-            topic.closed = update.info.is_closed;
-            if emit {
-                emit_topic(events, topic.clone());
+            if let Some(topic) = live.topics.get_mut(&key) {
+                topic.name.clone_from(&update.info.name);
+                topic.general = update.info.is_general;
+                topic.hidden = update.info.is_hidden;
+                topic.closed = update.info.is_closed;
+                if emit {
+                    emit_topic(events, topic.clone());
+                }
+            } else if emit {
+                refresh_forum_topic(
+                    client_id,
+                    update.info.chat_id,
+                    update.info.forum_topic_id,
+                    live,
+                    events,
+                )
+                .await;
             }
         }
         tdlib_rs::enums::Update::ForumTopic(update) => {
-            let key = (update.chat_id, update.forum_topic_id);
-            let Some(topic) = live.topics.get_mut(&key) else {
-                return;
-            };
-            topic.muted = update.notification_settings.mute_for > 0;
+            // This update carries the mute. Unread and the last message come
+            // from `getForumTopic`, including a topic that was not loaded yet.
             if emit {
-                emit_topic(events, topic.clone());
+                refresh_forum_topic(
+                    client_id,
+                    update.chat_id,
+                    update.forum_topic_id,
+                    live,
+                    events,
+                )
+                .await;
+            }
+            let key = (update.chat_id, update.forum_topic_id);
+            if let Some(topic) = live.topics.get_mut(&key) {
+                let muted = update.notification_settings.mute_for > 0;
+                if topic.muted != muted {
+                    topic.muted = muted;
+                    if emit {
+                        emit_topic(events, topic.clone());
+                    }
+                }
             }
         }
         _ => {}
@@ -1725,27 +1770,34 @@ async fn open_chat(client_id: i32, conversation_id: &str, live: &mut LiveInbox, 
         AdapterStatus::Ready,
         "Loading recent messages.",
     );
-    if live.directory.has_topics(chat_id) {
-        load_forum_topics(client_id, chat_id, live, events).await;
+    if live.directory.has_topics(chat_id)
+        && load_forum_topics(client_id, chat_id, live, events).await
+    {
+        live.topic_lists.insert(chat_id);
     }
     load_history(client_id, chat_id, live, events).await;
     emit_history_loaded(events, ProtocolId::Telegram, conversation_id);
 }
 
-/// The first page of forum topics, and one more page when the server has more.
-async fn load_forum_topics(client_id: i32, chat_id: i64, live: &mut LiveInbox, events: &EventTx) {
-    let mut offset_date = 0;
-    let mut offset_message_id = 0;
-    let mut offset_forum_topic_id = 0;
-    let mut seen = 0;
-    for _ in 0..2 {
+/// Forum topics of one chat, following `total_count` and the next offset.
+/// Stops at [`inbox::TOPIC_PAGE_CAP`]. Runs on the TDLib worker.
+/// `true` when the list finished. `false` when a page failed, so a later
+/// pass can try again.
+async fn load_forum_topics(
+    client_id: i32,
+    chat_id: i64,
+    live: &mut LiveInbox,
+    events: &EventTx,
+) -> bool {
+    let mut cursor = inbox::TopicListCursor::start();
+    loop {
         let page = tdlib_rs::functions::get_forum_topics(
             chat_id,
             String::new(),
-            offset_date,
-            offset_message_id,
-            offset_forum_topic_id,
-            100,
+            cursor.offset_date,
+            cursor.offset_message_id,
+            cursor.offset_forum_topic_id,
+            inbox::TOPIC_PAGE_LIMIT,
             client_id,
         )
         .await;
@@ -1753,23 +1805,68 @@ async fn load_forum_topics(client_id: i32, chat_id: i64, live: &mut LiveInbox, e
             if let Err(error) = page {
                 log_tdlib_error("getForumTopics", &error);
             }
-            return;
+            return false;
         };
-        let total = page.total_count;
         let count = i32::try_from(page.topics.len()).unwrap_or(i32::MAX);
         for topic in page.topics {
             let row = forum_topic_row(chat_id, &topic);
-            live.topics
-                .insert((chat_id, topic.info.forum_topic_id), row.clone());
-            emit_topic(events, row);
+            if inbox::cache_topic(&mut live.topics, &row) {
+                emit_topic(events, row);
+            }
         }
-        seen += count;
-        if count == 0 || seen >= total {
-            return;
+        let Some(next) = cursor.advance(
+            count,
+            page.total_count,
+            page.next_offset_date,
+            page.next_offset_message_id,
+            page.next_offset_forum_topic_id,
+        ) else {
+            return true;
+        };
+        cursor = next;
+    }
+}
+
+/// Load topic lists for main-list forums that do not have one yet.
+/// The worker does this with the chat list, off the UI thread.
+async fn load_due_forum_topics(client_id: i32, live: &mut LiveInbox, events: &EventTx) {
+    if !live.linked() {
+        return;
+    }
+    let listed: HashSet<i64> = live.directory.listed_topic_chats().into_iter().collect();
+    live.topic_lists.retain(|id| listed.contains(id));
+    let due: Vec<i64> = listed
+        .into_iter()
+        .filter(|id| !live.topic_lists.contains(id))
+        .collect();
+    for chat_id in due {
+        if load_forum_topics(client_id, chat_id, live, events).await {
+            live.topic_lists.insert(chat_id);
         }
-        offset_date = page.next_offset_date;
-        offset_message_id = page.next_offset_message_id;
-        offset_forum_topic_id = page.next_offset_forum_topic_id;
+    }
+}
+
+/// One topic, including one that was not in `live.topics`. Unread and the
+/// last message come from the fetched row.
+async fn refresh_forum_topic(
+    client_id: i32,
+    chat_id: i64,
+    forum_topic_id: i32,
+    live: &mut LiveInbox,
+    events: &EventTx,
+) -> bool {
+    match tdlib_rs::functions::get_forum_topic(chat_id, forum_topic_id, client_id).await {
+        Ok(tdlib_rs::enums::ForumTopic::ForumTopic(topic)) => {
+            let row = forum_topic_row(chat_id, &topic);
+            if inbox::cache_topic(&mut live.topics, &row) {
+                emit_topic(events, row);
+            }
+            true
+        }
+        Err(error) => {
+            log_tdlib_error("getForumTopic", &error);
+            false
+        }
     }
 }
 
@@ -1844,6 +1941,7 @@ async fn load_older_topic(
             before_message_id,
             more,
             note,
+            Some(topic),
         );
     };
     let Some((chat_id, before)) = inbox::parse_message_id(before_message_id) else {
@@ -1945,7 +2043,11 @@ async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &E
             // Read the cell after `getChatHistory`: `ViewChat` may have been
             // published while this call was in flight, and it is still queued.
             if !message_ids.is_empty()
-                && inbox::should_mark_history_viewed(live.viewed.get(), chat_id)
+                && inbox::should_mark_history_viewed(
+                    live.viewed.get(),
+                    live.viewed.get_topic(),
+                    chat_id,
+                )
                 && let Err(error) =
                     tdlib_rs::functions::view_messages(chat_id, message_ids, None, true, client_id)
                         .await
@@ -1996,6 +2098,7 @@ async fn load_older(
             before_message_id,
             more,
             note,
+            None,
         );
     };
     let done = |more: bool| end(more, None);
@@ -2727,6 +2830,7 @@ mod tests {
             open_chat: Some(42),
             open_topic: None,
             topics: HashMap::new(),
+            topic_lists: HashSet::new(),
             viewed: runtime.viewed.clone(),
             unviewed: HashMap::new(),
         };

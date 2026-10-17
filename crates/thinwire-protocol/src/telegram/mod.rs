@@ -327,6 +327,7 @@ impl ProtocolAdapter for TelegramAdapter {
                         before_message_id,
                         false,
                         None,
+                        None,
                     );
                 }
                 result
@@ -443,6 +444,7 @@ impl ProtocolAdapter for TelegramAdapter {
                         before_message_id,
                         false,
                         None,
+                        Some(topic),
                     );
                 }
                 result
@@ -1319,6 +1321,7 @@ mod tests {
                 before_message_id: "telegram:2:50".into(),
                 more: false,
                 note: None,
+                topic: None,
             }
         );
         let valid = adapter.handle(

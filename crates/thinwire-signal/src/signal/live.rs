@@ -623,6 +623,7 @@ async fn load_older_page(
         before_message_id: before_message_id.to_string(),
         more,
         note: note.map(str::to_string),
+        topic: None,
     });
 }
 

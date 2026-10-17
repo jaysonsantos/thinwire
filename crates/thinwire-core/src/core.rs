@@ -420,7 +420,9 @@ impl Core {
             Intent::SelectTopic {
                 conversation_id,
                 topic,
-            } => self.state.select_topic(conversation_id, topic),
+            } => {
+                let _ = self.state.select_topic(conversation_id, topic);
+            }
             Intent::MoveInbox { delta } => self.state.move_inbox_selection(delta),
             Intent::FocusInbox { id } => self.state.focus_inbox_row(id),
             Intent::SetFilter(filter) => self.state.set_filter(filter),
@@ -482,10 +484,13 @@ impl Core {
                         .conversation(key.protocol, &key.conversation_id)
                         .is_some()
                 {
-                    if let Some(topic) = key.topic {
-                        self.state.select_topic(key.conversation_id.clone(), topic);
-                    } else {
-                        self.state.select_conversation(key.conversation_id.clone());
+                    let id = key.conversation_id.clone();
+                    // A topic that is not loaded yet still opens the chat.
+                    let opened = key
+                        .topic
+                        .is_some_and(|topic| self.state.select_topic(id.clone(), topic));
+                    if !opened {
+                        self.state.select_conversation(id);
                     }
                 }
                 self.notify.dismiss(&key);
@@ -1675,6 +1680,86 @@ mod tests {
         assert!(!core.view().notifications());
         core.notify_message(&live(1, "off"));
         assert!(core.take_notify().is_empty(), "the switch is off");
+    }
+
+    /// A muted topic does not notify. An open topic is named "Group › Topic".
+    /// A click for a topic that is not loaded yet opens the chat.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_topic_notifies_with_its_name_and_a_missing_topic_opens_the_chat() {
+        use crate::notify::{NotifyCommand, NotifyKey};
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+        use thinwire_protocol::{ChatTopic, Delivery, MessageTopic};
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let mut camp = telegram_chat(9, "Camp forum", 30);
+        camp.has_topics = true;
+        camp.is_group = true;
+        core.state
+            .apply(AdapterEvent::ConversationUpsert { conversation: camp });
+        let topic = |id, name: &str, muted: bool| ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: MessageTopic::Forum(id),
+            name: name.into(),
+            unread: 1,
+            last_at: id,
+            general: false,
+            hidden: false,
+            closed: false,
+            muted,
+        };
+        core.state.apply(AdapterEvent::TopicUpsert {
+            topic: topic(2, "Trail", false),
+        });
+        core.state.apply(AdapterEvent::TopicUpsert {
+            topic: topic(3, "Quiet", true),
+        });
+        let live = |id: i64, topic_id: i64, body: &str| ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            id: format!("telegram:9:{id}"),
+            sender: "Ada".into(),
+            body: body.into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+            topic: Some(MessageTopic::Forum(topic_id)),
+        };
+        core.notify_message(&live(1, 3, "secret"));
+        assert!(
+            core.take_notify().is_empty(),
+            "a muted topic does not notify"
+        );
+        core.notify_message(&live(2, 2, "hello"));
+        let shown = core.take_notify();
+        assert!(
+            matches!(
+                &shown[..],
+                [NotifyCommand::Show(note)] if note.title == "Camp forum › Trail"
+            ),
+            "{shown:?}"
+        );
+
+        let missing = NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: Some(MessageTopic::Forum(8)),
+        };
+        core.dispatch(Intent::OpenFromNotification(missing));
+        assert_eq!(
+            core.view().selected_conversation.as_deref(),
+            Some("telegram:9")
+        );
+        assert!(core.view().selected_topic.is_none());
+        let known = NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: Some(MessageTopic::Forum(2)),
+        };
+        core.dispatch(Intent::OpenFromNotification(known));
+        assert_eq!(core.view().selected_topic, Some(MessageTopic::Forum(2)));
     }
 
     /// #153: a chat muted in thinwire does not notify, and its shown

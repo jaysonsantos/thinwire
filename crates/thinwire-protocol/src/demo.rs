@@ -288,6 +288,7 @@ impl DemoAdapter {
                 before_message_id: before,
                 more: from > 0,
                 note: None,
+                topic: None,
             },
         );
     }
@@ -335,6 +336,7 @@ impl DemoAdapter {
                 before_message_id: before,
                 more: from > 0,
                 note: None,
+                topic: Some(topic),
             },
         );
     }
