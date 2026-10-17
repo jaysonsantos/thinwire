@@ -136,6 +136,7 @@ mod tests {
             outbound,
             delivery: Delivery::Sent,
             sent_at,
+            topic: None,
         }
     }
 

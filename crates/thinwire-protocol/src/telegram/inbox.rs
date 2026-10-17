@@ -6,10 +6,10 @@
 
 #![cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::adapter::{ChatMessage, Conversation, Delivery, ProtocolId};
+use crate::adapter::{ChatMessage, ChatTopic, Conversation, Delivery, MessageTopic, ProtocolId};
 
 /// Page size passed to TDLib `loadChats` for the main list.
 pub(super) const MAIN_CHAT_LIMIT: i32 = 30;
@@ -19,6 +19,13 @@ pub(super) const HISTORY_LIMIT: i32 = 40;
 
 /// Page size for older messages (scroll up in a chat).
 pub(super) const OLDER_PAGE_LIMIT: i32 = 50;
+
+/// Page size passed to TDLib `getForumTopics`. The server allows at most 100.
+pub(super) const TOPIC_PAGE_LIMIT: i32 = 100;
+
+/// Most pages of forum topics one load will ask for. Twenty pages is 2000
+/// topics. A stuck offset stops sooner.
+pub(super) const TOPIC_PAGE_CAP: u32 = 20;
 
 /// TDLib uses 404 when `loadChats` has already reached the end of the list.
 pub(super) const END_OF_CHAT_LIST: i32 = 404;
@@ -42,6 +49,7 @@ pub(super) struct InboxMessage {
     pub body: String,
     pub delivery: Delivery,
     pub sent_at: i64,
+    pub topic: Option<crate::MessageTopic>,
 }
 
 /// What the shell should do after a chat-list mutation.
@@ -91,6 +99,9 @@ pub(super) struct ChatSeed<'a> {
     pub is_group: bool,
     pub scope: MuteScope,
     pub mute: ChatMute,
+    pub has_topics: bool,
+    /// Private-chat user id, so a later bot update can set `has_topics`.
+    pub peer: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +115,8 @@ struct ChatRecord {
     is_group: bool,
     scope: MuteScope,
     mute: ChatMute,
+    has_topics: bool,
+    peer: Option<i64>,
 }
 
 /// Main-list chats keyed by TDLib chat id. `order == 0` is not listed.
@@ -112,6 +125,8 @@ pub(super) struct ChatDirectory {
     chats: HashMap<i64, ChatRecord>,
     /// Scopes that TDLib reports as muted (`updateScopeNotificationSettings`).
     muted_scopes: HashMap<MuteScope, bool>,
+    /// Bot users whose chats have topics.
+    topic_bots: std::collections::HashSet<i64>,
 }
 
 impl ChatDirectory {
@@ -188,9 +203,84 @@ impl ChatDirectory {
                 is_group: seed.is_group,
                 scope: seed.scope,
                 mute: seed.mute,
+                has_topics: seed.has_topics,
+                peer: seed.peer,
             },
         );
         self.effect(chat_id, previous)
+    }
+
+    /// This bot user has topics. Private chats of that user follow.
+    pub(super) fn bot_has_topics(&self, user_id: i64) -> bool {
+        self.topic_bots.contains(&user_id)
+    }
+
+    /// A forum supergroup in "view as topics", or a private chat with a bot
+    /// that has topics.
+    pub(super) fn has_topics(&self, chat_id: i64) -> bool {
+        self.chats.get(&chat_id).is_some_and(|chat| chat.has_topics)
+    }
+
+    /// Main-list chats that have topics, in id order. The worker loads their
+    /// topic rows with the chat list, so a badge and a mute are known before
+    /// the user opens the forum.
+    pub(super) fn listed_topic_chats(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .chats
+            .iter()
+            .filter(|(_, chat)| chat.order > 0 && chat.has_topics)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A bot user gained or lost topics. Private chats of that user follow.
+    pub(super) fn note_topic_bot(&mut self, user_id: i64, has_topics: bool) -> Vec<ChatEffect> {
+        let changed = if has_topics {
+            self.topic_bots.insert(user_id)
+        } else {
+            self.topic_bots.remove(&user_id)
+        };
+        if !changed {
+            return Vec::new();
+        }
+        let ids: Vec<i64> = self
+            .chats
+            .iter()
+            .filter(|(_, chat)| chat.peer == Some(user_id))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| {
+                if let Some(chat) = self.chats.get_mut(&id) {
+                    chat.has_topics = has_topics;
+                }
+                let previous = self.chats.get(&id).map(|chat| chat.order);
+                self.effect(id, previous)
+            })
+            .collect()
+    }
+
+    /// `updateChatViewAsTopics` for a supergroup. A private chat (Saved
+    /// Messages) and a channel stay as they are.
+    pub(super) fn set_view_as_topics(
+        &mut self,
+        chat_id: i64,
+        view_as_topics: bool,
+    ) -> Option<ChatEffect> {
+        let chat = self.chats.get(&chat_id)?;
+        if chat.scope == MuteScope::Private || chat.scope == MuteScope::Channel {
+            return None;
+        }
+        if chat.has_topics == view_as_topics {
+            return None;
+        }
+        let previous = chat.order;
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.has_topics = view_as_topics;
+        }
+        self.effect(chat_id, Some(previous))
     }
 
     pub(super) fn set_title(&mut self, chat_id: i64, title: &str) -> Option<ChatEffect> {
@@ -259,6 +349,8 @@ impl ChatDirectory {
             is_group: false,
             scope: MuteScope::default(),
             mute: ChatMute::default(),
+            has_topics: false,
+            peer: None,
         })
     }
 
@@ -337,12 +429,108 @@ pub(super) fn live_message_to_view(
 }
 
 /// History calls `viewMessages` only when this page's chat is still the one
-/// the user looks at. The shared cell is what counts: `open_chat` on the
-/// worker is still the previous `ViewChat` while that command sits behind
-/// an in-flight `OpenChat`.
+/// the user looks at, and no topic is open. The shared cell is what counts:
+/// `open_chat` on the worker is still the previous `ViewChat` while that
+/// command sits behind an in-flight `OpenChat`. A topic click publishes the
+/// same chat id with a topic, and a chat-wide page must not mark that read.
 #[must_use]
-pub(super) fn should_mark_history_viewed(viewed: Option<i64>, chat_id: i64) -> bool {
-    viewed == Some(chat_id)
+pub(super) fn should_mark_history_viewed(
+    viewed: Option<i64>,
+    viewed_topic: Option<MessageTopic>,
+    chat_id: i64,
+) -> bool {
+    viewed == Some(chat_id) && viewed_topic.is_none()
+}
+
+/// Where the next `getForumTopics` page starts, and how many rows are in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TopicListCursor {
+    pub offset_date: i32,
+    pub offset_message_id: i64,
+    pub offset_forum_topic_id: i32,
+    pub seen: i32,
+    pub pages: u32,
+}
+
+impl TopicListCursor {
+    pub(super) const fn start() -> Self {
+        Self {
+            offset_date: 0,
+            offset_message_id: 0,
+            offset_forum_topic_id: 0,
+            seen: 0,
+            pages: 0,
+        }
+    }
+
+    /// The next page, or `None` when this page ends the list.
+    ///
+    /// The list ends when the page is empty, `seen` reaches `total`, the
+    /// next offset does not move, or [`TOPIC_PAGE_CAP`] pages are in.
+    #[must_use]
+    pub(super) fn advance(
+        self,
+        count: i32,
+        total: i32,
+        next_offset_date: i32,
+        next_offset_message_id: i64,
+        next_offset_forum_topic_id: i32,
+    ) -> Option<Self> {
+        let seen = self.seen.saturating_add(count);
+        let pages = self.pages.saturating_add(1);
+        if count == 0 || seen >= total || pages >= TOPIC_PAGE_CAP {
+            return None;
+        }
+        let stuck = next_offset_date == self.offset_date
+            && next_offset_message_id == self.offset_message_id
+            && next_offset_forum_topic_id == self.offset_forum_topic_id;
+        if stuck {
+            return None;
+        }
+        Some(Self {
+            offset_date: next_offset_date,
+            offset_message_id: next_offset_message_id,
+            offset_forum_topic_id: next_offset_forum_topic_id,
+            seen,
+            pages,
+        })
+    }
+}
+
+/// Store one forum topic. A topic that was not loaded yet is inserted.
+/// A later row replaces unread and the last-message time.
+///
+/// `false` only when the row is not a forum topic this cache can store.
+/// An identical row is stored again and returns true, so the caller still
+/// tells the core.
+#[must_use]
+pub(super) fn cache_topic(topics: &mut HashMap<(i64, i32), ChatTopic>, row: &ChatTopic) -> bool {
+    let MessageTopic::Forum(id) = row.topic else {
+        return false;
+    };
+    let Ok(forum_topic_id) = i32::try_from(id) else {
+        return false;
+    };
+    let Some(chat_id) = parse_telegram_chat_id(&row.conversation_id) else {
+        return false;
+    };
+    topics.insert((chat_id, forum_topic_id), row.clone());
+    true
+}
+
+/// Drop the cached topics of a chat that left the list.
+///
+/// The core drops those rows with the conversation. Leaving them here would
+/// make the next live message skip `getForumTopic`, and the core would not
+/// see the row. The whole map also dies with the worker, which is how an
+/// account end clears it.
+pub(super) fn forget_chat_topics(
+    topics: &mut HashMap<(i64, i32), ChatTopic>,
+    topic_lists: &mut HashSet<i64>,
+    chat_id: i64,
+) {
+    topics.retain(|(id, _), _| *id != chat_id);
+    topic_lists.remove(&chat_id);
 }
 
 /// The chat the user looks at, shared by the UI thread and the TDLib worker.
@@ -360,6 +548,7 @@ pub(super) struct ViewedChat {
 struct ViewedInner {
     view_seq: u64,
     chat: Option<i64>,
+    topic: Option<MessageTopic>,
 }
 
 impl ViewedChat {
@@ -368,6 +557,7 @@ impl ViewedChat {
             inner: Arc::new(Mutex::new(ViewedInner {
                 view_seq: 0,
                 chat: None,
+                topic: None,
             })),
         }
     }
@@ -382,21 +572,46 @@ impl ViewedChat {
         self.lock().chat
     }
 
+    /// The topic a history page may mark read. `None` is a chat with no topic.
+    #[must_use]
+    pub(super) fn get_topic(&self) -> Option<MessageTopic> {
+        self.lock().topic
+    }
+
     /// Caller side. Returns the `view_seq` the matching `ViewChat` must carry.
+    /// A chat view clears any topic.
     #[must_use]
     pub(super) fn publish(&self, chat: Option<i64>) -> u64 {
+        self.publish_topic(chat, None)
+    }
+
+    /// Caller side for one topic. Returns the `view_seq` `ViewTopic` must carry.
+    #[must_use]
+    pub(super) fn publish_topic(&self, chat: Option<i64>, topic: Option<MessageTopic>) -> u64 {
         let mut viewed = self.lock();
         viewed.view_seq = viewed.view_seq.wrapping_add(1);
         viewed.chat = chat;
+        viewed.topic = topic;
         viewed.view_seq
     }
 
-    /// Worker side. Applies `chat` only while `view_seq` is still current.
+    /// Worker side. Applies `chat` and clears the topic while `view_seq` is current.
     /// `false` means a newer publish already replaced this one.
     pub(super) fn sync(&self, view_seq: u64, chat: Option<i64>) -> bool {
+        self.sync_topic(view_seq, chat, None)
+    }
+
+    /// Worker side for one topic.
+    pub(super) fn sync_topic(
+        &self,
+        view_seq: u64,
+        chat: Option<i64>,
+        topic: Option<MessageTopic>,
+    ) -> bool {
         let mut viewed = self.lock();
         if viewed.view_seq == view_seq {
             viewed.chat = chat;
+            viewed.topic = topic;
             true
         } else {
             false
@@ -408,7 +623,19 @@ impl ViewedChat {
         let mut viewed = self.lock();
         viewed.view_seq = viewed.view_seq.wrapping_add(1);
         viewed.chat = None;
+        viewed.topic = None;
     }
+}
+
+/// History of one topic calls `viewMessages` only while that topic is open.
+#[must_use]
+pub(super) fn should_mark_topic_viewed(
+    viewed: Option<i64>,
+    viewed_topic: Option<MessageTopic>,
+    chat_id: i64,
+    topic: MessageTopic,
+) -> bool {
+    viewed == Some(chat_id) && viewed_topic == Some(topic)
 }
 
 #[must_use]
@@ -608,6 +835,7 @@ pub(super) fn to_chat_message(
         } else {
             Delivery::Sent
         },
+        topic: message.topic,
     }
 }
 
@@ -625,6 +853,7 @@ fn conversation_from(chat_id: i64, chat: &ChatRecord, muted: bool) -> Conversati
         writable: true,
         placeholder: false,
         muted,
+        has_topics: chat.has_topics,
     }
 }
 
@@ -667,6 +896,8 @@ mod tests {
             is_group: false,
             scope: MuteScope::Private,
             mute: ChatMute::default(),
+            has_topics: false,
+            peer: None,
         }
     }
 
@@ -716,7 +947,7 @@ mod tests {
         let viewed = ViewedChat::new();
         let opened = viewed.publish(Some(42));
         assert!(
-            should_mark_history_viewed(viewed.get(), 42),
+            should_mark_history_viewed(viewed.get(), viewed.get_topic(), 42),
             "the page is marked while this chat is still viewed"
         );
 
@@ -725,7 +956,7 @@ mod tests {
         // behind `OpenChat`. The cell is what the mark must read.
         let left = viewed.publish(None);
         assert!(
-            !should_mark_history_viewed(viewed.get(), 42),
+            !should_mark_history_viewed(viewed.get(), viewed.get_topic(), 42),
             "a queued ViewChat(None) skips viewMessages"
         );
         assert!(
@@ -741,40 +972,189 @@ mod tests {
             "a stale ViewChat does not mark that message"
         );
         assert!(
-            !should_mark_history_viewed(viewed.get(), 42),
+            !should_mark_history_viewed(viewed.get(), viewed.get_topic(), 42),
             "the queued ViewChat for the old chat does not undo the blur"
         );
         viewed.sync(left, None);
-        assert!(!should_mark_history_viewed(viewed.get(), 42));
+        assert!(!should_mark_history_viewed(
+            viewed.get(),
+            viewed.get_topic(),
+            42
+        ));
 
         // A switch names the new chat before its history page is ready.
         let switched = viewed.publish(Some(7));
         assert!(
-            !should_mark_history_viewed(viewed.get(), 42),
+            !should_mark_history_viewed(viewed.get(), viewed.get_topic(), 42),
             "history for the chat the user left is not marked"
         );
         assert!(
-            should_mark_history_viewed(viewed.get(), 7),
+            should_mark_history_viewed(viewed.get(), viewed.get_topic(), 7),
             "history for the chat they opened is marked"
         );
         viewed.sync(opened, Some(42));
         assert_eq!(viewed.get(), Some(7), "a stale view_seq does not win");
         viewed.sync(switched, Some(7));
-        assert!(should_mark_history_viewed(viewed.get(), 7));
+        assert!(should_mark_history_viewed(
+            viewed.get(),
+            viewed.get_topic(),
+            7
+        ));
         assert!(
-            should_mark_history_viewed(Some(-100), -100),
+            should_mark_history_viewed(Some(-100), None, -100),
             "a channel id is still that chat"
         );
 
         viewed.clear();
         assert!(
-            !should_mark_history_viewed(viewed.get(), 7),
+            !should_mark_history_viewed(viewed.get(), viewed.get_topic(), 7),
             "close clears the viewed chat"
         );
         viewed.sync(switched, Some(7));
         assert!(
             viewed.get().is_none(),
             "a ViewChat queued before close does not restore it"
+        );
+    }
+
+    /// A topic click while the chat-wide page is in flight publishes the same
+    /// chat id. That page must not mark every topic read.
+    #[test]
+    fn a_chat_wide_page_is_not_marked_read_while_a_topic_is_open() {
+        let viewed = ViewedChat::new();
+        let _opened = viewed.publish(Some(42));
+        assert!(should_mark_history_viewed(
+            viewed.get(),
+            viewed.get_topic(),
+            42
+        ));
+        let _topic = viewed.publish_topic(Some(42), Some(MessageTopic::Forum(7)));
+        assert_eq!(viewed.get(), Some(42));
+        assert!(
+            !should_mark_history_viewed(viewed.get(), viewed.get_topic(), 42),
+            "the chat-wide page waits; the topic page marks its own ids"
+        );
+        assert!(should_mark_topic_viewed(
+            viewed.get(),
+            viewed.get_topic(),
+            42,
+            MessageTopic::Forum(7),
+        ));
+    }
+
+    #[test]
+    fn forum_topic_pages_follow_the_total_and_stop_at_the_cap() {
+        let mut cursor = TopicListCursor::start();
+        let mut pages = 0u32;
+        while let Some(next) = cursor.advance(TOPIC_PAGE_LIMIT, 350, 1, 10, pages as i32 + 1) {
+            pages += 1;
+            cursor = next;
+        }
+        pages += 1;
+        assert_eq!(
+            pages, 4,
+            "350 topics take four pages, past the old cap of two"
+        );
+        assert_eq!(cursor.seen, 300);
+        assert!(
+            cursor.advance(50, 350, 2, 20, 99).is_none(),
+            "the last short page reaches total_count"
+        );
+
+        let stuck = TopicListCursor::start();
+        assert!(
+            stuck.advance(TOPIC_PAGE_LIMIT, 500, 0, 0, 0).is_none(),
+            "an offset that does not move does not loop"
+        );
+
+        let mut cursor = TopicListCursor::start();
+        let mut pages = 0u32;
+        loop {
+            pages += 1;
+            let Some(next) =
+                cursor.advance(TOPIC_PAGE_LIMIT, 10_000, 3, i64::from(pages), pages as i32)
+            else {
+                break;
+            };
+            cursor = next;
+        }
+        assert_eq!(pages, TOPIC_PAGE_CAP);
+        assert_eq!(cursor.pages, TOPIC_PAGE_CAP - 1);
+    }
+
+    #[test]
+    fn an_uncached_forum_topic_is_stored_and_a_later_row_replaces_its_counts() {
+        let mut topics = HashMap::new();
+        let first = ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: MessageTopic::Forum(4),
+            name: "Trail".into(),
+            unread: 4,
+            last_at: 10,
+            general: false,
+            hidden: false,
+            closed: false,
+            muted: false,
+        };
+        assert!(cache_topic(&mut topics, &first));
+        assert_eq!(topics.get(&(9, 4)).map(|row| row.unread), Some(4));
+        let mut read = first.clone();
+        read.unread = 0;
+        read.last_at = 30;
+        read.muted = true;
+        assert!(cache_topic(&mut topics, &read));
+        let row = topics.get(&(9, 4)).expect("cached");
+        assert_eq!(row.unread, 0);
+        assert_eq!(row.last_at, 30);
+        assert!(row.muted);
+        assert_eq!(topics.len(), 1);
+        assert!(
+            cache_topic(&mut topics, &read),
+            "an identical row is stored again, so the caller still tells the core"
+        );
+    }
+
+    /// The core drops a chat's topics when the conversation leaves. The
+    /// worker cache must drop them too, or the next message never fetches
+    /// the row.
+    #[test]
+    fn a_removed_chat_drops_its_cached_topics() {
+        let mut topics = HashMap::new();
+        let mut lists = HashSet::new();
+        let row = |chat: i64, id: i64, name: &str| ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: conversation_id(chat),
+            topic: MessageTopic::Forum(id),
+            name: name.into(),
+            unread: 1,
+            last_at: id,
+            general: id == 1,
+            hidden: id == 1,
+            closed: id == 1,
+            muted: false,
+        };
+        assert!(cache_topic(&mut topics, &row(9, 1, "General")));
+        assert!(cache_topic(&mut topics, &row(9, 4, "Trail")));
+        assert!(cache_topic(&mut topics, &row(8, 2, "Other")));
+        lists.insert(9);
+        lists.insert(8);
+        forget_chat_topics(&mut topics, &mut lists, 9);
+        assert!(
+            topics.keys().all(|(chat, _)| *chat != 9),
+            "chat 9 left the cache"
+        );
+        assert!(!lists.contains(&9));
+        assert!(lists.contains(&8));
+        assert_eq!(topics.len(), 1);
+        let again = row(9, 4, "Trail");
+        assert!(
+            cache_topic(&mut topics, &again),
+            "the next fetch stores the row, so the core is told"
+        );
+        assert_eq!(
+            topics.get(&(9, 4)).map(|topic| topic.name.as_str()),
+            Some("Trail")
         );
     }
 
@@ -969,6 +1349,7 @@ mod tests {
             body: "hello".into(),
             delivery: Delivery::Sent,
             sent_at: 1_700_000_000,
+            topic: None,
         };
         let mapped = to_chat_message(&message, &names, Some("Ada"));
         assert_eq!(mapped.sender, "Ada Lovelace");
@@ -995,6 +1376,7 @@ mod tests {
             body: "ping".into(),
             delivery: Delivery::Failed,
             sent_at: 0,
+            topic: None,
         };
         assert_eq!(
             to_chat_message(&failed, &names, None).delivery,

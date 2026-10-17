@@ -242,6 +242,15 @@ pub(crate) fn dispatch(
         adapter.view_chat(conversation_id.as_deref(), events);
         return false;
     }
+    if let AdapterCommand::ViewTopic {
+        conversation_id,
+        topic,
+        ..
+    } = &command
+    {
+        adapter.view_topic(conversation_id, *topic, events);
+        return false;
+    }
     let auth_epoch = match command {
         AdapterCommand::TelegramAuth { epoch, .. } => Some(epoch),
         _ => None,

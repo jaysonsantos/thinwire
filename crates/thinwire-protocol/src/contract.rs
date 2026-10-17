@@ -583,6 +583,7 @@ mod tests {
                 writable,
                 muted: false,
                 placeholder,
+                has_topics: false,
             },
         }
     }
@@ -634,6 +635,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 0,
                 arrival: crate::Arrival::History,
+                topic: None,
             },
         };
         let events = [

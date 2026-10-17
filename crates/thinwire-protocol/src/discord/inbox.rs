@@ -62,6 +62,7 @@ impl InboxChannel {
             writable: self.can_send,
             muted: false,
             placeholder: false,
+            has_topics: false,
         }
     }
 }
@@ -244,6 +245,7 @@ pub(crate) fn chat_message(
         delivery: Delivery::Sent,
         sent_at: snowflake_unix_seconds(message.id),
         arrival: crate::Arrival::History,
+        topic: None,
     }
 }
 

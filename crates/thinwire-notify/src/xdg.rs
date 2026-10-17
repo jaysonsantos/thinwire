@@ -500,6 +500,7 @@ mod tests {
         NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: id.into(),
+            topic: None,
         }
     }
 

@@ -623,6 +623,7 @@ async fn load_older_page(
         before_message_id: before_message_id.to_string(),
         more,
         note: note.map(str::to_string),
+        topic: None,
     });
 }
 
@@ -1144,6 +1145,7 @@ fn conversation_from_contact(contact: &Contact) -> Conversation {
         writable: true,
         muted: false,
         placeholder: false,
+        has_topics: false,
     }
 }
 
@@ -1162,6 +1164,7 @@ fn conversation_from_group(key: &[u8], group: &Group) -> Conversation {
         writable: true,
         muted: false,
         placeholder: false,
+        has_topics: false,
     }
 }
 
@@ -1281,6 +1284,7 @@ fn row_and_message(
         delivery: Delivery::Sent,
         sent_at: super::time::sent_at_secs(sent_millis),
         arrival,
+        topic: None,
     };
     let conversation = Conversation {
         protocol: ProtocolId::Signal,
@@ -1295,6 +1299,7 @@ fn row_and_message(
         writable: true,
         muted: false,
         placeholder: false,
+        has_topics: false,
     };
     Some((conversation, message))
 }
@@ -1362,6 +1367,7 @@ async fn send_text(
             delivery: Delivery::Sent,
             sent_at,
             arrival: thinwire_protocol::Arrival::History,
+            topic: None,
         },
     );
     session.remember(&id, &outbound.body).await;
@@ -1401,6 +1407,7 @@ fn sent_conversation(
         writable: true,
         muted: false,
         placeholder: false,
+        has_topics: false,
     }
 }
 
@@ -2379,6 +2386,7 @@ mod tests {
             writable: true,
             muted: false,
             placeholder: false,
+            has_topics: false,
         }
     }
 
