@@ -290,7 +290,7 @@ pub(crate) fn waiting(ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(48.0);
-            ui.spinner();
+            motion::spinner(ui);
             ui.add_space(12.0);
             ui.heading(CLOSING_NOTE);
             ui.add_space(4.0);

@@ -24,6 +24,39 @@ pub(crate) fn enabled(ctx: &egui::Context) -> bool {
     ctx.global_style().animation_time > 0.0
 }
 
+/// Still text in place of a spinner when the OS asks for less motion.
+pub(crate) const WORKING: &str = "Working…";
+
+/// A spinner, or the still text [`WORKING`] when motion is off.
+///
+/// [`egui::Spinner`] asks for another frame on every paint and turns from
+/// the clock. `Style::animation_time` does not stop it, so every loading
+/// spinner in the shell goes through here.
+pub(crate) fn spinner(ui: &mut egui::Ui) {
+    paint_spinner(ui, None);
+}
+
+/// The top-bar spinner: a fixed size and color, or [`WORKING`] when motion
+/// is off.
+pub(crate) fn busy_spinner(ui: &mut egui::Ui, size: f32, color: Color32) {
+    paint_spinner(ui, Some((size, color)));
+}
+
+fn paint_spinner(ui: &mut egui::Ui, look: Option<(f32, Color32)>) {
+    if !enabled(ui.ctx()) {
+        ui.label(egui::RichText::new(WORKING).weak());
+        return;
+    }
+    match look {
+        Some((size, color)) => {
+            ui.add(egui::Spinner::new().size(size).color(color));
+        }
+        None => {
+            ui.spinner();
+        }
+    }
+}
+
 /// Seconds for one egui transition. `0` when the OS asks for less motion.
 pub(crate) fn animation_time(reduce_motion: bool) -> f32 {
     if reduce_motion { 0.0 } else { PANEL }
@@ -202,6 +235,25 @@ mod tests {
         assert!(!follow(&ctx, &mut last, true));
         assert!(follow(&ctx, &mut last, false));
         assert_eq!(ctx.global_style().animation_time, PANEL);
+    }
+
+    /// Every spinner in the shell is this helper. A direct call outside
+    /// this file would keep turning when the OS asks for less motion.
+    #[test]
+    fn every_spinner_goes_through_the_reduce_motion_helper() {
+        let call = concat!("ui.", "spinner()");
+        let widget = concat!("Spinner::", "new()");
+        let here = include_str!("motion.rs");
+        assert_eq!(here.matches(call).count(), 1);
+        assert_eq!(here.matches(widget).count(), 1);
+        for src in [
+            include_str!("ui.rs"),
+            include_str!("auth.rs"),
+            include_str!("startup.rs"),
+        ] {
+            assert_eq!(src.matches(call).count(), 0);
+            assert_eq!(src.matches(widget).count(), 0);
+        }
     }
 
     #[test]

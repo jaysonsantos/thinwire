@@ -218,13 +218,11 @@ fn more_menu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 
 /// Side of the busy spinner in the top bar.
 const BUSY_SPINNER: f32 = 14.0;
-/// Still label in place of the busy spinner when the OS asks for less motion.
-const WORKING: &str = "Working…";
 
 /// A running load or send, left of the menu. It takes no row of its own, so
 /// the inbox and the thread do not move down and up for each send.
 /// Motion on: the busy line and a spinner.
-/// OS reduce-motion: the still label [`WORKING`].
+/// OS reduce-motion: the still label [`motion::WORKING`].
 /// A finished line or a failure stays on the strip.
 fn busy_indicator(ui: &mut egui::Ui, line: Option<&str>) {
     let id = ui.id().with("busy-line");
@@ -248,7 +246,7 @@ fn busy_indicator(ui: &mut egui::Ui, line: Option<&str>) {
             let palette = theme::palette(ui);
             ui.add(
                 egui::Label::new(
-                    RichText::new(WORKING)
+                    RichText::new(motion::WORKING)
                         .text_style(theme::secondary())
                         .color(palette.text2),
                 )
@@ -272,7 +270,7 @@ fn busy_indicator(ui: &mut egui::Ui, line: Option<&str>) {
                 .truncate(),
             );
         });
-        ui.add(egui::Spinner::new().size(BUSY_SPINNER).color(palette.text3));
+        motion::busy_spinner(ui, BUSY_SPINNER, palette.text3);
     });
 }
 
@@ -862,7 +860,7 @@ fn inbox(
         InboxState::Rows => {}
         InboxState::Loading => {
             ui.horizontal(|ui| {
-                ui.spinner();
+                motion::spinner(ui);
                 ui.label(RichText::new("Loading chats…").weak());
             });
             return DrawnInbox {
@@ -1453,7 +1451,7 @@ fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, connecting: bool) {
     let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
     ui.add_space(top);
     ui.vertical_centered(|ui| {
-        ui.spinner();
+        motion::spinner(ui);
         ui.add_space(8.0);
         if connecting {
             ui.label(RESUME_CONNECTING);
@@ -1625,7 +1623,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         match older {
             OlderState::Loading => {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    motion::spinner(ui);
                     ui.label(RichText::new("Loading older messages…").weak());
                 });
             }
@@ -1646,7 +1644,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         match state {
             ThreadState::Loading => {
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    motion::spinner(ui);
                     ui.label(RichText::new("Loading messages…").weak());
                 });
             }
@@ -3051,7 +3049,7 @@ mod tests {
         use egui_kittest::Harness;
         use egui_kittest::kittest::{By, Queryable};
 
-        use super::{WORKING, busy_indicator};
+        use super::busy_indicator;
         use crate::app::{motion, theme};
 
         let mut harness = Harness::builder()
@@ -3072,7 +3070,7 @@ mod tests {
             0.0,
             "reduce-motion sets animation_time to 0"
         );
-        harness.get_by_label(WORKING);
+        harness.get_by_label(motion::WORKING);
         assert!(
             harness
                 .query_all(By::new().role(Role::ProgressIndicator))
@@ -3092,7 +3090,6 @@ mod tests {
         use egui_kittest::Harness;
         use egui_kittest::kittest::{By, Queryable};
 
-        use super::WORKING;
         use crate::app::{motion, theme};
 
         let mut harness = Harness::builder()
@@ -3109,12 +3106,145 @@ mod tests {
         harness.run_steps(3);
         assert!(harness.ctx.global_style().animation_time > 0.0);
         harness.get_by_label("Sending…");
-        assert!(harness.query_by_label(WORKING).is_none());
+        assert!(harness.query_by_label(motion::WORKING).is_none());
         assert!(
             harness
                 .query_all(By::new().role(Role::ProgressIndicator))
                 .next()
                 .is_some()
         );
+    }
+
+    /// #247 review: a spinner ignores `animation_time` and keeps turning.
+    /// Each loading surface paints the still "Working…" text instead.
+    #[test]
+    fn with_reduce_motion_every_spinner_is_still_working_text() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{By, Queryable};
+        use thinwire_core::View;
+        use thinwire_core::demo::Scenario;
+        use thinwire_core::secrets::SecretStore;
+        use thinwire_core::settings::Settings;
+        use thinwire_core::state::test_support::{
+            complete_telegram, ready_with_chats, seed_override,
+        };
+        use thinwire_core::state::{
+            AuthScreen, CenterView, InboxState, RESUME_CONNECTING, Snapshot, ThreadState,
+        };
+        use thinwire_protocol::AdapterEvent;
+        use tokio::runtime::Builder;
+
+        use super::{Hints, draw};
+        use crate::app::{motion, startup, theme};
+
+        let store = SecretStore::memory();
+        let settings = Settings::in_memory();
+        seed_override(&store);
+
+        fn assert_still(size: [f32; 2], label: Option<&str>, mut show: impl FnMut(&mut egui::Ui)) {
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(size[0], size[1]))
+                .build_ui(|ui| {
+                    theme::install(ui.ctx());
+                    motion::apply(ui.ctx(), true);
+                    if !ui.style().text_styles.contains_key(&theme::secondary()) {
+                        return;
+                    }
+                    show(ui);
+                });
+            harness.run_steps(3);
+            assert_eq!(harness.ctx.global_style().animation_time, 0.0);
+            assert!(
+                harness
+                    .query_all(By::new().role(Role::ProgressIndicator))
+                    .next()
+                    .is_none(),
+                "{label:?}: no spinner"
+            );
+            assert!(
+                harness.query_all_by_label(motion::WORKING).next().is_some(),
+                "{label:?}: still text"
+            );
+            if let Some(label) = label {
+                assert!(
+                    harness.query_all_by_label(label).next().is_some(),
+                    "{label} stays"
+                );
+            }
+        }
+
+        fn draw_snapshot(
+            ui: &mut egui::Ui,
+            snapshot: &Snapshot,
+            store: &SecretStore,
+            settings: &Settings,
+        ) {
+            let view = View::from_parts(snapshot, store, settings);
+            let mut hints = Hints::default();
+            let mut out = Vec::new();
+            draw(ui, &view, &mut hints, &mut out);
+        }
+
+        assert_still(
+            [440.0, 220.0],
+            Some(startup::CLOSING_NOTE),
+            startup::waiting,
+        );
+
+        let mut connecting = Snapshot::new();
+        connecting.open_telegram(&store);
+        assert!(connecting.auth_busy);
+        assert_eq!(connecting.auth, AuthScreen::TelegramConnecting);
+        assert_still([480.0, 640.0], Some("Connecting to Telegram…"), |ui| {
+            draw_snapshot(ui, &connecting, &store, &settings);
+        });
+
+        let mut waiting_for_code = Snapshot::new();
+        complete_telegram(&mut waiting_for_code, &store);
+        waiting_for_code.auth = AuthScreen::TelegramPhone;
+        waiting_for_code.auth_busy = true;
+        assert_still([480.0, 640.0], Some("Waiting for Telegram…"), |ui| {
+            draw_snapshot(ui, &waiting_for_code, &store, &settings);
+        });
+
+        let mut inbox = Snapshot::new();
+        complete_telegram(&mut inbox, &store);
+        assert_eq!(inbox.inbox_state(), InboxState::Loading);
+        assert_still([800.0, 600.0], Some("Loading chats…"), |ui| {
+            draw_snapshot(ui, &inbox, &store, &settings);
+        });
+
+        let messages = ready_with_chats(&store);
+        assert_eq!(messages.thread_state(), ThreadState::Loading);
+        assert_still([800.0, 600.0], Some("Loading messages…"), |ui| {
+            draw_snapshot(ui, &messages, &store, &settings);
+        });
+
+        let mut resume = Snapshot::new();
+        complete_telegram(&mut resume, &store);
+        resume.apply(AdapterEvent::TelegramSessionEnded);
+        assert_eq!(
+            resume.center_view(),
+            CenterView::Resuming { connecting: true }
+        );
+        assert_still([800.0, 600.0], Some(RESUME_CONNECTING), |ui| {
+            draw_snapshot(ui, &resume, &store, &settings);
+        });
+
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let core = Scenario::LongChatLoadingOlder.build(runtime.handle());
+        assert_still([800.0, 600.0], Some("Loading older messages…"), |ui| {
+            let view = core.view();
+            let mut hints = Hints::default();
+            let mut out = Vec::new();
+            draw(ui, &view, &mut hints, &mut out);
+        });
+        drop(core);
+        drop(runtime);
     }
 }
