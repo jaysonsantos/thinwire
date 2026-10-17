@@ -142,6 +142,7 @@ mod tests {
             writable: true,
             muted: false,
             placeholder: false,
+            has_topics: false,
         };
         let message = ChatMessage {
             protocol,
@@ -153,6 +154,7 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: 1,
             arrival: thinwire_protocol::Arrival::History,
+            topic: None,
         };
         let commands = [
             AdapterCommand::Connect { protocol },

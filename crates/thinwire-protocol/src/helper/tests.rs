@@ -344,6 +344,7 @@ impl GatedFake {
             writable: true,
             placeholder: false,
             muted: false,
+            has_topics: false,
         }
     }
 
@@ -358,6 +359,7 @@ impl GatedFake {
             delivery: Delivery::Sent,
             sent_at: 1_790_000_000,
             arrival: Arrival::History,
+            topic: None,
         }
     }
 

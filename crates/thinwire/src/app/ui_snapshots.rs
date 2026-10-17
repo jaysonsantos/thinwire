@@ -153,6 +153,9 @@ shots! {
     muted_inbox => MutedInbox,
     muted_here => MutedHere,
     muted_by_protocol => MutedByProtocol,
+    forum_topics => ForumTopics,
+    open_topic => OpenForumTopic,
+    closed_topic => ClosedTopic,
 }
 
 /// Row menus for Mute, Unmute, and a disabled "Muted in Telegram" (#206).

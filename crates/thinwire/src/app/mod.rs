@@ -650,6 +650,7 @@ mod tests {
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:2".into(),
+            topic: None,
         };
         let (raise, opens) = notification_clicks(std::slice::from_ref(&key));
         assert!(raise);

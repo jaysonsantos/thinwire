@@ -352,16 +352,32 @@ impl Core {
     }
 
     fn notify_message(&mut self, message: &ChatMessage) {
+        let topic_name = message.topic.and_then(|topic| {
+            self.state
+                .topic(message.protocol, &message.conversation_id, topic)
+                .map(|row| row.name.clone())
+        });
+        let topic_muted = message.topic.is_some_and(|topic| {
+            let id = thinwire_protocol::topic_mute_id(&message.conversation_id, topic);
+            let protocol_muted = self
+                .state
+                .topic(message.protocol, &message.conversation_id, topic)
+                .is_some_and(|row| row.muted);
+            protocol_muted || self.settings.chat_mutes().contains(message.protocol, &id)
+        });
         let ctx = NotifyContext {
             enabled: self.settings.notifications(),
             preview: self.settings.notification_preview(),
             window_focused: self.notify.window_focused(),
             viewed: self.state.viewed(),
+            viewed_topic: self.state.viewed_topic(),
             has_session: self.state.has_session(message.protocol),
             muted_here: self
                 .settings
                 .chat_mutes()
                 .contains(message.protocol, &message.conversation_id),
+            topic_muted,
+            topic_name: topic_name.as_deref(),
             now: unix_now(),
         };
         let chat = self
@@ -373,12 +389,23 @@ impl Core {
 
     fn sync_notifications(&mut self) {
         let state = &self.state;
+        let viewed = state
+            .viewed()
+            .map(|(protocol, id)| (protocol, id, state.viewed_topic()));
         self.notify.sync(
-            state.viewed(),
+            viewed,
             |protocol| state.has_session(protocol),
-            |key| match state.conversation(key.protocol, &key.conversation_id) {
-                Some(row) => ChatNow::Listed { unread: row.unread },
-                None => ChatNow::Gone,
+            |key| {
+                if let Some(topic) = key.topic {
+                    return match state.topic(key.protocol, &key.conversation_id, topic) {
+                        Some(row) => ChatNow::Listed { unread: row.unread },
+                        None => ChatNow::Gone,
+                    };
+                }
+                match state.conversation(key.protocol, &key.conversation_id) {
+                    Some(row) => ChatNow::Listed { unread: row.unread },
+                    None => ChatNow::Gone,
+                }
             },
         );
     }
@@ -390,6 +417,10 @@ impl Core {
         match intent {
             Intent::SelectProtocol(protocol) => self.state.select_protocol(protocol),
             Intent::SelectConversation { id } => self.state.select_conversation(id),
+            Intent::SelectTopic {
+                conversation_id,
+                topic,
+            } => self.state.select_topic(conversation_id, topic),
             Intent::MoveInbox { delta } => self.state.move_inbox_selection(delta),
             Intent::FocusInbox { id } => self.state.focus_inbox_row(id),
             Intent::SetFilter(filter) => self.state.set_filter(filter),
@@ -400,15 +431,20 @@ impl Core {
             Intent::SetDraft {
                 protocol,
                 conversation_id,
+                topic,
                 text,
             } => self
                 .state
-                .set_draft(protocol, &conversation_id, text.into_inner()),
+                .set_draft(protocol, &conversation_id, topic, text.into_inner()),
             Intent::SendDraft {
                 protocol,
                 conversation_id,
+                topic,
             } => {
-                if self.state.is_selected_chat(protocol, &conversation_id) {
+                if self
+                    .state
+                    .is_selected_thread(protocol, &conversation_id, topic)
+                {
                     self.state.send_compose();
                 } else {
                     tracing::warn!("send dropped: its chat is no longer selected");
@@ -418,8 +454,12 @@ impl Core {
             Intent::LoadOlderMessages {
                 protocol,
                 conversation_id,
+                topic,
             } => {
-                if self.state.is_selected_chat(protocol, &conversation_id) {
+                if self
+                    .state
+                    .is_selected_thread(protocol, &conversation_id, topic)
+                {
                     self.state.load_older();
                 }
             }
@@ -442,7 +482,11 @@ impl Core {
                         .conversation(key.protocol, &key.conversation_id)
                         .is_some()
                 {
-                    self.state.select_conversation(key.conversation_id.clone());
+                    if let Some(topic) = key.topic {
+                        self.state.select_topic(key.conversation_id.clone(), topic);
+                    } else {
+                        self.state.select_conversation(key.conversation_id.clone());
+                    }
                 }
                 self.notify.dismiss(&key);
             }
@@ -466,11 +510,8 @@ impl Core {
                 self.settings
                     .set_chat_muted(protocol, &conversation_id, muted);
                 if muted {
-                    // A notification of this chat on screen goes away.
-                    self.notify.dismiss(&crate::notify::NotifyKey {
-                        protocol,
-                        conversation_id,
-                    });
+                    // A notification of this chat, or of this topic, goes away.
+                    self.notify.dismiss_muted(protocol, &conversation_id);
                 }
             }
             Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
@@ -924,6 +965,7 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             text: "hello".into(),
+            topic: None,
         });
         assert_eq!(core.view().compose, "hello");
         core.dispatch(Intent::SetTheme(ThemeMode::Dark));
@@ -1505,6 +1547,7 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: unix_now(),
             arrival: Arrival::Live,
+            topic: None,
         });
         assert!(
             matches!(&core.take_notify()[..], [NotifyCommand::Show(note)] if note.title == "Bob"),
@@ -1538,6 +1581,7 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: unix_now(),
             arrival: Arrival::Live,
+            topic: None,
         };
         core.notify_message(&live);
         assert!(
@@ -1555,6 +1599,7 @@ mod tests {
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:2".into(),
+            topic: None,
         };
         core.dispatch(Intent::OpenFromNotification(key));
         assert_eq!(
@@ -1591,6 +1636,7 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: unix_now(),
             arrival: Arrival::Live,
+            topic: None,
         };
         // Chat 1 is open and the window has focus: nothing.
         core.notify_message(&live(1, "seen"));
@@ -1600,6 +1646,7 @@ mod tests {
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:2".into(),
+            topic: None,
         };
         let shown = core.take_notify();
         assert!(
@@ -1663,10 +1710,12 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: unix_now(),
             arrival: Arrival::Live,
+            topic: None,
         };
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:2".into(),
+            topic: None,
         };
         let mute = |muted| Intent::SetChatMute {
             protocol: ProtocolId::Telegram,
@@ -1982,6 +2031,7 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: unix_now(),
             arrival: Arrival::Live,
+            topic: None,
         };
         core.notify_message(&live(2));
         assert_eq!(core.take_notify().len(), 1);
@@ -2000,6 +2050,7 @@ mod tests {
         core.dispatch(Intent::OpenFromNotification(NotifyKey {
             protocol: ProtocolId::Slack,
             conversation_id: "telegram:2".into(),
+            topic: None,
         }));
         assert_eq!(core.view().selected_protocol, ProtocolId::Telegram);
         assert_eq!(core.view().selected_conversation, selected);
@@ -2009,6 +2060,7 @@ mod tests {
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:2".into(),
+            topic: None,
         };
         assert_eq!(core.take_notify(), vec![NotifyCommand::Dismiss(key)]);
     }
@@ -2042,6 +2094,7 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: unix_now(),
             arrival: Arrival::Live,
+            topic: None,
         });
         assert_eq!(
             core.take_notify().len(),
@@ -2117,6 +2170,7 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             text: "for Ada only".into(),
+            topic: None,
         });
         assert_eq!(core.view().compose, "", "chat 2 gets no text from chat 1");
 
@@ -2147,6 +2201,7 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             text: "for Ada only".into(),
+            topic: None,
         });
         core.dispatch(Intent::SelectConversation {
             id: "telegram:2".into(),
@@ -2156,6 +2211,7 @@ mod tests {
         core.dispatch(Intent::SendDraft {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            topic: None,
         });
         let mut commands = Vec::new();
         while let Ok(command) = sent.try_recv() {
@@ -2175,6 +2231,7 @@ mod tests {
         core.dispatch(Intent::SendDraft {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            topic: None,
         });
         let mut sends = Vec::new();
         while let Ok(command) = sent.try_recv() {
@@ -2245,10 +2302,12 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             text: "hello".into(),
+            topic: None,
         });
         core.dispatch(Intent::SendDraft {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            topic: None,
         });
         assert!(core.send_wake.is_some(), "a wake is armed for the deadline");
         assert!(
@@ -2291,10 +2350,12 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             text: "hello".into(),
+            topic: None,
         });
         core.dispatch(Intent::SendDraft {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            topic: None,
         });
         assert!(core.sending());
         core.dispatch(Intent::Shutdown);
@@ -2397,10 +2458,12 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: chat.into(),
                 text: text.into(),
+                topic: None,
             });
             core.dispatch(Intent::SendDraft {
                 protocol: ProtocolId::Telegram,
                 conversation_id: chat.into(),
+                topic: None,
             });
             let request = std::iter::from_fn(|| sent.try_recv().ok())
                 .find_map(|command| match command {
@@ -2476,10 +2539,12 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             text: "secret".into(),
+            topic: None,
         });
         core.dispatch(Intent::SendDraft {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            topic: None,
         });
         let request = std::iter::from_fn(|| sent.try_recv().ok())
             .find_map(|command| match command {
@@ -2521,10 +2586,12 @@ mod tests {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             text: "hello".into(),
+            topic: None,
         });
         core.dispatch(Intent::SendDraft {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            topic: None,
         });
         let mut request = None;
         while let Ok(command) = sent.try_recv() {
@@ -2615,6 +2682,7 @@ mod tests {
                 delivery,
                 sent_at: unix_now(),
                 arrival: Arrival::History,
+                topic: None,
             },
         };
         events_tx.send(row(Delivery::Pending)).expect("queue");

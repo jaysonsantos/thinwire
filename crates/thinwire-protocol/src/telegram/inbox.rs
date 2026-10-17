@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::adapter::{ChatMessage, Conversation, Delivery, ProtocolId};
+use crate::adapter::{ChatMessage, Conversation, Delivery, MessageTopic, ProtocolId};
 
 /// Page size passed to TDLib `loadChats` for the main list.
 pub(super) const MAIN_CHAT_LIMIT: i32 = 30;
@@ -42,6 +42,7 @@ pub(super) struct InboxMessage {
     pub body: String,
     pub delivery: Delivery,
     pub sent_at: i64,
+    pub topic: Option<crate::MessageTopic>,
 }
 
 /// What the shell should do after a chat-list mutation.
@@ -91,6 +92,9 @@ pub(super) struct ChatSeed<'a> {
     pub is_group: bool,
     pub scope: MuteScope,
     pub mute: ChatMute,
+    pub has_topics: bool,
+    /// Private-chat user id, so a later bot update can set `has_topics`.
+    pub peer: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +108,8 @@ struct ChatRecord {
     is_group: bool,
     scope: MuteScope,
     mute: ChatMute,
+    has_topics: bool,
+    peer: Option<i64>,
 }
 
 /// Main-list chats keyed by TDLib chat id. `order == 0` is not listed.
@@ -112,6 +118,8 @@ pub(super) struct ChatDirectory {
     chats: HashMap<i64, ChatRecord>,
     /// Scopes that TDLib reports as muted (`updateScopeNotificationSettings`).
     muted_scopes: HashMap<MuteScope, bool>,
+    /// Bot users whose chats have topics.
+    topic_bots: std::collections::HashSet<i64>,
 }
 
 impl ChatDirectory {
@@ -188,9 +196,70 @@ impl ChatDirectory {
                 is_group: seed.is_group,
                 scope: seed.scope,
                 mute: seed.mute,
+                has_topics: seed.has_topics,
+                peer: seed.peer,
             },
         );
         self.effect(chat_id, previous)
+    }
+
+    /// This bot user has topics. Private chats of that user follow.
+    pub(super) fn bot_has_topics(&self, user_id: i64) -> bool {
+        self.topic_bots.contains(&user_id)
+    }
+
+    /// A forum supergroup in "view as topics", or a private chat with a bot
+    /// that has topics.
+    pub(super) fn has_topics(&self, chat_id: i64) -> bool {
+        self.chats.get(&chat_id).is_some_and(|chat| chat.has_topics)
+    }
+
+    /// A bot user gained or lost topics. Private chats of that user follow.
+    pub(super) fn note_topic_bot(&mut self, user_id: i64, has_topics: bool) -> Vec<ChatEffect> {
+        let changed = if has_topics {
+            self.topic_bots.insert(user_id)
+        } else {
+            self.topic_bots.remove(&user_id)
+        };
+        if !changed {
+            return Vec::new();
+        }
+        let ids: Vec<i64> = self
+            .chats
+            .iter()
+            .filter(|(_, chat)| chat.peer == Some(user_id))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| {
+                if let Some(chat) = self.chats.get_mut(&id) {
+                    chat.has_topics = has_topics;
+                }
+                let previous = self.chats.get(&id).map(|chat| chat.order);
+                self.effect(id, previous)
+            })
+            .collect()
+    }
+
+    /// `updateChatViewAsTopics` for a supergroup. A private chat (Saved
+    /// Messages) and a channel stay as they are.
+    pub(super) fn set_view_as_topics(
+        &mut self,
+        chat_id: i64,
+        view_as_topics: bool,
+    ) -> Option<ChatEffect> {
+        let chat = self.chats.get(&chat_id)?;
+        if chat.scope == MuteScope::Private || chat.scope == MuteScope::Channel {
+            return None;
+        }
+        if chat.has_topics == view_as_topics {
+            return None;
+        }
+        let previous = chat.order;
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.has_topics = view_as_topics;
+        }
+        self.effect(chat_id, Some(previous))
     }
 
     pub(super) fn set_title(&mut self, chat_id: i64, title: &str) -> Option<ChatEffect> {
@@ -259,6 +328,8 @@ impl ChatDirectory {
             is_group: false,
             scope: MuteScope::default(),
             mute: ChatMute::default(),
+            has_topics: false,
+            peer: None,
         })
     }
 
@@ -360,6 +431,7 @@ pub(super) struct ViewedChat {
 struct ViewedInner {
     view_seq: u64,
     chat: Option<i64>,
+    topic: Option<MessageTopic>,
 }
 
 impl ViewedChat {
@@ -368,6 +440,7 @@ impl ViewedChat {
             inner: Arc::new(Mutex::new(ViewedInner {
                 view_seq: 0,
                 chat: None,
+                topic: None,
             })),
         }
     }
@@ -382,21 +455,46 @@ impl ViewedChat {
         self.lock().chat
     }
 
+    /// The topic a history page may mark read. `None` is a chat with no topic.
+    #[must_use]
+    pub(super) fn get_topic(&self) -> Option<MessageTopic> {
+        self.lock().topic
+    }
+
     /// Caller side. Returns the `view_seq` the matching `ViewChat` must carry.
+    /// A chat view clears any topic.
     #[must_use]
     pub(super) fn publish(&self, chat: Option<i64>) -> u64 {
+        self.publish_topic(chat, None)
+    }
+
+    /// Caller side for one topic. Returns the `view_seq` `ViewTopic` must carry.
+    #[must_use]
+    pub(super) fn publish_topic(&self, chat: Option<i64>, topic: Option<MessageTopic>) -> u64 {
         let mut viewed = self.lock();
         viewed.view_seq = viewed.view_seq.wrapping_add(1);
         viewed.chat = chat;
+        viewed.topic = topic;
         viewed.view_seq
     }
 
-    /// Worker side. Applies `chat` only while `view_seq` is still current.
+    /// Worker side. Applies `chat` and clears the topic while `view_seq` is current.
     /// `false` means a newer publish already replaced this one.
     pub(super) fn sync(&self, view_seq: u64, chat: Option<i64>) -> bool {
+        self.sync_topic(view_seq, chat, None)
+    }
+
+    /// Worker side for one topic.
+    pub(super) fn sync_topic(
+        &self,
+        view_seq: u64,
+        chat: Option<i64>,
+        topic: Option<MessageTopic>,
+    ) -> bool {
         let mut viewed = self.lock();
         if viewed.view_seq == view_seq {
             viewed.chat = chat;
+            viewed.topic = topic;
             true
         } else {
             false
@@ -408,7 +506,19 @@ impl ViewedChat {
         let mut viewed = self.lock();
         viewed.view_seq = viewed.view_seq.wrapping_add(1);
         viewed.chat = None;
+        viewed.topic = None;
     }
+}
+
+/// History of one topic calls `viewMessages` only while that topic is open.
+#[must_use]
+pub(super) fn should_mark_topic_viewed(
+    viewed: Option<i64>,
+    viewed_topic: Option<MessageTopic>,
+    chat_id: i64,
+    topic: MessageTopic,
+) -> bool {
+    viewed == Some(chat_id) && viewed_topic == Some(topic)
 }
 
 #[must_use]
@@ -608,6 +718,7 @@ pub(super) fn to_chat_message(
         } else {
             Delivery::Sent
         },
+        topic: message.topic,
     }
 }
 
@@ -625,6 +736,7 @@ fn conversation_from(chat_id: i64, chat: &ChatRecord, muted: bool) -> Conversati
         writable: true,
         placeholder: false,
         muted,
+        has_topics: chat.has_topics,
     }
 }
 
@@ -667,6 +779,8 @@ mod tests {
             is_group: false,
             scope: MuteScope::Private,
             mute: ChatMute::default(),
+            has_topics: false,
+            peer: None,
         }
     }
 
@@ -969,6 +1083,7 @@ mod tests {
             body: "hello".into(),
             delivery: Delivery::Sent,
             sent_at: 1_700_000_000,
+            topic: None,
         };
         let mapped = to_chat_message(&message, &names, Some("Ada"));
         assert_eq!(mapped.sender, "Ada Lovelace");
@@ -995,6 +1110,7 @@ mod tests {
             body: "ping".into(),
             delivery: Delivery::Failed,
             sent_at: 0,
+            topic: None,
         };
         assert_eq!(
             to_chat_message(&failed, &names, None).delivery,

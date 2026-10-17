@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
-    AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery,
-    DiscordAdapter, HelperFault, HelperState, ProtocolCapabilities, ProtocolId, TelegramApiSource,
-    TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, TelegramSecretVault,
-    catalog, telegram_api_available,
+    AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, ChatTopic,
+    Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, MessageTopic,
+    ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthError, TelegramAuthPhase,
+    TelegramAuthStep, TelegramCodeVia, TelegramSecretVault, catalog, ordered_topics,
+    telegram_api_available, topic_mute_id,
 };
 
 use crate::mutes::{ChatMute, ChatMutes};
@@ -444,9 +445,14 @@ struct RejectedBody {
 pub struct Snapshot {
     pub accounts: Vec<AccountRow>,
     conversations: HashMap<ProtocolId, Vec<Conversation>>,
-    messages: HashMap<(ProtocolId, String), Vec<ChatMessage>>,
+    messages: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<ChatMessage>>,
+    /// Forum topics and bot threads, keyed by protocol and chat.
+    topics: HashMap<(ProtocolId, String), Vec<ChatTopic>>,
     pub selected_protocol: ProtocolId,
     pub selected_conversation: Option<String>,
+    /// The open topic of the selected chat. `None` is the topic list, or a
+    /// chat that has no topics.
+    pub selected_topic: Option<MessageTopic>,
     /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
     pub focused_row: Option<String>,
     pub filter: InboxFilter,
@@ -500,8 +506,10 @@ pub struct Snapshot {
     history_loading: HashSet<(ProtocolId, String)>,
     /// The last note of each protocol (`AdapterEvent::Notice`). Never an error.
     notices: HashMap<ProtocolId, String>,
-    /// The chat the adapters were last told the user looks at (`ViewChat`).
-    viewed: Option<(ProtocolId, String)>,
+    /// The chat the adapters were last told the user looks at (`ViewChat`
+    /// or `ViewTopic`). The topic is `None` for a chat that has no topics.
+    /// The topic list is not a viewed chat.
+    viewed: Option<(ProtocolId, String, Option<MessageTopic>)>,
     /// The window has focus. An open chat stays unread until it does, so a
     /// notification while the user is away still has a badge when they return.
     window_focused: bool,
@@ -546,8 +554,9 @@ pub struct Snapshot {
     scroll_to_focused: bool,
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
     seen_visible_ids: Vec<String>,
-    /// Unsent compose text per chat. `compose` holds the selected chat's draft.
-    drafts: HashMap<(ProtocolId, String), String>,
+    /// Unsent compose text per chat and topic. `compose` holds the open
+    /// thread's draft. A chat with no topics uses `None`.
+    drafts: HashMap<(ProtocolId, String, Option<MessageTopic>), String>,
     /// Body of a send or retry the adapter rejected, until that protocol's
     /// session ends. An unlink keeps one only when nothing newer replaced it.
     /// A Telegram session end drops them.
@@ -703,6 +712,14 @@ enum TelegramSendEnd {
     All,
 }
 
+fn thread_key(
+    protocol: ProtocolId,
+    chat: &str,
+    topic: Option<MessageTopic>,
+) -> (ProtocolId, String, Option<MessageTopic>) {
+    (protocol, chat.to_owned(), topic)
+}
+
 impl Snapshot {
     pub fn new() -> Self {
         let accounts = catalog()
@@ -719,8 +736,10 @@ impl Snapshot {
             accounts,
             conversations: HashMap::new(),
             messages: HashMap::new(),
+            topics: HashMap::new(),
             selected_protocol: ProtocolId::Telegram,
             selected_conversation: None,
+            selected_topic: None,
             focused_row: None,
             filter: InboxFilter::All,
             search: String::new(),
@@ -879,6 +898,7 @@ impl Snapshot {
             }
             AdapterEvent::ConversationUpsert { mut conversation } => {
                 if self.window_focused
+                    && !conversation.has_topics
                     && self.chat_is_viewed(conversation.protocol, &conversation.id)
                 {
                     conversation.unread = 0;
@@ -896,6 +916,7 @@ impl Snapshot {
                 self.ensure_conversation_selection();
                 self.sync_focused_row(FocusFollow::Upsert);
             }
+            AdapterEvent::TopicUpsert { topic } => self.upsert_topic(topic),
             AdapterEvent::MessageDelivery {
                 protocol,
                 conversation_id,
@@ -941,7 +962,7 @@ impl Snapshot {
             } => {
                 // Every protocol: a failure sets the chat's note, a success
                 // clears it. The thread shows plain text only.
-                let key = (protocol, conversation_id);
+                let key = (protocol, conversation_id.clone());
                 match note {
                     Some(detail) => {
                         tracing::debug!(?protocol, %detail, "older page did not load");
@@ -953,8 +974,8 @@ impl Snapshot {
                 }
                 self.older_loading.remove(&key);
                 let oldest = self
-                    .messages
-                    .get(&key)
+                    .message_bucket(protocol, &conversation_id, &before_message_id)
+                    .and_then(|bucket| self.messages.get(&bucket))
                     .and_then(|list| list.first())
                     .map(|row| row.id.as_str());
                 if !more {
@@ -996,6 +1017,7 @@ impl Snapshot {
                     self.delivery_of(message.protocol, &message.conversation_id, &message.id);
                 self.note_delivery(before, &message);
                 self.observe_telegram_message(&message, None);
+                self.note_live_topic(&message);
                 self.upsert_message(message);
             }
             AdapterEvent::MessageReplaced {
@@ -1205,10 +1227,49 @@ impl Snapshot {
     /// A later message does not: the list stays where the user left it.
     pub fn select_conversation(&mut self, id: String) {
         self.focused_row = Some(id.clone());
-        self.set_selected_conversation(Some(id));
-        self.focus_compose = true;
+        let has_topics = self
+            .conversation(self.selected_protocol, &id)
+            .is_some_and(|row| row.has_topics);
+        self.set_selection(Some(id), None);
+        // The topic list has no compose field.
+        self.focus_compose = !has_topics;
         self.scroll_to_selected = true;
         self.queue_open_chat();
+    }
+
+    /// Open one topic of the selected chat. A hidden topic is not a row.
+    pub fn select_topic(&mut self, conversation_id: String, topic: MessageTopic) {
+        let protocol = self.selected_protocol;
+        let Some(row) = self
+            .topics
+            .get(&(protocol, conversation_id.clone()))
+            .and_then(|rows| rows.iter().find(|row| row.topic == topic))
+        else {
+            return;
+        };
+        if row.hidden {
+            return;
+        }
+        let closed = row.closed;
+        let same_chat = self.selected_conversation.as_deref() == Some(conversation_id.as_str());
+        if !same_chat {
+            self.focused_row = Some(conversation_id.clone());
+            self.scroll_to_selected = true;
+        }
+        self.set_selection(Some(conversation_id), Some(topic));
+        self.focus_compose = !closed;
+        self.queue_open_chat();
+    }
+
+    /// Leave the open topic and show its topic list. The draft stays with
+    /// the topic.
+    pub fn close_open_topic(&mut self) {
+        if self.selected_topic.is_none() {
+            return;
+        }
+        let id = self.selected_conversation.clone();
+        self.set_selection(id, None);
+        self.focus_compose = false;
     }
 
     /// Move the keyboard highlight among the visible inbox rows.
@@ -1268,33 +1329,71 @@ impl Snapshot {
     /// Store unsent text of one chat. The selected chat keeps it in `compose`,
     /// another chat in its draft. Never "the selected chat" by default: the
     /// text stays with the chat it was typed in (PR #48 review).
-    pub fn set_draft(&mut self, protocol: ProtocolId, chat: &str, text: String) {
-        if self.is_selected_chat(protocol, chat) {
+    pub fn set_draft(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        text: String,
+    ) {
+        if self.is_selected_thread(protocol, chat, topic) {
             self.compose = text;
         } else if text.is_empty() {
-            self.drafts.remove(&(protocol, chat.to_owned()));
+            self.drafts.remove(&(protocol, chat.to_owned(), topic));
         } else {
-            self.drafts.insert((protocol, chat.to_owned()), text);
+            self.drafts.insert((protocol, chat.to_owned(), topic), text);
         }
     }
 
+    /// True when this chat and topic are the open thread.
+    #[must_use]
+    pub fn is_selected_thread(
+        &self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+    ) -> bool {
+        self.is_selected_chat(protocol, chat) && self.selected_topic == topic
+    }
+
     fn set_selected_conversation(&mut self, id: Option<String>) {
-        if self.selected_conversation == id {
+        self.set_selection(id, None);
+    }
+
+    /// Change the open chat and topic. The compose text stays with the
+    /// thread it was typed in.
+    fn set_selection(&mut self, id: Option<String>, topic: Option<MessageTopic>) {
+        if self.selected_conversation == id && self.selected_topic == topic {
             return;
         }
+        let same_chat = self.selected_conversation == id;
+        if same_chat && self.selected_topic != topic {
+            self.reset_older_page(self.selected_protocol, id.as_deref().unwrap_or(""));
+        }
         let draft = std::mem::take(&mut self.compose);
-        if let Some(old) = self.selected_conversation.take()
+        if let Some(old) = self.selected_conversation.clone()
             && !draft.is_empty()
         {
-            self.drafts.insert((self.selected_protocol, old), draft);
+            self.drafts
+                .insert((self.selected_protocol, old, self.selected_topic), draft);
         }
+        self.selected_topic = topic;
         if let Some(new) = id.as_ref() {
             self.compose = self
                 .drafts
-                .remove(&(self.selected_protocol, new.clone()))
+                .remove(&(self.selected_protocol, new.clone(), topic))
                 .unwrap_or_default();
         }
         self.selected_conversation = id;
+    }
+
+    /// Drop the older-page memory of one chat so the next topic can page.
+    fn reset_older_page(&mut self, protocol: ProtocolId, id: &str) {
+        let key = (protocol, id.to_owned());
+        self.older_loading.remove(&key);
+        self.older_at_start.remove(&key);
+        self.older_retry.remove(&key);
+        self.older_note.remove(&key);
     }
 
     /// Every adapter answered `Shutdown` with `Stopped`: no session of any
@@ -1327,7 +1426,9 @@ impl Snapshot {
             .accounts
             .iter()
             .any(|row| row.caps.id == protocol && row.linked() && row.caps.sends_text);
+        let topic_open = self.selected_topic_row().is_none_or(|topic| !topic.closed);
         sends_text
+            && topic_open
             && !self.compose.trim().is_empty()
             && self
                 .selected_conversation_row()
@@ -1364,7 +1465,7 @@ impl Snapshot {
         }
         let Some(message) = self
             .messages
-            .get_mut(&(protocol, conversation_id.clone()))
+            .get_mut(&thread_key(protocol, &conversation_id, self.selected_topic))
             .and_then(|list| list.iter_mut().find(|row| row.id == message_id))
         else {
             return;
@@ -1480,6 +1581,22 @@ impl Snapshot {
         self.conversations
             .get(&protocol)
             .map(|rows| rows.iter().map(|row| row.unread).sum())
+            .unwrap_or(0)
+    }
+
+    /// Unread on an account chip. A forum contributes unmuted topic counts.
+    #[must_use]
+    pub(crate) fn account_display_unread(&self, protocol: ProtocolId, mutes: &ChatMutes) -> u32 {
+        if !self.has_session(protocol) {
+            return 0;
+        }
+        self.conversations
+            .get(&protocol)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| self.display_unread(row, mutes))
+                    .fold(0, u32::saturating_add)
+            })
             .unwrap_or(0)
     }
 
@@ -1683,11 +1800,20 @@ impl Snapshot {
         };
         let protocol = self.selected_protocol;
         self.older_loading.insert((protocol, id.clone()));
-        self.pending.push(AdapterCommand::LoadOlderMessages {
-            protocol,
-            conversation_id: id,
-            before_message_id: oldest,
-        });
+        if let Some(topic) = self.selected_topic {
+            self.pending.push(AdapterCommand::LoadOlderTopic {
+                protocol,
+                conversation_id: id,
+                topic,
+                before_message_id: oldest,
+            });
+        } else {
+            self.pending.push(AdapterCommand::LoadOlderMessages {
+                protocol,
+                conversation_id: id,
+                before_message_id: oldest,
+            });
+        }
     }
 
     /// A request for older messages of the selected chat would go out now.
@@ -1750,8 +1876,68 @@ impl Snapshot {
             return &[];
         };
         self.messages
-            .get(&(self.selected_protocol, id.clone()))
+            .get(&thread_key(self.selected_protocol, id, self.selected_topic))
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// The open topic, when one is selected.
+    #[must_use]
+    pub fn selected_topic_row(&self) -> Option<&ChatTopic> {
+        let id = self.selected_conversation.as_ref()?;
+        let topic = self.selected_topic?;
+        self.topics
+            .get(&(self.selected_protocol, id.clone()))
+            .and_then(|rows| rows.iter().find(|row| row.topic == topic))
+    }
+
+    /// Topics of the selected chat, in list order.
+    #[must_use]
+    pub fn selected_topics(&self) -> Vec<&ChatTopic> {
+        let Some(id) = self.selected_conversation.as_ref() else {
+            return Vec::new();
+        };
+        self.topics
+            .get(&(self.selected_protocol, id.clone()))
+            .map(|topics| ordered_topics(topics))
+            .unwrap_or_default()
+    }
+
+    /// One topic of one chat.
+    #[must_use]
+    pub fn topic(
+        &self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        topic: MessageTopic,
+    ) -> Option<&ChatTopic> {
+        self.topics
+            .get(&(protocol, conversation_id.to_owned()))
+            .and_then(|rows| rows.iter().find(|row| row.topic == topic))
+    }
+
+    /// The badge of one row. A forum or a bot chat sums the unread counts
+    /// of the topics that are not muted.
+    #[must_use]
+    pub(crate) fn display_unread(&self, row: &Conversation, mutes: &ChatMutes) -> u32 {
+        if !row.has_topics {
+            return row.unread;
+        }
+        self.topics
+            .get(&(row.protocol, row.id.clone()))
+            .map(|topics| {
+                topics
+                    .iter()
+                    .filter(|topic| {
+                        !ChatMute::of(
+                            topic.muted,
+                            mutes.contains(row.protocol, &topic_mute_id(&row.id, topic.topic)),
+                        )
+                        .is_muted()
+                    })
+                    .map(|topic| topic.unread)
+                    .fold(0, u32::saturating_add)
+            })
+            .unwrap_or(0)
     }
 
     pub fn refresh_visible(&mut self) {
@@ -1901,7 +2087,12 @@ impl Snapshot {
                     self.retry_keychain();
                 }
             }
-            CenterView::Resuming { .. } | CenterView::Thread => {}
+            CenterView::Resuming { .. } => {}
+            CenterView::Thread => {
+                if key == AuthKey::Escape {
+                    self.close_open_topic();
+                }
+            }
         }
     }
 
@@ -2038,13 +2229,9 @@ impl Snapshot {
         let selected = self.is_selected_chat(protocol, chat);
         if selected && self.compose.trim() == body {
             self.compose.clear();
-        } else if self
-            .drafts
-            .get(&(protocol, chat.to_owned()))
-            .is_some_and(|draft| draft.trim() == body)
-        {
-            self.drafts.remove(&(protocol, chat.to_owned()));
         }
+        self.drafts
+            .retain(|key, draft| !(key.0 == protocol && key.1 == chat && draft.trim() == body));
     }
 
     /// Expire sends and retries with no answer after `SEND_TIMEOUT` (#69).
@@ -2209,7 +2396,7 @@ impl Snapshot {
             self.compose.trim()
         } else {
             self.drafts
-                .get(&(protocol, chat.to_owned()))
+                .get(&(protocol, chat.to_owned(), None))
                 .map_or("", |draft| draft.trim())
         }
     }
@@ -2261,8 +2448,9 @@ impl Snapshot {
     }
 
     fn message_body(&self, protocol: ProtocolId, chat: &str, message_id: &str) -> Option<String> {
+        let key = self.message_bucket(protocol, chat, message_id)?;
         self.messages
-            .get(&(protocol, chat.to_owned()))
+            .get(&key)
             .and_then(|rows| rows.iter().find(|row| row.id == message_id))
             .map(|row| row.body.trim().to_owned())
     }
@@ -2330,12 +2518,22 @@ impl Snapshot {
             return;
         };
         self.error = None;
-        self.pending.push(AdapterCommand::SendText {
-            protocol,
-            conversation_id,
-            body,
-            request,
-        });
+        if let Some(topic) = self.selected_topic {
+            self.pending.push(AdapterCommand::SendTopicText {
+                protocol,
+                conversation_id,
+                topic,
+                body,
+                request,
+            });
+        } else {
+            self.pending.push(AdapterCommand::SendText {
+                protocol,
+                conversation_id,
+                body,
+                request,
+            });
+        }
     }
 
     /// Telegram's accept is not its finished line. Hold that request until it ends.
@@ -2755,21 +2953,41 @@ impl Snapshot {
         if !listed {
             return;
         }
-        let already = self.pending.iter().any(|command| {
-            matches!(
-                command,
-                AdapterCommand::OpenChat { protocol: owner, conversation_id }
-                    if *owner == protocol && conversation_id == &id
-            )
+        let topic = self.selected_topic;
+        let already = self.pending.iter().any(|command| match (command, topic) {
+            (
+                AdapterCommand::OpenTopic {
+                    protocol: owner,
+                    conversation_id,
+                    topic: open,
+                },
+                Some(topic),
+            ) => *owner == protocol && conversation_id == &id && *open == topic,
+            (
+                AdapterCommand::OpenChat {
+                    protocol: owner,
+                    conversation_id,
+                },
+                None,
+            ) => *owner == protocol && conversation_id == &id,
+            _ => false,
         });
         if already {
             return;
         }
         self.history_loading.insert((protocol, id.clone()));
-        self.pending.push(AdapterCommand::OpenChat {
-            protocol,
-            conversation_id: id,
-        });
+        if let Some(topic) = topic {
+            self.pending.push(AdapterCommand::OpenTopic {
+                protocol,
+                conversation_id: id,
+                topic,
+            });
+        } else {
+            self.pending.push(AdapterCommand::OpenChat {
+                protocol,
+                conversation_id: id,
+            });
+        }
     }
 
     /// Tell the adapters which chat shows now (shell plan 9). Sends only the
@@ -2785,8 +3003,8 @@ impl Snapshot {
         }
         let before = std::mem::replace(&mut self.viewed, now.clone());
         let left_protocol = match (&before, &now) {
-            (Some((old, _)), Some((new, _))) => (old != new).then_some(*old),
-            (Some((old, _)), None) => Some(*old),
+            (Some((old, _, _)), Some((new, _, _))) => (old != new).then_some(*old),
+            (Some((old, _, _)), None) => Some(*old),
             (None, _) => None,
         };
         if let Some(protocol) = left_protocol {
@@ -2795,11 +3013,21 @@ impl Snapshot {
                 conversation_id: None,
             });
         }
-        if let Some((protocol, id)) = now {
-            self.pending.push(AdapterCommand::ViewChat {
-                protocol,
-                conversation_id: Some(id),
-            });
+        match now {
+            Some((protocol, id, Some(topic))) => {
+                self.pending.push(AdapterCommand::ViewTopic {
+                    protocol,
+                    conversation_id: id,
+                    topic,
+                });
+            }
+            Some((protocol, id, None)) => {
+                self.pending.push(AdapterCommand::ViewChat {
+                    protocol,
+                    conversation_id: Some(id),
+                });
+            }
+            None => {}
         }
         self.clear_viewed_unread();
     }
@@ -2817,7 +3045,7 @@ impl Snapshot {
     fn chat_is_viewed(&self, protocol: ProtocolId, id: &str) -> bool {
         self.viewed
             .as_ref()
-            .is_some_and(|(owner, chat)| *owner == protocol && chat == id)
+            .is_some_and(|(owner, chat, _topic)| *owner == protocol && chat == id)
     }
 
     /// The open chat is read once the window is focused. `ViewChat` is the
@@ -2826,9 +3054,23 @@ impl Snapshot {
         if !self.window_focused {
             return;
         }
-        let Some((protocol, id)) = self.viewed.clone() else {
+        let Some((protocol, id, topic)) = self.viewed.clone() else {
             return;
         };
+        if let Some(topic) = topic {
+            if let Some(rows) = self.topics.get_mut(&(protocol, id))
+                && let Some(row) = rows.iter_mut().find(|row| row.topic == topic)
+            {
+                row.unread = 0;
+            }
+            return;
+        }
+        let has_topics = self
+            .conversation(protocol, &id)
+            .is_some_and(|row| row.has_topics);
+        if has_topics {
+            return;
+        }
         let Some(list) = self.conversations.get_mut(&protocol) else {
             return;
         };
@@ -2842,7 +3084,13 @@ impl Snapshot {
     pub fn viewed(&self) -> Option<(ProtocolId, &str)> {
         self.viewed
             .as_ref()
-            .map(|(protocol, id)| (*protocol, id.as_str()))
+            .map(|(protocol, id, _)| (*protocol, id.as_str()))
+    }
+
+    /// The open topic last synced to the adapters.
+    #[must_use]
+    pub fn viewed_topic(&self) -> Option<MessageTopic> {
+        self.viewed.as_ref().and_then(|(_, _, topic)| *topic)
     }
 
     /// One chat row of one protocol.
@@ -2867,7 +3115,7 @@ impl Snapshot {
             .filter(|row| {
                 !ChatMute::of(row.muted, mutes.contains(row.protocol, &row.id)).is_muted()
             })
-            .map(|row| row.unread)
+            .map(|row| self.display_unread(row, mutes))
             .fold(0, u32::saturating_add)
     }
 
@@ -2875,19 +3123,24 @@ impl Snapshot {
     /// An unfocused window is not looking at it. Adapters that treat the
     /// viewed chat as read must hear `ViewChat(None)` or a live message
     /// while the user is away loses its badge.
-    fn viewed_chat(&self) -> Option<(ProtocolId, String)> {
+    fn viewed_chat(&self) -> Option<(ProtocolId, String, Option<MessageTopic>)> {
         if !self.window_focused || self.center_view() != CenterView::Thread {
             return None;
         }
         let protocol = self.selected_protocol;
         let id = self.selected_conversation.clone()?;
+        let row = self.conversation(protocol, &id)?;
         let listed = self.has_session(protocol)
             && self.account_surface_visible(protocol)
-            && self
-                .conversations
-                .get(&protocol)
-                .is_some_and(|rows| rows.iter().any(|row| row.id == id && !row.placeholder));
-        listed.then_some((protocol, id))
+            && !row.placeholder;
+        if !listed {
+            return None;
+        }
+        if row.has_topics {
+            let topic = self.selected_topic?;
+            return Some((protocol, id, Some(topic)));
+        }
+        Some((protocol, id, None))
     }
 
     /// New link state of one protocol (`AdapterEvent::Account`).
@@ -3107,13 +3360,28 @@ impl Snapshot {
     /// `Linked`, and drop the queued opens: new commands wait for `Linked`.
     /// Older pages and the chat list of this protocol end too (#163).
     fn hold_opens_for_reconnect(&mut self, protocol: ProtocolId) {
-        let is_open = |command: &AdapterCommand| matches!(command, AdapterCommand::OpenChat { protocol: owner, .. } if *owner == protocol);
+        let is_open = |command: &AdapterCommand| {
+            matches!(
+                command,
+                AdapterCommand::OpenChat { protocol: owner, .. }
+                    | AdapterCommand::OpenTopic { protocol: owner, .. }
+                    if *owner == protocol
+            )
+        };
         if self.selected_protocol == protocol
             && let Some(id) = self.selected_conversation.clone()
         {
             let queued = self.pending.iter().any(|command| {
                 is_open(command)
-                    && matches!(command, AdapterCommand::OpenChat { conversation_id, .. } if *conversation_id == id)
+                    && match command {
+                        AdapterCommand::OpenChat {
+                            conversation_id, ..
+                        }
+                        | AdapterCommand::OpenTopic {
+                            conversation_id, ..
+                        } => conversation_id == &id,
+                        _ => false,
+                    }
             });
             let in_flight = self.history_loading.contains(&(protocol, id.clone()));
             if queued || in_flight {
@@ -3136,7 +3404,14 @@ impl Snapshot {
         // would go out during the reconnect. End both; a later scroll asks
         // again (#163, Codex r4137896062).
         self.older_loading.retain(|(owner, _)| *owner != protocol);
-        self.pending.retain(|command| !matches!(command, AdapterCommand::LoadOlderMessages { protocol: owner, .. } if *owner == protocol));
+        self.pending.retain(|command| {
+            !matches!(
+                command,
+                AdapterCommand::LoadOlderMessages { protocol: owner, .. }
+                    | AdapterCommand::LoadOlderTopic { protocol: owner, .. }
+                    if *owner == protocol
+            )
+        });
         // A chat-list load that is in flight or queued ends here too. Its
         // spinner stops, and `Linked` loads the list again (#163).
         let is_list = |command: &AdapterCommand| matches!(command, AdapterCommand::LoadChats { protocol: owner } if *owner == protocol);
@@ -3181,11 +3456,15 @@ impl Snapshot {
         };
         self.rejected_bodies
             .retain(|(owner, _), _| *owner != protocol);
-        self.drafts.retain(|(owner, _), _| *owner != protocol);
+        self.drafts.retain(|(owner, _, _), _| *owner != protocol);
         for (chat, body) in keep {
-            self.drafts.insert((protocol, chat), body);
+            self.drafts.insert((protocol, chat, None), body);
         }
-        self.messages.retain(|(owner, _), _| *owner != protocol);
+        self.messages.retain(|(owner, _, _), _| *owner != protocol);
+        self.topics.retain(|(owner, _), _| *owner != protocol);
+        if self.selected_protocol == protocol {
+            self.selected_topic = None;
+        }
         self.history_loading.retain(|(owner, _)| *owner != protocol);
         self.chat_list_loading.remove(&protocol);
         self.list_on_link.remove(&protocol);
@@ -3293,8 +3572,10 @@ impl Snapshot {
         }
         self.messages
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
+        self.topics.remove(&(protocol, id.to_owned()));
         // Every removed chat loses its draft, selected or not (#43).
-        self.drafts.remove(&(protocol, id.to_owned()));
+        self.drafts
+            .retain(|key, _| !(key.0 == protocol && key.1 == id));
         self.drop_rejected_body(protocol, id);
         let key = (protocol, id.to_owned());
         self.older_loading.remove(&key);
@@ -3304,6 +3585,7 @@ impl Snapshot {
         if self.selected_protocol == protocol && self.selected_conversation.as_deref() == Some(id) {
             self.compose.clear();
             self.selected_conversation = None;
+            self.selected_topic = None;
             self.ensure_conversation_selection();
         }
         self.sync_focused_row(FocusFollow::List);
@@ -3361,14 +3643,29 @@ impl Snapshot {
             .then_some(id)
     }
 
+    fn message_bucket(
+        &self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Option<(ProtocolId, String, Option<MessageTopic>)> {
+        self.messages.iter().find_map(|(key, list)| {
+            (key.0 == protocol
+                && key.1 == conversation_id
+                && list.iter().any(|row| row.id == message_id))
+            .then(|| key.clone())
+        })
+    }
+
     fn delivery_of(
         &self,
         protocol: ProtocolId,
         conversation_id: &str,
         id: &str,
     ) -> Option<Delivery> {
+        let key = self.message_bucket(protocol, conversation_id, id)?;
         self.messages
-            .get(&(protocol, conversation_id.to_string()))?
+            .get(&key)?
             .iter()
             .find(|row| row.id == id)
             .map(|row| row.delivery)
@@ -3382,9 +3679,12 @@ impl Snapshot {
         delivery: Delivery,
     ) {
         let before = self.delivery_of(protocol, conversation_id, message_id);
+        let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
+            return;
+        };
         let Some(message) = self
             .messages
-            .get_mut(&(protocol, conversation_id.to_string()))
+            .get_mut(&key)
             .and_then(|list| list.iter_mut().find(|row| row.id == message_id))
         else {
             return;
@@ -3411,7 +3711,11 @@ impl Snapshot {
             }
         } else {
             self.drafts
-                .entry((message.protocol, message.conversation_id.clone()))
+                .entry((
+                    message.protocol,
+                    message.conversation_id.clone(),
+                    message.topic,
+                ))
                 .or_insert_with(|| message.body.clone());
         }
         let why = format!(
@@ -3425,8 +3729,61 @@ impl Snapshot {
         );
     }
 
+    /// A live message in a topic that is not on screen adds one to that topic.
+    /// The open topic stays at zero. A topic the list does not know yet waits
+    /// for the next topic load.
+    fn note_live_topic(&mut self, message: &ChatMessage) {
+        if message.arrival != thinwire_protocol::Arrival::Live || message.outbound {
+            return;
+        }
+        let Some(topic) = message.topic else {
+            return;
+        };
+        if self.window_focused
+            && self.topic_is_viewed(message.protocol, &message.conversation_id, topic)
+        {
+            return;
+        }
+        let Some(rows) = self
+            .topics
+            .get_mut(&(message.protocol, message.conversation_id.clone()))
+        else {
+            return;
+        };
+        let Some(row) = rows.iter_mut().find(|row| row.topic == topic) else {
+            return;
+        };
+        row.unread = row.unread.saturating_add(1);
+        if message.sent_at > row.last_at {
+            row.last_at = message.sent_at;
+        }
+    }
+
+    fn upsert_topic(&mut self, mut topic: ChatTopic) {
+        if self.window_focused
+            && self.topic_is_viewed(topic.protocol, &topic.conversation_id, topic.topic)
+        {
+            topic.unread = 0;
+        }
+        let list = self
+            .topics
+            .entry((topic.protocol, topic.conversation_id.clone()))
+            .or_default();
+        if let Some(existing) = list.iter_mut().find(|row| row.topic == topic.topic) {
+            *existing = topic;
+        } else {
+            list.push(topic);
+        }
+    }
+
+    fn topic_is_viewed(&self, protocol: ProtocolId, id: &str, topic: MessageTopic) -> bool {
+        self.viewed.as_ref().is_some_and(|(owner, chat, open)| {
+            *owner == protocol && chat == id && *open == Some(topic)
+        })
+    }
+
     fn upsert_message(&mut self, message: ChatMessage) {
-        let key = (message.protocol, message.conversation_id.clone());
+        let key = thread_key(message.protocol, &message.conversation_id, message.topic);
         let list = self.messages.entry(key).or_default();
         if let Some(existing) = list.iter_mut().find(|row| row.id == message.id) {
             *existing = message;
@@ -3437,10 +3794,10 @@ impl Snapshot {
     }
 
     fn remove_message(&mut self, protocol: ProtocolId, conversation_id: &str, message_id: &str) {
-        let Some(list) = self
-            .messages
-            .get_mut(&(protocol, conversation_id.to_string()))
-        else {
+        let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
+            return;
+        };
+        let Some(list) = self.messages.get_mut(&key) else {
             return;
         };
         list.retain(|row| row.id != message_id);
@@ -3452,13 +3809,18 @@ impl Snapshot {
         conversation_id: &str,
         message_ids: &[String],
     ) {
-        let Some(list) = self
+        let keys: Vec<_> = self
             .messages
-            .get_mut(&(protocol, conversation_id.to_string()))
-        else {
-            return;
-        };
-        list.retain(|row| !message_ids.contains(&row.id));
+            .keys()
+            .filter(|key| key.0 == protocol && key.1 == conversation_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            let Some(list) = self.messages.get_mut(&key) else {
+                continue;
+            };
+            list.retain(|row| !message_ids.contains(&row.id));
+        }
     }
 
     fn patch_message_body(
@@ -3468,10 +3830,10 @@ impl Snapshot {
         message_id: &str,
         body: String,
     ) {
-        let Some(list) = self
-            .messages
-            .get_mut(&(protocol, conversation_id.to_string()))
-        else {
+        let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
+            return;
+        };
+        let Some(list) = self.messages.get_mut(&key) else {
             return;
         };
         if let Some(message) = list.iter_mut().find(|row| row.id == message_id) {
@@ -3859,6 +4221,7 @@ pub mod test_support {
             writable: true,
             placeholder: false,
             muted: false,
+            has_topics: false,
         }
     }
 
@@ -4720,6 +5083,28 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: 0,
             arrival: thinwire_protocol::Arrival::History,
+            topic: None,
+        }
+    }
+
+    fn forum_row(
+        chat: &str,
+        topic: MessageTopic,
+        name: &str,
+        unread: u32,
+        last_at: i64,
+    ) -> ChatTopic {
+        ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: chat.into(),
+            topic,
+            name: name.into(),
+            unread,
+            last_at,
+            general: false,
+            hidden: false,
+            closed: false,
+            muted: false,
         }
     }
 
@@ -4895,6 +5280,103 @@ mod tests {
     }
 
     #[test]
+    fn a_message_in_another_topic_keeps_the_open_topic_and_its_draft() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let mut camp = telegram_chat(9, "Camp forum", 30);
+        camp.has_topics = true;
+        camp.is_group = true;
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation: camp });
+        let trail = MessageTopic::Forum(2);
+        let food = MessageTopic::Forum(3);
+        snapshot.apply(AdapterEvent::TopicUpsert {
+            topic: forum_row("telegram:9", trail, "Trail", 1, 100),
+        });
+        snapshot.apply(AdapterEvent::TopicUpsert {
+            topic: forum_row("telegram:9", food, "Food", 0, 50),
+        });
+        snapshot.select_conversation("telegram:9".into());
+        snapshot.select_topic("telegram:9".into(), trail);
+        assert!(snapshot.take_focus_compose());
+        assert!(snapshot.take_scroll_to_selected());
+        snapshot.compose = "draft for Trail".into();
+        snapshot.sync_viewed();
+
+        let mut message = telegram_text(9, 8, "soup");
+        message.topic = Some(food);
+        message.arrival = thinwire_protocol::Arrival::Live;
+        message.sent_at = 200;
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+
+        assert_eq!(snapshot.selected_topic, Some(trail));
+        assert_eq!(snapshot.compose, "draft for Trail");
+        assert!(snapshot.selected_messages().is_empty());
+        assert!(!snapshot.wants_focus_compose());
+        assert!(!snapshot.wants_scroll_to_selected());
+        assert!(!snapshot.wants_scroll_to_focused());
+        let food_row = snapshot
+            .topic(ProtocolId::Telegram, "telegram:9", food)
+            .expect("food");
+        assert_eq!(food_row.unread, 1);
+        assert_eq!(food_row.last_at, 200);
+
+        snapshot.center_key(AuthKey::Escape, &store);
+        assert!(snapshot.selected_topic.is_none());
+        snapshot.select_topic("telegram:9".into(), trail);
+        assert_eq!(snapshot.compose, "draft for Trail");
+    }
+
+    #[test]
+    fn a_forum_badge_skips_muted_topics_and_keeps_general_first() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let mut camp = telegram_chat(9, "Camp forum", 8);
+        camp.has_topics = true;
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: camp.clone(),
+        });
+        snapshot.apply(AdapterEvent::TopicUpsert {
+            topic: forum_row("telegram:9", MessageTopic::Forum(2), "Trail", 2, 300),
+        });
+        let mut general = forum_row("telegram:9", MessageTopic::Forum(1), "General", 1, 100);
+        general.general = true;
+        snapshot.apply(AdapterEvent::TopicUpsert { topic: general });
+        let mut hidden = forum_row("telegram:9", MessageTopic::Forum(8), "Hidden", 5, 400);
+        hidden.hidden = true;
+        hidden.general = true;
+        snapshot.apply(AdapterEvent::TopicUpsert { topic: hidden });
+        let mut protocol_muted = forum_row("telegram:9", MessageTopic::Forum(4), "Archive", 7, 200);
+        protocol_muted.muted = true;
+        snapshot.apply(AdapterEvent::TopicUpsert {
+            topic: protocol_muted,
+        });
+        snapshot.apply(AdapterEvent::TopicUpsert {
+            topic: forum_row("telegram:9", MessageTopic::Forum(3), "Food", 4, 250),
+        });
+        let mut mutes = ChatMutes::in_memory();
+        mutes.set(
+            ProtocolId::Telegram,
+            &topic_mute_id("telegram:9", MessageTopic::Forum(3)),
+            true,
+        );
+        let row = snapshot
+            .conversation(ProtocolId::Telegram, "telegram:9")
+            .expect("camp")
+            .clone();
+        // General 1 + Trail 2 + hidden 5. Food is muted here. Archive is muted
+        // in the protocol. The chat's own unread is not the badge.
+        assert_eq!(snapshot.display_unread(&row, &mutes), 8);
+        snapshot.select_conversation("telegram:9".into());
+        let names: Vec<&str> = snapshot
+            .selected_topics()
+            .iter()
+            .map(|topic| topic.name.as_str())
+            .collect();
+        assert_eq!(names, ["General", "Trail", "Food", "Archive"]);
+        let _ = store;
+    }
+
+    #[test]
     fn a_reorder_does_not_scroll_the_highlight() {
         let store = SecretStore::memory();
         let mut snapshot = Snapshot::new();
@@ -5024,6 +5506,7 @@ mod tests {
             delivery,
             sent_at: 0,
             arrival: thinwire_protocol::Arrival::History,
+            topic: None,
         }
     }
 
@@ -5299,6 +5782,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.apply(AdapterEvent::OlderHistoryLoaded {
@@ -5329,6 +5813,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -5356,6 +5841,7 @@ mod tests {
                 writable: true,
                 muted: false,
                 placeholder: false,
+                has_topics: false,
             },
         });
         assert_eq!(snapshot.unread_for(ProtocolId::Signal), 1);
@@ -5378,6 +5864,7 @@ mod tests {
                 writable: true,
                 muted: false,
                 placeholder: false,
+                has_topics: false,
             },
         });
         assert_eq!(snapshot.unread_for(ProtocolId::Signal), 0);
@@ -5661,7 +6148,7 @@ mod tests {
         assert!(
             snapshot
                 .drafts
-                .contains_key(&(ProtocolId::Telegram, "telegram:1".into()))
+                .contains_key(&(ProtocolId::Telegram, "telegram:1".into(), None))
         );
 
         snapshot.apply(AdapterEvent::ConversationRemoved {
@@ -5671,7 +6158,7 @@ mod tests {
         assert!(
             !snapshot
                 .drafts
-                .contains_key(&(ProtocolId::Telegram, "telegram:1".into())),
+                .contains_key(&(ProtocolId::Telegram, "telegram:1".into(), None)),
             "draft gone"
         );
         assert_eq!(
@@ -6614,6 +7101,7 @@ mod tests {
                 writable: true,
                 placeholder: false,
                 muted: false,
+                has_topics: false,
             },
         };
         // A row before Ready is from a cancelled or ended client: dropped.
@@ -7091,6 +7579,7 @@ mod tests {
             writable: true,
             placeholder: true,
             muted: false,
+            has_topics: false,
         }
     }
 
@@ -7202,6 +7691,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         assert_eq!(
@@ -7265,6 +7755,7 @@ mod tests {
                 writable: true,
                 placeholder: false,
                 muted: false,
+                has_topics: false,
             },
         });
         snapshot
@@ -7462,6 +7953,7 @@ mod tests {
                 writable: true,
                 placeholder: false,
                 muted: false,
+                has_topics: false,
             },
         });
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -7478,6 +7970,7 @@ mod tests {
                 writable: true,
                 placeholder: false,
                 muted: false,
+                has_topics: false,
             },
         });
         let ids: Vec<_> = snapshot
@@ -7520,6 +8013,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -7533,6 +8027,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -7546,6 +8041,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -7568,6 +8064,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -7605,6 +8102,7 @@ mod tests {
                     delivery: Delivery::Sent,
                     sent_at: 0,
                     arrival: thinwire_protocol::Arrival::History,
+                    topic: None,
                 },
             });
         }
@@ -7645,6 +8143,7 @@ mod tests {
                 writable: true,
                 placeholder: false,
                 muted: false,
+                has_topics: false,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -7658,6 +8157,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         let _ = snapshot.take_commands();
@@ -7765,7 +8265,12 @@ mod tests {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
         snapshot.compose = "old account".into();
-        snapshot.set_draft(ProtocolId::Telegram, "telegram:2", "other chat".into());
+        snapshot.set_draft(
+            ProtocolId::Telegram,
+            "telegram:2",
+            None,
+            "other chat".into(),
+        );
         snapshot.apply(AdapterEvent::TelegramSessionEnded);
         assert!(snapshot.drafts.is_empty());
         assert!(snapshot.compose.is_empty());
@@ -7837,6 +8342,7 @@ mod tests {
                 delivery: Delivery::Sent,
                 sent_at: 0,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -7935,7 +8441,7 @@ mod tests {
         snapshot.compose = "draft-fixture-3b7".into();
         snapshot.search = "search-fixture-6e5".into();
         snapshot.drafts.insert(
-            (ProtocolId::Telegram, "telegram:2".into()),
+            (ProtocolId::Telegram, "telegram:2".into(), None),
             "other-draft-fixture-2a9".into(),
         );
         #[cfg(feature = "whatsapp-web")]
@@ -8113,6 +8619,7 @@ mod tests {
                     delivery: Delivery::Sent,
                     sent_at: 1,
                     arrival: thinwire_protocol::Arrival::History,
+                    topic: None,
                 },
             });
             snapshot.apply(AdapterEvent::HistoryLoaded {
@@ -8184,6 +8691,7 @@ mod tests {
                 delivery: Delivery::Pending,
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageDelivery {
@@ -8217,6 +8725,7 @@ mod tests {
             writable,
             placeholder: false,
             muted: false,
+            has_topics: false,
         }
     }
 
@@ -9098,6 +9607,7 @@ mod tests {
                 delivery: Delivery::Failed,
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.take_commands();
@@ -9141,6 +9651,7 @@ mod tests {
                 delivery: Delivery::Failed,
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.take_commands();
@@ -9562,7 +10073,12 @@ mod tests {
         });
         snapshot.selected_conversation = Some("discord:1:2".into());
         snapshot.compose = "keep me".into();
-        snapshot.set_draft(ProtocolId::Discord, "discord:9:9", "other chat".into());
+        snapshot.set_draft(
+            ProtocolId::Discord,
+            "discord:9:9",
+            None,
+            "other chat".into(),
+        );
         snapshot.send_compose();
         let request = snapshot
             .take_commands()
@@ -9584,14 +10100,14 @@ mod tests {
         assert_eq!(
             snapshot
                 .drafts
-                .get(&(ProtocolId::Discord, "discord:1:2".into()))
+                .get(&(ProtocolId::Discord, "discord:1:2".into(), None))
                 .map(String::as_str),
             Some("keep me"),
         );
         assert!(
             !snapshot
                 .drafts
-                .contains_key(&(ProtocolId::Discord, "discord:9:9".into())),
+                .contains_key(&(ProtocolId::Discord, "discord:9:9".into(), None)),
             "only the rejected send stays"
         );
         link(&mut snapshot, ProtocolId::Discord);
@@ -9675,6 +10191,7 @@ mod tests {
                 delivery: Delivery::Failed,
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.retry_send("discord:pending:2:1");
@@ -9741,6 +10258,7 @@ mod tests {
                 delivery: Delivery::Failed,
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.retry_send("discord:row-b");
@@ -9780,8 +10298,13 @@ mod tests {
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: chat(ProtocolId::Slack, "telegram:2", true),
         });
-        snapshot.set_draft(ProtocolId::Telegram, "telegram:2", "telegram draft".into());
-        snapshot.set_draft(ProtocolId::Slack, "telegram:2", "slack draft".into());
+        snapshot.set_draft(
+            ProtocolId::Telegram,
+            "telegram:2",
+            None,
+            "telegram draft".into(),
+        );
+        snapshot.set_draft(ProtocolId::Slack, "telegram:2", None, "slack draft".into());
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Slack,
             state: AccountState::Unlinked,
@@ -10323,7 +10846,7 @@ mod tests {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
         let request = expired_send(&mut snapshot);
-        let key = (ProtocolId::Telegram, "telegram:1".to_owned());
+        let key = (ProtocolId::Telegram, "telegram:1".to_owned(), None);
         snapshot.select_conversation("telegram:2".into());
         assert!(snapshot.drafts.contains_key(&key), "the text is a draft");
         late_answer(&mut snapshot, request, true);
@@ -10790,7 +11313,7 @@ mod tests {
         assert_eq!(
             snapshot
                 .drafts
-                .get(&(ProtocolId::Slack, "slack:C1".to_owned()))
+                .get(&(ProtocolId::Slack, "slack:C1".to_owned(), None))
                 .map(String::as_str),
             Some("hello")
         );
@@ -10822,7 +11345,7 @@ mod tests {
         assert_eq!(
             snapshot
                 .drafts
-                .get(&(ProtocolId::Slack, "slack:C1".to_owned())),
+                .get(&(ProtocolId::Slack, "slack:C1".to_owned(), None)),
             None
         );
     }
@@ -10842,7 +11365,7 @@ mod tests {
         assert_eq!(
             snapshot
                 .drafts
-                .get(&(ProtocolId::Slack, "slack:C1".to_owned()))
+                .get(&(ProtocolId::Slack, "slack:C1".to_owned(), None))
                 .map(String::as_str),
             Some("hello")
         );
@@ -10870,7 +11393,7 @@ mod tests {
             !snapshot
                 .drafts
                 .keys()
-                .any(|(owner, _)| *owner == ProtocolId::Telegram)
+                .any(|(owner, _, _)| *owner == ProtocolId::Telegram)
         );
         assert_eq!(snapshot.compose, "");
     }
@@ -10897,6 +11420,7 @@ mod tests {
                 delivery: Delivery::Failed,
                 sent_at: 1,
                 arrival: thinwire_protocol::Arrival::History,
+                topic: None,
             },
         });
         snapshot.retry_send("slack:C1:m1");
@@ -10914,7 +11438,7 @@ mod tests {
         assert_eq!(
             snapshot
                 .drafts
-                .get(&(ProtocolId::Slack, "slack:C1".to_owned()))
+                .get(&(ProtocolId::Slack, "slack:C1".to_owned(), None))
                 .map(String::as_str),
             Some("try again")
         );

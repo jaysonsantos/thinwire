@@ -32,9 +32,10 @@ pub use inbox::parse_telegram_chat_id;
 #[cfg(test)]
 use super::adapter::TelegramCodeVia;
 use super::adapter::{
-    AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
-    ProtocolCapabilities, ProtocolId, SupportClass, TelegramAuthPhase, TelegramAuthStep,
-    emit_flush_secrets, emit_older_history_loaded, emit_send_rejected, emit_status,
+    AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, EventTx, MessageTopic,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, TelegramAuthPhase,
+    TelegramAuthStep, emit_flush_secrets, emit_older_history_loaded, emit_send_rejected,
+    emit_status,
 };
 use super::secrets::TelegramSecretVault;
 
@@ -240,6 +241,14 @@ impl ProtocolAdapter for TelegramAdapter {
         let _ = conversation_id;
     }
 
+    /// `ViewTopic` owns the topic live messages are marked read in.
+    fn view_topic(&mut self, conversation_id: &str, topic: MessageTopic, _events: &EventTx) {
+        #[cfg(feature = "telegram-tdlib")]
+        self.tdlib.view_topic(conversation_id.to_owned(), topic);
+        #[cfg(not(feature = "telegram-tdlib"))]
+        let _ = (conversation_id, topic);
+    }
+
     fn handle(&mut self, command: AdapterCommand, events: &EventTx) -> Result<(), AdapterError> {
         match command {
             AdapterCommand::TelegramAuth { step, epoch } => self.handle_auth(step, epoch, events),
@@ -384,6 +393,94 @@ impl ProtocolAdapter for TelegramAdapter {
                 }
                 result
             }
+            AdapterCommand::OpenTopic {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                topic,
+            } => {
+                if parse_telegram_chat_id(&conversation_id).is_none() {
+                    return Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason: "chat id is not a Telegram chat",
+                    });
+                }
+                self.dispatch_live(
+                    events,
+                    LiveCall::OpenTopic {
+                        conversation_id,
+                        topic,
+                    },
+                )
+            }
+            AdapterCommand::LoadOlderTopic {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                topic,
+                before_message_id,
+            } => {
+                let owned = inbox::parse_message_id(&before_message_id)
+                    .is_some_and(|(chat_id, _)| inbox::conversation_id(chat_id) == conversation_id);
+                let result = if owned {
+                    self.dispatch_live(
+                        events,
+                        LiveCall::LoadOlderTopic {
+                            conversation_id: conversation_id.clone(),
+                            topic,
+                            before_message_id: before_message_id.clone(),
+                        },
+                    )
+                } else {
+                    Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason: "message id is not in this Telegram chat",
+                    })
+                };
+                if result.is_err() {
+                    emit_older_history_loaded(
+                        events,
+                        ProtocolId::Telegram,
+                        conversation_id,
+                        before_message_id,
+                        false,
+                        None,
+                    );
+                }
+                result
+            }
+            AdapterCommand::SendTopicText {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                topic,
+                body,
+                request,
+            } => {
+                let rejected = if body.trim().is_empty() {
+                    Some("message text is empty")
+                } else if parse_telegram_chat_id(&conversation_id).is_none() {
+                    Some("chat id is not a Telegram chat")
+                } else {
+                    None
+                };
+                let result = match rejected {
+                    Some(reason) => Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason,
+                    }),
+                    None => self.dispatch_live(
+                        events,
+                        LiveCall::SendTopicText {
+                            conversation_id: conversation_id.clone(),
+                            topic,
+                            body,
+                            request,
+                        },
+                    ),
+                };
+                if result.is_err() {
+                    emit_send_rejected(events, ProtocolId::Telegram, conversation_id, request);
+                }
+                result
+            }
             other => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Telegram,
                 reason: command_mismatch(other),
@@ -439,6 +536,21 @@ enum LiveCall {
         conversation_id: String,
         before_message_id: String,
     },
+    OpenTopic {
+        conversation_id: String,
+        topic: MessageTopic,
+    },
+    LoadOlderTopic {
+        conversation_id: String,
+        topic: MessageTopic,
+        before_message_id: String,
+    },
+    SendTopicText {
+        conversation_id: String,
+        topic: MessageTopic,
+        body: String,
+        request: u64,
+    },
 }
 
 impl TelegramAdapter {
@@ -481,6 +593,43 @@ impl TelegramAdapter {
                     self.tdlib.resend(
                         conversation_id,
                         message_id,
+                        request,
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::OpenTopic {
+                    conversation_id,
+                    topic,
+                } => {
+                    self.tdlib
+                        .open_topic(conversation_id, topic, secrets, source, events);
+                }
+                LiveCall::LoadOlderTopic {
+                    conversation_id,
+                    topic,
+                    before_message_id,
+                } => {
+                    self.tdlib.load_older_topic(
+                        conversation_id,
+                        topic,
+                        before_message_id,
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::SendTopicText {
+                    conversation_id,
+                    topic,
+                    body,
+                    request,
+                } => {
+                    self.tdlib.send_topic_text(
+                        conversation_id,
+                        topic,
+                        body,
                         request,
                         secrets,
                         source,

@@ -1034,6 +1034,7 @@ impl Owner {
                         delivery: Delivery::Pending,
                         sent_at: local_unix_seconds(),
                         arrival: Arrival::History,
+                        topic: None,
                     },
                 );
                 (body, message_id, SendRow::Pending)

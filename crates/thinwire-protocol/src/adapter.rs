@@ -314,6 +314,12 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         conversation_id: String,
     },
+    /// Open one forum topic or bot thread and load its recent messages.
+    OpenTopic {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: MessageTopic,
+    },
     /// The app is closing. Close every client cleanly, then send `Stopped`.
     Shutdown {
         protocol: ProtocolId,
@@ -323,6 +329,13 @@ pub enum AdapterCommand {
     LoadOlderMessages {
         protocol: ProtocolId,
         conversation_id: String,
+        before_message_id: String,
+    },
+    /// One older page of one topic. Ids are not secrets.
+    LoadOlderTopic {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: MessageTopic,
         before_message_id: String,
     },
     /// Send a failed outgoing message again. Ids are not secrets. `request`
@@ -341,11 +354,26 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         conversation_id: Option<String>,
     },
+    /// The topic the user now looks at. The host routes it to
+    /// [`ProtocolAdapter::view_topic`].
+    ViewTopic {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: MessageTopic,
+    },
     /// Send plain text. The body is the user's message, never a credential.
     /// `request` is a local id; a rejection names it in `SendRejected`.
     SendText {
         protocol: ProtocolId,
         conversation_id: String,
+        body: String,
+        request: u64,
+    },
+    /// Send plain text in one topic. The body is the user's message.
+    SendTopicText {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: MessageTopic,
         body: String,
         request: u64,
     },
@@ -387,11 +415,15 @@ impl AdapterCommand {
             | Self::Disconnect { protocol }
             | Self::LoadChats { protocol }
             | Self::OpenChat { protocol, .. }
+            | Self::OpenTopic { protocol, .. }
             | Self::Shutdown { protocol }
             | Self::LoadOlderMessages { protocol, .. }
+            | Self::LoadOlderTopic { protocol, .. }
             | Self::SendText { protocol, .. }
+            | Self::SendTopicText { protocol, .. }
             | Self::ResendMessage { protocol, .. }
             | Self::ViewChat { protocol, .. }
+            | Self::ViewTopic { protocol, .. }
             | Self::RestartHelper { protocol } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
@@ -415,6 +447,10 @@ pub enum AdapterEvent {
     },
     ConversationUpsert {
         conversation: Conversation,
+    },
+    /// One forum topic or bot thread. It does not change which chat is open.
+    TopicUpsert {
+        topic: ChatTopic,
     },
     MessageReceived {
         message: ChatMessage,
@@ -589,6 +625,7 @@ impl AdapterEvent {
     pub fn inbox_protocol(&self) -> Option<ProtocolId> {
         match self {
             Self::ConversationUpsert { conversation } => Some(conversation.protocol),
+            Self::TopicUpsert { topic } => Some(topic.protocol),
             Self::MessageReceived { message } => Some(message.protocol),
             Self::ConversationRemoved { protocol, .. }
             | Self::MessageReplaced { protocol, .. }
@@ -658,6 +695,65 @@ pub struct Conversation {
     /// The user muted this chat in the protocol (for example TDLib
     /// notification settings). A muted chat never notifies (#32).
     pub muted: bool,
+    /// A forum supergroup, or a chat with a bot that has topics. The sidebar
+    /// keeps one row. The center pane lists the topics.
+    pub has_topics: bool,
+}
+
+/// One topic inside a forum or a bot chat.
+///
+/// `Forum` is a forum topic or a bot topic (`messageTopicForum`).
+/// `Thread` is a topic in a non-forum supergroup (`messageTopicThread`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MessageTopic {
+    Forum(i64),
+    Thread(i64),
+}
+
+/// The mute id of one topic. The mute file stays one id per line.
+#[must_use]
+pub fn topic_mute_id(conversation_id: &str, topic: MessageTopic) -> String {
+    let mark = match topic {
+        MessageTopic::Forum(id) => format!("#forum:{id}"),
+        MessageTopic::Thread(id) => format!("#thread:{id}"),
+    };
+    format!("{conversation_id}{mark}")
+}
+
+/// One topic row of a forum or a bot chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTopic {
+    pub protocol: ProtocolId,
+    pub conversation_id: String,
+    pub topic: MessageTopic,
+    pub name: String,
+    pub unread: u32,
+    /// Unix seconds of the last message. Zero when unknown.
+    pub last_at: i64,
+    /// The General topic. It stays first when it is not hidden.
+    pub general: bool,
+    /// Hidden above the topic list. A hidden General topic is not shown.
+    pub hidden: bool,
+    /// A closed topic does not take new messages.
+    pub closed: bool,
+    /// The user muted this topic in the protocol.
+    pub muted: bool,
+}
+
+/// Topics the center pane shows. Hidden topics are left out. General is
+/// first. The rest follow the last message, newest first. Equal times keep
+/// a stable order.
+#[must_use]
+pub fn ordered_topics(topics: &[ChatTopic]) -> Vec<&ChatTopic> {
+    let mut rows: Vec<&ChatTopic> = topics.iter().filter(|topic| !topic.hidden).collect();
+    rows.sort_by(|left, right| {
+        right
+            .general
+            .cmp(&left.general)
+            .then(right.last_at.cmp(&left.last_at))
+            .then(left.topic.cmp(&right.topic))
+    });
+    rows
 }
 
 /// Delivery of an outgoing message. Incoming messages are always `Sent`.
@@ -686,6 +782,8 @@ pub struct ChatMessage {
     /// A new message that just arrived, or a row of a history load. Only a
     /// `Live` message can notify (#32).
     pub arrival: Arrival,
+    /// The forum topic or bot thread this message belongs to.
+    pub topic: Option<MessageTopic>,
 }
 
 /// How a message reached the app.
@@ -745,6 +843,13 @@ pub trait ProtocolAdapter: Send {
     fn view_chat(&mut self, conversation_id: Option<&str>, events: &EventTx) {
         let _ = (conversation_id, events);
     }
+
+    /// The user now looks at this topic. Default: the same as looking at
+    /// the chat. An adapter that tracks a topic overrides it.
+    fn view_topic(&mut self, conversation_id: &str, topic: MessageTopic, events: &EventTx) {
+        let _ = topic;
+        self.view_chat(Some(conversation_id), events);
+    }
 }
 
 pub fn emit_status(
@@ -762,6 +867,11 @@ pub fn emit_status(
 
 pub fn emit_conversation(events: &EventTx, conversation: Conversation) {
     let _ = events.send(AdapterEvent::ConversationUpsert { conversation });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_topic(events: &EventTx, topic: ChatTopic) {
+    let _ = events.send(AdapterEvent::TopicUpsert { topic });
 }
 
 pub fn emit_message(events: &EventTx, message: ChatMessage) {

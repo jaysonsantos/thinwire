@@ -24,12 +24,12 @@ use super::lifecycle::{
 };
 use super::router::{self, Router};
 use crate::adapter::{
-    AdapterStatus, Arrival, ChatMessage, Delivery, EventTx, LoginEpoch, ProtocolId,
-    TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded,
-    emit_conversation, emit_conversation_removed, emit_history_loaded, emit_message,
-    emit_message_body, emit_message_delivery, emit_message_replaced, emit_messages_removed,
-    emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
-    emit_telegram_session_ended,
+    AdapterStatus, Arrival, ChatMessage, ChatTopic, Delivery, EventTx, LoginEpoch, MessageTopic,
+    ProtocolId, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia,
+    emit_chat_list_loaded, emit_conversation, emit_conversation_removed, emit_history_loaded,
+    emit_message, emit_message_body, emit_message_delivery, emit_message_replaced,
+    emit_messages_removed, emit_older_history_loaded, emit_send_accepted, emit_send_rejected,
+    emit_status, emit_stopped, emit_telegram_session_ended, emit_topic,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -55,6 +55,21 @@ enum TdlibCommand {
         conversation_id: String,
         before_message_id: String,
     },
+    OpenTopic {
+        conversation_id: String,
+        topic: MessageTopic,
+    },
+    LoadOlderTopic {
+        conversation_id: String,
+        topic: MessageTopic,
+        before_message_id: String,
+    },
+    SendTopicText {
+        conversation_id: String,
+        topic: MessageTopic,
+        body: String,
+        request: u64,
+    },
     /// The chat the user looks at. `None` means they left Telegram.
     /// This, not history load, owns `LiveInbox::open_chat`.
     /// `stamp` is the shared-cell write from the caller. The worker applies
@@ -62,6 +77,12 @@ enum TdlibCommand {
     /// `getChatHistory` is not overwritten when this command is dequeued.
     ViewChat {
         conversation_id: Option<String>,
+        stamp: u64,
+    },
+    /// The topic the user looks at. History of another topic stays unread.
+    ViewTopic {
+        conversation_id: String,
+        topic: MessageTopic,
         stamp: u64,
     },
     /// Ask TDLib to close. The worker exits after `authorizationStateClosed`.
@@ -108,6 +129,10 @@ struct LiveInbox {
     /// Chat `ViewChat` last named. A live message there is marked viewed.
     /// History load does not set this: the user can leave that thread.
     open_chat: Option<i64>,
+    /// The topic `ViewTopic` last named. `None` is the topic list or a normal chat.
+    open_topic: Option<MessageTopic>,
+    /// Forum topics already loaded, so a later update can keep the name.
+    topics: HashMap<(i64, i32), ChatTopic>,
     /// Same fact, published by `view_chat` before this worker dequeues
     /// `ViewChat`. History `viewMessages` reads this, not `open_chat`.
     viewed: inbox::ViewedChat,
@@ -271,6 +296,94 @@ impl TdlibRuntime {
                 stamp,
             });
         }
+    }
+
+    /// The topic the user looks at. The shared cell updates before the send,
+    /// so a topic history load sees this topic before the command is dequeued.
+    pub fn view_topic(&mut self, conversation_id: String, topic: MessageTopic) {
+        let stamp = {
+            let mut requested = self
+                .requested_view
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *requested = Some(conversation_id.clone());
+            if self.commands.is_none() {
+                return;
+            }
+            self.viewed
+                .publish_topic(inbox::viewed_chat_id(Some(&conversation_id)), Some(topic))
+        };
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(TdlibCommand::ViewTopic {
+                conversation_id,
+                topic,
+                stamp,
+            });
+        }
+    }
+
+    pub fn open_topic(
+        &mut self,
+        conversation_id: String,
+        topic: MessageTopic,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::OpenTopic {
+                conversation_id,
+                topic,
+            },
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    pub fn load_older_topic(
+        &mut self,
+        conversation_id: String,
+        topic: MessageTopic,
+        before_message_id: String,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::LoadOlderTopic {
+                conversation_id,
+                topic,
+                before_message_id,
+            },
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_topic_text(
+        &mut self,
+        conversation_id: String,
+        topic: MessageTopic,
+        body: String,
+        request: u64,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::SendTopicText {
+                conversation_id,
+                topic,
+                body,
+                request,
+            },
+            secrets,
+            source,
+            events,
+        );
     }
 
     pub fn send_text(
@@ -522,6 +635,8 @@ fn spawn_tdlib_worker(
             directory: ChatDirectory::new(),
             names: NameBook::new(),
             open_chat: None,
+            open_topic: None,
+            topics: HashMap::new(),
             viewed: view.viewed,
             unviewed: HashMap::new(),
         };
@@ -550,6 +665,7 @@ fn spawn_tdlib_worker(
                             live.closing.mark();
                             live.viewed.clear();
                             live.open_chat = None;
+                            live.open_topic = None;
                             let signed_in = live.authorized || live.late_ready;
                             match close_kind(signed_in, live.new_login, cancel) {
                                 CloseKind::LogOut => {
@@ -569,7 +685,13 @@ fn spawn_tdlib_worker(
                             load_main_chats(client_id, live.linked(), &events).await;
                         }
                         TdlibCommand::OpenChat(conversation_id) => {
-                            open_chat(client_id, &conversation_id, &live, &events).await;
+                            open_chat(client_id, &conversation_id, &mut live, &events).await;
+                        }
+                        TdlibCommand::OpenTopic {
+                            conversation_id,
+                            topic,
+                        } => {
+                            open_topic(client_id, &conversation_id, topic, &mut live, &events).await;
                         }
                         TdlibCommand::ViewChat {
                             conversation_id,
@@ -578,6 +700,7 @@ fn spawn_tdlib_worker(
                             apply_view_command(
                                 &live.viewed,
                                 &mut live.open_chat,
+                                &mut live.open_topic,
                                 conversation_id.as_deref(),
                                 stamp,
                             );
@@ -590,11 +713,80 @@ fn spawn_tdlib_worker(
                                 tokio::spawn(mark_message_viewed(client_id, chat_id, message_id));
                             }
                         }
-                        TdlibCommand::SendText { conversation_id, body, request } => {
-                            send_text(client_id, &conversation_id, &body, request, &live, &events).await;
+                        TdlibCommand::ViewTopic {
+                            conversation_id,
+                            topic,
+                            stamp,
+                        } => {
+                            let chat = inbox::viewed_chat_id(Some(&conversation_id));
+                            if live.viewed.sync_topic(stamp, chat, Some(topic)) {
+                                live.open_chat = chat;
+                                live.open_topic = Some(topic);
+                            } else {
+                                live.open_chat = live.viewed.get();
+                                live.open_topic = live.viewed.get_topic();
+                            }
                         }
-                        TdlibCommand::LoadOlder { conversation_id, before_message_id } => {
-                            load_older(client_id, &conversation_id, &before_message_id, &mut live, &events).await;
+                        TdlibCommand::SendText {
+                            conversation_id,
+                            body,
+                            request,
+                        } => {
+                            send_text(
+                                client_id,
+                                &conversation_id,
+                                &body,
+                                request,
+                                None,
+                                &live,
+                                &events,
+                            )
+                            .await;
+                        }
+                        TdlibCommand::SendTopicText {
+                            conversation_id,
+                            topic,
+                            body,
+                            request,
+                        } => {
+                            send_text(
+                                client_id,
+                                &conversation_id,
+                                &body,
+                                request,
+                                Some(topic),
+                                &live,
+                                &events,
+                            )
+                            .await;
+                        }
+                        TdlibCommand::LoadOlder {
+                            conversation_id,
+                            before_message_id,
+                        } => {
+                            load_older(
+                                client_id,
+                                &conversation_id,
+                                &before_message_id,
+                                &mut live,
+                                &events,
+                            )
+                            .await;
+                        }
+                        TdlibCommand::LoadOlderTopic {
+                            conversation_id,
+                            topic,
+                            before_message_id,
+                        } => {
+                            load_older_topic(
+                                client_id,
+                                &conversation_id,
+                                topic,
+                                &before_message_id,
+                                &mut live,
+                                &events,
+                            )
+                            .await;
                         }
                         TdlibCommand::Resend { conversation_id, message_id, request } => {
                             resend(client_id, &conversation_id, &message_id, request, &live, &events).await;
@@ -816,6 +1008,15 @@ async fn apply_update(
                 &update.user.first_name,
                 &update.user.last_name,
             );
+            if let tdlib_rs::enums::UserType::Bot(bot) = &update.user.r#type {
+                let effects = live
+                    .directory
+                    .note_topic_bot(update.user.id, bot.has_topics);
+                let emit = live.linked();
+                for effect in effects {
+                    publish(events, emit, &mut live.older, Some(effect));
+                }
+            }
         }
         other => {
             // `view_chat` published the cell while this update waited behind
@@ -842,18 +1043,30 @@ fn live_read_while_linked(
     if !live.linked() {
         return None;
     }
-    live_read_of(update, live.open_chat)
+    live_read_in_topic(update, live.open_chat, live.open_topic)
 }
 
-/// A live incoming message in the open chat. History calls `viewMessages`
-/// for a page only while that chat is still viewed. A message that arrives
-/// after that page must be marked too, or the server unread count stays above 0.
+/// A live incoming message in the open chat, with no topic open.
+/// Tests keep this two-argument form. The worker uses [`live_read_in_topic`].
+#[cfg(test)]
 fn live_read_of(update: &tdlib_rs::enums::Update, open_chat: Option<i64>) -> Option<(i64, i64)> {
+    live_read_in_topic(update, open_chat, None)
+}
+
+fn live_read_in_topic(
+    update: &tdlib_rs::enums::Update,
+    open_chat: Option<i64>,
+    open_topic: Option<MessageTopic>,
+) -> Option<(i64, i64)> {
     let tdlib_rs::enums::Update::NewMessage(update) = update else {
         return None;
     };
     let message = &update.message;
     if message.is_outgoing {
+        return None;
+    }
+    let message_topic = message.topic_id.as_ref().and_then(app_topic);
+    if message_topic != open_topic {
         return None;
     }
     inbox::live_message_to_view(open_chat, message.chat_id, message.id)
@@ -870,14 +1083,17 @@ fn apply_viewed_chat(open_chat: &mut Option<i64>, conversation_id: Option<&str>)
 fn apply_view_command(
     viewed: &inbox::ViewedChat,
     open_chat: &mut Option<i64>,
+    open_topic: &mut Option<MessageTopic>,
     conversation_id: Option<&str>,
     stamp: u64,
 ) {
     let chat = inbox::viewed_chat_id(conversation_id);
     if viewed.sync(stamp, chat) {
         apply_viewed_chat(open_chat, conversation_id);
+        *open_topic = None;
     } else {
         *open_chat = viewed.get();
+        *open_topic = viewed.get_topic();
     }
 }
 
@@ -1215,6 +1431,38 @@ fn apply_chat_update(update: tdlib_rs::enums::Update, live: &mut LiveInbox, even
                 message_body(&update.new_content),
             );
         }
+        tdlib_rs::enums::Update::ChatViewAsTopics(update) => {
+            publish(
+                events,
+                emit,
+                &mut live.older,
+                live.directory
+                    .set_view_as_topics(update.chat_id, update.view_as_topics),
+            );
+        }
+        tdlib_rs::enums::Update::ForumTopicInfo(update) => {
+            let key = (update.info.chat_id, update.info.forum_topic_id);
+            let Some(topic) = live.topics.get_mut(&key) else {
+                return;
+            };
+            topic.name.clone_from(&update.info.name);
+            topic.general = update.info.is_general;
+            topic.hidden = update.info.is_hidden;
+            topic.closed = update.info.is_closed;
+            if emit {
+                emit_topic(events, topic.clone());
+            }
+        }
+        tdlib_rs::enums::Update::ForumTopic(update) => {
+            let key = (update.chat_id, update.forum_topic_id);
+            let Some(topic) = live.topics.get_mut(&key) else {
+                return;
+            };
+            topic.muted = update.notification_settings.mute_for > 0;
+            if emit {
+                emit_topic(events, topic.clone());
+            }
+        }
         _ => {}
     }
 }
@@ -1235,6 +1483,56 @@ fn emit_effect(events: &EventTx, effect: Option<ChatEffect>) {
             emit_conversation_removed(events, ProtocolId::Telegram, id);
         }
         None => {}
+    }
+}
+
+/// A forum supergroup shown as topics, or a private chat with a topic bot.
+/// Saved Messages is a private chat with `view_as_topics`, so it stays a chat.
+fn forum_or_bot(
+    directory: &ChatDirectory,
+    kind: &tdlib_rs::enums::ChatType,
+    view_as_topics: bool,
+) -> bool {
+    match kind {
+        tdlib_rs::enums::ChatType::Supergroup(group) => view_as_topics && !group.is_channel,
+        tdlib_rs::enums::ChatType::Private(chat) => directory.bot_has_topics(chat.user_id),
+        tdlib_rs::enums::ChatType::BasicGroup(_) | tdlib_rs::enums::ChatType::Secret(_) => false,
+    }
+}
+
+fn chat_peer(kind: &tdlib_rs::enums::ChatType) -> Option<i64> {
+    match kind {
+        tdlib_rs::enums::ChatType::Private(chat) => Some(chat.user_id),
+        tdlib_rs::enums::ChatType::BasicGroup(_)
+        | tdlib_rs::enums::ChatType::Supergroup(_)
+        | tdlib_rs::enums::ChatType::Secret(_) => None,
+    }
+}
+
+fn app_topic(topic: &tdlib_rs::enums::MessageTopic) -> Option<MessageTopic> {
+    match topic {
+        tdlib_rs::enums::MessageTopic::Forum(topic) => {
+            Some(MessageTopic::Forum(i64::from(topic.forum_topic_id)))
+        }
+        tdlib_rs::enums::MessageTopic::Thread(topic) => {
+            Some(MessageTopic::Thread(topic.message_thread_id))
+        }
+        tdlib_rs::enums::MessageTopic::DirectMessages(_)
+        | tdlib_rs::enums::MessageTopic::SavedMessages(_) => None,
+    }
+}
+
+fn td_topic(topic: MessageTopic) -> Option<tdlib_rs::enums::MessageTopic> {
+    match topic {
+        MessageTopic::Forum(id) => {
+            let forum_topic_id = i32::try_from(id).ok()?;
+            Some(tdlib_rs::enums::MessageTopic::Forum(
+                tdlib_rs::types::MessageTopicForum { forum_topic_id },
+            ))
+        }
+        MessageTopic::Thread(message_thread_id) => Some(tdlib_rs::enums::MessageTopic::Thread(
+            tdlib_rs::types::MessageTopicThread { message_thread_id },
+        )),
     }
 }
 
@@ -1274,6 +1572,8 @@ fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Opt
             is_group,
             scope,
             mute: chat_mute(&chat.notification_settings),
+            has_topics: forum_or_bot(directory, &chat.r#type, chat.view_as_topics),
+            peer: chat_peer(&chat.r#type),
         },
     )
 }
@@ -1335,6 +1635,7 @@ fn emit_mapped_message_as(
                 Some(tdlib_rs::enums::MessageSendingState::Pending(_)) => Delivery::Pending,
                 Some(tdlib_rs::enums::MessageSendingState::Failed(_)) => Delivery::Failed,
             },
+            topic: message.topic_id.as_ref().and_then(app_topic),
         },
         &live.names,
         live.directory.title(message.chat_id),
@@ -1396,7 +1697,7 @@ async fn load_main_chats(client_id: i32, authorized: bool, events: &EventTx) {
     emit_chat_list_loaded(events, ProtocolId::Telegram);
 }
 
-async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, events: &EventTx) {
+async fn open_chat(client_id: i32, conversation_id: &str, live: &mut LiveInbox, events: &EventTx) {
     if !live.linked() {
         emit_status(
             events,
@@ -1424,8 +1725,204 @@ async fn open_chat(client_id: i32, conversation_id: &str, live: &LiveInbox, even
         AdapterStatus::Ready,
         "Loading recent messages.",
     );
+    if live.directory.has_topics(chat_id) {
+        load_forum_topics(client_id, chat_id, live, events).await;
+    }
     load_history(client_id, chat_id, live, events).await;
     emit_history_loaded(events, ProtocolId::Telegram, conversation_id);
+}
+
+/// The first page of forum topics, and one more page when the server has more.
+async fn load_forum_topics(client_id: i32, chat_id: i64, live: &mut LiveInbox, events: &EventTx) {
+    let mut offset_date = 0;
+    let mut offset_message_id = 0;
+    let mut offset_forum_topic_id = 0;
+    let mut seen = 0;
+    for _ in 0..2 {
+        let page = tdlib_rs::functions::get_forum_topics(
+            chat_id,
+            String::new(),
+            offset_date,
+            offset_message_id,
+            offset_forum_topic_id,
+            100,
+            client_id,
+        )
+        .await;
+        let Ok(tdlib_rs::enums::ForumTopics::ForumTopics(page)) = page else {
+            if let Err(error) = page {
+                log_tdlib_error("getForumTopics", &error);
+            }
+            return;
+        };
+        let total = page.total_count;
+        let count = i32::try_from(page.topics.len()).unwrap_or(i32::MAX);
+        for topic in page.topics {
+            let row = forum_topic_row(chat_id, &topic);
+            live.topics
+                .insert((chat_id, topic.info.forum_topic_id), row.clone());
+            emit_topic(events, row);
+        }
+        seen += count;
+        if count == 0 || seen >= total {
+            return;
+        }
+        offset_date = page.next_offset_date;
+        offset_message_id = page.next_offset_message_id;
+        offset_forum_topic_id = page.next_offset_forum_topic_id;
+    }
+}
+
+fn forum_topic_row(chat_id: i64, topic: &tdlib_rs::types::ForumTopic) -> ChatTopic {
+    let info = &topic.info;
+    ChatTopic {
+        protocol: ProtocolId::Telegram,
+        conversation_id: inbox::conversation_id(chat_id),
+        topic: MessageTopic::Forum(i64::from(info.forum_topic_id)),
+        name: info.name.clone(),
+        unread: u32::try_from(topic.unread_count).unwrap_or(0),
+        last_at: topic
+            .last_message
+            .as_ref()
+            .map(|message| i64::from(message.date))
+            .unwrap_or(0),
+        general: info.is_general,
+        hidden: info.is_hidden,
+        closed: info.is_closed,
+        muted: topic.notification_settings.mute_for > 0,
+    }
+}
+
+async fn open_topic(
+    client_id: i32,
+    conversation_id: &str,
+    topic: MessageTopic,
+    live: &mut LiveInbox,
+    events: &EventTx,
+) {
+    if !live.linked() {
+        emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            "Telegram is not ready. Open a topic after authorization.",
+        );
+        return;
+    }
+    let Some(chat_id) = inbox::parse_telegram_chat_id(conversation_id) else {
+        emit_status(
+            events,
+            ProtocolId::Telegram,
+            AdapterStatus::Error,
+            "That chat id is not a Telegram chat.",
+        );
+        return;
+    };
+    emit_status(
+        events,
+        ProtocolId::Telegram,
+        AdapterStatus::Ready,
+        "Loading recent messages.",
+    );
+    load_topic_history(client_id, chat_id, topic, 0, live, events).await;
+    emit_history_loaded(events, ProtocolId::Telegram, conversation_id);
+}
+
+async fn load_older_topic(
+    client_id: i32,
+    conversation_id: &str,
+    topic: MessageTopic,
+    before_message_id: &str,
+    live: &mut LiveInbox,
+    events: &EventTx,
+) {
+    let end = |more: bool, note: Option<String>| {
+        emit_older_history_loaded(
+            events,
+            ProtocolId::Telegram,
+            conversation_id,
+            before_message_id,
+            more,
+            note,
+        );
+    };
+    let Some((chat_id, before)) = inbox::parse_message_id(before_message_id) else {
+        end(false, None);
+        return;
+    };
+    if !live.linked() {
+        end(true, None);
+        return;
+    }
+    let loaded = load_topic_history(client_id, chat_id, topic, before, live, events).await;
+    end(loaded, None);
+}
+
+/// Messages of one topic, newest page when `from_message_id` is 0.
+/// Returns whether the page was non-empty.
+async fn load_topic_history(
+    client_id: i32,
+    chat_id: i64,
+    topic: MessageTopic,
+    from_message_id: i64,
+    live: &LiveInbox,
+    events: &EventTx,
+) -> bool {
+    let page = match topic {
+        MessageTopic::Forum(id) => {
+            let Some(forum_topic_id) = i32::try_from(id).ok() else {
+                return false;
+            };
+            tdlib_rs::functions::get_forum_topic_history(
+                chat_id,
+                forum_topic_id,
+                from_message_id,
+                0,
+                inbox::HISTORY_LIMIT,
+                client_id,
+            )
+            .await
+        }
+        MessageTopic::Thread(message_id) => {
+            tdlib_rs::functions::get_message_thread_history(
+                chat_id,
+                message_id,
+                from_message_id,
+                0,
+                inbox::HISTORY_LIMIT,
+                client_id,
+            )
+            .await
+        }
+    };
+    match page {
+        Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
+            let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
+            let message_ids: Vec<i64> = messages.iter().map(|message| message.id).collect();
+            let any = !messages.is_empty();
+            for message in inbox::chronological(messages) {
+                emit_mapped_message(events, &message, live, None);
+            }
+            if !message_ids.is_empty()
+                && inbox::should_mark_topic_viewed(
+                    live.viewed.get(),
+                    live.viewed.get_topic(),
+                    chat_id,
+                    topic,
+                )
+                && let Err(error) =
+                    tdlib_rs::functions::view_messages(chat_id, message_ids, None, true, client_id)
+                        .await
+            {
+                log_tdlib_error("viewMessages", &error);
+            }
+            any
+        }
+        Err(error) => {
+            log_tdlib_error("getForumTopicHistory", &error);
+            false
+        }
+    }
 }
 
 async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &EventTx) {
@@ -1567,6 +2064,7 @@ async fn send_text(
     conversation_id: &str,
     body: &str,
     request: u64,
+    topic: Option<MessageTopic>,
     live: &LiveInbox,
     events: &EventTx,
 ) {
@@ -1608,7 +2106,16 @@ async fn send_text(
             link_preview_options: None,
             clear_draft: true,
         });
-    match tdlib_rs::functions::send_message(chat_id, None, None, None, content, client_id).await {
+    match tdlib_rs::functions::send_message(
+        chat_id,
+        topic.and_then(td_topic),
+        None,
+        None,
+        content,
+        client_id,
+    )
+    .await
+    {
         Ok(tdlib_rs::enums::Message::Message(message)) => {
             emit_mapped_message(events, &message, live, None);
             // After the pending row, name this send as accepted.
@@ -1988,6 +2495,8 @@ mod tests {
                 is_group: false,
                 scope: MuteScope::Private,
                 mute: ChatMute::default(),
+                has_topics: false,
+                peer: None,
             },
         );
         assert!(
@@ -2043,6 +2552,8 @@ mod tests {
                 is_group: false,
                 scope: MuteScope::Private,
                 mute: ChatMute::default(),
+                has_topics: false,
+                peer: None,
             },
         );
         fake.view(Some("telegram:42"));
@@ -2119,6 +2630,7 @@ mod tests {
             start.wait();
             runtime.view_chat(None);
             let mut open = ready.join().expect("ready");
+            let mut topic = None;
             while let Ok(TdlibCommand::ViewChat {
                 conversation_id,
                 stamp,
@@ -2127,6 +2639,7 @@ mod tests {
                 apply_view_command(
                     &runtime.viewed,
                     &mut open,
+                    &mut topic,
                     conversation_id.as_deref(),
                     stamp,
                 );
@@ -2212,6 +2725,8 @@ mod tests {
             directory: ChatDirectory::new(),
             names: NameBook::new(),
             open_chat: Some(42),
+            open_topic: None,
+            topics: HashMap::new(),
             viewed: runtime.viewed.clone(),
             unviewed: HashMap::new(),
         };

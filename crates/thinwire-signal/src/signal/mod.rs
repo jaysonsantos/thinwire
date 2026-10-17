@@ -628,6 +628,7 @@ mod tests {
             writable: true,
             muted: false,
             placeholder: false,
+            has_topics: false,
         }
     }
 
@@ -642,6 +643,7 @@ mod tests {
             delivery: thinwire_protocol::Delivery::Sent,
             sent_at: 0,
             arrival: thinwire_protocol::Arrival::History,
+            topic: None,
         }
     }
 

@@ -166,6 +166,7 @@ mod tests {
         NotifyKey {
             protocol,
             conversation_id: id.into(),
+            topic: None,
         }
     }
 

@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage,
-    Conversation, Delivery, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
+    Conversation, Delivery, EventTx, MessageTopic, ProtocolAdapter, ProtocolCapabilities,
+    ProtocolId, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
 };
 
 /// How the demo answers a `SendText`.
@@ -223,6 +223,40 @@ impl DemoAdapter {
         );
     }
 
+    fn open_topic(&self, chat: String, topic: MessageTopic, events: &EventTx) {
+        let protocol = self.protocol();
+        let Some(history) = self.script.history.get(&chat) else {
+            self.send(
+                events,
+                AdapterEvent::HistoryLoaded {
+                    protocol,
+                    conversation_id: chat,
+                },
+            );
+            return;
+        };
+        let rows: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|message| message.topic == Some(topic))
+            .collect();
+        let from = rows.len().saturating_sub(self.script.page);
+        for message in &rows[from..] {
+            self.send(
+                events,
+                AdapterEvent::MessageReceived {
+                    message: (*message).clone(),
+                },
+            );
+        }
+        self.send(
+            events,
+            AdapterEvent::HistoryLoaded {
+                protocol,
+                conversation_id: chat,
+            },
+        );
+    }
+
     fn load_older(&self, chat: String, before: String, events: &EventTx) {
         if self.script.older == DemoOlder::Hold {
             return;
@@ -258,7 +292,61 @@ impl DemoAdapter {
         );
     }
 
-    fn send_text(&self, chat: String, body: String, request: u64, events: &EventTx) {
+    fn load_older_topic(
+        &self,
+        chat: String,
+        topic: MessageTopic,
+        before: String,
+        events: &EventTx,
+    ) {
+        if self.script.older == DemoOlder::Hold {
+            return;
+        }
+        let protocol = self.protocol();
+        let history = self
+            .script
+            .history
+            .get(&chat)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|message| message.topic == Some(topic))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let end = history
+            .iter()
+            .position(|message| message.id == before)
+            .unwrap_or(0);
+        let from = end.saturating_sub(self.script.page);
+        for message in &history[from..end] {
+            self.send(
+                events,
+                AdapterEvent::MessageReceived {
+                    message: message.clone(),
+                },
+            );
+        }
+        self.send(
+            events,
+            AdapterEvent::OlderHistoryLoaded {
+                protocol,
+                conversation_id: chat,
+                before_message_id: before,
+                more: from > 0,
+                note: None,
+            },
+        );
+    }
+
+    fn send_text(
+        &self,
+        chat: String,
+        topic: Option<MessageTopic>,
+        body: String,
+        request: u64,
+        events: &EventTx,
+    ) {
         let protocol = self.protocol();
         let delivery = match self.script.send {
             DemoSend::Accept => Delivery::Sent,
@@ -278,6 +366,7 @@ impl DemoAdapter {
                     delivery,
                     sent_at: self.script.now,
                     arrival: crate::Arrival::History,
+                    topic,
                 },
             },
         );
@@ -389,11 +478,22 @@ impl DemoAdapter {
             AdapterCommand::OpenChat {
                 conversation_id, ..
             } => self.open_chat(conversation_id, events),
+            AdapterCommand::OpenTopic {
+                conversation_id,
+                topic,
+                ..
+            } => self.open_topic(conversation_id, topic, events),
             AdapterCommand::LoadOlderMessages {
                 conversation_id,
                 before_message_id,
                 ..
             } => self.load_older(conversation_id, before_message_id, events),
+            AdapterCommand::LoadOlderTopic {
+                conversation_id,
+                topic,
+                before_message_id,
+                ..
+            } => self.load_older_topic(conversation_id, topic, before_message_id, events),
             AdapterCommand::LoadChats { protocol } => {
                 self.send(events, AdapterEvent::ChatListLoaded { protocol });
             }
@@ -402,7 +502,14 @@ impl DemoAdapter {
                 body,
                 request,
                 ..
-            } => self.send_text(conversation_id, body, request, events),
+            } => self.send_text(conversation_id, None, body, request, events),
+            AdapterCommand::SendTopicText {
+                conversation_id,
+                topic,
+                body,
+                request,
+                ..
+            } => self.send_text(conversation_id, Some(topic), body, request, events),
             AdapterCommand::ResendMessage {
                 conversation_id,
                 message_id,
@@ -443,6 +550,7 @@ mod tests {
             writable: true,
             muted: false,
             placeholder: false,
+            has_topics: false,
         }
     }
 
@@ -457,6 +565,7 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at: NOW + i64::try_from(index).unwrap_or_default(),
             arrival: crate::Arrival::History,
+            topic: None,
         }
     }
 

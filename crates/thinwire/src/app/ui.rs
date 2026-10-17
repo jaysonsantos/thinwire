@@ -5,7 +5,7 @@ use std::time::Instant;
 use eframe::egui::{self, RichText};
 use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
-use thinwire_protocol::{AdapterStatus, Delivery, ProtocolId};
+use thinwire_protocol::{AdapterStatus, Delivery, MessageTopic, ProtocolId, topic_mute_id};
 
 use super::auth;
 use super::motion;
@@ -543,7 +543,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
             let unread_by_protocol: Vec<u32> = snapshot
                 .accounts
                 .iter()
-                .map(|account| snapshot.unread_for(account.caps.id))
+                .map(|account| snapshot.account_unread(account.caps.id))
                 .collect();
             let mut clicked: Option<ProtocolId> = None;
             for (account, unread) in snapshot.accounts.iter().zip(unread_by_protocol) {
@@ -833,7 +833,7 @@ fn inbox(
             id: row.id.clone(),
             title: row.title.clone(),
             preview: row.preview.clone(),
-            unread: row.unread,
+            unread: snapshot.display_unread(row),
             time: view_list_time(row.last_at, now),
             mute: snapshot.chat_mute(row.protocol, &row.id),
         })
@@ -1541,6 +1541,10 @@ fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<
 
 fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     thread_header(ui, snapshot, out);
+    if snapshot.showing_topic_list() {
+        topic_list(ui, snapshot, out);
+        return;
+    }
 
     let is_group = snapshot
         .selected_conversation_row()
@@ -1574,8 +1578,9 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     let state = snapshot.thread_state();
     let older = snapshot.older_state();
     let mut retry: Option<String> = None;
-    // One scroll state per chat, so each chat opens at its newest message.
-    let salt = snapshot.selected_conversation.clone().unwrap_or_default();
+    // One scroll state per chat, and per topic inside a forum, so each
+    // thread opens at its newest message.
+    let salt = thread_salt(snapshot);
     let memo_id = ui.make_persistent_id(("thread-older", &salt));
     let memo: ThreadMemo = ui.data(|data| data.get_temp(memo_id)).unwrap_or_default();
     let scroll_id = ui.make_persistent_id(("thread-scroll", &salt));
@@ -1589,6 +1594,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         egui::Id::new((
             snapshot.selected_protocol,
             &snapshot.selected_conversation,
+            snapshot.selected_topic,
             state == ThreadState::Rows,
         )),
         motion::FADE,
@@ -1711,6 +1717,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         out.push(Intent::LoadOlderMessages {
             protocol,
             conversation_id,
+            topic: snapshot.selected_topic,
         });
     }
     if let Some(message_id) = retry {
@@ -1874,6 +1881,231 @@ struct Bubble {
     layout: RowLayout,
 }
 
+/// Scroll id of the open thread. A topic keeps its own offset.
+fn thread_salt(snapshot: &View<'_>) -> String {
+    match (
+        snapshot.selected_conversation.as_deref(),
+        snapshot.selected_topic,
+    ) {
+        (Some(id), Some(topic)) => topic_mute_id(id, topic),
+        (Some(id), None) => id.to_owned(),
+        (None, _) => String::new(),
+    }
+}
+
+/// Stable row id for the topic list anchor.
+fn topic_anchor(topic: MessageTopic) -> String {
+    match topic {
+        MessageTopic::Forum(id) => format!("forum:{id}"),
+        MessageTopic::Thread(id) => format!("thread:{id}"),
+    }
+}
+
+/// The topics of the open forum or bot chat. A reorder keeps the anchor row
+/// on the same screen line.
+fn topic_list(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    let Some(conversation) = snapshot.selected_conversation_row() else {
+        return;
+    };
+    let topics = snapshot.selected_topics();
+    let ids: Vec<String> = topics
+        .iter()
+        .map(|topic| topic_anchor(topic.topic))
+        .collect();
+    let memo_id = ui.make_persistent_id(("topic-anchor", conversation.id.clone()));
+    let previous: Option<InboxAnchor> = ui.data(|data| data.get_temp(memo_id));
+    let forced = previous
+        .as_ref()
+        .and_then(|previous| anchored_inbox_offset(previous, &ids));
+    let mut area = egui::ScrollArea::vertical()
+        .id_salt(("topics", &conversation.id))
+        .auto_shrink([false, false]);
+    if let Some(offset) = forced {
+        area = area.vertical_scroll_offset(offset);
+    }
+    let stride = inbox_row_stride(ui);
+    let mut drawn = DrawnInbox {
+        anchor: None,
+        stride,
+    };
+    let output = area.show(ui, |ui| {
+        if topics.is_empty() {
+            ui.label(RichText::new("No topics.").italics().weak());
+            return;
+        }
+        let now = snapshot.now();
+        let pointer = ui.input(|input| input.pointer.hover_pos());
+        let clip = ui.clip_rect();
+        let mut under_pointer = None;
+        let mut first_visible = None;
+        for topic in &topics {
+            let anchor = topic_anchor(topic.topic);
+            let mute = snapshot.topic_mute(topic);
+            let response = topic_row(
+                ui,
+                &anchor,
+                &topic.name,
+                &view_list_time(topic.last_at, now),
+                topic.unread,
+                topic.closed,
+                mute.is_muted(),
+            );
+            let protocol = topic.protocol;
+            let mute_id = topic_mute_id(&topic.conversation_id, topic.topic);
+            response.context_menu(|ui| {
+                if let Some(intent) = mute_control(ui, protocol, &mute_id, mute, "topic") {
+                    out.push(intent);
+                    ui.close();
+                }
+            });
+            if under_pointer.is_none() && pointer.is_some_and(|pos| response.rect.contains(pos)) {
+                under_pointer = Some(anchor.clone());
+            }
+            if first_visible.is_none() && response.rect.intersects(clip) {
+                first_visible = Some(anchor.clone());
+            }
+            if response.clicked() {
+                out.push(Intent::SelectTopic {
+                    conversation_id: topic.conversation_id.clone(),
+                    topic: topic.topic,
+                });
+            }
+        }
+        drawn.anchor = under_pointer.or(first_visible);
+    });
+    ui.data_mut(|data| {
+        data.insert_temp(
+            memo_id,
+            InboxAnchor {
+                ids,
+                offset: output.state.offset.y,
+                stride: drawn.stride,
+                anchor: drawn.anchor,
+            },
+        );
+    });
+}
+
+/// One topic row. A closed topic shows a lock beside the name.
+#[allow(clippy::too_many_arguments)]
+fn topic_row(
+    ui: &mut egui::Ui,
+    id: &str,
+    name: &str,
+    time: &str,
+    unread: u32,
+    closed: bool,
+    muted: bool,
+) -> egui::Response {
+    let palette = theme::palette(ui);
+    let width = laid_out_width(ui, "topic-row-width");
+    let (rect, hover) = ui.allocate_exact_size(
+        egui::vec2(width, inbox_row_height(ui)),
+        egui::Sense::hover(),
+    );
+    let row_id = ui.id().with(("topic-row", id));
+    row_backdrop(ui, row_id, rect, false, hover.hovered());
+    let gutter = ui.spacing().scroll.bar_width;
+    let inner = theme::row_content_rect(rect, gutter);
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::top_down(egui::Align::Min))
+            .id_salt(("topic-row", id)),
+    );
+    child.spacing_mut().item_spacing.y = space::XS;
+    let title_font = if unread > 0 {
+        theme::semibold()
+    } else {
+        theme::medium()
+    };
+    row_ends(
+        &mut child,
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::XS;
+                if closed {
+                    lock_icon(ui, palette.text2);
+                }
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(name)
+                            .text_style(theme::row_title())
+                            .family(title_font)
+                            .color(palette.text),
+                    )
+                    .truncate()
+                    .halign(egui::Align::LEFT),
+                );
+            });
+        },
+        |ui| {
+            ui.label(RichText::new(time).small().color(palette.text3));
+            if muted {
+                ui.label(RichText::new("muted").small().color(palette.text3));
+            }
+        },
+    );
+    row_ends(
+        &mut child,
+        |ui| {
+            let note = if closed { "Closed" } else { "" };
+            ui.add(
+                egui::Label::new(
+                    RichText::new(note)
+                        .text_style(theme::secondary())
+                        .color(palette.text2),
+                )
+                .truncate()
+                .halign(egui::Align::LEFT),
+            );
+        },
+        |ui| {
+            if let Some(text) = badge_text(unread) {
+                unread_badge(ui, &text, muted);
+            }
+        },
+    );
+    let response = ui.interact(rect, row_id, egui::Sense::click());
+    let access = if closed {
+        format!("{name}, closed")
+    } else {
+        name.to_owned()
+    };
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, access.clone()));
+    response
+}
+
+/// A small lock, painted with strokes so the snapshot font does not matter.
+fn lock_icon(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "closed"));
+    let stroke = egui::Stroke::new(1.5, color);
+    let body = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 2.0, rect.center().y),
+        egui::vec2(rect.width() - 4.0, rect.height() * 0.42),
+    );
+    ui.painter().rect_stroke(
+        body,
+        egui::CornerRadius::same(2),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    let left = body.left() + 2.5;
+    let right = body.right() - 2.5;
+    let top = rect.top() + 1.5;
+    ui.painter().add(egui::Shape::line(
+        vec![
+            egui::pos2(left, body.top()),
+            egui::pos2(left, top + 2.0),
+            egui::pos2(right, top + 2.0),
+            egui::pos2(right, body.top()),
+        ],
+        stroke,
+    ));
+}
+
 /// Title, optional "group" line, and a bottom border.
 fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let palette = theme::palette(ui);
@@ -1884,21 +2116,34 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
                 let mute = snapshot.chat_mute(conversation.protocol, &conversation.id);
                 // One row: the button sits right, and the title takes the
                 // rest and truncates.
+                let open = snapshot.open_topic();
+                let title = match open {
+                    Some(topic) => format!("{} › {}", conversation.title, topic.name),
+                    None => conversation.title.clone(),
+                };
+                let (mute_id, mute) = match open {
+                    Some(topic) => (
+                        topic_mute_id(&conversation.id, topic.topic),
+                        snapshot.topic_mute(topic),
+                    ),
+                    None => (conversation.id.clone(), mute),
+                };
                 egui::Sides::new().shrink_left().truncate().show(
                     ui,
                     |ui| {
+                        if open.is_some_and(|topic| topic.closed) {
+                            lock_icon(ui, palette.text2);
+                            ui.add_space(space::XS);
+                        }
                         ui.add(
-                            egui::Label::new(
-                                RichText::new(&conversation.title)
-                                    .heading()
-                                    .color(palette.text),
-                            )
-                            .truncate(),
+                            egui::Label::new(RichText::new(title).heading().color(palette.text))
+                                .truncate(),
                         );
                     },
                     |ui| {
+                        let what = if open.is_some() { "topic" } else { "" };
                         if let Some(intent) =
-                            mute_control(ui, conversation.protocol, &conversation.id, mute, "")
+                            mute_control(ui, conversation.protocol, &mute_id, mute, what)
                         {
                             out.push(intent);
                         }
@@ -2213,7 +2458,7 @@ fn compose(
     let chat = snapshot
         .selected_conversation
         .clone()
-        .map(|id| (snapshot.selected_protocol, id));
+        .map(|id| (snapshot.selected_protocol, id, snapshot.selected_topic));
     if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
     }
@@ -2228,22 +2473,28 @@ fn compose(
         });
         // Eat plain Enter before the text field sees it, so it does not add a line.
         if enter && !other && !shift {
-            if let Some((protocol, conversation_id)) = chat.clone() {
+            if let Some((protocol, conversation_id, topic)) = chat.clone() {
                 out.push(Intent::SendDraft {
                     protocol,
                     conversation_id,
+                    topic,
                 });
             }
             ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         }
     }
     let palette = theme::palette(ui);
+    let closed = snapshot.topic_closed();
     let y = ui.cursor().min.y;
     ui.painter().hline(
         ui.max_rect().x_range(),
         y,
         egui::Stroke::new(1.0, palette.border),
     );
+    if closed {
+        ui.add_space(space::S);
+        ui.label(RichText::new("This topic is closed.").color(palette.text2));
+    }
     let focused = ui.memory(|memory| memory.has_focus(compose_id));
     let ring = motion::toggle(ui.ctx(), compose_id.with("ring"), focused, motion::STATE);
     let field = egui::Frame::new()
@@ -2273,18 +2524,22 @@ fn compose(
                     .max_width(width)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
+                        let hint = snapshot.compose_hint();
                         if let Some(text) = edited(ui, &snapshot.compose, |text| {
                             egui::TextEdit::multiline(text)
                                 .id(compose_id)
                                 .frame(field)
                                 .desired_rows(1)
                                 .desired_width(width)
-                                .hint_text(RichText::new("Message").color(palette.text3))
-                        }) && let Some((protocol, conversation_id)) = chat.clone()
+                                .interactive(!closed)
+                                .hint_text(RichText::new(hint.clone()).color(palette.text3))
+                        }) && !closed
+                            && let Some((protocol, conversation_id, topic)) = chat.clone()
                         {
                             out.push(Intent::SetDraft {
                                 protocol,
                                 conversation_id,
+                                topic,
                                 text: text.into(),
                             });
                         }
@@ -2302,11 +2557,12 @@ fn compose(
                             .min_size(egui::vec2(send_width, SEND_MIN_HEIGHT))
                     })
                     .clicked()
-                    && let Some((protocol, conversation_id)) = chat.clone()
+                    && let Some((protocol, conversation_id, topic)) = chat.clone()
                 {
                     out.push(Intent::SendDraft {
                         protocol,
                         conversation_id,
+                        topic,
                     });
                 }
             });

@@ -92,10 +92,15 @@ pub(crate) fn command_to_wire(
             WireCommand::CancelLink
         }
         // The app answers these itself. They never cross the pipe.
+        // Topic commands are Telegram-only. A helper never sees them.
         AdapterCommand::Shutdown { .. }
         | AdapterCommand::RestartHelper { .. }
         | AdapterCommand::ConnectDiscord { .. }
-        | AdapterCommand::TelegramAuth { .. } => return None,
+        | AdapterCommand::TelegramAuth { .. }
+        | AdapterCommand::OpenTopic { .. }
+        | AdapterCommand::LoadOlderTopic { .. }
+        | AdapterCommand::SendTopicText { .. }
+        | AdapterCommand::ViewTopic { .. } => return None,
     })
 }
 
@@ -527,6 +532,7 @@ fn conversation_from_wire(protocol: ProtocolId, conversation: WireConversation) 
         writable: conversation.writable,
         placeholder: conversation.placeholder,
         muted: conversation.muted,
+        has_topics: false,
     }
 }
 
@@ -554,6 +560,7 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
         delivery: delivery_from_wire(message.delivery),
         sent_at: message.sent_at,
         arrival: arrival_from_wire(message.arrival),
+        topic: None,
     }
 }
 
@@ -576,6 +583,7 @@ mod tests {
             delivery: Delivery::Pending,
             sent_at: 1_790_000_000,
             arrival: Arrival::Live,
+            topic: None,
         }
     }
 
@@ -593,6 +601,7 @@ mod tests {
             writable: true,
             placeholder: false,
             muted: true,
+            has_topics: false,
         }
     }
 
