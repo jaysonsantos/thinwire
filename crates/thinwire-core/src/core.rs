@@ -43,6 +43,10 @@ const SECRET_STORE_STATUS_PREFIX: &str = "Sign in with Telegram to get started."
 const HELD_TOPIC_NOTICE_CAP: usize = 32;
 /// Most live messages remembered for one topic while its row is missing.
 const HELD_TOPIC_NOTICE_COUNT: u32 = 99;
+/// How long a live forum message waits for its topic row. A later `pump`
+/// then notifies with the group title. A row that arrives first still
+/// decides the mute and the name.
+const HELD_TOPIC_NOTICE_WAIT: Duration = Duration::from_secs(4);
 
 /// Start-up input for [`Core::new`].
 #[derive(Debug, Clone)]
@@ -131,6 +135,9 @@ struct HeldTopicNotice {
     message: ChatMessage,
     /// Live messages of this topic before `message`.
     earlier: u32,
+    /// When the first message of this topic was held. Later messages of the
+    /// same topic do not move it, so a burst cannot stretch the wait.
+    held_at: Instant,
 }
 
 /// While the app closes, a send answer is logged: a failure as a warning.
@@ -307,8 +314,9 @@ impl Core {
     }
 
     /// Apply the adapter events that arrived and run time-based checks.
-    /// Returns true when the state changed: an event was applied, or a send
-    /// with no answer expired.
+    /// Returns true when the state changed: an event was applied, a send
+    /// with no answer expired, or a forum notice that waited for its topic
+    /// row was released.
     ///
     /// Frontend thread only. See [`Core`] "Threads".
     pub fn pump(&mut self) -> bool {
@@ -336,9 +344,6 @@ impl Core {
                 if let Some(message) = live {
                     self.notify_message(&message);
                 }
-                // A topic row in this batch can free a message that arrived
-                // earlier, still inside this pump, before sync runs.
-                self.release_held_topic_notices();
                 applied = true;
             }
         }
@@ -347,6 +352,9 @@ impl Core {
             self.settings.forget_chat_mutes(protocol);
             self.drop_held_topic_notices(protocol);
         }
+        // After the batch: a topic row in this pump frees its message, and a
+        // row that never arrives gives up after [`HELD_TOPIC_NOTICE_WAIT`].
+        let released = self.release_held_topic_notices();
         // Only after the queued answers: a late accept that was queued in
         // time still finds its send (#90 item 3).
         self.state.prune_late_answers();
@@ -360,7 +368,7 @@ impl Core {
         self.state.sync_timeout_hint();
         self.sync_notifications();
         self.flush();
-        applied || expired
+        applied || expired || released
     }
 
     /// Notifications for the frontend to show or remove, oldest first
@@ -375,6 +383,8 @@ impl Core {
         // A forum topic's mute and name live on its row. That row is empty
         // until it is loaded, including when the forum was never opened.
         // Notifying now would use the bare group title and miss a mute.
+        // The notice waits, and a later pump uses the group title if the
+        // row does not arrive.
         if self.topic_row_pending(message) {
             self.hold_topic_notice(message.clone());
             return;
@@ -421,14 +431,21 @@ impl Core {
         self.held_topic_notices.push(HeldTopicNotice {
             message,
             earlier: 0,
+            held_at: Instant::now(),
         });
     }
 
-    /// Notify held forum messages whose topic row is now known. Drop a hold
-    /// whose chat or session is gone: there is nothing left to title.
-    fn release_held_topic_notices(&mut self) {
+    /// Notify held forum messages whose topic row is now known. A row that
+    /// is still missing after [`HELD_TOPIC_NOTICE_WAIT`] notifies with the
+    /// group title. Drop a hold whose chat or session is gone: there is
+    /// nothing left to title.
+    ///
+    /// `true` when a hold was released. The caller reports that from `pump`.
+    fn release_held_topic_notices(&mut self) -> bool {
+        let now = Instant::now();
         let pending = std::mem::take(&mut self.held_topic_notices);
         let mut keep = Vec::new();
+        let mut released = false;
         for held in pending {
             let message = held.message;
             let Some(topic) = message.topic else {
@@ -442,22 +459,30 @@ impl Core {
             {
                 continue;
             }
-            if self
+            let row_ready = self
                 .state
                 .topic(message.protocol, &message.conversation_id, topic)
-                .is_some()
-            {
+                .is_some();
+            let waited = now.saturating_duration_since(held.held_at) >= HELD_TOPIC_NOTICE_WAIT;
+            if row_ready || waited {
+                // One call per message that waited. The queue keeps one
+                // notification per topic (the key includes the topic) and
+                // adds one to its count on each call. A second topic of the
+                // same chat is a different notification.
                 for _ in 0..held.earlier.saturating_add(1) {
                     self.notify_with_topic(&message);
                 }
+                released = true;
             } else {
                 keep.push(HeldTopicNotice {
                     message,
                     earlier: held.earlier,
+                    held_at: held.held_at,
                 });
             }
         }
         self.held_topic_notices = keep;
+        released
     }
 
     fn drop_held_topic_notices(&mut self, protocol: ProtocolId) {
@@ -510,11 +535,13 @@ impl Core {
             viewed,
             |protocol| state.has_session(protocol),
             |key| {
-                if let Some(topic) = key.topic {
-                    return match state.topic(key.protocol, &key.conversation_id, topic) {
-                        Some(row) => ChatNow::Listed { unread: row.unread },
-                        None => ChatNow::Gone,
-                    };
+                // A topic row carries that topic's unread. A notice that
+                // fell back to the group title has no row yet: the chat
+                // decides, so the notice is not dropped as soon as it shows.
+                if let Some(topic) = key.topic
+                    && let Some(row) = state.topic(key.protocol, &key.conversation_id, topic)
+                {
+                    return ChatNow::Listed { unread: row.unread };
                 }
                 match state.conversation(key.protocol, &key.conversation_id) {
                     Some(row) => ChatNow::Listed { unread: row.unread },
@@ -2000,6 +2027,221 @@ mod tests {
             core.view().selected_conversation.as_deref(),
             Some("telegram:9"),
             "notifying does not open the forum"
+        );
+    }
+
+    /// A topic row that never arrives must not swallow the notice. After the
+    /// wait, the next pump uses the group title. Each topic keeps its own
+    /// count. A row that shows up in that same pump still decides the mute.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_forum_notice_uses_the_group_title_when_the_row_does_not_arrive() {
+        use crate::notify::NotifyCommand;
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+        use thinwire_protocol::{ChatTopic, Delivery, MessageTopic};
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let mut camp = telegram_chat(9, "Camp forum", 30);
+        camp.has_topics = true;
+        camp.is_group = true;
+        core.state
+            .apply(AdapterEvent::ConversationUpsert { conversation: camp });
+        let (queue, events) = unbounded_channel();
+        core.events = events;
+        let live = |id: i64, topic_id: i64| ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            id: format!("telegram:9:{id}"),
+            sender: "Ada".into(),
+            body: "hello".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+            topic: Some(MessageTopic::Forum(topic_id)),
+        };
+        let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
+            for event in events {
+                queue.send(event).expect("queue");
+            }
+            core.pump();
+        };
+        let expire = |core: &mut Core| {
+            let start = Instant::now()
+                .checked_sub(HELD_TOPIC_NOTICE_WAIT)
+                .expect("the wait fits");
+            for held in &mut core.held_topic_notices {
+                held.held_at = start;
+            }
+        };
+
+        // Two messages in Trail, one in Food. Neither row arrives.
+        pump(
+            &mut core,
+            vec![
+                AdapterEvent::MessageReceived {
+                    message: live(1, 2),
+                },
+                AdapterEvent::MessageReceived {
+                    message: live(2, 2),
+                },
+                AdapterEvent::MessageReceived {
+                    message: live(3, 5),
+                },
+            ],
+        );
+        assert!(core.take_notify().is_empty(), "still inside the wait");
+        assert!(
+            !core.pump(),
+            "a pump before the wait does not release the hold"
+        );
+        assert!(core.take_notify().is_empty());
+        expire(&mut core);
+        assert!(core.pump(), "the wait releases the hold");
+        let shown = core.take_notify();
+        assert_eq!(shown.len(), 2, "one notification per topic: {shown:?}");
+        let NotifyCommand::Show(trail) = &shown[0] else {
+            panic!("{shown:?}");
+        };
+        let NotifyCommand::Show(food) = &shown[1] else {
+            panic!("{shown:?}");
+        };
+        assert_eq!(trail.title, "Camp forum");
+        assert_eq!(trail.count, 2);
+        assert_eq!(trail.key.topic, Some(MessageTopic::Forum(2)));
+        assert_eq!(food.title, "Camp forum");
+        assert_eq!(food.count, 1);
+        assert_eq!(food.key.topic, Some(MessageTopic::Forum(5)));
+        assert!(
+            !shown
+                .iter()
+                .any(|command| matches!(command, NotifyCommand::Dismiss(_))),
+            "the group-title fallback stays on screen: {shown:?}"
+        );
+
+        // The wait has passed, but the row is in this pump. The mute wins.
+        pump(
+            &mut core,
+            vec![AdapterEvent::MessageReceived {
+                message: live(4, 7),
+            }],
+        );
+        assert!(core.take_notify().is_empty());
+        expire(&mut core);
+        pump(
+            &mut core,
+            vec![AdapterEvent::TopicUpsert {
+                topic: ChatTopic {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id: "telegram:9".into(),
+                    topic: MessageTopic::Forum(7),
+                    name: "Quiet".into(),
+                    unread: 1,
+                    last_at: 7,
+                    general: false,
+                    hidden: false,
+                    closed: false,
+                    muted: true,
+                },
+            }],
+        );
+        assert!(
+            core.take_notify().is_empty(),
+            "a row in the same pump still mutes, after the wait"
+        );
+    }
+
+    /// A hidden General row still decides the mute. `Forum(1)` waits for
+    /// that row the same way any other topic does, including when the row
+    /// is hidden and the center pane does not show it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hidden_general_topic_row_keeps_its_mute() {
+        use crate::notify::NotifyCommand;
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+        use thinwire_protocol::{ChatTopic, Delivery, MessageTopic};
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let mut camp = telegram_chat(9, "Camp forum", 30);
+        camp.has_topics = true;
+        camp.is_group = true;
+        core.state
+            .apply(AdapterEvent::ConversationUpsert { conversation: camp });
+        let (queue, events) = unbounded_channel();
+        core.events = events;
+        let live = |id: i64| ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            id: format!("telegram:9:{id}"),
+            sender: "Ada".into(),
+            body: "hello".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+            topic: Some(MessageTopic::Forum(1)),
+        };
+        let general = |muted: bool| ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: MessageTopic::Forum(1),
+            name: "General".into(),
+            unread: 1,
+            last_at: 1,
+            general: true,
+            hidden: true,
+            closed: true,
+            muted,
+        };
+        let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
+            for event in events {
+                queue.send(event).expect("queue");
+            }
+            core.pump();
+        };
+
+        pump(
+            &mut core,
+            vec![AdapterEvent::MessageReceived { message: live(1) }],
+        );
+        assert!(
+            core.take_notify().is_empty(),
+            "General waits for its row, hidden or not"
+        );
+        pump(
+            &mut core,
+            vec![AdapterEvent::TopicUpsert {
+                topic: general(true),
+            }],
+        );
+        assert!(
+            core.take_notify().is_empty(),
+            "a muted hidden General does not notify"
+        );
+        assert!(
+            core.view()
+                .topic(ProtocolId::Telegram, "telegram:9", MessageTopic::Forum(1))
+                .is_some_and(|row| row.hidden && row.general),
+            "the hidden row is in state"
+        );
+
+        pump(
+            &mut core,
+            vec![
+                AdapterEvent::TopicUpsert {
+                    topic: general(false),
+                },
+                AdapterEvent::MessageReceived { message: live(2) },
+            ],
+        );
+        let shown = core.take_notify();
+        assert!(
+            matches!(
+                &shown[..],
+                [NotifyCommand::Show(note)]
+                    if note.title == "Camp forum › General" && note.count == 1
+            ),
+            "{shown:?}"
         );
     }
 
