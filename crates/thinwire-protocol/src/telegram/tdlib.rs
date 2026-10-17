@@ -155,6 +155,22 @@ impl LiveInbox {
     fn linked(&self) -> bool {
         self.authorized && self.closing.current()
     }
+
+    /// Apply one chat-list change and emit it when `emit` is true.
+    fn publish(&mut self, events: &EventTx, emit: bool, effect: Option<ChatEffect>) {
+        // A chat that leaves the list drops its paging state too, even before
+        // Ready (PR #52 review). Its cached topics go with it: the core drops
+        // those rows, and the next message has to fetch them again.
+        self.older.follow(effect.as_ref());
+        if let Some(ChatEffect::Remove(id)) = effect.as_ref()
+            && let Some(chat_id) = inbox::parse_telegram_chat_id(id)
+        {
+            inbox::forget_chat_topics(&mut self.topics, &mut self.topic_lists, chat_id);
+        }
+        if emit {
+            emit_effect(events, effect);
+        }
+    }
 }
 
 /// Owns the command sink into the current worker and the workers' done flags.
@@ -1024,14 +1040,7 @@ async fn apply_update(
                     .note_topic_bot(update.user.id, bot.has_topics);
                 let emit = live.linked();
                 for effect in effects {
-                    publish(
-                        events,
-                        emit,
-                        &mut live.older,
-                        &mut live.topics,
-                        &mut live.topic_lists,
-                        Some(effect),
-                    );
+                    live.publish(events, emit, Some(effect));
                 }
             }
             load_due_forum_topics(client_id, live, events).await;
@@ -1296,111 +1305,61 @@ async fn apply_chat_update(
     let emit = live.linked();
     match update {
         tdlib_rs::enums::Update::NewChat(update) => {
-            publish(
-                events,
-                emit,
-                &mut live.older,
-                &mut live.topics,
-                &mut live.topic_lists,
-                note_chat(&mut live.directory, &update.chat),
-            );
+            let effect = note_chat(&mut live.directory, &update.chat);
+            live.publish(events, emit, effect);
         }
         tdlib_rs::enums::Update::ChatTitle(update) => {
-            publish(
-                events,
-                emit,
-                &mut live.older,
-                &mut live.topics,
-                &mut live.topic_lists,
-                live.directory.set_title(update.chat_id, &update.title),
-            );
+            let effect = live.directory.set_title(update.chat_id, &update.title);
+            live.publish(events, emit, effect);
         }
         tdlib_rs::enums::Update::ChatPosition(update) => {
             if matches!(update.position.list, tdlib_rs::enums::ChatList::Main) {
-                publish(
-                    events,
-                    emit,
-                    &mut live.older,
-                    &mut live.topics,
-                    &mut live.topic_lists,
-                    live.directory
-                        .set_main_order(update.chat_id, update.position.order),
-                );
+                let effect = live
+                    .directory
+                    .set_main_order(update.chat_id, update.position.order);
+                live.publish(events, emit, effect);
             }
         }
         tdlib_rs::enums::Update::ChatNotificationSettings(update) => {
-            publish(
-                events,
-                emit,
-                &mut live.older,
-                &mut live.topics,
-                &mut live.topic_lists,
-                live.directory
-                    .set_mute(update.chat_id, chat_mute(&update.notification_settings)),
-            );
+            let effect = live
+                .directory
+                .set_mute(update.chat_id, chat_mute(&update.notification_settings));
+            live.publish(events, emit, effect);
         }
         tdlib_rs::enums::Update::ScopeNotificationSettings(update) => {
             let muted = update.notification_settings.mute_for > 0;
-            for effect in live
+            let effects = live
                 .directory
-                .set_scope_mute(mute_scope(&update.scope), muted)
-            {
-                publish(
-                    events,
-                    emit,
-                    &mut live.older,
-                    &mut live.topics,
-                    &mut live.topic_lists,
-                    Some(effect),
-                );
+                .set_scope_mute(mute_scope(&update.scope), muted);
+            for effect in effects {
+                live.publish(events, emit, Some(effect));
             }
         }
         tdlib_rs::enums::Update::ChatReadInbox(update) => {
-            publish(
-                events,
-                emit,
-                &mut live.older,
-                &mut live.topics,
-                &mut live.topic_lists,
-                live.directory
-                    .set_unread(update.chat_id, update.unread_count),
-            );
+            let effect = live
+                .directory
+                .set_unread(update.chat_id, update.unread_count);
+            live.publish(events, emit, effect);
         }
         tdlib_rs::enums::Update::ChatLastMessage(update) => {
             // `positions` is the full list. No Main entry means the chat left
             // the main list (for example it was archived).
-            publish(
-                events,
-                emit,
-                &mut live.older,
-                &mut live.topics,
-                &mut live.topic_lists,
-                live.directory
-                    .set_main_position(update.chat_id, main_order(&update.positions)),
-            );
+            let effect = live
+                .directory
+                .set_main_position(update.chat_id, main_order(&update.positions));
+            live.publish(events, emit, effect);
             if let Some(message) = update.last_message.as_ref() {
                 let preview = message_body(&message.content);
-                publish(
-                    events,
-                    emit,
-                    &mut live.older,
-                    &mut live.topics,
-                    &mut live.topic_lists,
+                let effect =
                     live.directory
-                        .set_preview(update.chat_id, &preview, i64::from(message.date)),
-                );
+                        .set_preview(update.chat_id, &preview, i64::from(message.date));
+                live.publish(events, emit, effect);
                 if emit {
                     emit_mapped_message(events, message, live, None);
                 }
             } else {
-                publish(
-                    events,
-                    emit,
-                    &mut live.older,
-                    &mut live.topics,
-                    &mut live.topic_lists,
-                    live.directory.set_preview(update.chat_id, "", 0),
-                );
+                let effect = live.directory.set_preview(update.chat_id, "", 0);
+                live.publish(events, emit, effect);
             }
         }
         tdlib_rs::enums::Update::NewMessage(update) => {
@@ -1420,14 +1379,8 @@ async fn apply_chat_update(
                 }
                 emit_mapped_message_as(events, &update.message, live, None, Arrival::Live);
             }
-            publish(
-                events,
-                emit,
-                &mut live.older,
-                &mut live.topics,
-                &mut live.topic_lists,
-                live.directory.set_preview(chat_id, &preview, at),
-            );
+            let effect = live.directory.set_preview(chat_id, &preview, at);
+            live.publish(events, emit, effect);
         }
         tdlib_rs::enums::Update::MessageSendSucceeded(update) => {
             if emit {
@@ -1491,15 +1444,10 @@ async fn apply_chat_update(
             );
         }
         tdlib_rs::enums::Update::ChatViewAsTopics(update) => {
-            publish(
-                events,
-                emit,
-                &mut live.older,
-                &mut live.topics,
-                &mut live.topic_lists,
-                live.directory
-                    .set_view_as_topics(update.chat_id, update.view_as_topics),
-            );
+            let effect = live
+                .directory
+                .set_view_as_topics(update.chat_id, update.view_as_topics);
+            live.publish(events, emit, effect);
         }
         tdlib_rs::enums::Update::ForumTopicInfo(update) => {
             let key = (update.info.chat_id, update.info.forum_topic_id);
@@ -1547,28 +1495,6 @@ async fn apply_chat_update(
             }
         }
         _ => {}
-    }
-}
-
-fn publish(
-    events: &EventTx,
-    emit: bool,
-    older: &mut OlderHistory,
-    topics: &mut HashMap<(i64, i32), ChatTopic>,
-    topic_lists: &mut HashSet<i64>,
-    effect: Option<ChatEffect>,
-) {
-    // A chat that leaves the list drops its paging state too, even before
-    // Ready (PR #52 review). Its cached topics go with it: the core drops
-    // those rows, and the next message has to fetch them again.
-    older.follow(effect.as_ref());
-    if let Some(ChatEffect::Remove(id)) = effect.as_ref()
-        && let Some(chat_id) = inbox::parse_telegram_chat_id(id)
-    {
-        inbox::forget_chat_topics(topics, topic_lists, chat_id);
-    }
-    if emit {
-        emit_effect(events, effect);
     }
 }
 

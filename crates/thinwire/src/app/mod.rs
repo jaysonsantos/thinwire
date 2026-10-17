@@ -53,7 +53,9 @@ const _: () =
 const WATCHDOG_EXIT_CODE: i32 = 0;
 /// Idle repaint step (10 Hz). The change signal wakes the window at once for
 /// core changes. This timer covers what the core does not see: the OS
-/// light/dark switch in System mode (ADR 0005) and the close deadline.
+/// light/dark switch in System mode (ADR 0005), the close deadline, and a
+/// forum notice that still waits for its topic row. `logic` calls `pump` on
+/// each frame. That call ends the notice wait (`HELD_TOPIC_NOTICE_WAIT`).
 const IDLE_REPAINT: Duration = Duration::from_millis(100);
 
 /// What to do on a stop signal (SIGTERM, SIGINT, or Ctrl+C).

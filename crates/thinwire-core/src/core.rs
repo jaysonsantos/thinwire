@@ -45,7 +45,10 @@ const HELD_TOPIC_NOTICE_CAP: usize = 32;
 const HELD_TOPIC_NOTICE_COUNT: u32 = 99;
 /// How long a live forum message waits for its topic row. A later `pump`
 /// then notifies with the group title. A row that arrives first still
-/// decides the mute and the name.
+/// decides the mute and the name. The desktop window calls `pump` from
+/// `ThinwireApp::logic` and schedules the next frame with `IDLE_REPAINT`
+/// (100 ms) in `crates/thinwire/src/app/mod.rs`. A quiet app releases the
+/// hold on that timer.
 const HELD_TOPIC_NOTICE_WAIT: Duration = Duration::from_secs(4);
 
 /// Start-up input for [`Core::new`].
@@ -469,6 +472,10 @@ impl Core {
                 // notification per topic (the key includes the topic) and
                 // adds one to its count on each call. A second topic of the
                 // same chat is a different notification.
+                //
+                // A topic row that arrives after this wait does not change
+                // the title. The notice already shows the group title. That
+                // is intended.
                 for _ in 0..held.earlier.saturating_add(1) {
                     self.notify_with_topic(&message);
                 }
@@ -2117,6 +2124,29 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, NotifyCommand::Dismiss(_))),
             "the group-title fallback stays on screen: {shown:?}"
+        );
+
+        // The row can arrive after the fallback. The shown title stays.
+        pump(
+            &mut core,
+            vec![AdapterEvent::TopicUpsert {
+                topic: ChatTopic {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id: "telegram:9".into(),
+                    topic: MessageTopic::Forum(2),
+                    name: "Trail".into(),
+                    unread: 1,
+                    last_at: 2,
+                    general: false,
+                    hidden: false,
+                    closed: false,
+                    muted: false,
+                },
+            }],
+        );
+        assert!(
+            core.take_notify().is_empty(),
+            "a row after the wait keeps the group title"
         );
 
         // The wait has passed, but the row is in this pump. The mute wins.
