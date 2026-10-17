@@ -56,7 +56,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
 [dev-dependencies]
 # A zone with daylight saving time for the layout tests (#122).
 chrono-tz = "0.10"
-egui_kittest = { version = "0.36", default-features = false }
+egui_kittest = { version = "0.37", default-features = false }
 thinwire-core = { workspace = true, features = ["test-support"] }
 
 [lints]
