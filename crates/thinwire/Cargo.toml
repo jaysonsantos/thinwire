@@ -42,15 +42,33 @@ tracing-subscriber.workspace = true
 # QR for the Signal provisioning URI. Feature `signal-local` only.
 qrcode = { version = "0.14", optional = true, default-features = false }
 
+# Linux: the settings portal reports reduce-motion and sends SettingChanged.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = [
+  "async-io",
+  "blocking-api",
+] }
+
+# Windows: "Show animations" and its change event. Same windows-rs as
+# thinwire-notify. WinRT only: the workspace forbids unsafe.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Foundation",
+  "UI_ViewManagement",
+] }
+
 # The Dock icon goes while the app closes in the background. Same versions
 # as eframe's AppKit bindings in Cargo.lock: no second copy.
+# Reduce Motion is NSWorkspace, behind the NSAccessibility feature.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "std",
+  "NSAccessibility",
   "NSApplication",
   "NSResponder",
   "NSRunningApplication",
+  "NSWorkspace",
 ] }
 
 [dev-dependencies]

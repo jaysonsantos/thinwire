@@ -5,6 +5,7 @@ mod dock;
 #[cfg(test)]
 mod inbox_keys;
 mod motion;
+mod reduce_motion;
 #[cfg(feature = "signal-local")]
 mod signal_gate;
 pub mod startup;
@@ -53,7 +54,8 @@ const _: () =
 const WATCHDOG_EXIT_CODE: i32 = 0;
 /// Idle repaint step (10 Hz). The change signal wakes the window at once for
 /// core changes. This timer covers what the core does not see: the OS
-/// light/dark switch in System mode (ADR 0005) and the close deadline.
+/// light/dark switch in System mode (ADR 0005), the OS reduce-motion
+/// setting on macOS and Windows, and the close deadline.
 const IDLE_REPAINT: Duration = Duration::from_millis(100);
 
 /// What to do on a stop signal (SIGTERM, SIGINT, or Ctrl+C).

@@ -218,10 +218,14 @@ fn more_menu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
 
 /// Side of the busy spinner in the top bar.
 const BUSY_SPINNER: f32 = 14.0;
+/// Still label in place of the busy spinner when the OS asks for less motion.
+const WORKING: &str = "Working…";
 
 /// A running load or send, left of the menu. It takes no row of its own, so
-/// the inbox and the thread do not move down and up for each send. The
-/// spinner marks it as busy; a finished line or a failure stays on the strip.
+/// the inbox and the thread do not move down and up for each send.
+/// Motion on: the busy line and a spinner.
+/// OS reduce-motion: the still label [`WORKING`].
+/// A finished line or a failure stays on the strip.
 fn busy_indicator(ui: &mut egui::Ui, line: Option<&str>) {
     let id = ui.id().with("busy-line");
     let text = match line {
@@ -236,6 +240,21 @@ fn busy_indicator(ui: &mut egui::Ui, line: Option<&str>) {
     };
     let shown = motion::toggle(ui.ctx(), id, line.is_some(), motion::FADE);
     if shown <= 0.0 || text.is_empty() {
+        return;
+    }
+    if !motion::enabled(ui.ctx()) {
+        ui.scope(|ui| {
+            ui.multiply_opacity(shown);
+            let palette = theme::palette(ui);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(WORKING)
+                        .text_style(theme::secondary())
+                        .color(palette.text2),
+                )
+                .truncate(),
+            );
+        });
         return;
     }
     ui.scope(|ui| {
@@ -3022,5 +3041,80 @@ mod tests {
         assert!(first.contains("first-run-card-height"));
         assert!(first.contains("spare / 2.0"));
         assert!(!first.contains("0.18"));
+    }
+
+    /// #247: OS reduce-motion sets `animation_time` to 0 and the busy
+    /// indicator is the still "Working…" text.
+    #[test]
+    fn with_reduce_motion_the_busy_indicator_is_still_working_text() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{By, Queryable};
+
+        use super::{WORKING, busy_indicator};
+        use crate::app::{motion, theme};
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 48.0))
+            .build_ui(|ui| {
+                // `install` lands on the next pass. This pass can return
+                // before the new text styles exist.
+                theme::install(ui.ctx());
+                motion::apply(ui.ctx(), true);
+                if !ui.style().text_styles.contains_key(&theme::secondary()) {
+                    return;
+                }
+                busy_indicator(ui, Some("Sending…"));
+            });
+        harness.run_steps(3);
+        assert_eq!(
+            harness.ctx.global_style().animation_time,
+            0.0,
+            "reduce-motion sets animation_time to 0"
+        );
+        harness.get_by_label(WORKING);
+        assert!(
+            harness
+                .query_all(By::new().role(Role::ProgressIndicator))
+                .next()
+                .is_none(),
+            "the busy indicator has no spinner"
+        );
+        assert!(
+            harness.query_by_label("Sending…").is_none(),
+            "the still label replaces the busy line and the spinner"
+        );
+    }
+
+    #[test]
+    fn with_motion_the_busy_indicator_keeps_the_line_and_a_spinner() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{By, Queryable};
+
+        use super::WORKING;
+        use crate::app::{motion, theme};
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(480.0, 48.0))
+            .build_ui(|ui| {
+                theme::install(ui.ctx());
+                motion::apply(ui.ctx(), false);
+                if !ui.style().text_styles.contains_key(&theme::secondary()) {
+                    return;
+                }
+                super::busy_indicator(ui, Some("Sending…"));
+            });
+        // A spinner keeps requesting frames.
+        harness.run_steps(3);
+        assert!(harness.ctx.global_style().animation_time > 0.0);
+        harness.get_by_label("Sending…");
+        assert!(harness.query_by_label(WORKING).is_none());
+        assert!(
+            harness
+                .query_all(By::new().role(Role::ProgressIndicator))
+                .next()
+                .is_some()
+        );
     }
 }

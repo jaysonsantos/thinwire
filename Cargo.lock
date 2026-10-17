@@ -6774,7 +6774,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "winit",
+ "zbus",
 ]
 
 [[package]]
