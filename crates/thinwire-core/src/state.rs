@@ -3568,6 +3568,15 @@ impl Snapshot {
         self.history_loading.retain(|(owner, _)| *owner != protocol);
         self.chat_list_loading.remove(&protocol);
         self.list_on_link.remove(&protocol);
+        // A download in flight dies with the session. Forget it, and drop a
+        // queued one, so the next sign-in can request that file again.
+        self.photo_downloads.retain(|(owner, _)| *owner != protocol);
+        self.pending.retain(|command| {
+            !matches!(
+                command,
+                AdapterCommand::DownloadFile { protocol: owner, .. } if *owner == protocol
+            )
+        });
         self.notices.remove(&protocol);
         self.sends.drop_protocol(protocol);
         // Its timed-out sends leave the timeout error too (#90).
@@ -3966,7 +3975,8 @@ impl Snapshot {
     }
 
     /// Download one photo that is on screen. A second request while the first
-    /// is in flight does nothing. `PhotoFailed` lets a later request try again.
+    /// is in flight does nothing. `PhotoFailed`, or the session ending, lets
+    /// a later request try again.
     pub(crate) fn load_photo(
         &mut self,
         protocol: ProtocolId,
@@ -5390,6 +5400,144 @@ mod tests {
             file_id: 7,
         });
         snapshot.load_photo(ProtocolId::Telegram, chat, id, 7);
+        assert_eq!(downloads(&snapshot.take_commands()), 1);
+    }
+
+    #[test]
+    fn ending_the_session_lets_a_photo_download_start_again() {
+        use thinwire_protocol::{MessagePhoto, PhotoSize};
+
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:1".into(),
+                title: "Ada".into(),
+                participant: "Ada".into(),
+                preview: String::new(),
+                unread: 0,
+                order: 1,
+                last_at: 1,
+                is_group: false,
+                writable: true,
+                placeholder: false,
+                muted: false,
+                has_topics: false,
+            },
+        });
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        let mut message = telegram_text(1, 2, "");
+        message.photo = Some(MessagePhoto {
+            width: 100,
+            height: 80,
+            mini: None,
+            sizes: vec![PhotoSize {
+                width: 100,
+                height: 80,
+                file_id: Some(7),
+                path: None,
+                bytes: None,
+            }],
+            has_spoiler: false,
+            is_secret: false,
+            failed: false,
+        });
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        snapshot.load_photo(ProtocolId::Telegram, "telegram:1", "telegram:1:2", 7);
+        snapshot.queue(AdapterCommand::DownloadFile {
+            protocol: ProtocolId::Slack,
+            file_id: 3,
+            secret: false,
+        });
+        snapshot.photo_downloads.insert((ProtocolId::Slack, 3));
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Unlinked,
+        });
+        assert!(
+            !snapshot
+                .photo_downloads
+                .contains(&(ProtocolId::Telegram, 7)),
+            "the cancelled Telegram download is still pending"
+        );
+        assert!(
+            snapshot.photo_downloads.contains(&(ProtocolId::Slack, 3)),
+            "ending Telegram cleared a Slack download"
+        );
+        assert!(snapshot.pending.iter().any(|command| matches!(
+            command,
+            AdapterCommand::DownloadFile {
+                protocol: ProtocolId::Slack,
+                file_id: 3,
+                ..
+            }
+        )));
+        assert!(
+            !snapshot.pending.iter().any(|command| matches!(
+                command,
+                AdapterCommand::DownloadFile {
+                    protocol: ProtocolId::Telegram,
+                    ..
+                }
+            )),
+            "a queued Telegram download survived the session end"
+        );
+        snapshot.take_commands();
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:1".into(),
+                title: "Ada".into(),
+                participant: "Ada".into(),
+                preview: String::new(),
+                unread: 0,
+                order: 1,
+                last_at: 1,
+                is_group: false,
+                writable: true,
+                placeholder: false,
+                muted: false,
+                has_topics: false,
+            },
+        });
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        let mut again = telegram_text(1, 2, "");
+        again.photo = Some(MessagePhoto {
+            width: 100,
+            height: 80,
+            mini: None,
+            sizes: vec![PhotoSize {
+                width: 100,
+                height: 80,
+                file_id: Some(7),
+                path: None,
+                bytes: None,
+            }],
+            has_spoiler: false,
+            is_secret: false,
+            failed: false,
+        });
+        snapshot.apply(AdapterEvent::MessageReceived { message: again });
+        snapshot.load_photo(ProtocolId::Telegram, "telegram:1", "telegram:1:2", 7);
+        let downloads = |commands: &[AdapterCommand]| {
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(command, AdapterCommand::DownloadFile { file_id: 7, .. })
+                })
+                .count()
+        };
         assert_eq!(downloads(&snapshot.take_commands()), 1);
     }
 
