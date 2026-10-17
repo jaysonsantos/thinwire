@@ -5,6 +5,7 @@ use eframe::egui::{self, RichText};
 
 use thinwire_protocol::{TelegramAuthError, TelegramCodeVia};
 
+use super::motion;
 use super::theme::{self, space};
 use super::ui::edited;
 pub(crate) use thinwire_core::state::stub_banner;
@@ -328,7 +329,7 @@ fn continue_button(ui: &mut egui::Ui, snapshot: &Snapshot, label: &str, out: &mu
                     "Waiting for Telegram…"
                 };
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    motion::spinner(ui);
                     ui.label(
                         RichText::new(text)
                             .text_style(theme::secondary())
@@ -400,7 +401,7 @@ mod tests {
             .find("Connecting to Telegram…")
             .expect("connecting text");
         let waiting = button.find("Waiting for Telegram…").expect("waiting text");
-        let spinner = button.find("ui.spinner()").expect("spinner");
+        let spinner = button.find("motion::spinner(").expect("spinner");
         let early_return = button.find("return;").expect("busy returns");
         let label = button.find("RichText::new(label)").expect("idle label");
         assert!(busy < connecting && connecting < waiting);

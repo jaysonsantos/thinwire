@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use thinwire_core::instance::{InstanceLock, LockError, RETRY_STEP};
 
-use super::{SHUTDOWN_TIMEOUT, Settings, ThinwireApp, WATCHDOG_LOCK_HOLD, theme};
+use super::{
+    SHUTDOWN_TIMEOUT, Settings, ThinwireApp, WATCHDOG_LOCK_HOLD, motion, reduce_motion, theme,
+};
 
 /// Slack past the old process's worst-case exit. Covers the time from the
 /// user launching this process until the wait starts, and the OS dropping
@@ -165,19 +167,30 @@ pub struct Shell {
     stage: Stage,
     /// Used once, when the main window starts.
     settings: Option<Settings>,
+    /// OS reduce-motion. One watch for the whole window (#247).
+    os_motion: reduce_motion::OsReduceMotion,
+    /// Last value applied to egui, so a change repaints at once.
+    last_reduce_motion: Option<bool>,
 }
 
 impl Shell {
     #[must_use]
     pub fn new(startup: Startup, settings: Settings, ctx: &egui::Context) -> Self {
+        let os_motion = reduce_motion::OsReduceMotion::start(ctx.clone());
+        let mut last_reduce_motion = None;
+        motion::follow(ctx, &mut last_reduce_motion, os_motion.reduced());
         match startup {
             Startup::Ready => Self {
                 stage: Stage::Running(Box::new(ThinwireApp::new(settings, ctx))),
                 settings: None,
+                os_motion,
+                last_reduce_motion,
             },
             Startup::Waiting { path, deadline } => Self {
                 stage: Stage::Waiting(Wait::spawn(path, deadline, ctx)),
                 settings: Some(settings),
+                os_motion,
+                last_reduce_motion,
             },
         }
     }
@@ -234,6 +247,9 @@ impl Shell {
 
 impl eframe::App for Shell {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if motion::follow(ctx, &mut self.last_reduce_motion, self.os_motion.reduced()) {
+            ctx.request_repaint();
+        }
         if let Stage::Running(app) = &mut self.stage {
             app.logic(ctx, frame);
             return;
@@ -274,7 +290,7 @@ pub(crate) fn waiting(ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(48.0);
-            ui.spinner();
+            motion::spinner(ui);
             ui.add_space(12.0);
             ui.heading(CLOSING_NOTE);
             ui.add_space(4.0);
@@ -391,6 +407,21 @@ mod tests {
         assert!(
             !waiting.contains("ThinwireApp::new"),
             "no core while another copy holds the lock"
+        );
+    }
+
+    /// #247: every frame reads the OS reduce-motion value, including while
+    /// the startup window is the only window.
+    #[test]
+    fn the_shell_applies_os_reduce_motion_on_each_frame() {
+        let shell = include_str!("startup.rs");
+        let logic = &shell[shell.find("fn logic(").expect("logic")..];
+        let logic = &logic[..logic.find("\n    fn ui(").expect("ui")];
+        let follow = logic.find("motion::follow(").expect("follow");
+        let running = logic.find("Stage::Running").expect("running");
+        assert!(
+            follow < running,
+            "reduce-motion is applied before the main window draws"
         );
     }
 
