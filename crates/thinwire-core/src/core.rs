@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use thinwire_protocol::WhatsAppPhoneVault as PhoneVault;
 use thinwire_protocol::{
     AdapterCommand, AdapterEvent, AdapterHost, Arrival, ChatMessage, DiscordAdapter,
-    DiscordSecretVault, HostSender, ProtocolAdapter, ProtocolId, SlackAdapter, SlackSecretVault,
-    TelegramSecretVault, WhatsAppPhoneVault, catalog,
+    DiscordSecretVault, HostSender, MessageTopic, ProtocolAdapter, ProtocolId, SlackAdapter,
+    SlackSecretVault, TelegramSecretVault, WhatsAppPhoneVault, catalog,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -38,6 +38,11 @@ const STOP_POLL: Duration = Duration::from_millis(50);
 const CLOSING_STATUS: &str = "Closing…";
 /// First status line. The keychain backend does not change it.
 const SECRET_STORE_STATUS_PREFIX: &str = "Sign in with Telegram to get started.";
+/// Live forum messages kept until their topic row arrives. One entry is one
+/// topic. A topic that never arrives must not keep message text.
+const HELD_TOPIC_NOTICE_CAP: usize = 32;
+/// Most live messages remembered for one topic while its row is missing.
+const HELD_TOPIC_NOTICE_COUNT: u32 = 99;
 
 /// Start-up input for [`Core::new`].
 #[derive(Debug, Clone)]
@@ -116,6 +121,16 @@ pub struct Core {
     send_wake: Option<(Instant, tokio::task::JoinHandle<()>)>,
     /// Desktop notification rules and queue (#32).
     notify: Notifications,
+    /// Live forum messages whose topic row is not in state yet. The row has
+    /// the mute and the name, and it can arrive after the message.
+    held_topic_notices: Vec<HeldTopicNotice>,
+}
+
+/// One forum topic's latest live message, kept until that topic's row arrives.
+struct HeldTopicNotice {
+    message: ChatMessage,
+    /// Live messages of this topic before `message`.
+    earlier: u32,
 }
 
 /// While the app closes, a send answer is logged: a failure as a warning.
@@ -252,6 +267,7 @@ impl Core {
             closing: false,
             send_wake: None,
             notify: Notifications::new(),
+            held_topic_notices: Vec::new(),
         }
     }
 
@@ -320,12 +336,16 @@ impl Core {
                 if let Some(message) = live {
                     self.notify_message(&message);
                 }
+                // A topic row in this batch can free a message that arrived
+                // earlier, still inside this pump, before sync runs.
+                self.release_held_topic_notices();
                 applied = true;
             }
         }
         for protocol in self.state.take_ended_accounts() {
             // The next account must not get these mutes (#153 review).
             self.settings.forget_chat_mutes(protocol);
+            self.drop_held_topic_notices(protocol);
         }
         // Only after the queued answers: a late accept that was queued in
         // time still finds its send (#90 item 3).
@@ -352,6 +372,100 @@ impl Core {
     }
 
     fn notify_message(&mut self, message: &ChatMessage) {
+        // A forum topic's mute and name live on its row. That row is empty
+        // until it is loaded, including when the forum was never opened.
+        // Notifying now would use the bare group title and miss a mute.
+        if self.topic_row_pending(message) {
+            self.hold_topic_notice(message.clone());
+            return;
+        }
+        self.notify_with_topic(message);
+    }
+
+    /// A live forum message whose chat is listed and whose topic row is not.
+    fn topic_row_pending(&self, message: &ChatMessage) -> bool {
+        if message.arrival != Arrival::Live || message.outbound {
+            return false;
+        }
+        let Some(topic @ MessageTopic::Forum(_)) = message.topic else {
+            return false;
+        };
+        self.state
+            .conversation(message.protocol, &message.conversation_id)
+            .is_some()
+            && self
+                .state
+                .topic(message.protocol, &message.conversation_id, topic)
+                .is_none()
+    }
+
+    fn hold_topic_notice(&mut self, message: ChatMessage) {
+        let Some(topic) = message.topic else {
+            return;
+        };
+        if let Some(held) = self.held_topic_notices.iter_mut().find(|held| {
+            held.message.protocol == message.protocol
+                && held.message.conversation_id == message.conversation_id
+                && held.message.topic == Some(topic)
+        }) {
+            held.message = message;
+            held.earlier = held
+                .earlier
+                .saturating_add(1)
+                .min(HELD_TOPIC_NOTICE_COUNT - 1);
+            return;
+        }
+        if self.held_topic_notices.len() >= HELD_TOPIC_NOTICE_CAP {
+            self.held_topic_notices.remove(0);
+        }
+        self.held_topic_notices.push(HeldTopicNotice {
+            message,
+            earlier: 0,
+        });
+    }
+
+    /// Notify held forum messages whose topic row is now known. Drop a hold
+    /// whose chat or session is gone: there is nothing left to title.
+    fn release_held_topic_notices(&mut self) {
+        let pending = std::mem::take(&mut self.held_topic_notices);
+        let mut keep = Vec::new();
+        for held in pending {
+            let message = held.message;
+            let Some(topic) = message.topic else {
+                continue;
+            };
+            if !self.state.has_session(message.protocol)
+                || self
+                    .state
+                    .conversation(message.protocol, &message.conversation_id)
+                    .is_none()
+            {
+                continue;
+            }
+            if self
+                .state
+                .topic(message.protocol, &message.conversation_id, topic)
+                .is_some()
+            {
+                for _ in 0..held.earlier.saturating_add(1) {
+                    self.notify_with_topic(&message);
+                }
+            } else {
+                keep.push(HeldTopicNotice {
+                    message,
+                    earlier: held.earlier,
+                });
+            }
+        }
+        self.held_topic_notices = keep;
+    }
+
+    fn drop_held_topic_notices(&mut self, protocol: ProtocolId) {
+        self.held_topic_notices
+            .retain(|held| held.message.protocol != protocol);
+    }
+
+    fn notify_with_topic(&mut self, message: &ChatMessage) {
         let topic_name = message.topic.and_then(|topic| {
             self.state
                 .topic(message.protocol, &message.conversation_id, topic)
@@ -1760,6 +1874,309 @@ mod tests {
         };
         core.dispatch(Intent::OpenFromNotification(known));
         assert_eq!(core.view().selected_topic, Some(MessageTopic::Forum(2)));
+    }
+
+    /// A topic muted in Telegram does not notify, and an open topic is named
+    /// in the title, even when that forum was never opened. The topic row can
+    /// arrive before the message or after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_muted_topic_does_not_notify_before_its_forum_is_opened() {
+        use crate::notify::NotifyCommand;
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+        use thinwire_protocol::{ChatTopic, Delivery, MessageTopic};
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let mut camp = telegram_chat(9, "Camp forum", 30);
+        camp.has_topics = true;
+        camp.is_group = true;
+        core.state
+            .apply(AdapterEvent::ConversationUpsert { conversation: camp });
+        assert_ne!(
+            core.view().selected_conversation.as_deref(),
+            Some("telegram:9"),
+            "the forum stays closed"
+        );
+        let (queue, events) = unbounded_channel();
+        core.events = events;
+        let topic = |id, name: &str, muted: bool| ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: MessageTopic::Forum(id),
+            name: name.into(),
+            unread: 1,
+            last_at: id,
+            general: false,
+            hidden: false,
+            closed: false,
+            muted,
+        };
+        let live = |id: i64, topic_id: i64| ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            id: format!("telegram:9:{id}"),
+            sender: "Ada".into(),
+            body: "hello".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: unix_now(),
+            arrival: Arrival::Live,
+            topic: Some(MessageTopic::Forum(topic_id)),
+        };
+        let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
+            for event in events {
+                queue.send(event).expect("queue");
+            }
+            core.pump();
+        };
+
+        // The worker's order: the topic row, then the live message.
+        pump(
+            &mut core,
+            vec![
+                AdapterEvent::TopicUpsert {
+                    topic: topic(3, "Quiet", true),
+                },
+                AdapterEvent::MessageReceived {
+                    message: live(1, 3),
+                },
+            ],
+        );
+        assert!(
+            core.take_notify().is_empty(),
+            "a muted topic does not notify"
+        );
+
+        // The message can be applied before the row. It waits.
+        pump(
+            &mut core,
+            vec![AdapterEvent::MessageReceived {
+                message: live(2, 4),
+            }],
+        );
+        assert!(
+            core.take_notify().is_empty(),
+            "no notification before the topic row"
+        );
+        pump(
+            &mut core,
+            vec![AdapterEvent::TopicUpsert {
+                topic: topic(4, "Archive", true),
+            }],
+        );
+        assert!(
+            core.take_notify().is_empty(),
+            "a late muted row does not notify"
+        );
+
+        pump(
+            &mut core,
+            vec![
+                AdapterEvent::MessageReceived {
+                    message: live(3, 2),
+                },
+                AdapterEvent::MessageReceived {
+                    message: live(4, 2),
+                },
+            ],
+        );
+        assert!(core.take_notify().is_empty());
+        pump(
+            &mut core,
+            vec![AdapterEvent::TopicUpsert {
+                topic: topic(2, "Trail", false),
+            }],
+        );
+        let shown = core.take_notify();
+        assert!(
+            matches!(
+                &shown[..],
+                [NotifyCommand::Show(note)]
+                    if note.title == "Camp forum › Trail" && note.count == 2
+            ),
+            "{shown:?}"
+        );
+        assert_ne!(
+            core.view().selected_conversation.as_deref(),
+            Some("telegram:9"),
+            "notifying does not open the forum"
+        );
+    }
+
+    /// Muting one topic removes its unread from the sidebar badge and the
+    /// account chip. The other topics stay.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn muting_one_topic_drops_it_from_the_sidebar_badge() {
+        use crate::mutes::ChatMute;
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+        use thinwire_protocol::{ChatTopic, MessageTopic, topic_mute_id};
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let mut camp = telegram_chat(9, "Camp forum", 30);
+        camp.has_topics = true;
+        camp.unread = 30;
+        core.state
+            .apply(AdapterEvent::ConversationUpsert { conversation: camp });
+        let row = |id, name: &str, unread: u32, muted: bool| ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: MessageTopic::Forum(id),
+            name: name.into(),
+            unread,
+            last_at: id,
+            general: id == 1,
+            hidden: false,
+            closed: false,
+            muted,
+        };
+        for topic in [
+            row(1, "General", 1, false),
+            row(2, "Trail", 2, false),
+            row(3, "Food", 4, false),
+            row(4, "Archive", 7, true),
+        ] {
+            core.state.apply(AdapterEvent::TopicUpsert { topic });
+        }
+        let badges = |core: &Core| {
+            let view = core.view();
+            let camp = view
+                .conversation(ProtocolId::Telegram, "telegram:9")
+                .expect("camp")
+                .clone();
+            (
+                view.display_unread(&camp),
+                view.account_unread(ProtocolId::Telegram),
+            )
+        };
+        // General 1 + Trail 2 + Food 4. Archive is muted in Telegram.
+        // The chat's own unread is not the badge.
+        assert_eq!(badges(&core), (7, 7));
+        core.dispatch(Intent::SetChatMute {
+            protocol: ProtocolId::Telegram,
+            conversation_id: topic_mute_id("telegram:9", MessageTopic::Forum(3)),
+            muted: true,
+        });
+        assert_eq!(badges(&core), (3, 3), "Food leaves the badge");
+        {
+            let view = core.view();
+            let food = view
+                .topic(ProtocolId::Telegram, "telegram:9", MessageTopic::Forum(3))
+                .expect("food");
+            assert_eq!(view.topic_mute(food), ChatMute::Here);
+            let trail = view
+                .topic(ProtocolId::Telegram, "telegram:9", MessageTopic::Forum(2))
+                .expect("trail");
+            assert_eq!(view.topic_mute(trail), ChatMute::None);
+            let archive = view
+                .topic(ProtocolId::Telegram, "telegram:9", MessageTopic::Forum(4))
+                .expect("archive");
+            assert_eq!(view.topic_mute(archive), ChatMute::Protocol);
+        }
+        core.dispatch(Intent::SetChatMute {
+            protocol: ProtocolId::Telegram,
+            conversation_id: topic_mute_id("telegram:9", MessageTopic::Forum(3)),
+            muted: false,
+        });
+        assert_eq!(badges(&core), (7, 7), "unmuting Food puts it back");
+    }
+
+    /// Escape leaves the open topic and shows its topic list. The draft
+    /// stays with that topic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escape_returns_to_the_topic_list_and_keeps_the_topic_draft() {
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+        use thinwire_protocol::{ChatTopic, MessageTopic};
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let mut camp = telegram_chat(9, "Camp forum", 30);
+        camp.has_topics = true;
+        core.state
+            .apply(AdapterEvent::ConversationUpsert { conversation: camp });
+        let trail = MessageTopic::Forum(2);
+        core.state.apply(AdapterEvent::TopicUpsert {
+            topic: ChatTopic {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:9".into(),
+                topic: trail,
+                name: "Trail".into(),
+                unread: 0,
+                last_at: 1,
+                general: false,
+                hidden: false,
+                closed: false,
+                muted: false,
+            },
+        });
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:9".into(),
+        });
+        core.dispatch(Intent::SelectTopic {
+            conversation_id: "telegram:9".into(),
+            topic: trail,
+        });
+        assert_eq!(
+            core.view().open_topic().map(|topic| topic.name.as_str()),
+            Some("Trail")
+        );
+        core.dispatch(Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: Some(trail),
+            text: "bring water".into(),
+        });
+        assert_eq!(core.view().compose, "bring water");
+        core.dispatch(Intent::Key(crate::AuthKey::Escape));
+        assert!(core.view().showing_topic_list());
+        assert!(core.view().selected_topic.is_none());
+        assert_eq!(core.view().compose, "");
+        core.dispatch(Intent::SelectTopic {
+            conversation_id: "telegram:9".into(),
+            topic: trail,
+        });
+        assert_eq!(core.view().compose, "bring water");
+        assert_eq!(core.view().selected_topic, Some(trail));
+    }
+
+    /// A notification for a topic opens the forum when that forum's topics
+    /// have not been loaded. The click does not invent a topic row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_notification_click_opens_a_forum_whose_topics_are_not_loaded() {
+        use crate::notify::NotifyKey;
+        use crate::state::test_support::{ready_with_chats, telegram_chat};
+        use thinwire_protocol::MessageTopic;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let mut camp = telegram_chat(9, "Camp forum", 30);
+        camp.has_topics = true;
+        core.state
+            .apply(AdapterEvent::ConversationUpsert { conversation: camp });
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        assert_eq!(
+            core.view().selected_conversation.as_deref(),
+            Some("telegram:1")
+        );
+        core.dispatch(Intent::OpenFromNotification(NotifyKey {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: Some(MessageTopic::Forum(2)),
+        }));
+        assert_eq!(
+            core.view().selected_conversation.as_deref(),
+            Some("telegram:9")
+        );
+        assert!(core.view().selected_topic.is_none());
+        assert!(core.view().showing_topic_list());
+        assert!(
+            core.view()
+                .topic(ProtocolId::Telegram, "telegram:9", MessageTopic::Forum(2))
+                .is_none(),
+            "the click does not invent the topic"
+        );
     }
 
     /// #153: a chat muted in thinwire does not notify, and its shown

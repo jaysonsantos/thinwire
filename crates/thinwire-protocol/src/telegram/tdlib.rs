@@ -1376,7 +1376,8 @@ async fn apply_chat_update(
             let at = i64::from(update.message.date);
             if emit {
                 // A topic that is not loaded yet is fetched before the message,
-                // so a mute and the "Group › Topic" title are known.
+                // so a mute and the "Group › Topic" title are known. The core
+                // waits when that row is not applied yet.
                 if let Some(MessageTopic::Forum(id)) =
                     update.message.topic_id.as_ref().and_then(app_topic)
                     && let Ok(forum_topic_id) = i32::try_from(id)
