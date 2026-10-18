@@ -92,6 +92,7 @@ fn shoot(scenario: Scenario, theme: ThemeMode, size: [f32; 2]) {
         harness.run_steps(4);
     } else {
         harness.run();
+        settle_images(&mut harness);
     }
     harness.snapshot(&name);
     drop(harness);
@@ -105,6 +106,7 @@ fn pixels() -> Vec<u8> {
         .wgpu()
         .build_ui_state(draw, built);
     harness.run();
+    settle_images(&mut harness);
     let raw = harness.render().expect("snapshot frame").into_raw();
     drop(harness);
     drop(runtime);
@@ -217,6 +219,16 @@ fn waits_for_photo(scenario: Scenario) -> bool {
     )
 }
 
+/// A demo avatar is bytes already in memory. Step until egui has decoded it.
+fn settle_images(harness: &mut Harness<'_, Scene>) {
+    for _ in 0..12 {
+        if !harness.ctx.has_pending_images() {
+            return;
+        }
+        harness.step();
+    }
+}
+
 /// Blur and decode finish off the UI thread. Step until both are done.
 fn settle_photo(harness: &mut Harness<'_, Scene>) {
     for _ in 0..80 {
@@ -251,6 +263,7 @@ mod mute_menu {
             .wgpu()
             .build_ui_state(draw, built);
         harness.run();
+        settle_images(&mut harness);
         harness.snapshot(&name);
         drop(harness);
         drop(runtime);
@@ -302,6 +315,7 @@ mod jump_to_latest {
         harness.run_steps(12);
         harness.remove_cursor();
         harness.run();
+        settle_images(&mut harness);
         harness.get_by_role_and_label(Role::Button, "Jump to latest message");
         harness.snapshot(&name);
         drop(harness);
@@ -319,7 +333,8 @@ mod jump_to_latest {
     }
 }
 
-/// Header text, the account status dot, and inbox titles share one x.
+/// Header text, the account status dot, and the inbox avatar share one x.
+/// The chat title sits one [`theme::space::S`] past the avatar.
 /// The account unread badge sits inside the highlight by [`theme::ROW_INSET`].
 #[test]
 fn sidebar_content_lines_up_and_the_account_badge_clears_the_highlight() {
@@ -342,6 +357,9 @@ fn sidebar_content_lines_up_and_the_account_badge_clears_the_highlight() {
             .map(|node| node.rect())
             .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
             .expect("inbox title");
+        let avatar = harness
+            .get_by_role_and_label(Role::Label, "avatar Ada Park")
+            .rect();
         assert!(
             (header.min.x - dot.min.x).abs() < 0.5,
             "{theme:?} header {} dot {}",
@@ -349,10 +367,37 @@ fn sidebar_content_lines_up_and_the_account_badge_clears_the_highlight() {
             dot.min.x
         );
         assert!(
-            (dot.min.x - title.min.x).abs() < 0.5,
-            "{theme:?} dot {} title {}",
-            dot.min.x,
-            title.min.x
+            (header.min.x - avatar.min.x).abs() < 0.5,
+            "{theme:?} header {} avatar {}",
+            header.min.x,
+            avatar.min.x
+        );
+        assert!(
+            (avatar.width() - super::photos::AVATAR_SIDE).abs() < 0.5,
+            "{theme:?} avatar width {}",
+            avatar.width()
+        );
+        let gap = title.min.x - avatar.max.x;
+        assert!(
+            (gap - theme::space::S).abs() < 1.0,
+            "{theme:?} avatar-to-title gap {gap}"
+        );
+        let book = harness
+            .get_by_role_and_label(Role::Button, "Book club")
+            .rect();
+        let book_avatar = harness
+            .get_by_role_and_label(Role::Label, "avatar Book club")
+            .rect();
+        let book_badge = harness
+            .query_all(By::new().role(Role::Label).label("unread 2"))
+            .map(|node| node.rect())
+            .find(|rect| book.intersects(*rect))
+            .expect("book club unread badge");
+        assert!(
+            !book_badge.intersects(book_avatar),
+            "{theme:?} badge {:?} overlaps avatar {:?}",
+            book_badge,
+            book_avatar
         );
         assert!(
             (header.min.x - inbox_header.min.x).abs() < 0.5,

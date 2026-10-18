@@ -536,6 +536,7 @@ fn conversation_from_wire(protocol: ProtocolId, conversation: WireConversation) 
         placeholder: conversation.placeholder,
         muted: conversation.muted,
         has_topics: false,
+        avatar: Default::default(),
     }
 }
 
@@ -609,6 +610,7 @@ mod tests {
             placeholder: false,
             muted: true,
             has_topics: false,
+            avatar: Default::default(),
         }
     }
 

@@ -576,7 +576,7 @@ fn slack_linked() -> DemoScript {
 }
 
 fn inbox_rows() -> Vec<Conversation> {
-    vec![
+    let mut rows = vec![
         row(
             ProtocolId::Telegram,
             ADA,
@@ -602,7 +602,23 @@ fn inbox_rows() -> Vec<Conversation> {
             1,
             false,
         ),
-    ]
+    ];
+    // Ada is the open chat in the long-chat scenes: initials, selected.
+    // Milo carries a still photo. Book club and Nora stay initials.
+    for row in &mut rows {
+        row.avatar.accent = match row.id.as_str() {
+            ADA => 2,
+            BOOK_CLUB => 3,
+            MILO => 1,
+            NORA => 6,
+            _ => 0,
+        };
+        if row.id == MILO {
+            row.avatar.file_id = Some(42);
+            row.avatar.bytes = Some(ImageBytes::new(AVATAR_PNG.to_vec()));
+        }
+    }
+    rows
 }
 
 /// The inbox with unread counts on two muted chats: Milo (muted in thinwire
@@ -701,6 +717,7 @@ fn row(
         muted: false,
         placeholder: false,
         has_topics: false,
+        avatar: Default::default(),
     }
 }
 
@@ -726,6 +743,7 @@ fn message(chat: &str, index: usize, sender: &str, body: &str, sent_at: i64) -> 
     }
 }
 
+const AVATAR_PNG: &[u8] = include_bytes!("../assets/avatar-milo.png");
 const TALL_PNG: &[u8] = include_bytes!("../assets/photo-tall.png");
 const WIDE_PNG: &[u8] = include_bytes!("../assets/photo-wide.png");
 const MINI_PNG: &[u8] = include_bytes!("../assets/photo-mini.png");

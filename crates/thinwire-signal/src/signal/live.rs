@@ -1146,6 +1146,7 @@ fn conversation_from_contact(contact: &Contact) -> Conversation {
         muted: false,
         placeholder: false,
         has_topics: false,
+        avatar: Default::default(),
     }
 }
 
@@ -1165,6 +1166,7 @@ fn conversation_from_group(key: &[u8], group: &Group) -> Conversation {
         muted: false,
         placeholder: false,
         has_topics: false,
+        avatar: Default::default(),
     }
 }
 
@@ -1302,6 +1304,7 @@ fn row_and_message(
         muted: false,
         placeholder: false,
         has_topics: false,
+        avatar: Default::default(),
     };
     Some((conversation, message))
 }
@@ -1412,6 +1415,7 @@ fn sent_conversation(
         muted: false,
         placeholder: false,
         has_topics: false,
+        avatar: Default::default(),
     }
 }
 
@@ -2391,6 +2395,7 @@ mod tests {
             muted: false,
             placeholder: false,
             has_topics: false,
+            avatar: Default::default(),
         }
     }
 
