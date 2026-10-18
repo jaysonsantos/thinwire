@@ -2,7 +2,8 @@
 //!
 //! Offsets in [`MessageLink`] are UTF-8 byte indexes into the message body.
 //! TDLib reports entity offsets in UTF-16 code units. [`links_in`] converts
-//! them. `Debug` prints no URL, path, or image bytes.
+//! them. A link stays only when [`openable_url`] accepts the scheme.
+//! `Debug` prints no URL, path, or image bytes.
 
 use std::fmt;
 
@@ -163,7 +164,8 @@ pub enum TextKind {
     Email,
 }
 
-/// Links for `text` from TDLib entities. A bad offset is left out.
+/// Links for `text` from TDLib entities.
+/// A bad offset or a blocked scheme is left out.
 #[must_use]
 pub fn links_in(text: &str, spans: &[TextSpan]) -> Vec<MessageLink> {
     let mut links = Vec::new();
@@ -175,9 +177,6 @@ pub fn links_in(text: &str, spans: &[TextSpan]) -> Vec<MessageLink> {
         let Some(url) = link_url(label, &span.kind) else {
             continue;
         };
-        if url.is_empty() {
-            continue;
-        }
         links.push(MessageLink { start, end, url });
     }
     links.sort_by_key(|link| (link.start, link.end));
@@ -186,29 +185,27 @@ pub fn links_in(text: &str, spans: &[TextSpan]) -> Vec<MessageLink> {
 
 fn link_url(label: &str, kind: &TextKind) -> Option<String> {
     match kind {
-        TextKind::Url => Some(with_scheme(label)),
-        TextKind::TextUrl(url) => {
-            let url = url.trim();
-            if url.is_empty() {
-                None
-            } else {
-                Some(url.to_string())
-            }
-        }
-        TextKind::Email => {
-            let address = label.trim();
-            if address.is_empty() || address.contains(char::is_whitespace) {
-                None
-            } else if address.to_ascii_lowercase().starts_with("mailto:") {
-                Some(address.to_string())
-            } else {
-                Some(format!("mailto:{address}"))
-            }
-        }
+        TextKind::Url => openable_url(label),
+        TextKind::TextUrl(url) => openable_url(url),
+        TextKind::Email => mailto_url(label),
+    }
+}
+
+fn mailto_url(label: &str) -> Option<String> {
+    let address = label.trim();
+    if address.is_empty() || address.contains(char::is_whitespace) {
+        return None;
+    }
+    if address.to_ascii_lowercase().starts_with("mailto:") {
+        openable_url(address)
+    } else {
+        openable_url(&format!("mailto:{address}"))
     }
 }
 
 /// Add `https://` when the text has no scheme.
+///
+/// Call [`openable_url`] before you keep or open an address.
 #[must_use]
 pub fn with_scheme(text: &str) -> String {
     let text = text.trim();
@@ -217,6 +214,74 @@ pub fn with_scheme(text: &str) -> String {
     } else {
         format!("https://{text}")
     }
+}
+
+/// The address to open, or `None` when the scheme is not allowed.
+///
+/// The allowed schemes are `http`, `https`, and `mailto`. A text with no
+/// scheme gets `https://`. `example.com:443` is a host and a port, not a
+/// scheme. `tg` is not allowed: that address starts a program on the
+/// computer. An `https://t.me` address uses `https` and stays.
+#[must_use]
+pub fn openable_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(scheme) = explicit_scheme(raw) {
+        return scheme_allowed(scheme).then(|| raw.to_string());
+    }
+    let url = with_scheme(raw);
+    let scheme = explicit_scheme(&url)?;
+    scheme_allowed(scheme).then_some(url)
+}
+
+fn scheme_allowed(scheme: &str) -> bool {
+    const ALLOWED: [&str; 3] = ["http", "https", "mailto"];
+    ALLOWED
+        .iter()
+        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+}
+
+/// The scheme when `value` starts with `scheme:`.
+///
+/// `localhost:8080` and `example.com:443` have no scheme. The part before
+/// `:` is a host, and the part after `:` is a port. `javascript:1` is a
+/// scheme: `javascript` is not a host.
+fn explicit_scheme(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.first().is_none_or(|byte| !byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut end = 1usize;
+    while end < bytes.len() && is_scheme_byte(bytes[end]) {
+        end += 1;
+    }
+    if end >= bytes.len() || bytes[end] != b':' {
+        return None;
+    }
+    let scheme = &value[..end];
+    let rest = &value[end + 1..];
+    if rest_is_port(rest) && looks_like_host(scheme) {
+        return None;
+    }
+    Some(scheme)
+}
+
+fn is_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'-' || byte == b'.'
+}
+
+fn looks_like_host(scheme: &str) -> bool {
+    scheme.contains('.') || scheme.eq_ignore_ascii_case("localhost")
+}
+
+fn rest_is_port(rest: &str) -> bool {
+    if rest.is_empty() || rest.starts_with("//") {
+        return false;
+    }
+    let port = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Map a UTF-16 range to a UTF-8 byte range. `None` when the range is not on
@@ -300,6 +365,14 @@ mod tests {
     fn a_bare_host_gets_https_and_an_empty_target_is_dropped() {
         assert_eq!(with_scheme("a.test/x"), "https://a.test/x");
         assert_eq!(with_scheme("http://a.test"), "http://a.test");
+        assert_eq!(
+            openable_url("a.test/x").as_deref(),
+            Some("https://a.test/x")
+        );
+        assert_eq!(
+            openable_url("http://a.test").as_deref(),
+            Some("http://a.test")
+        );
         let links = links_in(
             "docs",
             &[TextSpan {
@@ -309,6 +382,98 @@ mod tests {
             }],
         );
         assert!(links.is_empty());
+    }
+
+    #[test]
+    fn a_blocked_scheme_is_not_a_link_and_does_not_open() {
+        // `with_scheme` returns the file address unchanged.
+        // `openable_url` rejects that address, and `links_in` drops the link.
+        assert_eq!(with_scheme("file:///etc/passwd"), "file:///etc/passwd");
+        let blocked = [
+            "file:///etc/passwd",
+            "FILE:///tmp/x",
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "javascript:1",
+            "custom://open",
+            "smb://server/share",
+            "ms-msdt:id",
+            "search-ms:query=docs",
+            "vscode://file/tmp/x",
+            "tg://resolve?domain=thinwire",
+        ];
+        for target in blocked {
+            assert!(openable_url(target).is_none(), "{target}");
+            let as_text = links_in(
+                "see the doc",
+                &[TextSpan {
+                    offset: 0,
+                    length: "see the doc".len() as i32,
+                    kind: TextKind::TextUrl(target.into()),
+                }],
+            );
+            assert!(as_text.is_empty(), "{target}");
+            let as_url = links_in(
+                target,
+                &[TextSpan {
+                    offset: 0,
+                    length: target.len() as i32,
+                    kind: TextKind::Url,
+                }],
+            );
+            assert!(as_url.is_empty(), "{target}");
+        }
+    }
+
+    #[test]
+    fn http_https_and_mailto_stay_links_beside_a_blocked_scheme() {
+        let text = "see the doc and https://a.test";
+        let docs = text.find("see the doc").expect("label") as i32;
+        let https = text.find("https://a.test").expect("url") as i32;
+        let links = links_in(
+            text,
+            &[
+                TextSpan {
+                    offset: docs,
+                    length: "see the doc".len() as i32,
+                    kind: TextKind::TextUrl("file:///etc/passwd".into()),
+                },
+                TextSpan {
+                    offset: https,
+                    length: "https://a.test".len() as i32,
+                    kind: TextKind::Url,
+                },
+            ],
+        );
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://a.test");
+        assert_eq!(&text[links[0].start..links[0].end], "https://a.test");
+        assert_eq!(
+            openable_url(" HTTPS://a.test/x ").as_deref(),
+            Some("HTTPS://a.test/x")
+        );
+        assert_eq!(
+            openable_url("localhost:8080").as_deref(),
+            Some("https://localhost:8080")
+        );
+        assert_eq!(
+            openable_url("a.test:443/x").as_deref(),
+            Some("https://a.test:443/x")
+        );
+        let mail = links_in(
+            "ada@b.test",
+            &[TextSpan {
+                offset: 0,
+                length: "ada@b.test".len() as i32,
+                kind: TextKind::Email,
+            }],
+        );
+        assert_eq!(mail.len(), 1);
+        assert_eq!(mail[0].url, "mailto:ada@b.test");
+        assert_eq!(
+            openable_url("https://t.me/thinwire").as_deref(),
+            Some("https://t.me/thinwire")
+        );
     }
 
     #[test]

@@ -1,11 +1,13 @@
-//! Underlined links in a message, and the confirm step when the label lies.
+//! Underlined links in a message, and the confirm step when the label hides
+//! the address.
 //!
 //! Opening a link happens off the UI thread. The address is not logged.
+//! [`open_url`] checks the scheme again. A blocked scheme is plain text.
 
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Color32, FontId, Stroke, TextFormat};
 
-use thinwire_protocol::MessageLink;
+use thinwire_protocol::{MessageLink, openable_url};
 
 /// A link the user has not opened yet, because the label is a different address.
 #[derive(Clone)]
@@ -13,16 +15,47 @@ struct PendingLink {
     url: String,
 }
 
-/// True when the label looks like an address and it is not the target.
+/// True when the label is not the address the app will open.
 ///
-/// An email label never asks. `www.a.com` and `https://www.a.com` are the
-/// same address. A different scheme, host, or path asks.
+/// A label that is not a URL hides the host. `docs` can point at
+/// `docs.example` or at `evil.example`. The app asks in both cases.
+/// An email label that is the same `mailto` address does not ask.
+/// `www.a.com` and `https://www.a.com` are the same address.
+/// A different scheme, host, or path asks.
 #[must_use]
 pub(crate) fn needs_confirm(label: &str, target: &str) -> bool {
-    if !label_looks_like_url(label) {
+    if same_mailto(label, target) {
         return false;
     }
+    if !label_looks_like_url(label) {
+        return true;
+    }
     normalize_url(label) != normalize_url(target)
+}
+
+/// The label is an email address, and `target` is that same `mailto`.
+fn same_mailto(label: &str, target: &str) -> bool {
+    match (mail_address(label), mail_address(target)) {
+        (Some(label), Some(target)) => label == target,
+        _ => false,
+    }
+}
+
+fn mail_address(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    let address = lower.strip_prefix("mailto:").unwrap_or(&lower);
+    if address.contains("://") || !address.contains('@') {
+        return None;
+    }
+    let address = address.split(['?', '#']).next().unwrap_or(address);
+    if address.is_empty() || address.starts_with('@') || address.ends_with('@') {
+        return None;
+    }
+    Some(address.to_string())
 }
 
 fn label_looks_like_url(label: &str) -> bool {
@@ -95,6 +128,9 @@ pub(crate) fn layout_job(
     let mut job = LayoutJob::default();
     let mut cursor = 0usize;
     for span in links {
+        if openable_url(&span.url).is_none() {
+            continue;
+        }
         let start = span.start.min(body.len());
         let end = span.end.min(body.len());
         if start < cursor
@@ -193,6 +229,9 @@ pub(crate) fn interact(
     let Some(link) = link_at(links, index) else {
         return;
     };
+    if openable_url(&link.url).is_none() {
+        return;
+    }
     let label = body.get(link.start..link.end).unwrap_or("");
     response.clone().on_hover_text(&link.url);
     if response.clicked() {
@@ -212,7 +251,10 @@ pub(crate) fn interact(
 }
 
 pub(crate) fn open_url(url: &str) {
-    let url = url.to_owned();
+    // `openable_url` is the gate. A link that skipped `links_in` stops here.
+    let Some(url) = openable_url(url) else {
+        return;
+    };
     std::thread::spawn(move || {
         if webbrowser::open(&url).is_err() {
             tracing::debug!("link did not open");
@@ -250,9 +292,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn confirm_only_when_a_url_like_label_points_somewhere_else() {
-        assert!(!needs_confirm("docs", "https://docs.example/guide"));
-        assert!(!needs_confirm("ada@b.test", "https://evil.example"));
+    fn confirm_when_the_label_hides_the_host_or_the_address_differs() {
+        assert!(needs_confirm("docs", "https://evil.example"));
+        assert!(needs_confirm("docs", "https://docs.example/guide"));
+        assert!(needs_confirm("see the doc", "https://evil.example"));
+        assert!(needs_confirm("ada@b.test", "https://evil.example"));
+        assert!(!needs_confirm("ada@b.test", "mailto:ada@b.test"));
+        assert!(!needs_confirm("Ada@B.test", "mailto:ada@b.test"));
+        assert!(!needs_confirm("ada@b.test", "mailto:ada@b.test?subject=Hi"));
+        assert!(needs_confirm("ada@b.test", "mailto:other@b.test"));
         assert!(!needs_confirm("https://a.com", "https://a.com"));
         assert!(!needs_confirm("www.a.com", "https://www.a.com"));
         assert!(!needs_confirm("https://a.com/", "https://a.com"));
@@ -260,6 +308,41 @@ mod tests {
         assert!(needs_confirm("https://a.com", "http://a.com"));
         assert!(needs_confirm("https://a.com/one", "https://a.com/two"));
         assert!(needs_confirm("www.a.com", "https://b.com"));
+        assert!(needs_confirm("https://a.com", "https://a.com@evil.com"));
+    }
+
+    #[test]
+    fn a_blocked_scheme_is_plain_text_and_the_open_gate_rejects_it() {
+        let text = Color32::WHITE;
+        let link = Color32::BLUE;
+        let font = FontId::monospace(14.0);
+        for url in ["file:///etc/passwd", "javascript:alert(1)", "custom://open"] {
+            let body = "see the doc";
+            let links = [MessageLink {
+                start: 0,
+                end: body.len(),
+                url: url.to_string(),
+            }];
+            let job = layout_job(body, &links, text, link, font.clone());
+            assert_eq!(job.text, body, "{url}");
+            assert_eq!(job.sections.len(), 1, "{url}");
+            assert_eq!(job.sections[0].format.color, text, "{url}");
+            assert_eq!(job.sections[0].format.underline.width, 0.0, "{url}");
+            assert!(openable_url(url).is_none(), "{url}");
+        }
+        let body = "https://a.test";
+        let links = [MessageLink {
+            start: 0,
+            end: body.len(),
+            url: body.to_string(),
+        }];
+        let job = layout_job(body, &links, text, link, font);
+        assert!(
+            job.sections
+                .iter()
+                .any(|section| section.format.underline.width > 0.0)
+        );
+        assert_eq!(openable_url(body).as_deref(), Some(body));
     }
 
     #[test]
