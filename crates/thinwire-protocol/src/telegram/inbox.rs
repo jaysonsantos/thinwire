@@ -345,6 +345,8 @@ impl ChatDirectory {
     }
 
     /// The file id remembered for this chat, if it has a photo.
+    /// The unit test reads the cache. Live code publishes it on the row.
+    #[cfg(test)]
     pub(super) fn photo_file_id(&self, chat_id: i64) -> Option<i32> {
         self.chats.get(&chat_id).and_then(|chat| chat.photo_file_id)
     }
