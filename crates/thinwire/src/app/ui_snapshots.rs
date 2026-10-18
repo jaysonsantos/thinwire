@@ -18,6 +18,10 @@ use super::ui::{self, Hints};
 struct Scene {
     core: Core,
     hints: Hints,
+    /// Height of the last photo box this frame. Zero when the screen has none.
+    photo_box_height: f32,
+    /// Height of the bubble that holds that photo. Zero when the screen has none.
+    photo_row_height: f32,
 }
 
 fn runtime() -> Runtime {
@@ -44,6 +48,8 @@ fn scene(scenario: Scenario, theme: ThemeMode) -> (Runtime, Scene) {
     let scene = Scene {
         core,
         hints: Hints::default(),
+        photo_box_height: 0.0,
+        photo_row_height: 0.0,
     };
     (runtime, scene)
 }
@@ -56,6 +62,14 @@ fn draw(ui: &mut egui::Ui, state: &mut Scene) {
     let mut out = Vec::new();
     let view = state.core.view();
     ui::draw(ui, &view, &mut state.hints, &mut out);
+    state.photo_box_height = ui.data(|data| {
+        data.get_temp(egui::Id::new("thinwire-photo-box-height"))
+            .unwrap_or(0.0)
+    });
+    state.photo_row_height = ui.data(|data| {
+        data.get_temp(egui::Id::new("thinwire-photo-row-height"))
+            .unwrap_or(0.0)
+    });
 }
 
 fn shoot(scenario: Scenario, theme: ThemeMode, size: [f32; 2]) {
@@ -72,7 +86,9 @@ fn shoot(scenario: Scenario, theme: ThemeMode, size: [f32; 2]) {
         .with_size(size)
         .wgpu()
         .build_ui_state(draw, built);
-    if keeps_repainting(scenario) {
+    if waits_for_photo(scenario) {
+        settle_photo(&mut harness);
+    } else if keeps_repainting(scenario) {
         harness.run_steps(4);
     } else {
         harness.run();
@@ -156,6 +172,64 @@ shots! {
     forum_topics => ForumTopics,
     open_topic => OpenForumTopic,
     closed_topic => ClosedTopic,
+    photo_tall => PhotoTall,
+    photo_wide => PhotoWide,
+    photo_spoiler => PhotoSpoiler,
+    photo_failed => PhotoFailed,
+}
+
+/// A loaded photo and a failed photo of the same size keep the same box
+/// and the same bubble.
+#[test]
+fn a_photo_row_keeps_its_height_when_the_image_is_missing() {
+    let loaded = photo_heights(Scenario::PhotoWide);
+    let missing = photo_heights(Scenario::PhotoFailed);
+    assert_eq!(loaded.0, missing.0, "photo box");
+    assert_eq!(loaded.1, missing.1, "bubble");
+    assert!(loaded.0 > 100.0, "the wide photo is on screen");
+    assert!(loaded.1 > loaded.0, "the bubble is taller than the photo");
+}
+
+fn photo_heights(scenario: Scenario) -> (f32, f32) {
+    let (runtime, built) = scene(scenario, ThemeMode::Light);
+    let mut harness = Harness::builder()
+        .with_size([1100.0, 720.0])
+        .wgpu()
+        .build_ui_state(draw, built);
+    if waits_for_photo(scenario) {
+        settle_photo(&mut harness);
+    } else {
+        harness.run();
+    }
+    let heights = (
+        harness.state().photo_box_height,
+        harness.state().photo_row_height,
+    );
+    drop(harness);
+    drop(runtime);
+    heights
+}
+
+fn waits_for_photo(scenario: Scenario) -> bool {
+    matches!(
+        scenario,
+        Scenario::PhotoTall | Scenario::PhotoWide | Scenario::PhotoSpoiler | Scenario::PhotoFailed
+    )
+}
+
+/// Blur and decode finish off the UI thread. Step until both are done.
+fn settle_photo(harness: &mut Harness<'_, Scene>) {
+    for _ in 0..80 {
+        harness.step();
+        if harness.state().photo_box_height > 0.0 && super::photos::visuals_ready(&harness.ctx) {
+            harness.step();
+            if super::photos::visuals_ready(&harness.ctx) {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    panic!("the photo did not settle");
 }
 
 /// Row menus for Mute, Unmute, and a disabled "Muted in Telegram" (#206).

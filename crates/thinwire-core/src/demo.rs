@@ -21,8 +21,9 @@ use thinwire_protocol::demo::{
 };
 use thinwire_protocol::{
     AdapterEvent, AdapterHost, AdapterStatus, ChatMessage, ChatTopic, Conversation, Delivery,
-    MessageTopic, ProtocolAdapter, ProtocolCapabilities, ProtocolId, TelegramApiSource,
-    TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, WhatsAppPhoneVault, topic_mute_id,
+    ImageBytes, MessageLink, MessagePhoto, MessageTopic, PhotoSize, ProtocolAdapter,
+    ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthError, TelegramAuthPhase,
+    TelegramAuthStep, WhatsAppPhoneVault, topic_mute_id,
 };
 use tokio::runtime::Handle;
 
@@ -120,11 +121,19 @@ pub enum Scenario {
     OpenForumTopic,
     /// A closed topic: a lock, and the compose box does not take text.
     ClosedTopic,
+    /// A tall photo with a link in the caption.
+    PhotoTall,
+    /// A wide photo.
+    PhotoWide,
+    /// A photo that stays blurred until a click.
+    PhotoSpoiler,
+    /// A photo that did not load.
+    PhotoFailed,
 }
 
 impl Scenario {
     /// Every scenario, in a fixed order.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 26] = [
         Self::FirstRun,
         Self::EmptyInbox,
         Self::LongChat,
@@ -147,6 +156,10 @@ impl Scenario {
         Self::ForumTopics,
         Self::OpenForumTopic,
         Self::ClosedTopic,
+        Self::PhotoTall,
+        Self::PhotoWide,
+        Self::PhotoSpoiler,
+        Self::PhotoFailed,
     ];
 
     /// A stable snake_case name, for example for a snapshot file.
@@ -175,6 +188,10 @@ impl Scenario {
             Self::ForumTopics => "forum_topics",
             Self::OpenForumTopic => "open_topic",
             Self::ClosedTopic => "closed_topic",
+            Self::PhotoTall => "photo_tall",
+            Self::PhotoWide => "photo_wide",
+            Self::PhotoSpoiler => "photo_spoiler",
+            Self::PhotoFailed => "photo_failed",
         }
     }
 
@@ -313,6 +330,23 @@ impl Scenario {
                         topic,
                     });
                 }
+            }
+            Self::PhotoTall | Self::PhotoWide | Self::PhotoSpoiler | Self::PhotoFailed => {
+                let photo = match self {
+                    Self::PhotoTall => photo_message(PhotoKind::Tall),
+                    Self::PhotoWide => photo_message(PhotoKind::Wide),
+                    Self::PhotoSpoiler => photo_message(PhotoKind::Spoiler),
+                    Self::PhotoFailed => photo_message(PhotoKind::Failed),
+                    _ => unreachable!(),
+                };
+                let preview = if photo.body.is_empty() {
+                    "Photo".to_string()
+                } else {
+                    photo.body.clone()
+                };
+                set_ada_preview(&mut telegram, &preview);
+                telegram.history.insert(ADA.into(), photo_chat(photo));
+                setup.intents.push(select(ADA));
             }
         }
         setup.scripts.insert(0, telegram);
@@ -687,7 +721,79 @@ fn message(chat: &str, index: usize, sender: &str, body: &str, sent_at: i64) -> 
         sent_at,
         arrival: thinwire_protocol::Arrival::History,
         topic: None,
+        links: Vec::new(),
+        photo: None,
     }
+}
+
+const TALL_PNG: &[u8] = include_bytes!("../assets/photo-tall.png");
+const WIDE_PNG: &[u8] = include_bytes!("../assets/photo-wide.png");
+const MINI_PNG: &[u8] = include_bytes!("../assets/photo-mini.png");
+
+enum PhotoKind {
+    Tall,
+    Wide,
+    Spoiler,
+    Failed,
+}
+
+fn set_ada_preview(script: &mut DemoScript, preview: &str) {
+    for event in &mut script.start {
+        if let AdapterEvent::ConversationUpsert { conversation } = event
+            && conversation.id == ADA
+        {
+            conversation.preview = preview.to_owned();
+        }
+    }
+}
+
+fn photo_chat(photo: ChatMessage) -> Vec<ChatMessage> {
+    vec![
+        message(ADA, 0, "Ada", "The trail photos are in.", NOW - 2 * HOUR),
+        message(ADA, 1, "You", "Send one.", NOW - HOUR),
+        photo,
+    ]
+}
+
+fn photo_message(kind: PhotoKind) -> ChatMessage {
+    let (body, width, height, bytes, mini, spoiler, failed) = match kind {
+        PhotoKind::Tall => (
+            "Map: https://example.com/trail",
+            144,
+            360,
+            Some(TALL_PNG),
+            None,
+            false,
+            false,
+        ),
+        PhotoKind::Wide => ("Hello", 360, 144, Some(WIDE_PNG), None, false, false),
+        PhotoKind::Spoiler => ("", 280, 280, None, Some(MINI_PNG), true, false),
+        PhotoKind::Failed => ("Hello", 360, 144, None, None, false, true),
+    };
+    let mut row = message(ADA, 2, "Ada", body, NOW - 10 * MINUTE);
+    if let Some(start) = body.find("https://") {
+        row.links.push(MessageLink {
+            start,
+            end: body.len(),
+            url: "https://example.com/trail".into(),
+        });
+    }
+    row.photo = Some(MessagePhoto {
+        width,
+        height,
+        mini: mini.map(|bytes| ImageBytes::new(bytes.to_vec())),
+        sizes: vec![PhotoSize {
+            width,
+            height,
+            file_id: Some(1),
+            path: None,
+            bytes: bytes.map(|bytes| ImageBytes::new(bytes.to_vec())),
+        }],
+        has_spoiler: spoiler,
+        is_secret: false,
+        failed,
+    });
+    row
 }
 
 /// A chat of two people, oldest first, 20 minutes apart, ending one hour
@@ -909,6 +1015,49 @@ mod tests {
                             assert!(view.topic_closed(), "{name}");
                             assert!(!view.can_send(), "{name}");
                             assert_eq!(view.display_unread(row), 3, "{name}");
+                        }
+                        _ => {}
+                    }
+                }
+                Scenario::PhotoTall
+                | Scenario::PhotoWide
+                | Scenario::PhotoSpoiler
+                | Scenario::PhotoFailed => {
+                    let messages = view.selected_messages();
+                    let photo = messages
+                        .last()
+                        .and_then(|message| message.photo.as_ref())
+                        .expect("photo");
+                    match scenario {
+                        Scenario::PhotoTall => {
+                            assert!(!photo.failed, "{name}");
+                            assert!(
+                                photo.sizes.iter().any(|size| size.bytes.is_some()),
+                                "{name}"
+                            );
+                            assert!(
+                                messages
+                                    .last()
+                                    .is_some_and(|message| !message.links.is_empty()),
+                                "{name}"
+                            );
+                        }
+                        Scenario::PhotoWide => {
+                            assert!(
+                                photo.sizes.iter().any(|size| size.bytes.is_some()),
+                                "{name}"
+                            );
+                        }
+                        Scenario::PhotoSpoiler => {
+                            assert!(photo.has_spoiler, "{name}");
+                            assert!(photo.mini.is_some(), "{name}");
+                            assert!(
+                                photo.sizes.iter().all(|size| size.bytes.is_none()),
+                                "{name}"
+                            );
+                        }
+                        Scenario::PhotoFailed => {
+                            assert!(photo.failed, "{name}");
                         }
                         _ => {}
                     }

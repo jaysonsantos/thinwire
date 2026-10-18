@@ -246,6 +246,8 @@ pub(crate) fn chat_message(
         sent_at: snowflake_unix_seconds(message.id),
         arrival: crate::Arrival::History,
         topic: None,
+        links: Vec::new(),
+        photo: None,
     }
 }
 

@@ -137,6 +137,8 @@ mod tests {
             delivery: Delivery::Sent,
             sent_at,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         }
     }
 

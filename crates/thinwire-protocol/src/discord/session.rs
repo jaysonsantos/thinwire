@@ -1035,6 +1035,8 @@ impl Owner {
                         sent_at: local_unix_seconds(),
                         arrival: Arrival::History,
                         topic: None,
+                        links: Vec::new(),
+                        photo: None,
                     },
                 );
                 (body, message_id, SendRow::Pending)

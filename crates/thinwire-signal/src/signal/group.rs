@@ -155,6 +155,8 @@ mod tests {
             sent_at: 1,
             arrival: thinwire_protocol::Arrival::History,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         };
         let commands = [
             AdapterCommand::Connect { protocol },

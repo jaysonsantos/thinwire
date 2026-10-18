@@ -16,7 +16,7 @@ default = []
 # binary. Linux link needs libc++-dev and libc++abi-dev. Publisher
 # api_id / api_hash stay compile-time env (credentials.rs). Public CI must
 # not set them. Main-only os-zips injects repository secrets.
-telegram-tdlib = ["dep:tdlib-rs"]
+telegram-tdlib = ["dep:tdlib-rs", "dep:base64"]
 # Official Slack workspace app via `slack-morphism`: OAuth v2 install on a
 # loopback redirect, Web API and Socket Mode over its `hyper` client. Default
 # CI stays feature-off. Publisher client credentials stay compile-time env in
@@ -37,13 +37,15 @@ discord-bot = ["dep:twilight-http", "dep:twilight-model", "dep:rustls"]
 contract-kit = []
 
 [dependencies]
+# TDLib sends a minithumbnail as base64. Only the live client decodes it.
+base64 = { version = "0.22", optional = true }
 tdlib-rs = { version = "1.4", optional = true, default-features = false, features = [
   "download-tdlib",
   "static",
 ] }
 slack-morphism = { version = "2.29", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"], optional = true }
-webbrowser = { version = "1", optional = true }
+webbrowser = { version = "1.2", optional = true, features = ["hardened"] }
 twilight-http = { version = "0.17.1", optional = true }
 twilight-model = { version = "0.17.1", optional = true }
 # twilight-http 0.17 and hyper-rustls leave rustls without a process crypto

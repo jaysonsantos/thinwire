@@ -259,7 +259,12 @@ impl Notifications {
             title,
             sender: (ctx.preview && chat.is_group).then(|| message.sender.clone()),
             preview: if ctx.preview {
-                message.body.chars().take(PREVIEW_CHARS).collect()
+                let text = if message.body.is_empty() && message.photo.is_some() {
+                    "Photo"
+                } else {
+                    message.body.as_str()
+                };
+                text.chars().take(PREVIEW_CHARS).collect()
             } else {
                 HIDDEN_PREVIEW.into()
             },
@@ -464,6 +469,8 @@ mod tests {
             sent_at: NOW,
             arrival: Arrival::Live,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         }
     }
 

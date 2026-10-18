@@ -100,7 +100,8 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::OpenTopic { .. }
         | AdapterCommand::LoadOlderTopic { .. }
         | AdapterCommand::SendTopicText { .. }
-        | AdapterCommand::ViewTopic { .. } => return None,
+        | AdapterCommand::ViewTopic { .. }
+        | AdapterCommand::DownloadFile { .. } => return None,
     })
 }
 
@@ -563,6 +564,8 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
         sent_at: message.sent_at,
         arrival: arrival_from_wire(message.arrival),
         topic: None,
+        links: Vec::new(),
+        photo: None,
     }
 }
 
@@ -586,6 +589,8 @@ mod tests {
             sent_at: 1_790_000_000,
             arrival: Arrival::Live,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         }
     }
 

@@ -158,6 +158,8 @@ impl SlackAdapter {
                 sent_at: 0,
                 arrival: crate::Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
 },
         );
     }
