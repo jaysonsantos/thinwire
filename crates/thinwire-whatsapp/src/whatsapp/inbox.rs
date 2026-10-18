@@ -770,6 +770,8 @@ impl Inbox {
             sent_at: message.timestamp,
             arrival,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         }
     }
 }

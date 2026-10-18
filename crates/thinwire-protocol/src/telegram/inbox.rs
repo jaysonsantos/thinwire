@@ -836,6 +836,8 @@ pub(super) fn to_chat_message(
             Delivery::Sent
         },
         topic: message.topic,
+        links: Vec::new(),
+        photo: None,
     }
 }
 

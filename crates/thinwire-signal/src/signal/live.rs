@@ -1285,6 +1285,8 @@ fn row_and_message(
         sent_at: super::time::sent_at_secs(sent_millis),
         arrival,
         topic: None,
+        links: Vec::new(),
+        photo: None,
     };
     let conversation = Conversation {
         protocol: ProtocolId::Signal,
@@ -1368,6 +1370,8 @@ async fn send_text(
             sent_at,
             arrival: thinwire_protocol::Arrival::History,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         },
     );
     session.remember(&id, &outbound.body).await;

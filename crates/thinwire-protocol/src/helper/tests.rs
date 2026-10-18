@@ -360,6 +360,8 @@ impl GatedFake {
             sent_at: 1_790_000_000,
             arrival: Arrival::History,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         }
     }
 

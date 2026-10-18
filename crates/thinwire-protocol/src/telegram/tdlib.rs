@@ -27,9 +27,10 @@ use crate::adapter::{
     AdapterStatus, Arrival, ChatMessage, ChatTopic, Delivery, EventTx, LoginEpoch, MessageTopic,
     ProtocolId, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia,
     emit_chat_list_loaded, emit_conversation, emit_conversation_removed, emit_history_loaded,
-    emit_message, emit_message_body, emit_message_delivery, emit_message_replaced,
-    emit_messages_removed, emit_older_history_loaded, emit_send_accepted, emit_send_rejected,
-    emit_status, emit_stopped, emit_telegram_session_ended, emit_topic,
+    emit_message, emit_message_delivery, emit_message_links, emit_message_media,
+    emit_message_replaced, emit_messages_removed, emit_older_history_loaded, emit_photo_failed,
+    emit_photo_ready, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
+    emit_telegram_session_ended, emit_topic,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -91,6 +92,11 @@ enum TdlibCommand {
     Close {
         cancel: bool,
     },
+    /// Download one photo. `secret` deletes the file after the bytes are read.
+    DownloadFile {
+        file_id: i32,
+        secret: bool,
+    },
 }
 
 /// How often a waiter checks that closing workers have exited.
@@ -146,6 +152,9 @@ struct LiveInbox {
     /// Latest incoming message id per chat that arrived while that chat was
     /// not viewed. Focus calls `viewMessages` through this id.
     unviewed: HashMap<i64, i64>,
+    /// Photo downloads this worker started. The value is secret, then whether
+    /// TDLib has reported the download as active.
+    downloads: HashMap<i32, (bool, bool)>,
 }
 
 impl LiveInbox {
@@ -409,6 +418,22 @@ impl TdlibRuntime {
         );
     }
 
+    pub fn download_file(
+        &mut self,
+        file_id: i32,
+        secret: bool,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::DownloadFile { file_id, secret },
+            secrets,
+            source,
+            events,
+        );
+    }
+
     pub fn send_text(
         &mut self,
         conversation_id: String,
@@ -663,6 +688,7 @@ fn spawn_tdlib_worker(
             topic_lists: HashSet::new(),
             viewed: view.viewed,
             unviewed: HashMap::new(),
+            downloads: HashMap::new(),
         };
         let requested_view = view.requested;
         let mut commands = Some(cmd_rx);
@@ -815,6 +841,9 @@ fn spawn_tdlib_worker(
                         }
                         TdlibCommand::Resend { conversation_id, message_id, request } => {
                             resend(client_id, &conversation_id, &message_id, request, &live, &events).await;
+                        }
+                        TdlibCommand::DownloadFile { file_id, secret } => {
+                            start_download(client_id, file_id, secret, &mut live, &events).await;
                         }
                     }
                 }
@@ -1349,13 +1378,13 @@ async fn apply_chat_update(
                 .set_main_position(update.chat_id, main_order(&update.positions));
             live.publish(events, emit, effect);
             if let Some(message) = update.last_message.as_ref() {
-                let preview = message_body(&message.content);
+                let preview = super::media_map::map_content(&message.content).preview;
                 let effect =
                     live.directory
                         .set_preview(update.chat_id, &preview, i64::from(message.date));
                 live.publish(events, emit, effect);
                 if emit {
-                    emit_mapped_message(events, message, live, None);
+                    emit_mapped_message(client_id, events, message, live, None);
                 }
             } else {
                 let effect = live.directory.set_preview(update.chat_id, "", 0);
@@ -1363,7 +1392,7 @@ async fn apply_chat_update(
             }
         }
         tdlib_rs::enums::Update::NewMessage(update) => {
-            let preview = message_body(&update.message.content);
+            let preview = super::media_map::map_content(&update.message.content).preview;
             let chat_id = update.message.chat_id;
             let at = i64::from(update.message.date);
             if emit {
@@ -1377,7 +1406,14 @@ async fn apply_chat_update(
                 {
                     refresh_forum_topic(client_id, chat_id, forum_topic_id, live, events).await;
                 }
-                emit_mapped_message_as(events, &update.message, live, None, Arrival::Live);
+                emit_mapped_message_as(
+                    client_id,
+                    events,
+                    &update.message,
+                    live,
+                    None,
+                    Arrival::Live,
+                );
             }
             let effect = live.directory.set_preview(chat_id, &preview, at);
             live.publish(events, emit, effect);
@@ -1385,7 +1421,7 @@ async fn apply_chat_update(
         tdlib_rs::enums::Update::MessageSendSucceeded(update) => {
             if emit {
                 let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
-                emit_mapped_message(events, &update.message, live, Some(old_id));
+                emit_mapped_message(client_id, events, &update.message, live, Some(old_id));
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -1398,7 +1434,7 @@ async fn apply_chat_update(
             if emit {
                 log_tdlib_error("sendMessage (update)", &update.error);
                 let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
-                emit_mapped_message(events, &update.message, live, Some(old_id));
+                emit_mapped_message(client_id, events, &update.message, live, Some(old_id));
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -1435,13 +1471,27 @@ async fn apply_chat_update(
             if !emit {
                 return;
             }
-            emit_message_body(
+            let mapped = super::media_map::map_content(&update.new_content);
+            let conversation_id = inbox::conversation_id(update.chat_id);
+            let message_id = inbox::message_id(update.chat_id, update.message_id);
+            emit_message_media(
                 events,
                 ProtocolId::Telegram,
-                inbox::conversation_id(update.chat_id),
-                inbox::message_id(update.chat_id, update.message_id),
-                message_body(&update.new_content),
+                conversation_id.clone(),
+                message_id.clone(),
+                mapped.text.clone(),
+                mapped.links,
+                mapped.photo,
             );
+            if mapped.scan {
+                schedule_text_entities(
+                    client_id,
+                    events.clone(),
+                    conversation_id,
+                    message_id,
+                    mapped.text,
+                );
+            }
         }
         tdlib_rs::enums::Update::ChatViewAsTopics(update) => {
             let effect = live
@@ -1493,6 +1543,9 @@ async fn apply_chat_update(
                     }
                 }
             }
+        }
+        tdlib_rs::enums::Update::File(update) => {
+            note_file(client_id, update.file, live, events).await;
         }
         _ => {}
     }
@@ -1563,7 +1616,7 @@ fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Opt
     let preview = chat
         .last_message
         .as_ref()
-        .map(|message| message_body(&message.content))
+        .map(|message| super::media_map::map_content(&message.content).preview)
         .unwrap_or_default();
     let last_at = chat
         .last_message
@@ -1623,17 +1676,26 @@ fn main_order(positions: &[tdlib_rs::types::ChatPosition]) -> Option<i64> {
 }
 
 fn emit_mapped_message(
+    client_id: i32,
     events: &EventTx,
     message: &tdlib_rs::types::Message,
     live: &LiveInbox,
     replace_old: Option<String>,
 ) {
-    emit_mapped_message_as(events, message, live, replace_old, Arrival::History);
+    emit_mapped_message_as(
+        client_id,
+        events,
+        message,
+        live,
+        replace_old,
+        Arrival::History,
+    );
 }
 
 /// `arrival` is `Live` only for `updateNewMessage`: a history page, a last
 /// message refresh, and a send result never notify (#32).
 fn emit_mapped_message_as(
+    client_id: i32,
     events: &EventTx,
     message: &tdlib_rs::types::Message,
     live: &LiveInbox,
@@ -1644,13 +1706,14 @@ fn emit_mapped_message_as(
         tdlib_rs::enums::MessageSender::User(user) => MessageParty::User(user.user_id),
         tdlib_rs::enums::MessageSender::Chat(chat) => MessageParty::Chat(chat.chat_id),
     };
+    let media = super::media_map::map_content(&message.content);
     let mapped = inbox::to_chat_message(
         &InboxMessage {
             chat_id: message.chat_id,
             message_id: message.id,
             outgoing: message.is_outgoing,
             party,
-            body: message_body(&message.content),
+            body: media.text.clone(),
             sent_at: i64::from(message.date),
             delivery: match &message.sending_state {
                 None => Delivery::Sent,
@@ -1662,7 +1725,18 @@ fn emit_mapped_message_as(
         &live.names,
         live.directory.title(message.chat_id),
     );
-    let mapped = ChatMessage { arrival, ..mapped };
+    let mut mapped = ChatMessage { arrival, ..mapped };
+    mapped.links = media.links;
+    mapped.photo = media.photo;
+    if media.scan {
+        schedule_text_entities(
+            client_id,
+            events.clone(),
+            mapped.conversation_id.clone(),
+            mapped.id.clone(),
+            media.text,
+        );
+    }
     if let Some(old_id) = replace_old.filter(|old_id| *old_id != mapped.id) {
         emit_message_replaced(events, old_id, mapped);
         return;
@@ -1670,16 +1744,121 @@ fn emit_mapped_message_as(
     emit_message(events, mapped);
 }
 
-fn message_body(content: &tdlib_rs::enums::MessageContent) -> String {
-    match content {
-        tdlib_rs::enums::MessageContent::MessageText(text) => text.text.text.clone(),
-        tdlib_rs::enums::MessageContent::MessagePhoto(_) => "Photo".into(),
-        tdlib_rs::enums::MessageContent::MessageSticker(_) => "Sticker".into(),
-        tdlib_rs::enums::MessageContent::MessageVideo(_) => "Video".into(),
-        tdlib_rs::enums::MessageContent::MessageAnimation(_) => "Animation".into(),
-        tdlib_rs::enums::MessageContent::MessageVoiceNote(_) => "Voice message".into(),
-        tdlib_rs::enums::MessageContent::MessageDocument(_) => "File".into(),
-        _ => "Message".into(),
+fn schedule_text_entities(
+    client_id: i32,
+    events: EventTx,
+    conversation_id: String,
+    message_id: String,
+    text: String,
+) {
+    tokio::spawn(async move {
+        match tdlib_rs::functions::get_text_entities(text.clone(), client_id).await {
+            Ok(tdlib_rs::enums::TextEntities::TextEntities(found)) => {
+                let links = super::media_map::links_from(&text, &found.entities);
+                if !links.is_empty() {
+                    emit_message_links(
+                        &events,
+                        ProtocolId::Telegram,
+                        conversation_id,
+                        message_id,
+                        links,
+                    );
+                }
+            }
+            Err(error) => log_tdlib_error("getTextEntities", &error),
+        }
+    });
+}
+
+async fn start_download(
+    client_id: i32,
+    file_id: i32,
+    secret: bool,
+    live: &mut LiveInbox,
+    events: &EventTx,
+) {
+    live.downloads.insert(file_id, (secret, false));
+    match tdlib_rs::functions::download_file(file_id, 1, 0, 0, false, client_id).await {
+        Ok(tdlib_rs::enums::File::File(file)) => {
+            if file.local.is_downloading_completed {
+                live.downloads.remove(&file_id);
+                finish_photo(client_id, file, secret, events).await;
+            } else if !file.local.is_downloading_active {
+                live.downloads.remove(&file_id);
+                emit_photo_failed(events, ProtocolId::Telegram, file_id);
+            } else if let Some(row) = live.downloads.get_mut(&file_id) {
+                row.1 = true;
+            }
+        }
+        Err(error) => {
+            log_tdlib_error("downloadFile", &error);
+            live.downloads.remove(&file_id);
+            emit_photo_failed(events, ProtocolId::Telegram, file_id);
+        }
+    }
+}
+
+async fn note_file(
+    client_id: i32,
+    file: tdlib_rs::types::File,
+    live: &mut LiveInbox,
+    events: &EventTx,
+) {
+    let Some((secret, saw_active)) = live.downloads.get(&file.id).copied() else {
+        return;
+    };
+    if file.local.is_downloading_completed {
+        live.downloads.remove(&file.id);
+        finish_photo(client_id, file, secret, events).await;
+    } else if file.local.is_downloading_active {
+        if let Some(row) = live.downloads.get_mut(&file.id) {
+            row.1 = true;
+        }
+    } else if saw_active {
+        live.downloads.remove(&file.id);
+        emit_photo_failed(events, ProtocolId::Telegram, file.id);
+    }
+}
+
+async fn finish_photo(client_id: i32, file: tdlib_rs::types::File, secret: bool, events: &EventTx) {
+    let file_id = file.id;
+    if secret {
+        let path = file.local.path;
+        let read = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || std::fs::read(&path).ok().filter(|bytes| !bytes.is_empty())
+        })
+        .await;
+        // TDLib wrote the file. Drop it after the read. A failed delete still
+        // removes the path, so a second process does not keep the bytes.
+        if let Err(error) = tdlib_rs::functions::delete_file(file_id, client_id).await {
+            log_tdlib_error("deleteFile", &error);
+        }
+        if !path.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
+        }
+        match read {
+            Ok(Some(bytes)) => emit_photo_ready(
+                events,
+                ProtocolId::Telegram,
+                file_id,
+                None,
+                Some(crate::ImageBytes::new(bytes)),
+            ),
+            _ => emit_photo_failed(events, ProtocolId::Telegram, file_id),
+        }
+        return;
+    }
+    if file.local.is_downloading_completed && !file.local.path.is_empty() {
+        emit_photo_ready(
+            events,
+            ProtocolId::Telegram,
+            file_id,
+            Some(crate::ImagePath::new(file.local.path)),
+            None,
+        );
+    } else {
+        emit_photo_failed(events, ProtocolId::Telegram, file_id);
     }
 }
 
@@ -1981,7 +2160,7 @@ async fn load_topic_history(
             let message_ids: Vec<i64> = messages.iter().map(|message| message.id).collect();
             let any = !messages.is_empty();
             for message in inbox::chronological(messages) {
-                emit_mapped_message(events, &message, live, None);
+                emit_mapped_message(client_id, events, &message, live, None);
             }
             if !message_ids.is_empty()
                 && inbox::should_mark_topic_viewed(
@@ -2020,7 +2199,7 @@ async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &E
             let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
             let message_ids: Vec<i64> = messages.iter().map(|message| message.id).collect();
             for message in inbox::chronological(messages) {
-                emit_mapped_message(events, &message, live, None);
+                emit_mapped_message(client_id, events, &message, live, None);
             }
             // Read the cell after `getChatHistory`: `ViewChat` may have been
             // published while this call was in flight, and it is still queued.
@@ -2108,7 +2287,7 @@ async fn load_older(
     match page {
         Ok((outcome, older)) => {
             for message in &older {
-                emit_mapped_message(events, message, live, None);
+                emit_mapped_message(client_id, events, message, live, None);
             }
             let more = live.older.finish(chat_id, before, outcome);
             let (more, note) = inbox::older_end(Ok(more));
@@ -2202,7 +2381,7 @@ async fn send_text(
     .await
     {
         Ok(tdlib_rs::enums::Message::Message(message)) => {
-            emit_mapped_message(events, &message, live, None);
+            emit_mapped_message(client_id, events, &message, live, None);
             // After the pending row, name this send as accepted.
             emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request);
         }
@@ -2258,7 +2437,13 @@ async fn resend(
         Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
             match batch.messages.into_iter().flatten().next() {
                 Some(message) => {
-                    emit_mapped_message(events, &message, live, Some(message_id.to_string()));
+                    emit_mapped_message(
+                        client_id,
+                        events,
+                        &message,
+                        live,
+                        Some(message_id.to_string()),
+                    );
                     emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request);
                 }
                 None => {
@@ -2815,6 +3000,7 @@ mod tests {
             topic_lists: HashSet::new(),
             viewed: runtime.viewed.clone(),
             unviewed: HashMap::new(),
+            downloads: HashMap::new(),
         };
         // Disconnect or Shutdown has marked closing. The cell can still name
         // the chat until `stop_client` clears it.

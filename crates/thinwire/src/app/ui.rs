@@ -5,7 +5,9 @@ use std::time::Instant;
 use eframe::egui::{self, RichText};
 use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
-use thinwire_protocol::{AdapterStatus, Delivery, MessageTopic, ProtocolId, topic_mute_id};
+use thinwire_protocol::{
+    AdapterStatus, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId, topic_mute_id,
+};
 
 use super::auth;
 use super::motion;
@@ -143,6 +145,8 @@ pub(crate) fn draw(
     status_strip(ui, snapshot, out);
     left_panel(ui, snapshot, hints, out);
     center_panel(ui, snapshot, hints, out);
+    super::links::confirm(ui);
+    super::photos::overlay(ui, snapshot.selected_messages());
 }
 
 /// Single-line or multiline text bound to a core value. A change becomes an intent.
@@ -1421,8 +1425,12 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: 
             )
         });
         if escape {
-            out.push(Intent::Key(AuthKey::Escape));
-        } else if enter {
+            let closed =
+                super::photos::take_escape(ui.ctx()) || super::links::take_escape(ui.ctx());
+            if !closed {
+                out.push(Intent::Key(AuthKey::Escape));
+            }
+        } else if enter && !super::links::take_enter(ui.ctx()) {
             out.push(Intent::Key(AuthKey::Enter));
         }
         // Another view or another login step fades in. A chat switch keeps
@@ -1570,15 +1578,19 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         ViewNow::Local(now) => thread_rows(snapshot.selected_messages(), is_group, &now),
         ViewNow::Fixed(now) => thread_rows(snapshot.selected_messages(), is_group, &now),
     };
-    let messages: Vec<Bubble> = snapshot
+    let messages: Vec<Bubble<'_>> = snapshot
         .selected_messages()
         .iter()
         .zip(layout)
         .map(|(message, layout)| Bubble {
-            id: message.id.clone(),
+            id: &message.id,
+            protocol: message.protocol,
+            conversation_id: &message.conversation_id,
             outbound: message.outbound,
-            sender: message.sender.clone(),
-            body: message.body.clone(),
+            sender: &message.sender,
+            body: &message.body,
+            links: &message.links,
+            photo: message.photo.as_ref(),
             delivery: message.delivery,
             group: is_group,
             layout,
@@ -1661,7 +1673,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         }
         let mut gap_before = None;
         for message in &messages {
-            bubble(ui, message, &mut retry, gap_before);
+            bubble(ui, message, &mut retry, gap_before, out);
             gap_before = Some(message.layout.run_end);
         }
         if scroll.jump {
@@ -1691,7 +1703,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
             },
         );
     });
-    let first_id = messages.first().map(|message| message.id.clone());
+    let first_id = messages.first().map(|message| message.id.to_owned());
     let step = older_step(
         &memo,
         first_id.as_deref(),
@@ -1886,12 +1898,17 @@ fn older_step(
     }
 }
 
-/// One message row, ready to draw.
-struct Bubble {
-    id: String,
+/// One message row, ready to draw. The photo stays a reference so a frame
+/// does not copy the image bytes.
+struct Bubble<'a> {
+    id: &'a str,
+    protocol: ProtocolId,
+    conversation_id: &'a str,
     outbound: bool,
-    sender: String,
-    body: String,
+    sender: &'a str,
+    body: &'a str,
+    links: &'a [MessageLink],
+    photo: Option<&'a MessagePhoto>,
     delivery: Delivery,
     /// Group chat. The AccessKit name keeps the sender on every row.
     group: bool,
@@ -2193,9 +2210,10 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
 /// gap between runs. `Some(false)` inserts the gap inside a run.
 fn bubble(
     ui: &mut egui::Ui,
-    message: &Bubble,
+    message: &Bubble<'_>,
     retry: &mut Option<String>,
     previous_run_ended: Option<bool>,
+    out: &mut Vec<Intent>,
 ) {
     let palette = theme::palette(ui);
     if let Some(day) = &message.layout.day_break {
@@ -2241,9 +2259,26 @@ fn bubble(
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     if message.layout.show_sender {
                         let response =
-                            ui.label(RichText::new(&message.sender).small().color(palette.text));
+                            ui.label(RichText::new(message.sender).small().color(palette.text));
                         // The pane name already includes the sender.
                         hide_from_accesskit(ui, response.id);
+                    }
+                    if let Some(photo) = message.photo {
+                        super::photos::show(
+                            ui,
+                            message.protocol,
+                            message.conversation_id,
+                            message.id,
+                            photo,
+                            out,
+                        );
+                    }
+                    let caption = !message.body.is_empty() || message.photo.is_none();
+                    if !caption {
+                        if !message.layout.time.is_empty() {
+                            ui.label(RichText::new(&message.layout.time).small().color(meta));
+                        }
+                        return;
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         let gap = ui.spacing().item_spacing.x;
@@ -2251,12 +2286,23 @@ fn bubble(
                         let body_rect = ui
                             .vertical(|ui| {
                                 ui.set_max_width(text_width);
-                                let (galley_pos, galley, response) =
-                                    egui::Label::new(RichText::new(&message.body).color(body))
-                                        .selectable(true)
-                                        .wrap()
-                                        .halign(egui::Align::LEFT)
-                                        .layout_in_ui(ui);
+                                let text = if message.links.is_empty() {
+                                    egui::WidgetText::from(RichText::new(message.body).color(body))
+                                } else {
+                                    let font = egui::TextStyle::Body.resolve(ui.style());
+                                    egui::WidgetText::from(super::links::layout_job(
+                                        message.body,
+                                        message.links,
+                                        body,
+                                        palette.link,
+                                        font,
+                                    ))
+                                };
+                                let (galley_pos, galley, response) = egui::Label::new(text)
+                                    .selectable(true)
+                                    .wrap()
+                                    .halign(egui::Align::LEFT)
+                                    .layout_in_ui(ui);
                                 response.widget_info(|| {
                                     egui::WidgetInfo::labeled(
                                         egui::WidgetType::Label,
@@ -2329,7 +2375,7 @@ fn bubble(
                                                 )
                                                 .clicked()
                                             {
-                                                *retry = Some(message.id.clone());
+                                                *retry = Some(message.id.to_owned());
                                             }
                                         }
                                         Delivery::Sent => {}
@@ -2341,6 +2387,14 @@ fn bubble(
                 });
             })
             .response;
+        if message.photo.is_some() {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("thinwire-photo-row-height"),
+                    frame.rect.height(),
+                );
+            });
+        }
         if let Some((galley_pos, galley, mut response)) = body_galley {
             // The text runs and the selection handler share the pane id.
             // A selection action from assistive tech targets that id.
@@ -2349,10 +2403,20 @@ fn bubble(
                 ui,
                 &response,
                 galley_pos,
-                galley,
+                galley.clone(),
                 body,
                 egui::Stroke::NONE,
             );
+            if !message.links.is_empty() {
+                super::links::interact(
+                    ui,
+                    &response,
+                    galley_pos,
+                    &galley,
+                    message.body,
+                    message.links,
+                );
+            }
         }
         // Restore the pane after selection, which sets a label role.
         frame.widget_info(|| {
@@ -2401,14 +2465,16 @@ fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery) -> f32 {
 /// time are hidden, so they do not repeat this name. Text runs on the pane
 /// keep partial selection. The visual sender header stays on the first row
 /// of a run.
-fn bubble_access_label(message: &Bubble) -> String {
-    if message.group {
-        format!(
-            "{} {} {}",
-            message.sender, message.layout.time, message.body
-        )
+fn bubble_access_label(message: &Bubble<'_>) -> String {
+    let body = if message.body.is_empty() && message.photo.is_some() {
+        "Photo"
     } else {
-        message.body.clone()
+        message.body
+    };
+    if message.group {
+        format!("{} {} {body}", message.sender, message.layout.time)
+    } else {
+        body.to_owned()
     }
 }
 

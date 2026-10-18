@@ -668,6 +668,14 @@ impl Core {
                 }
             }
             Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
+            Intent::LoadPhoto {
+                protocol,
+                conversation_id,
+                message_id,
+                file_id,
+            } => self
+                .state
+                .load_photo(protocol, &conversation_id, &message_id, file_id),
             Intent::Telegram(intent) => self.telegram(intent),
             Intent::WhatsApp(intent) => self.whatsapp(intent),
             Intent::Discord(DiscordIntent::Connect) => {
@@ -1701,6 +1709,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         });
         assert!(
             matches!(&core.take_notify()[..], [NotifyCommand::Show(note)] if note.title == "Bob"),
@@ -1735,6 +1745,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         };
         core.notify_message(&live);
         assert!(
@@ -1790,6 +1802,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         };
         // Chat 1 is open and the window has focus: nothing.
         core.notify_message(&live(1, "seen"));
@@ -1874,6 +1888,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: Some(MessageTopic::Forum(topic_id)),
+            links: Vec::new(),
+            photo: None,
         };
         core.notify_message(&live(1, 3, "secret"));
         assert!(
@@ -1956,6 +1972,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: Some(MessageTopic::Forum(topic_id)),
+            links: Vec::new(),
+            photo: None,
         };
         let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
             for event in events {
@@ -2066,6 +2084,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: Some(MessageTopic::Forum(topic_id)),
+            links: Vec::new(),
+            photo: None,
         };
         let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
             for event in events {
@@ -2210,6 +2230,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: Some(MessageTopic::Forum(1)),
+            links: Vec::new(),
+            photo: None,
         };
         let general = |muted: bool| ChatTopic {
             protocol: ProtocolId::Telegram,
@@ -2485,6 +2507,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         };
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
@@ -2806,6 +2830,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         };
         core.notify_message(&live(2));
         assert_eq!(core.take_notify().len(), 1);
@@ -2869,6 +2895,8 @@ mod tests {
             sent_at: unix_now(),
             arrival: Arrival::Live,
             topic: None,
+            links: Vec::new(),
+            photo: None,
         });
         assert_eq!(
             core.take_notify().len(),
@@ -3457,6 +3485,8 @@ mod tests {
                 sent_at: unix_now(),
                 arrival: Arrival::History,
                 topic: None,
+                links: Vec::new(),
+                photo: None,
             },
         };
         events_tx.send(row(Delivery::Pending)).expect("queue");
