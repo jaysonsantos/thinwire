@@ -6,7 +6,8 @@ use eframe::egui::{self, RichText};
 use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
-    AdapterStatus, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId, topic_mute_id,
+    AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
+    topic_mute_id,
 };
 
 use super::auth;
@@ -857,6 +858,7 @@ fn inbox(
             unread: snapshot.display_unread(row),
             time: view_list_time(row.last_at, now),
             mute: snapshot.chat_mute(row.protocol, &row.id),
+            avatar: row.avatar.clone(),
         })
         .collect();
 
@@ -915,11 +917,13 @@ fn inbox(
             unread,
             time,
             mute,
+            avatar,
         } = row;
         let selected = snapshot.selected_conversation.as_deref() == Some(id.as_str());
         let focused = snapshot.focused_row.as_deref() == Some(id.as_str());
         let response = inbox_row(
             ui,
+            protocol,
             &id,
             &title,
             &preview,
@@ -927,6 +931,8 @@ fn inbox(
             unread,
             selected,
             mute.is_muted(),
+            &avatar,
+            out,
         );
         let force_open = open_mute_menus && claim_menu_state(&mut menu_state_open, mute);
         let add_menu = |ui: &mut egui::Ui| {
@@ -1016,6 +1022,7 @@ struct InboxRow {
     unread: u32,
     time: String,
     mute: ChatMute,
+    avatar: ChatAvatar,
 }
 
 /// First row of each mute state in a snapshot that shows every menu at once.
@@ -1221,6 +1228,7 @@ fn inbox_row_height(ui: &egui::Ui) -> f32 {
 #[allow(clippy::too_many_arguments)]
 fn inbox_row(
     ui: &mut egui::Ui,
+    protocol: ProtocolId,
     id: &str,
     title: &str,
     preview: &str,
@@ -1228,6 +1236,8 @@ fn inbox_row(
     unread: u32,
     selected: bool,
     muted: bool,
+    avatar: &ChatAvatar,
+    out: &mut Vec<Intent>,
 ) -> egui::Response {
     let palette = theme::palette(ui);
     let width = laid_out_width(ui, "inbox-row-width");
@@ -1242,17 +1252,42 @@ fn inbox_row(
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(inner)
-            .layout(egui::Layout::top_down(egui::Align::Min))
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
             .id_salt(("inbox-row", id)),
     );
-    child.spacing_mut().item_spacing.y = space::XS;
+    child.spacing_mut().item_spacing.x = space::S;
+    let (avatar_rect, avatar_response) = child.allocate_exact_size(
+        egui::vec2(super::photos::AVATAR_SIDE, super::photos::AVATAR_SIDE),
+        egui::Sense::hover(),
+    );
+    avatar_response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("avatar {title}"))
+    });
+    super::photos::paint_avatar(ui, avatar_rect, protocol, id, title, avatar, out);
+    child.vertical(|ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = space::XS;
+        inbox_row_lines(ui, title, preview, time, unread, muted, palette);
+    });
+    ui.interact(rect, row_id, egui::Sense::click())
+}
+
+fn inbox_row_lines(
+    ui: &mut egui::Ui,
+    title: &str,
+    preview: &str,
+    time: &str,
+    unread: u32,
+    muted: bool,
+    palette: &theme::Palette,
+) {
     let title_font = if unread > 0 {
         theme::semibold()
     } else {
         theme::medium()
     };
     row_ends(
-        &mut child,
+        ui,
         |ui| {
             ui.add(
                 egui::Label::new(
@@ -1275,7 +1310,7 @@ fn inbox_row(
         },
     );
     row_ends(
-        &mut child,
+        ui,
         |ui| {
             ui.add(
                 egui::Label::new(
@@ -1293,7 +1328,6 @@ fn inbox_row(
             }
         },
     );
-    ui.interact(rect, row_id, egui::Sense::click())
 }
 
 /// Highlight behind an inbox row or an account chip. Hover and selection

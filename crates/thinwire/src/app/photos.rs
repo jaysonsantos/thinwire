@@ -8,9 +8,14 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use eframe::egui::{self, Color32, Sense, Vec2};
 use thinwire_core::Intent;
-use thinwire_protocol::{MessagePhoto, PhotoSize, ProtocolId};
+use thinwire_protocol::{ChatAvatar, MessagePhoto, PhotoSize, ProtocolId};
 
 use super::motion;
+
+/// Diameter of an inbox avatar, in points.
+pub(crate) const AVATAR_SIDE: f32 = 36.0;
+/// Corner radius that turns the 36 px square into a circle.
+const AVATAR_RADIUS: u8 = 18;
 
 /// Longest side of a chat photo, in points.
 const MAX_SIDE: f32 = 360.0;
@@ -198,6 +203,115 @@ pub(crate) fn take_escape(ctx: &egui::Context) -> bool {
         data.insert_temp(ui_id(), ui);
     });
     closed
+}
+
+/// One inbox avatar. A ready photo uses the chat-photo loader and cache.
+/// With no photo, or while the file is still loading, the circle shows initials.
+pub(crate) fn paint_avatar(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    protocol: ProtocolId,
+    conversation_id: &str,
+    title: &str,
+    avatar: &ChatAvatar,
+    out: &mut Vec<Intent>,
+) {
+    prune_loads(ui.ctx());
+    let ink = super::theme::avatar_ink(avatar.accent, ui.visuals().dark_mode);
+    // Opaque circle, so the row selection fill does not show through.
+    ui.painter()
+        .circle_filled(rect.center(), AVATAR_SIDE * 0.5, ink.fill);
+    let shown = avatar_image(ui, protocol, conversation_id, avatar);
+    if let Some(shown) = &shown {
+        paint_circle(ui, &avatar_base(protocol, conversation_id), shown, rect);
+    } else {
+        paint_initials(ui, rect, title, ink.text);
+    }
+    // One ask per file. A repeat each frame would dispatch each frame, and
+    // each dispatch asks for a repaint. The core sets `requested` when it
+    // queues the download.
+    if protocol.downloads_avatar()
+        && shown.is_none()
+        && !avatar.ready()
+        && !avatar.failed
+        && !avatar.requested
+        && ui.is_rect_visible(rect)
+        && let Some(file_id) = avatar.file_id
+    {
+        out.push(Intent::LoadAvatar {
+            protocol,
+            conversation_id: conversation_id.to_owned(),
+            file_id,
+        });
+    }
+}
+
+/// Up to two initials from `title`. A title with no letters is "?".
+#[must_use]
+pub(crate) fn initials(title: &str) -> String {
+    let mut letters = String::new();
+    for word in title.split_whitespace() {
+        let Some(ch) = word.chars().find(|ch| ch.is_alphanumeric()) else {
+            continue;
+        };
+        letters.extend(ch.to_uppercase());
+        if letters.chars().count() >= 2 {
+            break;
+        }
+    }
+    if letters.is_empty() {
+        "?".into()
+    } else {
+        letters
+    }
+}
+
+fn avatar_image(
+    ui: &egui::Ui,
+    protocol: ProtocolId,
+    conversation_id: &str,
+    avatar: &ChatAvatar,
+) -> Option<Shown> {
+    let base = avatar_base(protocol, conversation_id);
+    if let Some(bytes) = &avatar.bytes {
+        let slice = bytes.as_slice();
+        if !slice.is_empty() {
+            return Some(shown_inline(ui, &base, slice));
+        }
+    }
+    let path = avatar.path.as_ref()?.as_str();
+    let file_id = avatar.file_id?;
+    let slot = format!("{protocol}/{conversation_id}");
+    read_path(ui, &slot, &base, file_id, path)
+}
+
+fn avatar_base(protocol: ProtocolId, conversation_id: &str) -> String {
+    format!("bytes://thinwire/avatar/{protocol}/{conversation_id}")
+}
+
+fn paint_circle(ui: &mut egui::Ui, base: &str, shown: &Shown, rect: egui::Rect) {
+    if let Some(bytes) = &shown.fresh {
+        publish(ui, base, &shown.uri, bytes);
+        if let Some(slot) = &shown.slot {
+            slot.hand_to_egui(shown.uri.clone());
+        }
+    }
+    // Default image tint is white, which leaves the photo untinted.
+    egui::Image::from_uri(&shown.uri)
+        .fit_to_exact_size(rect.size())
+        .corner_radius(egui::CornerRadius::same(AVATAR_RADIUS))
+        .show_loading_spinner(false)
+        .paint_at(ui, rect);
+}
+
+fn paint_initials(ui: &egui::Ui, rect: egui::Rect, title: &str, color: Color32) {
+    let font = egui::FontId::new(super::theme::size::BUTTON, super::theme::semibold());
+    let galley = ui.painter().layout_no_wrap(initials(title), font, color);
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x * 0.5,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    ui.painter().galley(pos, galley, color);
 }
 
 pub(crate) fn show(
@@ -767,6 +881,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_visible_avatar_asks_for_its_file_once() {
+        let mut avatar = ChatAvatar {
+            file_id: Some(4),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        super::super::theme::install(&ctx);
+        let mut first = Vec::new();
+        run_avatar(&ctx, ProtocolId::Telegram, "1", &avatar, &mut first);
+        assert_eq!(avatar_asks(&first), 1);
+        avatar.requested = true;
+        let mut second = Vec::new();
+        run_avatar(&ctx, ProtocolId::Telegram, "1", &avatar, &mut second);
+        assert!(second.is_empty(), "the next frame asked again: {second:?}");
+        avatar.requested = false;
+        let mut other = Vec::new();
+        run_avatar(&ctx, ProtocolId::Discord, "1", &avatar, &mut other);
+        assert!(
+            other.is_empty(),
+            "another protocol asked for a photo: {other:?}"
+        );
+    }
+
+    #[test]
+    fn the_avatar_image_uri_includes_the_protocol() {
+        let bytes = b"avatar-bytes";
+        let avatar = ChatAvatar {
+            file_id: Some(4),
+            bytes: Some(thinwire_protocol::ImageBytes::new(bytes.to_vec())),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        super::super::theme::install(&ctx);
+        run_avatar(&ctx, ProtocolId::Telegram, "1", &avatar, &mut Vec::new());
+        let uri = image_uri(&avatar_base(ProtocolId::Telegram, "1"), fingerprint(bytes));
+        assert!(uri.contains("Telegram/1"), "{uri}");
+        assert_eq!(cached_bytes(&ctx, &uri).as_deref(), Some(bytes.as_slice()));
+        let discord = image_uri(&avatar_base(ProtocolId::Discord, "1"), fingerprint(bytes));
+        assert_ne!(uri, discord);
+        assert!(cached_bytes(&ctx, &discord).is_none());
+    }
+
+    #[test]
+    fn initials_use_the_first_letter_of_up_to_two_words() {
+        assert_eq!(initials("Ada Park"), "AP");
+        assert_eq!(initials("Book club"), "BC");
+        assert_eq!(initials("Milo"), "M");
+        assert_eq!(initials("#design"), "D");
+        assert_eq!(initials("   "), "?");
+    }
+
+    #[test]
     fn the_photo_box_does_not_change_when_the_bytes_arrive() {
         let before = photo_box(360, 144);
         let after = photo_box(360, 144);
@@ -989,6 +1155,38 @@ mod tests {
     }
 
     static NEXT_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn avatar_asks(out: &[Intent]) -> usize {
+        out.iter()
+            .filter(|intent| matches!(intent, Intent::LoadAvatar { file_id: 4, .. }))
+            .count()
+    }
+
+    fn run_avatar(
+        ctx: &egui::Context,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        avatar: &ChatAvatar,
+        out: &mut Vec<Intent>,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(AVATAR_SIDE, AVATAR_SIDE),
+                );
+                paint_avatar(ui, rect, protocol, conversation_id, "Ada", avatar, out);
+            });
+        });
+        output.textures_delta.clear();
+    }
 
     fn run_frame(ctx: &egui::Context, photo: &MessagePhoto, out: &mut Vec<Intent>) {
         let input = egui::RawInput {

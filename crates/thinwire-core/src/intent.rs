@@ -101,6 +101,13 @@ pub enum Intent {
         message_id: String,
         file_id: i32,
     },
+    /// Download the small photo of one inbox row. The core sends one request
+    /// until that file finishes or fails. The same download path as [`Self::LoadPhoto`].
+    LoadAvatar {
+        protocol: ProtocolId,
+        conversation_id: String,
+        file_id: i32,
+    },
     /// Telegram login and account actions.
     Telegram(TelegramIntent),
     /// Experimental WhatsApp pairing. Only a `whatsapp-web` build acts on it.

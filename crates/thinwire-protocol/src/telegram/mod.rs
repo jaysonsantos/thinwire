@@ -962,6 +962,14 @@ mod tests {
         );
         assert!(updates.contains("Update::ChatNotificationSettings"));
         assert!(updates.contains("Update::ScopeNotificationSettings"));
+        assert!(updates.contains("Update::ChatPhoto"));
+        assert!(updates.contains("set_photo"));
+        let small = fn_body(src, "fn small_photo_id");
+        assert!(small.contains("photo.small.id"));
+        assert!(
+            !small.contains("has_animation"),
+            "the animated variant stays unused"
+        );
         let chat = fn_body(src, "fn note_chat");
         assert!(chat.contains("i64::from(message.date)"));
         assert!(chat.contains("ChatType::BasicGroup(_) => true"));

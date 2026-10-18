@@ -798,6 +798,7 @@ where
                     muted: false,
                     placeholder: false,
                     has_topics: false,
+                    avatar: Default::default(),
                 };
                 if let Some(existing) = self.channels.get(&channel.id) {
                     // Keep live preview, unread, order, and time from Socket Mode.
@@ -1148,6 +1149,7 @@ where
                 muted: false,
                 placeholder: false,
                 has_topics: false,
+                avatar: Default::default(),
             };
             if workspace_denied {
                 let would_post = self

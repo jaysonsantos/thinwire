@@ -172,6 +172,89 @@ pub(crate) const fn muted_badge_ring(palette: &Palette) -> Color32 {
     palette.text
 }
 
+/// Circle behind inbox initials, and the initials color on that circle.
+///
+/// One pair per `accent_color_id` in 0–6. The initials use the accent ink.
+/// Each pair is at least 4.5:1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AvatarInk {
+    pub fill: Color32,
+    pub text: Color32,
+}
+
+const LIGHT_AVATAR: [AvatarInk; 7] = [
+    AvatarInk {
+        fill: hex(0xF3_B8_BE),
+        text: hex(0x8B_1E_2D),
+    },
+    AvatarInk {
+        fill: hex(0xF6_C9_A0),
+        text: hex(0x7A_32_00),
+    },
+    AvatarInk {
+        fill: hex(0xD4_C4_F5),
+        text: hex(0x54_28_87),
+    },
+    AvatarInk {
+        fill: hex(0xB7_E3_B8),
+        text: hex(0x0F_5C_2E),
+    },
+    AvatarInk {
+        fill: hex(0xB5_E3_E6),
+        text: hex(0x0C_59_62),
+    },
+    AvatarInk {
+        fill: hex(0xC5_D7_F6),
+        text: hex(0x0D_3C_88),
+    },
+    AvatarInk {
+        fill: hex(0xF5_C0_D6),
+        text: hex(0x8A_21_54),
+    },
+];
+
+const DARK_AVATAR: [AvatarInk; 7] = [
+    AvatarInk {
+        fill: hex(0x5C_2E_36),
+        text: hex(0xFF_D0_D4),
+    },
+    AvatarInk {
+        fill: hex(0x5C_3C_22),
+        text: hex(0xFF_E0_C2),
+    },
+    AvatarInk {
+        fill: hex(0x3E_34_58),
+        text: hex(0xE6_D8_FF),
+    },
+    AvatarInk {
+        fill: hex(0x24_50_3A),
+        text: hex(0xC8_F5_D4),
+    },
+    AvatarInk {
+        fill: hex(0x1E_4A_50),
+        text: hex(0xC6_F4_F8),
+    },
+    AvatarInk {
+        fill: hex(0x243C64),
+        text: hex(0xD4_E6_FF),
+    },
+    AvatarInk {
+        fill: hex(0x5C_2C_44),
+        text: hex(0xFF_D0_E4),
+    },
+];
+
+/// Initials colors for palette index `accent` (0–6). Other values use 0.
+#[must_use]
+pub(crate) const fn avatar_ink(accent: u8, dark: bool) -> AvatarInk {
+    let index = if accent <= 6 { accent as usize } else { 0 };
+    if dark {
+        DARK_AVATAR[index]
+    } else {
+        LIGHT_AVATAR[index]
+    }
+}
+
 /// Ink for a disabled "Muted in {protocol}" control (#206).
 ///
 /// Title and reason are full palette colors on `bg` (the menu popup and the
@@ -644,6 +727,22 @@ mod tests {
                 assert!(ratio >= TEXT_AA, "{theme} {part}: {ratio:.2} < {TEXT_AA}");
             }
         }
+    }
+
+    #[test]
+    fn every_palette_color_gives_initials_at_least_4_5_contrast() {
+        for accent in 0..=6 {
+            for (theme, dark) in [("light", false), ("dark", true)] {
+                let ink = avatar_ink(accent, dark);
+                assert_ne!(ink.text, Color32::WHITE, "{theme} accent {accent} text");
+                let ratio = contrast(ink.text, ink.fill);
+                assert!(
+                    ratio >= TEXT_AA,
+                    "{theme} accent {accent}: {ratio:.2} < {TEXT_AA}"
+                );
+            }
+        }
+        assert_eq!(avatar_ink(9, false).text, avatar_ink(0, false).text);
     }
 
     #[test]
