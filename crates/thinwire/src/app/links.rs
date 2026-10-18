@@ -359,7 +359,10 @@ pub(crate) fn interact(
         return;
     }
     let label = body.get(link.start..link.end).unwrap_or("");
-    response.clone().on_hover_text(&link.url);
+    response
+        .clone()
+        .on_hover_text(&link.url)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.clicked() {
         if needs_confirm(label, &link.url) {
             remember_confirm(ui.ctx(), &link.url);
