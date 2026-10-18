@@ -4,7 +4,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use eframe::egui::{self, Color32, Sense, Vec2};
 use thinwire_core::Intent;
@@ -16,6 +16,10 @@ use super::motion;
 const MAX_SIDE: f32 = 360.0;
 /// Shortest side when the photo can grow without passing [`MAX_SIDE`].
 const MIN_SHORT: f32 = 64.0;
+/// Workers that read and blur photos. The UI thread only queues a job.
+const PHOTO_WORKERS: usize = 2;
+/// Jobs waiting for a worker. A full queue leaves the photo for a later frame.
+const PHOTO_QUEUE: usize = 4;
 
 /// The box for a photo. Fit in 360×360. Grow a small photo until the short
 /// side is 64, unless that would pass 360. A wide photo stays inside 360
@@ -125,6 +129,10 @@ impl BytesSlot {
         self.cancelled.store(true, Ordering::Release);
         *self.lock() = Load::Missing;
         self.done.store(true, Ordering::Release);
+    }
+
+    fn abandoned(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 
     /// Drop the bytes after egui has stored them.
@@ -430,15 +438,18 @@ fn read_path(
         return shown_from_slot(&slot, base);
     }
     let slot = BytesSlot::wait();
-    track(ui.ctx(), slot.clone());
     let worker = slot.clone();
     let ctx = ui.ctx().clone();
     let path = path.to_owned();
-    std::thread::spawn(move || {
-        let bytes = std::fs::read(&path).ok();
-        worker.finish(bytes);
-        ctx.request_repaint();
-    });
+    // A full queue waits for the next frame. The UI thread does not block.
+    if !enqueue_photo(PhotoJob::Read {
+        path,
+        slot: worker,
+        ctx,
+    }) {
+        return None;
+    }
+    track(ui.ctx(), slot.clone());
     ui.data_mut(|data| data.insert_temp(id, slot));
     None
 }
@@ -474,15 +485,18 @@ fn blurred_mini(ui: &egui::Ui, message_id: &str, photo: &MessagePhoto) -> Option
         return shown_from_slot(&slot, &base);
     }
     let slot = BytesSlot::wait();
-    track(ui.ctx(), slot.clone());
     let worker = slot.clone();
     let ctx = ui.ctx().clone();
     let bytes = slice.to_vec();
-    std::thread::spawn(move || {
-        let png = blur_png(&bytes);
-        worker.finish(png);
-        ctx.request_repaint();
-    });
+    // A full queue waits for the next frame. The UI thread does not block.
+    if !enqueue_photo(PhotoJob::Blur {
+        bytes,
+        slot: worker,
+        ctx,
+    }) {
+        return None;
+    }
+    track(ui.ctx(), slot.clone());
     ui.data_mut(|data| data.insert_temp(id, slot));
     forget_base(ui, &base);
     None
@@ -503,6 +517,77 @@ fn retire_previous(ui: &egui::Ui, active: egui::Id, id: egui::Id) {
         data.remove::<BytesSlot>(previous);
         data.insert_temp(active, id);
     });
+}
+
+enum PhotoJob {
+    Read {
+        path: String,
+        slot: BytesSlot,
+        ctx: egui::Context,
+    },
+    Blur {
+        bytes: Vec<u8>,
+        slot: BytesSlot,
+        ctx: egui::Context,
+    },
+}
+
+fn photo_sender() -> &'static mpsc::SyncSender<PhotoJob> {
+    static SENDER: OnceLock<mpsc::SyncSender<PhotoJob>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel(PHOTO_QUEUE);
+        let rx = Arc::new(Mutex::new(rx));
+        for index in 0..PHOTO_WORKERS {
+            let rx = Arc::clone(&rx);
+            let started = std::thread::Builder::new()
+                .name(format!("thinwire-photo-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let guard = rx.lock().unwrap_or_else(|error| error.into_inner());
+                            guard.recv()
+                        };
+                        match job {
+                            Ok(job) => run_photo_job(job),
+                            Err(_) => break,
+                        }
+                    }
+                });
+            if let Err(error) = started {
+                tracing::warn!(%error, "photo worker did not start");
+            }
+        }
+        tx
+    })
+}
+
+/// `false` when the queue is full. The caller retries on a later frame.
+#[must_use]
+fn enqueue_photo(job: PhotoJob) -> bool {
+    photo_sender().try_send(job).is_ok()
+}
+
+fn run_photo_job(job: PhotoJob) {
+    match job {
+        PhotoJob::Read { path, slot, ctx } => {
+            let bytes = if slot.abandoned() {
+                None
+            } else {
+                std::fs::read(&path).ok()
+            };
+            slot.finish(bytes);
+            ctx.request_repaint();
+        }
+        PhotoJob::Blur { bytes, slot, ctx } => {
+            let png = if slot.abandoned() {
+                None
+            } else {
+                blur_png(&bytes)
+            };
+            slot.finish(png);
+            ctx.request_repaint();
+        }
+    }
 }
 
 fn blur_png(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -967,5 +1052,13 @@ mod tests {
         assert!(src.contains("motion::spinner"));
         assert!(!src.contains(concat!("ui.spin", "ner")));
         assert!(!src.contains(concat!("Spin", "ner::")));
+    }
+
+    #[test]
+    fn photo_jobs_use_a_bounded_queue() {
+        let src = include_str!("photos.rs");
+        assert!(src.contains("sync_channel(PHOTO_QUEUE)"));
+        assert!(src.contains("try_send"));
+        assert!(!src.contains(concat!("std::thread::", "spawn")));
     }
 }
