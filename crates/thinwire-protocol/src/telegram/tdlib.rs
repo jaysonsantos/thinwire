@@ -1858,13 +1858,13 @@ async fn finish_photo(client_id: i32, file: tdlib_rs::types::File, secret: bool,
             let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
         }
         match read {
-            Ok(Some(bytes)) => emit_photo_ready(
-                events,
-                ProtocolId::Telegram,
-                file_id,
-                None,
-                Some(crate::ImageBytes::new(bytes)),
-            ),
+            Ok(Some(bytes)) => {
+                let Some(file) = crate::PhotoFile::from_bytes(crate::ImageBytes::new(bytes)) else {
+                    emit_photo_failed(events, ProtocolId::Telegram, file_id);
+                    return;
+                };
+                emit_photo_ready(events, ProtocolId::Telegram, file_id, file);
+            }
             _ => emit_photo_failed(events, ProtocolId::Telegram, file_id),
         }
         return;
@@ -1874,8 +1874,7 @@ async fn finish_photo(client_id: i32, file: tdlib_rs::types::File, secret: bool,
             events,
             ProtocolId::Telegram,
             file_id,
-            Some(crate::ImagePath::new(file.local.path)),
-            None,
+            crate::PhotoFile::from_path(crate::ImagePath::new(file.local.path)),
         );
     } else {
         emit_photo_failed(events, ProtocolId::Telegram, file_id);

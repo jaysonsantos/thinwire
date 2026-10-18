@@ -73,6 +73,70 @@ impl fmt::Debug for ImagePath {
     }
 }
 
+/// A downloaded photo. It has a path, bytes, or both.
+///
+/// `finish_photo` sends `PhotoFailed` when the file has neither, so this
+/// value is never empty.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PhotoFile {
+    path: Option<ImagePath>,
+    bytes: Option<ImageBytes>,
+}
+
+impl PhotoFile {
+    /// A file on disk. The path is the image.
+    #[must_use]
+    pub fn from_path(path: ImagePath) -> Self {
+        Self {
+            path: Some(path),
+            bytes: None,
+        }
+    }
+
+    /// Encoded bytes, for a secret photo. `None` when `bytes` is empty.
+    #[must_use]
+    pub fn from_bytes(bytes: ImageBytes) -> Option<Self> {
+        if bytes.is_empty() {
+            None
+        } else {
+            Some(Self {
+                path: None,
+                bytes: Some(bytes),
+            })
+        }
+    }
+
+    /// `None` when there is no path and no bytes.
+    #[must_use]
+    pub fn new(path: Option<ImagePath>, bytes: Option<ImageBytes>) -> Option<Self> {
+        let bytes = bytes.filter(|bytes| !bytes.is_empty());
+        if path.is_none() && bytes.is_none() {
+            None
+        } else {
+            Some(Self { path, bytes })
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> Option<&ImagePath> {
+        self.path.as_ref()
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> Option<&ImageBytes> {
+        self.bytes.as_ref()
+    }
+}
+
+impl fmt::Debug for PhotoFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PhotoFile")
+            .field("path", &self.path)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
 /// One size of a photo. The UI picks the size near twice the display width.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PhotoSize {
@@ -158,7 +222,11 @@ pub struct ChatAvatar {
     pub bytes: Option<ImageBytes>,
     /// `accent_color_id` folded into palette 0–6.
     pub accent: u8,
-    /// The last download of [`Self::file_id`] failed. A new file id clears it.
+    /// The core has queued a download of [`Self::file_id`].
+    /// The inbox asks once. A new file id clears it.
+    pub requested: bool,
+    /// The last download of [`Self::file_id`] failed.
+    /// It stays failed until the file id changes. The next launch loads again.
     pub failed: bool,
 }
 
@@ -188,6 +256,7 @@ impl fmt::Debug for ChatAvatar {
             .field("path", &self.path)
             .field("bytes", &self.bytes)
             .field("accent", &self.accent)
+            .field("requested", &self.requested)
             .field("failed", &self.failed)
             .finish()
     }

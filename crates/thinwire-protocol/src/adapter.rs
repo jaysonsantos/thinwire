@@ -48,6 +48,13 @@ impl ProtocolId {
             Self::Signal => "Signal",
         }
     }
+
+    /// The inbox downloads a chat photo for this protocol.
+    /// The other protocols draw initials.
+    #[must_use]
+    pub const fn downloads_avatar(self) -> bool {
+        matches!(self, Self::Telegram)
+    }
 }
 
 impl fmt::Display for ProtocolId {
@@ -541,13 +548,12 @@ pub enum AdapterEvent {
         links: Vec<crate::media::MessageLink>,
     },
     /// A photo file finished downloading.
+    /// [`crate::media::PhotoFile`] has a path or bytes. An empty file is
+    /// [`Self::PhotoFailed`].
     PhotoReady {
         protocol: ProtocolId,
         file_id: i32,
-        /// Set for a normal photo. A secret photo leaves this empty.
-        path: Option<crate::media::ImagePath>,
-        /// Set for a secret photo. The file is not kept.
-        bytes: Option<crate::media::ImageBytes>,
+        file: crate::media::PhotoFile,
     },
     /// A photo file did not download.
     PhotoFailed {
@@ -1043,14 +1049,12 @@ pub(crate) fn emit_photo_ready(
     events: &EventTx,
     protocol: ProtocolId,
     file_id: i32,
-    path: Option<crate::media::ImagePath>,
-    bytes: Option<crate::media::ImageBytes>,
+    file: crate::media::PhotoFile,
 ) {
     let _ = events.send(AdapterEvent::PhotoReady {
         protocol,
         file_id,
-        path,
-        bytes,
+        file,
     });
 }
 
