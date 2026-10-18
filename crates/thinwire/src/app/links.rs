@@ -453,10 +453,11 @@ fn open_mailto(url: &str) -> std::io::Result<()> {
 
 /// Start the OS mail handler.
 ///
-/// The address is one argument. It is not interpolated into a shell string.
+/// The address is one argument. It is not a shell string.
 /// On Windows, `ShellExecuteW` needs `unsafe`, which this workspace forbids.
-/// `cmd /d /v:off /c start "" "<address>"` is the handler instead.
-/// `%` is written as `%%`. A quote or a control character is refused.
+/// `rundll32 url.dll,FileProtocolHandler` passes the address with no `cmd`.
+/// `cmd /c` is command-line mode: `%%` stays as two percent signs there,
+/// and `%name%` expands inside quotes.
 fn mailto_command(url: &str) -> std::io::Result<std::process::Command> {
     #[cfg(windows)]
     {
@@ -475,44 +476,47 @@ fn mailto_command(url: &str) -> std::io::Result<std::process::Command> {
     }
 }
 
-#[cfg(windows)]
-fn windows_mailto_command(url: &str) -> std::io::Result<std::process::Command> {
-    use std::os::windows::process::CommandExt;
-
-    let quoted = quote_cmd_arg(url).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "mailto address is not safe to open",
-        )
-    })?;
-    let mut command = std::process::Command::new("cmd");
-    command.arg("/d").arg("/v:off").arg("/c").arg("start");
-    // `raw_arg` keeps the quotes we wrote. `arg` would quote them again.
-    command.raw_arg("\"\"");
-    command.raw_arg(&quoted);
-    // `CREATE_NO_WINDOW`. A console must not flash over the app.
-    command.creation_flags(0x0800_0000);
-    Ok(command)
+/// `rundll32` in System32, so a `rundll32` earlier on `PATH` is not used.
+#[cfg(any(windows, test))]
+fn rundll32_program() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let root = root.trim_end_matches(['\\', '/']);
+    format!(r"{root}\System32\rundll32.exe")
 }
 
-/// One quoted `cmd` argument.
+/// One `rundll32` argument.
 ///
-/// `%` becomes `%%`, so `cmd` does not expand a variable.
-/// A quote or a control character cannot be quoted safely, so those addresses are refused.
+/// A quote, a space, or a control character is refused.
+/// `Command` would quote a space, and `rundll32` keeps those quotes in the address.
+/// `%` stays as written. This path does not run `cmd`.
+/// `url.dll` exports `FileProtocolHandler` as an ANSI entry.
+/// A percent-encoded address is ASCII, so that conversion keeps `%25`.
 #[cfg(any(windows, test))]
-fn quote_cmd_arg(url: &str) -> Option<String> {
-    if url.chars().any(|ch| ch.is_control() || ch == '"') {
-        return None;
+fn windows_mailto_arg(url: &str) -> bool {
+    is_mailto(url)
+        && !url
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '"')
+}
+
+#[cfg(any(windows, test))]
+fn windows_mailto_command(url: &str) -> std::io::Result<std::process::Command> {
+    if !windows_mailto_arg(url) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mailto address is not safe to open",
+        ));
     }
-    let mut quoted = String::from("\"");
-    for ch in url.chars() {
-        if ch == '%' {
-            quoted.push('%');
-        }
-        quoted.push(ch);
+    let mut command = std::process::Command::new(rundll32_program());
+    command.arg("url.dll,FileProtocolHandler");
+    command.arg(url);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // `CREATE_NO_WINDOW`. A console must not flash over the app.
+        command.creation_flags(0x0800_0000);
     }
-    quoted.push('"');
-    Some(quoted)
+    Ok(command)
 }
 
 fn confirm_id() -> egui::Id {
@@ -687,37 +691,50 @@ mod tests {
 
         let url = "mailto:ada@b.test?subject=Hi&body=a%20b";
         let command = mailto_command(url).expect("command");
-        let args: Vec<String> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let args = command_args(&command);
         if cfg!(target_os = "macos") {
             assert_eq!(command.get_program(), "open");
             assert_eq!(args, [url]);
         } else if cfg!(windows) {
-            assert_eq!(command.get_program(), "cmd");
-            assert_eq!(
-                args.iter().take(4).map(String::as_str).collect::<Vec<_>>(),
-                vec!["/d", "/v:off", "/c", "start"]
-            );
-            assert!(
-                args.iter()
-                    .any(|arg| arg.contains("mailto:ada@b.test") && arg.contains('&')),
-                "the address is one quoted argument: {args:?}"
-            );
+            assert_windows_mailto(&command, url);
         } else {
             assert_eq!(command.get_program(), "xdg-open");
             assert_eq!(args, [url]);
         }
 
-        let quoted = quote_cmd_arg("mailto:a@b.test?subject=100%&body=x").expect("quoted");
-        assert_eq!(quoted, "\"mailto:a@b.test?subject=100%%&body=x\"");
+        // `cmd /c` keeps `%%` as two percent signs. The handler must see `%25`.
+        let encoded = "mailto:a@b.test?subject=100%25";
+        let command = windows_mailto_command(encoded).expect("windows command");
+        assert_windows_mailto(&command, encoded);
+        assert!(windows_mailto_command("mailto:a\"@b.test&calc").is_err());
+        assert!(windows_mailto_command("mailto:a@b.test\ncalc").is_err());
+        assert!(windows_mailto_command("mailto:a@b.test?subject=hello world").is_err());
+        assert!(windows_mailto_command("https://a.test").is_err());
+    }
+
+    fn command_args(command: &std::process::Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn assert_windows_mailto(command: &std::process::Command, url: &str) {
+        let program = command.get_program().to_string_lossy();
         assert!(
-            quoted.starts_with('"') && quoted.ends_with('"'),
-            "the address stays inside one pair of quotes"
+            program.ends_with(r"\System32\rundll32.exe"),
+            "mailto goes through rundll32: {program}"
         );
-        assert!(quote_cmd_arg("mailto:a\"@b.test&calc").is_none());
-        assert!(quote_cmd_arg("mailto:a@b.test\ncalc").is_none());
+        let args = command_args(command);
+        assert_eq!(
+            args,
+            ["url.dll,FileProtocolHandler".to_string(), url.to_string()],
+            "the address is one argument and keeps each percent: {args:?}"
+        );
+        assert!(
+            !url.contains("%%") && args.iter().all(|arg| !arg.contains("%%")),
+            "a doubled percent would survive cmd /c: {args:?}"
+        );
     }
 
     #[test]
