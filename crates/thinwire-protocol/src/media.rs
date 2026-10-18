@@ -143,6 +143,56 @@ impl fmt::Debug for MessagePhoto {
     }
 }
 
+/// Still chat photo for an inbox avatar, plus the accent used for initials.
+///
+/// Telegram fills [`Self::file_id`] from `chat.photo.small` (160×160).
+/// Other protocols leave the photo empty. The shell draws initials from
+/// [`Self::accent`].
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct ChatAvatar {
+    /// TDLib file id of the small photo. Empty when the chat has no photo.
+    pub file_id: Option<i32>,
+    /// Local file after download. The UI reads it off the UI thread.
+    pub path: Option<ImagePath>,
+    /// Encoded bytes for a demo or a test.
+    pub bytes: Option<ImageBytes>,
+    /// `accent_color_id` folded into palette 0–6.
+    pub accent: u8,
+    /// The last download of [`Self::file_id`] failed. A new file id clears it.
+    pub failed: bool,
+}
+
+impl ChatAvatar {
+    /// Map a TDLib `accent_color_id` onto palette 0–6.
+    /// An id outside that range uses color 0.
+    #[must_use]
+    pub const fn accent_index(accent_color_id: i32) -> u8 {
+        if accent_color_id >= 0 && accent_color_id <= 6 {
+            accent_color_id as u8
+        } else {
+            0
+        }
+    }
+
+    /// The image is already here: bytes, or a downloaded file.
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        self.bytes.as_ref().is_some_and(|bytes| !bytes.is_empty()) || self.path.is_some()
+    }
+}
+
+impl fmt::Debug for ChatAvatar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChatAvatar")
+            .field("file_id", &self.file_id)
+            .field("path", &self.path)
+            .field("bytes", &self.bytes)
+            .field("accent", &self.accent)
+            .field("failed", &self.failed)
+            .finish()
+    }
+}
+
 /// One TDLib text entity, already filtered to a link kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextSpan {

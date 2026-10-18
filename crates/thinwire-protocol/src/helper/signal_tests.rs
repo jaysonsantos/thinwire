@@ -152,6 +152,7 @@ impl FakeClient {
             placeholder: false,
             muted: false,
             has_topics: false,
+            avatar: Default::default(),
         }
     }
 

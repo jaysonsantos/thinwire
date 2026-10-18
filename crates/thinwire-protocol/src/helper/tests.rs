@@ -345,6 +345,7 @@ impl GatedFake {
             placeholder: false,
             muted: false,
             has_topics: false,
+            avatar: Default::default(),
         }
     }
 

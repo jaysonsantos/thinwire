@@ -746,6 +746,9 @@ pub struct Conversation {
     /// A forum supergroup, or a chat with a bot that has topics. The sidebar
     /// keeps one row. The center pane lists the topics.
     pub has_topics: bool,
+    /// Inbox avatar. Telegram sets the small photo and the accent.
+    /// Other protocols leave the photo empty.
+    pub avatar: crate::media::ChatAvatar,
 }
 
 /// One topic inside a forum or a bot chat.

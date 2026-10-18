@@ -719,6 +719,7 @@ impl Inbox {
                 placeholder: false,
                 muted: record.mute.is_on(now_ms()),
                 has_topics: false,
+                avatar: Default::default(),
             },
         })
     }

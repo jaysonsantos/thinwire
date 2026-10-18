@@ -102,6 +102,10 @@ pub(super) struct ChatSeed<'a> {
     pub has_topics: bool,
     /// Private-chat user id, so a later bot update can set `has_topics`.
     pub peer: Option<i64>,
+    /// TDLib file id of `chat.photo.small`. Empty when the chat has no photo.
+    pub photo_file_id: Option<i32>,
+    /// `accent_color_id` in palette 0–6.
+    pub accent: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +121,8 @@ struct ChatRecord {
     mute: ChatMute,
     has_topics: bool,
     peer: Option<i64>,
+    photo_file_id: Option<i32>,
+    accent: u8,
 }
 
 /// Main-list chats keyed by TDLib chat id. `order == 0` is not listed.
@@ -205,6 +211,8 @@ impl ChatDirectory {
                 mute: seed.mute,
                 has_topics: seed.has_topics,
                 peer: seed.peer,
+                photo_file_id: seed.photo_file_id,
+                accent: seed.accent,
             },
         );
         self.effect(chat_id, previous)
@@ -323,6 +331,39 @@ impl ChatDirectory {
         self.effect(chat_id, Some(previous))
     }
 
+    /// `updateChatPhoto`. The cached file id is dropped first, then the new
+    /// small-photo id is stored. `None` means the chat has no photo.
+    pub(super) fn set_photo(&mut self, chat_id: i64, file_id: Option<i32>) -> Option<ChatEffect> {
+        let previous = self.ensure(chat_id).order;
+        self.drop_photo_file(chat_id);
+        if let Some(file_id) = file_id
+            && let Some(chat) = self.chats.get_mut(&chat_id)
+        {
+            chat.photo_file_id = Some(file_id);
+        }
+        self.effect(chat_id, Some(previous))
+    }
+
+    /// The file id remembered for this chat, if it has a photo.
+    pub(super) fn photo_file_id(&self, chat_id: i64) -> Option<i32> {
+        self.chats.get(&chat_id).and_then(|chat| chat.photo_file_id)
+    }
+
+    fn drop_photo_file(&mut self, chat_id: i64) {
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.photo_file_id = None;
+        }
+    }
+
+    /// `updateChatAccentColors`. The photo file id stays.
+    pub(super) fn set_accent(&mut self, chat_id: i64, accent_color_id: i32) -> Option<ChatEffect> {
+        let previous = self.ensure(chat_id).order;
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.accent = crate::media::ChatAvatar::accent_index(accent_color_id);
+        }
+        self.effect(chat_id, Some(previous))
+    }
+
     /// New last message. `at` is Unix seconds; zero clears the time.
     pub(super) fn set_preview(
         &mut self,
@@ -351,6 +392,8 @@ impl ChatDirectory {
             mute: ChatMute::default(),
             has_topics: false,
             peer: None,
+            photo_file_id: None,
+            accent: 0,
         })
     }
 
@@ -856,6 +899,11 @@ fn conversation_from(chat_id: i64, chat: &ChatRecord, muted: bool) -> Conversati
         placeholder: false,
         muted,
         has_topics: chat.has_topics,
+        avatar: crate::media::ChatAvatar {
+            file_id: chat.photo_file_id,
+            accent: chat.accent,
+            ..crate::media::ChatAvatar::default()
+        },
     }
 }
 
@@ -900,6 +948,8 @@ mod tests {
             mute: ChatMute::default(),
             has_topics: false,
             peer: None,
+            photo_file_id: None,
+            accent: 0,
         }
     }
 
@@ -1304,6 +1354,45 @@ mod tests {
             panic!("expected upsert");
         };
         assert_eq!(chat.order, 60);
+    }
+
+    #[test]
+    fn update_chat_photo_drops_the_cached_file_id() {
+        let mut directory = ChatDirectory::new();
+        directory.upsert(4, seed("Ada", 2, 0, "hi"));
+        let ChatEffect::Upsert(row) = directory.set_photo(4, Some(15)).expect("first photo") else {
+            panic!("expected upsert");
+        };
+        assert_eq!(row.avatar.file_id, Some(15));
+        assert_eq!(directory.photo_file_id(4), Some(15));
+
+        let ChatEffect::Upsert(row) = directory.set_photo(4, Some(16)).expect("new photo") else {
+            panic!("expected upsert");
+        };
+        assert_eq!(row.avatar.file_id, Some(16));
+        assert_eq!(directory.photo_file_id(4), Some(16));
+        assert_ne!(directory.photo_file_id(4), Some(15));
+
+        let ChatEffect::Upsert(row) = directory.set_photo(4, None).expect("photo removed") else {
+            panic!("expected upsert");
+        };
+        assert_eq!(row.avatar.file_id, None);
+        assert_eq!(directory.photo_file_id(4), None);
+        assert_eq!(row.avatar.accent, 0, "a photo update keeps the accent");
+
+        let ChatEffect::Upsert(row) = directory.set_accent(4, 3).expect("accent") else {
+            panic!("expected upsert");
+        };
+        assert_eq!(row.avatar.accent, 3);
+        assert_eq!(row.avatar.file_id, None);
+        assert_eq!(
+            directory.set_accent(4, 99).and_then(|effect| match effect {
+                ChatEffect::Upsert(row) => Some(row.avatar.accent),
+                ChatEffect::Remove(_) => None,
+            }),
+            Some(0),
+            "an accent outside 0–6 uses color 0"
+        );
     }
 
     #[test]

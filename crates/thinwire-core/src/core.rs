@@ -676,6 +676,11 @@ impl Core {
             } => self
                 .state
                 .load_photo(protocol, &conversation_id, &message_id, file_id),
+            Intent::LoadAvatar {
+                protocol,
+                conversation_id,
+                file_id,
+            } => self.state.load_avatar(protocol, &conversation_id, file_id),
             Intent::Telegram(intent) => self.telegram(intent),
             Intent::WhatsApp(intent) => self.whatsapp(intent),
             Intent::Discord(DiscordIntent::Connect) => {

@@ -143,6 +143,7 @@ impl SlackAdapter {
                 placeholder: true,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         );
         emit_message(

@@ -8,9 +8,14 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use eframe::egui::{self, Color32, Sense, Vec2};
 use thinwire_core::Intent;
-use thinwire_protocol::{MessagePhoto, PhotoSize, ProtocolId};
+use thinwire_protocol::{ChatAvatar, MessagePhoto, PhotoSize, ProtocolId};
 
 use super::motion;
+
+/// Diameter of an inbox avatar, in points.
+pub(crate) const AVATAR_SIDE: f32 = 36.0;
+/// Corner radius that turns the 36 px square into a circle.
+const AVATAR_RADIUS: u8 = 18;
 
 /// Longest side of a chat photo, in points.
 const MAX_SIDE: f32 = 360.0;
@@ -198,6 +203,105 @@ pub(crate) fn take_escape(ctx: &egui::Context) -> bool {
         data.insert_temp(ui_id(), ui);
     });
     closed
+}
+
+/// One inbox avatar. A ready photo uses the chat-photo loader and cache.
+/// With no photo, or while the file is still loading, the circle shows initials.
+pub(crate) fn paint_avatar(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    protocol: ProtocolId,
+    conversation_id: &str,
+    title: &str,
+    avatar: &ChatAvatar,
+    out: &mut Vec<Intent>,
+) {
+    prune_loads(ui.ctx());
+    let ink = super::theme::avatar_ink(avatar.accent, ui.visuals().dark_mode);
+    // Opaque circle, so the row selection fill does not show through.
+    ui.painter()
+        .circle_filled(rect.center(), AVATAR_SIDE * 0.5, ink.fill);
+    let shown = avatar_image(ui, conversation_id, avatar);
+    if let Some(shown) = &shown {
+        paint_circle(ui, &avatar_base(conversation_id), shown, rect);
+    } else {
+        paint_initials(ui, rect, title, ink.text);
+    }
+    if protocol == ProtocolId::Telegram
+        && shown.is_none()
+        && !avatar.ready()
+        && !avatar.failed
+        && ui.is_rect_visible(rect)
+        && let Some(file_id) = avatar.file_id
+    {
+        out.push(Intent::LoadAvatar {
+            protocol,
+            conversation_id: conversation_id.to_owned(),
+            file_id,
+        });
+    }
+}
+
+/// Up to two initials from `title`. A title with no letters is "?".
+#[must_use]
+pub(crate) fn initials(title: &str) -> String {
+    let mut letters = String::new();
+    for word in title.split_whitespace() {
+        let Some(ch) = word.chars().find(|ch| ch.is_alphanumeric()) else {
+            continue;
+        };
+        letters.extend(ch.to_uppercase());
+        if letters.chars().count() >= 2 {
+            break;
+        }
+    }
+    if letters.is_empty() {
+        "?".into()
+    } else {
+        letters
+    }
+}
+
+fn avatar_image(ui: &egui::Ui, conversation_id: &str, avatar: &ChatAvatar) -> Option<Shown> {
+    let base = avatar_base(conversation_id);
+    if let Some(bytes) = &avatar.bytes {
+        let slice = bytes.as_slice();
+        if !slice.is_empty() {
+            return Some(shown_inline(ui, &base, slice));
+        }
+    }
+    let path = avatar.path.as_ref()?.as_str();
+    let file_id = avatar.file_id?;
+    read_path(ui, conversation_id, &base, file_id, path)
+}
+
+fn avatar_base(conversation_id: &str) -> String {
+    format!("bytes://thinwire/avatar/{conversation_id}")
+}
+
+fn paint_circle(ui: &mut egui::Ui, base: &str, shown: &Shown, rect: egui::Rect) {
+    if let Some(bytes) = &shown.fresh {
+        publish(ui, base, &shown.uri, bytes);
+        if let Some(slot) = &shown.slot {
+            slot.hand_to_egui(shown.uri.clone());
+        }
+    }
+    // Default image tint is white, which leaves the photo untinted.
+    egui::Image::from_uri(&shown.uri)
+        .fit_to_exact_size(rect.size())
+        .corner_radius(egui::CornerRadius::same(AVATAR_RADIUS))
+        .show_loading_spinner(false)
+        .paint_at(ui, rect);
+}
+
+fn paint_initials(ui: &egui::Ui, rect: egui::Rect, title: &str, color: Color32) {
+    let font = egui::FontId::new(super::theme::size::BUTTON, super::theme::semibold());
+    let galley = ui.painter().layout_no_wrap(initials(title), font, color);
+    let pos = egui::pos2(
+        rect.center().x - galley.size().x * 0.5,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    ui.painter().galley(pos, galley, color);
 }
 
 pub(crate) fn show(
@@ -765,6 +869,15 @@ fn ui_id() -> egui::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initials_use_the_first_letter_of_up_to_two_words() {
+        assert_eq!(initials("Ada Park"), "AP");
+        assert_eq!(initials("Book club"), "BC");
+        assert_eq!(initials("Milo"), "M");
+        assert_eq!(initials("#design"), "D");
+        assert_eq!(initials("   "), "?");
+    }
 
     #[test]
     fn the_photo_box_does_not_change_when_the_bytes_arrive() {

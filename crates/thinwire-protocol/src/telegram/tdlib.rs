@@ -1341,6 +1341,19 @@ async fn apply_chat_update(
             let effect = live.directory.set_title(update.chat_id, &update.title);
             live.publish(events, emit, effect);
         }
+        tdlib_rs::enums::Update::ChatPhoto(update) => {
+            // Drop the cached file id, then store the new small photo.
+            let effect = live
+                .directory
+                .set_photo(update.chat_id, small_photo_id(update.photo.as_ref()));
+            live.publish(events, emit, effect);
+        }
+        tdlib_rs::enums::Update::ChatAccentColors(update) => {
+            let effect = live
+                .directory
+                .set_accent(update.chat_id, update.accent_color_id);
+            live.publish(events, emit, effect);
+        }
         tdlib_rs::enums::Update::ChatPosition(update) => {
             if matches!(update.position.list, tdlib_rs::enums::ChatList::Main) {
                 let effect = live
@@ -1649,8 +1662,15 @@ fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Opt
             mute: chat_mute(&chat.notification_settings),
             has_topics: forum_or_bot(directory, &chat.r#type, chat.view_as_topics),
             peer: chat_peer(&chat.r#type),
+            photo_file_id: small_photo_id(chat.photo.as_ref()),
+            accent: crate::media::ChatAvatar::accent_index(chat.accent_color_id),
         },
     )
+}
+
+/// File id of `chat.photo.small` (160×160). The animated variant is ignored.
+fn small_photo_id(photo: Option<&tdlib_rs::types::ChatPhotoInfo>) -> Option<i32> {
+    photo.map(|photo| photo.small.id)
 }
 
 fn chat_mute(settings: &tdlib_rs::types::ChatNotificationSettings) -> ChatMute {
@@ -2767,6 +2787,8 @@ mod tests {
                 mute: ChatMute::default(),
                 has_topics: false,
                 peer: None,
+                photo_file_id: None,
+                accent: 0,
             },
         );
         assert!(
@@ -2824,6 +2846,8 @@ mod tests {
                 mute: ChatMute::default(),
                 has_topics: false,
                 peer: None,
+                photo_file_id: None,
+                accent: 0,
             },
         );
         fake.view(Some("telegram:42"));

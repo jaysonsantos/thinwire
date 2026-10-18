@@ -927,6 +927,19 @@ impl Snapshot {
                 let protocol = conversation.protocol;
                 let list = self.conversations.entry(protocol).or_default();
                 if let Some(existing) = list.iter_mut().find(|row| row.id == conversation.id) {
+                    // A title or unread update keeps a download of the same file.
+                    // A new file id drops the old path so the row loads again.
+                    if existing.avatar.file_id == conversation.avatar.file_id {
+                        if conversation.avatar.path.is_none() {
+                            conversation.avatar.path.clone_from(&existing.avatar.path);
+                        }
+                        if conversation.avatar.bytes.is_none() {
+                            conversation.avatar.bytes.clone_from(&existing.avatar.bytes);
+                        }
+                        if existing.avatar.failed {
+                            conversation.avatar.failed = true;
+                        }
+                    }
                     *existing = conversation;
                 } else {
                     list.push(conversation);
@@ -4020,6 +4033,38 @@ impl Snapshot {
         });
     }
 
+    /// Download the small photo of an inbox row. A second request while the
+    /// first is in flight does nothing. The same `DownloadFile` path as a
+    /// chat photo. Only Telegram rows carry a file id.
+    pub(crate) fn load_avatar(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        file_id: i32,
+    ) {
+        if protocol != ProtocolId::Telegram {
+            return;
+        }
+        let Some(row) = self
+            .conversations
+            .get(&protocol)
+            .and_then(|list| list.iter().find(|row| row.id == conversation_id))
+        else {
+            return;
+        };
+        if row.avatar.file_id != Some(file_id) || row.avatar.ready() || row.avatar.failed {
+            return;
+        }
+        if !self.photo_downloads.insert((protocol, file_id)) {
+            return;
+        }
+        self.queue(AdapterCommand::DownloadFile {
+            protocol,
+            file_id,
+            secret: false,
+        });
+    }
+
     fn photo_ready(
         &mut self,
         protocol: ProtocolId,
@@ -4057,6 +4102,21 @@ impl Snapshot {
                 }
             }
         }
+        let Some(list) = self.conversations.get_mut(&protocol) else {
+            return;
+        };
+        for row in list.iter_mut() {
+            if row.avatar.file_id != Some(file_id) {
+                continue;
+            }
+            row.avatar.failed = false;
+            if let Some(bytes) = &bytes {
+                row.avatar.bytes = Some(bytes.clone());
+            }
+            if path.is_some() {
+                row.avatar.path.clone_from(&path);
+            }
+        }
     }
 
     fn photo_failed(&mut self, protocol: ProtocolId, file_id: i32) {
@@ -4072,6 +4132,14 @@ impl Snapshot {
                 if photo.sizes.iter().any(|size| size.file_id == Some(file_id)) {
                     photo.failed = true;
                 }
+            }
+        }
+        let Some(list) = self.conversations.get_mut(&protocol) else {
+            return;
+        };
+        for row in list.iter_mut() {
+            if row.avatar.file_id == Some(file_id) {
+                row.avatar.failed = true;
             }
         }
     }
@@ -4470,6 +4538,7 @@ pub mod test_support {
             placeholder: false,
             muted: false,
             has_topics: false,
+            avatar: Default::default(),
         }
     }
 
@@ -5361,6 +5430,7 @@ mod tests {
                 placeholder: false,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         snapshot.select_conversation("telegram:1".into());
@@ -5427,6 +5497,7 @@ mod tests {
                 placeholder: false,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         snapshot.select_conversation("telegram:1".into());
@@ -5508,6 +5579,7 @@ mod tests {
                 placeholder: false,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         snapshot.select_conversation("telegram:1".into());
@@ -5565,6 +5637,7 @@ mod tests {
                 placeholder: false,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         snapshot.select_conversation("telegram:1".into());
@@ -5617,6 +5690,67 @@ mod tests {
         );
         assert!(!format!("{photo:?}").contains("secret-photo"));
         assert!(!format!("{photo:?}").contains("jpeg-bytes"));
+    }
+
+    #[test]
+    fn a_new_avatar_file_id_drops_the_downloaded_path() {
+        use thinwire_protocol::ImagePath;
+
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        let mut row = telegram_chat(1, "Ada", 1);
+        row.avatar.file_id = Some(4);
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation: row });
+        snapshot.load_avatar(ProtocolId::Telegram, "telegram:1", 4);
+        snapshot.load_avatar(ProtocolId::Telegram, "telegram:1", 4);
+        let queued = snapshot.take_commands();
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    AdapterCommand::DownloadFile { file_id: 4, .. }
+                ))
+                .count(),
+            1,
+            "one download while the file is in flight"
+        );
+        snapshot.apply(AdapterEvent::PhotoReady {
+            protocol: ProtocolId::Telegram,
+            file_id: 4,
+            path: Some(ImagePath::new("/tmp/avatar-a")),
+            bytes: None,
+        });
+        let kept = snapshot
+            .conversation(ProtocolId::Telegram, "telegram:1")
+            .expect("row");
+        assert!(kept.avatar.path.is_some());
+        assert!(!format!("{kept:?}").contains("avatar-a"));
+
+        let mut same = telegram_chat(1, "Ada Park", 1);
+        same.avatar.file_id = Some(4);
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation: same });
+        assert!(
+            snapshot
+                .conversation(ProtocolId::Telegram, "telegram:1")
+                .expect("row")
+                .avatar
+                .path
+                .is_some(),
+            "the same file id keeps the download"
+        );
+
+        let mut next = telegram_chat(1, "Ada Park", 1);
+        next.avatar.file_id = Some(5);
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation: next });
+        let row = snapshot
+            .conversation(ProtocolId::Telegram, "telegram:1")
+            .expect("row");
+        assert_eq!(row.avatar.file_id, Some(5));
+        assert!(row.avatar.path.is_none(), "the old file id is gone");
     }
 
     fn forum_row(
@@ -6611,6 +6745,7 @@ mod tests {
                 muted: false,
                 placeholder: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         assert_eq!(snapshot.unread_for(ProtocolId::Signal), 1);
@@ -6634,6 +6769,7 @@ mod tests {
                 muted: false,
                 placeholder: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         assert_eq!(snapshot.unread_for(ProtocolId::Signal), 0);
@@ -7871,6 +8007,7 @@ mod tests {
                 placeholder: false,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         };
         // A row before Ready is from a cancelled or ended client: dropped.
@@ -8349,6 +8486,7 @@ mod tests {
             placeholder: true,
             muted: false,
             has_topics: false,
+            avatar: Default::default(),
         }
     }
 
@@ -8527,6 +8665,7 @@ mod tests {
                 placeholder: false,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         snapshot
@@ -8725,6 +8864,7 @@ mod tests {
                 placeholder: false,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         snapshot.apply(AdapterEvent::ConversationUpsert {
@@ -8742,6 +8882,7 @@ mod tests {
                 placeholder: false,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         let ids: Vec<_> = snapshot
@@ -8925,6 +9066,7 @@ mod tests {
                 placeholder: false,
                 muted: false,
                 has_topics: false,
+                avatar: Default::default(),
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -9518,6 +9660,7 @@ mod tests {
             placeholder: false,
             muted: false,
             has_topics: false,
+            avatar: Default::default(),
         }
     }
 

@@ -454,6 +454,7 @@ mod tests {
             muted: false,
             placeholder: false,
             has_topics: false,
+            avatar: Default::default(),
         }
     }
 

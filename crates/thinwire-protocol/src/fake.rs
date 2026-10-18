@@ -84,6 +84,7 @@ impl ProtocolAdapter for FakeAdapter {
                         placeholder: false,
                         muted: false,
                         has_topics: false,
+                        avatar: Default::default(),
                     },
                 );
                 emit_message(
