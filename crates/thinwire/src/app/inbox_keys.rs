@@ -8,7 +8,7 @@ use thinwire_core::state::test_support::{
 };
 use thinwire_core::{Intent, View};
 use thinwire_protocol::{
-    AdapterEvent, ChatMessage, Delivery, HelperFault, HelperState, ProtocolId,
+    AdapterEvent, ChatMessage, Delivery, HelperFault, HelperState, MessageLink, ProtocolId,
 };
 
 use super::theme;
@@ -738,6 +738,99 @@ fn an_accesskit_selection_reaches_the_bubble() {
     let selection = node
         .raw_text_selection()
         .expect("the pane reports a selection");
+    assert_eq!(selection.anchor.character_index, 0);
+    assert_eq!(selection.focus.character_index, 5);
+}
+
+/// A blocked scheme stays in the bubble as text. The user can select it and copy it.
+#[test]
+fn a_blocked_scheme_stays_selectable_text() {
+    let parts = [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "smb://server/share",
+        "custom://open",
+    ];
+    let body = parts.join(" ");
+    let mut links = Vec::new();
+    let mut offset = 0usize;
+    for (index, part) in parts.iter().enumerate() {
+        links.push(MessageLink {
+            start: offset,
+            end: offset + part.len(),
+            url: (*part).to_string(),
+        });
+        offset += part.len();
+        if index + 1 != parts.len() {
+            offset += 1;
+        }
+    }
+    let mut message = chat_message("telegram:1:blocked", &body, 1_790_300_000);
+    message.links = links;
+    let mut state = InboxUi::ready();
+    state
+        .snapshot
+        .apply(AdapterEvent::MessageReceived { message });
+    let mut harness = harness(state);
+    harness.run();
+    let _pane = harness.get(By::new().role(egui::accesskit::Role::Pane).predicate({
+        let body = body.clone();
+        move |node| !node.is_hidden() && node.label().is_some_and(|label| label.contains(&body))
+    }));
+    let run = harness
+        .query_all(By::new().role(egui::accesskit::Role::TextRun))
+        .find(|node| {
+            !node.accesskit_node().is_hidden()
+                && node
+                    .value()
+                    .is_some_and(|value| !value.is_empty() && body.contains(value.as_str()))
+        })
+        .expect("text run");
+    run.click();
+    harness.step();
+    let pane = harness.get(By::new().role(egui::accesskit::Role::Pane).predicate({
+        let body = body.clone();
+        move |node| !node.is_hidden() && node.label().is_some_and(|label| label.contains(&body))
+    }));
+    let (target_node, target_tree) = pane.accesskit_node().locate();
+    let run = harness
+        .query_all(By::new().role(egui::accesskit::Role::TextRun))
+        .find(|node| {
+            !node.accesskit_node().is_hidden()
+                && node
+                    .value()
+                    .is_some_and(|value| !value.is_empty() && body.contains(value.as_str()))
+        })
+        .expect("text run");
+    let (run_node, _) = run.accesskit_node().locate();
+    harness.event(egui::Event::AccessKitActionRequest(
+        egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::SetTextSelection,
+            target_node,
+            target_tree,
+            data: Some(egui::accesskit::ActionData::SetTextSelection(
+                egui::accesskit::TextSelection {
+                    anchor: egui::accesskit::TextPosition {
+                        node: run_node,
+                        character_index: 0,
+                    },
+                    focus: egui::accesskit::TextPosition {
+                        node: run_node,
+                        character_index: 5,
+                    },
+                },
+            )),
+        },
+    ));
+    harness.step();
+    let pane = harness.get(By::new().role(egui::accesskit::Role::Pane).predicate({
+        let body = body.clone();
+        move |node| !node.is_hidden() && node.label().is_some_and(|label| label.contains(&body))
+    }));
+    let node = pane.accesskit_node();
+    let selection = node
+        .raw_text_selection()
+        .expect("the blocked address can be selected");
     assert_eq!(selection.anchor.character_index, 0);
     assert_eq!(selection.focus.character_index, 5);
 }

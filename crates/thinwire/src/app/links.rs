@@ -3,6 +3,8 @@
 //!
 //! Opening a link happens off the UI thread. The address is not logged.
 //! [`open_url`] checks the scheme again. A blocked scheme is plain text.
+//! `http` and `https` go through `webbrowser` with its `hardened` feature.
+//! `mailto` goes to the OS handler as one argument.
 
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Color32, FontId, Stroke, TextFormat};
@@ -13,6 +15,8 @@ use thinwire_protocol::{MessageLink, openable_url};
 #[derive(Clone)]
 struct PendingLink {
     url: String,
+    /// Open button from the last frame. Enter activates it only when it has focus.
+    open_id: Option<egui::Id>,
 }
 
 /// True when the label is not the address the app will open.
@@ -153,11 +157,18 @@ pub(crate) fn layout_job(
 }
 
 pub(crate) fn remember_confirm(ctx: &egui::Context, url: &str) {
+    let same = ctx
+        .data(|data| data.get_temp::<PendingLink>(confirm_id()))
+        .is_some_and(|pending| pending.url == url);
+    if same {
+        return;
+    }
     ctx.data_mut(|data| {
         data.insert_temp(
             confirm_id(),
             PendingLink {
                 url: url.to_owned(),
+                open_id: None,
             },
         );
     });
@@ -167,12 +178,88 @@ pub(crate) fn remember_confirm(ctx: &egui::Context, url: &str) {
 pub(crate) fn take_escape(ctx: &egui::Context) -> bool {
     let open = ctx.data(|data| data.get_temp::<PendingLink>(confirm_id()).is_some());
     if open {
+        let _ = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         ctx.data_mut(|data| data.remove::<PendingLink>(confirm_id()));
     }
     open
 }
 
-/// The confirm dialog. It shows the real address and does not log it.
+/// Enter while the confirm dialog is open.
+///
+/// `true` when the dialog takes the key, so the center screen does not also
+/// act on it. The key cancels, unless focus is already on the Open button.
+pub(crate) fn take_enter(ctx: &egui::Context) -> bool {
+    let Some(pending) = ctx.data(|data| data.get_temp::<PendingLink>(confirm_id())) else {
+        return false;
+    };
+    let open_focused = pending
+        .open_id
+        .is_some_and(|id| ctx.memory(|memory| memory.focused() == Some(id)));
+    if open_focused {
+        return true;
+    }
+    let _ = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+    ctx.data_mut(|data| data.remove::<PendingLink>(confirm_id()));
+    true
+}
+
+/// The host the dialog shows.
+///
+/// [`url::Url::host_str`] is the punycode form of an international name.
+/// A `mailto` address has no host. The domain after `@` is read the same way.
+fn confirm_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if let Some(host) = parsed.host_str() {
+        return Some(host.to_owned());
+    }
+    if !parsed.scheme().eq_ignore_ascii_case("mailto") {
+        return None;
+    }
+    let domain = parsed.path().rsplit_once('@')?.1;
+    let domain = domain.split(['?', '#']).next().unwrap_or(domain);
+    let domain = percent_decode(domain)?;
+    if domain.is_empty() {
+        return None;
+    }
+    url::Url::parse(&format!("https://{domain}"))
+        .ok()
+        .and_then(|probe| probe.host_str().map(ToOwned::to_owned))
+}
+
+/// Decode `%HH` bytes. `None` when an escape is cut off or the bytes are not UTF-8.
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn open_button_label(url: &str) -> String {
+    match confirm_host(url) {
+        Some(host) => format!("Open {host}"),
+        None => "Open link".to_owned(),
+    }
+}
+
+/// Semibold is the bold weight of the UI font.
+fn host_font() -> egui::FontId {
+    egui::FontId::new(super::theme::size::BODY, super::theme::semibold())
+}
+
+/// The confirm dialog. It shows the real host and does not log the address.
 pub(crate) fn confirm(ui: &mut egui::Ui) {
     let Some(pending) = ui
         .ctx()
@@ -180,8 +267,12 @@ pub(crate) fn confirm(ui: &mut egui::Ui) {
     else {
         return;
     };
+    let url = pending.url.clone();
+    let host = confirm_host(&url);
+    let open_label = open_button_label(&url);
     let screen = ui.ctx().content_rect();
-    let mut open = true;
+    let mut dismiss = false;
+    let mut open_id = None;
     egui::Area::new(egui::Id::new("link-confirm"))
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
@@ -194,23 +285,58 @@ pub(crate) fn confirm(ui: &mut egui::Ui) {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ui.ctx(), |ui| {
-                    ui.set_max_width(360.0);
+                    ui.set_max_width(420.0);
                     ui.label("This link text does not match the address.");
-                    ui.label(pending.url.as_str());
+                    if let Some(host) = &host {
+                        ui.label(
+                            egui::RichText::new(host)
+                                .font(host_font())
+                                .color(super::theme::palette(ui).text),
+                        );
+                    }
+                    ui.label(url.as_str());
                     ui.horizontal(|ui| {
-                        if ui.button("Open link").clicked() {
-                            open_url(&pending.url);
-                            open = false;
+                        let open_button = ui.button(&open_label);
+                        open_id = Some(open_button.id);
+                        if open_button.clicked() {
+                            open_url(&url);
+                            dismiss = true;
                         }
-                        if ui.button("Cancel").clicked() {
-                            open = false;
+                        let cancel = ui.button("Cancel");
+                        let focused = ui.memory(|memory| memory.focused());
+                        if focused != Some(open_button.id) && focused != Some(cancel.id) {
+                            cancel.request_focus();
+                        }
+                        if cancel.clicked() {
+                            dismiss = true;
+                        }
+                        // The center panel also handles these keys. This covers
+                        // a frame where that panel did not run.
+                        let (enter, escape) = ui.input(|input| {
+                            (
+                                input.key_pressed(egui::Key::Enter),
+                                input.key_pressed(egui::Key::Escape),
+                            )
+                        });
+                        if escape || (enter && focused != Some(open_button.id)) {
+                            dismiss = true;
                         }
                     });
                 });
         });
-    if !open {
-        ui.ctx()
-            .data_mut(|data| data.remove::<PendingLink>(confirm_id()));
+    let ctx = ui.ctx();
+    if dismiss {
+        ctx.data_mut(|data| data.remove::<PendingLink>(confirm_id()));
+    } else if let Some(id) = open_id {
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                confirm_id(),
+                PendingLink {
+                    url,
+                    open_id: Some(id),
+                },
+            );
+        });
     }
 }
 
@@ -255,11 +381,138 @@ pub(crate) fn open_url(url: &str) {
     let Some(url) = openable_url(url) else {
         return;
     };
-    std::thread::spawn(move || {
-        if webbrowser::open(&url).is_err() {
-            tracing::debug!("link did not open");
+    dispatch_open(url);
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn dispatch_open(url: String) {
+    #[cfg(test)]
+    {
+        OPENED.with(|opened| opened.borrow_mut().push(url));
+    }
+    #[cfg(not(test))]
+    {
+        // The UI thread only queues the open. The worker talks to the OS.
+        std::thread::spawn(move || {
+            if !open_on_worker(&url) {
+                tracing::debug!("link did not open");
+            }
+        });
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Opener {
+    /// `webbrowser` with `hardened`. Only `http` and `https` succeed there.
+    Browser,
+    /// The OS handler. `hardened` rejects `mailto`.
+    Mail,
+}
+
+fn opener(url: &str) -> Option<Opener> {
+    let url = openable_url(url)?;
+    if is_mailto(&url) {
+        Some(Opener::Mail)
+    } else {
+        Some(Opener::Browser)
+    }
+}
+
+fn is_mailto(url: &str) -> bool {
+    url.split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("mailto"))
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn open_on_worker(url: &str) -> bool {
+    match opener(url) {
+        Some(Opener::Mail) => open_mailto(url).is_ok(),
+        Some(Opener::Browser) => webbrowser::open(url).is_ok(),
+        None => false,
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn open_mailto(url: &str) -> std::io::Result<()> {
+    let mut command = mailto_command(url)?;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("mailto handler failed"))
+    }
+}
+
+/// Start the OS mail handler.
+///
+/// The address is one argument. It is not interpolated into a shell string.
+/// On Windows, `ShellExecuteW` needs `unsafe`, which this workspace forbids.
+/// `cmd /d /v:off /c start "" "<address>"` is the handler instead.
+/// `%` is written as `%%`. A quote or a control character is refused.
+fn mailto_command(url: &str) -> std::io::Result<std::process::Command> {
+    #[cfg(windows)]
+    {
+        windows_mailto_command(url)
+    }
+    #[cfg(not(windows))]
+    {
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut command = std::process::Command::new(program);
+        command.arg(url);
+        Ok(command)
+    }
+}
+
+#[cfg(windows)]
+fn windows_mailto_command(url: &str) -> std::io::Result<std::process::Command> {
+    use std::os::windows::process::CommandExt;
+
+    let quoted = quote_cmd_arg(url).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mailto address is not safe to open",
+        )
+    })?;
+    let mut command = std::process::Command::new("cmd");
+    command.arg("/d").arg("/v:off").arg("/c").arg("start");
+    // `raw_arg` keeps the quotes we wrote. `arg` would quote them again.
+    command.raw_arg("\"\"");
+    command.raw_arg(&quoted);
+    // `CREATE_NO_WINDOW`. A console must not flash over the app.
+    command.creation_flags(0x0800_0000);
+    Ok(command)
+}
+
+/// One quoted `cmd` argument.
+///
+/// `%` becomes `%%`, so `cmd` does not expand a variable.
+/// A quote or a control character cannot be quoted safely, so those addresses are refused.
+#[cfg(any(windows, test))]
+fn quote_cmd_arg(url: &str) -> Option<String> {
+    if url.chars().any(|ch| ch.is_control() || ch == '"') {
+        return None;
+    }
+    let mut quoted = String::from("\"");
+    for ch in url.chars() {
+        if ch == '%' {
+            quoted.push('%');
         }
-    });
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    Some(quoted)
 }
 
 fn confirm_id() -> egui::Id {
@@ -316,8 +569,14 @@ mod tests {
         let text = Color32::WHITE;
         let link = Color32::BLUE;
         let font = FontId::monospace(14.0);
-        for url in ["file:///etc/passwd", "javascript:alert(1)", "custom://open"] {
-            let body = "see the doc";
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "smb://server/share",
+            "custom://open",
+        ] {
+            // The blocked address is the visible text, so a selection can copy it.
+            let body = url;
             let links = [MessageLink {
                 start: 0,
                 end: body.len(),
@@ -343,6 +602,122 @@ mod tests {
                 .any(|section| section.format.underline.width > 0.0)
         );
         assert_eq!(openable_url(body).as_deref(), Some(body));
+    }
+
+    #[test]
+    fn a_lookalike_idn_host_asks_and_the_dialog_shows_punycode() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{NodeT, Queryable};
+
+        // Cyrillic 'а' (U+0430) in place of Latin 'a'.
+        let target = "https://\u{0430}pple.com/account";
+        let label = "https://apple.com/account";
+        assert!(needs_confirm(label, target));
+        let host = confirm_host(target).expect("host");
+        assert_eq!(host, "xn--pple-43d.com");
+        assert_eq!(open_button_label(target), "Open xn--pple-43d.com");
+        assert_eq!(host_font().family, crate::app::theme::semibold());
+        // The real host is the part after `@` in the authority, not the lookalike.
+        assert_eq!(
+            confirm_host("https://apple.com@evil.example/x").as_deref(),
+            Some("evil.example")
+        );
+        assert_eq!(
+            confirm_host("mailto:ada@\u{0430}pple.com").as_deref(),
+            Some("xn--pple-43d.com")
+        );
+
+        let show = |target: &'static str| {
+            let remember = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fonts = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            Harness::builder()
+                .with_size(egui::vec2(640.0, 400.0))
+                .build_ui(move |ui| {
+                    // `install` lands on the next pass. The host label needs that font.
+                    if !fonts.load(std::sync::atomic::Ordering::Relaxed) {
+                        crate::app::theme::install(ui.ctx());
+                        if !ui
+                            .style()
+                            .text_styles
+                            .contains_key(&crate::app::theme::secondary())
+                        {
+                            return;
+                        }
+                        fonts.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // One shot. A later frame must not open the dialog again after Cancel.
+                    if !remember.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        remember_confirm(ui.ctx(), target);
+                    }
+                    confirm(ui);
+                })
+        };
+        let mut harness = show(target);
+        harness.run();
+        harness.get_by_label("xn--pple-43d.com");
+        harness.get_by_role_and_label(Role::Button, "Open xn--pple-43d.com");
+        let cancel = harness.get_by_role_and_label(Role::Button, "Cancel");
+        assert!(
+            cancel.accesskit_node().is_focused(),
+            "focus starts on Cancel"
+        );
+
+        OPENED.with(|opened| opened.borrow_mut().clear());
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+        assert!(harness.query_by_label("Cancel").is_none());
+        OPENED.with(|opened| assert!(opened.borrow().is_empty(), "Enter cancels"));
+
+        let mut harness = show(target);
+        harness.run();
+        harness.key_press(egui::Key::Escape);
+        harness.step();
+        assert!(harness.query_by_label("Cancel").is_none());
+        OPENED.with(|opened| assert!(opened.borrow().is_empty(), "Escape cancels"));
+    }
+
+    #[test]
+    fn mailto_is_one_argument_and_does_not_use_the_browser() {
+        assert_eq!(opener("https://a.test"), Some(Opener::Browser));
+        assert_eq!(opener("mailto:ada@b.test"), Some(Opener::Mail));
+        assert_eq!(opener("MAILTO:ada@b.test"), Some(Opener::Mail));
+        assert_eq!(opener("file:///etc/passwd"), None);
+        assert_eq!(opener("javascript:alert(1)"), None);
+
+        let url = "mailto:ada@b.test?subject=Hi&body=a%20b";
+        let command = mailto_command(url).expect("command");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        if cfg!(target_os = "macos") {
+            assert_eq!(command.get_program(), "open");
+            assert_eq!(args, [url]);
+        } else if cfg!(windows) {
+            assert_eq!(command.get_program(), "cmd");
+            assert_eq!(
+                args.iter().take(4).map(String::as_str).collect::<Vec<_>>(),
+                vec!["/d", "/v:off", "/c", "start"]
+            );
+            assert!(
+                args.iter()
+                    .any(|arg| arg.contains("mailto:ada@b.test") && arg.contains('&')),
+                "the address is one quoted argument: {args:?}"
+            );
+        } else {
+            assert_eq!(command.get_program(), "xdg-open");
+            assert_eq!(args, [url]);
+        }
+
+        let quoted = quote_cmd_arg("mailto:a@b.test?subject=100%&body=x").expect("quoted");
+        assert_eq!(quoted, "\"mailto:a@b.test?subject=100%%&body=x\"");
+        assert!(
+            quoted.starts_with('"') && quoted.ends_with('"'),
+            "the address stays inside one pair of quotes"
+        );
+        assert!(quote_cmd_arg("mailto:a\"@b.test&calc").is_none());
+        assert!(quote_cmd_arg("mailto:a@b.test\ncalc").is_none());
     }
 
     #[test]

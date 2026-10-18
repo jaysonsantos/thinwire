@@ -42,7 +42,10 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ] }
-webbrowser = "1"
+# `hardened` rejects every scheme except http and https (webbrowser 1.2).
+webbrowser = { version = "1.2", features = ["hardened"] }
+# Host display for the link confirm dialog. `host_str` is the punycode form.
+url = "2"
 thinwire-core.workspace = true
 thinwire-notify.workspace = true
 thinwire-protocol.workspace = true

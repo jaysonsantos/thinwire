@@ -1430,7 +1430,7 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: 
             if !closed {
                 out.push(Intent::Key(AuthKey::Escape));
             }
-        } else if enter {
+        } else if enter && !super::links::take_enter(ui.ctx()) {
             out.push(Intent::Key(AuthKey::Enter));
         }
         // Another view or another login step fades in. A chat switch keeps
