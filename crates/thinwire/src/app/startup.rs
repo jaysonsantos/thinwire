@@ -487,6 +487,18 @@ mod tests {
 
     use super::*;
 
+    /// A lock whose `instance.show` path is one byte past [`MAX_SOCKET_PATH_BYTES`].
+    #[cfg(unix)]
+    fn overlong_lock_path() -> PathBuf {
+        let root = std::path::Path::new("/tmp");
+        let name = "instance.show";
+        let total = thinwire_core::instance::MAX_SOCKET_PATH_BYTES + 1;
+        let overhead = root.as_os_str().len() + 1 + 1 + name.len();
+        let socket = root.join("t".repeat(total - overhead)).join(name);
+        assert_eq!(socket.as_os_str().len(), total);
+        socket.with_file_name("instance.lock")
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -771,6 +783,38 @@ mod tests {
         let listener = binder.join().expect("binder");
         assert!(listener.take_show());
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// Bind fails before `listen`. The process still takes the lock and starts.
+    /// A second launch finds no endpoint and waits, as it does with no listener.
+    #[cfg(unix)]
+    #[test]
+    fn an_overlong_socket_path_still_starts_this_process() {
+        let path = overlong_lock_path();
+        let launch = Instant::now();
+        let startup = first_try(Some(path.clone()), launch);
+        assert!(
+            matches!(startup, Launch::Start(Startup::Ready)),
+            "a path that cannot bind still starts, got {startup:?}"
+        );
+        assert!(
+            launch.elapsed() < Duration::from_millis(500),
+            "no wait window, waited {:?}",
+            launch.elapsed()
+        );
+        let socket = thinwire_core::instance::socket_path(&path);
+        assert!(socket.as_os_str().len() > thinwire_core::instance::MAX_SOCKET_PATH_BYTES);
+        assert!(
+            socket.symlink_metadata().is_err(),
+            "an overlong path must not leave a socket"
+        );
+        assert!(
+            matches!(InstanceLock::try_acquire(&path), Err(LockError::Held)),
+            "this process kept the lock"
+        );
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     fn leave_stale_socket(path: &std::path::Path) {

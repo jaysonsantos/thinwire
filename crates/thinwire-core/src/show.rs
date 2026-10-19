@@ -10,12 +10,21 @@
 //! files in that folder, so the pipe name is derived from the lock path and
 //! the pipe allows only its owner. A remote client is rejected.
 //!
+//! A Unix socket path has to fit in `sun_path`. That field is 108 bytes on
+//! Linux and 104 bytes on macOS and the BSDs. One byte is the trailing NUL,
+//! so the longest path is 107 bytes on Linux and 103 on macOS and the BSDs.
+//! A longer path does not bind. This process still runs, and a second launch
+//! waits for the lock.
+//!
 //! A stale socket file is removed only when this process holds the lock, the
-//! file is a socket, and nothing answers a connect. A live listener is left
-//! in place. A file that is not a socket is left in place.
+//! file is a socket, and connect fails with connection refused. Any other
+//! connect error leaves the file in place. A live listener is left in place.
+//! A file that is not a socket is left in place.
 //!
 //! The listener thread does a bounded read and write for each client, so one
-//! silent client cannot hold it.
+//! silent client cannot hold it. On Linux and macOS the connect call itself
+//! is not under that bound. It returns at once unless the listener queue is
+//! full. `std` has no timed Unix connect, and this crate forbids unsafe code.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +35,18 @@ use std::time::{Duration, Instant};
 
 /// Socket file name, next to `instance.lock`.
 pub const SHOW_FILE_NAME: &str = "instance.show";
+
+/// Longest Unix socket path, in bytes.
+///
+/// `sun_path` is 108 bytes on Linux and 104 bytes on macOS and the BSDs.
+/// One byte is the trailing NUL. A path of this length binds. One byte more
+/// fails with [`std::io::ErrorKind::InvalidInput`].
+#[cfg(unix)]
+pub const MAX_SOCKET_PATH_BYTES: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+    107
+} else {
+    103
+};
 
 /// The only request. Anything else is ignored.
 pub const SHOW_MESSAGE: &[u8] = b"show\n";
@@ -216,6 +237,10 @@ impl ShowListener {
 ///
 /// A connect failure, a timeout, a closed connection, or any other reply is
 /// [`ShowReply::Unanswered`]. The caller then waits for the lock.
+///
+/// The read and the write stop after 200 ms. On Linux and macOS the connect
+/// call is not under that limit. It returns at once unless the listener queue
+/// is full.
 #[must_use]
 pub fn ask(lock_path: &Path) -> ShowReply {
     ask_within(lock_path, EXCHANGE_LIMIT)
@@ -327,7 +352,12 @@ mod transport {
 
     use super::{State, server_exchange, socket_path};
 
-    pub(super) fn connect(lock_path: &Path, _limit: Duration) -> io::Result<UnixStream> {
+    pub(super) fn connect(lock_path: &Path, limit: Duration) -> io::Result<UnixStream> {
+        // `limit` bounds the read and the write after this returns. A pathname
+        // connect has no timeout in `std`: it returns at once, or it blocks
+        // while the listener queue is full. This crate forbids unsafe code, so
+        // the call stays blocking.
+        let _ = limit;
         let stream = UnixStream::connect(socket_path(lock_path))?;
         stream.set_nonblocking(true)?;
         Ok(stream)
@@ -366,8 +396,8 @@ mod transport {
         clear_stale_socket(&socket_path(lock_path))
     }
 
-    /// Remove a socket that nobody answers on. A live listener, a symlink,
-    /// and any other file stay.
+    /// Remove a socket that refuses a connect. A live listener, a symlink,
+    /// any other file, and any other connect error stay.
     fn clear_stale_socket(path: &Path) -> io::Result<()> {
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
@@ -389,7 +419,10 @@ mod transport {
                 ))
             }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(_) => fs::remove_file(path),
+            // Only a refused connect means the file is left over. A permission
+            // error or a full queue can belong to a live listener.
+            Err(error) if error.kind() == ErrorKind::ConnectionRefused => fs::remove_file(path),
+            Err(error) => Err(error),
         }
     }
 }
@@ -534,6 +567,43 @@ mod tests {
     fn the_socket_sits_next_to_the_lock() {
         let lock = Path::new("/tmp/thinwire/instance.lock");
         assert_eq!(socket_path(lock), Path::new("/tmp/thinwire/instance.show"));
+    }
+
+    /// `sun_path` holds 108 bytes on Linux and 104 on macOS, including the NUL.
+    /// A home directory such as `~/Library/Application Support/thinwire` can
+    /// push `instance.show` past that. Bind then fails, and the caller keeps
+    /// the lock wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_longer_than_sun_path_does_not_bind() {
+        let fits_lock = lock_path_with_socket_len(MAX_SOCKET_PATH_BYTES);
+        if let Some(dir) = fits_lock.parent() {
+            fs::create_dir_all(dir).expect("long directory");
+        }
+        let listener = ShowListener::spawn(&fits_lock).expect("the longest path still binds");
+        drop(listener);
+        if let Some(dir) = fits_lock.parent() {
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        let over_lock = lock_path_with_socket_len(MAX_SOCKET_PATH_BYTES + 1);
+        let error = ShowListener::spawn(&over_lock).expect_err("one byte past sun_path");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+    }
+
+    /// `total` is the byte length of `<dir>/instance.show`.
+    #[cfg(unix)]
+    fn lock_path_with_socket_len(total: usize) -> PathBuf {
+        let root = Path::new("/tmp");
+        let name = "instance.show";
+        let overhead = root.as_os_str().len() + 1 + 1 + name.len();
+        assert!(
+            total > overhead && total - overhead <= 200,
+            "cannot build a socket path of {total} bytes under /tmp"
+        );
+        let socket = root.join("s".repeat(total - overhead)).join(name);
+        assert_eq!(socket.as_os_str().len(), total, "{}", socket.display());
+        socket.with_file_name("instance.lock")
     }
 
     #[cfg(unix)]
@@ -683,6 +753,30 @@ mod tests {
         let listener = ShowListener::spawn(&path).expect("replaced the stale socket");
         assert_eq!(ask(&path), ShowReply::Shown);
         assert!(listener.take_show());
+        cleanup(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_connect_error_other_than_refusal_leaves_the_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let path = scratch("perm");
+        let _lock = InstanceLock::try_acquire(&path).expect("lock");
+        let socket = socket_path(&path);
+        let listener = UnixListener::bind(&socket).expect("socket");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).expect("mode");
+        drop(listener);
+        let error = ShowListener::spawn(&path).expect_err("mode 000 is not a stale socket");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{error}");
+        assert!(
+            fs::symlink_metadata(&socket)
+                .expect("the file stays")
+                .file_type()
+                .is_socket()
+        );
+        let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600));
         cleanup(&path);
     }
 

@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 /// File name of the lock in the thinwire data folder.
 pub const LOCK_FILE_NAME: &str = "instance.lock";
 
+#[cfg(unix)]
+pub use crate::show::MAX_SOCKET_PATH_BYTES;
 pub use crate::show::{ShowListener, ShowReply, ask, socket_path};
 
 /// Pause between two tries while another copy holds the lock.
