@@ -45,6 +45,12 @@ apple-native-keyring-store.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store.workspace = true
+# Named pipe for a second launch (#237). Unix uses `std::os::unix::net`.
+# 0BSD OR Apache-2.0. The texts ship in `third_party/interprocess/`.
+interprocess = "2.4.6"
+# UTF-16 pipe name and security-descriptor string for `interprocess`.
+# MIT OR Apache-2.0. The texts ship in `third_party/widestring/`.
+widestring = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

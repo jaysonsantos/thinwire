@@ -7,11 +7,16 @@ fn main() -> eframe::Result<()> {
     init_tracing();
 
     // One thinwire at a time. Taken before the window, the core, and any
-    // protocol start. A copy that is still closing gets time to quit.
-    let startup = app::startup::first_try(
+    // protocol start. A copy that is still closing gets time to quit. A
+    // copy that is running brings its window forward, and this process
+    // exits without a window.
+    let startup = match app::startup::first_try(
         thinwire_core::instance::InstanceLock::default_path(),
         std::time::Instant::now(),
-    );
+    ) {
+        app::startup::Launch::Shown => return Ok(()),
+        app::startup::Launch::Start(startup) => startup,
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
