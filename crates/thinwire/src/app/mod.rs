@@ -480,6 +480,13 @@ impl ThinwireApp {
             let action = self.close_gate.on_close_requested(now);
             let mut watchdog_runs = true;
             if action == CloseAction::HoldAndShutdown {
+                // The gate is no longer Open. Tell the listener now, including
+                // when the window stays up because the watchdog did not start.
+                // A later ask then hears `closing` and waits for the lock. If
+                // this ran only after the window was hidden, that ask would
+                // hear `shown`, the other process would exit, and the show
+                // below would be dropped.
+                startup::mark_closing();
                 let deadline = self
                     .close_gate
                     .deadline()
@@ -497,9 +504,6 @@ impl ThinwireApp {
                 ctx.send_viewport_cmd(command);
             }
             if shown == CloseAction::HoldAndShutdown {
-                // The window is hidden. A second launch must not show it
-                // again; that launch keeps waiting for this process to quit.
-                startup::mark_closing();
                 // The Dock icon and Cmd-Tab entry go now, not at the exit.
                 // `logic()` runs on the main thread, which AppKit needs.
                 dock::hide_icon();
@@ -516,7 +520,12 @@ impl ThinwireApp {
     /// wakes us; the viewport commands run here, on the UI thread.
     fn raise_for_show(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if self.close_gate != CloseGate::Open {
-            // The window is already hidden. Drop the request.
+            // Shutdown already started, so the show cannot be honored. Drop
+            // it. A `shown` reply that was already sent cannot be taken back
+            // here. The listener reads the closing flag immediately before it
+            // replies, and this frame handles close before show. A reply that
+            // left before that read can still be dropped. Closing that gap
+            // needs the UI to confirm the show before the listener replies.
             let _ = startup::take_show();
             return;
         }
@@ -724,9 +733,20 @@ mod tests {
         assert!(raise_fn.contains("show_commands("));
         let close_fn = &app[app.find("fn handle_close(").expect("close")..];
         let close_fn = &close_fn[..close_fn.find("fn raise_for_show(").expect("next")];
+        let action_at = close_fn
+            .find("if action == CloseAction::HoldAndShutdown")
+            .expect("first close");
+        let mark_at = close_fn
+            .find("startup::mark_closing()")
+            .expect("mark closing");
+        let window_at = close_fn.find("window_action(").expect("window action");
         assert!(
-            close_fn.contains("startup::mark_closing()"),
-            "a hidden window tells the next launch that it is closing"
+            action_at < mark_at && mark_at < window_at,
+            "the listener hears closing as soon as shutdown starts, even when the window stays up"
+        );
+        assert!(
+            raise_fn.contains("confirm the show"),
+            "the residual shown-then-drop race stays documented"
         );
     }
 
