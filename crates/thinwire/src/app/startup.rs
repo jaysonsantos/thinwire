@@ -8,6 +8,12 @@
 //! window says that thinwire is still closing. If the lock is still held at
 //! the end, the window explains what happened instead of starting a second
 //! copy.
+//!
+//! A held lock whose process is running, not closing, is different. This
+//! launch sends one show message to the endpoint next to the lock. When the
+//! running instance accepts it, this process exits and that window comes
+//! forward. A closing instance, a stale endpoint, or no answer keeps the
+//! wait above.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -15,7 +21,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use thinwire_core::instance::{InstanceLock, LockError, RETRY_STEP};
+use thinwire_core::instance::{InstanceLock, LockError, RETRY_STEP, ShowListener, ShowReply, ask};
 
 use super::{
     SHUTDOWN_TIMEOUT, Settings, ThinwireApp, WATCHDOG_LOCK_HOLD, motion, reduce_motion, theme,
@@ -71,10 +77,44 @@ pub(crate) const QUIT: &str = "Quit";
 /// The lock of this process. A static is never dropped, so the lock stays
 /// until the process ends and the OS releases it.
 static HELD: OnceLock<InstanceLock> = OnceLock::new();
+/// The show listener. It stays up while the process closes, so a second
+/// launch hears "closing" instead of bringing the hidden window back.
+static SHOW: OnceLock<ShowListener> = OnceLock::new();
 
 fn hold(lock: InstanceLock) {
     tracing::debug!(path = %lock.path().display(), "single-instance lock taken");
-    let _ = HELD.set(lock);
+    let path = lock.path().to_path_buf();
+    if HELD.set(lock).is_err() {
+        return;
+    }
+    match ShowListener::spawn(&path) {
+        Ok(listener) => {
+            let _ = SHOW.set(listener);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "a second launch cannot bring this window forward");
+        }
+    }
+}
+
+/// Wake the UI when a second launch asks to show the window.
+pub(crate) fn listen_for_show(wake: impl Fn() + Send + 'static) {
+    if let Some(listener) = SHOW.get() {
+        listener.set_wake(wake);
+    }
+}
+
+/// The window is hidden for shutdown. A second launch must keep waiting.
+pub(crate) fn mark_closing() {
+    if let Some(listener) = SHOW.get() {
+        listener.mark_closing();
+    }
+}
+
+/// `true` once for each accepted show since the last call.
+#[must_use]
+pub(crate) fn take_show() -> bool {
+    SHOW.get().is_some_and(ShowListener::take_show)
 }
 
 /// Where startup is after the first short wait.
@@ -84,6 +124,16 @@ pub enum Startup {
     Ready,
     /// Another process holds the lock: wait with a small window.
     Waiting { path: PathBuf, deadline: Instant },
+}
+
+/// The result of the launch-time lock check.
+#[derive(Debug)]
+pub enum Launch {
+    /// Open the window. `Ready` starts the app. `Waiting` shows the small
+    /// window until the lock is free or the wait ends.
+    Start(Startup),
+    /// A running instance accepted the show. Exit without a window.
+    Shown,
 }
 
 impl Startup {
@@ -99,27 +149,56 @@ impl Startup {
 
 /// Take the lock at `path`, waiting up to [`NOTE_AFTER`] with no window.
 /// Blocks the caller: call it before the window opens.
+///
+/// When the lock is already held, ask that process to show its window
+/// first. One short connect. The UI thread does not exist yet.
 #[must_use]
-pub fn first_try(path: Option<PathBuf>, launch: Instant) -> Startup {
+pub fn first_try(path: Option<PathBuf>, launch: Instant) -> Launch {
     let Some(path) = path else {
         tracing::warn!("no data folder: starting without the single-instance lock");
-        return Startup::Ready;
+        return Launch::Start(Startup::Ready);
     };
-    match InstanceLock::acquire_until(&path, launch + NOTE_AFTER) {
+    match InstanceLock::try_acquire(&path) {
         Ok(lock) => {
             hold(lock);
-            Startup::Ready
-        }
-        Err(LockError::Held) => {
-            tracing::info!("another thinwire holds the lock; waiting for it to quit");
-            Startup::Waiting {
-                path,
-                deadline: launch + LOCK_WAIT,
-            }
+            Launch::Start(Startup::Ready)
         }
         Err(LockError::Io(error)) => {
             start_without_lock(&error);
-            Startup::Ready
+            Launch::Start(Startup::Ready)
+        }
+        Err(LockError::Held) => match ask(&path) {
+            ShowReply::Shown => {
+                tracing::info!("the running thinwire will show its window");
+                Launch::Shown
+            }
+            ShowReply::Closing => {
+                tracing::info!("the other thinwire is closing; waiting for it to quit");
+                wait_for_lock(path, launch)
+            }
+            ShowReply::Unanswered => {
+                tracing::info!("another thinwire holds the lock; waiting for it to quit");
+                wait_for_lock(path, launch)
+            }
+        },
+    }
+}
+
+/// The lock is held and nobody will show a window. Wait until
+/// [`NOTE_AFTER`], then either start or open the small window.
+fn wait_for_lock(path: PathBuf, launch: Instant) -> Launch {
+    match InstanceLock::acquire_until(&path, launch + NOTE_AFTER) {
+        Ok(lock) => {
+            hold(lock);
+            Launch::Start(Startup::Ready)
+        }
+        Err(LockError::Held) => Launch::Start(Startup::Waiting {
+            path,
+            deadline: launch + LOCK_WAIT,
+        }),
+        Err(LockError::Io(error)) => {
+            start_without_lock(&error);
+            Launch::Start(Startup::Ready)
         }
     }
 }
@@ -370,23 +449,28 @@ mod tests {
             launch.elapsed() >= NOTE_AFTER,
             "a short wait shows no window"
         );
-        let Startup::Waiting {
-            path: waiting,
-            deadline,
-        } = &startup
-        else {
+        let Launch::Start(waiting) = &startup else {
             panic!("expected a wait, got {startup:?}");
         };
-        assert_eq!(waiting, &path);
+        let Startup::Waiting {
+            path: waiting_path,
+            deadline,
+        } = waiting
+        else {
+            panic!("expected a wait, got {waiting:?}");
+        };
+        assert_eq!(waiting_path, &path);
         assert_eq!(*deadline, launch + LOCK_WAIT);
-        assert_eq!(startup.window_size(), SMALL_SIZE);
+        assert_eq!(waiting.window_size(), SMALL_SIZE);
         drop(other);
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 
     #[test]
     fn no_data_folder_starts_at_once() {
-        let startup = first_try(None, Instant::now());
+        let Launch::Start(startup) = first_try(None, Instant::now()) else {
+            panic!("no data folder starts");
+        };
         assert!(matches!(startup, Startup::Ready));
         assert_eq!(startup.window_size(), MAIN_SIZE);
     }
@@ -399,6 +483,11 @@ mod tests {
         assert!(
             lock < run,
             "the lock is taken before the window and the core"
+        );
+        let between = &main[lock..run];
+        assert!(
+            between.contains("Launch::Shown"),
+            "a shown window exits before this process opens one"
         );
         let shell = include_str!("startup.rs");
         let new = &shell[shell.find("pub fn new(startup").expect("new")..];
@@ -492,5 +581,81 @@ mod tests {
             .rect();
         let quit = harness.get_by_role_and_label(Role::Button, QUIT).rect();
         assert!(try_again.max.x <= quit.min.x, "Try again left of Quit");
+    }
+
+    #[test]
+    fn a_taken_lock_listens_for_a_second_launch() {
+        let shell = include_str!("startup.rs");
+        let hold = &shell[shell.find("fn hold(").expect("hold")..];
+        let hold = &hold[..hold.find("\nfn ").expect("next")];
+        assert!(hold.contains("ShowListener::spawn"));
+    }
+
+    #[test]
+    fn a_running_instance_ends_the_second_launch() {
+        let path = scratch("shown");
+        let _other = InstanceLock::try_acquire(&path).expect("the running copy");
+        let listener = ShowListener::spawn(&path).expect("show endpoint");
+        let launch = Instant::now();
+        let startup = first_try(Some(path.clone()), launch);
+        assert!(
+            matches!(startup, Launch::Shown),
+            "the second launch exits, got {startup:?}"
+        );
+        assert!(
+            launch.elapsed() < NOTE_AFTER,
+            "an answer does not wait out the closing window"
+        );
+        assert!(listener.take_show());
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    #[test]
+    fn a_closing_instance_still_waits_for_the_lock() {
+        let path = scratch("closing");
+        let _other = InstanceLock::try_acquire(&path).expect("the closing copy");
+        let listener = ShowListener::spawn(&path).expect("show endpoint");
+        listener.mark_closing();
+        let launch = Instant::now();
+        let startup = first_try(Some(path.clone()), launch);
+        assert!(
+            launch.elapsed() >= NOTE_AFTER,
+            "a closing copy gets the same wait as before"
+        );
+        assert!(
+            matches!(startup, Launch::Start(Startup::Waiting { .. })),
+            "got {startup:?}"
+        );
+        assert!(!listener.take_show(), "a closing window does not show");
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    #[test]
+    fn a_stale_show_socket_still_waits_for_the_lock() {
+        let path = scratch("stale-show");
+        let _other = InstanceLock::try_acquire(&path).expect("the old copy");
+        leave_stale_socket(&thinwire_core::instance::socket_path(&path));
+        let launch = Instant::now();
+        let startup = first_try(Some(path.clone()), launch);
+        assert!(
+            matches!(startup, Launch::Start(Startup::Waiting { .. })),
+            "a stale endpoint falls back to the lock, got {startup:?}"
+        );
+        assert!(launch.elapsed() >= NOTE_AFTER);
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    fn leave_stale_socket(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixListener;
+            drop(UnixListener::bind(path).expect("stale socket"));
+        }
+        #[cfg(not(unix))]
+        {
+            // A Windows pipe disappears with its process. No leftover file
+            // means the show request finds nothing and the lock wait runs.
+            let _ = path;
+        }
     }
 }

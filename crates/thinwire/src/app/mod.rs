@@ -157,6 +157,24 @@ enum CloseAction {
     Hold,
 }
 
+/// Bring a running window forward.
+///
+/// On Wayland, winit 0.30 cannot raise a window, so also ask for
+/// attention, as a notification click does (#173).
+fn show_commands(wayland: bool) -> Vec<egui::ViewportCommand> {
+    let mut commands = vec![
+        egui::ViewportCommand::Visible(true),
+        egui::ViewportCommand::Minimized(false),
+        egui::ViewportCommand::Focus,
+    ];
+    if wayland {
+        commands.push(egui::ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Informational,
+        ));
+    }
+    commands
+}
+
 /// The window commands for a close request.
 ///
 /// The first close hides the window at once, so nobody clicks close again
@@ -383,6 +401,8 @@ impl ThinwireApp {
         let core = Core::with_replacement_adapters(runtime.handle(), config, replacement_adapters);
         repaint_on_change(&runtime, &core, ctx.clone());
         close_on_stop_signal(runtime.handle(), ctx.clone());
+        let wake = ctx.clone();
+        startup::listen_for_show(move || wake.request_repaint());
         let clicks = Arc::new(Mutex::new(Vec::new()));
         let clicked = Arc::clone(&clicks);
         let wake = ctx.clone();
@@ -477,6 +497,9 @@ impl ThinwireApp {
                 ctx.send_viewport_cmd(command);
             }
             if shown == CloseAction::HoldAndShutdown {
+                // The window is hidden. A second launch must not show it
+                // again; that launch keeps waiting for this process to quit.
+                startup::mark_closing();
                 // The Dock icon and Cmd-Tab entry go now, not at the exit.
                 // `logic()` runs on the main thread, which AppKit needs.
                 dock::hide_icon();
@@ -486,6 +509,22 @@ impl ThinwireApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             // The next pass reads the close: do not wait for the idle tick.
             ctx.request_repaint();
+        }
+    }
+
+    /// A second launch asked to show this window. The listener thread only
+    /// wakes us; the viewport commands run here, on the UI thread.
+    fn raise_for_show(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.close_gate != CloseGate::Open {
+            // The window is already hidden. Drop the request.
+            let _ = startup::take_show();
+            return;
+        }
+        if !startup::take_show() {
+            return;
+        }
+        for command in show_commands(is_wayland(frame)) {
+            ctx.send_viewport_cmd(command);
         }
     }
 }
@@ -568,6 +607,7 @@ impl eframe::App for ThinwireApp {
         self.update_focus(ctx);
         self.core.pump();
         self.handle_close(ctx, frame);
+        self.raise_for_show(ctx, frame);
         if theme_mode::follow_os_live(ctx, self.core.view().theme(), &mut self.last_os_theme) {
             ctx.request_repaint();
         }
@@ -646,6 +686,49 @@ mod tests {
     use thinwire_core::ProtocolId;
 
     use super::*;
+
+    #[test]
+    fn a_second_launch_shows_the_window_and_wayland_asks_for_attention() {
+        assert_eq!(
+            show_commands(false),
+            vec![
+                egui::ViewportCommand::Visible(true),
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Focus,
+            ]
+        );
+        assert_eq!(
+            show_commands(true),
+            vec![
+                egui::ViewportCommand::Visible(true),
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Focus,
+                egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational,),
+            ]
+        );
+
+        let app = include_str!("mod.rs");
+        let logic = &app[app.find("fn logic(").expect("logic")..];
+        let logic = &logic[..logic.find("\n    }\n").expect("end")];
+        let close = logic.find("self.handle_close(").expect("close first");
+        let raise = logic
+            .find("self.raise_for_show(")
+            .expect("show after close");
+        assert!(
+            close < raise,
+            "a close in this frame hides the window before a show can undo it"
+        );
+        let raise_fn = &app[app.find("fn raise_for_show(").expect("raise")..];
+        let raise_fn = &raise_fn[..raise_fn.find("\n    }\n").expect("end")];
+        assert!(raise_fn.contains("close_gate != CloseGate::Open"));
+        assert!(raise_fn.contains("show_commands("));
+        let close_fn = &app[app.find("fn handle_close(").expect("close")..];
+        let close_fn = &close_fn[..close_fn.find("fn raise_for_show(").expect("next")];
+        assert!(
+            close_fn.contains("startup::mark_closing()"),
+            "a hidden window tells the next launch that it is closing"
+        );
+    }
 
     #[test]
     fn a_notification_show_without_a_click_does_not_raise_the_window() {
