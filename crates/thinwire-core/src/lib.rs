@@ -16,6 +16,7 @@ mod secret_text;
 pub mod secrets;
 mod sends;
 pub mod settings;
+mod show;
 mod signal;
 pub mod state;
 mod theme;

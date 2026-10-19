@@ -68,7 +68,7 @@ Risk for each protocol:
 
 ## License
 
-MIT. Keep third-party notices (including Boost for TDLib if bundled). The binary embeds the Inter font (SIL OFL 1.1). See `crates/thinwire/assets/fonts/`. Release archives ship its license as `THIRD_PARTY_NOTICES/Inter-OFL.txt`. Chat photos use `egui_extras` and `image` (jpeg, png, and webp). The same folder ships the MIT and Apache-2.0 texts of `egui_extras`, `image`, `png`, and `image-webp`, and the MIT, Apache-2.0, and Zlib texts of `zune-jpeg` and `zune-core`.
+MIT. Keep third-party notices (including Boost for TDLib if bundled). The binary embeds the Inter font (SIL OFL 1.1). See `crates/thinwire/assets/fonts/`. Release archives ship its license as `THIRD_PARTY_NOTICES/Inter-OFL.txt`. Chat photos use `egui_extras` and `image` (jpeg, png, and webp). The same folder ships the MIT and Apache-2.0 texts of `egui_extras`, `image`, `png`, and `image-webp`, and the MIT, Apache-2.0, and Zlib texts of `zune-jpeg` and `zune-core`. A second launch on Windows uses `interprocess` (0BSD OR Apache-2.0) and `widestring` (MIT OR Apache-2.0). The same folder ships those texts. Linux and macOS use the Rust standard library for that socket.
 
 `crates/thinwire-whatsapp` and `crates/thinwire-signal` are AGPL-3.0-only. They build the programs `thinwire-whatsapp-helper` and `thinwire-signal-helper`. No MIT crate depends on those folders. The app talks to each helper over a pipe (ADR `0013`). `scripts/check-agpl-deps.sh` and `scripts/check-release-tree.sh` keep AGPL code out of the app. This is an engineering decision. It is not legal advice.
 
