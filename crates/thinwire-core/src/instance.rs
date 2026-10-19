@@ -9,6 +9,12 @@
 //! folder (`File::try_lock`: `flock` on Unix, `LockFileEx` on Windows). The
 //! OS drops it when the process ends, also after a crash or a kill, so a
 //! stale lock file never blocks a start.
+//!
+//! While this process holds the lock it also listens for a second launch.
+//! That launch sends one fixed message on the endpoint next to this file
+//! ([`ShowListener`]). A running window comes forward. A window that is
+//! already hidden for shutdown answers that it is closing, and the new
+//! launch keeps waiting for this lock.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
@@ -17,6 +23,8 @@ use std::time::{Duration, Instant};
 
 /// File name of the lock in the thinwire data folder.
 pub const LOCK_FILE_NAME: &str = "instance.lock";
+
+pub use crate::show::{ShowListener, ShowReply, ask, socket_path};
 
 /// Pause between two tries while another copy holds the lock.
 pub const RETRY_STEP: Duration = Duration::from_millis(100);

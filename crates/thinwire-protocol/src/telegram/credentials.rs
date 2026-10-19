@@ -285,6 +285,10 @@ mod tests {
             "image-webp-LICENSE-MIT.txt",
             "zune-jpeg-LICENSE-ZLIB.txt",
             "zune-core-LICENSE-APACHE.txt",
+            "interprocess-LICENSE-0BSD.txt",
+            "interprocess-LICENSE-APACHE.txt",
+            "widestring-LICENSE-MIT.txt",
+            "widestring-LICENSE-APACHE.txt",
         ] {
             assert!(
                 stage.contains(notice),

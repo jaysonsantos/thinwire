@@ -65,6 +65,11 @@ copy_app_notice third_party/zune-jpeg/LICENSE-ZLIB zune-jpeg-LICENSE-ZLIB.txt
 copy_app_notice third_party/zune-core/LICENSE-MIT zune-core-LICENSE-MIT.txt
 copy_app_notice third_party/zune-core/LICENSE-APACHE zune-core-LICENSE-APACHE.txt
 copy_app_notice third_party/zune-core/LICENSE-ZLIB zune-core-LICENSE-ZLIB.txt
+# A second launch on Windows (#237). Unix uses the standard library.
+copy_app_notice third_party/interprocess/LICENSE-0BSD.txt interprocess-LICENSE-0BSD.txt
+copy_app_notice third_party/interprocess/LICENSE-APACHE.txt interprocess-LICENSE-APACHE.txt
+copy_app_notice third_party/widestring/LICENSE-MIT widestring-LICENSE-MIT.txt
+copy_app_notice third_party/widestring/LICENSE-APACHE widestring-LICENSE-APACHE.txt
 
 copy_llvm_notice() {
   local lib="$1"
@@ -226,7 +231,11 @@ EOF
     zune-jpeg-LICENSE-ZLIB.txt \
     zune-core-LICENSE-MIT.txt \
     zune-core-LICENSE-APACHE.txt \
-    zune-core-LICENSE-ZLIB.txt
+    zune-core-LICENSE-ZLIB.txt \
+    interprocess-LICENSE-0BSD.txt \
+    interprocess-LICENSE-APACHE.txt \
+    widestring-LICENSE-MIT.txt \
+    widestring-LICENSE-APACHE.txt
   do
     if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${notice}" ]]; then
       echo "::error::Thinwire.app Resources are missing the image notice ${notice}."
@@ -394,6 +403,10 @@ with tarfile.open(archive, "r:gz") as tf:
         "zune-core-LICENSE-MIT.txt",
         "zune-core-LICENSE-APACHE.txt",
         "zune-core-LICENSE-ZLIB.txt",
+        "interprocess-LICENSE-0BSD.txt",
+        "interprocess-LICENSE-APACHE.txt",
+        "widestring-LICENSE-MIT.txt",
+        "widestring-LICENSE-APACHE.txt",
     ):
         if not any(name.endswith(f"THIRD_PARTY_NOTICES/{notice}") for name in names):
             raise SystemExit(f"{archive} is missing the notice {notice}")
