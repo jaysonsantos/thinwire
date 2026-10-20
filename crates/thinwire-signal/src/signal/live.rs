@@ -45,6 +45,24 @@ const LINK_FAILED: &str = "Signal linking failed. No provisioning URL was logged
 const SYNC_FAILED: &str = "Signal chat list could not be read. Message text was not logged.";
 const SEND_FAILED: &str = "Signal send failed. The message text was not logged.";
 const DISCONNECTED: &str = "Signal disconnected. The receive stream ended.";
+const DEVICE_REMOVED: &str = "The phone removed this linked device. Link Signal again.";
+
+/// How `run` finishes a generation.
+enum LinkedEnd {
+    /// The phone removed this device.
+    DeviceRemoved,
+    /// This generation stopped. A worker failure uses this end.
+    Stopped,
+    /// Cancel or shutdown moved the generation. The owner emits `Unlinked`.
+    Superseded,
+}
+
+/// What a failed `receive_messages` means for this generation.
+enum OpenStop {
+    DeviceRemoved,
+    Reconnect { after: std::time::Duration },
+    Superseded,
+}
 
 pub(super) struct Outbound {
     pub(super) conversation_id: String,
@@ -230,9 +248,58 @@ pub(super) async fn run(
     wake: Arc<tokio::sync::Notify>,
     events: EventTx,
 ) {
-    run_linked(Arc::clone(&session), token, wake, events.clone()).await;
-    if session.is_current(token) {
-        emit_account(&events, ProtocolId::Signal, AccountState::Unlinked);
+    let end = run_linked(Arc::clone(&session), token, wake, events.clone()).await;
+    let end = if session.is_current(token) {
+        end
+    } else {
+        LinkedEnd::Superseded
+    };
+    publish_link_end(&events, end);
+}
+
+/// `AccountEnded` only when the phone removed this device. A worker stop is
+/// `Unlinked`. Cancel and shutdown emit nothing here.
+fn publish_link_end(events: &EventTx, end: LinkedEnd) {
+    if let LinkedEnd::DeviceRemoved = end {
+        emit_status(
+            events,
+            ProtocolId::Signal,
+            AdapterStatus::Error,
+            DEVICE_REMOVED,
+        );
+        let _ = events.send(AdapterEvent::AccountEnded {
+            protocol: ProtocolId::Signal,
+        });
+    }
+    if matches!(end, LinkedEnd::DeviceRemoved | LinkedEnd::Stopped) {
+        emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
+    }
+}
+
+/// HTTP 401 or 403: Signal rejected this device. That is the phone removing it.
+fn device_removed<E: std::error::Error>(error: &presage::Error<E>) -> bool {
+    matches!(
+        error,
+        presage::Error::ServiceError(
+            presage::libsignal_service::prelude::ServiceError::Unauthorized
+        )
+    )
+}
+
+fn classify_open<E: std::error::Error>(
+    error: &presage::Error<E>,
+    still_current: bool,
+    receive: &mut ReceiveLoop,
+) -> OpenStop {
+    if !still_current {
+        return OpenStop::Superseded;
+    }
+    if device_removed(error) {
+        return OpenStop::DeviceRemoved;
+    }
+    match receive.on_open_failed(true) {
+        StreamPoll::Reconnect { after } => OpenStop::Reconnect { after },
+        StreamPoll::Stop | StreamPoll::Continue => OpenStop::Superseded,
     }
 }
 
@@ -241,15 +308,15 @@ async fn run_linked(
     token: u64,
     wake: Arc<tokio::sync::Notify>,
     events: EventTx,
-) {
+) -> LinkedEnd {
     if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
-        return;
+        return LinkedEnd::Stopped;
     }
     let Ok(path) = signal_session_path() else {
         fail(&events, DATA_DIR_MISSING);
         session.active.store(false, Ordering::SeqCst);
-        return;
+        return LinkedEnd::Stopped;
     };
     let dir = path.clone();
     let prepared = tokio::task::spawn_blocking(move || prepare_session_dir(&dir))
@@ -259,24 +326,24 @@ async fn run_linked(
     if prepared.is_none() || !session.is_current(token) {
         fail(&events, STORE_FAILED);
         session.active.store(false, Ordering::SeqCst);
-        return;
+        return LinkedEnd::Stopped;
     }
     let Ok(store_path) = signal_session_path() else {
         fail(&events, DATA_DIR_MISSING);
         session.active.store(false, Ordering::SeqCst);
-        return;
+        return LinkedEnd::Stopped;
     };
     let Some(store_url) = sqlite_store_path(&store_path).to_str().map(str::to_string) else {
         fail(&events, STORE_FAILED);
         session.active.store(false, Ordering::SeqCst);
-        return;
+        return LinkedEnd::Stopped;
     };
     let store = match SqliteStore::open(&store_url, OnNewIdentity::Trust).await {
         Ok(store) => store,
         Err(_) => {
             fail(&events, STORE_FAILED);
             session.active.store(false, Ordering::SeqCst);
-            return;
+            return LinkedEnd::Stopped;
         }
     };
     if sled_session_present(&store_path) && !store.is_registered().await {
@@ -289,7 +356,7 @@ async fn run_linked(
     }
     if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
-        return;
+        return LinkedEnd::Stopped;
     }
 
     let mut manager = if store.is_registered().await {
@@ -298,7 +365,7 @@ async fn run_linked(
             Err(_) => {
                 fail(&events, LINK_FAILED);
                 session.active.store(false, Ordering::SeqCst);
-                return;
+                return LinkedEnd::Stopped;
             }
         }
     } else {
@@ -307,13 +374,13 @@ async fn run_linked(
             Err(()) => {
                 fail(&events, LINK_FAILED);
                 session.active.store(false, Ordering::SeqCst);
-                return;
+                return LinkedEnd::Stopped;
             }
         }
     };
     if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
-        return;
+        return LinkedEnd::Stopped;
     }
     emit_account(&events, ProtocolId::Signal, AccountState::Linked);
     let mut rows = std::collections::HashMap::<String, Conversation>::new();
@@ -324,7 +391,7 @@ async fn run_linked(
             Err(()) => {
                 fail(&events, SYNC_FAILED);
                 session.active.store(false, Ordering::SeqCst);
-                return;
+                return LinkedEnd::Stopped;
             }
         };
     let mut names = contact_names(&manager).await;
@@ -339,25 +406,31 @@ async fn run_linked(
     *session.outbound.lock().expect("outbound") = Some(tx);
     let mut receive = ReceiveLoop::new();
     let mut relink = Relink::new();
+    let mut ended = LinkedEnd::Stopped;
     while session.is_current(token) {
-        let Ok(stream) = manager.receive_messages().await else {
-            if let StreamPoll::Reconnect { after } =
-                receive.on_open_failed(session.is_current(token))
-            {
-                emit_account(&events, ProtocolId::Signal, AccountState::Linking);
-                emit_status(
-                    &events,
-                    ProtocolId::Signal,
-                    AdapterStatus::Connecting,
-                    DISCONNECTED,
-                );
-                if !wait_backoff(session.as_ref(), token, after).await {
+        let stream = match manager.receive_messages().await {
+            Ok(stream) => stream,
+            Err(error) => match classify_open(&error, session.is_current(token), &mut receive) {
+                OpenStop::DeviceRemoved => {
+                    ended = LinkedEnd::DeviceRemoved;
                     break;
                 }
-                relink.note_end();
-                continue;
-            }
-            break;
+                OpenStop::Reconnect { after } => {
+                    emit_account(&events, ProtocolId::Signal, AccountState::Linking);
+                    emit_status(
+                        &events,
+                        ProtocolId::Signal,
+                        AdapterStatus::Connecting,
+                        DISCONNECTED,
+                    );
+                    if !wait_backoff(session.as_ref(), token, after).await {
+                        break;
+                    }
+                    relink.note_end();
+                    continue;
+                }
+                OpenStop::Superseded => break,
+            },
         };
         if relink.on_stream() {
             names = contact_names(&manager).await;
@@ -497,6 +570,7 @@ async fn run_linked(
     }
     session.active.store(false, Ordering::SeqCst);
     *session.outbound.lock().expect("outbound") = None;
+    ended
 }
 
 async fn link_new(
@@ -1528,6 +1602,113 @@ mod tests {
             arrival_of(stored),
             Some(thinwire_protocol::Arrival::History),
             "a stored message never notifies"
+        );
+    }
+
+    fn events_of(end: LinkedEnd) -> Vec<AdapterEvent> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        publish_link_end(&tx, end);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn account_ended(events: &[AdapterEvent]) -> bool {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                AdapterEvent::AccountEnded {
+                    protocol: ProtocolId::Signal
+                }
+            )
+        })
+    }
+
+    /// #174 item 14: the phone removed this device. The worker emits
+    /// `AccountEnded`, then `Unlinked`.
+    #[test]
+    fn a_phone_removed_device_ends_the_account() {
+        use presage::libsignal_service::prelude::ServiceError;
+
+        let removed = presage::Error::<std::io::Error>::ServiceError(ServiceError::Unauthorized);
+        assert!(device_removed(&removed));
+        let mut receive = ReceiveLoop::new();
+        assert!(matches!(
+            classify_open(&removed, true, &mut receive),
+            OpenStop::DeviceRemoved
+        ));
+        // Cancel moved the generation. The phone-removed error does not end
+        // the account from this worker.
+        assert!(matches!(
+            classify_open(&removed, false, &mut receive),
+            OpenStop::Superseded
+        ));
+        let events = events_of(LinkedEnd::DeviceRemoved);
+        assert!(account_ended(&events), "{events:?}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Unlinked,
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status { detail, .. } if detail == DEVICE_REMOVED
+        )));
+    }
+
+    /// #174 item 14: a worker failure is `Unlinked` only.
+    #[test]
+    fn a_worker_failure_does_not_end_the_account() {
+        let network =
+            presage::Error::<std::io::Error>::IoError(std::io::Error::other("store closed"));
+        assert!(!device_removed(&network));
+        let events = events_of(LinkedEnd::Stopped);
+        assert!(!account_ended(&events), "{events:?}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Unlinked,
+            }
+        )));
+        let none = events_of(LinkedEnd::Superseded);
+        assert!(
+            none.is_empty(),
+            "cancel and shutdown emit no account end from the worker: {none:?}"
+        );
+    }
+
+    /// #174 item 14: a dropped receive stream reconnects. It does not end
+    /// the account.
+    #[test]
+    fn a_reconnect_does_not_end_the_account() {
+        use presage::libsignal_service::prelude::ServiceError;
+
+        let network =
+            presage::Error::<std::io::Error>::IoError(std::io::Error::other("connection reset"));
+        let mut receive = ReceiveLoop::new();
+        assert!(matches!(
+            classify_open(&network, true, &mut receive),
+            OpenStop::Reconnect { .. }
+        ));
+        assert_eq!(
+            receive.on_item(true, true),
+            StreamPoll::Reconnect {
+                after: super::super::reconnect::RECONNECT_BACKOFF * 2
+            },
+            "the stream end waits, then opens again"
+        );
+        let removed = presage::Error::<std::io::Error>::ServiceError(ServiceError::Unauthorized);
+        assert!(
+            !matches!(
+                classify_open(&removed, true, &mut receive),
+                OpenStop::Reconnect { .. }
+            ),
+            "an unauthorized open is not a reconnect"
         );
     }
 
