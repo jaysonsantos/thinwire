@@ -353,17 +353,38 @@ fn store_link(registered: bool) -> StoreLink {
 /// identity key pairs, sender certificate, master key, and account entropy
 /// pool. Contacts, groups, and `thread_messages` stay.
 ///
-/// A failed delete still ends the account. [`LinkedEnd::Stopped`] emits
-/// `Unlinked` with no device-removed flag, and the shell then ends the
-/// session: the open chat and its history leave the inbox. The phone already
-/// rejected this device. Ending the account is what keeps them. If the
-/// registration row is still loadable, the next begin loads it and can
-/// reach this delete again.
-async fn forget_rejected_registration(store: &mut SqliteStore) {
+/// Returns `false` when a delete fails. Each failed delete is an error log.
+/// The account still ends. [`LinkedEnd::Stopped`] emits `Unlinked` with no
+/// device-removed flag, and the shell then ends the session: the open chat
+/// and its history leave the inbox. The phone already rejected this device.
+/// Ending the account is what keeps them. When this returns `false` and the
+/// store is still registered, [`run_linked`] logs
+/// [`REJECTED_REGISTRATION_STILL_LOADABLE`]. The next begin loads that row
+/// and can reach this delete again.
+#[must_use]
+async fn forget_rejected_registration(store: &mut SqliteStore) -> bool {
     let registration = store.clear_registration().await;
     let keys = presage::store::Store::clear(store).await;
-    if registration.is_err() || keys.is_err() {
-        tracing::warn!("signal could not clear the rejected registration");
+    if let Err(error) = &registration {
+        tracing::error!(%error, "{msg}", msg = CLEAR_REGISTRATION_FAILED);
+    }
+    if let Err(error) = &keys {
+        tracing::error!(%error, "{msg}", msg = CLEAR_KEYS_FAILED);
+    }
+    registration.is_ok() && keys.is_ok()
+}
+
+const CLEAR_REGISTRATION_FAILED: &str = "signal could not clear the rejected registration";
+const CLEAR_KEYS_FAILED: &str = "signal could not clear the rejected device keys";
+/// The registration row survived a failed clear. The next begin loads it.
+const REJECTED_REGISTRATION_STILL_LOADABLE: &str =
+    "signal rejected registration is still loadable; the next begin can try the delete again";
+
+/// `cleared` is the result of [`forget_rejected_registration`]. `registered`
+/// is [`presage::store::StateStore::is_registered`] after that call.
+fn note_if_rejected_registration_survived(cleared: bool, registered: bool) {
+    if !cleared && registered {
+        tracing::error!("{}", REJECTED_REGISTRATION_STILL_LOADABLE);
     }
 }
 
@@ -514,7 +535,8 @@ async fn run_linked(
             ) {
                 OpenStop::DeviceRemoved => {
                     let mut rejected = manager.store().clone();
-                    forget_rejected_registration(&mut rejected).await;
+                    let cleared = forget_rejected_registration(&mut rejected).await;
+                    note_if_rejected_registration_survived(cleared, rejected.is_registered().await);
                     ended = LinkedEnd::DeviceRemoved;
                     break;
                 }
@@ -1863,7 +1885,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         match classify_open(&removed, true, &mut receive, &mut seen) {
             OpenStop::Confirm => publish_link_check(&tx),
-            OpenStop::DeviceRemoved => forget_rejected_registration(&mut store).await,
+            OpenStop::DeviceRemoved => {
+                let _ = forget_rejected_registration(&mut store).await;
+            }
             OpenStop::Reconnect { .. } | OpenStop::Superseded => {
                 panic!("one unauthorized open is a check");
             }
@@ -2093,7 +2117,10 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .await
             .expect("group");
 
-        forget_rejected_registration(&mut store).await;
+        assert!(
+            forget_rejected_registration(&mut store).await,
+            "the rejected registration is cleared"
+        );
 
         assert!(
             !store.is_registered().await,
@@ -2134,6 +2161,171 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .await
             .expect("group");
         assert_eq!(group, "Kept", "the group name stays");
+
+        pool.close().await;
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Log lines of this thread while the guard lives. Plain text, no ANSI.
+    fn capture_logs() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        #[derive(Clone)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Buf(std::sync::Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        (bytes, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn logged(bytes: &std::sync::Mutex<Vec<u8>>) -> String {
+        String::from_utf8_lossy(
+            &bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+
+    /// A delete that does not land leaves the rejected registration loadable.
+    /// The error log is the hint. History stays. The account still ends.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_clear_keeps_the_rejected_registration() {
+        let path = std::env::temp_dir().join(format!(
+            "thinwire-signal-clear-fail-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let url = path.to_str().expect("temp path").to_string();
+        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("store");
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("url")
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(2));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool");
+        sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
+            .bind(REJECTED_REGISTRATION.as_bytes())
+            .execute(&pool)
+            .await
+            .expect("registration");
+        sqlx::query("INSERT INTO kv (key, value) VALUES ('identity_keypair_aci', ?)")
+            .bind([1u8].as_slice())
+            .execute(&pool)
+            .await
+            .expect("device key");
+        let thread = Thread::Contact(ServiceId::Aci(Uuid::from_u128(7).into()));
+        store
+            .save_message(
+                &thread,
+                envelope(
+                    Uuid::from_u128(7),
+                    DataMessage {
+                        body: Some("kept when the clear fails".into()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("history");
+        sqlx::query(
+            "CREATE TRIGGER thinwire_block_kv_delete BEFORE DELETE ON kv BEGIN SELECT RAISE(ABORT, 'clear blocked'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("block deletes");
+
+        let (quiet, quiet_guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        note_if_rejected_registration_survived(true, true);
+        note_if_rejected_registration_survived(false, false);
+        note_if_rejected_registration_survived(true, false);
+        assert!(
+            !logged(&quiet).contains(REJECTED_REGISTRATION_STILL_LOADABLE),
+            "a clear that worked, or a row that is already gone, is not this miss"
+        );
+        drop(quiet_guard);
+
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        let cleared = forget_rejected_registration(&mut store).await;
+        assert!(!cleared, "a blocked delete is a failed clear");
+        let registered = store.is_registered().await;
+        assert!(
+            registered,
+            "the rejected registration row is still loadable"
+        );
+        assert_eq!(store_link(registered), StoreLink::Existing);
+        note_if_rejected_registration_survived(cleared, registered);
+        let log = logged(&bytes);
+        drop(guard);
+        assert!(
+            log.contains("ERROR"),
+            "the failed clear is an error log: {log}"
+        );
+        assert!(
+            !log.contains("WARN"),
+            "the failed clear is not a warning: {log}"
+        );
+        assert!(
+            log.contains(CLEAR_REGISTRATION_FAILED),
+            "the registration delete is in the log: {log}"
+        );
+        assert!(
+            log.contains(CLEAR_KEYS_FAILED),
+            "the key delete is in the log: {log}"
+        );
+        assert!(
+            log.contains(REJECTED_REGISTRATION_STILL_LOADABLE),
+            "run_linked records that the next begin loads this row: {log}"
+        );
+        assert!(
+            !log.contains("rejected-device") && !log.contains("2025550100"),
+            "the log has no registration data: {log}"
+        );
+        let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kv WHERE key IN (?, ?)")
+            .bind("registration")
+            .bind("identity_keypair_aci")
+            .fetch_one(&pool)
+            .await
+            .expect("keys");
+        assert_eq!(
+            keys, 2,
+            "the rejected credentials stay when the delete fails"
+        );
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_messages")
+            .fetch_one(&pool)
+            .await
+            .expect("messages");
+        assert_eq!(messages, 1, "a failed clear does not drop history");
 
         pool.close().await;
         store.close().await;
@@ -2196,7 +2388,10 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .await
             .expect("contact");
 
-        forget_rejected_registration(&mut store).await;
+        assert!(
+            forget_rejected_registration(&mut store).await,
+            "removal clears the registration row"
+        );
         assert!(
             !store.is_registered().await,
             "removal clears the registration row"
