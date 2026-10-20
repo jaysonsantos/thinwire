@@ -45,7 +45,6 @@ const LINK_FAILED: &str = "Signal linking failed. No provisioning URL was logged
 const SYNC_FAILED: &str = "Signal chat list could not be read. Message text was not logged.";
 const SEND_FAILED: &str = "Signal send failed. The message text was not logged.";
 const DISCONNECTED: &str = "Signal disconnected. The receive stream ended.";
-const DEVICE_REMOVED: &str = "The phone removed this linked device. Link Signal again.";
 
 /// How `run` finishes a generation.
 enum LinkedEnd {
@@ -265,7 +264,7 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
             events,
             ProtocolId::Signal,
             AdapterStatus::Error,
-            DEVICE_REMOVED,
+            thinwire_protocol::SIGNAL_DEVICE_REMOVED,
         );
         let _ = events.send(AdapterEvent::AccountEnded {
             protocol: ProtocolId::Signal,
@@ -1656,7 +1655,8 @@ mod tests {
         )));
         assert!(events.iter().any(|event| matches!(
             event,
-            AdapterEvent::Status { detail, .. } if detail == DEVICE_REMOVED
+            AdapterEvent::Status { detail, .. }
+                if detail == thinwire_protocol::SIGNAL_DEVICE_REMOVED
         )));
     }
 

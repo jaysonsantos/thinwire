@@ -194,6 +194,8 @@ pub enum SignalIntent {
     BeginLink,
     /// Stop linking and drop the notice acknowledgement.
     CancelLink,
+    /// The phone removed this device. Open the normal QR link flow again.
+    Relink,
 }
 
 /// Discord bot inbox actions. No user-account path exists (ADR 0009).

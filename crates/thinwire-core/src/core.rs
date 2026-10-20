@@ -303,6 +303,14 @@ impl Core {
         &mut self.state
     }
 
+    /// Apply one adapter event. Snapshots and tests use it. A frontend uses
+    /// [`Self::pump`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn apply_event(&mut self, event: AdapterEvent) {
+        self.state.apply(event);
+        self.state.sync_viewed();
+    }
+
     /// The state for this redraw.
     ///
     /// Frontend thread only. See [`Core`] "Threads".
@@ -884,6 +892,7 @@ impl Core {
             SignalIntent::AcknowledgeNotice => self.state.acknowledge_signal_notice(),
             SignalIntent::BeginLink => self.state.begin_signal_link(),
             SignalIntent::CancelLink => self.state.cancel_signal_link(),
+            SignalIntent::Relink => self.state.relink_removed_signal(),
         }
     }
 

@@ -7,7 +7,7 @@ use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
     AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    topic_mute_id,
+    SIGNAL_DEVICE_REMOVED, topic_mute_id,
 };
 
 use super::auth;
@@ -15,6 +15,8 @@ use super::motion;
 use super::theme::{self, radius, size, space};
 use super::theme_mode::ThemeModeEgui;
 use super::thread_layout::{RowLayout, list_time, thread_rows};
+#[cfg(feature = "signal-local")]
+use thinwire_core::SignalIntent;
 #[cfg(feature = "slack-oauth")]
 use thinwire_core::SlackIntent;
 use thinwire_core::secrets::Persistence;
@@ -582,6 +584,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                     clicked = Some(account.caps.id);
                 }
                 helper_actions(ui, account, out);
+                removed_signal_link(ui, snapshot, account, out);
                 ui.add_space(4.0);
             }
             if let Some(protocol) = clicked {
@@ -614,9 +617,16 @@ fn account_chip(
     let caps = account.caps;
     let palette = theme::palette(ui);
     let width = ui.available_width();
-    // Two lines used 36 px. [`theme::ROW_INSET`] adds 8 px above and below.
+    let label = chip_label(snapshot, account);
+    // Two lines used 36 px. The removed-device line wraps, so that row is taller.
+    // [`theme::ROW_INSET`] adds 8 px above and below.
+    let lines = if label == SIGNAL_DEVICE_REMOVED {
+        52.0
+    } else {
+        36.0
+    };
     let (rect, hover) = ui.allocate_exact_size(
-        egui::vec2(width, 36.0 + space::S * 2.0),
+        egui::vec2(width, lines + space::S * 2.0),
         egui::Sense::hover(),
     );
     let chip_id = ui.id().with(("account-chip", caps.id));
@@ -652,7 +662,6 @@ fn account_chip(
                 .text_style(theme::row_title())
                 .color(palette.text),
         );
-        let label = chip_label(snapshot, account);
         let color = if account.status == AdapterStatus::Ready {
             palette.ok
         } else {
@@ -683,6 +692,35 @@ fn account_chip(
 /// Under the chip of a protocol that runs in a helper process (ADR 0013).
 /// A stopped helper gets Restart: with the chip line it reads "Helper
 /// stopped. Restart". A missing helper gets the full reason.
+/// Link again after the phone removed this Signal device. The button opens
+/// the normal QR link flow. The line above it is the only copy on the row.
+#[cfg(feature = "signal-local")]
+fn removed_signal_link(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    account: &AccountRow,
+    out: &mut Vec<Intent>,
+) {
+    if account.caps.id != ProtocolId::Signal || !snapshot.signal_device_removed() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(theme::ROW_INSET.x);
+        if ui.button("Link").clicked() {
+            out.push(Intent::Signal(SignalIntent::Relink));
+        }
+    });
+}
+
+#[cfg(not(feature = "signal-local"))]
+fn removed_signal_link(
+    _ui: &mut egui::Ui,
+    _snapshot: &Snapshot,
+    _account: &AccountRow,
+    _out: &mut Vec<Intent>,
+) {
+}
+
 fn helper_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
     let protocol = account.caps.id;
     if account.helper_stopped() {
@@ -1410,6 +1448,9 @@ fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
 /// "Not signed in" until a login or a resume starts.
 #[must_use]
 fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
+    if account.caps.id == ProtocolId::Signal && snapshot.signal_device_removed() {
+        return SIGNAL_DEVICE_REMOVED;
+    }
     // The helper state wins: with no helper, the adapter status is old.
     if let Some(label) = account.helper_label() {
         return label;
@@ -1600,6 +1641,11 @@ fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<
 
 fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     thread_header(ui, snapshot, out);
+    if snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal {
+        let palette = theme::palette(ui);
+        ui.label(RichText::new(SIGNAL_DEVICE_REMOVED).color(palette.warn));
+        ui.label(RichText::new(thinwire_core::state::SIGNAL_SENDING_OFF).color(palette.text2));
+    }
     if snapshot.showing_topic_list() {
         topic_list(ui, snapshot, out);
         return;
