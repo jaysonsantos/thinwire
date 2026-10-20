@@ -42,10 +42,23 @@ fn inbox_and_thread_scroll_and_show_load_states() {
 #[test]
 fn compose_ui_uses_enter_multiline_and_disabled_send() {
     let ui = include_str!("ui.rs");
-    assert!(ui.contains("edited(ui, &snapshot.compose"));
-    assert!(ui.contains("TextEdit::multiline(text)"));
-    assert!(ui.contains("if enter && !other && !shift {"));
-    assert!(ui.contains("add_enabled(snapshot.can_send()"));
+    let compose = &ui[ui.find("fn compose(").expect("compose")..];
+    let compose = &compose[..compose.find("\nfn ").expect("next")];
+    assert!(compose.contains("edited(ui, &snapshot.compose"));
+    assert!(compose.contains("TextEdit::multiline(text)"));
+    // Plain Enter sends and is eaten, so the field does not also add a line.
+    // Shift+Enter misses this branch. A closed topic or a removed Signal
+    // device sets compose_open false, so Enter does not send and Send is off.
+    assert!(
+        compose.contains("if enter && !other && !shift && compose_open {"),
+        "plain Enter sends only while compose is open"
+    );
+    assert!(compose.contains("Intent::SendDraft {"));
+    assert!(compose.contains("consume_key(egui::Modifiers::NONE, egui::Key::Enter)"));
+    assert!(compose.contains("let compose_open = !closed && !sending_off;"));
+    assert!(compose.contains("snapshot.signal_device_removed()"));
+    assert!(compose.contains(".interactive(compose_open)"));
+    assert!(compose.contains("add_enabled(snapshot.can_send()"));
     assert!(ui.contains("request_focus(compose_id)"));
     assert!(ui.contains("\"Not sent\""));
     assert!(ui.contains("\"Retry\""));
