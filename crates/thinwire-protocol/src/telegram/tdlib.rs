@@ -149,9 +149,11 @@ struct LiveInbox {
     /// Same fact, published by `view_chat` before this worker dequeues
     /// `ViewChat`. History `viewMessages` reads this, not `open_chat`.
     viewed: inbox::ViewedChat,
-    /// Latest incoming message id per chat that arrived while that chat was
-    /// not viewed. Focus calls `viewMessages` through this id.
-    unviewed: HashMap<i64, i64>,
+    /// Newest message id per chat that was not passed to `viewMessages`:
+    /// a live message while the chat was not viewed, or a history page that
+    /// returned after the window blurred. Focus calls `viewMessages` through
+    /// this id. The id stays until that call succeeds (#174 items 12 and 13).
+    unviewed: Arc<Mutex<HashMap<i64, i64>>>,
     /// Photo downloads this worker started. The value is secret, then whether
     /// TDLib has reported the download as active.
     downloads: HashMap<i32, (bool, bool)>,
@@ -687,7 +689,7 @@ fn spawn_tdlib_worker(
             topics: HashMap::new(),
             topic_lists: HashSet::new(),
             viewed: view.viewed,
-            unviewed: HashMap::new(),
+            unviewed: Arc::new(Mutex::new(HashMap::new())),
             downloads: HashMap::new(),
         };
         let requested_view = view.requested;
@@ -756,12 +758,25 @@ fn spawn_tdlib_worker(
                                 stamp,
                             );
                             // Messages that arrived while this chat was not
-                            // viewed never reached viewMessages. Mark through
-                            // the latest one now. `force_read` covers that id.
-                            if let Some((chat_id, message_id)) =
-                                catch_up_read(live.open_chat, &mut live.unviewed)
-                            {
-                                tokio::spawn(mark_message_viewed(client_id, chat_id, message_id));
+                            // viewed, and a history page skipped after a blur,
+                            // never reached viewMessages. Mark through the
+                            // latest id now. `force_read` covers that id.
+                            // The id stays until the call succeeds (#174 item 13).
+                            let pending = {
+                                let unviewed =
+                                    live.unviewed.lock().unwrap_or_else(PoisonError::into_inner);
+                                catch_up_read(live.open_chat, &unviewed)
+                            };
+                            if let Some((chat_id, message_id)) = pending {
+                                let unviewed = Arc::clone(&live.unviewed);
+                                tokio::spawn(async move {
+                                    if mark_message_viewed(client_id, chat_id, message_id).await {
+                                        let mut waiting = unviewed
+                                            .lock()
+                                            .unwrap_or_else(PoisonError::into_inner);
+                                        note_view_succeeded(&mut waiting, chat_id, message_id);
+                                    }
+                                });
                             }
                         }
                         TdlibCommand::ViewTopic {
@@ -1079,7 +1094,10 @@ async fn apply_update(
             // `getChatHistory`. `open_chat` is still the previous command.
             live.open_chat = live.viewed.get();
             let mark_read = live_read_while_linked(live, &other);
-            remember_unviewed(&other, live.open_chat, &mut live.unviewed);
+            {
+                let mut unviewed = live.unviewed.lock().unwrap_or_else(PoisonError::into_inner);
+                remember_unviewed(&other, live.open_chat, &mut unviewed);
+            }
             apply_chat_update(client_id, other, live, events).await;
             load_due_forum_topics(client_id, live, events).await;
             if let Some((chat_id, message_id)) = mark_read {
@@ -1168,18 +1186,53 @@ fn remember_unviewed(
     if message.is_outgoing || open_chat == Some(message.chat_id) {
         return;
     }
-    let slot = unviewed.entry(message.chat_id).or_insert(message.id);
-    if message.id > *slot {
-        *slot = message.id;
+    remember_id(unviewed, message.chat_id, message.id);
+}
+
+/// Keep the newest id for this chat. A later id replaces an earlier one.
+fn remember_id(unviewed: &mut HashMap<i64, i64>, chat_id: i64, message_id: i64) {
+    let slot = unviewed.entry(chat_id).or_insert(message_id);
+    if message_id > *slot {
+        *slot = message_id;
+    }
+}
+
+/// A history page was not marked. Keep its newest id for the focus catch-up
+/// (#174 item 12). A topic of this same chat is open: that page marks its
+/// own ids, so this page stores nothing.
+fn remember_skipped_history(
+    unviewed: &mut HashMap<i64, i64>,
+    viewed: Option<i64>,
+    chat_id: i64,
+    message_ids: &[i64],
+) {
+    if viewed == Some(chat_id) {
+        return;
+    }
+    if let Some(newest) = message_ids.iter().copied().max() {
+        remember_id(unviewed, chat_id, newest);
     }
 }
 
 /// `ViewChat` selected this chat again. Returns the id to pass to
-/// `viewMessages`, if any message arrived while it was not viewed.
-fn catch_up_read(open_chat: Option<i64>, unviewed: &mut HashMap<i64, i64>) -> Option<(i64, i64)> {
+/// `viewMessages`, if one is waiting. The id stays until
+/// [`note_view_succeeded`]. A failed call leaves it for the next focus
+/// (#174 item 13).
+fn catch_up_read(open_chat: Option<i64>, unviewed: &HashMap<i64, i64>) -> Option<(i64, i64)> {
     let chat_id = open_chat?;
-    let message_id = unviewed.remove(&chat_id)?;
+    let message_id = *unviewed.get(&chat_id)?;
     Some((chat_id, message_id))
+}
+
+/// `viewMessages` for `message_id` succeeded. Drop it. A newer id that
+/// arrived while the call was in flight stays.
+fn note_view_succeeded(unviewed: &mut HashMap<i64, i64>, chat_id: i64, message_id: i64) {
+    if unviewed
+        .get(&chat_id)
+        .is_some_and(|saved| *saved <= message_id)
+    {
+        unviewed.remove(&chat_id);
+    }
 }
 
 /// Ready copies the last `ViewChat` into this worker's cell. `sync_viewed`
@@ -1198,11 +1251,14 @@ fn apply_requested_view(
     *open_chat = chat;
 }
 
-async fn mark_message_viewed(client_id: i32, chat_id: i64, message_id: i64) {
-    if let Err(error) =
-        tdlib_rs::functions::view_messages(chat_id, vec![message_id], None, true, client_id).await
+async fn mark_message_viewed(client_id: i32, chat_id: i64, message_id: i64) -> bool {
+    match tdlib_rs::functions::view_messages(chat_id, vec![message_id], None, true, client_id).await
     {
-        log_tdlib_error("viewMessages", &error);
+        Ok(_) => true,
+        Err(error) => {
+            log_tdlib_error("viewMessages", &error);
+            false
+        }
     }
 }
 
@@ -2203,7 +2259,7 @@ async fn load_topic_history(
     }
 }
 
-async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &EventTx) {
+async fn load_history(client_id: i32, chat_id: i64, live: &mut LiveInbox, events: &EventTx) {
     match tdlib_rs::functions::get_chat_history(
         chat_id,
         0,
@@ -2222,24 +2278,31 @@ async fn load_history(client_id: i32, chat_id: i64, live: &LiveInbox, events: &E
             }
             // Read the cell after `getChatHistory`: `ViewChat` may have been
             // published while this call was in flight, and it is still queued.
+            let viewed = live.viewed.get();
+            let viewed_topic = live.viewed.get_topic();
             if !message_ids.is_empty()
-                && inbox::should_mark_history_viewed(
-                    live.viewed.get(),
-                    live.viewed.get_topic(),
-                    chat_id,
-                )
-                && let Err(error) =
+                && inbox::should_mark_history_viewed(viewed, viewed_topic, chat_id)
+            {
+                if let Err(error) =
                     tdlib_rs::functions::view_messages(chat_id, message_ids, None, true, client_id)
                         .await
-            {
-                log_tdlib_error("viewMessages", &error);
-                emit_status(
-                    events,
-                    ProtocolId::Telegram,
-                    AdapterStatus::Error,
-                    format!("Could not mark messages read (TDLib {}).", error.code),
-                );
-                return;
+                {
+                    log_tdlib_error("viewMessages", &error);
+                    emit_status(
+                        events,
+                        ProtocolId::Telegram,
+                        AdapterStatus::Error,
+                        format!("Could not mark messages read (TDLib {}).", error.code),
+                    );
+                    return;
+                }
+            } else {
+                // The page was not marked. Keep the newest id so focus can
+                // catch up (#174 item 12). A topic of this chat stores nothing.
+                {
+                    let mut unviewed = live.unviewed.lock().unwrap_or_else(PoisonError::into_inner);
+                    remember_skipped_history(&mut unviewed, viewed, chat_id, &message_ids);
+                }
             }
             emit_status(
                 events,
@@ -2737,10 +2800,39 @@ mod tests {
         /// `Some(0)` when focus marks messages that arrived while the chat
         /// was not viewed. That is the unread upsert after `viewMessages`.
         fn view(&mut self, conversation_id: Option<&str>) -> Option<i32> {
+            self.finish_catch_up(conversation_id, true)
+        }
+
+        /// Focus catch-up. `succeed` is false when `viewMessages` fails:
+        /// the id stays for the next focus (#174 item 13).
+        fn finish_catch_up(&mut self, conversation_id: Option<&str>, succeed: bool) -> Option<i32> {
             apply_viewed_chat(&mut self.open_chat, conversation_id);
-            let (chat_id, message_id) = catch_up_read(self.open_chat, &mut self.unviewed)?;
+            let (chat_id, message_id) = catch_up_read(self.open_chat, &self.unviewed)?;
+            if !succeed {
+                return None;
+            }
             self.view_messages(chat_id, message_id);
+            note_view_succeeded(&mut self.unviewed, chat_id, message_id);
             Some(0)
+        }
+
+        /// A history page returned. The viewed cell is what the mark reads.
+        /// A blur stores the newest id for focus (#174 item 12).
+        fn load_history_page(
+            &mut self,
+            chat_id: i64,
+            message_ids: &[i64],
+            viewed: Option<i64>,
+            topic: Option<MessageTopic>,
+        ) {
+            if !message_ids.is_empty() && inbox::should_mark_history_viewed(viewed, topic, chat_id)
+            {
+                if let Some(newest) = message_ids.iter().copied().max() {
+                    self.view_messages(chat_id, newest);
+                }
+                return;
+            }
+            remember_skipped_history(&mut self.unviewed, viewed, chat_id, message_ids);
         }
 
         fn view_messages(&mut self, chat_id: i64, message_id: i64) {
@@ -2867,6 +2959,83 @@ mod tests {
             panic!("unread upsert");
         };
         assert_eq!(row.unread, 0);
+    }
+
+    /// #174 item 12: a history page that returns after the window blurred
+    /// keeps its newest id. Focus calls `viewMessages` for that id.
+    #[test]
+    fn a_blurred_history_load_is_marked_viewed_when_focus_returns() {
+        let mut open = FakeTelegram::new();
+        let viewed = inbox::ViewedChat::new();
+        let _opened = viewed.publish(Some(42));
+        open.load_history_page(42, &[10, 40, 25], viewed.get(), viewed.get_topic());
+        assert_eq!(
+            open.viewed,
+            vec![(42, 40)],
+            "a page of the open chat is marked now"
+        );
+        assert!(
+            open.view(Some("telegram:42")).is_none(),
+            "that page is not waiting for focus"
+        );
+
+        let mut blurred = FakeTelegram::new();
+        let _blurred = viewed.publish(None);
+        blurred.load_history_page(42, &[10, 40, 25], viewed.get(), viewed.get_topic());
+        assert!(
+            blurred.viewed.is_empty(),
+            "a blurred history load does not call viewMessages"
+        );
+        let unread = blurred
+            .view(Some("telegram:42"))
+            .expect("focus marks the newest skipped history id");
+        assert_eq!(blurred.viewed, vec![(42, 40)]);
+        assert_eq!(unread, 0);
+
+        // A topic of this chat is open. The chat-wide page must not be stored
+        // for a later chat-wide catch-up.
+        let mut topic = FakeTelegram::new();
+        let _topic = viewed.publish_topic(Some(42), Some(MessageTopic::Forum(3)));
+        topic.load_history_page(42, &[1, 8], viewed.get(), viewed.get_topic());
+        assert!(topic.viewed.is_empty());
+        assert!(
+            topic.view(Some("telegram:42")).is_none(),
+            "a topic of this chat does not store the chat-wide ids"
+        );
+    }
+
+    /// #174 item 13: a failed `viewMessages` keeps the id. The next focus
+    /// calls it again. Success drops the id. A newer id that arrived while
+    /// the failed call was in flight stays.
+    #[test]
+    fn a_failed_view_messages_keeps_the_id_until_it_succeeds() {
+        let mut fake = FakeTelegram::new();
+        fake.view(Some("telegram:42"));
+        fake.view(None);
+        assert!(fake.receive_live(42, 101, false).is_none());
+        assert!(
+            fake.finish_catch_up(Some("telegram:42"), false).is_none(),
+            "a failed viewMessages is not a read"
+        );
+        assert!(fake.viewed.is_empty());
+        let unread = fake
+            .view(Some("telegram:42"))
+            .expect("the next focus calls viewMessages again");
+        assert_eq!(fake.viewed, vec![(42, 101)]);
+        assert_eq!(unread, 0);
+        assert!(
+            fake.view(Some("telegram:42")).is_none(),
+            "success drops the id"
+        );
+
+        let mut unviewed = HashMap::from([(42, 101)]);
+        remember_id(&mut unviewed, 42, 110);
+        note_view_succeeded(&mut unviewed, 42, 101);
+        assert_eq!(
+            unviewed.get(&42),
+            Some(&110),
+            "a late success of the old id keeps a newer one"
+        );
     }
 
     #[test]
@@ -3022,7 +3191,7 @@ mod tests {
             topics: HashMap::new(),
             topic_lists: HashSet::new(),
             viewed: runtime.viewed.clone(),
-            unviewed: HashMap::new(),
+            unviewed: Arc::new(Mutex::new(HashMap::new())),
             downloads: HashMap::new(),
         };
         // Disconnect or Shutdown has marked closing. The cell can still name
