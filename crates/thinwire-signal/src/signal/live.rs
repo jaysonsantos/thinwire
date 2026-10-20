@@ -275,7 +275,12 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
     }
 }
 
-/// HTTP 401 or 403: Signal rejected this device. That is the phone removing it.
+/// Signal rejected this device.
+///
+/// Pinned libsignal-service maps both HTTP 401 and HTTP 403 to
+/// `ServiceError::Unauthorized` in `baseline_decode`, which is what the
+/// receive websocket uses. Linking and account registration map 403 onto
+/// other variants. Those responses are not this open.
 fn device_removed<E: std::error::Error>(error: &presage::Error<E>) -> bool {
     matches!(
         error,
@@ -283,6 +288,40 @@ fn device_removed<E: std::error::Error>(error: &presage::Error<E>) -> bool {
             presage::libsignal_service::prelude::ServiceError::Unauthorized
         )
     )
+}
+
+/// How the next begin opens this store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreLink {
+    /// The store still has a registration, so the begin loads it.
+    Existing,
+    /// No registration, so the begin calls `link_new`.
+    New,
+}
+
+fn store_link(registered: bool) -> StoreLink {
+    if registered {
+        StoreLink::Existing
+    } else {
+        StoreLink::New
+    }
+}
+
+/// Drop the registration Signal rejected, and the identity rows that belong
+/// to it. The next begin then takes [`StoreLink::New`].
+///
+/// Registration and chat history share one sqlite file. `clear_registration`
+/// deletes the `registration` kv row (`is_registered` reads that row) and the
+/// protocol tables (`sessions`, `identities`, prekeys, `sender_keys`).
+/// [`presage::store::Store::clear`] deletes the rest of `kv`: this device's
+/// identity key pairs, sender certificate, master key, and account entropy
+/// pool. Contacts, groups, and `thread_messages` stay.
+async fn forget_rejected_registration(store: &mut SqliteStore) {
+    let registration = store.clear_registration().await;
+    let keys = presage::store::Store::clear(store).await;
+    if registration.is_err() || keys.is_err() {
+        tracing::warn!("signal could not clear the rejected registration");
+    }
 }
 
 fn classify_open<E: std::error::Error>(
@@ -358,24 +397,23 @@ async fn run_linked(
         return LinkedEnd::Stopped;
     }
 
-    let mut manager = if store.is_registered().await {
-        match Manager::load_registered(store).await {
+    let mut manager = match store_link(store.is_registered().await) {
+        StoreLink::Existing => match Manager::load_registered(store).await {
             Ok(manager) => manager,
             Err(_) => {
                 fail(&events, LINK_FAILED);
                 session.active.store(false, Ordering::SeqCst);
                 return LinkedEnd::Stopped;
             }
-        }
-    } else {
-        match link_new(&events, session.as_ref(), token, store).await {
+        },
+        StoreLink::New => match link_new(&events, session.as_ref(), token, store).await {
             Ok(manager) => manager,
             Err(()) => {
                 fail(&events, LINK_FAILED);
                 session.active.store(false, Ordering::SeqCst);
                 return LinkedEnd::Stopped;
             }
-        }
+        },
     };
     if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
@@ -411,6 +449,8 @@ async fn run_linked(
             Ok(stream) => stream,
             Err(error) => match classify_open(&error, session.is_current(token), &mut receive) {
                 OpenStop::DeviceRemoved => {
+                    let mut rejected = manager.store().clone();
+                    forget_rejected_registration(&mut rejected).await;
                     ended = LinkedEnd::DeviceRemoved;
                     break;
                 }
@@ -459,6 +499,11 @@ async fn run_linked(
                         break;
                     }
                     item = incoming.next() => {
+                        // `receive_messages` yields `Received`, not `Result`.
+                        // Presage logs a mid-stream pipe `Err` (401 or 403
+                        // included) and keeps the stream. A closed pipe is
+                        // `None`, which reconnects; the next open classifies
+                        // device removal.
                         match receive.on_item(item.is_none(), session.is_current(token)) {
                             StreamPoll::Continue => {
                                 if let Some(Received::Content(content)) = item {
@@ -1658,6 +1703,125 @@ mod tests {
             AdapterEvent::Status { detail, .. }
                 if detail == thinwire_protocol::SIGNAL_DEVICE_REMOVED
         )));
+    }
+
+    /// A registration blob `is_registered` accepts. The password and profile
+    /// key are fixtures, not a linked device.
+    const REJECTED_REGISTRATION: &str = r#"{
+        "signal_servers": "Production",
+        "device_name": "thinwire",
+        "phone_number": {
+            "code": { "value": 1, "source": "plus" },
+            "national": { "value": 2025550100 },
+            "extension": null,
+            "carrier": null
+        },
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "pni": "22222222-2222-2222-2222-222222222222",
+        "password": "rejected-device",
+        "device_id": 2,
+        "registration_id": 7,
+        "pni_registration_id": 8,
+        "profile_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    }"#;
+
+    /// The phone removed this device. The registration row is gone, so the
+    /// next begin calls `link_new`. The stored message stays.
+    #[tokio::test]
+    async fn a_link_after_device_removal_starts_a_new_link() {
+        let path = std::env::temp_dir().join(format!(
+            "thinwire-signal-removed-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let url = path.to_str().expect("temp path").to_string();
+        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("store");
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("url")
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(2));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool");
+        sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
+            .bind(REJECTED_REGISTRATION.as_bytes())
+            .execute(&pool)
+            .await
+            .expect("registration");
+        sqlx::query(
+            "INSERT INTO kv (key, value) VALUES ('identity_keypair_aci', ?), \
+             ('sender_certificate', ?), ('master_key', ?)",
+        )
+        .bind([1u8].as_slice())
+        .bind([2u8].as_slice())
+        .bind([3u8].as_slice())
+        .execute(&pool)
+        .await
+        .expect("device keys");
+        sqlx::query(
+            "INSERT INTO sessions (address, device_id, identity, record) \
+             VALUES ('removed', 1, 'aci', ?)",
+        )
+        .bind([4u8].as_slice())
+        .execute(&pool)
+        .await
+        .expect("session");
+        let loaded = store
+            .load_registration_data()
+            .await
+            .expect("registration decodes");
+        assert!(loaded.is_some(), "the rejected device is still registered");
+        assert_eq!(store_link(store.is_registered().await), StoreLink::Existing);
+
+        let thread = Thread::Contact(ServiceId::Aci(Uuid::from_u128(7).into()));
+        let content = envelope(
+            Uuid::from_u128(7),
+            DataMessage {
+                body: Some("kept after removal".into()),
+                ..Default::default()
+            },
+        );
+        store.save_message(&thread, content).await.expect("history");
+
+        forget_rejected_registration(&mut store).await;
+
+        assert!(
+            !store.is_registered().await,
+            "the next begin must not load the rejected registration"
+        );
+        assert_eq!(store_link(store.is_registered().await), StoreLink::New);
+        let kept = store
+            .message(&thread, 1_700_000_000_000)
+            .await
+            .expect("history read");
+        assert!(kept.is_some(), "local chat history stays");
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&pool)
+            .await
+            .expect("sessions");
+        assert_eq!(sessions, 0, "the rejected session is gone");
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM kv WHERE key IN \
+             ('registration', 'identity_keypair_aci', 'sender_certificate', 'master_key')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("keys");
+        assert_eq!(keys, 0, "the rejected credentials are gone");
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_messages")
+            .fetch_one(&pool)
+            .await
+            .expect("messages");
+        assert_eq!(messages, 1);
+
+        pool.close().await;
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
     }
 
     /// #174 item 14: a worker failure is `Unlinked` only.
