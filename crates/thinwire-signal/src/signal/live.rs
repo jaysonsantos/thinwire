@@ -389,6 +389,12 @@ fn note_if_rejected_registration_survived(cleared: bool, registered: bool) {
 }
 
 /// `removal_seen` is the unauthorized open that is waiting for a confirm.
+///
+/// `still_current` is checked here. [`run_linked`] wipes the rejected
+/// registration after this returns [`OpenStop::DeviceRemoved`]. A cancel
+/// in that gap still runs the wipe. [`run`] then reports
+/// [`LinkedEnd::Superseded`], so this worker emits no account event. That
+/// emit is the same as a cancel that lands before the wipe.
 fn classify_open<E: std::error::Error>(
     error: &presage::Error<E>,
     still_current: bool,
