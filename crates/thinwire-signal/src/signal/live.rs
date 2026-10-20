@@ -329,6 +329,13 @@ fn store_link(registered: bool) -> StoreLink {
 /// [`presage::store::Store::clear`] deletes the rest of `kv`: this device's
 /// identity key pairs, sender certificate, master key, and account entropy
 /// pool. Contacts, groups, and `thread_messages` stay.
+///
+/// A failed delete still ends the account. [`LinkedEnd::Stopped`] emits
+/// `Unlinked` with no device-removed flag, and the shell then ends the
+/// session: the open chat and its history leave the inbox. The phone already
+/// rejected this device. Ending the account is what keeps them. If the
+/// registration row is still loadable, the next begin loads it and can
+/// reach this delete again.
 async fn forget_rejected_registration(store: &mut SqliteStore) {
     let registration = store.clear_registration().await;
     let keys = presage::store::Store::clear(store).await;
