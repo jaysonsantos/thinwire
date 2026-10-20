@@ -1753,20 +1753,22 @@ mod tests {
             .execute(&pool)
             .await
             .expect("registration");
+        for (key, value) in [
+            ("identity_keypair_aci", &[1u8][..]),
+            ("sender_certificate", &[2u8][..]),
+            ("master_key", &[3u8][..]),
+        ] {
+            sqlx::query("INSERT INTO kv (key, value) VALUES (?, ?)")
+                .bind(key)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .expect("device keys");
+        }
         sqlx::query(
-            "INSERT INTO kv (key, value) VALUES ('identity_keypair_aci', ?), \
-             ('sender_certificate', ?), ('master_key', ?)",
+            "INSERT INTO sessions (address, device_id, identity, record) VALUES (?, 1, 'aci', ?)",
         )
-        .bind([1u8].as_slice())
-        .bind([2u8].as_slice())
-        .bind([3u8].as_slice())
-        .execute(&pool)
-        .await
-        .expect("device keys");
-        sqlx::query(
-            "INSERT INTO sessions (address, device_id, identity, record) \
-             VALUES ('removed', 1, 'aci', ?)",
-        )
+        .bind("removed")
         .bind([4u8].as_slice())
         .execute(&pool)
         .await
@@ -1805,13 +1807,14 @@ mod tests {
             .await
             .expect("sessions");
         assert_eq!(sessions, 0, "the rejected session is gone");
-        let keys: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM kv WHERE key IN \
-             ('registration', 'identity_keypair_aci', 'sender_certificate', 'master_key')",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("keys");
+        let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kv WHERE key IN (?, ?, ?, ?)")
+            .bind("registration")
+            .bind("identity_keypair_aci")
+            .bind("sender_certificate")
+            .bind("master_key")
+            .fetch_one(&pool)
+            .await
+            .expect("keys");
         assert_eq!(keys, 0, "the rejected credentials are gone");
         let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_messages")
             .fetch_one(&pool)
