@@ -45,6 +45,7 @@ const LINK_FAILED: &str = "Signal linking failed. No provisioning URL was logged
 const SYNC_FAILED: &str = "Signal chat list could not be read. Message text was not logged.";
 const SEND_FAILED: &str = "Signal send failed. The message text was not logged.";
 const DISCONNECTED: &str = "Signal disconnected. The receive stream ended.";
+const LINKED_READY: &str = "Signal is linked. Experimental client: expect breakage.";
 
 /// How `run` finishes a generation.
 enum LinkedEnd {
@@ -279,6 +280,28 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
     }
 }
 
+/// The first unauthorized open. The account row shows the check at once.
+/// Keys stay. The UI thread does not wait on this send.
+fn publish_link_check(events: &EventTx) {
+    emit_status(
+        events,
+        ProtocolId::Signal,
+        AdapterStatus::Connecting,
+        thinwire_protocol::SIGNAL_LINK_CHECK,
+    );
+}
+
+/// The confirm open succeeded. The row returns to the linked line.
+fn publish_link_ready(events: &EventTx) {
+    emit_account(events, ProtocolId::Signal, AccountState::Linked);
+    emit_status(
+        events,
+        ProtocolId::Signal,
+        AdapterStatus::Ready,
+        LINKED_READY,
+    );
+}
+
 /// Signal rejected this device on the receive open.
 ///
 /// Pinned libsignal-service maps both HTTP 401 and HTTP 403 to
@@ -464,7 +487,7 @@ async fn run_linked(
         &events,
         ProtocolId::Signal,
         AdapterStatus::Ready,
-        "Signal is linked. Experimental client: expect breakage.",
+        LINKED_READY,
     );
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -476,6 +499,10 @@ async fn run_linked(
     while session.is_current(token) {
         let stream = match manager.receive_messages().await {
             Ok(stream) => {
+                // The confirm open worked. The row drops the checking line.
+                if removal_seen {
+                    publish_link_ready(&events);
+                }
                 removal_seen = false;
                 stream
             }
@@ -491,10 +518,13 @@ async fn run_linked(
                     ended = LinkedEnd::DeviceRemoved;
                     break;
                 }
-                // The next open decides. Wait out a short gateway or auth glitch.
+                // The next open decides. The row shows the check before the
+                // wait, so the shell does not sit on the old line for that
+                // second. This task waits. The UI thread only reads the event.
                 // No disconnect line for this one try. Cancel during the wait
                 // leaves this generation, so the worker does not open again.
                 OpenStop::Confirm => {
+                    publish_link_check(&events);
                     if !wait_before_confirm(session.as_ref(), token).await {
                         break;
                     }
@@ -519,13 +549,7 @@ async fn run_linked(
         };
         if relink.on_stream() {
             names = contact_names(&manager).await;
-            emit_account(&events, ProtocolId::Signal, AccountState::Linked);
-            emit_status(
-                &events,
-                ProtocolId::Signal,
-                AdapterStatus::Ready,
-                "Signal is linked. Experimental client: expect breakage.",
-            );
+            publish_link_ready(&events);
         }
         let mut pending: Option<WorkerJob> = None;
         let mut reconnect_after = None;
@@ -1784,6 +1808,138 @@ mod tests {
             event,
             AdapterEvent::Status { detail, .. }
                 if detail == thinwire_protocol::SIGNAL_DEVICE_REMOVED
+        )));
+    }
+
+    /// One unauthorized open tells the row to check. It does not delete keys.
+    #[tokio::test]
+    async fn one_unauthorized_open_checks_the_link_and_keeps_the_keys() {
+        use presage::libsignal_service::prelude::ServiceError;
+
+        let path = std::env::temp_dir().join(format!(
+            "thinwire-signal-check-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let url = path.to_str().expect("temp path").to_string();
+        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("store");
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("url")
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(2));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool");
+        sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
+            .bind(REJECTED_REGISTRATION.as_bytes())
+            .execute(&pool)
+            .await
+            .expect("registration");
+        for (key, value) in [
+            ("identity_keypair_aci", &[1u8][..]),
+            ("sender_certificate", &[2u8][..]),
+            ("master_key", &[3u8][..]),
+        ] {
+            sqlx::query("INSERT INTO kv (key, value) VALUES (?, ?)")
+                .bind(key)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .expect("device keys");
+        }
+
+        let removed = presage::Error::<std::io::Error>::ServiceError(ServiceError::Unauthorized);
+        let mut receive = ReceiveLoop::new();
+        let mut seen = false;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        match classify_open(&removed, true, &mut receive, &mut seen) {
+            OpenStop::Confirm => publish_link_check(&tx),
+            OpenStop::DeviceRemoved => forget_rejected_registration(&mut store).await,
+            OpenStop::Reconnect { .. } | OpenStop::Superseded => {
+                panic!("one unauthorized open is a check");
+            }
+        }
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status {
+                    protocol: ProtocolId::Signal,
+                    status: AdapterStatus::Connecting,
+                    detail,
+                } if detail == thinwire_protocol::SIGNAL_LINK_CHECK
+            )),
+            "the row hears the check before the retry: {events:?}"
+        );
+        assert!(
+            !account_ended(&events),
+            "the first unauthorized open does not end the account: {events:?}"
+        );
+        assert!(seen, "the confirm mark stays for the next open");
+        assert!(
+            store.is_registered().await,
+            "the registration row stays until a second unauthorized open"
+        );
+        let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kv WHERE key IN (?, ?, ?, ?)")
+            .bind("registration")
+            .bind("identity_keypair_aci")
+            .bind("sender_certificate")
+            .bind("master_key")
+            .fetch_one(&pool)
+            .await
+            .expect("keys");
+        assert_eq!(
+            keys, 4,
+            "one unauthorized open does not wipe the device keys"
+        );
+
+        pool.close().await;
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A confirm open that succeeds puts the linked line back. It is not removal.
+    #[test]
+    fn a_successful_confirm_open_restores_the_linked_line() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        publish_link_ready(&tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linked,
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                protocol: ProtocolId::Signal,
+                status: AdapterStatus::Ready,
+                detail,
+            } if detail == LINKED_READY
+        )));
+        assert!(!account_ended(&events), "{events:?}");
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            AdapterEvent::Status { detail, .. }
+                if detail == thinwire_protocol::SIGNAL_LINK_CHECK
+                    || detail == thinwire_protocol::SIGNAL_DEVICE_REMOVED
         )));
     }
 

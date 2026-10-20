@@ -7,7 +7,7 @@ use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
     AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    SIGNAL_DEVICE_REMOVED, topic_mute_id,
+    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, topic_mute_id,
 };
 
 use super::auth;
@@ -1448,6 +1448,11 @@ fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
 /// "Not signed in" until a login or a resume starts.
 #[must_use]
 fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
+    // The check is the first unauthorized open. Removal, and its Link
+    // button, wait for the second one.
+    if account.caps.id == ProtocolId::Signal && snapshot.signal_link_checking() {
+        return SIGNAL_LINK_CHECK;
+    }
     if account.caps.id == ProtocolId::Signal && snapshot.signal_device_removed() {
         return SIGNAL_DEVICE_REMOVED;
     }
@@ -3653,5 +3658,92 @@ mod tests {
         });
         drop(core);
         drop(runtime);
+    }
+
+    /// The first unauthorized open. The row says it is checking. Link waits
+    /// for the second open, which is the removed-device state.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_signal_link_check_shows_the_checking_line_and_no_link_button() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{By, Queryable};
+        use thinwire_core::View;
+        use thinwire_core::secrets::SecretStore;
+        use thinwire_core::settings::Settings;
+        use thinwire_core::state::Snapshot;
+        use thinwire_protocol::{
+            AccountState, AdapterEvent, AdapterStatus, ProtocolId, SIGNAL_DEVICE_REMOVED,
+            SIGNAL_LINK_CHECK,
+        };
+
+        use super::{Hints, draw};
+        use crate::app::theme;
+
+        let store = SecretStore::memory();
+        let settings = Settings::in_memory();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: "Signal is linked. Experimental client: expect breakage.".into(),
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Connecting,
+            detail: SIGNAL_LINK_CHECK.into(),
+        });
+        assert!(snapshot.signal_link_checking());
+        assert!(!snapshot.signal_device_removed());
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 720.0))
+            .build_ui(|ui| {
+                theme::install(ui.ctx());
+                if !ui.style().text_styles.contains_key(&theme::row_title()) {
+                    return;
+                }
+                let view = View::from_parts(&snapshot, &store, &settings);
+                let mut hints = Hints::default();
+                let mut out = Vec::new();
+                draw(ui, &view, &mut hints, &mut out);
+            });
+        harness.run_steps(4);
+        let copies = harness
+            .query_all(
+                By::new()
+                    .role(Role::Label)
+                    .label(SIGNAL_LINK_CHECK)
+                    .include_labels(),
+            )
+            .count();
+        assert_eq!(copies, 1, "the checking line is on the account row");
+        assert!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Label)
+                        .label(SIGNAL_DEVICE_REMOVED)
+                        .include_labels(),
+                )
+                .next()
+                .is_none(),
+            "the removed line stays off during the check"
+        );
+        assert!(
+            harness
+                .query_all(By::new().role(Role::Button).label("Link").include_labels(),)
+                .next()
+                .is_none(),
+            "Link waits for the second unauthorized open"
+        );
     }
 }
