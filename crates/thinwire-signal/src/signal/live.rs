@@ -59,7 +59,11 @@ enum LinkedEnd {
 /// What a failed `receive_messages` means for this generation.
 enum OpenStop {
     DeviceRemoved,
-    Reconnect { after: std::time::Duration },
+    /// The first unauthorized open. Open once more before deleting keys.
+    Confirm,
+    Reconnect {
+        after: std::time::Duration,
+    },
     Superseded,
 }
 
@@ -275,12 +279,20 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
     }
 }
 
-/// Signal rejected this device.
+/// Signal rejected this device on the receive open.
 ///
 /// Pinned libsignal-service maps both HTTP 401 and HTTP 403 to
 /// `ServiceError::Unauthorized` in `baseline_decode`, which is what the
 /// receive websocket uses. Linking and account registration map 403 onto
-/// other variants. Those responses are not this open.
+/// other variants. Those responses are not this open. A timeout or a 5xx
+/// is a different error and reconnects without touching the store.
+///
+/// One unauthorized open is not enough to call this device removed.
+/// [`classify_open`] returns [`OpenStop::Confirm`] and the worker opens
+/// the stream once more, immediately. Only a second consecutive
+/// unauthorized open is removal. A successful open, or any other error,
+/// clears that mark. The removal path deletes identity keys, the sender
+/// certificate, and the master key, and those rows cannot be put back.
 fn device_removed<E: std::error::Error>(error: &presage::Error<E>) -> bool {
     matches!(
         error,
@@ -324,17 +336,25 @@ async fn forget_rejected_registration(store: &mut SqliteStore) {
     }
 }
 
+/// `removal_seen` is the unauthorized open that is waiting for a confirm.
 fn classify_open<E: std::error::Error>(
     error: &presage::Error<E>,
     still_current: bool,
     receive: &mut ReceiveLoop,
+    removal_seen: &mut bool,
 ) -> OpenStop {
     if !still_current {
+        *removal_seen = false;
         return OpenStop::Superseded;
     }
     if device_removed(error) {
-        return OpenStop::DeviceRemoved;
+        if *removal_seen {
+            return OpenStop::DeviceRemoved;
+        }
+        *removal_seen = true;
+        return OpenStop::Confirm;
     }
+    *removal_seen = false;
     match receive.on_open_failed(true) {
         StreamPoll::Reconnect { after } => OpenStop::Reconnect { after },
         StreamPoll::Stop | StreamPoll::Continue => OpenStop::Superseded,
@@ -444,16 +464,27 @@ async fn run_linked(
     let mut receive = ReceiveLoop::new();
     let mut relink = Relink::new();
     let mut ended = LinkedEnd::Stopped;
+    let mut removal_seen = false;
     while session.is_current(token) {
         let stream = match manager.receive_messages().await {
-            Ok(stream) => stream,
-            Err(error) => match classify_open(&error, session.is_current(token), &mut receive) {
+            Ok(stream) => {
+                removal_seen = false;
+                stream
+            }
+            Err(error) => match classify_open(
+                &error,
+                session.is_current(token),
+                &mut receive,
+                &mut removal_seen,
+            ) {
                 OpenStop::DeviceRemoved => {
                     let mut rejected = manager.store().clone();
                     forget_rejected_registration(&mut rejected).await;
                     ended = LinkedEnd::DeviceRemoved;
                     break;
                 }
+                // The next open decides. No disconnect line for this one try.
+                OpenStop::Confirm => continue,
                 OpenStop::Reconnect { after } => {
                     emit_account(&events, ProtocolId::Signal, AccountState::Linking);
                     emit_status(
@@ -1679,16 +1710,36 @@ mod tests {
         let removed = presage::Error::<std::io::Error>::ServiceError(ServiceError::Unauthorized);
         assert!(device_removed(&removed));
         let mut receive = ReceiveLoop::new();
+        let mut seen = false;
+        assert!(
+            matches!(
+                classify_open(&removed, true, &mut receive, &mut seen),
+                OpenStop::Confirm
+            ),
+            "the first unauthorized open retries before deleting keys"
+        );
+        let network =
+            presage::Error::<std::io::Error>::IoError(std::io::Error::other("connection reset"));
         assert!(matches!(
-            classify_open(&removed, true, &mut receive),
+            classify_open(&network, true, &mut receive, &mut seen),
+            OpenStop::Reconnect { .. }
+        ));
+        assert!(!seen, "another error clears the confirm");
+        assert!(matches!(
+            classify_open(&removed, true, &mut receive, &mut seen),
+            OpenStop::Confirm
+        ));
+        assert!(matches!(
+            classify_open(&removed, true, &mut receive, &mut seen),
             OpenStop::DeviceRemoved
         ));
         // Cancel moved the generation. The phone-removed error does not end
         // the account from this worker.
         assert!(matches!(
-            classify_open(&removed, false, &mut receive),
+            classify_open(&removed, false, &mut receive, &mut seen),
             OpenStop::Superseded
         ));
+        assert!(!seen);
         let events = events_of(LinkedEnd::DeviceRemoved);
         assert!(account_ended(&events), "{events:?}");
         assert!(events.iter().any(|event| matches!(
@@ -1892,8 +1943,9 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let network =
             presage::Error::<std::io::Error>::IoError(std::io::Error::other("connection reset"));
         let mut receive = ReceiveLoop::new();
+        let mut seen = false;
         assert!(matches!(
-            classify_open(&network, true, &mut receive),
+            classify_open(&network, true, &mut receive, &mut seen),
             OpenStop::Reconnect { .. }
         ));
         assert_eq!(
@@ -1905,11 +1957,11 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         );
         let removed = presage::Error::<std::io::Error>::ServiceError(ServiceError::Unauthorized);
         assert!(
-            !matches!(
-                classify_open(&removed, true, &mut receive),
-                OpenStop::Reconnect { .. }
+            matches!(
+                classify_open(&removed, true, &mut receive, &mut seen),
+                OpenStop::Confirm
             ),
-            "an unauthorized open is not a reconnect"
+            "an unauthorized open retries once; it is not a reconnect"
         );
     }
 
