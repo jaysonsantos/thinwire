@@ -42,6 +42,23 @@ pub(crate) fn sqlite_store_path(session_dir: &Path) -> PathBuf {
     session_dir.join(SQLITE_FILE)
 }
 
+/// File name of a link that is still in progress. It sits beside [`SQLITE_FILE`]
+/// until the link has an account id.
+#[cfg(feature = "signal-local")]
+pub(crate) const PENDING_FILE: &str = "session.sqlite.pending";
+
+/// Directory name for a previous account's sqlite file. The active store stays
+/// [`SQLITE_FILE`].
+#[cfg(feature = "signal-local")]
+pub(crate) const RETAINED_DIR: &str = "retained";
+
+/// The sqlite file of a link that has not been placed yet.
+#[must_use]
+#[cfg(feature = "signal-local")]
+pub(crate) fn pending_store_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(PENDING_FILE)
+}
+
 /// `true` when this directory still holds a sled database from the previous store.
 #[must_use]
 #[cfg(any(test, feature = "signal-local"))]
