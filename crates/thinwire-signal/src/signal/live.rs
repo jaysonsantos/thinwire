@@ -1725,8 +1725,17 @@ mod tests {
         "profile_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     }"#;
 
+    const KEPT_CONTACT: &str = "\
+INSERT INTO contacts (uuid, name, profile_key, expire_timer, inbox_position) \
+VALUES (?, 'Ada', ?, 0, 0)";
+
+    const KEPT_GROUP: &str = "\
+INSERT INTO groups (\
+master_key, title, avatar, members, pending_members, requesting_members) \
+VALUES (?, 'Kept', '', ?, ?, ?)";
+
     /// The phone removed this device. The registration row is gone, so the
-    /// next begin calls `link_new`. The stored message stays.
+    /// next begin calls `link_new`. The stored message, contact, and group stay.
     #[tokio::test]
     async fn a_link_after_device_removal_starts_a_new_link() {
         let path = std::env::temp_dir().join(format!(
@@ -1789,6 +1798,21 @@ mod tests {
             },
         );
         store.save_message(&thread, content).await.expect("history");
+        sqlx::query(KEPT_CONTACT)
+            .bind(Uuid::from_u128(9).as_bytes().as_slice())
+            .bind([9u8; 32].as_slice())
+            .execute(&pool)
+            .await
+            .expect("contact");
+        let empty: &[u8] = &[];
+        sqlx::query(KEPT_GROUP)
+            .bind([8u8; 32].as_slice())
+            .bind(empty)
+            .bind(empty)
+            .bind(empty)
+            .execute(&pool)
+            .await
+            .expect("group");
 
         forget_rejected_registration(&mut store).await;
 
@@ -1821,6 +1845,16 @@ mod tests {
             .await
             .expect("messages");
         assert_eq!(messages, 1);
+        let contact: String = sqlx::query_scalar("SELECT name FROM contacts")
+            .fetch_one(&pool)
+            .await
+            .expect("contact");
+        assert_eq!(contact, "Ada", "the contact name stays");
+        let group: String = sqlx::query_scalar("SELECT title FROM groups")
+            .fetch_one(&pool)
+            .await
+            .expect("group");
+        assert_eq!(group, "Kept", "the group name stays");
 
         pool.close().await;
         store.close().await;
