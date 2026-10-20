@@ -273,7 +273,7 @@ pub(crate) fn confirm(ui: &mut egui::Ui) {
     let screen = ui.ctx().content_rect();
     let mut dismiss = false;
     let mut open_id = None;
-    egui::Area::new(egui::Id::new("link-confirm"))
+    egui::Area::new(egui::Id::unique("link-confirm"))
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
         .show(ui.ctx(), |ui| {
@@ -523,7 +523,7 @@ fn windows_mailto_command(url: &str) -> std::io::Result<std::process::Command> {
 }
 
 fn confirm_id() -> egui::Id {
-    egui::Id::new("thinwire-link-confirm")
+    egui::Id::unique("thinwire-link-confirm")
 }
 
 /// Byte index of a pointer position in `body`.

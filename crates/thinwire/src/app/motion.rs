@@ -161,9 +161,9 @@ mod tests {
     #[test]
     fn a_new_key_fades_in_and_the_first_key_shows_at_once() {
         let ctx = egui::Context::default();
-        let id = egui::Id::new("fade");
+        let id = egui::Id::unique("fade");
         let mut seen = 0.0;
-        let key = |name: &str| egui::Id::new(name);
+        let key = |name: &str| egui::Id::unique(name);
         frame(&ctx, 1.0, |ctx| {
             seen = fade_in_on_change(ctx, id, key("a"), FADE)
         });
@@ -192,19 +192,19 @@ mod tests {
     fn zero_animation_time_turns_motion_off() {
         let ctx = egui::Context::default();
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
-        let id = egui::Id::new("fade");
+        let id = egui::Id::unique("fade");
         let mut seen = (0.0, 0.0);
         frame(&ctx, 1.0, |ctx| {
-            seen.0 = fade_in_on_change(ctx, id, egui::Id::new("a"), FADE);
+            seen.0 = fade_in_on_change(ctx, id, egui::Id::unique("a"), FADE);
             seen.1 = toggle(ctx, id.with("t"), false, HOVER);
         });
         frame(&ctx, 1.01, |ctx| {
-            seen.0 = fade_in_on_change(ctx, id, egui::Id::new("b"), FADE);
+            seen.0 = fade_in_on_change(ctx, id, egui::Id::unique("b"), FADE);
             seen.1 = toggle(ctx, id.with("t"), true, HOVER);
         });
         assert_eq!(seen, (1.0, 1.0));
         let repaint = frame(&ctx, 1.02, |ctx| {
-            seen.0 = fade_in_on_change(ctx, id, egui::Id::new("b"), FADE);
+            seen.0 = fade_in_on_change(ctx, id, egui::Id::unique("b"), FADE);
             seen.1 = toggle(ctx, id.with("t"), true, HOVER);
         });
         assert!(!repaint, "no motion, no extra frames");
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn a_toggle_moves_toward_its_target_and_settles() {
         let ctx = egui::Context::default();
-        let id = egui::Id::new("hover");
+        let id = egui::Id::unique("hover");
         let mut value = 0.0;
         frame(&ctx, 1.0, |ctx| value = toggle(ctx, id, false, HOVER));
         assert_eq!(value, 0.0);
