@@ -70,6 +70,8 @@ copy_app_notice third_party/interprocess/LICENSE-0BSD.txt interprocess-LICENSE-0
 copy_app_notice third_party/interprocess/LICENSE-APACHE.txt interprocess-LICENSE-APACHE.txt
 copy_app_notice third_party/widestring/LICENSE-MIT widestring-LICENSE-MIT.txt
 copy_app_notice third_party/widestring/LICENSE-APACHE widestring-LICENSE-APACHE.txt
+copy_app_notice third_party/webbrowser/LICENSE-MIT webbrowser-LICENSE-MIT.txt
+copy_app_notice third_party/webbrowser/LICENSE-APACHE webbrowser-LICENSE-APACHE.txt
 
 copy_llvm_notice() {
   local lib="$1"
@@ -235,7 +237,9 @@ EOF
     interprocess-LICENSE-0BSD.txt \
     interprocess-LICENSE-APACHE.txt \
     widestring-LICENSE-MIT.txt \
-    widestring-LICENSE-APACHE.txt
+    widestring-LICENSE-APACHE.txt \
+    webbrowser-LICENSE-MIT.txt \
+    webbrowser-LICENSE-APACHE.txt
   do
     if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${notice}" ]]; then
       echo "::error::Thinwire.app Resources are missing the image notice ${notice}."
@@ -407,6 +411,8 @@ with tarfile.open(archive, "r:gz") as tf:
         "interprocess-LICENSE-APACHE.txt",
         "widestring-LICENSE-MIT.txt",
         "widestring-LICENSE-APACHE.txt",
+        "webbrowser-LICENSE-MIT.txt",
+        "webbrowser-LICENSE-APACHE.txt",
     ):
         if not any(name.endswith(f"THIRD_PARTY_NOTICES/{notice}") for name in names):
             raise SystemExit(f"{archive} is missing the notice {notice}")
