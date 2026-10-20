@@ -351,7 +351,14 @@ fn store_link(registered: bool) -> StoreLink {
 /// protocol tables (`sessions`, `identities`, prekeys, `sender_keys`).
 /// [`presage::store::Store::clear`] deletes the rest of `kv`: this device's
 /// identity key pairs, sender certificate, master key, and account entropy
-/// pool. Contacts, groups, and `thread_messages` stay.
+/// pool. Contacts, groups, and `thread_messages` stay through this wipe.
+/// The ACI is read first and written to [`PRIOR_ACI_KEY`] after the wipe.
+/// [`presage::store::Store::clear`] deletes every `kv` row, so the copy has
+/// to follow that delete. [`retain_chats_for_linked_aci`] compares it with
+/// the next link.
+/// The same ACI keeps the rows. A different ACI clears them before
+/// [`publish_chats`]. When the ACI copy cannot be written, this function
+/// clears the rows here. A later link then has no previous chats to publish.
 ///
 /// Returns `false` when a delete fails. Each failed delete is an error log.
 /// The account still ends. [`LinkedEnd::Stopped`] emits `Unlinked` with no
@@ -362,7 +369,13 @@ fn store_link(registered: bool) -> StoreLink {
 /// [`REJECTED_REGISTRATION_STILL_LOADABLE`]. The next begin loads that row
 /// and can reach this delete again.
 #[must_use]
-async fn forget_rejected_registration(store: &mut SqliteStore) -> bool {
+async fn forget_rejected_registration(store: &mut SqliteStore, url: &str) -> bool {
+    let prior = registration_aci(store).await;
+    let carried = if prior.is_none() {
+        read_prior_aci(url).await.ok().flatten()
+    } else {
+        None
+    };
     let registration = store.clear_registration().await;
     let keys = presage::store::Store::clear(store).await;
     if let Err(error) = &registration {
@@ -371,11 +384,140 @@ async fn forget_rejected_registration(store: &mut SqliteStore) -> bool {
     if let Err(error) = &keys {
         tracing::error!(%error, "{msg}", msg = CLEAR_KEYS_FAILED);
     }
+    if let Some(aci) = prior.or(carried) {
+        remember_prior_aci(store, url, aci).await;
+    }
     registration.is_ok() && keys.is_ok()
 }
 
+/// `kv` key for the ACI that owned the stored chats. It is written after the
+/// key wipe and removed once the next link has been compared.
+const PRIOR_ACI_KEY: &str = "thinwire_prior_aci";
+
 const CLEAR_REGISTRATION_FAILED: &str = "signal could not clear the rejected registration";
 const CLEAR_KEYS_FAILED: &str = "signal could not clear the rejected device keys";
+const PRIOR_ACI_NOT_STORED: &str = "signal could not store the previous account id";
+const STORED_CHATS_NOT_CLEARED: &str =
+    "signal could not clear stored chats of a rejected registration";
+
+async fn registration_aci(store: &SqliteStore) -> Option<Uuid> {
+    store
+        .load_registration_data()
+        .await
+        .ok()
+        .flatten()
+        .map(|data| data.service_ids.aci)
+}
+
+/// Store `aci` for the next link. When the row cannot be written, clear the
+/// chats now. The compare in [`retain_chats_for_linked_aci`] would have no
+/// ACI to match, and [`publish_chats`] would show the previous account.
+async fn remember_prior_aci(store: &mut SqliteStore, url: &str, aci: Uuid) {
+    if write_prior_aci(url, aci).await {
+        return;
+    }
+    tracing::error!("{}", PRIOR_ACI_NOT_STORED);
+    if clear_account_chats(store).await.is_err() {
+        tracing::error!("{}", STORED_CHATS_NOT_CLEARED);
+    }
+}
+
+/// Keep contacts, groups, messages, and profiles when `linked` is the ACI
+/// saved at device removal. A different ACI clears those rows before the
+/// chat list is published. No saved ACI means this store has no previous
+/// account to drop.
+async fn retain_chats_for_linked_aci(
+    store: &mut SqliteStore,
+    url: &str,
+    linked: Uuid,
+) -> Result<(), ()> {
+    let Some(prior) = read_prior_aci(url).await? else {
+        return Ok(());
+    };
+    if prior != linked {
+        if clear_account_chats(store).await.is_err() {
+            tracing::error!("{}", STORED_CHATS_NOT_CLEARED);
+            return Err(());
+        }
+        // The saved ACI now names this link. A failed delete then still
+        // matches on the next compare, so this account's new chats stay.
+        let remarked = write_prior_aci(url, linked).await;
+        let removed = delete_prior_aci(url).await;
+        if !remarked && !removed {
+            tracing::error!("{}", PRIOR_ACI_NOT_STORED);
+            return Err(());
+        }
+        return Ok(());
+    }
+    let _ = delete_prior_aci(url).await;
+    Ok(())
+}
+
+async fn clear_account_chats(store: &mut SqliteStore) -> Result<(), ()> {
+    store.clear_contents().await.map_err(|_| ())?;
+    store.clear_profiles().await.map_err(|_| ())?;
+    Ok(())
+}
+
+async fn open_kv_write(url: &str) -> Result<sqlx::SqlitePool, ()> {
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .map_err(|_| ())?
+        .create_if_missing(false)
+        .busy_timeout(std::time::Duration::from_secs(2));
+    sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|_| ())
+}
+
+async fn write_prior_aci(url: &str, aci: Uuid) -> bool {
+    let Ok(pool) = open_kv_write(url).await else {
+        return false;
+    };
+    let bytes = aci.into_bytes();
+    let wrote = sqlx::query("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)")
+        .bind(PRIOR_ACI_KEY)
+        .bind(bytes.as_slice())
+        .execute(&pool)
+        .await
+        .is_ok();
+    pool.close().await;
+    wrote
+}
+
+async fn read_prior_aci(url: &str) -> Result<Option<Uuid>, ()> {
+    let pool = open_kv_write(url).await?;
+    let value: Result<Option<Vec<u8>>, ()> =
+        sqlx::query_scalar("SELECT value FROM kv WHERE key = ?")
+            .bind(PRIOR_ACI_KEY)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|_| ());
+    pool.close().await;
+    match value? {
+        None => Ok(None),
+        Some(bytes) => {
+            let bytes: [u8; 16] = bytes.as_slice().try_into().map_err(|_| ())?;
+            Ok(Some(Uuid::from_bytes(bytes)))
+        }
+    }
+}
+
+async fn delete_prior_aci(url: &str) -> bool {
+    let Ok(pool) = open_kv_write(url).await else {
+        return false;
+    };
+    let deleted = sqlx::query("DELETE FROM kv WHERE key = ?")
+        .bind(PRIOR_ACI_KEY)
+        .execute(&pool)
+        .await
+        .is_ok();
+    pool.close().await;
+    deleted
+}
+
 /// The registration row survived a failed clear. The next begin loads it.
 const REJECTED_REGISTRATION_STILL_LOADABLE: &str =
     "signal rejected registration is still loadable; the next begin can try the delete again";
@@ -497,6 +639,16 @@ async fn run_linked(
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
     }
+    let linked_aci = manager.registration_data().service_ids.aci;
+    let mut linked_store = manager.store().clone();
+    if retain_chats_for_linked_aci(&mut linked_store, &store_url, linked_aci)
+        .await
+        .is_err()
+    {
+        fail(&events, SYNC_FAILED);
+        session.active.store(false, Ordering::SeqCst);
+        return LinkedEnd::Stopped;
+    }
     emit_account(&events, ProtocolId::Signal, AccountState::Linked);
     let mut rows = std::collections::HashMap::<String, Conversation>::new();
     let mut unread = std::collections::HashMap::<String, u32>::new();
@@ -541,7 +693,7 @@ async fn run_linked(
             ) {
                 OpenStop::DeviceRemoved => {
                     let mut rejected = manager.store().clone();
-                    let cleared = forget_rejected_registration(&mut rejected).await;
+                    let cleared = forget_rejected_registration(&mut rejected, &store_url).await;
                     note_if_rejected_registration_survived(cleared, rejected.is_registered().await);
                     ended = LinkedEnd::DeviceRemoved;
                     break;
@@ -1892,7 +2044,7 @@ mod tests {
         match classify_open(&removed, true, &mut receive, &mut seen) {
             OpenStop::Confirm => publish_link_check(&tx),
             OpenStop::DeviceRemoved => {
-                let _ = forget_rejected_registration(&mut store).await;
+                let _ = forget_rejected_registration(&mut store, &url).await;
             }
             OpenStop::Reconnect { .. } | OpenStop::Superseded => {
                 panic!("one unauthorized open is a check");
@@ -2123,9 +2275,24 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .await
             .expect("group");
 
+        let removed_aci = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("aci");
         assert!(
-            forget_rejected_registration(&mut store).await,
+            forget_rejected_registration(&mut store, &url).await,
             "the rejected registration is cleared"
+        );
+        assert_eq!(
+            read_prior_aci(&url).await.expect("prior aci row"),
+            Some(removed_aci),
+            "the wiped registration keeps its ACI for the next link"
+        );
+        assert!(
+            forget_rejected_registration(&mut store, &url).await,
+            "a second wipe still has the ACI to store"
+        );
+        assert_eq!(
+            read_prior_aci(&url).await.expect("prior aci row"),
+            Some(removed_aci),
+            "a second wipe keeps the ACI"
         );
 
         assert!(
@@ -2282,7 +2449,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
 
         let (bytes, guard) = capture_logs();
         tracing::callsite::rebuild_interest_cache();
-        let cleared = forget_rejected_registration(&mut store).await;
+        let cleared = forget_rejected_registration(&mut store, &url).await;
         assert!(!cleared, "a blocked delete is a failed clear");
         let registered = store.is_registered().await;
         assert!(
@@ -2339,7 +2506,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
     }
 
     /// The same phone number links again after removal. The ACI is unchanged,
-    /// so the history stays in this store. A different number is issue #330.
+    /// so the history stays in this store.
     #[tokio::test]
     async fn a_same_aci_relink_keeps_one_history_row() {
         let path = std::env::temp_dir().join(format!(
@@ -2387,20 +2554,24 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             },
         );
         store.save_message(&thread, content).await.expect("history");
-        sqlx::query(KEPT_CONTACT)
-            .bind(Uuid::from_u128(9).as_bytes().as_slice())
-            .bind([9u8; 32].as_slice())
-            .execute(&pool)
+        store.save_contact(&kept_contact()).await.expect("contact");
+        store
+            .save_group([8u8; 32], kept_group())
             .await
-            .expect("contact");
+            .expect("group");
 
         assert!(
-            forget_rejected_registration(&mut store).await,
+            forget_rejected_registration(&mut store, &url).await,
             "removal clears the registration row"
         );
         assert!(
             !store.is_registered().await,
             "removal clears the registration row"
+        );
+        assert_eq!(
+            read_prior_aci(&url).await.expect("prior aci row"),
+            Some(aci),
+            "the ACI stays after the key wipe"
         );
 
         sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
@@ -2418,6 +2589,14 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "the same number is the same ACI"
         );
         assert_eq!(store_link(store.is_registered().await), StoreLink::Existing);
+        retain_chats_for_linked_aci(&mut store, &url, again.service_ids.aci)
+            .await
+            .expect("the same ACI keeps the stored chats");
+        assert_eq!(
+            read_prior_aci(&url).await.expect("prior aci row"),
+            None,
+            "the compare consumes the saved ACI"
+        );
         let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_messages")
             .fetch_one(&pool)
             .await
@@ -2442,10 +2621,251 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .await
             .expect("contacts");
         assert_eq!(contacts, 1, "the contact stays on this account");
+        assert_eq!(
+            contact_names_of(&store).await,
+            vec!["Ada".to_string()],
+            "publish_chats still lists this contact"
+        );
+        assert_eq!(
+            group_titles_of(&store).await,
+            vec!["Kept".to_string()],
+            "publish_chats still lists this group"
+        );
 
         pool.close().await;
         store.close().await;
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A different Signal account scans the QR after device removal.
+    /// The previous account's chats and history are cleared before publish.
+    /// A later compare does not clear rows the new account stored.
+    #[tokio::test]
+    async fn a_different_aci_link_clears_the_previous_account() {
+        let path = std::env::temp_dir().join(format!(
+            "thinwire-signal-other-aci-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let url = path.to_str().expect("temp path").to_string();
+        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("store");
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("url")
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(2));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool");
+        sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
+            .bind(REJECTED_REGISTRATION.as_bytes())
+            .execute(&pool)
+            .await
+            .expect("registration");
+        let previous = store
+            .load_registration_data()
+            .await
+            .expect("registration decodes")
+            .expect("registered")
+            .service_ids
+            .aci;
+
+        let thread = Thread::Contact(ServiceId::Aci(Uuid::from_u128(7).into()));
+        store
+            .save_message(
+                &thread,
+                envelope(
+                    Uuid::from_u128(7),
+                    DataMessage {
+                        body: Some("previous account history".into()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("history");
+        store.save_contact(&kept_contact()).await.expect("contact");
+        store
+            .save_group([8u8; 32], kept_group())
+            .await
+            .expect("group");
+        let profile_uuid = Uuid::from_u128(9);
+        sqlx::query("INSERT INTO profile_keys (uuid, key) VALUES (?, ?)")
+            .bind(profile_uuid.as_bytes().as_slice())
+            .bind([9u8; 32].as_slice())
+            .execute(&pool)
+            .await
+            .expect("profile key");
+        sqlx::query(
+            "INSERT INTO profiles (uuid, given_name, unrestricted_unidentified_access) VALUES (?, 'Ada', 0)",
+        )
+        .bind(profile_uuid.as_bytes().as_slice())
+        .execute(&pool)
+        .await
+        .expect("profile");
+
+        assert!(
+            forget_rejected_registration(&mut store, &url).await,
+            "removal clears the registration row"
+        );
+        assert_eq!(
+            read_prior_aci(&url).await.expect("prior aci row"),
+            Some(previous),
+            "the previous ACI is still available after the key wipe"
+        );
+        assert_eq!(
+            contact_names_of(&store).await,
+            vec!["Ada".to_string()],
+            "the wipe alone still holds the previous contact"
+        );
+        assert_eq!(group_titles_of(&store).await, vec!["Kept".to_string()]);
+        assert!(
+            store
+                .message(&thread, 1_700_000_000_000)
+                .await
+                .expect("history read")
+                .is_some(),
+            "the wipe alone still holds the previous history"
+        );
+
+        let linked_aci = Uuid::from_u128(0x3333_3333_3333_3333_3333_3333_3333_3333);
+        assert_ne!(linked_aci, previous);
+        let registration = registration_for(linked_aci);
+        sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
+            .bind(registration.as_bytes())
+            .execute(&pool)
+            .await
+            .expect("other registration");
+        let linked = store
+            .load_registration_data()
+            .await
+            .expect("registration decodes")
+            .expect("the other account is registered")
+            .service_ids
+            .aci;
+        assert_eq!(linked, linked_aci);
+
+        retain_chats_for_linked_aci(&mut store, &url, linked)
+            .await
+            .expect("a different ACI clears the previous chats");
+        assert_eq!(
+            read_prior_aci(&url).await.expect("prior aci row"),
+            None,
+            "the compare consumes the saved ACI"
+        );
+        assert!(
+            contact_names_of(&store).await.is_empty(),
+            "publish_chats has no previous contact"
+        );
+        assert!(
+            group_titles_of(&store).await.is_empty(),
+            "publish_chats has no previous group"
+        );
+        assert!(
+            store
+                .message(&thread, 1_700_000_000_000)
+                .await
+                .expect("history read")
+                .is_none(),
+            "publish_chats has no previous history"
+        );
+        let profiles: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM profiles")
+            .fetch_one(&pool)
+            .await
+            .expect("profiles");
+        assert_eq!(profiles, 0, "the previous profile is cleared");
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_messages")
+            .fetch_one(&pool)
+            .await
+            .expect("messages");
+        assert_eq!(messages, 0);
+
+        store
+            .save_message(
+                &thread,
+                envelope(
+                    Uuid::from_u128(7),
+                    DataMessage {
+                        body: Some("new account history".into()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("new history");
+        retain_chats_for_linked_aci(&mut store, &url, linked)
+            .await
+            .expect("a second compare has no previous ACI");
+        let kept = store
+            .message(&thread, 1_700_000_000_000)
+            .await
+            .expect("history read")
+            .expect("the new account keeps its own history");
+        match kept.body {
+            ContentBody::DataMessage(message) => {
+                assert_eq!(message.body.as_deref(), Some("new account history"));
+            }
+            _ => panic!("stored history is a data message"),
+        }
+
+        pool.close().await;
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn kept_contact() -> Contact {
+        Contact {
+            uuid: Uuid::from_u128(9),
+            phone_number: None,
+            name: "Ada".into(),
+            verified: Default::default(),
+            profile_key: vec![9; 32],
+            expire_timer: 0,
+            expire_timer_version: 2,
+            inbox_position: 0,
+            avatar: None,
+        }
+    }
+
+    fn kept_group() -> Group {
+        Group {
+            title: "Kept".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 0,
+            members: Vec::new(),
+            pending_members: Vec::new(),
+            requesting_members: Vec::new(),
+            invite_link_password: Vec::new(),
+            description: None,
+        }
+    }
+
+    async fn contact_names_of(store: &SqliteStore) -> Vec<String> {
+        let contacts = store.contacts().await.expect("contacts");
+        contacts
+            .map(|contact| contact.expect("contact decodes").name)
+            .collect()
+    }
+
+    async fn group_titles_of(store: &SqliteStore) -> Vec<String> {
+        let groups = store.groups().await.expect("groups");
+        groups
+            .map(|group| group.expect("group decodes").1.title)
+            .collect()
+    }
+
+    fn registration_for(aci: Uuid) -> String {
+        REJECTED_REGISTRATION.replacen("11111111-1111-1111-1111-111111111111", &aci.to_string(), 1)
     }
 
     /// #174 item 14: a worker failure is `Unlinked` only.
