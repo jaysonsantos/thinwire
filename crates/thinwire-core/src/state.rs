@@ -8203,6 +8203,96 @@ mod tests {
         assert_ne!(row.detail, thinwire_protocol::SIGNAL_DEVICE_REMOVED);
     }
 
+    /// After removal, linking the same number again keeps history on the one
+    /// Signal account row. Republishing the same chat does not add a second row.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_same_number_relink_keeps_history_on_the_existing_account() {
+        use thinwire_protocol::SIGNAL_DEVICE_REMOVED;
+
+        let mut snapshot = signal_inbox_ready();
+        let conversation = chat(ProtocolId::Signal, "ada", true);
+        let message = ChatMessage {
+            protocol: ProtocolId::Signal,
+            conversation_id: "ada".into(),
+            id: "ada:1".into(),
+            sender: "Ada".into(),
+            body: "kept".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: 0,
+            arrival: thinwire_protocol::Arrival::History,
+            topic: None,
+            links: Vec::new(),
+            photo: None,
+        };
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: conversation.clone(),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: message.clone(),
+        });
+        snapshot.select_conversation("ada".into());
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: SIGNAL_DEVICE_REMOVED.into(),
+        });
+        snapshot.apply(AdapterEvent::AccountEnded {
+            protocol: ProtocolId::Signal,
+        });
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        assert!(snapshot.signal_device_removed());
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .filter(|row| row.caps.id == ProtocolId::Signal)
+                .count(),
+            1
+        );
+
+        snapshot.relink_removed_signal();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: "Signal is linked. Experimental client: expect breakage.".into(),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation });
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .filter(|row| row.caps.id == ProtocolId::Signal)
+                .count(),
+            1,
+            "the same number stays on the existing account row"
+        );
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("account row");
+        assert!(row.linked());
+        assert!(!snapshot.signal_device_removed());
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+        assert_eq!(snapshot.visible_conversations()[0].id, "ada");
+        assert_eq!(snapshot.selected_conversation.as_deref(), Some("ada"));
+        assert_eq!(snapshot.selected_messages().len(), 1);
+        assert_eq!(snapshot.selected_messages()[0].id, "ada:1");
+        assert_eq!(snapshot.selected_messages()[0].body, "kept");
+    }
+
     #[cfg(feature = "signal-local")]
     fn signal_inbox_ready() -> Snapshot {
         let mut snapshot = Snapshot::new();

@@ -2140,6 +2140,113 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The same phone number links again after removal. The ACI is unchanged,
+    /// so the history stays in this store. A different number is issue #330.
+    #[tokio::test]
+    async fn a_same_aci_relink_keeps_one_history_row() {
+        let path = std::env::temp_dir().join(format!(
+            "thinwire-signal-same-aci-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let url = path.to_str().expect("temp path").to_string();
+        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("store");
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("url")
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(2));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool");
+        sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
+            .bind(REJECTED_REGISTRATION.as_bytes())
+            .execute(&pool)
+            .await
+            .expect("registration");
+        let aci = store
+            .load_registration_data()
+            .await
+            .expect("registration decodes")
+            .expect("registered")
+            .service_ids
+            .aci;
+
+        let thread = Thread::Contact(ServiceId::Aci(Uuid::from_u128(7).into()));
+        let content = envelope(
+            Uuid::from_u128(7),
+            DataMessage {
+                body: Some("kept after the same number linked again".into()),
+                ..Default::default()
+            },
+        );
+        store.save_message(&thread, content).await.expect("history");
+        sqlx::query(KEPT_CONTACT)
+            .bind(Uuid::from_u128(9).as_bytes().as_slice())
+            .bind([9u8; 32].as_slice())
+            .execute(&pool)
+            .await
+            .expect("contact");
+
+        forget_rejected_registration(&mut store).await;
+        assert!(
+            !store.is_registered().await,
+            "removal clears the registration row"
+        );
+
+        sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
+            .bind(REJECTED_REGISTRATION.as_bytes())
+            .execute(&pool)
+            .await
+            .expect("same registration");
+        let again = store
+            .load_registration_data()
+            .await
+            .expect("registration decodes")
+            .expect("the same number is registered");
+        assert_eq!(
+            again.service_ids.aci, aci,
+            "the same number is the same ACI"
+        );
+        assert_eq!(store_link(store.is_registered().await), StoreLink::Existing);
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_messages")
+            .fetch_one(&pool)
+            .await
+            .expect("messages");
+        assert_eq!(messages, 1, "relink does not add a second history row");
+        let kept = store
+            .message(&thread, 1_700_000_000_000)
+            .await
+            .expect("history read")
+            .expect("the message stays in the existing store");
+        match kept.body {
+            ContentBody::DataMessage(message) => {
+                assert_eq!(
+                    message.body.as_deref(),
+                    Some("kept after the same number linked again")
+                );
+            }
+            _ => panic!("stored history is a data message"),
+        }
+        let contacts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contacts")
+            .fetch_one(&pool)
+            .await
+            .expect("contacts");
+        assert_eq!(contacts, 1, "the contact stays on this account");
+
+        pool.close().await;
+        store.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// #174 item 14: a worker failure is `Unlinked` only.
     #[test]
     fn a_worker_failure_does_not_end_the_account() {
