@@ -2622,6 +2622,12 @@ fn compose(
         .selected_conversation
         .clone()
         .map(|id| (snapshot.selected_protocol, id, snapshot.selected_topic));
+    let closed = snapshot.topic_closed();
+    // A closed topic already disables this field. Sending is off after the
+    // phone removes the device, so the field uses that same switch.
+    let sending_off =
+        snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal;
+    let compose_open = !closed && !sending_off;
     if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
     }
@@ -2635,7 +2641,7 @@ fn compose(
             )
         });
         // Eat plain Enter before the text field sees it, so it does not add a line.
-        if enter && !other && !shift {
+        if enter && !other && !shift && compose_open {
             if let Some((protocol, conversation_id, topic)) = chat.clone() {
                 out.push(Intent::SendDraft {
                     protocol,
@@ -2647,7 +2653,6 @@ fn compose(
         }
     }
     let palette = theme::palette(ui);
-    let closed = snapshot.topic_closed();
     let y = ui.cursor().min.y;
     ui.painter().hline(
         ui.max_rect().x_range(),
@@ -2694,9 +2699,9 @@ fn compose(
                                 .frame(field)
                                 .desired_rows(1)
                                 .desired_width(width)
-                                .interactive(!closed)
+                                .interactive(compose_open)
                                 .hint_text(RichText::new(hint.clone()).color(palette.text3))
-                        }) && !closed
+                        }) && compose_open
                             && let Some((protocol, conversation_id, topic)) = chat.clone()
                         {
                             out.push(Intent::SetDraft {

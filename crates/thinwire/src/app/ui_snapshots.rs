@@ -72,8 +72,8 @@ fn draw(ui: &mut egui::Ui, state: &mut Scene) {
     });
 }
 
-/// Same frame as [`draw`], and it applies a Link click. The catalog shots
-/// stay on [`draw`]: a text field must not dispatch on the first frame.
+/// Same frame as [`draw`], and it applies a Link click and a draft edit.
+/// The catalog shots stay on [`draw`].
 #[cfg(all(feature = "ui-snapshots", feature = "signal-local"))]
 fn draw_signal(ui: &mut egui::Ui, state: &mut Scene) {
     theme::install(ui.ctx());
@@ -84,7 +84,10 @@ fn draw_signal(ui: &mut egui::Ui, state: &mut Scene) {
     let view = state.core.view();
     ui::draw(ui, &view, &mut state.hints, &mut out);
     for intent in out {
-        if matches!(intent, Intent::Signal(thinwire_core::SignalIntent::Relink)) {
+        if matches!(
+            intent,
+            Intent::Signal(thinwire_core::SignalIntent::Relink) | Intent::SetDraft { .. }
+        ) {
             state.core.dispatch(intent);
         }
     }
@@ -667,8 +670,28 @@ mod signal_removed {
                 .is_none(),
             "no error popup"
         );
+        assert!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Label)
+                        .label("Signal is linked.")
+                        .include_labels(),
+                )
+                .next()
+                .is_none(),
+            "the status line does not say linked"
+        );
         harness.get_by_role_and_label(Role::Button, "Link");
         harness.snapshot(&name);
+        let field = harness.get_by_role(Role::MultilineTextInput);
+        field.click();
+        field.type_text("nope");
+        harness.run();
+        assert!(
+            harness.state().core.view().compose.is_empty(),
+            "sending is off: the message input takes no text"
+        );
         harness.get_by_role_and_label(Role::Button, "Link").click();
         harness.run();
         harness.get_by_role_and_label(Role::Label, "Link a secondary device");

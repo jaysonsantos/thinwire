@@ -1137,6 +1137,10 @@ impl Snapshot {
                 #[cfg(feature = "signal-local")]
                 if protocol == ProtocolId::Signal {
                     self.signal_removed = true;
+                    // The row and the open chat show the removal. The strip
+                    // must not keep the link success line, and it must not
+                    // repeat that sentence.
+                    self.clear_linked_signal_status();
                 }
             }
             AdapterEvent::TelegramDataReset { moved_to } => {
@@ -3593,8 +3597,18 @@ impl Snapshot {
         self.end_signal_pairing();
         self.signal_screen = SignalScreen::Hidden;
         self.signal_removed = true;
-        // The line is on the row and in the open chat. No error block.
+        // The line is on the row and in the open chat. No error block, and
+        // the strip does not repeat it.
         self.error = None;
+        self.clear_linked_signal_status();
+    }
+
+    /// Drop a status line that still says this Signal device is linked.
+    #[cfg(feature = "signal-local")]
+    fn clear_linked_signal_status(&mut self) {
+        if self.status_text.to_ascii_lowercase().contains("linked") {
+            self.status_text.clear();
+        }
     }
 
     /// The phone removed this Signal device. The row and the open chat show
@@ -7977,6 +7991,10 @@ mod tests {
         snapshot.select_conversation("ada".into());
         snapshot.compose = "hello".into();
         let _ = snapshot.take_commands();
+        assert_eq!(
+            snapshot.status_text, "Signal is linked.",
+            "a real link leaves this line"
+        );
 
         snapshot.apply(AdapterEvent::Status {
             protocol: ProtocolId::Signal,
@@ -7986,10 +8004,30 @@ mod tests {
         snapshot.apply(AdapterEvent::AccountEnded {
             protocol: ProtocolId::Signal,
         });
+        assert!(
+            !snapshot
+                .status_line()
+                .to_ascii_lowercase()
+                .contains("linked"),
+            "after AccountEnded the strip must not say linked: {}",
+            snapshot.status_line()
+        );
+        assert_ne!(
+            snapshot.status_text, SIGNAL_DEVICE_REMOVED,
+            "the strip does not repeat the row"
+        );
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Signal,
             state: AccountState::Unlinked,
         });
+        assert!(
+            !snapshot
+                .status_line()
+                .to_ascii_lowercase()
+                .contains("linked"),
+            "Unlinked keeps the strip clear: {}",
+            snapshot.status_line()
+        );
 
         assert!(snapshot.signal_device_removed());
         assert!(
