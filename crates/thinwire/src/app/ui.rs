@@ -210,7 +210,7 @@ fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
 /// The settings menu button. Its three dots are painted: U+22EF is in
 /// neither Inter nor egui's fallback fonts, so a text glyph draws as a box.
 fn more_menu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let icon = egui::Atom::custom(ui.id().with("more-icon"), egui::vec2(16.0, 16.0));
+    let icon = egui::Atom::custom(egui::IdSalt::new("more-icon"), egui::vec2(16.0, 16.0));
     let response = ui.menu_button(icon, add_contents).response;
     let ink = ui.style().interact(&response).fg_stroke.color;
     let center = response.rect.center();
@@ -218,7 +218,7 @@ fn more_menu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         ui.painter()
             .circle_filled(center + egui::vec2(dx, 0.0), 1.75, ink);
     }
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Menu"));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Menu"));
 }
 
 /// Side of the busy spinner in the top bar.
@@ -230,7 +230,7 @@ const BUSY_SPINNER: f32 = 14.0;
 /// OS reduce-motion: the still label [`motion::WORKING`].
 /// A finished line or a failure stays on the strip.
 fn busy_indicator(ui: &mut egui::Ui, line: Option<&str>) {
-    let id = ui.id().with("busy-line");
+    let id = ui.scope_id().with("busy-line");
     let text = match line {
         Some(text) => {
             ui.data_mut(|data| data.insert_temp(id, text.to_owned()));
@@ -283,7 +283,7 @@ fn filter_pill(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response
     let palette = theme::palette(ui);
     let on = motion::toggle(
         ui.ctx(),
-        ui.id().with(("filter-pill", label)),
+        ui.scope_id().with(("filter-pill", label)),
         selected,
         motion::STATE,
     );
@@ -309,7 +309,7 @@ fn search_field(ui: &mut egui::Ui, search: &str) -> Option<String> {
         .margin(theme::search_field_margin())
         .hint_text(RichText::new("title / participant").color(palette.text3))
         .prefix(egui::Atom::custom(
-            ui.id().with("search-icon"),
+            egui::IdSalt::new("search-icon"),
             egui::vec2(SEARCH_ICON, SEARCH_ICON),
         ))
         .show(ui);
@@ -328,7 +328,7 @@ fn search_field(ui: &mut egui::Ui, search: &str) -> Option<String> {
 fn theme_control(ui: &mut egui::Ui, current: ThemeMode, out: &mut Vec<Intent>) {
     ui.label("Theme");
     let mut preference = current.to_egui();
-    preference.radio_buttons(ui);
+    preference.buttons(ui);
     let chosen = ThemeMode::from_egui(preference);
     if chosen != current {
         out.push(Intent::SetTheme(chosen));
@@ -356,7 +356,7 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let content = StripContent::of(snapshot, keychain_notice(snapshot.persistence()));
     let visible = !content.is_empty();
     // While the strip slides away, it draws the last content it had.
-    let last = egui::Id::new("status-strip-content");
+    let last = egui::Id::unique("status-strip-content");
     let shown = if visible {
         ui.data_mut(|data| data.insert_temp(last, content.clone()));
         content
@@ -619,7 +619,7 @@ fn account_chip(
         egui::vec2(width, 36.0 + space::S * 2.0),
         egui::Sense::hover(),
     );
-    let chip_id = ui.id().with(("account-chip", caps.id));
+    let chip_id = ui.scope_id().with(("account-chip", caps.id));
     row_backdrop(ui, chip_id, rect, selected, hover.hovered());
     let inner = theme::row_content_rect(rect, 0.0);
     let mut child = ui.new_child(
@@ -633,7 +633,7 @@ fn account_chip(
     // The dot is painted, so tests need a label to read its left edge.
     #[cfg(test)]
     dot_response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "account status"));
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, "account status"));
     #[cfg(not(test))]
     let _ = dot_response;
     child.painter().circle_filled(
@@ -667,12 +667,7 @@ fn account_chip(
     }
     let response = ui.interact(rect, chip_id, egui::Sense::click());
     response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::WidgetType::Button,
-            true,
-            selected,
-            caps.id.display_name(),
-        )
+        egui::WidgetInfo::selected(egui::Role::Button, true, selected, caps.id.display_name())
     });
     if let Some(note) = account_footnote(caps.id, account.linked()) {
         ui.label(RichText::new(note).small().weak());
@@ -830,7 +825,7 @@ fn inbox_scroll(
             memo_id,
             InboxAnchor {
                 ids,
-                offset: output.state.offset.y,
+                offset: output.state.clamped_offset().y,
                 stride: drawn.stride,
                 anchor: drawn.anchor,
             },
@@ -970,7 +965,7 @@ fn inbox(
             } else {
                 title.clone()
             };
-            egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label)
+            egui::WidgetInfo::selected(egui::Role::Button, true, selected, label)
         });
         if row_scrolls(selected, focused, scroll_to_selected, scroll_to_focused) {
             response.scroll_to_me(None);
@@ -1002,7 +997,7 @@ fn inbox(
         .find(|intent| matches!(intent, Intent::MoveInbox { .. }))
         && let Some(id) = snapshot.inbox_move_target(*delta)
     {
-        let row_id = ui.id().with(("inbox-row", id));
+        let row_id = ui.scope_id().with(("inbox-row", id));
         ui.memory_mut(|memory| memory.request_focus(row_id));
     }
     // The pointer's row wins. With the pointer elsewhere, the first visible
@@ -1138,7 +1133,7 @@ fn inbox_keys(
     let row_ids: Vec<egui::Id> = snapshot
         .visible_conversations()
         .iter()
-        .map(|row| ui.id().with(("inbox-row", &row.id)))
+        .map(|row| ui.scope_id().with(("inbox-row", &row.id)))
         .collect();
     let keys_here = ui.ctx().memory(|m| m.focused()).is_none()
         || ui.ctx().memory(|memory| {
@@ -1177,7 +1172,7 @@ fn inbox_keys(
 /// #61 applies the thread scroll offset on the next frame. That frame can
 /// report a width of 0. A wrap at 0 draws one letter per line.
 fn laid_out_width(ui: &egui::Ui, key: &str) -> f32 {
-    let id = ui.id().with(key);
+    let id = ui.scope_id().with(key);
     let raw = ui.available_width();
     if raw.is_finite() && raw >= 48.0 {
         ui.data_mut(|data| data.insert_temp(id, raw));
@@ -1245,7 +1240,7 @@ fn inbox_row(
         egui::vec2(width, inbox_row_height(ui)),
         egui::Sense::hover(),
     );
-    let row_id = ui.id().with(("inbox-row", id));
+    let row_id = ui.scope_id().with(("inbox-row", id));
     row_backdrop(ui, row_id, rect, selected, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
@@ -1261,7 +1256,7 @@ fn inbox_row(
         egui::Sense::hover(),
     );
     avatar_response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("avatar {title}"))
+        egui::WidgetInfo::labeled(egui::Role::Label, true, format!("avatar {title}"))
     });
     super::photos::paint_avatar(ui, avatar_rect, protocol, id, title, avatar, out);
     child.vertical(|ui| {
@@ -1357,7 +1352,7 @@ fn unread_badge(ui: &mut egui::Ui, text: &str, muted: bool) {
     let height = galley.size().y + space::XS;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("unread {text}"))
+        egui::WidgetInfo::labeled(egui::Role::Label, true, format!("unread {text}"))
     });
     let corner = egui::CornerRadius::same(radius::PILL);
     if muted {
@@ -1472,8 +1467,8 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: 
         let view = snapshot.center_view();
         ui.multiply_opacity(motion::fade_in_on_change(
             ui.ctx(),
-            ui.id().with("center-fade"),
-            egui::Id::new((
+            ui.scope_id().with("center-fade"),
+            egui::Id::unique((
                 std::mem::discriminant(&view),
                 std::mem::discriminant(&snapshot.auth),
             )),
@@ -1516,7 +1511,7 @@ fn keychain_failed(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
 }
 
 fn first_run(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
-    let id = ui.id().with("first-run-card-height");
+    let id = ui.scope_id().with("first-run-card-height");
     let known = ui.data(|data| data.get_temp::<f32>(id).unwrap_or(0.0));
     let spare = (ui.available_height() - known).max(0.0);
     ui.add_space(spare / 2.0);
@@ -1653,8 +1648,8 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     // reaches the newest message only at the end of that pass.
     let fade = motion::fade_in_on_change(
         ui.ctx(),
-        ui.id().with("thread-fade"),
-        egui::Id::new((
+        ui.scope_id().with("thread-fade"),
+        egui::Id::unique((
             snapshot.selected_protocol,
             &snapshot.selected_conversation,
             snapshot.selected_topic,
@@ -1716,10 +1711,11 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     });
     // `stick_to_bottom` moves the offset after this pass painted. Draw the
     // next frame now, not at the idle tick, so a new message shows at once.
-    if (output.state.offset.y - scroll.offset).abs() > 0.01 {
+    if (output.state.clamped_offset().y - scroll.offset).abs() > 0.01 {
         ui.ctx().request_repaint();
     }
-    let below = output.content_size.y - output.inner_rect.height() - output.state.offset.y;
+    let below =
+        output.content_size.y - output.inner_rect.height() - output.state.clamped_offset().y;
     let jump = jump_to_latest(
         ui,
         output.inner_rect,
@@ -1732,7 +1728,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         data.insert_temp(
             scroll_id,
             ThreadScroll {
-                offset: output.state.offset.y,
+                offset: output.state.clamped_offset().y,
                 jump,
             },
         );
@@ -1742,7 +1738,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         &memo,
         first_id.as_deref(),
         |id| messages.iter().any(|message| message.id == id),
-        output.state.offset.y,
+        output.state.clamped_offset().y,
         output.content_size.y,
         cannot_leave_zone(output.content_size.y, output.inner_rect.height()),
     );
@@ -1807,7 +1803,7 @@ const JUMP_SIZE: f32 = 36.0;
 /// Round button over the bottom right of the messages. It fades in while the
 /// newest message is out of view. True on a click.
 fn jump_to_latest(ui: &mut egui::Ui, view: egui::Rect, offered: bool) -> bool {
-    let id = ui.id().with("jump-to-latest");
+    let id = ui.scope_id().with("jump-to-latest");
     let shown = motion::toggle(ui.ctx(), id, offered, motion::FADE);
     if shown <= 0.0 {
         return false;
@@ -1829,7 +1825,7 @@ fn jump_to_latest(ui: &mut egui::Ui, view: egui::Rect, offered: bool) -> bool {
     };
     let response = ui.interact(rect, id, sense);
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, offered, "Jump to latest message")
+        egui::WidgetInfo::labeled(egui::Role::Button, offered, "Jump to latest message")
     });
     let hover = motion::toggle(
         ui.ctx(),
@@ -2046,7 +2042,7 @@ fn topic_list(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
             memo_id,
             InboxAnchor {
                 ids,
-                offset: output.state.offset.y,
+                offset: output.state.clamped_offset().y,
                 stride: drawn.stride,
                 anchor: drawn.anchor,
             },
@@ -2071,7 +2067,7 @@ fn topic_row(
         egui::vec2(width, inbox_row_height(ui)),
         egui::Sense::hover(),
     );
-    let row_id = ui.id().with(("topic-row", id));
+    let row_id = ui.scope_id().with(("topic-row", id));
     row_backdrop(ui, row_id, rect, false, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
@@ -2140,15 +2136,14 @@ fn topic_row(
     } else {
         name.to_owned()
     };
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, access.clone()));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, access.clone()));
     response
 }
 
 /// A small lock, painted with strokes so the snapshot font does not matter.
 fn lock_icon(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "closed"));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, "closed"));
     let stroke = egui::Stroke::new(1.5, color);
     let body = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 2.0, rect.center().y),
@@ -2339,7 +2334,7 @@ fn bubble(
                                     .layout_in_ui(ui);
                                 response.widget_info(|| {
                                     egui::WidgetInfo::labeled(
-                                        egui::WidgetType::Label,
+                                        egui::Role::Label,
                                         ui.is_enabled(),
                                         galley.text(),
                                     )
@@ -2424,7 +2419,7 @@ fn bubble(
         if message.photo.is_some() {
             ui.ctx().data_mut(|data| {
                 data.insert_temp(
-                    egui::Id::new("thinwire-photo-row-height"),
+                    egui::Id::unique("thinwire-photo-row-height"),
                     frame.rect.height(),
                 );
             });
@@ -2454,7 +2449,7 @@ fn bubble(
         }
         // Restore the pane after selection, which sets a label role.
         frame.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Panel, true, bubble_access_label(message))
+            egui::WidgetInfo::labeled(egui::Role::Pane, true, bubble_access_label(message))
         });
     });
 }
@@ -2569,7 +2564,7 @@ fn compose(
     max_height: f32,
     out: &mut Vec<Intent>,
 ) {
-    let compose_id = egui::Id::new("thread-compose");
+    let compose_id = egui::Id::unique("thread-compose");
     // The chat this frame drew. Drafts and sends name it, so a click on
     // another chat in the same frame cannot move them (PR #48 review).
     let chat = snapshot
@@ -3031,7 +3026,7 @@ mod tests {
                     let reserve = compose_reserve(row_height, rows, spacing);
                     let top = ui.cursor().min.y;
                     ui.memory_mut(|memory| {
-                        memory.request_focus(egui::Id::new("thread-compose"));
+                        memory.request_focus(egui::Id::unique("thread-compose"));
                     });
                     compose(
                         ui,
@@ -3113,7 +3108,7 @@ mod tests {
                                 "{rows} rows: scroll {scroll_height} did not hit max height"
                             );
                             ui.memory_mut(|memory| {
-                                memory.request_focus(egui::Id::new("thread-compose"));
+                                memory.request_focus(egui::Id::unique("thread-compose"));
                             });
                             compose(
                                 ui,

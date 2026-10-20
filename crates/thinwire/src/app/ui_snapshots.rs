@@ -63,11 +63,11 @@ fn draw(ui: &mut egui::Ui, state: &mut Scene) {
     let view = state.core.view();
     ui::draw(ui, &view, &mut state.hints, &mut out);
     state.photo_box_height = ui.data(|data| {
-        data.get_temp(egui::Id::new("thinwire-photo-box-height"))
+        data.get_temp(egui::Id::unique("thinwire-photo-box-height"))
             .unwrap_or(0.0)
     });
     state.photo_row_height = ui.data(|data| {
-        data.get_temp(egui::Id::new("thinwire-photo-row-height"))
+        data.get_temp(egui::Id::unique("thinwire-photo-row-height"))
             .unwrap_or(0.0)
     });
 }
@@ -310,6 +310,7 @@ mod jump_to_latest {
             delta: egui::vec2(0.0, 5_000.0),
             phase: egui::TouchPhase::Move,
             modifiers: egui::Modifiers::NONE,
+            source: egui::MouseWheelSource::Wheel,
         });
         // egui spreads a wheel step over several frames.
         harness.run_steps(12);
