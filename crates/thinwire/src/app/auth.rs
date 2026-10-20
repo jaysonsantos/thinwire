@@ -108,7 +108,7 @@ fn inline_feedback(ui: &mut egui::Ui, snapshot: &Snapshot) {
 
 /// Focus the step field when the step opens, and again when a submit ends.
 fn take_focus(ui: &egui::Ui, snapshot: &Snapshot) -> bool {
-    let key = egui::Id::new("auth-last-step");
+    let key = egui::Id::unique("auth-last-step");
     let now = (snapshot.auth, snapshot.auth_busy);
     let previous = ui.data_mut(|data| {
         let previous = data.get_temp::<(AuthScreen, bool)>(key);
@@ -126,7 +126,7 @@ fn field(
     focus: bool,
     edit: impl FnOnce(&mut String) -> egui::TextEdit<'_>,
 ) -> Option<String> {
-    let id = egui::Id::new(("auth-field", auth_field));
+    let id = egui::Id::unique(("auth-field", auth_field));
     let width = ui.available_width();
     let changed = edited(ui, current, |text| {
         edit(text)

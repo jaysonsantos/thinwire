@@ -3,7 +3,7 @@
 **Status:** accepted
 
 ## Context
-Product-council (2026-09-20) locked the desktop renderer after option B. The shell is a thin native messenger for Windows, macOS, and Linux. eframe 0.36 turns wgpu on by default. Glow is enough for this UI. The council rejected a wgpu-default stack and gpui until it says otherwise.
+Product-council (2026-09-20) locked the desktop renderer after option B. The shell is a thin native messenger for Windows, macOS, and Linux. eframe 0.36 turns wgpu on by default. eframe 0.37 still does, and also turns `system_fonts` on by default. Glow is enough for this UI. The council rejected a wgpu-default stack and gpui until it says otherwise. `system_fonts` stays off so a missing glyph uses the bundled fallback and the spacing tokens stay in charge of the layout. Emoji coverage stays the bundled Noto set through egui's `monochrome_emoji_fonts` feature, which 0.37 split out of `default_fonts`.
 
 ## Decision
 thinwire uses **egui + eframe + glow**. wgpu stays off.

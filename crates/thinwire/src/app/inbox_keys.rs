@@ -117,7 +117,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
     if state.focus_retry {
         ui.interact(
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(8.0, 8.0)),
-            egui::Id::new("thread-retry"),
+            egui::Id::unique("thread-retry"),
             egui::Sense::click(),
         )
         .request_focus();
@@ -378,7 +378,7 @@ fn arrows_move_the_highlight_and_enter_opens_it() {
     harness.state_mut().focus_retry = false;
     harness
         .ctx
-        .memory_mut(|memory| memory.surrender_focus(egui::Id::new("thread-retry")));
+        .memory_mut(|memory| memory.surrender_focus(egui::Id::unique("thread-retry")));
     harness.step();
     harness.key_press(egui::Key::Enter);
     harness.step();
@@ -1023,6 +1023,7 @@ fn the_thread_follows_new_messages_and_jumps_back_to_the_newest() {
         delta: egui::vec2(0.0, 5_000.0),
         phase: egui::TouchPhase::Move,
         modifiers: egui::Modifiers::NONE,
+        source: egui::MouseWheelSource::Wheel,
     });
     // egui spreads a wheel step over several frames.
     harness.run_steps(12);
@@ -1093,9 +1094,9 @@ fn a_message_in_another_chat_keeps_the_open_chat_and_the_composer() {
     harness.run();
     harness
         .ctx
-        .memory_mut(|memory| memory.request_focus(egui::Id::new("thread-compose")));
+        .memory_mut(|memory| memory.request_focus(egui::Id::unique("thread-compose")));
     harness.step();
-    let compose = egui::Id::new("thread-compose");
+    let compose = egui::Id::unique("thread-compose");
     assert!(
         harness.ctx.memory(|memory| memory.has_focus(compose)),
         "the composer has focus"
@@ -1180,6 +1181,7 @@ fn a_scrolled_inbox_keeps_the_row_under_the_pointer() {
         delta: egui::vec2(0.0, -180.0),
         phase: egui::TouchPhase::Move,
         modifiers: egui::Modifiers::NONE,
+        source: egui::MouseWheelSource::Wheel,
     });
     harness.run_steps(12);
     harness.run();

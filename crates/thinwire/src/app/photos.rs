@@ -326,7 +326,7 @@ pub(crate) fn show(
     let size = photo_box(photo.width, photo.height);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     ui.ctx().data_mut(|data| {
-        data.insert_temp(egui::Id::new("thinwire-photo-box-height"), rect.height());
+        data.insert_temp(egui::Id::unique("thinwire-photo-box-height"), rect.height());
     });
     let mut revealed_now = is_revealed(ui.ctx(), message_id);
     let spoiler_was_hidden = photo.has_spoiler && !revealed_now;
@@ -545,8 +545,8 @@ fn read_path(
     // The path is not part of the id source: egui keeps that string for its
     // debug inspector. The stamp changes when the file path changes.
     let path_stamp = fingerprint(path.as_bytes());
-    let id = egui::Id::new(("thinwire-photo-read", message_id, file_id, path_stamp));
-    let active = egui::Id::new(("thinwire-photo-active", message_id, file_id));
+    let id = egui::Id::unique(("thinwire-photo-read", message_id, file_id, path_stamp));
+    let active = egui::Id::unique(("thinwire-photo-active", message_id, file_id));
     retire_previous(ui, active, id);
     if let Some(slot) = ui.data(|data| data.get_temp::<BytesSlot>(id)) {
         return shown_from_slot(&slot, base);
@@ -591,8 +591,8 @@ fn blurred_mini(ui: &egui::Ui, message_id: &str, photo: &MessagePhoto) -> Option
         return None;
     }
     let stamp = fingerprint(slice);
-    let id = egui::Id::new(("thinwire-photo-blur", message_id, stamp));
-    let active = egui::Id::new(("thinwire-photo-blur-active", message_id));
+    let id = egui::Id::unique(("thinwire-photo-blur", message_id, stamp));
+    let active = egui::Id::unique(("thinwire-photo-blur-active", message_id));
     retire_previous(ui, active, id);
     let base = mini_base(message_id);
     if let Some(slot) = ui.data(|data| data.get_temp::<BytesSlot>(id)) {
@@ -756,7 +756,7 @@ fn remembered_uri(ui: &egui::Ui, base: &str) -> Option<String> {
 }
 
 fn uri_id(base: &str) -> egui::Id {
-    egui::Id::new(("thinwire-photo-uri", base))
+    egui::Id::unique(("thinwire-photo-uri", base))
 }
 
 fn image_uri(base: &str, stamp: u64) -> String {
@@ -797,7 +797,7 @@ pub(crate) fn overlay(ui: &mut egui::Ui, messages: &[thinwire_protocol::ChatMess
         return;
     };
     let screen = ui.ctx().content_rect();
-    egui::Area::new(egui::Id::new("photo-overlay"))
+    egui::Area::new(egui::Id::unique("photo-overlay"))
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
         .show(ui.ctx(), |ui| {
@@ -873,7 +873,7 @@ fn store(ctx: &egui::Context, state: PhotoUi) {
 }
 
 fn ui_id() -> egui::Id {
-    egui::Id::new("thinwire-photo-ui")
+    egui::Id::unique("thinwire-photo-ui")
 }
 
 #[cfg(test)]
