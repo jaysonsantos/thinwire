@@ -59,7 +59,7 @@ enum LinkedEnd {
 /// What a failed `receive_messages` means for this generation.
 enum OpenStop {
     DeviceRemoved,
-    /// The first unauthorized open. Open once more before deleting keys.
+    /// The first unauthorized open. Wait, then open once more before deleting keys.
     Confirm,
     Reconnect {
         after: std::time::Duration,
@@ -288,11 +288,12 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
 /// is a different error and reconnects without touching the store.
 ///
 /// One unauthorized open is not enough to call this device removed.
-/// [`classify_open`] returns [`OpenStop::Confirm`] and the worker opens
-/// the stream once more, immediately. Only a second consecutive
-/// unauthorized open is removal. A successful open, or any other error,
-/// clears that mark. The removal path deletes identity keys, the sender
-/// certificate, and the master key, and those rows cannot be put back.
+/// [`classify_open`] returns [`OpenStop::Confirm`]. The worker waits the
+/// first reconnect backoff ([`confirm_wait`]), then opens the stream once
+/// more. Only a second consecutive unauthorized open is removal. A
+/// successful open, or any other error, clears that mark. The removal path
+/// deletes identity keys, the sender certificate, and the master key, and
+/// those rows cannot be put back.
 fn device_removed<E: std::error::Error>(error: &presage::Error<E>) -> bool {
     matches!(
         error,
@@ -483,8 +484,15 @@ async fn run_linked(
                     ended = LinkedEnd::DeviceRemoved;
                     break;
                 }
-                // The next open decides. No disconnect line for this one try.
-                OpenStop::Confirm => continue,
+                // The next open decides. Wait out a short gateway or auth glitch.
+                // No disconnect line for this one try. Cancel during the wait
+                // leaves this generation, so the worker does not open again.
+                OpenStop::Confirm => {
+                    if !wait_before_confirm(session.as_ref(), token).await {
+                        break;
+                    }
+                    continue;
+                }
                 OpenStop::Reconnect { after } => {
                     emit_account(&events, ProtocolId::Signal, AccountState::Linking);
                     emit_status(
@@ -1568,6 +1576,22 @@ fn sent_conversation(
     }
 }
 
+/// How long the worker waits before the confirm open.
+///
+/// This is the first reconnect backoff. A gateway or auth glitch of a few
+/// hundred milliseconds must not look like two removals.
+const fn confirm_wait() -> std::time::Duration {
+    super::reconnect::RECONNECT_BACKOFF
+}
+
+/// `true` when this generation is still current after the confirm wait.
+///
+/// The confirm open runs only after this returns `true`. A cancel or a new
+/// generation during the wait returns `false`, and the worker does not open.
+async fn wait_before_confirm(session: &Session, token: u64) -> bool {
+    wait_backoff(session, token, confirm_wait()).await
+}
+
 /// `true` when this generation is still current after the wait.
 async fn wait_backoff(session: &Session, token: u64, delay: std::time::Duration) -> bool {
     let deadline = tokio::time::Instant::now() + delay;
@@ -1754,6 +1778,47 @@ mod tests {
             AdapterEvent::Status { detail, .. }
                 if detail == thinwire_protocol::SIGNAL_DEVICE_REMOVED
         )));
+    }
+
+    /// The confirm open waits the first reconnect backoff.
+    #[tokio::test]
+    async fn the_confirm_open_waits_before_it_runs() {
+        let session = Session::new();
+        let (token, _wake) = session.begin_attempt();
+        assert_eq!(
+            confirm_wait(),
+            super::super::reconnect::RECONNECT_BACKOFF,
+            "the confirm wait is the first reconnect backoff"
+        );
+        let started = std::time::Instant::now();
+        let still_current = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_before_confirm(&session, token),
+        )
+        .await
+        .expect("the confirm wait ends");
+        assert!(still_current, "this generation is still current");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= confirm_wait(),
+            "the confirm open runs only after the wait, elapsed {elapsed:?}"
+        );
+    }
+
+    /// Cancel during the confirm wait does not open again.
+    #[tokio::test]
+    async fn a_cancel_during_the_confirm_wait_does_not_open() {
+        let session = Arc::new(Session::new());
+        let (token, _wake) = session.begin_attempt();
+        let waiting = Arc::clone(&session);
+        let task = tokio::spawn(async move { wait_before_confirm(&waiting, token).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        session.cancel_attempt();
+        let still_current = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("cancel ends the confirm wait")
+            .expect("task");
+        assert!(!still_current, "a superseded generation does not open");
     }
 
     /// A registration blob `is_registered` accepts. The password and profile
