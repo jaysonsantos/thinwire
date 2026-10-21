@@ -57,6 +57,9 @@ pub enum PrepareError {
     CheckFailed,
     /// The file is encrypted and this key does not open it. The file stays.
     WrongKey,
+    /// The file is not a plaintext store and not a SQLCipher page file.
+    /// It stays where it is.
+    Unreadable,
     /// A file step failed. An encrypted store was not deleted.
     Io,
 }
@@ -79,13 +82,27 @@ pub fn is_plaintext_sqlite(path: &Path) -> bool {
     file.read_exact(&mut header).is_ok() && header == *SQLITE_HEADER
 }
 
-/// `true` when the file has bytes and is not a plaintext SQLite file.
+/// `true` when the file has the shape of a SQLCipher database.
+///
+/// A plaintext store starts with the SQLite header. A short file, an empty
+/// file, or a file whose size is not a whole cipher page is not a store.
+/// Those files are unreadable. They are not a wrong key.
 #[must_use]
 pub fn is_encrypted_store(path: &Path) -> bool {
-    match fs::metadata(path) {
-        Ok(meta) if meta.is_file() && meta.len() > 0 => !is_plaintext_sqlite(path),
-        _ => false,
+    cipher_shaped(path)
+}
+
+/// SQLCipher page sizes are powers of two from 512. A real store is at least
+/// one page, and its size is a whole number of pages.
+fn cipher_shaped(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
     }
+    let len = meta.len();
+    len >= 512 && len.is_multiple_of(512) && !is_plaintext_sqlite(path)
 }
 
 /// SQL text for a raw SQLCipher key: `"x'<64 hex chars>'"`.
@@ -149,7 +166,13 @@ pub fn prepare_file(
         }
         return Ok(PrepareOutcome::Ready);
     }
-    Err(PrepareError::WrongKey)
+    // A page-sized file that does not open is SQLCipher with the wrong key.
+    // Anything else is corrupt or not a database. Neither case deletes the file.
+    if cipher_shaped(path) {
+        Err(PrepareError::WrongKey)
+    } else {
+        Err(PrepareError::Unreadable)
+    }
 }
 
 fn resume_without_canonical(
@@ -249,21 +272,23 @@ fn migrate_plaintext(
 fn export_encrypted(plain: &Path, dest: &Path, key: &[u8; 32]) -> Result<(), PrepareError> {
     let conn = Connection::open(plain).map_err(|_| PrepareError::Io)?;
     let _ = conn.busy_timeout(Duration::from_secs(2));
-    if conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-        .is_err()
-    {
+    // Column 0 is 1 when TRUNCATE was blocked, for example by another reader.
+    // A blocked checkpoint leaves the WAL in place, so the copy stops and the
+    // plaintext file stays.
+    let busy: i64 = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .map_err(|_| PrepareError::Io)?;
+    if busy != 0 {
         return Err(PrepareError::Io);
     }
-    let quoted = dest
-        .to_string_lossy()
-        .replace('\\', "/")
-        .replace('\'', "''");
+    let path_text = dest.to_str().ok_or(PrepareError::Io)?;
+    // The path is a bound parameter. A backslash is a normal character in a
+    // Unix file name, so the SQL text does not rewrite it.
     let mut attach = format!(
-        "ATTACH DATABASE '{quoted}' AS encrypted KEY {};",
+        "ATTACH DATABASE ?1 AS encrypted KEY {};",
         raw_key_literal(key)
     );
-    let attached = conn.execute_batch(&attach);
+    let attached = conn.execute(&attach, [path_text]);
     wipe(&mut attach);
     if attached.is_err() {
         drop(conn);
@@ -280,6 +305,11 @@ fn export_encrypted(plain: &Path, dest: &Path, key: &[u8; 32]) -> Result<(), Pre
     Ok(())
 }
 
+/// The check compares row counts only.
+///
+/// `sqlcipher_export` copies each row as it stands. A short or failed export
+/// changes a count, so equal counts mean the new file has every row. The
+/// check does not hash cell contents.
 fn counts_match(plain: &Path, encrypted: &Path, key: &[u8; 32]) -> Result<bool, PrepareError> {
     let plain_conn = Connection::open(plain).map_err(|_| PrepareError::Io)?;
     let plain_counts = table_counts(&plain_conn)?;
@@ -336,6 +366,74 @@ fn apply_key(conn: &Connection, key: &[u8; 32]) -> Result<(), ()> {
     let result = conn.execute_batch(&sql);
     wipe(&mut sql);
     result.map(|_| ()).map_err(|_| ())
+}
+
+/// The file next to `path` whose name is the file name plus `suffix`.
+#[must_use]
+pub fn store_sibling(path: &Path, suffix: &str) -> PathBuf {
+    sibling(path, suffix)
+}
+
+/// A store file could not be moved aside. No path is included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveAsideError;
+
+/// Move every entry in `dir` except `helper.lock` into a new folder beside `dir`.
+///
+/// The session directory and `helper.lock` stay. A helper that holds the lock
+/// still owns this path, so a second helper cannot take it. The new folder is
+/// `<name>.stale-<unix>`, then `-2` when that name is taken.
+///
+/// # Errors
+///
+/// Returns [`MoveAsideError`] when a rename fails. Files that already moved are put back.
+pub fn move_stores_aside(dir: &Path) -> Result<(), MoveAsideError> {
+    const LOCK_NAME: &str = "helper.lock";
+    let parent = dir.parent().ok_or(MoveAsideError)?;
+    let dir_name = dir.file_name().ok_or(MoveAsideError)?;
+    let mut moving = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|_| MoveAsideError)? {
+        let entry = entry.map_err(|_| MoveAsideError)?;
+        if entry.file_name() == LOCK_NAME {
+            continue;
+        }
+        moving.push(entry.file_name());
+    }
+    if moving.is_empty() {
+        return Ok(());
+    }
+    let dest = stale_folder(parent, &dir_name.to_string_lossy())?;
+    fs::create_dir(&dest).map_err(|_| MoveAsideError)?;
+    let mut moved = Vec::new();
+    for name in &moving {
+        if fs::rename(dir.join(name), dest.join(name)).is_err() {
+            for done in moved.iter().rev() {
+                let _ = fs::rename(dest.join(done), dir.join(done));
+            }
+            let _ = fs::remove_dir(&dest);
+            return Err(MoveAsideError);
+        }
+        moved.push(name);
+    }
+    Ok(())
+}
+
+fn stale_folder(parent: &Path, name: &str) -> Result<PathBuf, MoveAsideError> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let base = format!("{name}.stale-{secs}");
+    for suffix in [String::new()]
+        .into_iter()
+        .chain((2..1_000).map(|index| format!("-{index}")))
+    {
+        let dest = parent.join(format!("{base}{suffix}"));
+        if !dest.exists() {
+            return Ok(dest);
+        }
+    }
+    Err(MoveAsideError)
 }
 
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
@@ -565,6 +663,57 @@ CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
         let outcome = prepare_file(&path, &KEY, MigrateOptions::default()).expect("missing");
         assert_eq!(outcome, PrepareOutcome::Ready);
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_short_file_is_unreadable_and_a_page_file_is_a_store() {
+        let dir = temp_dir("shape");
+        let short = dir.join("short.sqlite");
+        fs::write(&short, b"not a database").expect("short");
+        assert!(!is_encrypted_store(&short));
+        let error = prepare_file(&short, &KEY, MigrateOptions::default()).expect_err("short");
+        assert_eq!(error, PrepareError::Unreadable);
+        assert_eq!(fs::read(&short).expect("kept"), b"not a database");
+
+        let page = dir.join("page.sqlite");
+        fs::write(&page, vec![0xab; 512]).expect("page");
+        assert!(is_encrypted_store(&page));
+        let error = prepare_file(&page, &KEY, MigrateOptions::default()).expect_err("page");
+        assert_eq!(error, PrepareError::WrongKey);
+        assert_eq!(fs::read(&page).expect("kept").len(), 512);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blocked_checkpoint_keeps_the_plaintext_file() {
+        let dir = temp_dir("busy");
+        let path = dir.join("session.sqlite");
+        seed(&path, 2);
+        let reader = Connection::open(&path).expect("reader");
+        reader.execute_batch("BEGIN DEFERRED").expect("begin");
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .expect("read");
+        let writer = Connection::open(&path).expect("writer");
+        writer
+            .execute("INSERT INTO notes (id, body) VALUES (99, 'x')", [])
+            .expect("wal");
+        drop(writer);
+        let error = prepare_file(&path, &KEY, MigrateOptions::default()).expect_err("busy");
+        assert_eq!(error, PrepareError::Io);
+        assert!(is_plaintext_sqlite(&path));
+        assert!(
+            !sibling(&path, ENC_NEW_SUFFIX).exists(),
+            "a blocked checkpoint does not write the new file"
+        );
+        assert!(!sibling(&path, PLAIN_OLD_SUFFIX).exists());
+        let conn = Connection::open(&path).expect("plain");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .expect("count");
+        assert!(count >= 2);
+        drop(reader);
         let _ = fs::remove_dir_all(&dir);
     }
 }

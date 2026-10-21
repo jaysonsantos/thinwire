@@ -54,8 +54,8 @@ pub use secrets::{
 };
 #[cfg(feature = "session-cipher")]
 pub use session_cipher::{
-    MigrateOptions, MigrateStop, PrepareError, PrepareOutcome, is_encrypted_store,
-    is_plaintext_sqlite, prepare_file, raw_key_literal,
+    MigrateOptions, MigrateStop, MoveAsideError, PrepareError, PrepareOutcome, is_encrypted_store,
+    is_plaintext_sqlite, move_stores_aside, prepare_file, raw_key_literal, store_sibling,
 };
 pub use signal::{
     SIGNAL_DEVICE_REMOVED, SIGNAL_HELPER_PROGRAM, SIGNAL_LINK_CHECK, SignalAdapter,

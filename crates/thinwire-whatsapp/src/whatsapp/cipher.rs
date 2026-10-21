@@ -7,7 +7,6 @@
 
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use diesel::prelude::RunQueryDsl;
 use whatsapp_rust::store::{SqliteDatabase, SqliteDatabaseConfig, SqliteStore};
@@ -17,14 +16,18 @@ use thinwire_core::{
     CreateStoreKeyError, LoadStoreKey, StoreKeyAction, WHATSAPP_STORE_KEY_ACCOUNT,
     create_store_key, load_store_key, store_key_action,
 };
-use thinwire_protocol::{MigrateOptions, PrepareError, is_encrypted_store, prepare_file};
+use thinwire_protocol::{
+    MigrateOptions, PrepareError, is_encrypted_store, move_stores_aside, prepare_file,
+    store_sibling,
+};
 
 /// Why the store was not opened. The app maps this to the account row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProtectFail {
     /// The keychain refused the read. The store was not moved.
     KeychainDenied,
-    /// The encrypted store did not open. The folder was moved aside.
+    /// The encrypted store did not open. The store files were moved aside.
+    /// `helper.lock` stays in the session folder.
     WrongKey,
     /// The keychain cannot keep a key. The store was not moved.
     NotSaved,
@@ -41,14 +44,16 @@ static SESSION_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 /// The string is the account-row sentence. A failure does not delete a store.
 pub(super) fn protect_store(path: &Path) -> Result<(), ProtectFail> {
     let encrypted = is_encrypted_store(path)
-        || sibling(path, ".enc-new").exists()
-        || sibling(path, ".plain-old").exists();
+        || store_sibling(path, ".enc-new").exists()
+        || store_sibling(path, ".plain-old").exists();
     let key = resolve_key(encrypted, path)?;
     let _ = SESSION_KEY.set(key);
     match prepare_file(path, &key, MigrateOptions::default()) {
         Ok(_) => Ok(()),
         Err(PrepareError::WrongKey) => Err(move_store(path)),
-        Err(PrepareError::CheckFailed | PrepareError::Io) => Err(ProtectFail::EncryptFailed),
+        Err(PrepareError::Unreadable | PrepareError::CheckFailed | PrepareError::Io) => {
+            Err(ProtectFail::EncryptFailed)
+        }
     }
 }
 
@@ -142,40 +147,9 @@ fn move_store(store: &Path) -> ProtectFail {
     if let Some(dir) = store.parent()
         && dir.exists()
     {
-        let _ = rename_aside(dir);
+        let _ = move_stores_aside(dir);
     }
     ProtectFail::WrongKey
-}
-
-fn rename_aside(dir: &Path) -> Result<String, ()> {
-    let parent = dir.parent().ok_or(())?;
-    let name = dir.file_name().ok_or(())?;
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let base = format!("{}.stale-{secs}", name.to_string_lossy());
-    for suffix in [String::new()]
-        .into_iter()
-        .chain((2..1_000).map(|index| format!("-{index}")))
-    {
-        let folder = format!("{base}{suffix}");
-        let dest = parent.join(&folder);
-        if dest.exists() {
-            continue;
-        }
-        return std::fs::rename(dir, dest).map(|()| folder).map_err(|_| ());
-    }
-    Err(())
-}
-
-fn sibling(path: &Path, suffix: &str) -> std::path::PathBuf {
-    let mut name = path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
-    name.push(suffix);
-    path.with_file_name(name)
 }
 
 fn wipe(text: &mut String) {
@@ -203,7 +177,7 @@ mod tests {
             "thinwire-whatsapp-cipher-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
         ));
@@ -233,8 +207,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
             .expect("count");
         assert_eq!(count, 2);
-        assert!(!sibling(&path, "-wal").exists());
-        assert!(!sibling(&path, "-shm").exists());
+        assert!(!store_sibling(&path, "-wal").exists());
+        assert!(!store_sibling(&path, "-shm").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -252,7 +226,8 @@ mod tests {
         prepare_file(&path, &other, MigrateOptions::default()).expect("encrypt");
         let error = protect_store(&path).expect_err("wrong key");
         assert_eq!(error, ProtectFail::WrongKey);
-        assert!(!dir.exists());
+        assert!(dir.is_dir(), "the session directory stays");
+        assert!(!path.exists());
         let moved = std::fs::read_dir(&parent)
             .expect("parent")
             .flatten()
@@ -263,6 +238,32 @@ mod tests {
                     .starts_with("whatsapp.stale-")
             });
         assert!(moved);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn a_second_helper_cannot_lock_the_session_after_a_wrong_key() {
+        let parent = temp_dir("lock");
+        let dir = parent.join("whatsapp");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("device.sqlite");
+        let conn = rusqlite::Connection::open(&path).expect("plain");
+        conn.execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY);")
+            .expect("schema");
+        drop(conn);
+        let other = [0x11u8; 32];
+        prepare_file(&path, &other, MigrateOptions::default()).expect("encrypt");
+        let held = super::super::path::lock_session_at(&dir).expect("first helper");
+        let error = protect_store(&path).expect_err("wrong key");
+        assert_eq!(error, ProtectFail::WrongKey);
+        assert!(dir.join("helper.lock").is_file());
+        assert!(!path.exists());
+        let second = super::super::path::lock_session_at(&dir);
+        assert_eq!(
+            second.expect_err("second helper"),
+            super::super::path::SessionLockError::InUse
+        );
+        drop(held);
         let _ = std::fs::remove_dir_all(&parent);
     }
 

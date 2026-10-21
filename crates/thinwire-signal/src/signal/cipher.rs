@@ -8,7 +8,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::path::{PENDING_FILE, RETAINED_DIR, SQLITE_FILE};
 
@@ -17,14 +16,18 @@ use thinwire_core::{
     CreateStoreKeyError, LoadStoreKey, SIGNAL_STORE_KEY_ACCOUNT, StoreKeyAction, create_store_key,
     load_store_key, store_key_action,
 };
-use thinwire_protocol::{MigrateOptions, PrepareError, is_encrypted_store, prepare_file};
+use thinwire_protocol::{
+    MigrateOptions, PrepareError, is_encrypted_store, move_stores_aside, prepare_file,
+    store_sibling,
+};
 
 /// Why the stores were not opened. The app maps this to the account row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProtectFail {
     /// The keychain refused the read. The store was not moved.
     KeychainDenied,
-    /// The encrypted store did not open. The folder was moved aside.
+    /// The encrypted store did not open. The store files were moved aside.
+    /// `helper.lock` stays in the session folder.
     WrongKey,
     /// The keychain cannot keep a key. The store was not moved.
     NotSaved,
@@ -41,27 +44,30 @@ static SESSION_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 /// The string is the account-row sentence. A failure does not delete a store.
 pub(super) fn protect_session(dir: &Path) -> Result<(), ProtectFail> {
     let files = store_files(dir);
-    let key = resolve_key(files.iter().any(|path| is_encrypted_store(path)), dir)?;
+    // A bad file under retained/ is not a reason to treat the live store as encrypted.
+    let encrypted_live = files
+        .iter()
+        .any(|path| !is_retained(dir, path) && is_encrypted_store(path));
+    let key = resolve_key(encrypted_live, dir)?;
     let _ = SESSION_KEY.set(key);
     for path in &files {
-        if is_encrypted_store(path) {
-            open_or_move(dir, path, &key)?;
-        }
-    }
-    for path in &files {
-        if is_encrypted_store(path) {
-            continue;
-        }
         match prepare_file(path, &key, MigrateOptions::default()) {
             Ok(_) => {}
+            Err(PrepareError::WrongKey | PrepareError::Unreadable) if is_retained(dir, path) => {
+                // The path holds the account id. The log line does not.
+                tracing::warn!("{RETAINED_LEFT}");
+            }
             Err(PrepareError::WrongKey) => return Err(move_aside(dir)),
-            Err(PrepareError::CheckFailed | PrepareError::Io) => {
+            Err(PrepareError::Unreadable | PrepareError::CheckFailed | PrepareError::Io) => {
                 return Err(ProtectFail::EncryptFailed);
             }
         }
     }
     Ok(())
 }
+
+/// Log text for a retained store that stays. It has no account id and no path.
+const RETAINED_LEFT: &str = "a retained Signal store was left in place";
 
 /// sqlx options that set the raw key before any other statement.
 ///
@@ -83,14 +89,6 @@ pub(super) fn connect_options(
         .foreign_keys(true)
         .busy_timeout(std::time::Duration::from_secs(2))
         .pragma("key", literal))
-}
-
-fn open_or_move(dir: &Path, path: &Path, key: &[u8; 32]) -> Result<(), ProtectFail> {
-    match prepare_file(path, key, MigrateOptions::default()) {
-        Ok(_) => Ok(()),
-        Err(PrepareError::WrongKey) => Err(move_aside(dir)),
-        Err(PrepareError::CheckFailed | PrepareError::Io) => Err(ProtectFail::EncryptFailed),
-    }
 }
 
 /// The raw-key SQL fragment. The caller does not log it.
@@ -181,40 +179,17 @@ fn push_store(dir: &Path, file_name: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn is_retained(dir: &Path, path: &Path) -> bool {
+    path.starts_with(dir.join(RETAINED_DIR))
+}
+
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
-    name.push(suffix);
-    path.with_file_name(name)
+    store_sibling(path, suffix)
 }
 
 fn move_aside(dir: &Path) -> ProtectFail {
-    let _ = rename_aside(dir);
+    let _ = move_stores_aside(dir);
     ProtectFail::WrongKey
-}
-
-fn rename_aside(dir: &Path) -> Result<String, ()> {
-    let parent = dir.parent().ok_or(())?;
-    let name = dir.file_name().ok_or(())?;
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let base = format!("{}.stale-{secs}", name.to_string_lossy());
-    for suffix in [String::new()]
-        .into_iter()
-        .chain((2..1_000).map(|index| format!("-{index}")))
-    {
-        let folder = format!("{base}{suffix}");
-        let dest = parent.join(&folder);
-        if dest.exists() {
-            continue;
-        }
-        return std::fs::rename(dir, &dest).map(|()| folder).map_err(|_| ());
-    }
-    Err(())
 }
 
 #[cfg(test)]
@@ -235,7 +210,7 @@ mod tests {
             "thinwire-signal-cipher-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
         ));
@@ -316,7 +291,11 @@ mod tests {
         prepare_file(&live, &other, MigrateOptions::default()).expect("encrypt");
         let error = protect_session(&dir).expect_err("wrong key");
         assert_eq!(error, ProtectFail::WrongKey);
-        assert!(!dir.exists());
+        assert!(dir.is_dir(), "the session directory stays");
+        assert!(
+            !live.exists(),
+            "the store file leaves the session directory"
+        );
         let moved = std::fs::read_dir(&parent)
             .expect("parent")
             .flatten()
@@ -330,6 +309,61 @@ mod tests {
         let kept = moved.path().join(SQLITE_FILE);
         assert!(kept.is_file());
         assert!(!is_plaintext_sqlite(&kept));
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn a_bad_retained_store_does_not_move_the_live_session() {
+        let parent = temp_dir("retained-bad");
+        let dir = parent.join("signal");
+        let live = dir.join(SQLITE_FILE);
+        write_plain(&live, 2);
+        let aci = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let retained = dir.join(RETAINED_DIR).join(aci).join(SQLITE_FILE);
+        std::fs::create_dir_all(retained.parent().expect("parent")).expect("retained");
+        let garbage = b"not a database";
+        std::fs::write(&retained, garbage).expect("garbage");
+        assert!(!RETAINED_LEFT.contains(aci));
+        assert!(!RETAINED_LEFT.contains('/'));
+        protect_session(&dir).expect("live store still opens");
+        assert!(dir.is_dir());
+        assert!(live.is_file());
+        assert!(!is_plaintext_sqlite(&live));
+        assert_eq!(item_count(&live), 2);
+        assert_eq!(std::fs::read(&retained).expect("untouched"), garbage);
+        let stale = std::fs::read_dir(&parent)
+            .expect("parent")
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("signal.stale-")
+            });
+        assert!(!stale, "a bad retained file does not move the session");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn a_second_helper_cannot_lock_the_session_after_a_wrong_key() {
+        let parent = temp_dir("lock");
+        let dir = parent.join("signal");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let live = dir.join(SQLITE_FILE);
+        write_plain(&live, 1);
+        let other = [0x11u8; 32];
+        thinwire_protocol::prepare_file(&live, &other, MigrateOptions::default()).expect("encrypt");
+        let held = super::super::path::lock_session_at(&dir).expect("first helper");
+        let error = protect_session(&dir).expect_err("wrong key");
+        assert_eq!(error, ProtectFail::WrongKey);
+        assert!(dir.join("helper.lock").is_file());
+        assert!(!dir.join(SQLITE_FILE).exists());
+        let second = super::super::path::lock_session_at(&dir);
+        assert_eq!(
+            second.expect_err("second helper"),
+            super::super::path::SessionLockError::InUse
+        );
+        drop(held);
         let _ = std::fs::remove_dir_all(&parent);
     }
 }
