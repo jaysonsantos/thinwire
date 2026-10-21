@@ -583,6 +583,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                 ) {
                     clicked = Some(account.caps.id);
                 }
+                store_protection_line(ui, account);
                 helper_actions(ui, account, out);
                 removed_signal_link(ui, snapshot, account, out);
                 ui.add_space(4.0);
@@ -714,6 +715,24 @@ fn removed_signal_link(
     _account: &AccountRow,
     _out: &mut Vec<Intent>,
 ) {
+}
+
+/// The keychain or encryption sentence, under the chip. The chip label stays short.
+fn store_protection_line(ui: &mut egui::Ui, account: &AccountRow) {
+    if account.status != AdapterStatus::Error {
+        return;
+    }
+    if !thinwire_protocol::is_store_protection_detail(&account.detail) {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(theme::ROW_INSET.x);
+        ui.label(
+            RichText::new(&account.detail)
+                .small()
+                .color(theme::palette(ui).warn),
+        );
+    });
 }
 
 fn helper_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {

@@ -24,7 +24,14 @@ default = []
 # messenger. `sqlite-storage` (not `sqlite-storage-bundled`) so the lock can
 # use libsqlite3-sys 0.36. The 0.38 pin cannot share the graph with the
 # Signal sqlite store. The bundled build is the direct dependency below.
-whatsapp-web = ["dep:whatsapp-rust", "dep:libsqlite3-sys"]
+whatsapp-web = [
+  "dep:whatsapp-rust",
+  "dep:libsqlite3-sys",
+  "dep:diesel",
+  "dep:rusqlite",
+  "dep:thinwire-core",
+  "thinwire-protocol/session-cipher",
+]
 
 [dependencies]
 # The command line of the helper program.
@@ -43,10 +50,19 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "69a6
   "ureq-client",
   "tokio-native",
 ] }
-# Same 0.36 line as the Signal sqlite store. `bundled` keeps WhatsApp off the system libsqlite.
+# Same SQLCipher build as the Signal helper. Vendored OpenSSL keeps the
+# helper off the system libssl. The key lives in the OS keychain.
 libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
-  "bundled",
+  "bundled-sqlcipher-vendored-openssl",
 ] }
+# The connection hook sets the raw key. `sqlite` does not bundle a second SQLite.
+diesel = { version = "2.3.14", optional = true, default-features = false, features = [
+  "sqlite",
+] }
+rusqlite = { version = "0.38", optional = true, default-features = false, features = [
+  "bundled-sqlcipher-vendored-openssl",
+] }
+thinwire-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The adapter contract kit (ADR 0010) for the tests.

@@ -47,22 +47,28 @@ const BUILD_FAILED: &str =
     "WhatsApp pairing client could not be built. No session material was logged.";
 
 /// Why a start failed. No path, OS text, or session material.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum StartError {
     DataDir,
     Store,
     Build,
     /// An earlier client did not stop yet. Two clients on one store break it.
     StillRunning,
+    /// The keychain or the store encryption stopped the link. The text is the
+    /// account-row sentence. It does not contain the key.
+    #[cfg(feature = "whatsapp-web")]
+    Reported(String),
 }
 
 impl StartError {
-    const fn detail(self) -> &'static str {
+    fn detail(&self) -> &str {
         match self {
             Self::DataDir => DATA_DIR_MISSING,
             Self::Store => STORE_FAILED,
             Self::Build => BUILD_FAILED,
             Self::StillRunning => STILL_RUNNING,
+            #[cfg(feature = "whatsapp-web")]
+            Self::Reported(text) => text,
         }
     }
 }
@@ -519,7 +525,7 @@ pub(super) mod tests {
             if let Some(gate) = &self.0.start_gate {
                 gate.notified().await;
             }
-            if let Some(error) = self.0.start_error {
+            if let Some(error) = self.0.start_error.clone() {
                 return Err(error);
             }
             Ok(Started {
@@ -688,7 +694,7 @@ pub(super) mod tests {
             let gate = Arc::new(Notify::new());
             let (fake, handle, session, mut rx) = owner(Fake {
                 start_gate: Some(Arc::clone(&gate)),
-                start_error,
+                start_error: start_error.clone(),
                 ..Fake::default()
             });
             handle.begin(None, 7);

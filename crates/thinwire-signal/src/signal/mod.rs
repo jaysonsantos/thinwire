@@ -17,6 +17,8 @@ mod time;
 mod wake;
 
 #[cfg(feature = "signal-local")]
+mod cipher;
+#[cfg(feature = "signal-local")]
 mod live;
 #[cfg(feature = "signal-local")]
 mod owner;
@@ -684,13 +686,13 @@ mod tests {
             .join("\n");
         assert!(
             signal_local.contains("libsqlite3-sys"),
-            "signal-local enables bundled sqlite"
+            "signal-local enables bundled sqlcipher"
         );
-        assert!(manifest.contains("features = [\n  \"bundled\",\n]"));
+        assert!(manifest.contains("features = [\n  \"bundled-sqlcipher-vendored-openssl\",\n]"));
         assert!(
             manifest.contains("presage-store-sqlite")
                 && manifest.contains("default-features = false"),
-            "SQLCipher stays off"
+            "presage-store-sqlite does not turn on its own SQLCipher feature"
         );
     }
 

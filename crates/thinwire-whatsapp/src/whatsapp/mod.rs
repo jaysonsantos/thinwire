@@ -12,6 +12,8 @@ mod path;
 mod session;
 
 #[cfg(feature = "whatsapp-web")]
+mod cipher;
+#[cfg(feature = "whatsapp-web")]
 mod live;
 
 pub use path::{SessionLock, SessionLockError, lock_session, set_session_dir};

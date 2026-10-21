@@ -31,6 +31,10 @@ The WhatsApp client is not in the app. It runs in a separate program, `thinwire-
 - After 5 failures in a row, the account row shows "Helper stopped." and Restart. Restart starts the helper again.
 - Only one helper process uses the session store. A second helper finds the lock and does not start.
 - The device store stays in the platform app-data directory, not in git.
+- The helper encrypts `device.sqlite`. It stores a random key in the OS keychain. The service is `thinwire`. The account is `whatsapp.store_key`. The key is not in a file, a log line, a command line, or an environment variable.
+- This encryption does not stop a program that runs as the same user and can read the keychain.
+- If the keychain cannot save the key, the helper does not link WhatsApp. The account row shows the reason. The helper does not write a store.
+- If the key is missing or wrong, the helper does not delete the store. It moves the store folder aside. The account row shows the folder name.
 
 The Signal client is cargo feature `signal-local` (`presage`, pinned to a git revision). It is experimental and not the default UI. Default builds and the default CI jobs leave the feature off. Release builds turn it on. The client runs in a second program, `thinwire-signal-helper`, from `crates/thinwire-signal` (AGPL-3.0-only, ADR `0013`, #248). The app does not link it. The rules of the WhatsApp helper apply to the Signal helper too:
 
@@ -41,6 +45,12 @@ The Signal client is cargo feature `signal-local` (`presage`, pinned to a git re
 - After 5 failures in a row, the Signal account row shows "Helper stopped." and Restart.
 - Signal links with a QR code only. No phone number goes to the Signal helper.
 - The session store stays in `thinwire/signal/` in the platform app-data directory. A device that an older local build linked stays linked.
+- The helper encrypts every Signal store. That is the live `session.sqlite`, a pending link file, and every `session.sqlite` under `retained/`.
+- One key opens all of those files. The helper stores it in the OS keychain. The service is `thinwire`. The account is `signal.store_key`. A retained store is the live store after a rename, so it uses the same key. The Signal key is not the WhatsApp key.
+- This encryption does not stop a program that runs as the same user and can read the keychain.
+- The helper copies an old plaintext store into a new encrypted file. It checks the row counts. It then removes the plaintext file. A failed check keeps the plaintext store.
+- A link of a different account still moves the old store into `retained/`. The helper does not delete that store.
+- If the keychain cannot save the key, the helper does not link Signal. The account row shows the reason. The helper does not write a store.
 
 ## Protocol support (honest)
 
@@ -199,7 +209,7 @@ Telegram `api_id`, `api_hash`, and session material go to the OS secret store (`
 | Linux | D-Bus Secret Service first (KDE Wallet or GNOME Keyring, pure Rust `zbus`, no `libdbus` at build time). Then kernel keyutils. Then memory. The app probes each store with one read before it uses it. |
 | Linux headless / CI | The same order. Keyutils keeps secrets only until the computer restarts. Memory keeps them only for this process. Nothing goes to a file. |
 
-Set `THINWIRE_KEYRING=memory` to skip the OS keychain (CI and local headless). The UI thread only reads/writes an in-memory map; OS keychain attach and flush run on a tokio `spawn_blocking` worker. Never put secrets in the repo, `.env` committed files, logs, or CI artifacts. Tests use the memory backend and stay green without a desktop keychain or TDLib. The status strip tells you how long the sign-in lasts:
+Set `THINWIRE_KEYRING=memory` to skip the OS keychain (CI and local headless). The UI thread only reads/writes an in-memory map; OS keychain attach and flush run on a tokio `spawn_blocking` worker. Never put secrets in the repo, `.env` committed files, logs, or CI artifacts. Tests use the memory backend and stay green without a desktop keychain or TDLib. Signal and WhatsApp session keys need a keychain that keeps values across a restart. A memory keychain and Linux keyutils do not keep those keys. Those helpers do not link, and they do not write a store. The status strip tells you how long the sign-in lasts:
 
 - Memory only: "Sign-in is not saved on this device: keychain unavailable." The next launch cannot resume the session.
 - Keyutils: "Sign-in is kept until you restart the computer."

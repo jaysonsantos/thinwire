@@ -19,6 +19,7 @@ pub mod settings;
 mod show;
 mod signal;
 pub mod state;
+mod store_key;
 mod theme;
 mod view;
 
@@ -30,6 +31,10 @@ pub use intent::{
 pub use secret_text::SecretText;
 pub use signal::{ChangeNotifier, ChangeSignal, change_channel};
 pub use state::{AuthKey, InboxFilter};
+pub use store_key::{
+    CreateStoreKeyError, LoadStoreKey, SIGNAL_STORE_KEY_ACCOUNT, StoreKey, StoreKeyPolicy,
+    WHATSAPP_STORE_KEY_ACCOUNT, create_store_key, load_store_key, store_key_policy,
+};
 pub use theme::ThemeMode;
 pub use view::View;
 // Frontends name protocols through the core, not through a second dependency.

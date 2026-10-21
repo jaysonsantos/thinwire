@@ -49,8 +49,16 @@ impl LinkBackend for LiveBackend {
             .ok()
             .and_then(Result::ok)
             .ok_or(StartError::Store)?;
+        let store_path = path.clone();
+        let protected =
+            tokio::task::spawn_blocking(move || super::cipher::protect_store(&store_path))
+                .await
+                .map_err(|_| StartError::Store)?;
+        protected.map_err(StartError::Reported)?;
         let db = path.to_str().ok_or(StartError::Store)?;
-        let backend = SqliteStore::open(db).await.map_err(|_| StartError::Store)?;
+        let backend = super::cipher::open_store(db)
+            .await
+            .map_err(|()| StartError::Store)?;
         let _ = restrict_store_file(&path);
         let bot = build_bot(backend, digits_only(phone), callbacks)
             .await
