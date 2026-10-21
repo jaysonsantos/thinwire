@@ -412,6 +412,11 @@ pub enum AdapterCommand {
     RestartHelper {
         protocol: ProtocolId,
     },
+    /// Read the session key again. This does not start a link and it does
+    /// not move the store.
+    RetryStoreKey {
+        protocol: ProtocolId,
+    },
     /// Download one Telegram photo file. `secret` means the file is deleted
     /// after the bytes are read, and the UI does not open the full view.
     /// The file id is not a secret.
@@ -440,6 +445,7 @@ impl AdapterCommand {
             | Self::ViewChat { protocol, .. }
             | Self::ViewTopic { protocol, .. }
             | Self::RestartHelper { protocol }
+            | Self::RetryStoreKey { protocol }
             | Self::DownloadFile { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
@@ -453,6 +459,28 @@ impl AdapterCommand {
     }
 }
 
+/// Why the helper could not use the session key. The account stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreAccessReason {
+    /// The keychain refused the read. The store was not moved.
+    KeychainDenied,
+    /// The encrypted store did not open. The folder was moved aside.
+    WrongKey,
+}
+
+/// `true` when this command makes a helper read the session key.
+///
+/// A start with no Signal or WhatsApp account does not send one of these.
+#[must_use]
+pub const fn command_reads_session_key(command: &AdapterCommand) -> bool {
+    matches!(
+        command,
+        AdapterCommand::SignalBeginLink { .. }
+            | AdapterCommand::WhatsAppBeginLink { .. }
+            | AdapterCommand::RetryStoreKey { .. }
+    )
+}
+
 /// Events a worker may push. The UI is the only consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterEvent {
@@ -460,6 +488,11 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         status: AdapterStatus,
         detail: String,
+    },
+    /// The session key could not be used. This does not end the account.
+    StoreAccess {
+        protocol: ProtocolId,
+        reason: StoreAccessReason,
     },
     ConversationUpsert {
         conversation: Conversation,

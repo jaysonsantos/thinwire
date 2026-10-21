@@ -93,6 +93,9 @@ pub enum Intent {
     /// Start the helper process of this protocol again (ADR 0013). It acts
     /// only while the account row shows "Helper stopped."
     RestartHelper(ProtocolId),
+    /// Read the session key again after the keychain refused the read.
+    /// This does not start a link and does not move the store.
+    RetryStoreKey(ProtocolId),
     /// Download one photo that is on screen. The core sends one request
     /// until that file finishes or fails.
     LoadPhoto {

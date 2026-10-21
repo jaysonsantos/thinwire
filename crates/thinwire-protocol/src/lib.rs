@@ -24,10 +24,11 @@ pub use adapter::{
     APP_CLOSE_LIMIT, AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus,
     Arrival, ChatMessage, ChatTopic, Conversation, Delivery, DiscordAuthMode, EventTx, HelperFault,
     HelperState, MessageTopic, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    RedactedPairingSecret, SupportClass, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
-    TelegramCodeVia, emit_account, emit_chat_list_loaded, emit_conversation, emit_history_loaded,
-    emit_message, emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status,
-    emit_stopped, ordered_topics, topic_mute_id,
+    RedactedPairingSecret, StoreAccessReason, SupportClass, TelegramAuthError, TelegramAuthPhase,
+    TelegramAuthStep, TelegramCodeVia, command_reads_session_key, emit_account,
+    emit_chat_list_loaded, emit_conversation, emit_history_loaded, emit_message,
+    emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
+    ordered_topics, topic_mute_id,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -73,10 +74,10 @@ pub use slack::{
 #[cfg(feature = "slack-oauth")]
 pub use slack::{oauth_v2_access_request, socket_mode_config, workspace_bot_token};
 pub use store_protect::{
-    is_store_protection_detail, signal_encrypt_failed, signal_key_not_saved, signal_key_wrong,
-    signal_key_wrong_kept, signal_keychain_unavailable, whatsapp_encrypt_failed,
-    whatsapp_key_not_saved, whatsapp_key_wrong, whatsapp_key_wrong_kept,
-    whatsapp_keychain_unavailable,
+    KEYCHAIN_ACCESS_DENIED, is_store_protection_detail, signal_encrypt_failed,
+    signal_key_not_saved, signal_key_wrong, signal_key_wrong_kept, signal_keychain_unavailable,
+    signal_session_kept, whatsapp_encrypt_failed, whatsapp_key_not_saved, whatsapp_key_wrong,
+    whatsapp_key_wrong_kept, whatsapp_keychain_unavailable, whatsapp_session_kept,
 };
 pub use telegram::{
     TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,

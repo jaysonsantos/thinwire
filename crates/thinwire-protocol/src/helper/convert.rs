@@ -6,12 +6,12 @@
 
 use thinwire_ipc::{
     SecretText, WireAccountState, WireArrival, WireCommand, WireConversation, WireDelivery,
-    WireEvent, WireMessage, WireProtocol, WireStatus,
+    WireEvent, WireMessage, WireProtocol, WireStatus, WireStoreAccess,
 };
 
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, Arrival, ChatMessage, Conversation,
-    Delivery, ProtocolId, RedactedPairingSecret,
+    Delivery, ProtocolId, RedactedPairingSecret, StoreAccessReason,
 };
 
 /// The wire name of a protocol that runs in a helper. `None` for a protocol
@@ -91,6 +91,7 @@ pub(crate) fn command_to_wire(
         AdapterCommand::WhatsAppCancelLink | AdapterCommand::SignalCancelLink => {
             WireCommand::CancelLink
         }
+        AdapterCommand::RetryStoreKey { .. } => WireCommand::RetryStoreKey,
         // The app answers these itself. They never cross the pipe.
         // Topic commands are Telegram-only. A helper never sees them.
         AdapterCommand::Shutdown { .. }
@@ -169,6 +170,7 @@ pub(crate) fn command_from_wire(
             ProtocolId::Signal => AdapterCommand::SignalCancelLink,
             _ => return None,
         },
+        WireCommand::RetryStoreKey => AdapterCommand::RetryStoreKey { protocol },
     };
     Some((command, None))
 }
@@ -190,6 +192,15 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
         } if own(seen) => WireEvent::Status {
             status: status_to_wire(status),
             detail,
+        },
+        AdapterEvent::StoreAccess {
+            protocol: seen,
+            reason,
+        } if own(seen) => WireEvent::StoreAccess {
+            reason: match reason {
+                StoreAccessReason::KeychainDenied => WireStoreAccess::KeychainDenied,
+                StoreAccessReason::WrongKey => WireStoreAccess::WrongKey,
+            },
         },
         AdapterEvent::Account {
             protocol: seen,
@@ -323,6 +334,13 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
             protocol,
             status: status_from_wire(status),
             detail,
+        },
+        WireEvent::StoreAccess { reason } => AdapterEvent::StoreAccess {
+            protocol,
+            reason: match reason {
+                WireStoreAccess::KeychainDenied => StoreAccessReason::KeychainDenied,
+                WireStoreAccess::WrongKey => StoreAccessReason::WrongKey,
+            },
         },
         WireEvent::Account { state } => AdapterEvent::Account {
             protocol,

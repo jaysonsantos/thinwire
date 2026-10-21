@@ -243,6 +243,25 @@ impl WhatsAppAdapter {
         Ok(())
     }
 
+    /// Read the session key again. This is not a new link and does not
+    /// delete the store. The row shows Connecting until the read ends.
+    fn retry_store_key(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        let Some(link) = &self.link else {
+            return Err(AdapterError::Unavailable {
+                protocol: ProtocolId::WhatsApp,
+                reason: "WhatsApp is not reading a session key",
+            });
+        };
+        emit_status(
+            events,
+            ProtocolId::WhatsApp,
+            AdapterStatus::Connecting,
+            "Opening the saved session.",
+        );
+        link.retry();
+        Ok(())
+    }
+
     fn cancel_link(&mut self, events: &EventTx) -> Result<(), AdapterError> {
         self.risk_acknowledged = false;
         // The owner stops the client and drops its later callbacks. The session
@@ -646,6 +665,9 @@ impl ProtocolAdapter for WhatsAppAdapter {
             | AdapterCommand::WhatsAppCancelLink => self.cancel_link(events),
             AdapterCommand::WhatsAppAcknowledgeRisk => self.acknowledge(events),
             AdapterCommand::WhatsAppBeginLink { generation } => self.begin_link(generation, events),
+            AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::WhatsApp,
+            } => self.retry_store_key(events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::WhatsApp,
                 reason: "command is not handled by the WhatsApp adapter",

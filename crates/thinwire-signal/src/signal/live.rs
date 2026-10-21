@@ -57,6 +57,10 @@ enum LinkedEnd {
     Stopped,
     /// Cancel or shutdown moved the generation. The owner emits `Unlinked`.
     Superseded,
+    /// The keychain refused the read. The account stays. The store stays.
+    KeychainDenied,
+    /// The encrypted store did not open. The folder was moved aside.
+    WrongKey,
 }
 
 /// What a failed `receive_messages` means for this generation.
@@ -138,7 +142,7 @@ impl Session {
         self.pairing.store(generation, Ordering::SeqCst);
     }
 
-    fn pairing(&self) -> u64 {
+    pub(super) fn pairing(&self) -> u64 {
         self.pairing.load(Ordering::SeqCst)
     }
 
@@ -275,6 +279,18 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
         );
         let _ = events.send(AdapterEvent::AccountEnded {
             protocol: ProtocolId::Signal,
+        });
+    }
+    if let LinkedEnd::KeychainDenied = end {
+        let _ = events.send(AdapterEvent::StoreAccess {
+            protocol: ProtocolId::Signal,
+            reason: thinwire_protocol::StoreAccessReason::KeychainDenied,
+        });
+    }
+    if let LinkedEnd::WrongKey = end {
+        let _ = events.send(AdapterEvent::StoreAccess {
+            protocol: ProtocolId::Signal,
+            reason: thinwire_protocol::StoreAccessReason::WrongKey,
         });
     }
     if matches!(end, LinkedEnd::DeviceRemoved | LinkedEnd::Stopped) {
@@ -951,14 +967,34 @@ async fn run_linked(
         return LinkedEnd::Stopped;
     };
     // Encrypt the live store, the pending file, and every retained store
-    // before any open. This runs in the helper, not on the UI thread.
+    // before any open. This runs off the UI thread. The row stays on
+    // Connecting until this returns.
+    emit_status(
+        &events,
+        ProtocolId::Signal,
+        AdapterStatus::Connecting,
+        "Opening the saved session.",
+    );
     let protect_dir = store_path.clone();
     let protected =
         tokio::task::spawn_blocking(move || super::cipher::protect_session(&protect_dir)).await;
     match protected {
         Ok(Ok(())) => {}
-        Ok(Err(detail)) => {
-            fail(&events, &detail);
+        Ok(Err(super::cipher::ProtectFail::KeychainDenied)) => {
+            session.active.store(false, Ordering::SeqCst);
+            return LinkedEnd::KeychainDenied;
+        }
+        Ok(Err(super::cipher::ProtectFail::WrongKey)) => {
+            session.active.store(false, Ordering::SeqCst);
+            return LinkedEnd::WrongKey;
+        }
+        Ok(Err(super::cipher::ProtectFail::NotSaved)) => {
+            fail(&events, thinwire_protocol::signal_key_not_saved());
+            session.active.store(false, Ordering::SeqCst);
+            return LinkedEnd::Stopped;
+        }
+        Ok(Err(super::cipher::ProtectFail::EncryptFailed)) => {
+            fail(&events, thinwire_protocol::signal_encrypt_failed());
             session.active.store(false, Ordering::SeqCst);
             return LinkedEnd::Stopped;
         }

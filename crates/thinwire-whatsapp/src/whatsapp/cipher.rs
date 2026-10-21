@@ -14,14 +14,23 @@ use whatsapp_rust::store::{SqliteDatabase, SqliteDatabaseConfig, SqliteStore};
 
 #[cfg(not(test))]
 use thinwire_core::{
-    CreateStoreKeyError, LoadStoreKey, WHATSAPP_STORE_KEY_ACCOUNT, create_store_key, load_store_key,
+    CreateStoreKeyError, LoadStoreKey, StoreKeyAction, WHATSAPP_STORE_KEY_ACCOUNT,
+    create_store_key, load_store_key, store_key_action,
 };
-use thinwire_protocol::{
-    MigrateOptions, PrepareError, is_encrypted_store, prepare_file, whatsapp_encrypt_failed,
-    whatsapp_key_wrong, whatsapp_key_wrong_kept,
-};
-#[cfg(not(test))]
-use thinwire_protocol::{whatsapp_key_not_saved, whatsapp_keychain_unavailable};
+use thinwire_protocol::{MigrateOptions, PrepareError, is_encrypted_store, prepare_file};
+
+/// Why the store was not opened. The app maps this to the account row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProtectFail {
+    /// The keychain refused the read. The store was not moved.
+    KeychainDenied,
+    /// The encrypted store did not open. The folder was moved aside.
+    WrongKey,
+    /// The keychain cannot keep a key. The store was not moved.
+    NotSaved,
+    /// The export or the row check failed. The plaintext store stays.
+    EncryptFailed,
+}
 
 static SESSION_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
@@ -30,7 +39,7 @@ static SESSION_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 /// # Errors
 ///
 /// The string is the account-row sentence. A failure does not delete a store.
-pub(super) fn protect_store(path: &Path) -> Result<(), String> {
+pub(super) fn protect_store(path: &Path) -> Result<(), ProtectFail> {
     let encrypted = is_encrypted_store(path)
         || sibling(path, ".enc-new").exists()
         || sibling(path, ".plain-old").exists();
@@ -38,10 +47,8 @@ pub(super) fn protect_store(path: &Path) -> Result<(), String> {
     let _ = SESSION_KEY.set(key);
     match prepare_file(path, &key, MigrateOptions::default()) {
         Ok(_) => Ok(()),
-        Err(PrepareError::WrongKey) => Err(move_store_detail(path)),
-        Err(PrepareError::CheckFailed | PrepareError::Io) => {
-            Err(whatsapp_encrypt_failed().to_string())
-        }
+        Err(PrepareError::WrongKey) => Err(move_store(path)),
+        Err(PrepareError::CheckFailed | PrepareError::Io) => Err(ProtectFail::EncryptFailed),
     }
 }
 
@@ -101,7 +108,7 @@ fn remember_key() -> Result<[u8; 32], ()> {
 }
 
 #[cfg(test)]
-fn resolve_key(_encrypted: bool, _path: &Path) -> Result<[u8; 32], String> {
+fn resolve_key(_encrypted: bool, _path: &Path) -> Result<[u8; 32], ProtectFail> {
     Ok(test_key())
 }
 
@@ -111,33 +118,33 @@ fn test_key() -> [u8; 32] {
 }
 
 #[cfg(not(test))]
-fn resolve_key(encrypted: bool, path: &Path) -> Result<[u8; 32], String> {
-    match load_store_key(WHATSAPP_STORE_KEY_ACCOUNT) {
-        LoadStoreKey::Found(key) => Ok(key.bytes()),
-        LoadStoreKey::Unavailable => Err(whatsapp_keychain_unavailable().to_string()),
-        LoadStoreKey::NotSaved => Err(whatsapp_key_not_saved().to_string()),
-        LoadStoreKey::Missing if encrypted => Err(move_store_detail(path)),
-        LoadStoreKey::Missing => match create_store_key(WHATSAPP_STORE_KEY_ACCOUNT) {
-            Ok(key) => Ok(key.bytes()),
-            Err(CreateStoreKeyError::NotSaved) => Err(whatsapp_key_not_saved().to_string()),
-            Err(CreateStoreKeyError::Unavailable) => {
-                Err(whatsapp_keychain_unavailable().to_string())
+fn resolve_key(encrypted: bool, path: &Path) -> Result<[u8; 32], ProtectFail> {
+    let loaded = load_store_key(WHATSAPP_STORE_KEY_ACCOUNT);
+    match store_key_action(&loaded, encrypted) {
+        StoreKeyAction::Open => match loaded {
+            LoadStoreKey::Found(key) => Ok(key.bytes()),
+            LoadStoreKey::Missing | LoadStoreKey::NotSaved | LoadStoreKey::Unavailable => {
+                Err(ProtectFail::KeychainDenied)
             }
+        },
+        StoreKeyAction::Denied => Err(ProtectFail::KeychainDenied),
+        StoreKeyAction::NotSaved => Err(ProtectFail::NotSaved),
+        StoreKeyAction::MoveAside => Err(move_store(path)),
+        StoreKeyAction::Create => match create_store_key(WHATSAPP_STORE_KEY_ACCOUNT) {
+            Ok(key) => Ok(key.bytes()),
+            Err(CreateStoreKeyError::NotSaved) => Err(ProtectFail::NotSaved),
+            Err(CreateStoreKeyError::Unavailable) => Err(ProtectFail::KeychainDenied),
         },
     }
 }
 
-fn move_store_detail(store: &Path) -> String {
-    let Some(dir) = store.parent() else {
-        return whatsapp_key_wrong_kept().to_string();
-    };
-    if !dir.exists() {
-        return whatsapp_key_wrong_kept().to_string();
+fn move_store(store: &Path) -> ProtectFail {
+    if let Some(dir) = store.parent()
+        && dir.exists()
+    {
+        let _ = rename_aside(dir);
     }
-    match rename_aside(dir) {
-        Ok(folder) => whatsapp_key_wrong(&folder),
-        Err(()) => whatsapp_key_wrong_kept().to_string(),
-    }
+    ProtectFail::WrongKey
 }
 
 fn rename_aside(dir: &Path) -> Result<String, ()> {
@@ -182,6 +189,14 @@ fn wipe(text: &mut String) {
 mod tests {
     use super::*;
     use thinwire_protocol::{is_plaintext_sqlite, raw_key_literal};
+
+    #[test]
+    fn a_denied_read_is_not_a_wrong_key() {
+        assert_ne!(ProtectFail::KeychainDenied, ProtectFail::WrongKey);
+        assert_ne!(ProtectFail::NotSaved, ProtectFail::WrongKey);
+        assert_ne!(ProtectFail::KeychainDenied, ProtectFail::NotSaved);
+        assert_ne!(ProtectFail::EncryptFailed, ProtectFail::KeychainDenied);
+    }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -236,7 +251,7 @@ mod tests {
         let other = [0x11u8; 32];
         prepare_file(&path, &other, MigrateOptions::default()).expect("encrypt");
         let error = protect_store(&path).expect_err("wrong key");
-        assert!(error.contains("moved aside"));
+        assert_eq!(error, ProtectFail::WrongKey);
         assert!(!dir.exists());
         let moved = std::fs::read_dir(&parent)
             .expect("parent")

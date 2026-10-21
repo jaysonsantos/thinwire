@@ -121,6 +121,38 @@ pub const fn store_key_policy(memory: bool, backend: Option<OsBackend>) -> Store
     }
 }
 
+/// What the helper does with a keychain read.
+///
+/// A denied read never moves the store. A missing key moves the folder
+/// aside only when an encrypted file is already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreKeyAction {
+    /// Open with the key that was found.
+    Open,
+    /// The read failed. Do not move the store and do not create a key.
+    Denied,
+    /// The keychain cannot keep a key. Do not move the store.
+    NotSaved,
+    /// No key, and an encrypted file is present. Move the folder aside.
+    MoveAside,
+    /// No key and no encrypted file. Create a key, then encrypt.
+    Create,
+}
+
+/// Choose the next step from a keychain read.
+///
+/// `encrypted_present` is true when a store file is already encrypted.
+#[must_use]
+pub const fn store_key_action(loaded: &LoadStoreKey, encrypted_present: bool) -> StoreKeyAction {
+    match loaded {
+        LoadStoreKey::Found(_) => StoreKeyAction::Open,
+        LoadStoreKey::Unavailable => StoreKeyAction::Denied,
+        LoadStoreKey::NotSaved => StoreKeyAction::NotSaved,
+        LoadStoreKey::Missing if encrypted_present => StoreKeyAction::MoveAside,
+        LoadStoreKey::Missing => StoreKeyAction::Create,
+    }
+}
+
 /// Result of a keychain read. `Missing` means the entry is not there.
 /// `Unavailable` means the read failed or the stored text is not a key.
 /// A failed read does not overwrite the entry.
@@ -244,6 +276,23 @@ mod tests {
             StoreKeyPolicy::NotSaved
         );
         assert_eq!(store_key_policy(false, None), StoreKeyPolicy::NotSaved);
+    }
+
+    #[test]
+    fn a_denied_read_does_not_move_the_store() {
+        let denied = LoadStoreKey::Unavailable;
+        assert_eq!(store_key_action(&denied, true), StoreKeyAction::Denied);
+        assert_eq!(store_key_action(&denied, false), StoreKeyAction::Denied);
+        let unsaved = LoadStoreKey::NotSaved;
+        assert_eq!(store_key_action(&unsaved, true), StoreKeyAction::NotSaved);
+        assert_eq!(
+            store_key_action(&LoadStoreKey::Missing, true),
+            StoreKeyAction::MoveAside
+        );
+        assert_eq!(
+            store_key_action(&LoadStoreKey::Missing, false),
+            StoreKeyAction::Create
+        );
     }
 
     #[test]

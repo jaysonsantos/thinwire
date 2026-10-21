@@ -34,7 +34,8 @@ The WhatsApp client is not in the app. It runs in a separate program, `thinwire-
 - The helper encrypts `device.sqlite`. It stores a random key in the OS keychain. The service is `thinwire`. The account is `whatsapp.store_key`. The key is not in a file, a log line, a command line, or an environment variable.
 - This encryption does not stop a program that runs as the same user and can read the keychain.
 - If the keychain cannot save the key, the helper does not link WhatsApp. The account row shows the reason. The helper does not write a store.
-- If the key is missing or wrong, the helper does not delete the store. It moves the store folder aside. The account row shows the folder name.
+- If the keychain read fails, the account row stays. It shows "Can't read the session key from Keychain. Allow access" and Retry. Retry reads the key again. The helper does not move the store and does not start a new link.
+- If the key is missing or wrong, the helper does not delete the store. It moves the store folder aside. The account row shows "Can't open the saved WhatsApp session. Link again. Your old data is kept."
 
 The Signal client is cargo feature `signal-local` (`presage`, pinned to a git revision). It is experimental and not the default UI. Default builds and the default CI jobs leave the feature off. Release builds turn it on. The client runs in a second program, `thinwire-signal-helper`, from `crates/thinwire-signal` (AGPL-3.0-only, ADR `0013`, #248). The app does not link it. The rules of the WhatsApp helper apply to the Signal helper too:
 
@@ -51,6 +52,8 @@ The Signal client is cargo feature `signal-local` (`presage`, pinned to a git re
 - The helper copies an old plaintext store into a new encrypted file. It checks the row counts. It then removes the plaintext file. A failed check keeps the plaintext store.
 - A link of a different account still moves the old store into `retained/`. The helper does not delete that store.
 - If the keychain cannot save the key, the helper does not link Signal. The account row shows the reason. The helper does not write a store.
+- If the keychain read fails, the Signal row stays and shows the same Keychain sentence and Retry as WhatsApp. The helper does not move the store.
+- If the key is missing or wrong, the helper moves the store folder aside. The account row shows "Can't open the saved Signal session. Link again. Your old data is kept."
 
 ## Protocol support (honest)
 

@@ -703,6 +703,14 @@ impl Supervisor {
             WireCommand::ViewChat { .. } => {}
             // A start that failed: `launch` reported it.
             WireCommand::AcknowledgeGate | WireCommand::BeginLink { .. } => {}
+            // The helper is not running. Do not start it: a start would
+            // replay the link. Tell the row to ask again.
+            WireCommand::RetryStoreKey => {
+                let _ = self.events.send(AdapterEvent::StoreAccess {
+                    protocol,
+                    reason: crate::StoreAccessReason::KeychainDenied,
+                });
+            }
         }
     }
 

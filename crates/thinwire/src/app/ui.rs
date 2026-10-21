@@ -6,8 +6,8 @@ use eframe::egui::{self, RichText};
 use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
-    AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, topic_mute_id,
+    AccountState, AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic,
+    ProtocolId, SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, StoreAccessReason, topic_mute_id,
 };
 
 use super::auth;
@@ -583,7 +583,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                 ) {
                     clicked = Some(account.caps.id);
                 }
-                store_protection_line(ui, account);
+                store_protection_line(ui, account, out);
                 helper_actions(ui, account, out);
                 removed_signal_link(ui, snapshot, account, out);
                 ui.add_space(4.0);
@@ -718,8 +718,11 @@ fn removed_signal_link(
 }
 
 /// The keychain or encryption sentence, under the chip. The chip label stays short.
-fn store_protection_line(ui: &mut egui::Ui, account: &AccountRow) {
-    if account.status != AdapterStatus::Error {
+///
+/// A denied keychain read shows Retry. Retry reads the key again. A wrong
+/// key shows its own sentence and no Retry.
+fn store_protection_line(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
+    if account.status != AdapterStatus::Error && account.store_access.is_none() {
         return;
     }
     if !thinwire_protocol::is_store_protection_detail(&account.detail) {
@@ -732,6 +735,14 @@ fn store_protection_line(ui: &mut egui::Ui, account: &AccountRow) {
                 .small()
                 .color(theme::palette(ui).warn),
         );
+        if account.store_access == Some(StoreAccessReason::KeychainDenied)
+            && ui
+                .small_button("Retry")
+                .on_hover_text("Read the session key from Keychain again")
+                .clicked()
+        {
+            out.push(Intent::RetryStoreKey(account.caps.id));
+        }
     });
 }
 
@@ -1473,6 +1484,20 @@ fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
     // The helper state wins: with no helper, the adapter status is old.
     if let Some(label) = account.helper_label() {
         return label;
+    }
+    // A denied read or a wrong key has its own sentence under the chip.
+    if account.store_access.is_some() {
+        return "Connection problem";
+    }
+    // A store migration runs while the account is Linking. The row stays
+    // on Connecting until that work finishes.
+    if account.state == AccountState::Linking
+        && !matches!(
+            account.status,
+            AdapterStatus::Error | AdapterStatus::Refused | AdapterStatus::Ready
+        )
+    {
+        return "Connecting…";
     }
     let session_moving = snapshot.auth != AuthScreen::Idle
         || matches!(snapshot.center_view(), CenterView::Resuming { .. });
@@ -3283,6 +3308,52 @@ mod tests {
             .find(|account| account.caps.id == ProtocolId::Telegram)
             .expect("telegram");
         assert_eq!(chip_label(&snapshot, account), "Connecting…");
+    }
+
+    /// A store migration keeps the row on Connecting. A denied keychain
+    /// read is its own chip, even before the account is linked.
+    #[test]
+    fn chip_shows_connecting_during_migration_and_the_denied_key() {
+        use super::chip_label;
+        use thinwire_core::state::Snapshot;
+        use thinwire_protocol::{AccountState, ProtocolId, StoreAccessReason};
+
+        let mut snapshot = Snapshot::new();
+        snapshot.poll_resume(&thinwire_core::secrets::SecretStore::memory());
+        {
+            let account = snapshot
+                .accounts
+                .iter_mut()
+                .find(|account| account.caps.id == ProtocolId::WhatsApp)
+                .expect("whatsapp");
+            account.state = AccountState::Linking;
+            account.status = AdapterStatus::Stubbed;
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.caps.id == ProtocolId::WhatsApp)
+            .expect("whatsapp");
+        assert_eq!(chip_label(&snapshot, account), "Connecting…");
+
+        {
+            let account = snapshot
+                .accounts
+                .iter_mut()
+                .find(|account| account.caps.id == ProtocolId::Signal)
+                .expect("signal");
+            account.state = AccountState::Linking;
+            account.status = AdapterStatus::Error;
+            account.detail = thinwire_protocol::KEYCHAIN_ACCESS_DENIED.into();
+            account.store_access = Some(StoreAccessReason::KeychainDenied);
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.caps.id == ProtocolId::Signal)
+            .expect("signal");
+        assert_eq!(chip_label(&snapshot, account), "Connection problem");
+        assert_eq!(account.detail, thinwire_protocol::KEYCHAIN_ACCESS_DENIED);
     }
 
     /// Shell plan 11: a linked account with an error is not "Not signed in".

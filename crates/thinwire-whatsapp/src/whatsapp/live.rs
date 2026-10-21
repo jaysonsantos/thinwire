@@ -54,7 +54,16 @@ impl LinkBackend for LiveBackend {
             tokio::task::spawn_blocking(move || super::cipher::protect_store(&store_path))
                 .await
                 .map_err(|_| StartError::Store)?;
-        protected.map_err(StartError::Reported)?;
+        protected.map_err(|fail| match fail {
+            super::cipher::ProtectFail::KeychainDenied => StartError::KeychainDenied,
+            super::cipher::ProtectFail::WrongKey => StartError::WrongKey,
+            super::cipher::ProtectFail::NotSaved => {
+                StartError::Reported(thinwire_protocol::whatsapp_key_not_saved().to_string())
+            }
+            super::cipher::ProtectFail::EncryptFailed => {
+                StartError::Reported(thinwire_protocol::whatsapp_encrypt_failed().to_string())
+            }
+        })?;
         let db = path.to_str().ok_or(StartError::Store)?;
         let backend = super::cipher::open_store(db)
             .await

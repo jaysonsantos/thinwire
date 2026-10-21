@@ -158,6 +158,24 @@ impl SignalAdapter {
             self.owner_handle().begin(generation, events);
             return Ok(());
         }
+        self.link_device(events, generation)
+    }
+
+    /// Read the session key again. This is not a new link.
+    fn retry_store_key(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        #[cfg(feature = "signal-local")]
+        if matches!(self.engine, Engine::Live(_)) {
+            self.owner_handle().retry_key(events);
+            return Ok(());
+        }
+        let _ = events;
+        Err(AdapterError::Unavailable {
+            protocol: ProtocolId::Signal,
+            reason: "Signal is not reading a session key",
+        })
+    }
+
+    fn link_device(&mut self, events: &EventTx, generation: u64) -> Result<(), AdapterError> {
         match &mut self.engine {
             Engine::Sync(device) => match device.link() {
                 Ok(Some(url)) => {
@@ -566,6 +584,9 @@ impl ProtocolAdapter for SignalAdapter {
             | AdapterCommand::SignalCancelLink => self.cancel_link(events),
             AdapterCommand::SignalAcknowledgeNotice => self.acknowledge(events),
             AdapterCommand::SignalBeginLink { generation } => self.begin_link(events, generation),
+            AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::Signal,
+            } => self.retry_store_key(events),
             AdapterCommand::ResendMessage {
                 protocol: ProtocolId::Signal,
                 conversation_id,
