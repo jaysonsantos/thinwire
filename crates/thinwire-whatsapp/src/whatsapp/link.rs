@@ -491,21 +491,27 @@ impl<B: LinkBackend> Owner<B> {
 
     fn fail(&self, error: StartError) {
         self.active.store(false, Ordering::SeqCst);
-        let reason = match error {
-            StartError::KeychainDenied => Some(StoreAccessReason::KeychainDenied),
-            StartError::WrongKey => Some(StoreAccessReason::WrongKey),
+        match error {
+            StartError::KeychainDenied => {
+                // The store stays. Retry reads the key again.
+                let _ = self.events.send(AdapterEvent::StoreAccess {
+                    protocol: ProtocolId::WhatsApp,
+                    reason: StoreAccessReason::KeychainDenied,
+                });
+            }
+            StartError::WrongKey => {
+                // The store files are aside. Nothing here deletes them.
+                // The account is not linked.
+                let _ = self.events.send(AdapterEvent::StoreAccess {
+                    protocol: ProtocolId::WhatsApp,
+                    reason: StoreAccessReason::WrongKey,
+                });
+                let _ = self.events.send(account(AccountState::Unlinked));
+            }
             other => {
                 self.status(AdapterStatus::Error, other.detail());
                 let _ = self.events.send(account(AccountState::Unlinked));
-                None
             }
-        };
-        if let Some(reason) = reason {
-            // The account stays. The core shows the sentence. No relink.
-            let _ = self.events.send(AdapterEvent::StoreAccess {
-                protocol: ProtocolId::WhatsApp,
-                reason,
-            });
         }
     }
 
@@ -914,17 +920,18 @@ pub(super) mod tests {
         }
     }
 
-    /// A denied keychain read and a wrong key are different events.
-    /// Neither one unlinks the account or deletes the store.
+    /// A denied keychain read keeps the account and does not delete the store.
     /// Retry asks `start` again, which is where the key is read.
+    /// A wrong key leaves the account unlinked and still deletes nothing.
     #[tokio::test]
-    async fn denied_and_wrong_key_keep_the_account_and_retry_reads_again() {
-        for (error, reason) in [
+    async fn denied_and_wrong_key_keep_the_store_and_retry_reads_again() {
+        for (error, reason, unlinked) in [
             (
                 StartError::KeychainDenied,
                 StoreAccessReason::KeychainDenied,
+                false,
             ),
-            (StartError::WrongKey, StoreAccessReason::WrongKey),
+            (StartError::WrongKey, StoreAccessReason::WrongKey, true),
         ] {
             let (fake, handle, _session, mut rx) = owner(Fake {
                 start_error: Some(error),
@@ -937,13 +944,16 @@ pub(super) mod tests {
                 event,
                 AdapterEvent::StoreAccess { reason: seen, .. } if *seen == reason
             )));
-            assert!(!events.iter().any(|event| matches!(
-                event,
-                AdapterEvent::Account {
-                    state: AccountState::Unlinked,
-                    ..
-                }
-            )));
+            assert_eq!(
+                events.iter().any(|event| matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )),
+                unlinked
+            );
             assert!(
                 !fake.log().iter().any(|line| line.contains("delete")),
                 "the store stays, log {:?}",
@@ -957,13 +967,16 @@ pub(super) mod tests {
                 event,
                 AdapterEvent::StoreAccess { reason: seen, .. } if *seen == reason
             )));
-            assert!(!retry.iter().any(|event| matches!(
-                event,
-                AdapterEvent::Account {
-                    state: AccountState::Unlinked,
-                    ..
-                }
-            )));
+            assert_eq!(
+                retry.iter().any(|event| matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )),
+                unlinked
+            );
         }
     }
 

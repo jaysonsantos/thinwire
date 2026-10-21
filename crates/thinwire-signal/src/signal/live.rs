@@ -293,7 +293,11 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
             reason: thinwire_protocol::StoreAccessReason::WrongKey,
         });
     }
-    if matches!(end, LinkedEnd::DeviceRemoved | LinkedEnd::Stopped) {
+    // A wrong key moved the store files aside. The account is not linked.
+    if matches!(
+        end,
+        LinkedEnd::DeviceRemoved | LinkedEnd::Stopped | LinkedEnd::WrongKey
+    ) {
         emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
     }
 }

@@ -353,14 +353,14 @@ pub struct AccountRow {
     pub caps: ProtocolCapabilities,
     pub status: AdapterStatus,
     pub detail: String,
-    /// Link state. Only `AdapterEvent::Account` (and the Telegram login,
-    /// which maps onto it) changes it. A `Status` never does.
+    /// Link state. `AdapterEvent::Account` changes it. A wrong key also
+    /// leaves Linked. A `Status` never does.
     pub state: AccountState,
     /// State of the protocol's helper process (ADR 0013). `None` for a
     /// protocol that runs in the app, and before its helper reports.
     pub helper: Option<HelperState>,
     /// The session key could not be used. `None` after the next status.
-    /// A denied read shows Retry. A wrong key does not.
+    /// A denied read shows Retry. A wrong key shows Link and leaves Linked.
     pub store_access: Option<StoreAccessReason>,
 }
 
@@ -427,14 +427,32 @@ pub const HELPER_STOPPED: &str = "Helper stopped.";
 pub const HELPER_MISSING: &str = "Helper missing";
 
 /// The sentence under the chip for a session-key problem.
-fn store_access_detail(protocol: ProtocolId, reason: StoreAccessReason) -> &'static str {
+///
+/// A saved account (`linked`) that cannot read the key gets the retry
+/// sentence. A first link gets the "did not link" sentence.
+fn store_access_detail(
+    protocol: ProtocolId,
+    reason: StoreAccessReason,
+    linked: bool,
+) -> &'static str {
     match reason {
-        StoreAccessReason::KeychainDenied => thinwire_protocol::KEYCHAIN_ACCESS_DENIED,
+        StoreAccessReason::KeychainDenied if linked => thinwire_protocol::KEYCHAIN_ACCESS_DENIED,
+        StoreAccessReason::KeychainDenied if protocol == ProtocolId::WhatsApp => {
+            thinwire_protocol::whatsapp_keychain_unavailable()
+        }
+        StoreAccessReason::KeychainDenied => thinwire_protocol::signal_keychain_unavailable(),
         StoreAccessReason::WrongKey if protocol == ProtocolId::WhatsApp => {
             thinwire_protocol::whatsapp_session_kept()
         }
         StoreAccessReason::WrongKey => thinwire_protocol::signal_session_kept(),
     }
+}
+
+/// Drop a trailing "did not link" sentence. A saved account does not use it.
+fn without_did_not_link(detail: &str) -> String {
+    detail
+        .replace(" Signal did not link.", "")
+        .replace(" WhatsApp did not link.", "")
 }
 
 /// Shown in the open chat when the phone removed this Signal device.
@@ -911,6 +929,13 @@ impl Snapshot {
                 status,
                 detail,
             } => {
+                // A saved account never hears "did not link". That sentence is
+                // for a first link only.
+                let detail = if self.has_session(protocol) && detail.contains("did not link") {
+                    without_did_not_link(&detail)
+                } else {
+                    detail
+                };
                 // The status line only. It never changes the link state: a
                 // recoverable error must not hide the inbox (shell plan 1, 11).
                 if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
@@ -1203,9 +1228,30 @@ impl Snapshot {
                 }
             }
             AdapterEvent::StoreAccess { protocol, reason } => {
-                // The account stays. This is not a link failure and not a
-                // relink: the row keeps its state, its chats, and no popup.
-                let detail = store_access_detail(protocol, reason);
+                // A saved account keeps its session on a denied read. A wrong
+                // key moved the store files aside, so the row leaves Linked.
+                // A first link that cannot read the key is not a saved account.
+                let saved = self.has_session(protocol);
+                let detail = store_access_detail(protocol, reason, saved);
+                let leave = match reason {
+                    StoreAccessReason::WrongKey => {
+                        saved
+                            || self.accounts.iter().any(|row| {
+                                row.caps.id == protocol && row.state != AccountState::Unlinked
+                            })
+                    }
+                    StoreAccessReason::KeychainDenied => !saved,
+                };
+                if leave {
+                    self.set_account(protocol, AccountState::Unlinked);
+                } else if saved && reason == StoreAccessReason::KeychainDenied {
+                    // A helper may have marked a saved account Linking while
+                    // it read the key. The account is still linked.
+                    if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol)
+                    {
+                        row.state = AccountState::Linked;
+                    }
+                }
                 if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
                     row.status = AdapterStatus::Error;
                     row.detail = detail.to_string();
@@ -3537,8 +3583,9 @@ impl Snapshot {
 
     /// The user clicked Retry after the keychain refused the read.
     ///
-    /// The command asks the helper to read the key again. It is not a link
-    /// and it is not Restart. A wrong key does not take this path.
+    /// The command asks the helper to read the key again and open the saved
+    /// session. It is not a new link and it is not Restart. A wrong key does
+    /// not take this path.
     pub fn retry_store_key(&mut self, protocol: ProtocolId) {
         let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) else {
             return;
@@ -4577,7 +4624,14 @@ impl Snapshot {
     /// With no acceptance yet, it opens the notice first.
     #[cfg(feature = "signal-local")]
     pub fn relink_removed_signal(&mut self) {
-        if !self.signal_removed
+        // The same path after the phone removed the device and after a wrong
+        // key moved the store files aside. Neither path deletes those files.
+        let wrong_key = self.accounts.iter().any(|row| {
+            row.caps.id == ProtocolId::Signal
+                && row.store_access == Some(StoreAccessReason::WrongKey)
+                && !row.linked()
+        });
+        if (!self.signal_removed && !wrong_key)
             || !self.signal_linking_available()
             || self.helper_missing(ProtocolId::Signal)
         {
@@ -4846,6 +4900,94 @@ mod tests {
         snapshot.take_commands();
     }
 
+    /// A saved account hears the retry sentence. A first link hears
+    /// "did not link". Retry reads the key again on both, and does not
+    /// start a link.
+    #[test]
+    fn a_denied_key_says_did_not_link_only_on_a_first_link() {
+        let mut saved = Snapshot::new();
+        link_signal(&mut saved);
+        saved.apply(AdapterEvent::StoreAccess {
+            protocol: ProtocolId::Signal,
+            reason: StoreAccessReason::KeychainDenied,
+        });
+        let row = saved
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert_eq!(row.state, AccountState::Linked);
+        assert_eq!(row.detail, thinwire_protocol::KEYCHAIN_ACCESS_DENIED);
+        assert!(
+            !row.detail.contains("did not link"),
+            "a saved account does not hear that the link failed"
+        );
+        assert_eq!(row.store_access, Some(StoreAccessReason::KeychainDenied));
+        saved.retry_store_key(ProtocolId::Signal);
+        assert_eq!(
+            saved.take_commands(),
+            vec![AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::Signal,
+            }]
+        );
+
+        let mut first = Snapshot::new();
+        first.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linking,
+        });
+        first.take_commands();
+        first.apply(AdapterEvent::StoreAccess {
+            protocol: ProtocolId::Signal,
+            reason: StoreAccessReason::KeychainDenied,
+        });
+        let row = first
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert_ne!(row.state, AccountState::Linked);
+        assert_eq!(row.detail, thinwire_protocol::signal_keychain_unavailable());
+        assert!(row.detail.contains("did not link"));
+        assert_eq!(row.store_access, Some(StoreAccessReason::KeychainDenied));
+        first.retry_store_key(ProtocolId::Signal);
+        assert_eq!(
+            first.take_commands(),
+            vec![AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::Signal,
+            }]
+        );
+
+        let mut saved_status = Snapshot::new();
+        link_signal(&mut saved_status);
+        saved_status.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: thinwire_protocol::signal_key_not_saved().into(),
+        });
+        let row = saved_status
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert!(
+            !row.detail.contains("did not link"),
+            "a saved account keeps the reason without the first-link sentence"
+        );
+        let mut first_status = Snapshot::new();
+        first_status.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: thinwire_protocol::signal_key_not_saved().into(),
+        });
+        let row = first_status
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert!(row.detail.contains("did not link"));
+    }
+
     /// Keychain Deny keeps the row, the chats, and the exact sentence.
     /// Retry asks for the key again and does not start a link.
     #[test]
@@ -4894,9 +5036,10 @@ mod tests {
         assert_eq!(row.state, AccountState::Linked);
     }
 
-    /// A wrong key keeps the row and its own sentence. Retry does nothing.
+    /// A wrong key leaves Linked. The sentence ends with Link again.
+    /// Retry does nothing. Link starts the same QR flow as a removed device.
     #[test]
-    fn a_wrong_key_keeps_the_row_and_does_not_retry_as_a_link() {
+    fn a_wrong_key_leaves_linked_and_link_starts_the_relink() {
         for (protocol, sentence) in [
             (ProtocolId::Signal, thinwire_protocol::signal_session_kept()),
             (
@@ -4909,7 +5052,16 @@ mod tests {
                 protocol,
                 state: AccountState::Linked,
             });
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: {
+                    let mut chat = telegram_chat(1, "Ada", 1);
+                    chat.protocol = protocol;
+                    chat.id = format!("{protocol:?}:ada");
+                    chat
+                },
+            });
             snapshot.take_commands();
+            assert!(snapshot.has_session(protocol));
             snapshot.apply(AdapterEvent::StoreAccess {
                 protocol,
                 reason: StoreAccessReason::WrongKey,
@@ -4919,15 +5071,43 @@ mod tests {
                 .iter()
                 .find(|row| row.caps.id == protocol)
                 .expect("row");
-            assert_eq!(row.state, AccountState::Linked);
+            assert_eq!(row.state, AccountState::Unlinked);
+            assert!(!snapshot.has_session(protocol));
             assert_eq!(row.detail, sentence);
-            assert!(!row.detail.is_empty());
+            assert!(row.detail.ends_with("Link again"), "{}", row.detail);
             assert_eq!(row.store_access, Some(StoreAccessReason::WrongKey));
             snapshot.retry_store_key(protocol);
             assert!(
                 snapshot.take_commands().is_empty(),
-                "a wrong key does not ask for a new link"
+                "a wrong key does not retry the key read"
             );
+            #[cfg(feature = "signal-local")]
+            if protocol == ProtocolId::Signal {
+                snapshot.signal_notice_acknowledged = true;
+                snapshot.relink_removed_signal();
+                let commands = snapshot.take_commands();
+                assert!(
+                    commands
+                        .iter()
+                        .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+                    "Link starts the QR flow: {commands:?}"
+                );
+                assert!(
+                    commands
+                        .iter()
+                        .all(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+                    "Link does not delete the saved store: {commands:?}"
+                );
+            }
+            #[cfg(feature = "whatsapp-web")]
+            if protocol == ProtocolId::WhatsApp {
+                snapshot.open_whatsapp_risk_gate();
+                assert!(matches!(snapshot.whatsapp_screen, WhatsAppScreen::RiskGate));
+                assert!(
+                    snapshot.take_commands().is_empty(),
+                    "the risk gate does not delete the saved store"
+                );
+            }
         }
     }
 

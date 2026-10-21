@@ -102,8 +102,9 @@ pub struct ProtocolCapabilities {
     pub pages_history: bool,
 }
 
-/// Link state of the account of one protocol. Only
-/// [`AdapterEvent::Account`] changes it; a `Status` never does.
+/// Link state of the account of one protocol.
+/// [`AdapterEvent::Account`] changes it. A wrong key also leaves `Linked`.
+/// A `Status` never does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccountState {
     /// No account, or the account ended. The shell shows no rows for it.
