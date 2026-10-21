@@ -1106,6 +1106,53 @@ mod tests {
         );
     }
 
+    /// #174 item 14: Cancel and shutdown emit `Unlinked`. They do not emit
+    /// `AccountEnded`. That event is only for a device the phone removed.
+    #[tokio::test]
+    async fn cancel_and_shutdown_do_not_end_the_account() {
+        let mut adapter = SignalAdapter::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        adapter.cancel_link(&tx).expect("cancel");
+        adapter.shutdown(&tx);
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            let stopped = matches!(event, AdapterEvent::Stopped { .. });
+            events.push(event);
+            if stopped {
+                break;
+            }
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Account {
+                    protocol: ProtocolId::Signal,
+                    state: AccountState::Unlinked,
+                }
+            )),
+            "cancel unlinks: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Stopped {
+                    protocol: ProtocolId::Signal
+                }
+            )),
+            "shutdown stops: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::AccountEnded {
+                    protocol: ProtocolId::Signal
+                }
+            )),
+            "cancel and shutdown do not end the account: {events:?}"
+        );
+    }
+
     #[cfg(feature = "signal-local")]
     #[tokio::test]
     async fn shutdown_joins_the_worker_before_stopped() {

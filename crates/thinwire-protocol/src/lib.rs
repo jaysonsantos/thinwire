@@ -48,7 +48,10 @@ pub use secrets::{
     TELEGRAM_SECRET_PHONE, TELEGRAM_SECRET_SERVICE, TELEGRAM_SECRET_SESSION, TelegramSecretKey,
     TelegramSecretVault,
 };
-pub use signal::{SIGNAL_HELPER_PROGRAM, SignalAdapter, signal_helper_adapter};
+pub use signal::{
+    SIGNAL_DEVICE_REMOVED, SIGNAL_HELPER_PROGRAM, SIGNAL_LINK_CHECK, SignalAdapter,
+    signal_helper_adapter,
+};
 pub use slack::{
     DEDUP_FRESH_SECS, MemorySlackVault, SLACK_CONVERSATION_PREFIX, SLACK_OAUTH_CALLBACK_PATH,
     SLACK_OAUTH_LOOPBACK_PORT, SLACK_SECRET_SERVICE, SlackAdapter, SlackApiError, SlackApiOrigin,
