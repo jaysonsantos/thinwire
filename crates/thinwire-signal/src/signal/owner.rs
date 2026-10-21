@@ -307,6 +307,9 @@ mod tests {
                     status: AdapterStatus::Connecting,
                     ..
                 } => order.push("connecting"),
+                AdapterEvent::AccountEnded { .. } => {
+                    panic!("a worker that failed to start does not end the account")
+                }
                 other => panic!("unexpected event {other:?}"),
             }
         }

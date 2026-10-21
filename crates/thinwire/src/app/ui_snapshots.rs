@@ -72,6 +72,27 @@ fn draw(ui: &mut egui::Ui, state: &mut Scene) {
     });
 }
 
+/// Same frame as [`draw`], and it applies a Link click and a draft edit.
+/// The catalog shots stay on [`draw`].
+#[cfg(all(feature = "ui-snapshots", feature = "signal-local"))]
+fn draw_signal(ui: &mut egui::Ui, state: &mut Scene) {
+    theme::install(ui.ctx());
+    if !ui.style().text_styles.contains_key(&theme::row_title()) {
+        return;
+    }
+    let mut out = Vec::new();
+    let view = state.core.view();
+    ui::draw(ui, &view, &mut state.hints, &mut out);
+    for intent in out {
+        if matches!(
+            intent,
+            Intent::Signal(thinwire_core::SignalIntent::Relink) | Intent::SetDraft { .. }
+        ) {
+            state.core.dispatch(intent);
+        }
+    }
+}
+
 fn shoot(scenario: Scenario, theme: ThemeMode, size: [f32; 2]) {
     let name = format!(
         "{}-{}-{}x{}",
@@ -523,4 +544,169 @@ fn a_demo_screen_formats_times_from_the_fixed_utc_clock() {
 #[test]
 fn two_runs_draw_the_same_snapshot() {
     assert_eq!(pixels(), pixels());
+}
+
+/// The phone removed this Signal device. The row and the open chat show the
+/// line once each. A Link button is on the row. There is no error popup.
+#[cfg(all(feature = "ui-snapshots", feature = "signal-local"))]
+mod signal_removed {
+    use super::*;
+    use thinwire_core::SignalIntent;
+    use thinwire_core::state::SIGNAL_SENDING_OFF;
+    use thinwire_protocol::{
+        AccountState, AdapterEvent, AdapterStatus, Arrival, ChatMessage, Conversation, Delivery,
+        ProtocolId, SIGNAL_DEVICE_REMOVED,
+    };
+
+    fn removed_core(runtime: &Runtime) -> Core {
+        let mut core = Scenario::EmptyInbox.build(runtime.handle());
+        core.dispatch(Intent::Signal(SignalIntent::OpenNotice));
+        core.dispatch(Intent::Signal(SignalIntent::AcknowledgeNotice));
+        core.apply_event(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        core.apply_event(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: "Signal is linked. Experimental client: expect breakage.".into(),
+        });
+        core.apply_event(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Signal,
+                id: "signal:ada".into(),
+                title: "Ada".into(),
+                participant: "Ada".into(),
+                preview: "kept".into(),
+                unread: 0,
+                order: 1,
+                last_at: 1_772_445_600,
+                is_group: false,
+                writable: true,
+                placeholder: false,
+                muted: false,
+                has_topics: false,
+                avatar: Default::default(),
+            },
+        });
+        core.apply_event(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Signal,
+                conversation_id: "signal:ada".into(),
+                id: "signal:ada:1".into(),
+                sender: "Ada".into(),
+                body: "kept".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 1_772_445_600,
+                arrival: Arrival::History,
+                topic: None,
+                links: Vec::new(),
+                photo: None,
+            },
+        });
+        core.dispatch(Intent::SelectConversation {
+            id: "signal:ada".into(),
+        });
+        core.apply_event(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: SIGNAL_DEVICE_REMOVED.into(),
+        });
+        core.apply_event(AdapterEvent::AccountEnded {
+            protocol: ProtocolId::Signal,
+        });
+        core.apply_event(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        core
+    }
+
+    fn shoot(theme: ThemeMode, size: [f32; 2]) {
+        let name = format!(
+            "signal_removed-{}-{}x{}",
+            theme_slug(theme),
+            size[0] as u32,
+            size[1] as u32
+        );
+        let runtime = runtime();
+        let mut core = removed_core(&runtime);
+        core.dispatch(Intent::SetTheme(theme));
+        let built = Scene {
+            core,
+            hints: Hints::default(),
+            photo_box_height: 0.0,
+            photo_row_height: 0.0,
+        };
+        let mut harness = Harness::builder()
+            .with_size(size)
+            .wgpu()
+            .build_ui_state(draw_signal, built);
+        harness.run();
+        settle_images(&mut harness);
+        let line = SIGNAL_DEVICE_REMOVED;
+        let copies = harness
+            .query_all(By::new().role(Role::Label).label(line).include_labels())
+            .count();
+        assert_eq!(copies, 2, "the line is on the row and in the open chat");
+        let sending_off = harness
+            .query_all(
+                By::new()
+                    .role(Role::Label)
+                    .label(SIGNAL_SENDING_OFF)
+                    .include_labels(),
+            )
+            .count();
+        assert_eq!(sending_off, 1, "the open chat says sending is off");
+        assert!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Label)
+                        .label("What happened")
+                        .include_labels(),
+                )
+                .next()
+                .is_none(),
+            "no error popup"
+        );
+        assert!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Label)
+                        .label("Signal is linked.")
+                        .include_labels(),
+                )
+                .next()
+                .is_none(),
+            "the status line does not say linked"
+        );
+        harness.get_by_role_and_label(Role::Button, "Link");
+        harness.snapshot(&name);
+        let field = harness.get_by_role(Role::MultilineTextInput);
+        field.click();
+        field.type_text("nope");
+        harness.run();
+        assert!(
+            harness.state().core.view().compose.is_empty(),
+            "sending is off: the message input takes no text"
+        );
+        harness.get_by_role_and_label(Role::Button, "Link").click();
+        harness.run();
+        harness.get_by_role_and_label(Role::Label, "Link a secondary device");
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_1100x720() {
+        shoot(ThemeMode::Light, [1100.0, 720.0]);
+    }
+
+    #[test]
+    fn dark_1100x720() {
+        shoot(ThemeMode::Dark, [1100.0, 720.0]);
+    }
 }

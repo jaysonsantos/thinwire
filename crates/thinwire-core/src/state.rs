@@ -423,6 +423,10 @@ pub const HELPER_STOPPED: &str = "Helper stopped.";
 /// Account row line when the helper program is not installed.
 pub const HELPER_MISSING: &str = "Helper missing";
 
+/// Shown in the open chat when the phone removed this Signal device.
+/// Sending does not go out. The history stays.
+pub const SIGNAL_SENDING_OFF: &str = "Sending is off.";
+
 /// Why `sync_focused_row` runs. A search change or a key move scrolls.
 /// A chat update does not: the list stays where the user left it.
 enum FocusFollow {
@@ -634,6 +638,14 @@ pub struct Snapshot {
     /// Linking needs it; showing the notice again or cancelling clears it.
     #[cfg(feature = "signal-local")]
     signal_notice_acknowledged: bool,
+    /// The phone removed this linked device. The row and the open chat stay.
+    /// Local history stays. Sending is off until the user links again.
+    #[cfg(feature = "signal-local")]
+    signal_removed: bool,
+    /// One unauthorized receive open is waiting for a second open. The row
+    /// shows the check. Keys stay, and this is not removal.
+    #[cfg(feature = "signal-local")]
+    signal_checking: bool,
 }
 
 /// Redacted: login fields, the WhatsApp phone and pairing material, the
@@ -670,7 +682,9 @@ impl std::fmt::Debug for Snapshot {
         #[cfg(feature = "signal-local")]
         out.field("signal_screen", &self.signal_screen)
             .field("signal_started", &self.signal_started)
-            .field("signal_inbox_open", &self.signal_inbox_open);
+            .field("signal_inbox_open", &self.signal_inbox_open)
+            .field("signal_removed", &self.signal_removed)
+            .field("signal_checking", &self.signal_checking);
         out.finish_non_exhaustive()
     }
 }
@@ -846,6 +860,10 @@ impl Snapshot {
             signal_inbox_open: false,
             #[cfg(feature = "signal-local")]
             signal_notice_acknowledged: false,
+            #[cfg(feature = "signal-local")]
+            signal_removed: false,
+            #[cfg(feature = "signal-local")]
+            signal_checking: false,
         }
     }
 
@@ -885,14 +903,24 @@ impl Snapshot {
                     row.detail = detail.clone();
                 }
                 #[cfg(feature = "signal-local")]
-                if protocol == ProtocolId::Signal && status == AdapterStatus::Ready {
-                    self.signal_inbox_open = true;
+                if protocol == ProtocolId::Signal {
+                    if status == AdapterStatus::Ready {
+                        self.signal_inbox_open = true;
+                    }
+                    // Any other Signal line replaces the check. Removal uses
+                    // its own flag, set below, and does not keep this one.
+                    self.signal_checking = detail == thinwire_protocol::SIGNAL_LINK_CHECK;
                 }
                 if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                     // A failed load does not send its end event. Stop the spinners.
                     self.stop_spinners(protocol, None);
                     #[cfg(feature = "signal-local")]
-                    if protocol == ProtocolId::Signal && self.signal_started {
+                    if protocol == ProtocolId::Signal
+                        && detail == thinwire_protocol::SIGNAL_DEVICE_REMOVED
+                    {
+                        // The row and the open chat show this line. No popup.
+                        self.signal_removed = true;
+                    } else if protocol == ProtocolId::Signal && self.signal_started {
                         self.note_signal_failure(&detail);
                     }
                 }
@@ -1116,7 +1144,18 @@ impl Snapshot {
                 self.auth_rejection = Some(error);
             }
             AdapterEvent::TelegramSessionEnded => self.end_telegram_session(),
-            AdapterEvent::AccountEnded { protocol } => self.ended_accounts.push(protocol),
+            AdapterEvent::AccountEnded { protocol } => {
+                self.ended_accounts.push(protocol);
+                #[cfg(feature = "signal-local")]
+                if protocol == ProtocolId::Signal {
+                    self.signal_removed = true;
+                    self.signal_checking = false;
+                    // The row and the open chat show the removal. The strip
+                    // must not keep the link success line, and it must not
+                    // repeat that sentence.
+                    self.clear_linked_signal_status();
+                }
+            }
             AdapterEvent::TelegramDataReset { moved_to } => {
                 self.data_reset = Some(moved_to);
             }
@@ -3300,10 +3339,19 @@ impl Snapshot {
                 }
                 #[cfg(feature = "signal-local")]
                 if protocol == ProtocolId::Signal {
+                    self.signal_removed = false;
+                    self.signal_checking = false;
                     self.finish_signal_link();
                 }
             }
             AccountState::Unlinked if had_session || before != AccountState::Unlinked => {
+                #[cfg(feature = "signal-local")]
+                if self.keep_removed_signal(protocol) {
+                    self.park_removed_signal();
+                } else {
+                    self.end_session(protocol);
+                }
+                #[cfg(not(feature = "signal-local"))]
                 self.end_session(protocol);
             }
             AccountState::Unlinked =>
@@ -3536,6 +3584,76 @@ impl Snapshot {
         self.pending.retain(|command| !is_list(command));
     }
 
+    /// The phone removed this Signal device. Keep the account row, the open
+    /// chat, and the local history. Do not ask before that, and do not delete
+    /// it. Sending is off. A later `Unlinked` from a cancel uses the same
+    /// path while this flag stays set.
+    #[cfg(feature = "signal-local")]
+    fn keep_removed_signal(&self, protocol: ProtocolId) -> bool {
+        protocol == ProtocolId::Signal && self.signal_removed
+    }
+
+    /// Stop the Signal worker state without dropping chats or messages.
+    #[cfg(feature = "signal-local")]
+    fn park_removed_signal(&mut self) {
+        if let Some(row) = self
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+        {
+            row.state = AccountState::Unlinked;
+            row.status = AdapterStatus::Error;
+            row.detail = thinwire_protocol::SIGNAL_DEVICE_REMOVED.to_owned();
+        }
+        self.stop_spinners(ProtocolId::Signal, None);
+        self.signal_started = false;
+        self.signal_inbox_open = false;
+        self.end_signal_pairing();
+        self.signal_screen = SignalScreen::Hidden;
+        self.signal_removed = true;
+        self.signal_checking = false;
+        // The line is on the row and in the open chat. No error block, and
+        // the strip does not repeat it.
+        self.error = None;
+        self.clear_linked_signal_status();
+    }
+
+    /// Drop a status line that still says this Signal device is linked.
+    #[cfg(feature = "signal-local")]
+    fn clear_linked_signal_status(&mut self) {
+        if self.status_text.to_ascii_lowercase().contains("linked") {
+            self.status_text.clear();
+        }
+    }
+
+    /// One unauthorized open is waiting for a confirm open. The row shows
+    /// [`thinwire_protocol::SIGNAL_LINK_CHECK`]. This is not removal.
+    #[must_use]
+    pub fn signal_link_checking(&self) -> bool {
+        #[cfg(feature = "signal-local")]
+        {
+            self.signal_checking
+        }
+        #[cfg(not(feature = "signal-local"))]
+        {
+            false
+        }
+    }
+
+    /// The phone removed this Signal device. The row and the open chat show
+    /// [`thinwire_protocol::SIGNAL_DEVICE_REMOVED`]. Sending is off.
+    #[must_use]
+    pub fn signal_device_removed(&self) -> bool {
+        #[cfg(feature = "signal-local")]
+        {
+            self.signal_removed
+        }
+        #[cfg(not(feature = "signal-local"))]
+        {
+            false
+        }
+    }
+
     /// The session of one protocol ended (shell plan 8): drop its rows,
     /// messages, spinners, notes, and sends. Another linked protocol takes
     /// the selection. Drafts of this protocol go too, except a rejected send
@@ -3614,6 +3732,7 @@ impl Snapshot {
         if protocol == ProtocolId::Signal {
             self.signal_started = false;
             self.signal_inbox_open = false;
+            self.signal_checking = false;
             self.end_signal_pairing();
             self.signal_notice_acknowledged = false;
             self.signal_screen = SignalScreen::Hidden;
@@ -4406,6 +4525,27 @@ impl Snapshot {
         self.error = None;
         self.status_text = "Signal notice accepted. Linking has not started.".into();
         self.pending.push(AdapterCommand::SignalAcknowledgeNotice);
+    }
+
+    /// The Link button after the phone removed this device. The notice was
+    /// already accepted, so this opens the link screen and starts the QR.
+    /// With no acceptance yet, it opens the notice first.
+    #[cfg(feature = "signal-local")]
+    pub fn relink_removed_signal(&mut self) {
+        if !self.signal_removed
+            || !self.signal_linking_available()
+            || self.helper_missing(ProtocolId::Signal)
+        {
+            return;
+        }
+        if !self.signal_notice_acknowledged {
+            self.open_signal_notice();
+            return;
+        }
+        self.signal_screen = SignalScreen::Link;
+        self.signal_started = false;
+        self.error = None;
+        self.begin_signal_link();
     }
 
     #[cfg(feature = "signal-local")]
@@ -7848,6 +7988,309 @@ mod tests {
         assert!(snapshot.signal_started);
         assert!(snapshot.protocol_linked(ProtocolId::Signal));
         assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+    }
+
+    /// The phone removed this device. The account row stays. Local history
+    /// stays. Sending is off. There is no error popup. Link opens the QR flow.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_removed_signal_device_keeps_history_and_opens_the_link_flow() {
+        use thinwire_protocol::SIGNAL_DEVICE_REMOVED;
+
+        let mut snapshot = signal_inbox_ready();
+        assert!(snapshot.signal_notice_acknowledged);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, "ada", true),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Signal,
+                conversation_id: "ada".into(),
+                id: "ada:1".into(),
+                sender: "Ada".into(),
+                body: "kept".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 0,
+                arrival: thinwire_protocol::Arrival::History,
+                topic: None,
+                links: Vec::new(),
+                photo: None,
+            },
+        });
+        snapshot.select_conversation("ada".into());
+        snapshot.compose = "hello".into();
+        let _ = snapshot.take_commands();
+        assert_eq!(
+            snapshot.status_text, "Signal is linked.",
+            "a real link leaves this line"
+        );
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: SIGNAL_DEVICE_REMOVED.into(),
+        });
+        snapshot.apply(AdapterEvent::AccountEnded {
+            protocol: ProtocolId::Signal,
+        });
+        assert!(
+            !snapshot
+                .status_line()
+                .to_ascii_lowercase()
+                .contains("linked"),
+            "after AccountEnded the strip must not say linked: {}",
+            snapshot.status_line()
+        );
+        assert_ne!(
+            snapshot.status_text, SIGNAL_DEVICE_REMOVED,
+            "the strip does not repeat the row"
+        );
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        assert!(
+            !snapshot
+                .status_line()
+                .to_ascii_lowercase()
+                .contains("linked"),
+            "Unlinked keeps the strip clear: {}",
+            snapshot.status_line()
+        );
+
+        assert!(snapshot.signal_device_removed());
+        assert!(
+            snapshot.error.is_none(),
+            "the line is not an error popup: {:?}",
+            snapshot.error
+        );
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("account row");
+        assert_eq!(row.state, AccountState::Unlinked);
+        assert_eq!(row.detail, SIGNAL_DEVICE_REMOVED);
+        assert_eq!(snapshot.selected_conversation.as_deref(), Some("ada"));
+        assert_eq!(snapshot.selected_messages().len(), 1);
+        assert_eq!(snapshot.selected_messages()[0].body, "kept");
+        assert!(
+            snapshot
+                .visible_conversations()
+                .iter()
+                .any(|row| row.id == "ada"),
+            "the chat stays in the inbox"
+        );
+        assert!(!snapshot.can_send());
+        snapshot.send_compose();
+        assert!(
+            snapshot
+                .take_commands()
+                .iter()
+                .all(|command| !matches!(command, AdapterCommand::SendText { .. })),
+            "sending is off"
+        );
+        assert_eq!(SIGNAL_SENDING_OFF, "Sending is off.");
+
+        snapshot.relink_removed_signal();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Link);
+        assert!(
+            snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+            "Link starts the QR flow"
+        );
+        assert_eq!(snapshot.selected_messages().len(), 1, "history stays");
+    }
+
+    /// The first unauthorized open shows the check. History stays. A later
+    /// success, or any other error, drops that line and does not say removed.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn one_unauthorized_open_checks_the_row_and_keeps_history() {
+        use thinwire_protocol::SIGNAL_LINK_CHECK;
+
+        let mut snapshot = signal_inbox_ready();
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, "ada", true),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Signal,
+                conversation_id: "ada".into(),
+                id: "ada:1".into(),
+                sender: "Ada".into(),
+                body: "kept".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 0,
+                arrival: thinwire_protocol::Arrival::History,
+                topic: None,
+                links: Vec::new(),
+                photo: None,
+            },
+        });
+        snapshot.select_conversation("ada".into());
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Connecting,
+            detail: SIGNAL_LINK_CHECK.into(),
+        });
+        assert!(snapshot.signal_link_checking());
+        assert!(!snapshot.signal_device_removed());
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("account row");
+        assert_eq!(row.state, AccountState::Linked);
+        assert_eq!(row.detail, SIGNAL_LINK_CHECK);
+        assert_eq!(snapshot.selected_messages().len(), 1);
+        assert_eq!(snapshot.selected_messages()[0].body, "kept");
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: "Signal is linked. Experimental client: expect breakage.".into(),
+        });
+        assert!(!snapshot.signal_link_checking());
+        assert!(!snapshot.signal_device_removed());
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("account row");
+        assert_eq!(row.status, AdapterStatus::Ready);
+        assert_ne!(row.detail, SIGNAL_LINK_CHECK);
+        assert_eq!(snapshot.selected_messages().len(), 1);
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Connecting,
+            detail: SIGNAL_LINK_CHECK.into(),
+        });
+        assert!(snapshot.signal_link_checking());
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linking,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Connecting,
+            detail: "Signal disconnected. The receive stream ended.".into(),
+        });
+        assert!(
+            !snapshot.signal_link_checking(),
+            "another error drops the check"
+        );
+        assert!(
+            !snapshot.signal_device_removed(),
+            "another error is not removal"
+        );
+        assert_eq!(snapshot.selected_messages().len(), 1, "history stays");
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("account row");
+        assert_ne!(row.detail, thinwire_protocol::SIGNAL_DEVICE_REMOVED);
+    }
+
+    /// After removal, linking the same number again keeps history on the one
+    /// Signal account row. Republishing the same chat does not add a second row.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_same_number_relink_keeps_history_on_the_existing_account() {
+        use thinwire_protocol::SIGNAL_DEVICE_REMOVED;
+
+        let mut snapshot = signal_inbox_ready();
+        let conversation = chat(ProtocolId::Signal, "ada", true);
+        let message = ChatMessage {
+            protocol: ProtocolId::Signal,
+            conversation_id: "ada".into(),
+            id: "ada:1".into(),
+            sender: "Ada".into(),
+            body: "kept".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: 0,
+            arrival: thinwire_protocol::Arrival::History,
+            topic: None,
+            links: Vec::new(),
+            photo: None,
+        };
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: conversation.clone(),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: message.clone(),
+        });
+        snapshot.select_conversation("ada".into());
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: SIGNAL_DEVICE_REMOVED.into(),
+        });
+        snapshot.apply(AdapterEvent::AccountEnded {
+            protocol: ProtocolId::Signal,
+        });
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        assert!(snapshot.signal_device_removed());
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .filter(|row| row.caps.id == ProtocolId::Signal)
+                .count(),
+            1
+        );
+
+        snapshot.relink_removed_signal();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: "Signal is linked. Experimental client: expect breakage.".into(),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert { conversation });
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .filter(|row| row.caps.id == ProtocolId::Signal)
+                .count(),
+            1,
+            "the same number stays on the existing account row"
+        );
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("account row");
+        assert!(row.linked());
+        assert!(!snapshot.signal_device_removed());
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+        assert_eq!(snapshot.visible_conversations()[0].id, "ada");
+        assert_eq!(snapshot.selected_conversation.as_deref(), Some("ada"));
+        assert_eq!(snapshot.selected_messages().len(), 1);
+        assert_eq!(snapshot.selected_messages()[0].id, "ada:1");
+        assert_eq!(snapshot.selected_messages()[0].body, "kept");
     }
 
     #[cfg(feature = "signal-local")]

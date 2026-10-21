@@ -31,6 +31,15 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 /// File name of the Signal helper program, without `.exe`.
 pub const SIGNAL_HELPER_PROGRAM: &str = "thinwire-signal-helper";
 
+/// The phone removed this linked device. The account row and the open chat
+/// show this line. Sending stays off. Local history stays.
+pub const SIGNAL_DEVICE_REMOVED: &str = "Signal removed this device. Link again";
+
+/// The account row shows this after one unauthorized receive open, while the
+/// worker waits and opens the stream once more. It is not removal. The row
+/// goes back to its normal line if that open succeeds or fails another way.
+pub const SIGNAL_LINK_CHECK: &str = "Checking Signal link…";
+
 /// The capabilities of the client in the helper. The account row shows them
 /// also while no helper runs.
 const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {

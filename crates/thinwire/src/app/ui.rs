@@ -7,7 +7,7 @@ use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
     AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    topic_mute_id,
+    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, topic_mute_id,
 };
 
 use super::auth;
@@ -15,6 +15,8 @@ use super::motion;
 use super::theme::{self, radius, size, space};
 use super::theme_mode::ThemeModeEgui;
 use super::thread_layout::{RowLayout, list_time, thread_rows};
+#[cfg(feature = "signal-local")]
+use thinwire_core::SignalIntent;
 #[cfg(feature = "slack-oauth")]
 use thinwire_core::SlackIntent;
 use thinwire_core::secrets::Persistence;
@@ -582,6 +584,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                     clicked = Some(account.caps.id);
                 }
                 helper_actions(ui, account, out);
+                removed_signal_link(ui, snapshot, account, out);
                 ui.add_space(4.0);
             }
             if let Some(protocol) = clicked {
@@ -614,9 +617,16 @@ fn account_chip(
     let caps = account.caps;
     let palette = theme::palette(ui);
     let width = ui.available_width();
-    // Two lines used 36 px. [`theme::ROW_INSET`] adds 8 px above and below.
+    let label = chip_label(snapshot, account);
+    // Two lines used 36 px. The removed-device line wraps, so that row is taller.
+    // [`theme::ROW_INSET`] adds 8 px above and below.
+    let lines = if label == SIGNAL_DEVICE_REMOVED {
+        52.0
+    } else {
+        36.0
+    };
     let (rect, hover) = ui.allocate_exact_size(
-        egui::vec2(width, 36.0 + space::S * 2.0),
+        egui::vec2(width, lines + space::S * 2.0),
         egui::Sense::hover(),
     );
     let chip_id = ui.scope_id().with(("account-chip", caps.id));
@@ -652,7 +662,6 @@ fn account_chip(
                 .text_style(theme::row_title())
                 .color(palette.text),
         );
-        let label = chip_label(snapshot, account);
         let color = if account.status == AdapterStatus::Ready {
             palette.ok
         } else {
@@ -678,6 +687,35 @@ fn account_chip(
 /// Under the chip of a protocol that runs in a helper process (ADR 0013).
 /// A stopped helper gets Restart: with the chip line it reads "Helper
 /// stopped. Restart". A missing helper gets the full reason.
+/// Link again after the phone removed this Signal device. The button opens
+/// the normal QR link flow. The line above it is the only copy on the row.
+#[cfg(feature = "signal-local")]
+fn removed_signal_link(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    account: &AccountRow,
+    out: &mut Vec<Intent>,
+) {
+    if account.caps.id != ProtocolId::Signal || !snapshot.signal_device_removed() {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(theme::ROW_INSET.x);
+        if ui.button("Link").clicked() {
+            out.push(Intent::Signal(SignalIntent::Relink));
+        }
+    });
+}
+
+#[cfg(not(feature = "signal-local"))]
+fn removed_signal_link(
+    _ui: &mut egui::Ui,
+    _snapshot: &Snapshot,
+    _account: &AccountRow,
+    _out: &mut Vec<Intent>,
+) {
+}
+
 fn helper_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
     let protocol = account.caps.id;
     if account.helper_stopped() {
@@ -1405,6 +1443,14 @@ fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
 /// "Not signed in" until a login or a resume starts.
 #[must_use]
 fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
+    // The check is the first unauthorized open. Removal, and its Link
+    // button, wait for the second one.
+    if account.caps.id == ProtocolId::Signal && snapshot.signal_link_checking() {
+        return SIGNAL_LINK_CHECK;
+    }
+    if account.caps.id == ProtocolId::Signal && snapshot.signal_device_removed() {
+        return SIGNAL_DEVICE_REMOVED;
+    }
     // The helper state wins: with no helper, the adapter status is old.
     if let Some(label) = account.helper_label() {
         return label;
@@ -1595,6 +1641,11 @@ fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<
 
 fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     thread_header(ui, snapshot, out);
+    if snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal {
+        let palette = theme::palette(ui);
+        ui.label(RichText::new(SIGNAL_DEVICE_REMOVED).color(palette.warn));
+        ui.label(RichText::new(thinwire_core::state::SIGNAL_SENDING_OFF).color(palette.text2));
+    }
     if snapshot.showing_topic_list() {
         topic_list(ui, snapshot, out);
         return;
@@ -2571,6 +2622,12 @@ fn compose(
         .selected_conversation
         .clone()
         .map(|id| (snapshot.selected_protocol, id, snapshot.selected_topic));
+    let closed = snapshot.topic_closed();
+    // A closed topic already disables this field. Sending is off after the
+    // phone removes the device, so the field uses that same switch.
+    let sending_off =
+        snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal;
+    let compose_open = !closed && !sending_off;
     if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
     }
@@ -2584,7 +2641,7 @@ fn compose(
             )
         });
         // Eat plain Enter before the text field sees it, so it does not add a line.
-        if enter && !other && !shift {
+        if enter && !other && !shift && compose_open {
             if let Some((protocol, conversation_id, topic)) = chat.clone() {
                 out.push(Intent::SendDraft {
                     protocol,
@@ -2596,7 +2653,6 @@ fn compose(
         }
     }
     let palette = theme::palette(ui);
-    let closed = snapshot.topic_closed();
     let y = ui.cursor().min.y;
     ui.painter().hline(
         ui.max_rect().x_range(),
@@ -2643,9 +2699,9 @@ fn compose(
                                 .frame(field)
                                 .desired_rows(1)
                                 .desired_width(width)
-                                .interactive(!closed)
+                                .interactive(compose_open)
                                 .hint_text(RichText::new(hint.clone()).color(palette.text3))
-                        }) && !closed
+                        }) && compose_open
                             && let Some((protocol, conversation_id, topic)) = chat.clone()
                         {
                             out.push(Intent::SetDraft {
@@ -3597,5 +3653,92 @@ mod tests {
         });
         drop(core);
         drop(runtime);
+    }
+
+    /// The first unauthorized open. The row says it is checking. Link waits
+    /// for the second open, which is the removed-device state.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_signal_link_check_shows_the_checking_line_and_no_link_button() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{By, Queryable};
+        use thinwire_core::View;
+        use thinwire_core::secrets::SecretStore;
+        use thinwire_core::settings::Settings;
+        use thinwire_core::state::Snapshot;
+        use thinwire_protocol::{
+            AccountState, AdapterEvent, AdapterStatus, ProtocolId, SIGNAL_DEVICE_REMOVED,
+            SIGNAL_LINK_CHECK,
+        };
+
+        use super::{Hints, draw};
+        use crate::app::theme;
+
+        let store = SecretStore::memory();
+        let settings = Settings::in_memory();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_signal_notice();
+        snapshot.acknowledge_signal_notice();
+        snapshot.begin_signal_link();
+        let _ = snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: "Signal is linked. Experimental client: expect breakage.".into(),
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Connecting,
+            detail: SIGNAL_LINK_CHECK.into(),
+        });
+        assert!(snapshot.signal_link_checking());
+        assert!(!snapshot.signal_device_removed());
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 720.0))
+            .build_ui(|ui| {
+                theme::install(ui.ctx());
+                if !ui.style().text_styles.contains_key(&theme::row_title()) {
+                    return;
+                }
+                let view = View::from_parts(&snapshot, &store, &settings);
+                let mut hints = Hints::default();
+                let mut out = Vec::new();
+                draw(ui, &view, &mut hints, &mut out);
+            });
+        harness.run_steps(4);
+        let copies = harness
+            .query_all(
+                By::new()
+                    .role(Role::Label)
+                    .label(SIGNAL_LINK_CHECK)
+                    .include_labels(),
+            )
+            .count();
+        assert_eq!(copies, 1, "the checking line is on the account row");
+        assert!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Label)
+                        .label(SIGNAL_DEVICE_REMOVED)
+                        .include_labels(),
+                )
+                .next()
+                .is_none(),
+            "the removed line stays off during the check"
+        );
+        assert!(
+            harness
+                .query_all(By::new().role(Role::Button).label("Link").include_labels(),)
+                .next()
+                .is_none(),
+            "Link waits for the second unauthorized open"
+        );
     }
 }
