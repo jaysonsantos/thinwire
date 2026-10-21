@@ -613,6 +613,9 @@ fn rename_sqlite_set(from: &Path, to: &Path) -> Result<(), ()> {
         }
         let dst = sqlite_sidecar(to, suffix);
         if std::fs::rename(&src, &dst).is_err() {
+            // Callers run `wal_checkpoint(TRUNCATE)` before this rename, so a
+            // `-wal` already in the destination is normally empty. Leave it
+            // there. Move the main file back and ignore a failure of that move.
             let _ = std::fs::rename(to, from);
             return Err(());
         }
@@ -734,7 +737,7 @@ async fn merge_pending_into_session(session_url: &str, pending_url: &str) -> Res
             .await
             .map_err(|_| ())?;
         let list_tables = "SELECT name FROM pending.sqlite_master \
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'";
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'";
         let tables: Vec<String> = sqlx::query_scalar(list_tables)
             .fetch_all(&mut *conn)
             .await
@@ -3133,8 +3136,8 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         insert_kept_profile(&pool).await;
         sqlx::query(
             "CREATE TRIGGER thinwire_block_prior BEFORE INSERT ON kv \
-             WHEN NEW.key = 'thinwire_prior_aci' \
-             BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+                WHEN NEW.key = 'thinwire_prior_aci' \
+                BEGIN SELECT RAISE(ABORT, 'blocked'); END",
         )
         .execute(&pool)
         .await
