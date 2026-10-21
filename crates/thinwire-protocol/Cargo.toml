@@ -38,7 +38,7 @@ contract-kit = []
 
 [dependencies]
 # TDLib sends a minithumbnail as base64. Only the live client decodes it.
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 tdlib-rs = { version = "1.4", optional = true, default-features = false, features = [
   "download-tdlib",
   "static",
