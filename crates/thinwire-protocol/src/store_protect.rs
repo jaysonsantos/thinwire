@@ -101,6 +101,12 @@ pub fn is_store_protection_detail(detail: &str) -> bool {
         || detail == whatsapp_key_wrong_kept()
         || detail == signal_keychain_unavailable()
         || detail == whatsapp_keychain_unavailable()
+        || detail.starts_with(
+            "The Signal session key is missing or wrong. The old store was moved aside to ",
+        )
+        || detail.starts_with(
+            "The WhatsApp session key is missing or wrong. The old store was moved aside to ",
+        )
         || detail.starts_with("The keychain cannot save the ")
         || detail.starts_with("The Signal session store could not be encrypted.")
         || detail.starts_with("The WhatsApp session store could not be encrypted.")
@@ -141,5 +147,74 @@ mod tests {
         }
         assert!(!is_store_protection_detail("Signal is linked."));
         assert!(!is_store_protection_detail(""));
+    }
+
+    /// Every account-row sentence. A rewording fails this test.
+    #[test]
+    fn every_account_row_sentence_is_exact() {
+        let sentences = [
+            (
+                KEYCHAIN_ACCESS_DENIED,
+                "Can't read the session key from Keychain. Allow access, then retry.",
+            ),
+            (
+                signal_session_kept(),
+                "Can't open the saved Signal session. Your old data is kept. Link again",
+            ),
+            (
+                whatsapp_session_kept(),
+                "Can't open the saved WhatsApp session. Your old data is kept. Link again",
+            ),
+            (
+                signal_key_wrong_kept(),
+                "The saved Signal session could not be moved aside. It was left in place. Nothing was deleted.",
+            ),
+            (
+                whatsapp_key_wrong_kept(),
+                "The saved WhatsApp session could not be moved aside. It was left in place. Nothing was deleted.",
+            ),
+            (
+                signal_key_not_saved(),
+                "The keychain cannot save the Signal session key. Signal did not link.",
+            ),
+            (
+                whatsapp_key_not_saved(),
+                "The keychain cannot save the WhatsApp session key. WhatsApp did not link.",
+            ),
+            (
+                signal_keychain_unavailable(),
+                "The keychain cannot be read. Signal did not link.",
+            ),
+            (
+                whatsapp_keychain_unavailable(),
+                "The keychain cannot be read. WhatsApp did not link.",
+            ),
+            (
+                signal_encrypt_failed(),
+                "The Signal session store could not be encrypted. The old store was kept.",
+            ),
+            (
+                whatsapp_encrypt_failed(),
+                "The WhatsApp session store could not be encrypted. The old store was kept.",
+            ),
+        ];
+        for (sentence, exact) in sentences {
+            assert_eq!(sentence, exact);
+            assert!(is_store_protection_detail(sentence), "{sentence}");
+        }
+        let moved = [
+            (
+                signal_key_wrong("signal.stale-1"),
+                "The Signal session key is missing or wrong. The old store was moved aside to signal.stale-1.",
+            ),
+            (
+                whatsapp_key_wrong("whatsapp.stale-1"),
+                "The WhatsApp session key is missing or wrong. The old store was moved aside to whatsapp.stale-1.",
+            ),
+        ];
+        for (sentence, exact) in moved {
+            assert_eq!(sentence, exact);
+            assert!(is_store_protection_detail(&sentence), "{sentence}");
+        }
     }
 }

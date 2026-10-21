@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -380,15 +380,19 @@ pub struct MoveAsideError;
 
 /// Move every entry in `dir` except `helper.lock` into a new folder beside `dir`.
 ///
-/// The session directory and `helper.lock` stay. A helper that holds the lock
-/// still owns this path, so a second helper cannot take it. The new folder is
-/// `<name>.stale-<unix>`, then `-2` when that name is taken.
+/// Every entry moves on purpose, not only the store file. The session folder
+/// holds only this helper's data: the store, its `-wal`, `-shm`, and
+/// `-journal` files, and, for Signal, the `retained/` tree. A file left in
+/// place would still be the saved session. A later file in this folder moves
+/// too. `helper.lock` stays. The helper that holds it still owns this path,
+/// so a second helper cannot take it. The new folder is `<name>.stale-<unix>`,
+/// then `-2` when that name is taken.
 ///
 /// # Errors
 ///
 /// Returns [`MoveAsideError`] when a folder or a rename fails. Files that
-/// already moved are put back. A put-back that fails is logged and does not
-/// replace this error. Nothing is deleted.
+/// already moved are put back. A put-back that fails is logged with the step
+/// that failed. That log does not replace this error. Nothing is deleted.
 pub fn move_stores_aside(dir: &Path) -> Result<(), MoveAsideError> {
     const LOCK_NAME: &str = "helper.lock";
     let parent = dir.parent().ok_or(MoveAsideError)?;
@@ -405,7 +409,6 @@ pub fn move_stores_aside(dir: &Path) -> Result<(), MoveAsideError> {
         return Ok(());
     }
     let dest = stale_folder(parent, &dir_name.to_string_lossy())?;
-    fs::create_dir(&dest).map_err(|_| MoveAsideError)?;
     let mut moved = Vec::new();
     for name in &moving {
         if fs::rename(dir.join(name), dest.join(name)).is_err() {
@@ -418,24 +421,30 @@ pub fn move_stores_aside(dir: &Path) -> Result<(), MoveAsideError> {
     Ok(())
 }
 
-/// A put-back failed. No path, account id, or key.
-const MOVE_BACK_FAILED: &str = "a store file could not be moved back";
+/// The step that moves a store file back failed. No path, account id, or key.
+const ROLLBACK_MOVE_BACK_FAILED: &str =
+    "move-aside rollback failed at the step that moves a store file back";
 
-/// The stale folder could not be removed. No path, account id, or key.
-const STALE_FOLDER_LEFT: &str = "a stale folder could not be removed";
+/// The step that removes the stale folder failed. No path, account id, or key.
+const ROLLBACK_REMOVE_FOLDER_FAILED: &str =
+    "move-aside rollback failed at the step that removes the stale folder";
 
-/// Put moved entries back. A failure is logged. The caller keeps its own error.
+/// Put moved entries back. A failure is logged by step. The caller keeps its own error.
 fn put_stores_back(dir: &Path, dest: &Path, moved: &[&std::ffi::OsString]) {
     for name in moved.iter().rev() {
         if fs::rename(dest.join(name), dir.join(name)).is_err() {
-            tracing::warn!("{MOVE_BACK_FAILED}");
+            tracing::warn!("{ROLLBACK_MOVE_BACK_FAILED}");
         }
     }
     if fs::remove_dir(dest).is_err() {
-        tracing::warn!("{STALE_FOLDER_LEFT}");
+        tracing::warn!("{ROLLBACK_REMOVE_FOLDER_FAILED}");
     }
 }
 
+/// Create `<name>.stale-<unix>`, or the next suffix when that name exists.
+///
+/// `create_dir` is the check. [`ErrorKind::AlreadyExists`] tries the next
+/// suffix. Another error stops the search.
 fn stale_folder(parent: &Path, name: &str) -> Result<PathBuf, MoveAsideError> {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -447,8 +456,10 @@ fn stale_folder(parent: &Path, name: &str) -> Result<PathBuf, MoveAsideError> {
         .chain((2..1_000).map(|index| format!("-{index}")))
     {
         let dest = parent.join(format!("{base}{suffix}"));
-        if !dest.exists() {
-            return Ok(dest);
+        match fs::create_dir(&dest) {
+            Ok(()) => return Ok(dest),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(MoveAsideError),
         }
     }
     Err(MoveAsideError)
@@ -770,14 +781,76 @@ CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
         put_stores_back(&dir, &dest, &names);
         drop(guard);
         let text = String::from_utf8(log.lock().expect("log").clone()).expect("utf8");
-        assert!(text.contains(MOVE_BACK_FAILED), "{text}");
-        assert!(text.contains(STALE_FOLDER_LEFT), "{text}");
+        let key = "5a".repeat(32);
+        assert!(text.contains(ROLLBACK_MOVE_BACK_FAILED), "{text}");
+        assert!(text.contains(ROLLBACK_REMOVE_FOLDER_FAILED), "{text}");
+        assert!(text.contains("step that moves a store file back"), "{text}");
+        assert!(
+            text.contains("step that removes the stale folder"),
+            "{text}"
+        );
         assert!(!text.contains(aci), "{text}");
+        assert!(!text.contains(&key), "{text}");
         assert!(!text.contains(&*parent.to_string_lossy()), "{text}");
-        assert!(!MOVE_BACK_FAILED.contains('/'));
-        assert!(!STALE_FOLDER_LEFT.contains('/'));
+        assert!(!ROLLBACK_MOVE_BACK_FAILED.contains('/'));
+        assert!(!ROLLBACK_REMOVE_FOLDER_FAILED.contains('/'));
+        assert!(!ROLLBACK_MOVE_BACK_FAILED.contains(&key));
+        assert!(!ROLLBACK_REMOVE_FOLDER_FAILED.contains(&key));
         assert_eq!(fs::read(&kept).expect("still there"), b"store-bytes");
         assert!(dir.is_file(), "the failed put-back deletes nothing");
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// Only the remove step failed, so the log names that step and not the other.
+    #[test]
+    fn a_failed_rollback_names_only_the_step_that_failed() {
+        let parent = temp_dir("rollback-one");
+        let dir = parent.join("session");
+        fs::create_dir(&dir).expect("dir");
+        let dest = parent.join("stale");
+        fs::write(&dest, b"not-a-directory").expect("file");
+        let (log, guard) = capture_logs();
+        put_stores_back(&dir, &dest, &[]);
+        drop(guard);
+        let text = String::from_utf8(log.lock().expect("log").clone()).expect("utf8");
+        assert!(text.contains(ROLLBACK_REMOVE_FOLDER_FAILED), "{text}");
+        assert!(!text.contains(ROLLBACK_MOVE_BACK_FAILED), "{text}");
+        assert_eq!(fs::read(&dest).expect("untouched"), b"not-a-directory");
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// The first stale name exists. The move uses the next suffix.
+    #[test]
+    fn an_existing_stale_name_retries_the_next_suffix() {
+        let parent = temp_dir("suffix");
+        let dir = parent.join("signal");
+        fs::create_dir(&dir).expect("dir");
+        let store = dir.join("session.sqlite");
+        fs::write(&store, b"kept").expect("store");
+        fs::write(dir.join("helper.lock"), b"lock").expect("lock");
+        let start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        for stamp in start..=start + 8 {
+            fs::write(parent.join(format!("signal.stale-{stamp}")), b"taken").expect("taken");
+        }
+        move_stores_aside(&dir).expect("next suffix");
+        assert!(!store.exists(), "the store left the session folder");
+        assert_eq!(fs::read(dir.join("helper.lock")).expect("lock"), b"lock");
+        let moved = fs::read_dir(&parent)
+            .expect("parent")
+            .flatten()
+            .find(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("signal.stale-") && name.ends_with("-2") && entry.path().is_dir()
+            })
+            .expect("suffix -2");
+        assert_eq!(
+            fs::read(moved.path().join("session.sqlite")).expect("moved"),
+            b"kept"
+        );
         let _ = fs::remove_dir_all(&parent);
     }
 
