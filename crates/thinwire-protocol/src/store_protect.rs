@@ -62,16 +62,18 @@ pub fn whatsapp_key_wrong(folder: &str) -> String {
     )
 }
 
-/// The folder rename failed. The helper did not delete the store.
+/// The store files could not be moved aside. They stay. Nothing was deleted.
+/// The row stays linked and does not offer Link.
 #[must_use]
 pub const fn signal_key_wrong_kept() -> &'static str {
-    "The Signal session key is missing or wrong. The old store was kept because it could not be moved aside."
+    "The saved Signal session could not be moved aside. It was left in place. Nothing was deleted."
 }
 
-/// The folder rename failed. The helper did not delete the store.
+/// The store files could not be moved aside. They stay. Nothing was deleted.
+/// The row stays linked and does not offer Link.
 #[must_use]
 pub const fn whatsapp_key_wrong_kept() -> &'static str {
-    "The WhatsApp session key is missing or wrong. The old store was kept because it could not be moved aside."
+    "The saved WhatsApp session could not be moved aside. It was left in place. Nothing was deleted."
 }
 
 /// The export or the row check failed. The plaintext store is unchanged.
@@ -95,6 +97,8 @@ pub fn is_store_protection_detail(detail: &str) -> bool {
     detail == KEYCHAIN_ACCESS_DENIED
         || detail == signal_session_kept()
         || detail == whatsapp_session_kept()
+        || detail == signal_key_wrong_kept()
+        || detail == whatsapp_key_wrong_kept()
         || detail == signal_keychain_unavailable()
         || detail == whatsapp_keychain_unavailable()
         || detail.starts_with("The keychain cannot save the ")
@@ -112,6 +116,8 @@ mod tests {
             KEYCHAIN_ACCESS_DENIED,
             signal_session_kept(),
             whatsapp_session_kept(),
+            signal_key_wrong_kept(),
+            whatsapp_key_wrong_kept(),
             signal_key_not_saved(),
             whatsapp_key_not_saved(),
             signal_keychain_unavailable(),
@@ -121,6 +127,12 @@ mod tests {
         ];
         assert!(signal_session_kept().ends_with("Link again"));
         assert!(whatsapp_session_kept().ends_with("Link again"));
+        assert!(signal_key_wrong_kept().contains("left in place"));
+        assert!(whatsapp_key_wrong_kept().contains("left in place"));
+        assert!(signal_key_wrong_kept().contains("Nothing was deleted."));
+        assert!(whatsapp_key_wrong_kept().contains("Nothing was deleted."));
+        assert!(!signal_key_wrong_kept().contains("Link again"));
+        assert!(!whatsapp_key_wrong_kept().contains("Link again"));
         assert!(signal_keychain_unavailable().contains("did not link"));
         assert!(whatsapp_keychain_unavailable().contains("did not link"));
         assert!(!KEYCHAIN_ACCESS_DENIED.contains("did not link"));

@@ -60,6 +60,8 @@ pub(super) enum StartError {
     KeychainDenied,
     /// The encrypted store did not open. The folder was moved aside.
     WrongKey,
+    /// The store files could not be moved aside. They stay. Nothing was deleted.
+    MoveFailed,
     /// The keychain or the store encryption stopped the link. The text is the
     /// account-row sentence. It does not contain the key.
     #[cfg(feature = "whatsapp-web")]
@@ -75,6 +77,7 @@ impl StartError {
             Self::StillRunning => STILL_RUNNING,
             Self::KeychainDenied => thinwire_protocol::KEYCHAIN_ACCESS_DENIED,
             Self::WrongKey => thinwire_protocol::whatsapp_session_kept(),
+            Self::MoveFailed => thinwire_protocol::whatsapp_key_wrong_kept(),
             #[cfg(feature = "whatsapp-web")]
             Self::Reported(text) => text,
         }
@@ -507,6 +510,13 @@ impl<B: LinkBackend> Owner<B> {
                     reason: StoreAccessReason::WrongKey,
                 });
                 let _ = self.events.send(account(AccountState::Unlinked));
+            }
+            StartError::MoveFailed => {
+                // The files stayed. This is not a wrong key. The account stays.
+                self.status(
+                    AdapterStatus::Error,
+                    thinwire_protocol::whatsapp_key_wrong_kept(),
+                );
             }
             other => {
                 self.status(AdapterStatus::Error, other.detail());
@@ -978,6 +988,47 @@ pub(super) mod tests {
                 unlinked
             );
         }
+    }
+
+    /// The files stayed. The helper does not unlink and does not send a wrong key.
+    #[tokio::test]
+    async fn a_failed_move_aside_does_not_unlink_or_offer_a_link() {
+        let (fake, handle, _session, mut rx) = owner(Fake {
+            start_error: Some(StartError::MoveFailed),
+            ..Fake::default()
+        });
+        handle.begin(Some("15551212".into()), 3);
+        handle.flush().await;
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Error,
+                detail,
+                ..
+            } if detail == thinwire_protocol::whatsapp_key_wrong_kept()
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::StoreAccess { .. }
+                | AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                }
+        )));
+        let states: Vec<AccountState> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Account { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, vec![AccountState::Linking]);
+        assert!(
+            !fake.log().iter().any(|line| line.contains("delete")),
+            "nothing is deleted, log {:?}",
+            fake.log()
+        );
     }
 
     #[tokio::test]

@@ -3449,6 +3449,14 @@ mod tests {
             store_row_intent(&account),
             Some(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate))
         );
+        account.store_access = None;
+        account.state = AccountState::Linked;
+        account.detail = thinwire_protocol::whatsapp_key_wrong_kept().into();
+        assert!(store_row_intent(&account).is_none());
+        assert_eq!(store_row_button(&account), "");
+        account.caps = signal;
+        account.detail = thinwire_protocol::signal_key_wrong_kept().into();
+        assert!(store_row_intent(&account).is_none());
     }
 
     /// Shell plan 11: a linked account with an error is not "Not signed in".

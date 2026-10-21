@@ -61,6 +61,8 @@ enum LinkedEnd {
     KeychainDenied,
     /// The encrypted store did not open. The folder was moved aside.
     WrongKey,
+    /// The store files could not be moved aside. They stay. The account stays.
+    MoveFailed,
 }
 
 /// What a failed `receive_messages` means for this generation.
@@ -292,6 +294,10 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
             protocol: ProtocolId::Signal,
             reason: thinwire_protocol::StoreAccessReason::WrongKey,
         });
+    }
+    // The files stayed. This is not a wrong key, and the account stays linked.
+    if let LinkedEnd::MoveFailed = end {
+        fail(events, thinwire_protocol::signal_key_wrong_kept());
     }
     // A wrong key moved the store files aside. The account is not linked.
     if matches!(
@@ -991,6 +997,10 @@ async fn run_linked(
         Ok(Err(super::cipher::ProtectFail::WrongKey)) => {
             session.active.store(false, Ordering::SeqCst);
             return LinkedEnd::WrongKey;
+        }
+        Ok(Err(super::cipher::ProtectFail::NotMoved)) => {
+            session.active.store(false, Ordering::SeqCst);
+            return LinkedEnd::MoveFailed;
         }
         Ok(Err(super::cipher::ProtectFail::NotSaved)) => {
             fail(&events, thinwire_protocol::signal_key_not_saved());
@@ -3424,6 +3434,25 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
 
     fn registration_for(aci: Uuid) -> String {
         REJECTED_REGISTRATION.replacen("11111111-1111-1111-1111-111111111111", &aci.to_string(), 1)
+    }
+
+    /// A failed move is a status line. It does not unlink and it is not a wrong key.
+    #[test]
+    fn a_failed_move_aside_does_not_unlink() {
+        let events = events_of(LinkedEnd::MoveFailed);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Error,
+                detail,
+                ..
+            } if detail == thinwire_protocol::signal_key_wrong_kept()
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account { .. } | AdapterEvent::StoreAccess { .. }
+        )));
     }
 
     /// #174 item 14: a worker failure is `Unlinked` only.

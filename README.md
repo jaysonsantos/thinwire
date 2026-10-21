@@ -36,6 +36,7 @@ The WhatsApp client is not in the app. It runs in a separate program, `thinwire-
 - If the keychain cannot save the key, the helper does not link WhatsApp. The account row shows the reason. The helper does not write a store.
 - If the keychain read fails on a saved account, the account row stays linked. It shows "Can't read the session key from Keychain. Allow access, then retry." and Retry. Retry reads the key again. The helper does not move the store and does not start a new link. A first link that cannot read the key shows "WhatsApp did not link." A saved account does not.
 - If the key is missing or wrong, the helper keeps the store. It moves the store files into a folder beside the session folder. The session folder and `helper.lock` stay, so a second helper cannot start. The account row leaves the linked state. It shows "Can't open the saved WhatsApp session. Your old data is kept. Link again" and Link. Link opens the ban gate. It does not delete the old files.
+- If the helper cannot move those files, they stay in the session folder. Nothing is deleted. The account row stays linked. It shows "The saved WhatsApp session could not be moved aside. It was left in place. Nothing was deleted." It does not show Link.
 
 The Signal client is cargo feature `signal-local` (`presage`, pinned to a git revision). It is experimental and not the default UI. Default builds and the default CI jobs leave the feature off. Release builds turn it on. The client runs in a second program, `thinwire-signal-helper`, from `crates/thinwire-signal` (AGPL-3.0-only, ADR `0013`, #248). The app does not link it. The rules of the WhatsApp helper apply to the Signal helper too:
 
@@ -54,6 +55,7 @@ The Signal client is cargo feature `signal-local` (`presage`, pinned to a git re
 - If the keychain cannot save the key, the helper does not link Signal. The account row shows the reason. The helper does not write a store.
 - If the keychain read fails on a saved Signal account, the row stays linked and shows the same Keychain sentence and Retry as WhatsApp. A first link shows "Signal did not link." The helper does not move the store.
 - If the key is missing or wrong, the helper moves the store files into a folder beside the session folder and leaves `helper.lock` in place. The account row leaves the linked state. It shows "Can't open the saved Signal session. Your old data is kept. Link again" and Link. Link starts the same QR flow as a removed device. It does not delete the old files.
+- If the helper cannot move those files, they stay in the session folder. Nothing is deleted. The account row stays linked. It shows "The saved Signal session could not be moved aside. It was left in place. Nothing was deleted." It does not show Link.
 - If a file under `retained/` is corrupt or does not open, the helper leaves that file in place. The live session stays. The log line has no account id and no path.
 
 ## Protocol support (honest)

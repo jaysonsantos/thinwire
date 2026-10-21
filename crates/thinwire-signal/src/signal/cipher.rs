@@ -29,6 +29,9 @@ pub(super) enum ProtectFail {
     /// The encrypted store did not open. The store files were moved aside.
     /// `helper.lock` stays in the session folder.
     WrongKey,
+    /// The store files could not be moved aside. They were left in place.
+    /// Nothing was deleted.
+    NotMoved,
     /// The keychain cannot keep a key. The store was not moved.
     NotSaved,
     /// The export or the row check failed. The plaintext store stays.
@@ -188,8 +191,11 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn move_aside(dir: &Path) -> ProtectFail {
-    let _ = move_stores_aside(dir);
-    ProtectFail::WrongKey
+    if move_stores_aside(dir).is_ok() {
+        ProtectFail::WrongKey
+    } else {
+        ProtectFail::NotMoved
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +209,7 @@ mod tests {
         assert_ne!(ProtectFail::NotSaved, ProtectFail::WrongKey);
         assert_ne!(ProtectFail::KeychainDenied, ProtectFail::NotSaved);
         assert_ne!(ProtectFail::EncryptFailed, ProtectFail::KeychainDenied);
+        assert_ne!(ProtectFail::NotMoved, ProtectFail::WrongKey);
     }
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -310,6 +317,42 @@ mod tests {
         assert!(kept.is_file());
         assert!(!is_plaintext_sqlite(&kept));
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn a_failed_move_aside_is_not_a_wrong_key() {
+        let parent = temp_dir("stuck");
+        let dir = parent.join("signal");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let live = dir.join(SQLITE_FILE);
+        write_plain(&live, 2);
+        let other = [0x11u8; 32];
+        prepare_file(&live, &other, MigrateOptions::default()).expect("encrypt");
+        let before = std::fs::read(&live).expect("bytes");
+        block_stale_names(&parent, "signal");
+        let error = protect_session(&dir).expect_err("move failed");
+        assert_eq!(error, ProtectFail::NotMoved);
+        assert_ne!(error, ProtectFail::WrongKey);
+        assert_eq!(std::fs::read(&live).expect("left in place"), before);
+        assert!(dir.join(SQLITE_FILE).is_file());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Every stale name the move would pick, for this second and the next few.
+    fn block_stale_names(parent: &Path, dir_name: &str) {
+        let start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        for stamp in start..=start + 8 {
+            let base = format!("{dir_name}.stale-{stamp}");
+            for suffix in [String::new()]
+                .into_iter()
+                .chain((2..1_000).map(|index| format!("-{index}")))
+            {
+                std::fs::write(parent.join(format!("{base}{suffix}")), b"taken").expect("block");
+            }
+        }
     }
 
     #[test]

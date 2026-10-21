@@ -386,7 +386,9 @@ pub struct MoveAsideError;
 ///
 /// # Errors
 ///
-/// Returns [`MoveAsideError`] when a rename fails. Files that already moved are put back.
+/// Returns [`MoveAsideError`] when a folder or a rename fails. Files that
+/// already moved are put back. A put-back that fails is logged and does not
+/// replace this error. Nothing is deleted.
 pub fn move_stores_aside(dir: &Path) -> Result<(), MoveAsideError> {
     const LOCK_NAME: &str = "helper.lock";
     let parent = dir.parent().ok_or(MoveAsideError)?;
@@ -407,15 +409,31 @@ pub fn move_stores_aside(dir: &Path) -> Result<(), MoveAsideError> {
     let mut moved = Vec::new();
     for name in &moving {
         if fs::rename(dir.join(name), dest.join(name)).is_err() {
-            for done in moved.iter().rev() {
-                let _ = fs::rename(dest.join(done), dir.join(done));
-            }
-            let _ = fs::remove_dir(&dest);
+            // The rename is the reported error. A later put-back failure is only a log line.
+            put_stores_back(dir, &dest, &moved);
             return Err(MoveAsideError);
         }
         moved.push(name);
     }
     Ok(())
+}
+
+/// A put-back failed. No path, account id, or key.
+const MOVE_BACK_FAILED: &str = "a store file could not be moved back";
+
+/// The stale folder could not be removed. No path, account id, or key.
+const STALE_FOLDER_LEFT: &str = "a stale folder could not be removed";
+
+/// Put moved entries back. A failure is logged. The caller keeps its own error.
+fn put_stores_back(dir: &Path, dest: &Path, moved: &[&std::ffi::OsString]) {
+    for name in moved.iter().rev() {
+        if fs::rename(dest.join(name), dir.join(name)).is_err() {
+            tracing::warn!("{MOVE_BACK_FAILED}");
+        }
+    }
+    if fs::remove_dir(dest).is_err() {
+        tracing::warn!("{STALE_FOLDER_LEFT}");
+    }
 }
 
 fn stale_folder(parent: &Path, name: &str) -> Result<PathBuf, MoveAsideError> {
@@ -715,5 +733,98 @@ CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
         assert!(count >= 2);
         drop(reader);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blocked_move_keeps_the_store_and_reports_the_move_error() {
+        let parent = temp_dir("blocked");
+        let dir = parent.join("signal");
+        fs::create_dir(&dir).expect("dir");
+        let store = dir.join("session.sqlite");
+        let bytes = b"encrypted-bytes";
+        fs::write(&store, bytes).expect("store");
+        fs::write(dir.join("helper.lock"), b"lock").expect("lock");
+        block_stale_names(&parent, "signal");
+        let error = move_stores_aside(&dir).expect_err("cannot move");
+        assert_eq!(error, MoveAsideError);
+        assert_eq!(fs::read(&store).expect("stays"), bytes);
+        assert_eq!(fs::read(dir.join("helper.lock")).expect("lock"), b"lock");
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// A put-back that fails is logged. The log has no account id and no path.
+    /// The store bytes stay. The move error is still [`MoveAsideError`].
+    #[test]
+    fn a_failed_rollback_is_logged_and_the_move_error_stays() {
+        let parent = temp_dir("rollback");
+        let dir = parent.join("session");
+        fs::write(&dir, b"not-a-directory").expect("file");
+        let dest = parent.join("stale");
+        fs::create_dir(&dest).expect("dest");
+        let aci = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let name = std::ffi::OsString::from(aci);
+        let kept = dest.join(&name);
+        fs::write(&kept, b"store-bytes").expect("store");
+        let names = [&name];
+        let (log, guard) = capture_logs();
+        put_stores_back(&dir, &dest, &names);
+        drop(guard);
+        let text = String::from_utf8(log.lock().expect("log").clone()).expect("utf8");
+        assert!(text.contains(MOVE_BACK_FAILED), "{text}");
+        assert!(text.contains(STALE_FOLDER_LEFT), "{text}");
+        assert!(!text.contains(aci), "{text}");
+        assert!(!text.contains(&*parent.to_string_lossy()), "{text}");
+        assert!(!MOVE_BACK_FAILED.contains('/'));
+        assert!(!STALE_FOLDER_LEFT.contains('/'));
+        assert_eq!(fs::read(&kept).expect("still there"), b"store-bytes");
+        assert!(dir.is_file(), "the failed put-back deletes nothing");
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// Every stale name `stale_folder` would pick, for this second and the next few.
+    fn block_stale_names(parent: &Path, dir_name: &str) {
+        let start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        for stamp in start..=start + 8 {
+            let base = format!("{dir_name}.stale-{stamp}");
+            for suffix in [String::new()]
+                .into_iter()
+                .chain((2..1_000).map(|index| format!("-{index}")))
+            {
+                fs::write(parent.join(format!("{base}{suffix}")), b"taken").expect("block");
+            }
+        }
+    }
+
+    fn capture_logs() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        #[derive(Clone)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Buf(std::sync::Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        (bytes, guard)
     }
 }

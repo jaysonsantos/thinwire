@@ -448,6 +448,12 @@ fn store_access_detail(
     }
 }
 
+/// The move-aside failed. The files stayed, so a saved account stays linked.
+fn stores_left_in_place(detail: &str) -> bool {
+    detail == thinwire_protocol::signal_key_wrong_kept()
+        || detail == thinwire_protocol::whatsapp_key_wrong_kept()
+}
+
 /// Drop a trailing "did not link" sentence. A saved account does not use it.
 fn without_did_not_link(detail: &str) -> String {
     detail
@@ -931,18 +937,22 @@ impl Snapshot {
             } => {
                 // A saved account never hears "did not link". That sentence is
                 // for a first link only.
-                let detail = if self.has_session(protocol) && detail.contains("did not link") {
+                let saved = self.has_session(protocol);
+                let detail = if saved && detail.contains("did not link") {
                     without_did_not_link(&detail)
                 } else {
                     detail
                 };
-                // The status line only. It never changes the link state: a
-                // recoverable error must not hide the inbox (shell plan 1, 11).
+                // The status line does not end a session. A failed move of a
+                // saved account puts the row back to Linked: the files stayed.
                 if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) {
                     row.status = status;
                     row.detail = detail.clone();
                     // A new status replaces the key sentence and hides Retry.
                     row.store_access = None;
+                    if saved && stores_left_in_place(&detail) {
+                        row.state = AccountState::Linked;
+                    }
                 }
                 #[cfg(feature = "signal-local")]
                 if protocol == ProtocolId::Signal {
@@ -5108,6 +5118,72 @@ mod tests {
                     "the risk gate does not delete the saved store"
                 );
             }
+        }
+    }
+
+    /// A failed move is not a wrong key. The files stayed, the row stays
+    /// linked, and nothing offers Link.
+    #[test]
+    fn a_failed_move_keeps_the_linked_row_and_offers_no_link() {
+        for (protocol, sentence) in [
+            (
+                ProtocolId::Signal,
+                thinwire_protocol::signal_key_wrong_kept(),
+            ),
+            (
+                ProtocolId::WhatsApp,
+                thinwire_protocol::whatsapp_key_wrong_kept(),
+            ),
+        ] {
+            let mut snapshot = Snapshot::new();
+            snapshot.apply(AdapterEvent::Account {
+                protocol,
+                state: AccountState::Linked,
+            });
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: {
+                    let mut chat = telegram_chat(1, "Ada", 1);
+                    chat.protocol = protocol;
+                    chat.id = format!("{protocol:?}:ada");
+                    chat
+                },
+            });
+            snapshot.take_commands();
+            snapshot.apply(AdapterEvent::Account {
+                protocol,
+                state: AccountState::Linking,
+            });
+            snapshot.apply(AdapterEvent::Status {
+                protocol,
+                status: AdapterStatus::Error,
+                detail: sentence.into(),
+            });
+            let row = snapshot
+                .accounts
+                .iter()
+                .find(|row| row.caps.id == protocol)
+                .expect("row");
+            assert_eq!(row.state, AccountState::Linked);
+            assert!(snapshot.has_session(protocol));
+            assert!(row.store_access.is_none());
+            assert_eq!(row.detail, sentence);
+            assert!(row.detail.contains("left in place"), "{}", row.detail);
+            assert!(
+                row.detail.contains("Nothing was deleted."),
+                "{}",
+                row.detail
+            );
+            assert!(!row.detail.contains("Link again"), "{}", row.detail);
+            assert_eq!(
+                snapshot.conversations.get(&protocol).map(Vec::len),
+                Some(1),
+                "the account is not emptied"
+            );
+            snapshot.retry_store_key(protocol);
+            assert!(
+                snapshot.take_commands().is_empty(),
+                "a failed move does not read the key again and does not link"
+            );
         }
     }
 

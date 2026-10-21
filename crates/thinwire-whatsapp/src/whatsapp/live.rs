@@ -57,6 +57,7 @@ impl LinkBackend for LiveBackend {
         protected.map_err(|fail| match fail {
             super::cipher::ProtectFail::KeychainDenied => StartError::KeychainDenied,
             super::cipher::ProtectFail::WrongKey => StartError::WrongKey,
+            super::cipher::ProtectFail::NotMoved => StartError::MoveFailed,
             super::cipher::ProtectFail::NotSaved => {
                 StartError::Reported(thinwire_protocol::whatsapp_key_not_saved().to_string())
             }
