@@ -260,29 +260,97 @@ mod tests {
         let other = [0x11u8; 32];
         prepare_file(&path, &other, MigrateOptions::default()).expect("encrypt");
         let before = std::fs::read(&path).expect("bytes");
-        block_stale_names(&parent, "whatsapp");
+        // Filling every stale-<second> name loses to the clock on a slow disk.
+        // A parent that cannot take a new entry fails the first create_dir.
+        let block = ParentBlock::lock(&parent);
         let error = protect_store(&path).expect_err("move failed");
         assert_eq!(error, ProtectFail::NotMoved);
         assert_ne!(error, ProtectFail::WrongKey);
         assert_eq!(std::fs::read(&path).expect("left in place"), before);
+        drop(block);
         let _ = std::fs::remove_dir_all(&parent);
     }
 
-    /// Every stale name the move would pick, for this second and the next few.
-    fn block_stale_names(parent: &std::path::Path, dir_name: &str) {
-        let start = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_secs();
-        for stamp in start..=start + 8 {
-            let base = format!("{dir_name}.stale-{stamp}");
-            for suffix in [String::new()]
-                .into_iter()
-                .chain((2..1_000).map(|index| format!("-{index}")))
+    /// The parent cannot gain a stale folder until this value is dropped.
+    struct ParentBlock<'a> {
+        parent: &'a std::path::Path,
+        #[cfg(unix)]
+        mode: u32,
+        #[cfg(windows)]
+        user: String,
+    }
+
+    impl<'a> ParentBlock<'a> {
+        fn lock(parent: &'a std::path::Path) -> Self {
+            #[cfg(unix)]
             {
-                std::fs::write(parent.join(format!("{base}{suffix}")), b"taken").expect("block");
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(parent)
+                    .expect("meta")
+                    .permissions()
+                    .mode();
+                let mut perms = std::fs::metadata(parent).expect("meta").permissions();
+                perms.set_mode(mode & !0o222);
+                std::fs::set_permissions(parent, perms).expect("chmod");
+                let blocked = Self { parent, mode };
+                assert!(
+                    std::fs::create_dir(parent.join("cannot-create-stale")).is_err(),
+                    "the parent still accepts a new folder"
+                );
+                blocked
+            }
+            #[cfg(windows)]
+            {
+                let user = current_windows_user();
+                let status = std::process::Command::new("icacls")
+                    .arg(parent)
+                    .arg("/deny")
+                    .arg(format!("{user}:(AD)"))
+                    .status()
+                    .expect("icacls");
+                assert!(status.success(), "icacls deny");
+                let blocked = Self { parent, user };
+                assert!(
+                    std::fs::create_dir(parent.join("cannot-create-stale")).is_err(),
+                    "the parent still accepts a new folder"
+                );
+                blocked
             }
         }
+    }
+
+    impl Drop for ParentBlock<'_> {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(self.parent).expect("meta").permissions();
+                perms.set_mode(self.mode);
+                std::fs::set_permissions(self.parent, perms).expect("chmod");
+            }
+            #[cfg(windows)]
+            {
+                let status = std::process::Command::new("icacls")
+                    .arg(self.parent)
+                    .arg("/remove:d")
+                    .arg(&self.user)
+                    .status()
+                    .expect("icacls");
+                assert!(status.success(), "icacls remove deny");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn current_windows_user() -> String {
+        let output = std::process::Command::new("whoami")
+            .output()
+            .expect("whoami");
+        assert!(output.status.success(), "whoami");
+        String::from_utf8(output.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string()
     }
 
     #[test]

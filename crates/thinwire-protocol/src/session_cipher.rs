@@ -755,11 +755,14 @@ CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
         let bytes = b"encrypted-bytes";
         fs::write(&store, bytes).expect("store");
         fs::write(dir.join("helper.lock"), b"lock").expect("lock");
-        block_stale_names(&parent, "signal");
+        // Filling every stale-<second> name loses to the clock on a slow disk.
+        // A parent that cannot take a new entry fails the first create_dir.
+        let block = ParentBlock::lock(&parent);
         let error = move_stores_aside(&dir).expect_err("cannot move");
         assert_eq!(error, MoveAsideError);
         assert_eq!(fs::read(&store).expect("stays"), bytes);
         assert_eq!(fs::read(dir.join("helper.lock")).expect("lock"), b"lock");
+        drop(block);
         let _ = fs::remove_dir_all(&parent);
     }
 
@@ -854,21 +857,83 @@ CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
         let _ = fs::remove_dir_all(&parent);
     }
 
-    /// Every stale name `stale_folder` would pick, for this second and the next few.
-    fn block_stale_names(parent: &Path, dir_name: &str) {
-        let start = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_secs();
-        for stamp in start..=start + 8 {
-            let base = format!("{dir_name}.stale-{stamp}");
-            for suffix in [String::new()]
-                .into_iter()
-                .chain((2..1_000).map(|index| format!("-{index}")))
+    /// The parent cannot gain a stale folder until this value is dropped.
+    struct ParentBlock<'a> {
+        parent: &'a Path,
+        #[cfg(unix)]
+        mode: u32,
+        #[cfg(windows)]
+        user: String,
+    }
+
+    impl<'a> ParentBlock<'a> {
+        fn lock(parent: &'a Path) -> Self {
+            #[cfg(unix)]
             {
-                fs::write(parent.join(format!("{base}{suffix}")), b"taken").expect("block");
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(parent).expect("meta").permissions().mode();
+                let mut perms = fs::metadata(parent).expect("meta").permissions();
+                perms.set_mode(mode & !0o222);
+                fs::set_permissions(parent, perms).expect("chmod");
+                let blocked = Self { parent, mode };
+                assert!(
+                    fs::create_dir(parent.join("cannot-create-stale")).is_err(),
+                    "the parent still accepts a new folder"
+                );
+                blocked
+            }
+            #[cfg(windows)]
+            {
+                let user = current_windows_user();
+                let status = std::process::Command::new("icacls")
+                    .arg(parent)
+                    .arg("/deny")
+                    .arg(format!("{user}:(AD)"))
+                    .status()
+                    .expect("icacls");
+                assert!(status.success(), "icacls deny");
+                let blocked = Self { parent, user };
+                assert!(
+                    fs::create_dir(parent.join("cannot-create-stale")).is_err(),
+                    "the parent still accepts a new folder"
+                );
+                blocked
             }
         }
+    }
+
+    impl Drop for ParentBlock<'_> {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(self.parent).expect("meta").permissions();
+                perms.set_mode(self.mode);
+                fs::set_permissions(self.parent, perms).expect("chmod");
+            }
+            #[cfg(windows)]
+            {
+                let status = std::process::Command::new("icacls")
+                    .arg(self.parent)
+                    .arg("/remove:d")
+                    .arg(&self.user)
+                    .status()
+                    .expect("icacls");
+                assert!(status.success(), "icacls remove deny");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn current_windows_user() -> String {
+        let output = std::process::Command::new("whoami")
+            .output()
+            .expect("whoami");
+        assert!(output.status.success(), "whoami");
+        String::from_utf8(output.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string()
     }
 
     fn capture_logs() -> (
