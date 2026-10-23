@@ -416,6 +416,11 @@ const RETAINED_COPY_NOT_REMOVED: &str = "signal could not remove the previous co
 /// The file name and the contents have no account id and no phone number.
 const RETAINED_SLOT_FILE: &str = "slot";
 
+/// File in `retained/`. The contents are the next slot to assign.
+/// A restore deletes a slot file and does not lower this number, so a
+/// slot is not given to a later account.
+const RETAINED_NEXT_SLOT_FILE: &str = "next-slot";
+
 async fn registration_aci(store: &SqliteStore) -> Option<Uuid> {
     store
         .load_registration_data()
@@ -582,7 +587,8 @@ fn park_sqlite_blocking(session_dir: &Path, aci: Option<Uuid>) -> Result<(), ()>
     prepare_session_dir(&dest_dir).map_err(|_| ())?;
     rename_sqlite_set(&source, &sqlite_store_path(&dest_dir))?;
     // The slot is assigned once, in link order. A later directory sort does
-    // not change it. A failed write is filled in on the next publish.
+    // not change it. The high-water mark stays put when a restore deletes
+    // this file. A failed write is filled in on the next publish.
     if assign_retained_slot(session_dir, &dest_dir).is_err() {
         tracing::error!("{}", RETAINED_SLOT_NOT_STORED);
     }
@@ -591,21 +597,66 @@ fn park_sqlite_blocking(session_dir: &Path, aci: Option<Uuid>) -> Result<(), ()>
 
 fn assign_retained_slot(session_dir: &Path, dest_dir: &Path) -> Result<(), ()> {
     let slot = next_retained_slot(session_dir)?;
-    write_slot_file(dest_dir, slot)
+    write_slot_file(dest_dir, slot)?;
+    let next = slot.checked_add(1).filter(|slot| *slot > 0).ok_or(())?;
+    store_next_slot_mark(session_dir, next)
 }
 
+/// Next slot to assign. The mark in `retained/next-slot` wins when it is
+/// ahead of the files still on disk, so a freed number is not reused.
 fn next_retained_slot(session_dir: &Path) -> Result<u32, ()> {
-    let mut max = 0u32;
+    let mut next = 1u32;
     for dir in retained_store_dirs(session_dir) {
         if let Some(slot) = read_slot_file(&dir) {
-            max = max.max(slot);
+            let after = slot.checked_add(1).filter(|slot| *slot > 0).ok_or(())?;
+            next = next.max(after);
         }
     }
-    max.checked_add(1).filter(|slot| *slot > 0).ok_or(())
+    if let Some(mark) = read_next_slot_mark(session_dir) {
+        next = next.max(mark);
+    }
+    Ok(next)
+}
+
+/// Write the mark before a restore can delete the highest slot file.
+/// No retained store and no mark yet means there is nothing to remember,
+/// and this does not create `retained/`.
+fn ensure_next_slot_mark(session_dir: &Path) -> Result<(), ()> {
+    let has_store = !retained_store_dirs(session_dir).is_empty();
+    let has_mark = read_next_slot_mark(session_dir).is_some();
+    if !has_store && !has_mark {
+        return Ok(());
+    }
+    store_next_slot_mark(session_dir, next_retained_slot(session_dir)?)
+}
+
+fn next_slot_mark_path(session_dir: &Path) -> PathBuf {
+    session_dir.join(RETAINED_DIR).join(RETAINED_NEXT_SLOT_FILE)
+}
+
+fn read_next_slot_mark(session_dir: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(next_slot_mark_path(session_dir)).ok()?;
+    parse_slot_count(&text)
+}
+
+fn store_next_slot_mark(session_dir: &Path, next: u32) -> Result<(), ()> {
+    if next == 0 {
+        return Err(());
+    }
+    if read_next_slot_mark(session_dir).is_some_and(|current| current >= next) {
+        return Ok(());
+    }
+    let root = session_dir.join(RETAINED_DIR);
+    prepare_session_dir(&root).map_err(|_| ())?;
+    std::fs::write(next_slot_mark_path(session_dir), format!("{next}\n")).map_err(|_| ())
 }
 
 fn read_slot_file(dir: &Path) -> Option<u32> {
     let text = std::fs::read_to_string(dir.join(RETAINED_SLOT_FILE)).ok()?;
+    parse_slot_count(&text)
+}
+
+fn parse_slot_count(text: &str) -> Option<u32> {
     let text = text.trim();
     if text.is_empty() || text.starts_with('+') || (text.len() > 1 && text.starts_with('0')) {
         return None;
@@ -622,7 +673,8 @@ fn write_slot_file(dir: &Path, slot: u32) -> Result<(), ()> {
 
 /// Slot and directory for every retained store. The slot comes from the slot
 /// file. A directory with no file, or with a duplicate count, gets the next
-/// count and that count is written. The result is sorted by slot.
+/// count from the high-water mark, and that count is written. The result is
+/// sorted by slot.
 fn retained_slots(session_dir: &Path) -> Vec<(u32, PathBuf)> {
     let mut used = HashSet::new();
     let mut ready = Vec::new();
@@ -633,15 +685,14 @@ fn retained_slots(session_dir: &Path) -> Vec<(u32, PathBuf)> {
             _ => missing.push(dir),
         }
     }
-    let mut next = used.iter().copied().max().unwrap_or(0);
     for dir in missing {
-        next = next.saturating_add(1);
-        if next == 0 {
+        let Ok(slot) = next_retained_slot(session_dir) else {
+            break;
+        };
+        if assign_retained_slot(session_dir, &dir).is_err() {
             break;
         }
-        if write_slot_file(&dir, next).is_ok() {
-            ready.push((next, dir));
-        }
+        ready.push((slot, dir));
     }
     ready.sort_by_key(|(slot, _)| *slot);
     ready
@@ -752,6 +803,15 @@ async fn set_aside_store_without_aci(session_dir: &Path) -> Result<bool, ()> {
 async fn separate_previous_account(session_dir: &Path) -> Result<(), ()> {
     if !pending_store_path(session_dir).exists() {
         return Ok(());
+    }
+    // A return below can delete the highest slot file. Remember that
+    // number first, so the next link does not reuse it.
+    let dir = session_dir.to_path_buf();
+    let marked = tokio::task::spawn_blocking(move || ensure_next_slot_mark(&dir))
+        .await
+        .map_err(|_| ())?;
+    if marked.is_err() {
+        tracing::error!("{}", RETAINED_SLOT_NOT_STORED);
     }
     let session_file = sqlite_store_path(session_dir);
     if !session_file.exists() {
@@ -4158,6 +4218,92 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "the log and the events have no account id"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Link A, then B, then C. Return to C, then link D.
+    ///
+    /// C is parked at the highest slot. The return drops that slot file.
+    /// The store moved aside for D must take a new slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_returned_slot_is_not_reused_by_the_next_link() {
+        let dir = temp_session_dir("slot-high-water");
+        let aci_a = Uuid::from_u128(0xaaa1_0000_0000_0000_0000_0000_0000_0001);
+        let aci_b = Uuid::from_u128(0xbbb2_0000_0000_0000_0000_0000_0000_0002);
+        let aci_c = Uuid::from_u128(0xccc3_0000_0000_0000_0000_0000_0000_0003);
+        let aci_d = Uuid::from_u128(0xddd4_0000_0000_0000_0000_0000_0000_0004);
+        let ada = named_contact(1, "Ada");
+
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        insert_registration(&pool, &registration_for(aci_a)).await;
+        save_contact_message(&mut store, &ada, "on A").await;
+        assert!(forget_rejected_registration(&mut store, &url).await);
+        pool.close().await;
+        store.close().await;
+
+        replace_with_account(&dir, aci_b).await;
+        replace_with_account(&dir, aci_c).await;
+        // Leave C, so C is the highest retained slot. Drop the live session
+        // file, then return to C. That restore removes C's slot and does
+        // not park another store first.
+        replace_with_account(&dir, aci_a).await;
+        let c_slot = std::fs::read_to_string(retained_slot_path(&dir, aci_c)).expect("C slot");
+        assert_eq!(c_slot, "3\n", "C is the highest slot");
+        remove_sqlite_files(&sqlite_store_path(&dir)).expect("drop the live session");
+        replace_with_account(&dir, aci_c).await;
+        assert!(
+            !retained_slot_path(&dir, aci_c).exists(),
+            "returning to C drops that slot file"
+        );
+        replace_with_account(&dir, aci_d).await;
+        let parked =
+            std::fs::read_to_string(retained_slot_path(&dir, aci_c)).expect("slot written for D");
+        assert_ne!(parked, c_slot, "D must not reuse the slot C held");
+        assert!(
+            parked.trim().parse::<u32>().expect("slot") > 3,
+            "D must get a new slot, got {parked:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(retained_slot_path(&dir, aci_b)).expect("B slot"),
+            "2\n",
+            "B keeps its slot"
+        );
+        let mark = std::fs::read_to_string(dir.join(RETAINED_DIR).join(RETAINED_NEXT_SLOT_FILE))
+            .expect("high-water mark");
+        let mark: u32 = mark.trim().parse().expect("mark");
+        let parked: u32 = parked.trim().parse().expect("slot");
+        assert!(
+            mark > parked,
+            "the high-water mark stays above the slot D's link wrote"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn replace_with_account(dir: &std::path::Path, aci: Uuid) {
+        let session = sqlite_store_path(dir);
+        if session.is_file() {
+            let url = session.to_str().expect("path").to_string();
+            let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
+                .await
+                .expect("store");
+            assert!(
+                forget_rejected_registration(&mut store, &url).await,
+                "the open account can be cleared"
+            );
+            store.close().await;
+        }
+        let (pending, _pending_url, pending_pool) = open_pending_db(dir).await;
+        insert_registration(&pending_pool, &registration_for(aci)).await;
+        pending_pool.close().await;
+        pending.close().await;
+        separate_previous_account(dir)
+            .await
+            .expect("the link is placed");
+    }
+
+    fn retained_slot_path(dir: &std::path::Path, aci: Uuid) -> std::path::PathBuf {
+        dir.join(RETAINED_DIR)
+            .join(aci.to_string())
+            .join(RETAINED_SLOT_FILE)
     }
 
     /// A retained chat with more than one page loads the older page.
