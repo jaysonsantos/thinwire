@@ -47,6 +47,14 @@ pub const SIGNAL_LINK_CHECK: &str = "Checking Signal link…";
 pub const SIGNAL_PREVIOUS_ACCOUNT: &str =
     "You linked a different number. This history stays. Sending is off.";
 
+/// Shown in the account list while old Signal history is on disk and its
+/// rows are not on screen. The rows come back after the next link.
+///
+/// Signal does not show an account phone number, and no phone number
+/// crosses the helper pipe, so this line names no digits.
+pub const SIGNAL_HISTORY_KEPT: &str =
+    "Old Signal history for the previous number is kept. It shows again after you link.";
+
 /// Chat id prefix for a previous Signal account in `retained/`.
 /// The form is `retained:<slot>:<chat id>`. The slot is a count, not an
 /// account id.
@@ -245,5 +253,16 @@ mod tests {
             "the row must not call Signal reliable"
         );
         assert!(SIGNAL_PREVIOUS_ACCOUNT.contains("Sending is off."));
+        assert!(
+            !SIGNAL_HISTORY_KEPT
+                .to_ascii_lowercase()
+                .contains("reliable"),
+            "the held line must not call Signal reliable"
+        );
+        assert!(SIGNAL_HISTORY_KEPT.contains("It shows again after you link."));
+        assert!(
+            !SIGNAL_HISTORY_KEPT.chars().any(|ch| ch.is_ascii_digit()),
+            "the held line has no phone number"
+        );
     }
 }

@@ -654,6 +654,9 @@ pub struct Snapshot {
     /// Signal number, or another protocol. The number is a slot, not an
     /// account id.
     selected_signal_retained: Option<u32>,
+    /// Old Signal history is on disk under `retained/`. The rows may be
+    /// hidden until the next link. This flag is not a phone number.
+    signal_history_on_disk: bool,
 }
 
 /// Redacted: login fields, the WhatsApp phone and pairing material, the
@@ -693,7 +696,8 @@ impl std::fmt::Debug for Snapshot {
             .field("signal_inbox_open", &self.signal_inbox_open)
             .field("signal_removed", &self.signal_removed)
             .field("signal_checking", &self.signal_checking);
-        out.field("selected_signal_retained", &self.selected_signal_retained);
+        out.field("selected_signal_retained", &self.selected_signal_retained)
+            .field("signal_history_on_disk", &self.signal_history_on_disk);
         out.finish_non_exhaustive()
     }
 }
@@ -875,6 +879,7 @@ impl Snapshot {
             #[cfg(feature = "signal-local")]
             signal_checking: false,
             selected_signal_retained: None,
+            signal_history_on_disk: false,
         }
     }
 
@@ -911,8 +916,15 @@ impl Snapshot {
                 // the previous number. The retained rows already hold them.
                 // This line is not a status of the live account.
                 if protocol == ProtocolId::Signal
+                    && detail == thinwire_protocol::SIGNAL_HISTORY_KEPT
+                {
+                    // The files are on disk. The rows are not in this event.
+                    // This line is not a status of the live account.
+                    self.signal_history_on_disk = true;
+                } else if protocol == ProtocolId::Signal
                     && detail == thinwire_protocol::SIGNAL_PREVIOUS_ACCOUNT
                 {
+                    self.signal_history_on_disk = true;
                     self.retire_live_signal_chats();
                 } else {
                     // The status line only. It never changes the link state: a
@@ -1386,6 +1398,20 @@ impl Snapshot {
             return true;
         }
         self.selected_signal_retained == account.signal_retained
+    }
+
+    /// One line for the account list while old Signal history is on disk
+    /// and its rows are not shown. `None` when those rows are on screen,
+    /// and when no old history is kept.
+    ///
+    /// The line names no phone number. Signal does not show one.
+    #[must_use]
+    pub fn signal_history_kept_line(&self) -> Option<&'static str> {
+        if self.signal_history_on_disk && !self.retained_signal_chats_shown() {
+            Some(thinwire_protocol::SIGNAL_HISTORY_KEPT)
+        } else {
+            None
+        }
     }
 
     /// Why the open Signal chat cannot send, when it is a previous number.
@@ -3719,6 +3745,19 @@ impl Snapshot {
             .find(|row| row.caps.id == protocol && row.signal_retained.is_none())
     }
 
+    /// The previous number's chats are in the inbox. A session end hides
+    /// them until the next link publishes the retained store again.
+    fn retained_signal_chats_shown(&self) -> bool {
+        self.has_session(ProtocolId::Signal)
+            && self
+                .conversations
+                .get(&ProtocolId::Signal)
+                .is_some_and(|rows| {
+                    rows.iter()
+                        .any(|row| thinwire_protocol::signal_retained_slot(&row.id).is_some())
+                })
+    }
+
     /// `true` when `id` belongs to the account row that is open.
     fn chat_in_open_account(&self, id: &str) -> bool {
         if self.selected_protocol != ProtocolId::Signal {
@@ -3745,6 +3784,7 @@ impl Snapshot {
 
     /// One read-only row for a previous Signal number. The live row stays.
     fn ensure_retained_signal_row(&mut self, slot: u32) {
+        self.signal_history_on_disk = true;
         if self
             .accounts
             .iter()
@@ -3924,6 +3964,11 @@ impl Snapshot {
             self.end_signal_pairing();
             self.signal_notice_acknowledged = false;
             self.signal_screen = SignalScreen::Hidden;
+        }
+        // The retained files stay. The rows come back on the next link.
+        // The account list says so while they are hidden.
+        if protocol == ProtocolId::Signal {
+            self.selected_signal_retained = None;
         }
         if self.selected_protocol == protocol {
             self.compose.clear();
@@ -8617,6 +8662,84 @@ mod tests {
                 .iter()
                 .all(|command| !matches!(command, AdapterCommand::SendText { .. })),
             "sending from the old row does not go out"
+        );
+    }
+
+    /// After the session ends, the old rows are hidden. The account list
+    /// says the history is kept. The line goes away when the rows return.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_hidden_retained_history_says_it_is_kept_until_the_rows_return() {
+        use thinwire_protocol::{SIGNAL_HISTORY_KEPT, signal_retained_chat_id};
+
+        let mut snapshot = signal_inbox_ready();
+        let ready = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("live row")
+            .detail
+            .clone();
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: SIGNAL_HISTORY_KEPT.into(),
+        });
+        assert_eq!(
+            snapshot.signal_history_kept_line(),
+            Some(SIGNAL_HISTORY_KEPT)
+        );
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .find(|row| row.caps.id == ProtocolId::Signal)
+                .expect("live row")
+                .detail,
+            ready,
+            "the held line is not a status of the live account"
+        );
+        assert!(
+            !SIGNAL_HISTORY_KEPT.chars().any(|ch| ch.is_ascii_digit()),
+            "the line has no phone number"
+        );
+
+        let kept_id = signal_retained_chat_id(1, "ada");
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, &kept_id, false),
+        });
+        assert!(
+            snapshot.signal_history_kept_line().is_none(),
+            "the line goes away when the rows are published"
+        );
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        assert!(
+            snapshot
+                .conversations
+                .get(&ProtocolId::Signal)
+                .is_none_or(|rows| rows.is_empty()),
+            "a session end hides the retained rows"
+        );
+        assert_eq!(
+            snapshot.signal_history_kept_line(),
+            Some(SIGNAL_HISTORY_KEPT),
+            "the account list says the history is kept"
+        );
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, &kept_id, false),
+        });
+        assert!(
+            snapshot.signal_history_kept_line().is_none(),
+            "the line goes away when the rows are published again"
         );
     }
 

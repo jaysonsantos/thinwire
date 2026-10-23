@@ -49,8 +49,9 @@ pub use secrets::{
     TelegramSecretVault,
 };
 pub use signal::{
-    SIGNAL_DEVICE_REMOVED, SIGNAL_HELPER_PROGRAM, SIGNAL_LINK_CHECK, SIGNAL_PREVIOUS_ACCOUNT,
-    SignalAdapter, signal_helper_adapter, signal_retained_chat_id, signal_retained_slot,
+    SIGNAL_DEVICE_REMOVED, SIGNAL_HELPER_PROGRAM, SIGNAL_HISTORY_KEPT, SIGNAL_LINK_CHECK,
+    SIGNAL_PREVIOUS_ACCOUNT, SignalAdapter, signal_helper_adapter, signal_retained_chat_id,
+    signal_retained_slot,
 };
 pub use slack::{
     DEDUP_FRESH_SECS, MemorySlackVault, SLACK_CONVERSATION_PREFIX, SLACK_OAUTH_CALLBACK_PATH,

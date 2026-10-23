@@ -35,8 +35,8 @@ use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::AttemptCancel;
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolId, RedactedPairingSecret, SIGNAL_PREVIOUS_ACCOUNT, emit_account, emit_conversation,
-    emit_message, emit_status, signal_retained_chat_id, signal_retained_slot,
+    ProtocolId, RedactedPairingSecret, SIGNAL_HISTORY_KEPT, SIGNAL_PREVIOUS_ACCOUNT, emit_account,
+    emit_conversation, emit_message, emit_status, signal_retained_chat_id, signal_retained_slot,
 };
 
 const DATA_DIR_MISSING: &str =
@@ -941,6 +941,9 @@ async fn run_linked(
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
     };
+    // Old history can sit under `retained/` while this link is still open.
+    // Tell the core before the rows exist. The line names no phone number.
+    note_retained_history(&store_path, &events);
     let Some(store_url) = sqlite_store_path(&store_path).to_str().map(str::to_string) else {
         fail(&events, STORE_FAILED);
         session.active.store(false, Ordering::SeqCst);
@@ -1338,6 +1341,20 @@ async fn publish_chats(
 }
 
 const RETAINED_HISTORY_NOT_READ: &str = "signal could not read a previous account store";
+
+/// Tell the core that `retained/` has a previous account.
+/// The status names no phone number and no account id.
+/// The core shows one line until the rows are published.
+fn note_retained_history(session_dir: &Path, events: &EventTx) {
+    if retained_store_dirs(session_dir).is_empty() {
+        return;
+    }
+    let _ = events.send(AdapterEvent::Status {
+        protocol: ProtocolId::Signal,
+        status: AdapterStatus::Ready,
+        detail: SIGNAL_HISTORY_KEPT.to_owned(),
+    });
+}
 
 /// Publish every store under `retained/` as a read-only account.
 ///
@@ -3507,6 +3524,49 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         );
         active.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Retained files exist and the rows are not published yet.
+    /// The status names no phone number and no account id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retained_hold_names_no_phone_and_no_account_id() {
+        let dir = temp_session_dir("held-history");
+        let aci = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+        let aside = dir.join(RETAINED_DIR).join(aci.to_string());
+        std::fs::create_dir_all(&aside).expect("dir");
+        std::fs::write(sqlite_store_path(&aside), []).expect("file");
+
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        note_retained_history(&dir, &tx);
+        drop(tx);
+        let log = logged(&bytes);
+        drop(guard);
+        assert!(
+            !log.contains(&aci.to_string()) && !log.contains("2025550100"),
+            "the log has no account id and no phone number: {log}"
+        );
+
+        let event = rx.recv().await.expect("held status");
+        assert!(matches!(
+            &event,
+            AdapterEvent::Status { detail, .. } if detail == SIGNAL_HISTORY_KEPT
+        ));
+        let debug = format!("{event:?}");
+        assert!(
+            !debug.contains(&aci.to_string()) && !debug.contains("2025550100"),
+            "the event has no account id and no phone number: {debug}"
+        );
+        assert!(rx.recv().await.is_none(), "one line, not the rows");
+
+        let empty = temp_session_dir("held-empty");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        note_retained_history(&empty, &tx);
+        drop(tx);
+        assert!(rx.recv().await.is_none(), "no retained store, no line");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     fn temp_session_dir(label: &str) -> std::path::PathBuf {
