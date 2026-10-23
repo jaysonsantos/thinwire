@@ -5100,9 +5100,9 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let (mut store, _, pool) = open_session_db(&dir).await;
         save_contact_message(&mut store, contact, "kept").await;
         let row = sqlx::query(
-            "SELECT m.content_body, m.sender_service_id, m.destination_service_id, m.ts, \
-             t.recipient_id \
-             FROM thread_messages m JOIN threads t ON t.id = m.thread_id",
+            "SELECT m.content_body, m.sender_service_id, m.destination_service_id, m.ts,
+                t.recipient_id
+                FROM thread_messages m JOIN threads t ON t.id = m.thread_id",
         )
         .fetch_one(&pool)
         .await
@@ -5143,9 +5143,9 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         }
         for (version, checksum) in EARLY_MIGRATIONS {
             sqlx::query(
-                "INSERT INTO _sqlx_migrations \
-                 (version, description, success, checksum, execution_time) \
-                 VALUES (?, 'early', 1, ?, 0)",
+                "INSERT INTO _sqlx_migrations (
+                    version, description, success, checksum, execution_time
+                ) VALUES (?, 'early', 1, ?, 0)",
             )
             .bind(version)
             .bind(hex_bytes(checksum))
@@ -5154,8 +5154,9 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .expect("migration row");
         }
         sqlx::query(
-            "INSERT INTO contacts (uuid, name, profile_key, expire_timer, inbox_position) \
-             VALUES (?, 'Ada', ?, 0, 0)",
+            "INSERT INTO contacts (
+                uuid, name, profile_key, expire_timer, inbox_position
+            ) VALUES (?, 'Ada', ?, 0, 0)",
         )
         .bind(contact.uuid.as_bytes().as_slice())
         .bind([9u8; 32].as_slice())
@@ -5163,8 +5164,9 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         .await
         .expect("contact");
         sqlx::query(
-            "INSERT INTO groups (master_key, title, avatar, members, pending_members, requesting_members) \
-             VALUES (?, 'Kept', '', '[]', '[]', '[]')",
+            "INSERT INTO groups (
+                master_key, title, avatar, members, pending_members, requesting_members
+            ) VALUES (?, 'Kept', '', '[]', '[]', '[]')",
         )
         .bind([8u8; 32].as_slice())
         .execute(&pool)
@@ -5213,8 +5215,9 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         .await
         .expect("kyber pre key");
         sqlx::query(
-            "INSERT INTO sender_keys (address, device_id, identity, distribution_id, record) \
-             VALUES ('kept', 1, 'aci', 'dist', ?)",
+            "INSERT INTO sender_keys (
+                address, device_id, identity, distribution_id, record
+            ) VALUES ('kept', 1, 'aci', 'dist', ?)",
         )
         .bind([5u8].as_slice())
         .execute(&pool)
