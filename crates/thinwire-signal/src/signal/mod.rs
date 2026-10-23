@@ -161,7 +161,8 @@ impl SignalAdapter {
         self.link_device(events, generation)
     }
 
-    /// Read the session key again. This is not a new link.
+    /// Read the session key again and open the saved session. This is not a
+    /// new link. A wrong key tries the move-aside again and deletes nothing.
     fn retry_store_key(&mut self, events: &EventTx) -> Result<(), AdapterError> {
         #[cfg(feature = "signal-local")]
         if matches!(self.engine, Engine::Live(_)) {

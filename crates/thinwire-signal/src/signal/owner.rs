@@ -144,6 +144,7 @@ impl Owner {
 
     /// Open again with the pairing id that is already set.
     /// This does not start a new link, and a failed start does not end the account.
+    /// The new open reads the key. A wrong key tries the move-aside again.
     async fn retry_key(&mut self, events: &EventTx) {
         if self.worker.is_some() {
             self.cleanup().await;
@@ -391,5 +392,49 @@ mod tests {
             9,
             "a key retry keeps the pairing id and does not start a new link"
         );
+    }
+
+    /// The worker has ended after a failed move. Retry starts it again.
+    /// That start is the open, and a wrong key there tries the move again.
+    #[tokio::test]
+    async fn a_retry_after_the_worker_ends_opens_again() {
+        let session = Arc::new(Session::new());
+        let starts = Arc::new(AtomicUsize::new(0));
+        let starts_for_start = Arc::clone(&starts);
+        let handle = Handle::spawn(Arc::clone(&session), {
+            Box::new(move |session, _events| {
+                let (_token, _wake) = session.begin_attempt();
+                session.mark_active();
+                starts_for_start.fetch_add(1, Ordering::SeqCst);
+                let thread = std::thread::spawn(|| {});
+                let abort = tokio::spawn(async {}).abort_handle();
+                Some(SignalWorker { thread, abort })
+            })
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle.begin(4, &tx);
+        handle.flush().await;
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        while rx.try_recv().is_ok() {}
+        handle.retry_key(&tx);
+        handle.flush().await;
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "retry opens the saved session again"
+        );
+        assert_eq!(session.pairing(), 4, "retry does not start a new link");
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                ),
+                "retry does not drop the saved account: {event:?}"
+            );
+        }
     }
 }

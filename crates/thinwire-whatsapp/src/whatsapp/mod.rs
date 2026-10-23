@@ -243,8 +243,9 @@ impl WhatsAppAdapter {
         Ok(())
     }
 
-    /// Read the session key again. This is not a new link and does not
-    /// delete the store. The row shows Connecting until the read ends.
+    /// Read the session key again and open the saved session. This is not a
+    /// new link and does not delete the store. A wrong key tries the
+    /// move-aside again. The row shows Connecting until the open ends.
     fn retry_store_key(&mut self, events: &EventTx) -> Result<(), AdapterError> {
         let Some(link) = &self.link else {
             return Err(AdapterError::Unavailable {

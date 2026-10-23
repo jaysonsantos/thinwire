@@ -719,8 +719,10 @@ fn removed_signal_link(
 /// The keychain or encryption sentence, under the chip. The chip label stays short.
 ///
 /// A denied keychain read shows Retry. Retry reads the key again
-/// (`RetryStoreKey`). A wrong key shows Link. Link starts the same flow as
-/// a removed Signal device, and the WhatsApp risk gate. Nothing is deleted.
+/// (`RetryStoreKey`). A failed move shows Retry too. That Retry opens the
+/// saved session and, on a wrong key, tries the move again. Nothing is
+/// deleted. A wrong key that already moved shows Link. Link starts the same
+/// flow as a removed Signal device, and the WhatsApp risk gate.
 fn store_protection_line(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
     if account.status != AdapterStatus::Error && account.store_access.is_none() {
         return;
@@ -746,23 +748,26 @@ fn store_protection_line(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<
     });
 }
 
-/// Retry reads the key again. Link starts the existing link flow.
+/// Retry reads the key again. A failed move uses the same command to try
+/// the move again. Link starts the existing link flow.
 fn store_row_intent(account: &AccountRow) -> Option<Intent> {
     match account.store_access {
-        Some(StoreAccessReason::KeychainDenied) => Some(Intent::RetryStoreKey(account.caps.id)),
+        Some(StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed) => {
+            Some(Intent::RetryStoreKey(account.caps.id))
+        }
         Some(StoreAccessReason::WrongKey) if account.caps.id == ProtocolId::Signal => {
             Some(Intent::Signal(SignalIntent::Relink))
         }
         Some(StoreAccessReason::WrongKey) if account.caps.id == ProtocolId::WhatsApp => {
             Some(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate))
         }
-        _ => None,
+        Some(StoreAccessReason::WrongKey) | None => None,
     }
 }
 
 fn store_row_button(account: &AccountRow) -> &'static str {
     match account.store_access {
-        Some(StoreAccessReason::KeychainDenied) => "Retry",
+        Some(StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed) => "Retry",
         Some(StoreAccessReason::WrongKey) => "Link",
         None => "",
     }
@@ -771,6 +776,9 @@ fn store_row_button(account: &AccountRow) -> &'static str {
 fn store_row_hover(account: &AccountRow) -> &'static str {
     match account.store_access {
         Some(StoreAccessReason::KeychainDenied) => "Read the session key from Keychain again",
+        Some(StoreAccessReason::MoveFailed) => {
+            "Tries to move the saved session aside again. Nothing is deleted."
+        }
         Some(StoreAccessReason::WrongKey) => "Link again. The old data stays.",
         None => "",
     }
@@ -3408,7 +3416,7 @@ mod tests {
     /// relink (`SignalIntent::Relink`), which starts the QR flow.
     #[test]
     fn a_wrong_key_link_button_starts_the_relink() {
-        use super::{store_row_button, store_row_intent};
+        use super::{store_row_button, store_row_hover, store_row_intent};
         use thinwire_core::state::AccountRow;
         use thinwire_core::{Intent, SignalIntent, WhatsAppIntent};
         use thinwire_protocol::{
@@ -3449,14 +3457,76 @@ mod tests {
             store_row_intent(&account),
             Some(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate))
         );
-        account.store_access = None;
+        account.store_access = Some(StoreAccessReason::MoveFailed);
         account.state = AccountState::Linked;
         account.detail = thinwire_protocol::whatsapp_key_wrong_kept().into();
-        assert!(store_row_intent(&account).is_none());
-        assert_eq!(store_row_button(&account), "");
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::RetryStoreKey(ProtocolId::WhatsApp))
+        );
+        assert_eq!(store_row_button(&account), "Retry");
+        assert_eq!(
+            store_row_hover(&account),
+            "Tries to move the saved session aside again. Nothing is deleted."
+        );
         account.caps = signal;
         account.detail = thinwire_protocol::signal_key_wrong_kept().into();
-        assert!(store_row_intent(&account).is_none());
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::RetryStoreKey(ProtocolId::Signal))
+        );
+    }
+
+    /// The failed-move row draws Retry. The click sends `RetryStoreKey`.
+    #[test]
+    fn a_failed_move_row_draws_retry() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use thinwire_core::Intent;
+        use thinwire_core::state::AccountRow;
+        use thinwire_protocol::{
+            AccountState, AdapterStatus, ProtocolId, StoreAccessReason, catalog,
+        };
+
+        use super::{store_protection_line, store_row_hover};
+        use crate::app::theme;
+
+        let signal = catalog()
+            .into_iter()
+            .find(|caps| caps.id == ProtocolId::Signal)
+            .expect("signal");
+        let account = AccountRow {
+            caps: signal,
+            status: AdapterStatus::Error,
+            detail: thinwire_protocol::signal_key_wrong_kept().into(),
+            state: AccountState::Linked,
+            helper: None,
+            store_access: Some(StoreAccessReason::MoveFailed),
+        };
+        assert_eq!(
+            store_row_hover(&account),
+            "Tries to move the saved session aside again. Nothing is deleted."
+        );
+        let intents = Rc::new(RefCell::new(Vec::new()));
+        let intents_ui = Rc::clone(&intents);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(520.0, 96.0))
+            .build_ui(move |ui| {
+                theme::install(ui.ctx());
+                let mut out = Vec::new();
+                store_protection_line(ui, &account, &mut out);
+                intents_ui.borrow_mut().extend(out);
+            });
+        harness.run_steps(3);
+        harness.get_by_role_and_label(Role::Button, "Retry").click();
+        harness.run_steps(2);
+        assert_eq!(
+            intents.borrow().as_slice(),
+            [Intent::RetryStoreKey(ProtocolId::Signal)]
+        );
     }
 
     /// Shell plan 11: a linked account with an error is not "Not signed in".

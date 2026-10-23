@@ -360,7 +360,8 @@ pub struct AccountRow {
     /// protocol that runs in the app, and before its helper reports.
     pub helper: Option<HelperState>,
     /// The session key could not be used. `None` after the next status.
-    /// A denied read shows Retry. A wrong key shows Link and leaves Linked.
+    /// A denied read shows Retry. A failed move shows Retry and stays
+    /// linked. A wrong key shows Link and leaves Linked.
     pub store_access: Option<StoreAccessReason>,
 }
 
@@ -445,6 +446,10 @@ fn store_access_detail(
             thinwire_protocol::whatsapp_session_kept()
         }
         StoreAccessReason::WrongKey => thinwire_protocol::signal_session_kept(),
+        StoreAccessReason::MoveFailed if protocol == ProtocolId::WhatsApp => {
+            thinwire_protocol::whatsapp_key_wrong_kept()
+        }
+        StoreAccessReason::MoveFailed => thinwire_protocol::signal_key_wrong_kept(),
     }
 }
 
@@ -949,9 +954,12 @@ impl Snapshot {
                     row.status = status;
                     row.detail = detail.clone();
                     // A new status replaces the key sentence and hides Retry.
+                    // A failed move is the exception: the files stayed, so
+                    // the row stays linked and Retry tries the move again.
                     row.store_access = None;
                     if saved && stores_left_in_place(&detail) {
                         row.state = AccountState::Linked;
+                        row.store_access = Some(StoreAccessReason::MoveFailed);
                     }
                 }
                 #[cfg(feature = "signal-local")]
@@ -1251,10 +1259,16 @@ impl Snapshot {
                             })
                     }
                     StoreAccessReason::KeychainDenied => !saved,
+                    StoreAccessReason::MoveFailed => false,
                 };
                 if leave {
                     self.set_account(protocol, AccountState::Unlinked);
-                } else if saved && reason == StoreAccessReason::KeychainDenied {
+                } else if saved
+                    && matches!(
+                        reason,
+                        StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed
+                    )
+                {
                     // A helper may have marked a saved account Linking while
                     // it read the key. The account is still linked.
                     if let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol)
@@ -3591,16 +3605,20 @@ impl Snapshot {
             .push(AdapterCommand::RestartHelper { protocol });
     }
 
-    /// The user clicked Retry after the keychain refused the read.
+    /// The user clicked Retry on a keychain denial or a failed move.
     ///
     /// The command asks the helper to read the key again and open the saved
-    /// session. It is not a new link and it is not Restart. A wrong key does
+    /// session. A wrong key tries the move-aside again. It is not a new link
+    /// and it does not delete a store. A wrong key that already moved does
     /// not take this path.
     pub fn retry_store_key(&mut self, protocol: ProtocolId) {
         let Some(row) = self.accounts.iter_mut().find(|row| row.caps.id == protocol) else {
             return;
         };
-        if row.store_access != Some(StoreAccessReason::KeychainDenied) {
+        if !matches!(
+            row.store_access,
+            Some(StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed)
+        ) {
             return;
         }
         row.store_access = None;
@@ -5122,9 +5140,9 @@ mod tests {
     }
 
     /// A failed move is not a wrong key. The files stayed, the row stays
-    /// linked, and nothing offers Link.
+    /// linked, and Retry asks for the move again. It does not link.
     #[test]
-    fn a_failed_move_keeps_the_linked_row_and_offers_no_link() {
+    fn a_failed_move_keeps_the_linked_row_and_retries_the_move() {
         for (protocol, sentence) in [
             (
                 ProtocolId::Signal,
@@ -5165,7 +5183,7 @@ mod tests {
                 .expect("row");
             assert_eq!(row.state, AccountState::Linked);
             assert!(snapshot.has_session(protocol));
-            assert!(row.store_access.is_none());
+            assert_eq!(row.store_access, Some(StoreAccessReason::MoveFailed));
             assert_eq!(row.detail, sentence);
             assert!(row.detail.contains("left in place"), "{}", row.detail);
             assert!(
@@ -5180,9 +5198,17 @@ mod tests {
                 "the account is not emptied"
             );
             snapshot.retry_store_key(protocol);
+            let commands = snapshot.take_commands();
+            assert_eq!(
+                commands,
+                vec![AdapterCommand::RetryStoreKey { protocol }],
+                "Retry reads the key and tries the move again"
+            );
             assert!(
-                snapshot.take_commands().is_empty(),
-                "a failed move does not read the key again and does not link"
+                commands
+                    .iter()
+                    .all(|command| matches!(command, AdapterCommand::RetryStoreKey { .. })),
+                "Retry does not start a link: {commands:?}"
             );
         }
     }

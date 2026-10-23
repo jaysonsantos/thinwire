@@ -413,8 +413,9 @@ pub enum AdapterCommand {
     RestartHelper {
         protocol: ProtocolId,
     },
-    /// Read the session key again. This does not start a link and it does
-    /// not move the store.
+    /// Read the session key again and open the saved session. This does not
+    /// start a link and it does not delete a store. A wrong key tries the
+    /// move-aside again.
     RetryStoreKey {
         protocol: ProtocolId,
     },
@@ -467,6 +468,8 @@ pub enum StoreAccessReason {
     KeychainDenied,
     /// The encrypted store did not open. The folder was moved aside.
     WrongKey,
+    /// The store files could not be moved aside. They stay. Nothing was deleted.
+    MoveFailed,
 }
 
 /// `true` when this command makes a helper read the session key.

@@ -314,6 +314,7 @@ impl<B: LinkBackend> Owner<B> {
 
     /// Read the key again with the saved phone and pairing.
     /// This does not delete the store and does not start a new shell link.
+    /// The new open tries the move-aside again when the key is wrong.
     async fn retry_key(&mut self) {
         let Some(pairing) = self.last_pairing else {
             self.fail(StartError::KeychainDenied);
@@ -1027,6 +1028,33 @@ pub(super) mod tests {
         assert!(
             !fake.log().iter().any(|line| line.contains("delete")),
             "nothing is deleted, log {:?}",
+            fake.log()
+        );
+        // Retry opens again. `start` is the open, and a wrong key there
+        // tries the move. This start still fails the move. Nothing is deleted.
+        handle.retry();
+        handle.flush().await;
+        assert_eq!(fake.log(), vec!["start 1", "start 2"]);
+        let retry = drain(&mut rx);
+        assert!(retry.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Error,
+                detail,
+                ..
+            } if detail == thinwire_protocol::whatsapp_key_wrong_kept()
+        )));
+        assert!(!retry.iter().any(|event| matches!(
+            event,
+            AdapterEvent::StoreAccess { .. }
+                | AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                }
+        )));
+        assert!(
+            !fake.log().iter().any(|line| line.contains("delete")),
+            "retry deletes nothing, log {:?}",
             fake.log()
         );
     }

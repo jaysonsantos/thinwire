@@ -196,12 +196,16 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
         AdapterEvent::StoreAccess {
             protocol: seen,
             reason,
-        } if own(seen) => WireEvent::StoreAccess {
-            reason: match reason {
+        } if own(seen) => {
+            // A failed move crosses as the status sentence. Version 2 has no
+            // third `StoreAccess` reason.
+            let reason = match reason {
                 StoreAccessReason::KeychainDenied => WireStoreAccess::KeychainDenied,
                 StoreAccessReason::WrongKey => WireStoreAccess::WrongKey,
-            },
-        },
+                StoreAccessReason::MoveFailed => return None,
+            };
+            WireEvent::StoreAccess { reason }
+        }
         AdapterEvent::Account {
             protocol: seen,
             state,
