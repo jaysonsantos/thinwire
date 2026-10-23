@@ -3868,11 +3868,21 @@ impl Snapshot {
             helper: None,
             signal_retained: Some(slot),
         };
+        // The highest slot is the most recent previous account. It sits
+        // next to the live row. "Previous account N" stays the slot.
         let at = self
             .accounts
             .iter()
-            .rposition(|row| row.caps.id == ProtocolId::Signal)
-            .map_or(self.accounts.len(), |index| index + 1);
+            .position(|row| {
+                row.caps.id == ProtocolId::Signal
+                    && row.signal_retained.is_some_and(|existing| existing < slot)
+            })
+            .unwrap_or_else(|| {
+                self.accounts
+                    .iter()
+                    .rposition(|row| row.caps.id == ProtocolId::Signal)
+                    .map_or(self.accounts.len(), |index| index + 1)
+            });
         self.accounts.insert(at, row);
     }
 
@@ -8780,6 +8790,62 @@ mod tests {
                 "the label has no account id and no phone number: {label}"
             );
         }
+    }
+
+    /// Three previous accounts. The newest slot is first in the account list.
+    /// The chip text stays "Previous account N" for slot N.
+    #[test]
+    fn the_newest_previous_signal_account_is_listed_first() {
+        use thinwire_protocol::signal_retained_chat_id;
+
+        let slots_of = |snapshot: &Snapshot| -> Vec<Option<u32>> {
+            snapshot
+                .accounts
+                .iter()
+                .filter(|row| row.caps.id == ProtocolId::Signal)
+                .map(|row| row.signal_retained)
+                .collect()
+        };
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        for slot in [1u32, 2, 3] {
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: chat(
+                    ProtocolId::Signal,
+                    &signal_retained_chat_id(slot, "ada"),
+                    false,
+                ),
+            });
+        }
+        assert_eq!(
+            slots_of(&snapshot),
+            vec![None, Some(3), Some(2), Some(1)],
+            "the highest slot is next to the live row"
+        );
+        assert_eq!(snapshot.signal_retained_chip_label(1), "Previous account 1");
+        assert_eq!(snapshot.signal_retained_chip_label(2), "Previous account 2");
+        assert_eq!(snapshot.signal_retained_chip_label(3), "Previous account 3");
+
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        for slot in [1u32, 3, 2] {
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: chat(
+                    ProtocolId::Signal,
+                    &signal_retained_chat_id(slot, "ada"),
+                    false,
+                ),
+            });
+        }
+        assert_eq!(slots_of(&snapshot), vec![None, Some(3), Some(2), Some(1)]);
+        assert_eq!(snapshot.signal_retained_chip_label(1), "Previous account 1");
+        assert_eq!(snapshot.signal_retained_chip_label(3), "Previous account 3");
     }
 
     /// A retained chat asks for the next page. Sending stays off.
