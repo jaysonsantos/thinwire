@@ -588,7 +588,8 @@ fn park_sqlite_blocking(session_dir: &Path, aci: Option<Uuid>) -> Result<(), ()>
     rename_sqlite_set(&source, &sqlite_store_path(&dest_dir))?;
     // The slot is assigned once, in link order. A later directory sort does
     // not change it. The high-water mark stays put when a restore deletes
-    // this file. A failed write is filled in on the next publish.
+    // this file. A crash before the write is filled in on the next link,
+    // before retained rows are read. A read does not fill it in.
     if assign_retained_slot(session_dir, &dest_dir).is_err() {
         tracing::error!("{}", RETAINED_SLOT_NOT_STORED);
     }
@@ -671,31 +672,46 @@ fn write_slot_file(dir: &Path, slot: u32) -> Result<(), ()> {
     std::fs::write(dir.join(RETAINED_SLOT_FILE), format!("{slot}\n")).map_err(|_| ())
 }
 
-/// Slot and directory for every retained store. The slot comes from the slot
-/// file. A directory with no file, or with a duplicate count, gets the next
-/// count from the high-water mark, and that count is written. The result is
-/// sorted by slot.
+/// Slot and directory for every retained store that already has a slot file.
+/// This does not write. A directory with no file, or with a duplicate count,
+/// is left out until [`repair_retained_slots`] runs on the link path.
+/// The result is sorted by slot.
 fn retained_slots(session_dir: &Path) -> Vec<(u32, PathBuf)> {
     let mut used = HashSet::new();
     let mut ready = Vec::new();
+    for dir in retained_store_dirs(session_dir) {
+        if let Some(slot) = read_slot_file(&dir)
+            && used.insert(slot)
+        {
+            ready.push((slot, dir));
+        }
+    }
+    ready.sort_by_key(|(slot, _)| *slot);
+    ready
+}
+
+/// Fill a slot file that a crash skipped.
+///
+/// [`park_sqlite_blocking`] renames the store, then writes the slot file.
+/// A crash between those two steps leaves a directory with no slot. A
+/// duplicate count is the same gap. This runs when a link is placed and
+/// once at helper start, before retained rows are published. A read does
+/// not call it. The number comes from the high-water mark, so it can
+/// differ from the original link order.
+fn repair_retained_slots(session_dir: &Path) -> Result<(), ()> {
+    ensure_next_slot_mark(session_dir)?;
     let mut missing = Vec::new();
+    let mut used = HashSet::new();
     for dir in retained_store_dirs(session_dir) {
         match read_slot_file(&dir) {
-            Some(slot) if used.insert(slot) => ready.push((slot, dir)),
+            Some(slot) if used.insert(slot) => {}
             _ => missing.push(dir),
         }
     }
     for dir in missing {
-        let Ok(slot) = next_retained_slot(session_dir) else {
-            break;
-        };
-        if assign_retained_slot(session_dir, &dir).is_err() {
-            break;
-        }
-        ready.push((slot, dir));
+        assign_retained_slot(session_dir, &dir)?;
     }
-    ready.sort_by_key(|(slot, _)| *slot);
-    ready
+    Ok(())
 }
 
 fn unique_retained_dir(session_dir: &Path, aci: Option<Uuid>) -> Result<PathBuf, ()> {
@@ -805,12 +821,13 @@ async fn separate_previous_account(session_dir: &Path) -> Result<(), ()> {
         return Ok(());
     }
     // A return below can delete the highest slot file. Remember that
-    // number first, so the next link does not reuse it.
+    // number first, and fill a slot file a crash skipped. A later read
+    // does not write either file.
     let dir = session_dir.to_path_buf();
-    let marked = tokio::task::spawn_blocking(move || ensure_next_slot_mark(&dir))
+    let repaired = tokio::task::spawn_blocking(move || repair_retained_slots(&dir))
         .await
         .map_err(|_| ())?;
-    if marked.is_err() {
+    if repaired.is_err() {
         tracing::error!("{}", RETAINED_SLOT_NOT_STORED);
     }
     let session_file = sqlite_store_path(session_dir);
@@ -1258,6 +1275,12 @@ async fn run_linked(
     // A different number leaves the previous store under `retained/`.
     // Publish that history before the live chat list. The same number has
     // no retained store, so this does not add a row.
+    // Fill a slot file a crash skipped. An older-page read does not.
+    let repair_dir = store_path.clone();
+    match tokio::task::spawn_blocking(move || repair_retained_slots(&repair_dir)).await {
+        Ok(Ok(())) => {}
+        _ => tracing::error!("{}", RETAINED_SLOT_NOT_STORED),
+    }
     let _ = publish_retained_accounts(&store_path, &events).await;
     let mut rows = std::collections::HashMap::<String, Conversation>::new();
     let mut unread = std::collections::HashMap::<String, u32>::new();
@@ -4304,6 +4327,73 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         dir.join(RETAINED_DIR)
             .join(aci.to_string())
             .join(RETAINED_SLOT_FILE)
+    }
+
+    /// Publishing a previous account, and loading an older page, does not
+    /// write a slot file. The link path does, including a file a crash skipped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retained_read_does_not_write_a_slot_file() {
+        let dir = temp_session_dir("retained-read-slot");
+        let aci = Uuid::from_u128(0xabc0_0000_0000_0000_0000_0000_0000_0001);
+        let aside = dir.join(RETAINED_DIR).join(aci.to_string());
+        std::fs::create_dir_all(&aside).expect("dir");
+        let url = sqlite_store_path(&aside)
+            .to_str()
+            .expect("path")
+            .to_string();
+        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("store");
+        let contact = named_contact(3, "Ada");
+        save_contact_message(&mut store, &contact, "kept").await;
+        store.close().await;
+        let slot_bytes = b"1\n".to_vec();
+        std::fs::write(aside.join(RETAINED_SLOT_FILE), &slot_bytes).expect("slot");
+
+        let gap = dir.join(RETAINED_DIR).join("gap");
+        std::fs::create_dir_all(&gap).expect("dir");
+        std::fs::write(sqlite_store_path(&gap), []).expect("store with no slot");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(publish_retained_accounts(&dir, &tx).await);
+        drop(tx);
+        let _ = collect_events(&mut rx).await;
+
+        let chat_id = signal_retained_chat_id(1, &contact.uuid.to_string());
+        let before_id = signal_message_id(1_700_000_000_000, &contact.uuid.to_string());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        load_retained_older_page(&dir, &tx, &chat_id, &before_id).await;
+        drop(tx);
+        let _ = collect_events(&mut rx).await;
+
+        assert_eq!(
+            std::fs::read(aside.join(RETAINED_SLOT_FILE)).expect("slot"),
+            slot_bytes,
+            "a read leaves the slot file as it was"
+        );
+        assert!(
+            !gap.join(RETAINED_SLOT_FILE).exists(),
+            "a read does not create a slot file"
+        );
+        assert!(
+            !dir.join(RETAINED_DIR)
+                .join(RETAINED_NEXT_SLOT_FILE)
+                .exists(),
+            "a read does not write the high-water mark"
+        );
+
+        repair_retained_slots(&dir).expect("the link path fills the gap");
+        assert_eq!(
+            std::fs::read_to_string(gap.join(RETAINED_SLOT_FILE)).expect("repaired slot"),
+            "2\n",
+            "the skipped slot is filled from the high-water mark"
+        );
+        assert_eq!(
+            std::fs::read(aside.join(RETAINED_SLOT_FILE)).expect("slot"),
+            slot_bytes,
+            "the repair leaves an existing slot file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A retained chat with more than one page loads the older page.
