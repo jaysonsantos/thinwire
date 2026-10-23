@@ -1574,6 +1574,8 @@ async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool
         status: AdapterStatus::Ready,
         detail: SIGNAL_RETAINED_RESET.to_owned(),
     });
+    // A directory with no store is not an account. Do not create the file.
+    log_missing_retained_stores(session_dir);
     let live = live_registration_aci(session_dir).await;
     let mut published = false;
     let mut kept = false;
@@ -1626,7 +1628,7 @@ fn retained_dir_is_live(dir: &Path, live: Option<Uuid>) -> bool {
         .is_some_and(|name| name == live.to_string())
 }
 
-fn retained_store_dirs(session_dir: &Path) -> Vec<PathBuf> {
+fn retained_dirs(session_dir: &Path) -> Vec<PathBuf> {
     let root = session_dir.join(RETAINED_DIR);
     let Ok(read) = std::fs::read_dir(&root) else {
         return Vec::new();
@@ -1634,12 +1636,30 @@ fn retained_store_dirs(session_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for entry in read.flatten() {
         let path = entry.path();
-        if path.is_dir() && sqlite_store_path(&path).is_file() {
+        if path.is_dir() {
             dirs.push(path);
         }
     }
     dirs.sort();
     dirs
+}
+
+fn retained_store_dirs(session_dir: &Path) -> Vec<PathBuf> {
+    retained_dirs(session_dir)
+        .into_iter()
+        .filter(|path| sqlite_store_path(path).is_file())
+        .collect()
+}
+
+/// A retained directory whose `session.sqlite` is missing.
+/// One log line, with no account id. No row, and no new file.
+fn log_missing_retained_stores(session_dir: &Path) {
+    for dir in retained_dirs(session_dir) {
+        if sqlite_store_path(&dir).is_file() {
+            continue;
+        }
+        tracing::error!("{}", RETAINED_HISTORY_NOT_READ);
+    }
 }
 
 /// `Ok(true)` when this store published at least one chat.
@@ -1843,15 +1863,26 @@ async fn retained_group_titles(store: &SqliteStore) -> HashMap<String, String> {
 
 /// Open a store under `retained/`.
 ///
-/// Presage has no read-only open, and this path does not build a `Manager`.
-/// It does not sync, send, or update keys. `SqliteStore::open` and
-/// `open_with_options` always set WAL mode and run migrations, so this can
-/// create `-wal` and `-shm` files next to the store. A later change encrypts
-/// `retained/` by export and an atomic rename (#347, for #291). This open
-/// must not assume those file bytes stay unchanged. History paging still
-/// reads timestamps through a read-only connection.
+/// A missing file is an error. This does not create an empty store.
+/// Presage exposes `open_with_options`, so the open uses
+/// `create_if_missing(false)`. The file is also checked just before that
+/// call. Presage has no read-only open, and this path does not build a
+/// `Manager`. It does not sync, send, or update keys. The open sets WAL
+/// mode and runs migrations, so `-wal` and `-shm` files can appear next to
+/// an existing store. A later change encrypts `retained/` by export and an
+/// atomic rename (#347, for #291). This open must not assume those file
+/// bytes stay unchanged. History paging still reads timestamps through a
+/// read-only connection.
 async fn open_retained_store(url: &str) -> Result<SqliteStore, ()> {
-    SqliteStore::open(url, OnNewIdentity::Trust)
+    if !Path::new(url).is_file() {
+        return Err(());
+    }
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .map_err(|_| ())?
+        .create_if_missing(false)
+        .foreign_keys(true);
+    SqliteStore::open_with_options(options, OnNewIdentity::Trust)
         .await
         .map_err(|_| ())
 }
@@ -4235,100 +4266,113 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A retained directory with no `session.sqlite` is not an account.
+    /// The publish does not create the file, and it does not emit a row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_missing_retained_store_makes_no_row_and_no_file() {
+        let dir = temp_session_dir("retained-missing");
+        let account = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let aside = dir.join(RETAINED_DIR).join(account);
+        std::fs::create_dir_all(&aside).expect("dir");
+        let store_path = sqlite_store_path(&aside);
+
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(
+            !publish_retained_accounts(&dir, &tx).await,
+            "a missing store publishes no account"
+        );
+        drop(tx);
+        let log = logged(&bytes);
+        drop(guard);
+        let events = collect_events(&mut rx).await;
+
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::ConversationUpsert { .. } | AdapterEvent::MessageReceived { .. }
+            )),
+            "a missing store adds no row: {events:?}"
+        );
+        assert!(
+            !store_path.exists()
+                && !sqlite_sidecar(&store_path, "-wal").exists()
+                && !sqlite_sidecar(&store_path, "-shm").exists(),
+            "a missing store creates no file"
+        );
+        assert!(
+            std::fs::read_dir(&aside).expect("dir").next().is_none(),
+            "the directory stays empty"
+        );
+        let lines: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains(RETAINED_HISTORY_NOT_READ))
+            .collect();
+        assert_eq!(lines.len(), 1, "one log line: {log}");
+        assert!(!log.contains(account), "the log has no account id: {log}");
+        let url = store_path.to_str().expect("path");
+        assert!(
+            open_retained_store(url).await.is_err(),
+            "the open fails when the file is missing"
+        );
+        assert!(!store_path.exists(), "the failed open creates no file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Reading a previous account does not change its rows.
-    /// Presage has no read-only open, so `-wal` and `-shm` may appear.
-    /// The tables this path reads, and the identity and key rows, stay.
+    /// The store starts on the schema of the migrations through
+    /// `base_keys_seen`. The open applies the later presage migrations.
+    /// Row counts and message bodies stay. File bytes are not compared.
+    /// `-wal` and `-shm` may appear.
     #[tokio::test(flavor = "current_thread")]
     async fn a_retained_read_does_not_change_stored_rows() {
         let dir = temp_session_dir("retained-read");
         let aside = dir.join(RETAINED_DIR).join("unstored");
         std::fs::create_dir_all(&aside).expect("dir");
-        let (mut store, _url, pool) = open_session_db(&aside).await;
         let contact = kept_contact();
-        save_contact_message(&mut store, &contact, "kept").await;
-        store
-            .save_group([8u8; 32], kept_group())
-            .await
-            .expect("group");
-        store
-            .save_message(
-                &Thread::Group([8u8; 32]),
-                envelope_at(contact.uuid, "group kept", 1_700_000_000_100),
-            )
-            .await
-            .expect("group history");
-        sqlx::query("INSERT INTO identities (address, identity, record) VALUES ('kept', 'aci', ?)")
-            .bind([1u8].as_slice())
-            .execute(&pool)
-            .await
-            .expect("identity");
-        sqlx::query("INSERT INTO pre_keys (id, identity, record) VALUES (1, 'aci', ?)")
-            .bind([2u8].as_slice())
-            .execute(&pool)
-            .await
-            .expect("pre key");
-        sqlx::query("INSERT INTO signed_pre_keys (id, identity, record) VALUES (1, 'aci', ?)")
-            .bind([3u8].as_slice())
-            .execute(&pool)
-            .await
-            .expect("signed pre key");
-        sqlx::query(
-            "INSERT INTO kyber_pre_keys (id, identity, record, is_last_resort) VALUES (1, 'aci', ?, 0)",
-        )
-        .bind([4u8].as_slice())
-        .execute(&pool)
-        .await
-        .expect("kyber pre key");
-        sqlx::query(
-            "INSERT INTO sender_keys (address, device_id, identity, distribution_id, record) \
-             VALUES ('kept', 1, 'aci', 'dist', ?)",
-        )
-        .bind([5u8].as_slice())
-        .execute(&pool)
-        .await
-        .expect("sender key");
-        sqlx::query(
-            "INSERT INTO sessions (address, device_id, identity, record) VALUES ('kept', 1, 'aci', ?)",
-        )
-        .bind([6u8].as_slice())
-        .execute(&pool)
-        .await
-        .expect("session");
-        sqlx::query("INSERT INTO kv (key, value) VALUES ('identity_keypair_aci', ?)")
-            .bind([7u8].as_slice())
-            .execute(&pool)
-            .await
-            .expect("identity key");
-        pool.close().await;
-        store.close().await;
+        let message = one_stored_message(&contact).await;
+        let path = sqlite_store_path(&aside);
+        write_early_retained_store(&path, &contact, &message).await;
         std::fs::write(aside.join(RETAINED_SLOT_FILE), "1\n").expect("slot");
 
-        let path = sqlite_store_path(&aside);
-        let before = retained_content_snapshot(&path).await;
-        assert!(before.identity_rows > 0, "the store has an identity row");
-        assert!(before.key_rows > 0, "the store has key rows");
+        let before = retained_kept_rows(&path).await;
         assert!(
-            before.count("contacts") >= 1 && before.count("thread_messages") >= 1,
-            "the store has the rows the read path opens"
+            !column_exists(&path, "server_ts").await && column_exists(&path, "device_id").await,
+            "the store still has the earlier schema"
+        );
+        assert!(before.count("contacts") >= 1 && before.count("thread_messages") >= 1);
+        assert!(!before.messages.is_empty(), "the message body is stored");
+        assert!(before.count("identities") >= 1 && before.key_rows >= 1);
+
+        let url = path.to_str().expect("path");
+        let opened = open_retained_store(url).await.expect("open migrates");
+        opened.close().await;
+        let after_open = retained_kept_rows(&path).await;
+        assert_eq!(after_open, before, "the migration keeps the rows");
+        assert!(
+            column_exists(&path, "server_ts").await && !column_exists(&path, "device_id").await,
+            "the open applied the later migrations"
         );
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         assert!(publish_retained_accounts(&dir, &tx).await);
         drop(tx);
         let _published = collect_events(&mut rx).await;
+        let after_publish = retained_kept_rows(&path).await;
+        assert_eq!(after_publish, before, "publish keeps the rows");
 
         let chat_id = signal_retained_chat_id(1, &contact.uuid.to_string());
-        let before_id = signal_message_id(1_700_000_000_000, &contact.uuid.to_string());
+        let before_id = signal_message_id(
+            u64::try_from(message.ts).expect("ts"),
+            &contact.uuid.to_string(),
+        );
         let (tx, mut rx) = mpsc::unbounded_channel();
         load_retained_older_page(&dir, &tx, &chat_id, &before_id).await;
         drop(tx);
         let _paged = collect_events(&mut rx).await;
-
-        let after = retained_content_snapshot(&path).await;
-        assert_eq!(after.counts, before.counts, "row counts stay");
-        assert_eq!(after.digest, before.digest, "stored rows stay");
-        assert_eq!(after.identity_rows, before.identity_rows);
-        assert_eq!(after.key_rows, before.key_rows);
+        let after_page = retained_kept_rows(&path).await;
+        assert_eq!(after_page, before, "the older page keeps the rows");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4477,103 +4521,13 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
     }
 
     #[derive(Debug, PartialEq, Eq)]
-    struct StoreContent {
+    struct KeptRows {
         counts: Vec<(&'static str, i64)>,
-        digest: u64,
-        identity_rows: i64,
+        messages: Vec<Vec<u8>>,
         key_rows: i64,
     }
 
-    /// One count and one ordered content line per table the retained path reads.
-    const RETAINED_SNAPSHOT_SQL: &[(&str, &str)] = &[
-        (
-            "contacts",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT hex(uuid) || '|' || ifnull(phone_number, '') || '|' || name || '|' \
-                    || hex(profile_key) || '|' || expire_timer || '|' || expire_timer_version \
-                    || '|' || inbox_position || '|' || ifnull(hex(avatar), '') AS line \
-                FROM contacts ORDER BY uuid)",
-        ),
-        (
-            "groups",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT hex(master_key) || '|' || title || '|' || revision || '|' \
-                    || ifnull(hex(invite_link_password), '') || '|' || ifnull(hex(access_control), '') \
-                    || '|' || avatar || '|' || ifnull(description, '') || '|' || hex(members) \
-                    || '|' || hex(pending_members) || '|' || hex(requesting_members) || '|' \
-                    || ifnull(disappearing_messages_timer, -1) AS line \
-                FROM groups ORDER BY master_key)",
-        ),
-        (
-            "threads",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT id || '|' || ifnull(hex(group_master_key), '') || '|' \
-                    || ifnull(recipient_id, '') AS line \
-                FROM threads ORDER BY id)",
-        ),
-        (
-            "thread_messages",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT ts || '|' || thread_id || '|' || sender_service_id || '|' \
-                    || sender_device_id || '|' || destination_service_id || '|' \
-                    || needs_receipt || '|' || unidentified_sender || '|' || hex(content_body) \
-                    || '|' || was_plaintext || '|' || ifnull(server_ts, -1) || '|' \
-                    || ifnull(pni_verified, '') AS line \
-                FROM thread_messages ORDER BY ts, thread_id)",
-        ),
-        (
-            "identities",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT address || '|' || identity || '|' || hex(record) AS line \
-                FROM identities ORDER BY address, identity)",
-        ),
-        (
-            "pre_keys",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT id || '|' || identity || '|' || hex(record) AS line \
-                FROM pre_keys ORDER BY id, identity)",
-        ),
-        (
-            "signed_pre_keys",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT id || '|' || identity || '|' || hex(record) AS line \
-                FROM signed_pre_keys ORDER BY id, identity)",
-        ),
-        (
-            "kyber_pre_keys",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT id || '|' || identity || '|' || hex(record) || '|' || is_last_resort AS line \
-                FROM kyber_pre_keys ORDER BY id, identity)",
-        ),
-        (
-            "sender_keys",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT address || '|' || device_id || '|' || identity || '|' \
-                    || distribution_id || '|' || hex(record) AS line \
-                FROM sender_keys ORDER BY address, device_id, identity, distribution_id)",
-        ),
-        (
-            "sessions",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT address || '|' || device_id || '|' || identity || '|' || hex(record) AS line \
-                FROM sessions ORDER BY address, device_id, identity)",
-        ),
-        (
-            "kv",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT key || '|' || hex(value) AS line FROM kv ORDER BY key)",
-        ),
-        (
-            "base_keys_seen",
-            "SELECT COUNT(*), ifnull(group_concat(line, char(10)), '') FROM ( \
-                SELECT kyber_pre_key_id || '|' || signed_pre_key_id || '|' || identity \
-                    || '|' || hex(base_key) AS line \
-                FROM base_keys_seen \
-                ORDER BY identity, kyber_pre_key_id, signed_pre_key_id, base_key)",
-        ),
-    ];
-
-    impl StoreContent {
+    impl KeptRows {
         fn count(&self, table: &str) -> i64 {
             self.counts
                 .iter()
@@ -4583,40 +4537,333 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         }
     }
 
-    /// Counts and a content digest of the tables a retained read opens,
-    /// plus the identity and key tables. `_sqlx_migrations` is omitted.
-    /// `-wal` and `-shm` are not part of this snapshot.
-    async fn retained_content_snapshot(path: &std::path::Path) -> StoreContent {
+    struct StoredMessage {
+        content: Vec<u8>,
+        sender: String,
+        destination: String,
+        recipient: Vec<u8>,
+        ts: i64,
+    }
+
+    /// The migrations this open still applies sit after `base_keys_seen`.
+    /// These checksums are SHA-384 of those earlier migration files, which
+    /// is what sqlx records. The open then runs the rest.
+    const EARLY_MIGRATIONS: &[(i64, &str)] = &[
+        (
+            20_250_112_201_436,
+            "9fb066d52b0955ceda6045b86590b3f66f2f7340d9704ae1800c282639dd784e552e7ba205229edee641ac50900e8064",
+        ),
+        (
+            20_250_731_181_329,
+            "c7bad93659890c9ba89bf9cdedbda5bde6a38c6d14a707f7e0155e5bcbd98446f1818e594da1e71eee5b6f49bc25bd94",
+        ),
+        (
+            20_251_019_115_300,
+            "d847ccfa4cbf5455a10cd3929421a6c015e92df8b518ea150bffb7f6457c412d6142ab1384c6b7bc200ed9331ffe7638",
+        ),
+    ];
+
+    const EARLY_SCHEMA: &[&str] = &[
+        "CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL)",
+        "CREATE TABLE sessions (
+            address TEXT NOT NULL,
+            device_id INTEGER NOT NULL,
+            identity TEXT NOT NULL CHECK (identity IN ('aci', 'pni')),
+            record BLOB NOT NULL,
+            PRIMARY KEY (address, device_id, identity)
+        )",
+        "CREATE TABLE identities (
+            address TEXT NOT NULL,
+            device_id INTEGER NOT NULL,
+            identity TEXT NOT NULL CHECK (identity IN ('aci', 'pni')),
+            record BLOB NOT NULL,
+            PRIMARY KEY (address, device_id, identity)
+        )",
+        "CREATE TABLE pre_keys (
+            id INTEGER NOT NULL,
+            identity TEXT NOT NULL CHECK (identity IN ('aci', 'pni')),
+            record BLOB NOT NULL,
+            PRIMARY KEY (id, identity)
+        )",
+        "CREATE TABLE signed_pre_keys (
+            id INTEGER NOT NULL,
+            identity TEXT NOT NULL CHECK (identity IN ('aci', 'pni')),
+            record BLOB NOT NULL,
+            PRIMARY KEY (id, identity)
+        )",
+        "CREATE TABLE kyber_pre_keys (
+            id INTEGER NOT NULL,
+            identity TEXT NOT NULL CHECK (identity IN ('aci', 'pni')),
+            record BLOB NOT NULL,
+            is_last_resort INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (id, identity)
+        )",
+        "CREATE TABLE sender_keys (
+            address TEXT NOT NULL,
+            device_id INTEGER NOT NULL,
+            identity TEXT NOT NULL CHECK (identity IN ('aci', 'pni')),
+            distribution_id TEXT NOT NULL,
+            record BLOB NOT NULL,
+            PRIMARY KEY (address, device_id, identity, distribution_id)
+        )",
+        "CREATE TABLE contacts (
+            uuid BLOB NOT NULL PRIMARY KEY,
+            phone_number TEXT,
+            name TEXT NOT NULL,
+            profile_key BLOB NOT NULL,
+            expire_timer INTEGER NOT NULL,
+            expire_timer_version INTEGER NOT NULL DEFAULT 2,
+            inbox_position INTEGER NOT NULL,
+            avatar BLOB
+        )",
+        "CREATE TABLE contacts_verification_state (
+            destination_aci BLOB NOT NULL PRIMARY KEY,
+            identity_key BLOB NOT NULL,
+            is_verified BOOLEAN,
+            FOREIGN KEY (destination_aci) REFERENCES contacts (uuid) ON UPDATE CASCADE
+        )",
+        "CREATE TABLE groups (
+            master_key BLOB NOT NULL PRIMARY KEY,
+            title TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            invite_link_password BLOB,
+            access_control BLOB,
+            avatar TEXT NOT NULL,
+            description TEXT,
+            members BLOB NOT NULL,
+            pending_members BLOB NOT NULL,
+            requesting_members BLOB NOT NULL
+        )",
+        "CREATE TABLE threads (
+            id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+            group_master_key BLOB UNIQUE,
+            recipient_id TEXT UNIQUE
+        )",
+        "CREATE TABLE thread_messages (
+            ts INTEGER NOT NULL,
+            thread_id INTEGER NOT NULL,
+            sender_service_id TEXT NOT NULL,
+            sender_device_id INTEGER NOT NULL,
+            destination_service_id TEXT NOT NULL,
+            needs_receipt BOOLEAN NOT NULL,
+            unidentified_sender BOOLEAN NOT NULL,
+            content_body BLOB NOT NULL,
+            was_plaintext BOOLEAN NOT NULL,
+            PRIMARY KEY (ts, thread_id)
+        )",
+        "CREATE TABLE base_keys_seen (
+            kyber_pre_key_id INTEGER NOT NULL,
+            signed_pre_key_id INTEGER NOT NULL,
+            identity TEXT NOT NULL CHECK (identity IN ('aci', 'pni')),
+            base_key BLOB NOT NULL,
+            PRIMARY KEY (identity, kyber_pre_key_id, signed_pre_key_id, base_key)
+        )",
+        "CREATE TABLE _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            success BOOLEAN NOT NULL,
+            checksum BLOB NOT NULL,
+            execution_time BIGINT NOT NULL
+        )",
+    ];
+
+    const KEPT_COUNTS: &[(&str, &str)] = &[
+        ("contacts", "SELECT COUNT(*) FROM contacts"),
+        ("groups", "SELECT COUNT(*) FROM groups"),
+        ("thread_messages", "SELECT COUNT(*) FROM thread_messages"),
+        ("identities", "SELECT COUNT(*) FROM identities"),
+        ("pre_keys", "SELECT COUNT(*) FROM pre_keys"),
+        ("signed_pre_keys", "SELECT COUNT(*) FROM signed_pre_keys"),
+        ("kyber_pre_keys", "SELECT COUNT(*) FROM kyber_pre_keys"),
+        ("sender_keys", "SELECT COUNT(*) FROM sender_keys"),
+        ("sessions", "SELECT COUNT(*) FROM sessions"),
+        ("kv", "SELECT COUNT(*) FROM kv"),
+    ];
+
+    async fn one_stored_message(contact: &Contact) -> StoredMessage {
         use sqlx::Row;
 
+        let dir = temp_session_dir("message-bytes");
+        let (mut store, _, pool) = open_session_db(&dir).await;
+        save_contact_message(&mut store, contact, "kept").await;
+        let row = sqlx::query(
+            "SELECT m.content_body, m.sender_service_id, m.destination_service_id, m.ts, \
+             t.recipient_id \
+             FROM thread_messages m JOIN threads t ON t.id = m.thread_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("stored message");
+        let stored = StoredMessage {
+            content: row.try_get(0).expect("body"),
+            sender: row.try_get(1).expect("sender"),
+            destination: row.try_get(2).expect("destination"),
+            ts: row.try_get(3).expect("ts"),
+            recipient: row.try_get(4).expect("recipient"),
+        };
+        pool.close().await;
+        store.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        stored
+    }
+
+    async fn write_early_retained_store(
+        path: &std::path::Path,
+        contact: &Contact,
+        message: &StoredMessage,
+    ) {
         let url = path.to_str().expect("path");
         let options = url
             .parse::<sqlx::sqlite::SqliteConnectOptions>()
             .expect("url")
-            .read_only(true)
-            .busy_timeout(std::time::Duration::from_secs(2));
+            .create_if_missing(true);
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
             .await
             .expect("pool");
-        let mut counts = Vec::new();
-        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
-        for (table, sql) in RETAINED_SNAPSHOT_SQL {
-            let row = sqlx::query(*sql)
-                .fetch_one(&pool)
+        for sql in EARLY_SCHEMA {
+            sqlx::query(*sql)
+                .execute(&pool)
                 .await
-                .unwrap_or_else(|_| panic!("snapshot {table}"));
-            let count: i64 = row.try_get(0).unwrap_or_else(|_| panic!("count {table}"));
-            let body: String = row.try_get(1).unwrap_or_else(|_| panic!("rows {table}"));
-            counts.push((*table, count));
-            mix_digest(&mut digest, table.as_bytes());
-            mix_digest(&mut digest, body.as_bytes());
+                .expect("early schema");
         }
-        let identity_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identities")
+        for (version, checksum) in EARLY_MIGRATIONS {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, success, checksum, execution_time) \
+                 VALUES (?, 'early', 1, ?, 0)",
+            )
+            .bind(version)
+            .bind(hex_bytes(checksum))
+            .execute(&pool)
+            .await
+            .expect("migration row");
+        }
+        sqlx::query(
+            "INSERT INTO contacts (uuid, name, profile_key, expire_timer, inbox_position) \
+             VALUES (?, 'Ada', ?, 0, 0)",
+        )
+        .bind(contact.uuid.as_bytes().as_slice())
+        .bind([9u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .expect("contact");
+        sqlx::query(
+            "INSERT INTO groups (master_key, title, avatar, members, pending_members, requesting_members) \
+             VALUES (?, 'Kept', '', '[]', '[]', '[]')",
+        )
+        .bind([8u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .expect("group");
+        sqlx::query("INSERT INTO threads (recipient_id) VALUES (?)")
+            .bind(message.recipient.as_slice())
+            .execute(&pool)
+            .await
+            .expect("thread");
+        sqlx::query(
+            "INSERT INTO thread_messages (
+                ts, thread_id, sender_service_id, sender_device_id, destination_service_id,
+                needs_receipt, unidentified_sender, content_body, was_plaintext
+            ) VALUES (?, 1, ?, 1, ?, 0, 0, ?, 0)",
+        )
+        .bind(message.ts)
+        .bind(&message.sender)
+        .bind(&message.destination)
+        .bind(message.content.as_slice())
+        .execute(&pool)
+        .await
+        .expect("message");
+        sqlx::query(
+            "INSERT INTO identities (address, device_id, identity, record) VALUES ('kept', 1, 'aci', ?)",
+        )
+        .bind([1u8].as_slice())
+        .execute(&pool)
+        .await
+        .expect("identity");
+        sqlx::query("INSERT INTO pre_keys (id, identity, record) VALUES (1, 'aci', ?)")
+            .bind([2u8].as_slice())
+            .execute(&pool)
+            .await
+            .expect("pre key");
+        sqlx::query("INSERT INTO signed_pre_keys (id, identity, record) VALUES (1, 'aci', ?)")
+            .bind([3u8].as_slice())
+            .execute(&pool)
+            .await
+            .expect("signed pre key");
+        sqlx::query(
+            "INSERT INTO kyber_pre_keys (id, identity, record, is_last_resort) VALUES (1, 'aci', ?, 0)",
+        )
+        .bind([4u8].as_slice())
+        .execute(&pool)
+        .await
+        .expect("kyber pre key");
+        sqlx::query(
+            "INSERT INTO sender_keys (address, device_id, identity, distribution_id, record) \
+             VALUES ('kept', 1, 'aci', 'dist', ?)",
+        )
+        .bind([5u8].as_slice())
+        .execute(&pool)
+        .await
+        .expect("sender key");
+        sqlx::query(
+            "INSERT INTO sessions (address, device_id, identity, record) VALUES ('kept', 1, 'aci', ?)",
+        )
+        .bind([6u8].as_slice())
+        .execute(&pool)
+        .await
+        .expect("session");
+        sqlx::query("INSERT INTO kv (key, value) VALUES ('identity_keypair_aci', ?)")
+            .bind([7u8].as_slice())
+            .execute(&pool)
+            .await
+            .expect("identity key");
+        pool.close().await;
+    }
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    async fn column_exists(path: &std::path::Path, column: &str) -> bool {
+        let sql = match column {
+            "server_ts" => {
+                "SELECT COUNT(*) FROM pragma_table_info('thread_messages') WHERE name = 'server_ts'"
+            }
+            "device_id" => {
+                "SELECT COUNT(*) FROM pragma_table_info('identities') WHERE name = 'device_id'"
+            }
+            _ => panic!("unknown column"),
+        };
+        let pool = open_readonly_pool(path).await;
+        let count: i64 = sqlx::query_scalar(sql)
             .fetch_one(&pool)
             .await
-            .expect("identities");
+            .expect("column");
+        pool.close().await;
+        count > 0
+    }
+
+    async fn retained_kept_rows(path: &std::path::Path) -> KeptRows {
+        let pool = open_readonly_pool(path).await;
+        let mut counts = Vec::new();
+        for (table, sql) in KEPT_COUNTS {
+            let count: i64 = sqlx::query_scalar(*sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|_| panic!("count {table}"));
+            counts.push((*table, count));
+        }
+        let messages: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT content_body FROM thread_messages ORDER BY ts, thread_id")
+                .fetch_all(&pool)
+                .await
+                .expect("messages");
         let key_rows: i64 = sqlx::query_scalar(
             "SELECT \
                 (SELECT COUNT(*) FROM pre_keys) \
@@ -4630,20 +4877,25 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         .await
         .expect("keys");
         pool.close().await;
-        StoreContent {
+        KeptRows {
             counts,
-            digest,
-            identity_rows,
+            messages,
             key_rows,
         }
     }
 
-    fn mix_digest(digest: &mut u64, bytes: &[u8]) {
-        for byte in bytes {
-            *digest = digest
-                .wrapping_mul(0x0000_0100_0000_01b3)
-                .wrapping_add(u64::from(*byte));
-        }
+    async fn open_readonly_pool(path: &std::path::Path) -> sqlx::SqlitePool {
+        let url = path.to_str().expect("path");
+        let options = url
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("url")
+            .read_only(true)
+            .busy_timeout(std::time::Duration::from_secs(2));
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool")
     }
 
     async fn account_rows(path: &std::path::Path) -> AccountRows {
