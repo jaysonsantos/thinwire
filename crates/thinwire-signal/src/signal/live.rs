@@ -565,6 +565,9 @@ async fn park_previous_store(session_dir: &Path, aci: Option<Uuid>) -> Result<()
 
 /// When `session.sqlite` is missing and a pending link file is present, the
 /// pending file becomes `session.sqlite`.
+///
+/// Startup uses [`recover_pending_link`]. That path restores a retained
+/// store for the pending account before this rename.
 async fn adopt_pending_store(session_dir: &Path) -> Result<(), ()> {
     let pending = pending_store_path(session_dir);
     if pending.exists()
@@ -839,6 +842,63 @@ async fn set_aside_store_without_aci(session_dir: &Path) -> Result<bool, ()> {
     Ok(true)
 }
 
+/// Place a pending link a crash left behind, before the session file is opened.
+///
+/// The open account can already be parked, with the finished link still in
+/// the pending file. The pending ACI goes through [`place_linked_store`], the
+/// same placement a live relink uses. A retained store for that account moves
+/// back, and the pending link merges into it. A later crash, once that store
+/// is the session file again, merges the pending link when the account is the
+/// same. A pending link for a different open account stays on disk. A second
+/// call leaves the files where the first call put them.
+async fn recover_pending_link(session_dir: &Path) -> Result<(), ()> {
+    if !pending_store_path(session_dir).exists() {
+        return Ok(());
+    }
+    if !sqlite_store_path(session_dir).exists() {
+        return separate_previous_account(session_dir).await;
+    }
+    let pending_url = pending_sqlite_url(session_dir)?;
+    let Ok(Some(linked)) = read_registration_aci(&pending_url).await else {
+        return Ok(());
+    };
+    let session_url = session_sqlite_url(session_dir)?;
+    let Ok(live) = read_registration_aci(&session_url).await else {
+        return Ok(());
+    };
+    let Ok(prior) = read_prior_aci(&session_url).await else {
+        return Ok(());
+    };
+    // The session file is this account, or it is the retained store moved
+    // back before the merge. Fold the pending link in. A registered store
+    // for a different account keeps its pending file.
+    let same_account = live == Some(linked) || (live.is_none() && prior == Some(linked));
+    if same_account {
+        return merge_linked_account(session_dir, &session_url, &pending_url, linked).await;
+    }
+    Ok(())
+}
+
+/// Copy the pending link into the live store, then remove the pending file.
+///
+/// A retained copy of this account is folded in after that copy lands, and
+/// the directory is removed. Rows already in the live store stay. The pending
+/// file stays when the copy fails.
+async fn merge_linked_account(
+    session_dir: &Path,
+    session_url: &str,
+    pending_url: &str,
+    linked: Uuid,
+) -> Result<(), ()> {
+    merge_pending_into_session(session_url, pending_url).await?;
+    if remove_sqlite_files(&pending_store_path(session_dir)).is_err() {
+        tracing::error!("{}", PENDING_LINK_NOT_PLACED);
+    }
+    absorb_retained_copy(session_dir, linked).await?;
+    let _ = delete_prior_aci(session_url).await;
+    Ok(())
+}
+
 /// Place a finished pending link into `session.sqlite`.
 ///
 /// The pending file is the new account. `session.sqlite` is the previous
@@ -885,16 +945,7 @@ async fn separate_previous_account(session_dir: &Path) -> Result<(), ()> {
     let prior = read_prior_aci(&session_url).await?;
     match prior {
         Some(previous) if previous == linked => {
-            merge_pending_into_session(&session_url, &pending_url).await?;
-            if remove_sqlite_files(&pending_store_path(session_dir)).is_err() {
-                tracing::error!("{}", PENDING_LINK_NOT_PLACED);
-            }
-            // A copy of this number can still sit under `retained/` from an
-            // earlier link. Fold it in, then remove it, so the live row is
-            // the only row.
-            absorb_retained_copy(session_dir, linked).await?;
-            let _ = delete_prior_aci(&session_url).await;
-            Ok(())
+            merge_linked_account(session_dir, &session_url, &pending_url, linked).await
         }
         Some(previous) => {
             park_previous_store(session_dir, Some(previous)).await?;
@@ -922,11 +973,7 @@ async fn place_linked_store(session_dir: &Path, linked: Uuid) -> Result<(), ()> 
     if restore_retained_account(session_dir, linked).await? {
         let session_url = session_sqlite_url(session_dir)?;
         let pending_url = pending_sqlite_url(session_dir)?;
-        merge_pending_into_session(&session_url, &pending_url).await?;
-        if remove_sqlite_files(&pending_store_path(session_dir)).is_err() {
-            tracing::error!("{}", PENDING_LINK_NOT_PLACED);
-        }
-        let _ = delete_prior_aci(&session_url).await;
+        merge_linked_account(session_dir, &session_url, &pending_url, linked).await?;
         if !sqlite_store_path(session_dir).exists() {
             tracing::error!("{}", PREVIOUS_STORE_NOT_SET_ASIDE);
             return Err(());
@@ -1317,9 +1364,10 @@ async fn run_linked(
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
     };
-    // A previous attempt may have moved the old store aside and left the new
-    // link under the pending name. Place that file before open creates one.
-    if adopt_pending_store(&store_path).await.is_err() {
+    // A crash can park the open account and leave the finished link in the
+    // pending file. Restore a retained store for that account before open
+    // creates a session file.
+    if recover_pending_link(&store_path).await.is_err() {
         fail(&events, STORE_FAILED);
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
@@ -4356,6 +4404,249 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "the log and the events have no account id"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A is linked, then retained while B links. B is parked and A's finished
+    /// link is still the pending file: the crash window before restoration.
+    /// Startup recovery puts A's retained history on the live row. B's store
+    /// stays byte for byte. A second recovery leaves both stores in place.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_relink_crash_restores_the_retained_history() {
+        let crash = crash_while_returning_to_a("pending-relink-crash").await;
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        recover_pending_link(&crash.dir)
+            .await
+            .expect("startup recovery restores A");
+        recover_pending_link(&crash.dir)
+            .await
+            .expect("a second startup leaves the restored stores");
+        let log = logged(&bytes);
+        drop(guard);
+        assert!(
+            !log.contains(&crash.aci_a.to_string()) && !log.contains(&crash.aci_b.to_string()),
+            "the log has no account id: {log}"
+        );
+        assert_a_is_live_and_b_is_kept(&crash).await;
+        let _ = std::fs::remove_dir_all(&crash.dir);
+    }
+
+    /// The retained store has moved back and the pending link is still there.
+    /// That is a crash during restoration. Recovery merges the pending link
+    /// and leaves B's store in place. A second call does this again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_relink_crash_resumes_after_the_store_moves_back() {
+        let crash = crash_while_returning_to_a("pending-relink-resume").await;
+        assert!(
+            restore_retained_account(&crash.dir, crash.aci_a)
+                .await
+                .expect("A moves back"),
+            "A's retained store is the session file"
+        );
+        assert!(
+            pending_store_path(&crash.dir).exists(),
+            "the pending link is still on disk"
+        );
+        assert!(
+            sqlite_store_path(&crash.dir).is_file(),
+            "A's history is already the session file"
+        );
+        recover_pending_link(&crash.dir)
+            .await
+            .expect("startup recovery finishes the merge");
+        recover_pending_link(&crash.dir)
+            .await
+            .expect("a second startup leaves the merged stores");
+        assert_a_is_live_and_b_is_kept(&crash).await;
+        let _ = std::fs::remove_dir_all(&crash.dir);
+    }
+
+    struct ReturningCrash {
+        dir: std::path::PathBuf,
+        url: String,
+        aci_a: Uuid,
+        aci_b: Uuid,
+        b_tree: Vec<(String, Vec<u8>)>,
+    }
+
+    /// A linked, A retained when B links, B parked, A's link left in the pending file.
+    async fn crash_while_returning_to_a(label: &str) -> ReturningCrash {
+        let dir = temp_session_dir(label);
+        let aci_a = Uuid::from_u128(0xaaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aa01);
+        let aci_b = Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bb02);
+        let ada = kept_contact();
+        let bea = named_contact(8, "Bea");
+
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        insert_registration(&pool, &registration_for(aci_a)).await;
+        save_contact_message(&mut store, &ada, "kept on A").await;
+        assert!(forget_rejected_registration(&mut store, &url).await);
+        pool.close().await;
+        store.close().await;
+
+        let (mut pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, &registration_for(aci_b)).await;
+        save_contact_message(&mut pending, &bea, "on B").await;
+        pending_pool.close().await;
+        pending.close().await;
+        separate_previous_account(&dir)
+            .await
+            .expect("B replaces A and A is retained");
+
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        assert!(forget_rejected_registration(&mut store, &url).await);
+        pool.close().await;
+        store.close().await;
+
+        let (pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, &registration_for(aci_a)).await;
+        pending_pool.close().await;
+        pending.close().await;
+        park_previous_store(&dir, Some(aci_b))
+            .await
+            .expect("B is parked");
+
+        assert!(
+            !sqlite_store_path(&dir).exists(),
+            "the crash is before restoration"
+        );
+        assert!(
+            pending_store_path(&dir).exists(),
+            "A's finished link is the pending file"
+        );
+        assert!(
+            sqlite_store_path(&dir.join(RETAINED_DIR).join(aci_a.to_string())).is_file(),
+            "A's history is still in the retained store"
+        );
+        let b_dir = dir.join(RETAINED_DIR).join(aci_b.to_string());
+        let b_tree = directory_bytes(&b_dir);
+        assert!(
+            b_tree.iter().any(|(name, _)| name == "session.sqlite"),
+            "B's history is in the retained store"
+        );
+        let url = sqlite_store_path(&dir).to_str().expect("path").to_string();
+        ReturningCrash {
+            dir,
+            url,
+            aci_a,
+            aci_b,
+            b_tree,
+        }
+    }
+
+    async fn assert_a_is_live_and_b_is_kept(crash: &ReturningCrash) {
+        let b_dir = crash.dir.join(RETAINED_DIR).join(crash.aci_b.to_string());
+        assert_eq!(
+            directory_bytes(&b_dir),
+            crash.b_tree,
+            "B's retained store stays byte for byte"
+        );
+        assert!(
+            !pending_store_path(&crash.dir).exists(),
+            "the pending link is placed"
+        );
+        assert!(
+            !sqlite_store_path(&crash.dir.join(RETAINED_DIR).join(crash.aci_a.to_string()))
+                .exists(),
+            "A is not left under retained/"
+        );
+
+        let store = SqliteStore::open(&crash.url, OnNewIdentity::Trust)
+            .await
+            .expect("live store");
+        assert_eq!(
+            store
+                .load_registration_data()
+                .await
+                .expect("registration")
+                .expect("A is registered")
+                .service_ids
+                .aci,
+            crash.aci_a
+        );
+        let ada = kept_contact();
+        let thread = Thread::Contact(ServiceId::Aci(ada.uuid.into()));
+        let kept = store
+            .message(&thread, 1_700_000_000_000)
+            .await
+            .expect("history read")
+            .expect("A's retained history is in the live store");
+        match kept.body {
+            ContentBody::DataMessage(message) => {
+                assert_eq!(message.body.as_deref(), Some("kept on A"));
+            }
+            _ => panic!("stored history is a data message"),
+        }
+        assert_eq!(contact_names_of(&store).await, vec!["Ada".to_string()]);
+        store.close().await;
+
+        let live_rows = account_rows(&sqlite_store_path(&crash.dir)).await;
+        let b_rows = account_rows(&sqlite_store_path(&b_dir)).await;
+        assert_eq!(live_rows.messages, 1, "A's message stays one row");
+        assert_eq!(live_rows.contacts, 1, "A's contact stays");
+        assert_eq!(b_rows.messages, 1, "B's message stays");
+        assert_eq!(b_rows.contacts, 1, "B's contact stays");
+
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(
+            publish_retained_accounts(&crash.dir, &tx).await,
+            "B is still a previous account"
+        );
+        drop(tx);
+        let log = logged(&bytes);
+        drop(guard);
+        let events = collect_events(&mut rx).await;
+        let bea = named_contact(8, "Bea");
+        let bea_id = signal_retained_chat_id(2, &bea.uuid.to_string());
+        let ada_retained = signal_retained_chat_id(1, &ada.uuid.to_string());
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::MessageReceived { message }
+                    if message.conversation_id == bea_id && message.body.as_str() == "on B"
+            )),
+            "B's history is still reachable"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation } if conversation.id == ada_retained
+                    || conversation.title == "Ada"
+            )),
+            "A's history is the live row, so publish does not skip a stranded copy"
+        );
+        let debug = format!("{events:?}{log}");
+        assert!(
+            !debug.contains(&crash.aci_a.to_string()) && !debug.contains(&crash.aci_b.to_string()),
+            "the log and the events have no account id"
+        );
+    }
+
+    fn directory_bytes(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(current) = pending.pop() {
+            let Ok(read) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(dir)
+                    .expect("prefix")
+                    .to_string_lossy()
+                    .into_owned();
+                files.push((name, std::fs::read(&path).expect("bytes")));
+            }
+        }
+        files.sort();
+        files
     }
 
     /// Link A, then B, then C. Return to C, then link D.
