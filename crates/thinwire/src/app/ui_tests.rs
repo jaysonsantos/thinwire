@@ -397,6 +397,7 @@ fn signal_ui_is_feature_gated_and_uses_the_helper() {
     assert!(readme.contains("Signal: no supported third-party API, expect breakage."));
     // A previous Signal number shows why sending is off, and the same risk line.
     assert!(ui.contains("SIGNAL_PREVIOUS_ACCOUNT"));
+    assert!(ui.contains("signal_retained_chip_label"));
     assert!(ui.contains("Signal: no supported third-party API, expect breakage."));
     assert!(ui.contains("signal_read_only_reason()"));
     // Hidden retained rows stay explained until the next link publishes them.
