@@ -649,7 +649,7 @@ fn store_next_slot_mark(session_dir: &Path, next: u32) -> Result<(), ()> {
     }
     let root = session_dir.join(RETAINED_DIR);
     prepare_session_dir(&root).map_err(|_| ())?;
-    std::fs::write(next_slot_mark_path(session_dir), format!("{next}\n")).map_err(|_| ())
+    replace_file(&next_slot_mark_path(session_dir), &format!("{next}\n"))
 }
 
 fn read_slot_file(dir: &Path) -> Option<u32> {
@@ -669,7 +669,35 @@ fn parse_slot_count(text: &str) -> Option<u32> {
 }
 
 fn write_slot_file(dir: &Path, slot: u32) -> Result<(), ()> {
-    std::fs::write(dir.join(RETAINED_SLOT_FILE), format!("{slot}\n")).map_err(|_| ())
+    replace_file(&dir.join(RETAINED_SLOT_FILE), &format!("{slot}\n"))
+}
+
+/// Write `text` over `path` by a rename in the same directory.
+/// A crash keeps the previous file, so the path is never an empty file.
+fn replace_file(path: &Path, text: &str) -> Result<(), ()> {
+    use std::io::Write;
+
+    let parent = path.parent().ok_or(())?;
+    let name = path.file_name().ok_or(())?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&temp);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    })();
+    let result = written.and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(|_| ())
 }
 
 /// Slot and directory for every retained store that already has a slot file.
@@ -835,6 +863,8 @@ async fn separate_previous_account(session_dir: &Path) -> Result<(), ()> {
     let repaired = tokio::task::spawn_blocking(move || repair_retained_slots(&dir))
         .await
         .map_err(|_| ())?;
+    // A failed `repair_retained_slots` is only logged on purpose. A store
+    // with no slot stays hidden until the next successful link.
     if repaired.is_err() {
         tracing::error!("{}", RETAINED_SLOT_NOT_STORED);
     }
@@ -4414,6 +4444,29 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .join(RETAINED_SLOT_FILE)
     }
 
+    fn no_temp_files(dir: &std::path::Path) -> bool {
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(current) = pending.pop() {
+            let Ok(read) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".tmp"))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Publishing a previous account, and loading an older page, does not
     /// write a slot file. The link path does, including a file a crash skipped.
     #[tokio::test(flavor = "current_thread")]
@@ -4477,6 +4530,10 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             std::fs::read(aside.join(RETAINED_SLOT_FILE)).expect("slot"),
             slot_bytes,
             "the repair leaves an existing slot file"
+        );
+        assert!(
+            no_temp_files(&dir),
+            "a slot write renames the temp file into place"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
