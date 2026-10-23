@@ -7,7 +7,7 @@ use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
     AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, topic_mute_id,
+    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, SIGNAL_PREVIOUS_ACCOUNT, topic_mute_id,
 };
 
 use super::auth;
@@ -564,24 +564,24 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
         .show(ui, |ui| {
             section_header(ui, "Accounts");
 
-            let unread_by_protocol: Vec<u32> = snapshot
-                .accounts
-                .iter()
-                .map(|account| snapshot.account_unread(account.caps.id))
-                .collect();
             let mut clicked: Option<ProtocolId> = None;
-            for (account, unread) in snapshot.accounts.iter().zip(unread_by_protocol) {
+            for account in snapshot.accounts.iter() {
                 if !snapshot.shows_in_switcher(account.caps.id) {
                     continue;
                 }
+                let unread = snapshot.account_row_unread(account);
                 if account_chip(
                     ui,
                     snapshot,
                     account,
-                    snapshot.selected_protocol == account.caps.id,
+                    snapshot.account_row_selected(account),
                     unread,
                 ) {
-                    clicked = Some(account.caps.id);
+                    if let Some(slot) = account.signal_retained {
+                        out.push(Intent::SelectRetainedSignal(slot));
+                    } else {
+                        clicked = Some(account.caps.id);
+                    }
                 }
                 helper_actions(ui, account, out);
                 removed_signal_link(ui, snapshot, account, out);
@@ -620,7 +620,9 @@ fn account_chip(
     let label = chip_label(snapshot, account);
     // Two lines used 36 px. The removed-device line wraps, so that row is taller.
     // [`theme::ROW_INSET`] adds 8 px above and below.
-    let lines = if label == SIGNAL_DEVICE_REMOVED {
+    let lines = if label == SIGNAL_PREVIOUS_ACCOUNT {
+        68.0
+    } else if label == SIGNAL_DEVICE_REMOVED {
         52.0
     } else {
         36.0
@@ -629,14 +631,16 @@ fn account_chip(
         egui::vec2(width, lines + space::S * 2.0),
         egui::Sense::hover(),
     );
-    let chip_id = ui.scope_id().with(("account-chip", caps.id));
+    let chip_id = ui
+        .scope_id()
+        .with(("account-chip", caps.id, account.signal_retained));
     row_backdrop(ui, chip_id, rect, selected, hover.hovered());
     let inner = theme::row_content_rect(rect, 0.0);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(inner)
             .layout(egui::Layout::left_to_right(egui::Align::Center))
-            .id_salt(("account-chip", caps.id)),
+            .id_salt(("account-chip", caps.id, account.signal_retained)),
     );
     let (dot, dot_response) =
         child.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
@@ -696,7 +700,10 @@ fn removed_signal_link(
     account: &AccountRow,
     out: &mut Vec<Intent>,
 ) {
-    if account.caps.id != ProtocolId::Signal || !snapshot.signal_device_removed() {
+    if account.signal_retained.is_some()
+        || account.caps.id != ProtocolId::Signal
+        || !snapshot.signal_device_removed()
+    {
         return;
     }
     ui.horizontal(|ui| {
@@ -1445,6 +1452,9 @@ fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
 fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
     // The check is the first unauthorized open. Removal, and its Link
     // button, wait for the second one.
+    if account.signal_retained.is_some() {
+        return SIGNAL_PREVIOUS_ACCOUNT;
+    }
     if account.caps.id == ProtocolId::Signal && snapshot.signal_link_checking() {
         return SIGNAL_LINK_CHECK;
     }
@@ -1641,7 +1651,15 @@ fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<
 
 fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     thread_header(ui, snapshot, out);
-    if snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal {
+    if let Some(reason) = snapshot.signal_read_only_reason() {
+        let palette = theme::palette(ui);
+        ui.label(RichText::new(reason).color(palette.warn));
+        // The README risk line. The previous number stays read-only.
+        ui.label(
+            RichText::new("Signal: no supported third-party API, expect breakage.")
+                .color(palette.text2),
+        );
+    } else if snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal {
         let palette = theme::palette(ui);
         ui.label(RichText::new(SIGNAL_DEVICE_REMOVED).color(palette.warn));
         ui.label(RichText::new(thinwire_core::state::SIGNAL_SENDING_OFF).color(palette.text2));
@@ -2625,8 +2643,8 @@ fn compose(
     let closed = snapshot.topic_closed();
     // A closed topic already disables this field. Sending is off after the
     // phone removes the device, so the field uses that same switch.
-    let sending_off =
-        snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal;
+    let sending_off = snapshot.selected_protocol == ProtocolId::Signal
+        && (snapshot.signal_device_removed() || snapshot.signal_read_only_reason().is_some());
     let compose_open = !closed && !sending_off;
     if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));

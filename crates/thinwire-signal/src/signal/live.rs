@@ -35,7 +35,8 @@ use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::AttemptCancel;
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolId, RedactedPairingSecret, emit_account, emit_conversation, emit_message, emit_status,
+    ProtocolId, RedactedPairingSecret, SIGNAL_PREVIOUS_ACCOUNT, emit_account, emit_conversation,
+    emit_message, emit_status, signal_retained_chat_id, signal_retained_slot,
 };
 
 const DATA_DIR_MISSING: &str =
@@ -360,7 +361,9 @@ fn store_link(registered: bool) -> StoreLink {
 /// link.
 /// The same ACI keeps this file, including contacts, groups, messages, and
 /// profiles. A different ACI moves this file aside and opens a new store, so
-/// [`publish_chats`] reads the new account only. When the ACI copy cannot be
+/// [`publish_chats`] reads the new account only.
+/// [`publish_retained_accounts`] reads the moved file and shows it as a
+/// read-only account row. When the ACI copy cannot be
 /// written, the rows stay in this file. The next link treats that file as a
 /// different account: it moves the file aside and opens a new store.
 ///
@@ -667,7 +670,8 @@ async fn set_aside_store_without_aci(session_dir: &Path) -> Result<bool, ()> {
 /// account when it holds chats. The same ACI copies the new link into
 /// `session.sqlite` and leaves those chats there. A different ACI renames
 /// `session.sqlite` to `retained/<aci>/session.sqlite` and renames the pending
-/// file to `session.sqlite`. No pending file means there is nothing to place.
+/// file to `session.sqlite`. The next publish reads that file as a read-only
+/// account. No pending file means there is nothing to place.
 /// Callers close both stores before this runs.
 async fn separate_previous_account(session_dir: &Path) -> Result<(), ()> {
     if !pending_store_path(session_dir).exists() {
@@ -1009,6 +1013,10 @@ async fn run_linked(
         return LinkedEnd::Stopped;
     }
     emit_account(&events, ProtocolId::Signal, AccountState::Linked);
+    // A different number leaves the previous store under `retained/`.
+    // Publish that history before the live chat list. The same number has
+    // no retained store, so this does not add a row.
+    let _ = publish_retained_accounts(&store_path, &events).await;
     let mut rows = std::collections::HashMap::<String, Conversation>::new();
     let mut unread = std::collections::HashMap::<String, u32>::new();
     let (mut known, mut group_titles) =
@@ -1166,6 +1174,17 @@ async fn run_linked(
             Some(WorkerJob::Send(outbound)) => {
                 let request = outbound.request;
                 let conversation_id = outbound.conversation_id.clone();
+                // A previous number is read-only. Do not send, and do not
+                // open an error for the live account.
+                if signal_retained_slot(&conversation_id).is_some() {
+                    thinwire_protocol::emit_send_rejected(
+                        &events,
+                        ProtocolId::Signal,
+                        conversation_id,
+                        request,
+                    );
+                    continue;
+                }
                 if send_text(
                     &mut manager,
                     &session,
@@ -1316,6 +1335,163 @@ async fn publish_chats(
         }
     }
     Ok((known, group_titles))
+}
+
+const RETAINED_HISTORY_NOT_READ: &str = "signal could not read a previous account store";
+
+/// Publish every store under `retained/` as a read-only account.
+///
+/// The directory name is an account id. It is not a slot, and it is not
+/// written to the log. Slots are 1, 2, 3 in directory-name order.
+/// Returns `true` when at least one previous account was published.
+/// The status line tells the core to drop the live copy of those chats.
+async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool {
+    let dirs = retained_store_dirs(session_dir);
+    let mut published = false;
+    for (index, dir) in dirs.iter().enumerate() {
+        let Some(slot) = u32::try_from(index + 1).ok() else {
+            break;
+        };
+        match publish_one_retained(slot, dir, events).await {
+            Ok(true) => published = true,
+            Ok(false) => {}
+            Err(()) => tracing::error!("{}", RETAINED_HISTORY_NOT_READ),
+        }
+    }
+    if published {
+        let _ = events.send(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: SIGNAL_PREVIOUS_ACCOUNT.to_owned(),
+        });
+    }
+    published
+}
+
+fn retained_store_dirs(session_dir: &Path) -> Vec<PathBuf> {
+    let root = session_dir.join(RETAINED_DIR);
+    let Ok(read) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.is_dir() && sqlite_store_path(&path).is_file() {
+            dirs.push(path);
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
+/// `Ok(true)` when this store published at least one chat.
+async fn publish_one_retained(slot: u32, dir: &Path, events: &EventTx) -> Result<bool, ()> {
+    let url = path_url(&sqlite_store_path(dir))?;
+    let store = SqliteStore::open(&url, OnNewIdentity::Trust)
+        .await
+        .map_err(|_| ())?;
+    let contacts = store.contacts().await.map_err(|_| ())?;
+    let mut names = HashMap::new();
+    let mut contact_list = Vec::new();
+    for contact in contacts.flatten() {
+        if !contact.name.is_empty() {
+            names.insert(contact.uuid.to_string(), contact.name.clone());
+        }
+        contact_list.push(contact);
+    }
+    let groups = store.groups().await.map_err(|_| ())?;
+    let group_list: Vec<_> = groups.flatten().collect();
+    if contact_list.is_empty() && group_list.is_empty() {
+        store.close().await;
+        return Ok(false);
+    }
+    let mut group_titles = HashMap::new();
+    for (key, group) in &group_list {
+        let conversation = conversation_from_group(key, group);
+        group_titles.insert(conversation.id.clone(), conversation.title.clone());
+    }
+    let mut rows = HashMap::new();
+    let unread = HashMap::new();
+    for contact in &contact_list {
+        let mut conversation = conversation_from_contact(contact);
+        mark_retained_conversation(slot, &mut conversation);
+        emit_refreshed_row(events, &mut rows, &unread, conversation);
+        let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
+        let history = retained_history(&store, &thread).await;
+        for message in history {
+            emit_retained_content(slot, events, &message, &names, &group_titles, &mut rows);
+        }
+    }
+    for (key, group) in &group_list {
+        let mut conversation = conversation_from_group(key, group);
+        mark_retained_conversation(slot, &mut conversation);
+        emit_refreshed_row(events, &mut rows, &unread, conversation);
+        let thread = Thread::Group(*key);
+        let history = retained_history(&store, &thread).await;
+        for message in history {
+            emit_retained_content(slot, events, &message, &names, &group_titles, &mut rows);
+        }
+    }
+    store.close().await;
+    Ok(true)
+}
+
+fn mark_retained_conversation(slot: u32, conversation: &mut Conversation) {
+    conversation.id = signal_retained_chat_id(slot, &conversation.id);
+    conversation.writable = false;
+}
+
+fn emit_retained_content(
+    slot: u32,
+    events: &EventTx,
+    content: &Content,
+    names: &HashMap<String, String>,
+    group_titles: &HashMap<String, String>,
+    rows: &mut HashMap<String, Conversation>,
+) {
+    let Some((mut conversation, mut message)) = row_and_message(
+        content,
+        names,
+        group_titles,
+        thinwire_protocol::Arrival::History,
+    ) else {
+        return;
+    };
+    mark_retained_conversation(slot, &mut conversation);
+    message.conversation_id.clone_from(&conversation.id);
+    let unread = HashMap::new();
+    emit_refreshed_row(events, rows, &unread, conversation);
+    emit_message(events, message);
+}
+
+/// The newest page of one thread in a previous account.
+/// The window widens the same way as the live chat list.
+async fn retained_history(store: &SqliteStore, thread: &Thread) -> Vec<Content> {
+    let Some(before) = unix_now_millis().map(initial_history_before) else {
+        return Vec::new();
+    };
+    let mut span = HISTORY_WINDOW_MS;
+    loop {
+        let (start, reached_start) = history_window(before, span);
+        let Ok(found) = store.messages(thread, start..before).await else {
+            return Vec::new();
+        };
+        let mut page = Vec::new();
+        for message in found.flatten() {
+            page.push(message);
+            if page.len() >= HISTORY_PAGE {
+                break;
+            }
+        }
+        if page.len() >= HISTORY_PAGE || reached_start {
+            return page;
+        }
+        let next = widen_history_span(before, span);
+        if next == span {
+            return page;
+        }
+        span = next;
+    }
 }
 
 #[allow(
@@ -2914,6 +3090,13 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             !dir.join(RETAINED_DIR).exists(),
             "the same account keeps the session file"
         );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(
+            !publish_retained_accounts(&dir, &tx).await,
+            "the same number does not add a second account row"
+        );
+        drop(tx);
+        assert!(rx.recv().await.is_none(), "no retained events");
 
         let store = SqliteStore::open(&url, OnNewIdentity::Trust)
             .await
@@ -3222,6 +3405,107 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         assert_eq!(fresh_rows.groups, 0);
         assert_eq!(fresh_rows.profiles, 0);
         fresh.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A different number links again. The previous store is published as a
+    /// read-only account. The new store does not hold that history.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_different_number_relink_publishes_the_old_account_read_only() {
+        let dir = temp_session_dir("other-number-row");
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        insert_registration(&pool, REJECTED_REGISTRATION).await;
+        let previous = registered_aci(&store).await;
+        let contact = kept_contact();
+        let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
+        store
+            .save_message(
+                &thread,
+                envelope(
+                    contact.uuid,
+                    DataMessage {
+                        body: Some("previous account history".into()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("history");
+        store.save_contact(&contact).await.expect("contact");
+        assert!(
+            forget_rejected_registration(&mut store, &url).await,
+            "removal clears the registration row"
+        );
+        pool.close().await;
+        store.close().await;
+
+        let linked_aci = Uuid::from_u128(0x3333_3333_3333_3333_3333_3333_3333_3333);
+        assert_ne!(linked_aci, previous);
+        let (pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, &registration_for(linked_aci)).await;
+        pending_pool.close().await;
+        pending.close().await;
+        separate_previous_account(&dir)
+            .await
+            .expect("a different number moves the previous store aside");
+
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(
+            publish_retained_accounts(&dir, &tx).await,
+            "the previous account is a row"
+        );
+        drop(tx);
+        let log = logged(&bytes);
+        drop(guard);
+        assert!(
+            !log.contains(&previous.to_string()) && !log.contains(&linked_aci.to_string()),
+            "the log has no account id: {log}"
+        );
+
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        let chat_id = signal_retained_chat_id(1, &contact.uuid.to_string());
+        let chat = events.iter().find_map(|event| match event {
+            AdapterEvent::ConversationUpsert { conversation } if conversation.id == chat_id => {
+                Some(conversation)
+            }
+            _ => None,
+        });
+        let chat = chat.expect("the previous chat is published");
+        assert!(!chat.writable, "the old row cannot send");
+        assert_eq!(chat.title, "Ada");
+        let body = events.iter().find_map(|event| match event {
+            AdapterEvent::MessageReceived { message } if message.conversation_id == chat_id => {
+                Some(message.body.as_str())
+            }
+            _ => None,
+        });
+        assert_eq!(body, Some("previous account history"));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_PREVIOUS_ACCOUNT
+            )),
+            "the core is told to keep the previous row"
+        );
+        let debug = format!("{events:?}");
+        assert!(
+            !debug.contains(&previous.to_string()) && !debug.contains(&linked_aci.to_string()),
+            "events do not carry an account id: {debug}"
+        );
+
+        let active = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("active store");
+        assert!(
+            contact_names_of(&active).await.is_empty(),
+            "the new account does not list the previous contact"
+        );
+        active.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 

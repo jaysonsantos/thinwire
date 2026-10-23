@@ -57,6 +57,7 @@ fn compose_ui_uses_enter_multiline_and_disabled_send() {
     assert!(compose.contains("consume_key(egui::Modifiers::NONE, egui::Key::Enter)"));
     assert!(compose.contains("let compose_open = !closed && !sending_off;"));
     assert!(compose.contains("snapshot.signal_device_removed()"));
+    assert!(compose.contains("snapshot.signal_read_only_reason()"));
     assert!(compose.contains(".interactive(compose_open)"));
     assert!(compose.contains("add_enabled(snapshot.can_send()"));
     assert!(ui.contains("request_focus(compose_id)"));
@@ -394,6 +395,10 @@ fn signal_ui_is_feature_gated_and_uses_the_helper() {
     assert!(gate.contains("Signal: no supported third-party API, expect breakage."));
     let readme = include_str!("../../../../README.md");
     assert!(readme.contains("Signal: no supported third-party API, expect breakage."));
+    // A previous Signal number shows why sending is off, and the same risk line.
+    assert!(ui.contains("SIGNAL_PREVIOUS_ACCOUNT"));
+    assert!(ui.contains("Signal: no supported third-party API, expect breakage."));
+    assert!(ui.contains("signal_read_only_reason()"));
     assert!(gate.contains("No provisioning URL is shown on this screen."));
     assert!(!gate.contains("local build"), "Signal is in release builds");
     // With no helper program the entry stays, disabled, with the reason.
