@@ -714,6 +714,14 @@ fn repair_retained_slots(session_dir: &Path) -> Result<(), ()> {
     Ok(())
 }
 
+/// Directory for one parked store.
+///
+/// The first park of an account uses `retained/<aci>`. When that directory
+/// is still there, the next park uses `retained/<aci>-2`, then `-3`, and
+/// so on. A failed removal is what leaves the first directory.
+/// [`restore_retained_account`] and [`absorb_retained_copy`] read every
+/// `<aci>-N` directory. `None` uses `retained/unstored`, then
+/// `retained/unstored-2`. That name has no account id.
 fn unique_retained_dir(session_dir: &Path, aci: Option<Uuid>) -> Result<PathBuf, ()> {
     let leaf = match aci {
         Some(aci) => aci.to_string(),
@@ -903,66 +911,143 @@ async fn place_linked_store(session_dir: &Path, linked: Uuid) -> Result<(), ()> 
     Ok(())
 }
 
-/// Copy `retained/<aci>/` into the live session, then remove that directory.
-/// The live store already holds this number. The copy must not stay as a
-/// second row.
+/// Copy every retained store for `aci` into the live session, then remove
+/// those directories. The live store already holds this number. A copy
+/// must not stay as a second row. `retained/<aci>-N` is included.
 async fn absorb_retained_copy(session_dir: &Path, aci: Uuid) -> Result<(), ()> {
-    let source = retained_sqlite(session_dir, aci);
-    if !source.is_file() {
+    let sources = retained_account_stores(session_dir, aci);
+    if sources.is_empty() {
         return Ok(());
     }
     let session_url = session_sqlite_url(session_dir)?;
-    let source_url = path_url(&source)?;
-    let _ = checkpoint_sqlite(&source_url).await;
-    merge_pending_into_session(&session_url, &source_url).await?;
+    for source in &sources {
+        let source_url = path_url(source)?;
+        let _ = checkpoint_sqlite(&source_url).await;
+        merge_pending_into_session(&session_url, &source_url).await?;
+    }
     let dir = session_dir.to_path_buf();
     let removed = tokio::task::spawn_blocking(move || remove_retained_dir(&dir, aci))
         .await
         .map_err(|_| ())?;
     if removed.is_err() {
-        // The history is in the live store. Publish skips this directory when
-        // its name is the live account id, so a leftover file is not a second row.
+        // The history is in the live store. Publish skips a directory whose
+        // name is this account, including `<aci>-N`, so a leftover file is
+        // not a second row.
         tracing::error!("{}", RETAINED_COPY_NOT_REMOVED);
     }
     Ok(())
 }
 
-/// Move `retained/<aci>/session.sqlite` back to `session.sqlite`.
+/// Move a retained store for `aci` back to `session.sqlite`.
 /// Returns `true` when a retained store was moved.
 /// The session file must be absent. The slot file is removed with the directory.
+///
+/// A failed removal can leave `retained/<aci>/` in place. The next park
+/// then uses `retained/<aci>-N`. This reads every such directory. The
+/// newest store moves back. Any other copy is merged in. Every matching
+/// directory is then removed, so the number is not also a previous account.
 async fn restore_retained_account(session_dir: &Path, aci: Uuid) -> Result<bool, ()> {
-    if !retained_sqlite(session_dir, aci).is_file() {
+    let stores = retained_account_stores(session_dir, aci);
+    let Some(chosen) = preferred_retained_store(&stores, &aci.to_string()) else {
         return Ok(false);
-    }
+    };
     if sqlite_store_path(session_dir).exists() {
         return Err(());
     }
-    let url = path_url(&retained_sqlite(session_dir, aci))?;
+    let url = path_url(&chosen)?;
     let _ = checkpoint_sqlite(&url).await;
+    let extras: Vec<PathBuf> = stores.into_iter().filter(|path| path != &chosen).collect();
+    for extra in &extras {
+        let _ = checkpoint_sqlite(&path_url(extra)?).await;
+    }
     let dir = session_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let source = retained_sqlite(&dir, aci);
-        rename_sqlite_set(&source, &sqlite_store_path(&dir))?;
-        // The sqlite file has moved. A leftover slot file does not publish.
-        let _ = remove_retained_dir(&dir, aci);
-        Ok(())
-    })
-    .await
-    .map_err(|_| ())?
-    .map(|()| true)
+    let moving = chosen.clone();
+    tokio::task::spawn_blocking(move || rename_sqlite_set(&moving, &sqlite_store_path(&dir)))
+        .await
+        .map_err(|_| ())??;
+    let session_url = session_sqlite_url(session_dir)?;
+    for extra in &extras {
+        merge_pending_into_session(&session_url, &path_url(extra)?).await?;
+    }
+    let dir = session_dir.to_path_buf();
+    // The sqlite file has moved. A leftover slot file does not publish.
+    let _ = tokio::task::spawn_blocking(move || remove_retained_dir(&dir, aci))
+        .await
+        .map_err(|_| ())?;
+    Ok(true)
 }
 
-fn retained_account_dir(session_dir: &Path, aci: Uuid) -> PathBuf {
-    session_dir.join(RETAINED_DIR).join(aci.to_string())
+fn retained_account_dirs(session_dir: &Path, aci: Uuid) -> Vec<PathBuf> {
+    let aci = aci.to_string();
+    retained_dirs(session_dir)
+        .into_iter()
+        .filter(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| retained_name_is_aci(name, &aci))
+        })
+        .collect()
 }
 
-fn retained_sqlite(session_dir: &Path, aci: Uuid) -> PathBuf {
-    sqlite_store_path(&retained_account_dir(session_dir, aci))
+fn retained_account_stores(session_dir: &Path, aci: Uuid) -> Vec<PathBuf> {
+    retained_account_dirs(session_dir, aci)
+        .into_iter()
+        .map(|dir| sqlite_store_path(&dir))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+/// The newest parked store. A higher slot is newer. With no slot file,
+/// a higher `<aci>-N` suffix is newer than `retained/<aci>`.
+fn preferred_retained_store(stores: &[PathBuf], aci: &str) -> Option<PathBuf> {
+    stores
+        .iter()
+        .max_by_key(|path| {
+            let dir = path.parent().unwrap_or(path);
+            (
+                read_slot_file(dir).unwrap_or(0),
+                retained_suffix_index(dir, aci),
+            )
+        })
+        .cloned()
+}
+
+fn retained_suffix_index(dir: &Path, aci: &str) -> u32 {
+    let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
+        return 0;
+    };
+    if name == aci {
+        return 1;
+    }
+    name.strip_prefix(aci)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(parse_slot_count)
+        .unwrap_or(0)
+}
+
+/// `true` when `name` is `retained/<aci>` or `retained/<aci>-N` for `N >= 2`.
+fn retained_name_is_aci(name: &str, aci: &str) -> bool {
+    if name == aci {
+        return true;
+    }
+    let Some(suffix) = name
+        .strip_prefix(aci)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    parse_slot_count(suffix).is_some_and(|n| n >= 2)
 }
 
 fn remove_retained_dir(session_dir: &Path, aci: Uuid) -> Result<(), ()> {
-    let dir = retained_account_dir(session_dir, aci);
-    let sqlite = sqlite_store_path(&dir);
+    for dir in retained_account_dirs(session_dir, aci) {
+        remove_retained_tree(&dir)?;
+    }
+    Ok(())
+}
+
+fn remove_retained_tree(dir: &Path) -> Result<(), ()> {
+    let sqlite = sqlite_store_path(dir);
     if sqlite.exists() {
         remove_sqlite_files(&sqlite)?;
     }
@@ -970,7 +1055,7 @@ fn remove_retained_dir(session_dir: &Path, aci: Uuid) -> Result<(), ()> {
     if slot.exists() && std::fs::remove_file(&slot).is_err() {
         return Err(());
     }
-    if dir.exists() && std::fs::remove_dir(&dir).is_err() {
+    if dir.exists() && std::fs::remove_dir(dir).is_err() {
         return Err(());
     }
     Ok(())
@@ -1708,7 +1793,7 @@ fn retained_dir_is_live(dir: &Path, live: Option<Uuid>) -> bool {
     };
     dir.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == live.to_string())
+        .is_some_and(|name| retained_name_is_aci(name, &live.to_string()))
 }
 
 fn retained_dirs(session_dir: &Path) -> Vec<PathBuf> {
@@ -4392,6 +4477,97 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             std::fs::read(aside.join(RETAINED_SLOT_FILE)).expect("slot"),
             slot_bytes,
             "the repair leaves an existing slot file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed removal leaves `retained/<aci>/` in place, so the next park
+    /// uses `retained/<aci>-2`. A return finds that store and removes both
+    /// directories. The history stays on the live row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_return_finds_a_suffixed_retained_directory() {
+        let dir = temp_session_dir("aci-suffix");
+        let aci_a = Uuid::from_u128(0xa11a_0000_0000_0000_0000_0000_0000_000a);
+        let aci_b = Uuid::from_u128(0xb22b_0000_0000_0000_0000_0000_0000_000b);
+        let ada = named_contact(4, "Ada");
+
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        insert_registration(&pool, &registration_for(aci_a)).await;
+        save_contact_message(&mut store, &ada, "kept on the suffixed store").await;
+        assert!(forget_rejected_registration(&mut store, &url).await);
+        pool.close().await;
+        store.close().await;
+
+        let leftover = dir.join(RETAINED_DIR).join(aci_a.to_string());
+        std::fs::create_dir_all(&leftover).expect("leftover dir");
+        let suffixed = dir.join(RETAINED_DIR).join(format!("{aci_a}-2"));
+        assert!(
+            retained_dir_is_live(&suffixed, Some(aci_a)),
+            "a suffixed directory is the same account"
+        );
+        assert!(
+            !retained_dir_is_live(&suffixed, Some(aci_b)),
+            "a suffixed directory is not another account"
+        );
+
+        replace_with_account(&dir, aci_b).await;
+        assert!(
+            sqlite_store_path(&suffixed).is_file(),
+            "the next park uses the suffixed directory"
+        );
+        assert!(
+            !sqlite_store_path(&leftover).is_file(),
+            "the leftover directory has no store"
+        );
+
+        replace_with_account(&dir, aci_a).await;
+        assert!(
+            !suffixed.exists(),
+            "the return removes the suffixed directory"
+        );
+        assert!(
+            !leftover.exists(),
+            "the return removes the leftover directory"
+        );
+
+        let active = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("live store");
+        assert_eq!(registered_aci(&active).await, aci_a);
+        let thread = Thread::Contact(ServiceId::Aci(ada.uuid.into()));
+        let kept = active
+            .message(&thread, 1_700_000_000_000)
+            .await
+            .expect("history read")
+            .expect("the suffixed store is the live history");
+        match kept.body {
+            ContentBody::DataMessage(message) => {
+                assert_eq!(message.body.as_deref(), Some("kept on the suffixed store"));
+            }
+            _ => panic!("stored history is a data message"),
+        }
+        active.close().await;
+
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _ = publish_retained_accounts(&dir, &tx).await;
+        drop(tx);
+        let log = logged(&bytes);
+        drop(guard);
+        let events = collect_events(&mut rx).await;
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.title == "Ada"
+            )),
+            "the returned number is not also a previous account"
+        );
+        let debug = format!("{events:?}{log}");
+        assert!(
+            !debug.contains(&aci_a.to_string()) && !debug.contains(&aci_b.to_string()),
+            "the log and the events have no account id"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
