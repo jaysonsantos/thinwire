@@ -35,8 +35,10 @@ use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::AttemptCancel;
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolId, RedactedPairingSecret, SIGNAL_HISTORY_KEPT, SIGNAL_PREVIOUS_ACCOUNT, emit_account,
-    emit_conversation, emit_message, emit_status, signal_retained_chat_id, signal_retained_slot,
+    ProtocolId, RedactedPairingSecret, SIGNAL_HISTORY_KEPT, SIGNAL_HISTORY_NOT_KEPT,
+    SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_RESET, SIGNAL_RETAINED_SETTLED, emit_account,
+    emit_conversation, emit_message, emit_status, signal_retained_chat, signal_retained_chat_id,
+    signal_retained_slot,
 };
 
 const DATA_DIR_MISSING: &str =
@@ -407,6 +409,12 @@ const PRIOR_ACI_NOT_STORED: &str = "signal could not store the previous account 
 const PREVIOUS_STORE_NOT_SET_ASIDE: &str = "signal could not move the previous account store aside";
 const PENDING_LINK_NOT_PLACED: &str =
     "signal could not place a link beside the previous account store";
+const RETAINED_SLOT_NOT_STORED: &str = "signal could not store the previous account slot";
+const RETAINED_COPY_NOT_REMOVED: &str = "signal could not remove the previous copy of this account";
+
+/// File in a retained directory. The contents are the slot count only.
+/// The file name and the contents have no account id and no phone number.
+const RETAINED_SLOT_FILE: &str = "slot";
 
 async fn registration_aci(store: &SqliteStore) -> Option<Uuid> {
     store
@@ -572,7 +580,71 @@ fn park_sqlite_blocking(session_dir: &Path, aci: Option<Uuid>) -> Result<(), ()>
     }
     let dest_dir = unique_retained_dir(session_dir, aci)?;
     prepare_session_dir(&dest_dir).map_err(|_| ())?;
-    rename_sqlite_set(&source, &sqlite_store_path(&dest_dir))
+    rename_sqlite_set(&source, &sqlite_store_path(&dest_dir))?;
+    // The slot is assigned once, in link order. A later directory sort does
+    // not change it. A failed write is filled in on the next publish.
+    if assign_retained_slot(session_dir, &dest_dir).is_err() {
+        tracing::error!("{}", RETAINED_SLOT_NOT_STORED);
+    }
+    Ok(())
+}
+
+fn assign_retained_slot(session_dir: &Path, dest_dir: &Path) -> Result<(), ()> {
+    let slot = next_retained_slot(session_dir)?;
+    write_slot_file(dest_dir, slot)
+}
+
+fn next_retained_slot(session_dir: &Path) -> Result<u32, ()> {
+    let mut max = 0u32;
+    for dir in retained_store_dirs(session_dir) {
+        if let Some(slot) = read_slot_file(&dir) {
+            max = max.max(slot);
+        }
+    }
+    max.checked_add(1).filter(|slot| *slot > 0).ok_or(())
+}
+
+fn read_slot_file(dir: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(dir.join(RETAINED_SLOT_FILE)).ok()?;
+    let text = text.trim();
+    if text.is_empty() || text.starts_with('+') || (text.len() > 1 && text.starts_with('0')) {
+        return None;
+    }
+    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok().filter(|slot: &u32| *slot > 0)
+}
+
+fn write_slot_file(dir: &Path, slot: u32) -> Result<(), ()> {
+    std::fs::write(dir.join(RETAINED_SLOT_FILE), format!("{slot}\n")).map_err(|_| ())
+}
+
+/// Slot and directory for every retained store. The slot comes from the slot
+/// file. A directory with no file, or with a duplicate count, gets the next
+/// count and that count is written. The result is sorted by slot.
+fn retained_slots(session_dir: &Path) -> Vec<(u32, PathBuf)> {
+    let mut used = HashSet::new();
+    let mut ready = Vec::new();
+    let mut missing = Vec::new();
+    for dir in retained_store_dirs(session_dir) {
+        match read_slot_file(&dir) {
+            Some(slot) if used.insert(slot) => ready.push((slot, dir)),
+            _ => missing.push(dir),
+        }
+    }
+    let mut next = used.iter().copied().max().unwrap_or(0);
+    for dir in missing {
+        next = next.saturating_add(1);
+        if next == 0 {
+            break;
+        }
+        if write_slot_file(&dir, next).is_ok() {
+            ready.push((next, dir));
+        }
+    }
+    ready.sort_by_key(|(slot, _)| *slot);
+    ready
 }
 
 fn unique_retained_dir(session_dir: &Path, aci: Option<Uuid>) -> Result<PathBuf, ()> {
@@ -669,8 +741,12 @@ async fn set_aside_store_without_aci(session_dir: &Path) -> Result<bool, ()> {
 /// The pending file is the new account. `session.sqlite` is the previous
 /// account when it holds chats. The same ACI copies the new link into
 /// `session.sqlite` and leaves those chats there. A different ACI renames
-/// `session.sqlite` to `retained/<aci>/session.sqlite` and renames the pending
-/// file to `session.sqlite`. The next publish reads that file as a read-only
+/// `session.sqlite` to `retained/<aci>/session.sqlite` and writes a slot
+/// file there. The pending file then becomes `session.sqlite`.
+///
+/// When the linked ACI already has a directory under `retained/`, that
+/// directory moves back to `session.sqlite` and the pending link merges
+/// into it. The history stays on the live row. It is not also a previous
 /// account. No pending file means there is nothing to place.
 /// Callers close both stores before this runs.
 async fn separate_previous_account(session_dir: &Path) -> Result<(), ()> {
@@ -679,7 +755,11 @@ async fn separate_previous_account(session_dir: &Path) -> Result<(), ()> {
     }
     let session_file = sqlite_store_path(session_dir);
     if !session_file.exists() {
-        return adopt_pending_store(session_dir).await;
+        let pending_url = pending_sqlite_url(session_dir)?;
+        let Some(linked) = read_registration_aci(&pending_url).await? else {
+            return adopt_pending_store(session_dir).await;
+        };
+        return place_linked_store(session_dir, linked).await;
     }
     let pending_url = pending_sqlite_url(session_dir)?;
     let Some(linked) = read_registration_aci(&pending_url).await? else {
@@ -694,33 +774,129 @@ async fn separate_previous_account(session_dir: &Path) -> Result<(), ()> {
             if remove_sqlite_files(&pending_store_path(session_dir)).is_err() {
                 tracing::error!("{}", PENDING_LINK_NOT_PLACED);
             }
+            // A copy of this number can still sit under `retained/` from an
+            // earlier link. Fold it in, then remove it, so the live row is
+            // the only row.
+            absorb_retained_copy(session_dir, linked).await?;
             let _ = delete_prior_aci(&session_url).await;
             Ok(())
         }
         Some(previous) => {
             park_previous_store(session_dir, Some(previous)).await?;
-            adopt_pending_store(session_dir).await?;
-            if !sqlite_store_path(session_dir).exists() {
-                tracing::error!("{}", PREVIOUS_STORE_NOT_SET_ASIDE);
-                return Err(());
-            }
-            Ok(())
+            place_linked_store(session_dir, linked).await
         }
         None => {
             // No saved ACI. Move the file aside even when it looks empty, so a
             // row outside the content check stays on disk. The pending file
-            // then becomes the session store.
+            // then becomes the session store, unless this number already has
+            // a retained store.
             if session_file.exists() {
                 park_previous_store(session_dir, None).await?;
             }
-            adopt_pending_store(session_dir).await?;
-            if !sqlite_store_path(session_dir).exists() {
-                tracing::error!("{}", PREVIOUS_STORE_NOT_SET_ASIDE);
-                return Err(());
-            }
-            Ok(())
+            place_linked_store(session_dir, linked).await
         }
     }
+}
+
+/// Put the pending link into `session.sqlite`.
+///
+/// When `retained/<linked>/` exists, that file becomes `session.sqlite` and
+/// the pending link merges into it. The old thread ids stay, so the history
+/// stays readable. Otherwise the pending file itself becomes the session.
+async fn place_linked_store(session_dir: &Path, linked: Uuid) -> Result<(), ()> {
+    if restore_retained_account(session_dir, linked).await? {
+        let session_url = session_sqlite_url(session_dir)?;
+        let pending_url = pending_sqlite_url(session_dir)?;
+        merge_pending_into_session(&session_url, &pending_url).await?;
+        if remove_sqlite_files(&pending_store_path(session_dir)).is_err() {
+            tracing::error!("{}", PENDING_LINK_NOT_PLACED);
+        }
+        let _ = delete_prior_aci(&session_url).await;
+        if !sqlite_store_path(session_dir).exists() {
+            tracing::error!("{}", PREVIOUS_STORE_NOT_SET_ASIDE);
+            return Err(());
+        }
+        return Ok(());
+    }
+    adopt_pending_store(session_dir).await?;
+    if !sqlite_store_path(session_dir).exists() {
+        tracing::error!("{}", PREVIOUS_STORE_NOT_SET_ASIDE);
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Copy `retained/<aci>/` into the live session, then remove that directory.
+/// The live store already holds this number. The copy must not stay as a
+/// second row.
+async fn absorb_retained_copy(session_dir: &Path, aci: Uuid) -> Result<(), ()> {
+    let source = retained_sqlite(session_dir, aci);
+    if !source.is_file() {
+        return Ok(());
+    }
+    let session_url = session_sqlite_url(session_dir)?;
+    let source_url = path_url(&source)?;
+    let _ = checkpoint_sqlite(&source_url).await;
+    merge_pending_into_session(&session_url, &source_url).await?;
+    let dir = session_dir.to_path_buf();
+    let removed = tokio::task::spawn_blocking(move || remove_retained_dir(&dir, aci))
+        .await
+        .map_err(|_| ())?;
+    if removed.is_err() {
+        // The history is in the live store. Publish skips this directory when
+        // its name is the live account id, so a leftover file is not a second row.
+        tracing::error!("{}", RETAINED_COPY_NOT_REMOVED);
+    }
+    Ok(())
+}
+
+/// Move `retained/<aci>/session.sqlite` back to `session.sqlite`.
+/// Returns `true` when a retained store was moved.
+/// The session file must be absent. The slot file is removed with the directory.
+async fn restore_retained_account(session_dir: &Path, aci: Uuid) -> Result<bool, ()> {
+    if !retained_sqlite(session_dir, aci).is_file() {
+        return Ok(false);
+    }
+    if sqlite_store_path(session_dir).exists() {
+        return Err(());
+    }
+    let url = path_url(&retained_sqlite(session_dir, aci))?;
+    let _ = checkpoint_sqlite(&url).await;
+    let dir = session_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let source = retained_sqlite(&dir, aci);
+        rename_sqlite_set(&source, &sqlite_store_path(&dir))?;
+        // The sqlite file has moved. A leftover slot file does not publish.
+        let _ = remove_retained_dir(&dir, aci);
+        Ok(())
+    })
+    .await
+    .map_err(|_| ())?
+    .map(|()| true)
+}
+
+fn retained_account_dir(session_dir: &Path, aci: Uuid) -> PathBuf {
+    session_dir.join(RETAINED_DIR).join(aci.to_string())
+}
+
+fn retained_sqlite(session_dir: &Path, aci: Uuid) -> PathBuf {
+    sqlite_store_path(&retained_account_dir(session_dir, aci))
+}
+
+fn remove_retained_dir(session_dir: &Path, aci: Uuid) -> Result<(), ()> {
+    let dir = retained_account_dir(session_dir, aci);
+    let sqlite = sqlite_store_path(&dir);
+    if sqlite.exists() {
+        remove_sqlite_files(&sqlite)?;
+    }
+    let slot = dir.join(RETAINED_SLOT_FILE);
+    if slot.exists() && std::fs::remove_file(&slot).is_err() {
+        return Err(());
+    }
+    if dir.exists() && std::fs::remove_dir(&dir).is_err() {
+        return Err(());
+    }
+    Ok(())
 }
 
 async fn merge_pending_into_session(session_url: &str, pending_url: &str) -> Result<(), ()> {
@@ -1016,6 +1192,9 @@ async fn run_linked(
         return LinkedEnd::Stopped;
     }
     emit_account(&events, ProtocolId::Signal, AccountState::Linked);
+    // Once per link, before the receive loop. A reconnect in that loop does
+    // not open `retained/` again. The next link in this process publishes
+    // again, because that link can park another store.
     // A different number leaves the previous store under `retained/`.
     // Publish that history before the live chat list. The same number has
     // no retained store, so this does not add a row.
@@ -1214,17 +1393,29 @@ async fn run_linked(
                 conversation_id,
                 before_message_id,
             }) => {
-                load_older_page(
-                    &manager,
-                    session.as_ref(),
-                    &events,
-                    &names,
-                    &group_titles,
-                    &conversation_id,
-                    &before_message_id,
-                    &mut rows,
-                )
-                .await;
+                if signal_retained_slot(&conversation_id).is_some() {
+                    // The retained store is not the live manager. Page it
+                    // here. A send to this id is rejected above.
+                    load_retained_older_page(
+                        &store_path,
+                        &events,
+                        &conversation_id,
+                        &before_message_id,
+                    )
+                    .await;
+                } else {
+                    load_older_page(
+                        &manager,
+                        session.as_ref(),
+                        &events,
+                        &names,
+                        &group_titles,
+                        &conversation_id,
+                        &before_message_id,
+                        &mut rows,
+                    )
+                    .await;
+                }
             }
             Some(WorkerJob::Refresh) => {
                 match publish_chats(&manager, session.as_ref(), &events, &mut rows, &unread).await {
@@ -1302,6 +1493,7 @@ async fn publish_chats(
     let mut group_titles = HashMap::new();
     let names = contact_names(manager).await;
     let history_before = unix_now_millis().map(initial_history_before);
+    let history_url = history_store_url();
     let contacts = manager.store().contacts().await.map_err(|_| ())?;
     for contact in contacts.flatten() {
         let conversation = conversation_from_contact(&contact);
@@ -1311,7 +1503,12 @@ async fn publish_chats(
             continue;
         };
         let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
-        let Ok((messages, _)) = fetch_history_page(manager, &thread, before, None).await else {
+        let Some(url) = history_url.as_deref() else {
+            continue;
+        };
+        let Ok((messages, _)) =
+            fetch_history_page(manager.store(), url, &thread, before, None).await
+        else {
             continue;
         };
         for message in messages {
@@ -1330,7 +1527,12 @@ async fn publish_chats(
             continue;
         };
         let thread = Thread::Group(key);
-        let Ok((messages, _)) = fetch_history_page(manager, &thread, before, None).await else {
+        let Some(url) = history_url.as_deref() else {
+            continue;
+        };
+        let Ok((messages, _)) =
+            fetch_history_page(manager.store(), url, &thread, before, None).await
+        else {
             continue;
         };
         for message in messages {
@@ -1359,17 +1561,26 @@ fn note_retained_history(session_dir: &Path, events: &EventTx) {
 /// Publish every store under `retained/` as a read-only account.
 ///
 /// The directory name is an account id. It is not a slot, and it is not
-/// written to the log. Slots are 1, 2, 3 in directory-name order.
+/// written to the log. The slot is the count in the slot file, written when
+/// the store was moved aside. A directory whose name is the live account id
+/// is skipped, so that number is not also a previous-account row.
 /// Returns `true` when at least one previous account was published.
 /// The status line tells the core to drop the live copy of those chats.
 async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool {
-    let dirs = retained_store_dirs(session_dir);
+    let _ = events.send(AdapterEvent::Status {
+        protocol: ProtocolId::Signal,
+        status: AdapterStatus::Ready,
+        detail: SIGNAL_RETAINED_RESET.to_owned(),
+    });
+    let live = live_registration_aci(session_dir).await;
     let mut published = false;
-    for (index, dir) in dirs.iter().enumerate() {
-        let Some(slot) = u32::try_from(index + 1).ok() else {
-            break;
-        };
-        match publish_one_retained(slot, dir, events).await {
+    let mut kept = false;
+    for (slot, dir) in retained_slots(session_dir) {
+        if retained_dir_is_live(&dir, live) {
+            continue;
+        }
+        kept = true;
+        match publish_one_retained(slot, &dir, events).await {
             Ok(true) => published = true,
             Ok(false) => {}
             Err(()) => tracing::error!("{}", RETAINED_HISTORY_NOT_READ),
@@ -1381,8 +1592,36 @@ async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool
             status: AdapterStatus::Ready,
             detail: SIGNAL_PREVIOUS_ACCOUNT.to_owned(),
         });
+    } else if !kept {
+        let _ = events.send(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: SIGNAL_HISTORY_NOT_KEPT.to_owned(),
+        });
     }
+    let _ = events.send(AdapterEvent::Status {
+        protocol: ProtocolId::Signal,
+        status: AdapterStatus::Ready,
+        detail: SIGNAL_RETAINED_SETTLED.to_owned(),
+    });
     published
+}
+
+async fn live_registration_aci(session_dir: &Path) -> Option<Uuid> {
+    if !sqlite_store_path(session_dir).is_file() {
+        return None;
+    }
+    let url = session_sqlite_url(session_dir).ok()?;
+    read_registration_aci(&url).await.ok().flatten()
+}
+
+fn retained_dir_is_live(dir: &Path, live: Option<Uuid>) -> bool {
+    let Some(live) = live else {
+        return false;
+    };
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == live.to_string())
 }
 
 fn retained_store_dirs(session_dir: &Path) -> Vec<PathBuf> {
@@ -1404,9 +1643,7 @@ fn retained_store_dirs(session_dir: &Path) -> Vec<PathBuf> {
 /// `Ok(true)` when this store published at least one chat.
 async fn publish_one_retained(slot: u32, dir: &Path, events: &EventTx) -> Result<bool, ()> {
     let url = path_url(&sqlite_store_path(dir))?;
-    let store = SqliteStore::open(&url, OnNewIdentity::Trust)
-        .await
-        .map_err(|_| ())?;
+    let store = open_retained_store(&url).await?;
     let contacts = store.contacts().await.map_err(|_| ())?;
     let mut names = HashMap::new();
     let mut contact_list = Vec::new();
@@ -1434,7 +1671,7 @@ async fn publish_one_retained(slot: u32, dir: &Path, events: &EventTx) -> Result
         mark_retained_conversation(slot, &mut conversation);
         emit_refreshed_row(events, &mut rows, &unread, conversation);
         let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
-        let history = retained_history(&store, &thread).await;
+        let history = retained_history(&store, &url, &thread).await;
         for message in history {
             emit_retained_content(slot, events, &message, &names, &group_titles, &mut rows);
         }
@@ -1444,7 +1681,7 @@ async fn publish_one_retained(slot: u32, dir: &Path, events: &EventTx) -> Result
         mark_retained_conversation(slot, &mut conversation);
         emit_refreshed_row(events, &mut rows, &unread, conversation);
         let thread = Thread::Group(*key);
-        let history = retained_history(&store, &thread).await;
+        let history = retained_history(&store, &url, &thread).await;
         for message in history {
             emit_retained_content(slot, events, &message, &names, &group_titles, &mut rows);
         }
@@ -1482,33 +1719,137 @@ fn emit_retained_content(
 }
 
 /// The newest page of one thread in a previous account.
-/// The window widens the same way as the live chat list.
-async fn retained_history(store: &SqliteStore, thread: &Thread) -> Vec<Content> {
+/// Older pages use the same read as the live chat list.
+async fn retained_history(store: &SqliteStore, url: &str, thread: &Thread) -> Vec<Content> {
     let Some(before) = unix_now_millis().map(initial_history_before) else {
         return Vec::new();
     };
-    let mut span = HISTORY_WINDOW_MS;
-    loop {
-        let (start, reached_start) = history_window(before, span);
-        let Ok(found) = store.messages(thread, start..before).await else {
-            return Vec::new();
-        };
-        let mut page = Vec::new();
-        for message in found.flatten() {
-            page.push(message);
-            if page.len() >= HISTORY_PAGE {
-                break;
-            }
-        }
-        if page.len() >= HISTORY_PAGE || reached_start {
-            return page;
-        }
-        let next = widen_history_span(before, span);
-        if next == span {
-            return page;
-        }
-        span = next;
+    match fetch_history_page(store, url, thread, before, None).await {
+        Ok((page, _)) => page,
+        Err(()) => Vec::new(),
     }
+}
+
+/// One older page of a retained chat.
+/// The timestamp query is read-only. Sending to this chat stays rejected.
+async fn load_retained_older_page(
+    session_dir: &Path,
+    events: &EventTx,
+    conversation_id: &str,
+    before_message_id: &str,
+) {
+    let loaded = read_retained_older_page(session_dir, conversation_id, before_message_id).await;
+    let (more, note) = match loaded {
+        Ok((slot, page, more, names, titles)) => {
+            let mut rows = HashMap::new();
+            for message in &page {
+                emit_retained_content(slot, events, message, &names, &titles, &mut rows);
+            }
+            (more, None)
+        }
+        Err(()) => (true, Some(HISTORY_READ_FAILED)),
+    };
+    let _ = events.send(AdapterEvent::OlderHistoryLoaded {
+        protocol: ProtocolId::Signal,
+        conversation_id: conversation_id.to_string(),
+        before_message_id: before_message_id.to_string(),
+        more,
+        note: note.map(str::to_string),
+        topic: None,
+    });
+}
+
+async fn read_retained_older_page(
+    session_dir: &Path,
+    conversation_id: &str,
+    before_message_id: &str,
+) -> Result<
+    (
+        u32,
+        Vec<Content>,
+        bool,
+        HashMap<String, String>,
+        HashMap<String, String>,
+    ),
+    (),
+> {
+    let slot = signal_retained_slot(conversation_id).ok_or(())?;
+    let chat_id = signal_retained_chat(conversation_id).ok_or(())?;
+    let before = message_millis(before_message_id).ok_or(())?;
+    let dir = retained_dir_for_slot(session_dir, slot).ok_or(())?;
+    let url = path_url(&sqlite_store_path(&dir))?;
+    let store = open_retained_store(&url).await?;
+    let read = async {
+        let thread = thread_for_retained_chat(&store, chat_id).await.ok_or(())?;
+        let names = retained_contact_names(&store).await;
+        let titles = retained_group_titles(&store).await;
+        let (messages, more) =
+            fetch_history_page(&store, &url, &thread, before, Some(before_message_id)).await?;
+        Ok((messages, more, names, titles))
+    }
+    .await;
+    store.close().await;
+    let (messages, more, names, titles) = read?;
+    Ok((slot, messages, more, names, titles))
+}
+
+fn retained_dir_for_slot(session_dir: &Path, slot: u32) -> Option<PathBuf> {
+    retained_slots(session_dir)
+        .into_iter()
+        .find(|(found, _)| *found == slot)
+        .map(|(_, dir)| dir)
+}
+
+async fn thread_for_retained_chat(store: &SqliteStore, chat_id: &str) -> Option<Thread> {
+    if !super::group::is_group_id(chat_id) {
+        return service_id_of(chat_id).map(Thread::Contact);
+    }
+    let groups = store.groups().await.ok()?;
+    for group in groups.flatten() {
+        if super::group::group_id(&group.0) == chat_id {
+            return Some(Thread::Group(group.0));
+        }
+    }
+    None
+}
+
+async fn retained_contact_names(store: &SqliteStore) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let Ok(contacts) = store.contacts().await else {
+        return names;
+    };
+    for contact in contacts.flatten() {
+        if !contact.name.is_empty() {
+            names.insert(contact.uuid.to_string(), contact.name);
+        }
+    }
+    names
+}
+
+async fn retained_group_titles(store: &SqliteStore) -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    let Ok(groups) = store.groups().await else {
+        return titles;
+    };
+    for (key, group) in groups.flatten() {
+        let conversation = conversation_from_group(&key, &group);
+        titles.insert(conversation.id, conversation.title);
+    }
+    titles
+}
+
+/// Open a store under `retained/`.
+///
+/// `SqliteStore::open` and `open_with_options` always set WAL mode and run
+/// migrations. Presage does not offer a read-only open, so this can create
+/// `-wal` and `-shm` files next to the store. A later change encrypts
+/// `retained/` by export and an atomic rename (#347, for #291). This open
+/// must not assume those file bytes stay unchanged. History paging still
+/// reads timestamps through a read-only connection.
+async fn open_retained_store(url: &str) -> Result<SqliteStore, ()> {
+    SqliteStore::open(url, OnNewIdentity::Trust)
+        .await
+        .map_err(|_| ())
 }
 
 #[allow(
@@ -1528,9 +1869,16 @@ async fn load_older_page(
     let loaded = async {
         let before = message_millis(before_message_id)?;
         let thread = thread_of(conversation_id, session.group_key(conversation_id).await)?;
-        fetch_history_page(manager, &thread, before, Some(before_message_id))
-            .await
-            .ok()
+        let url = history_store_url()?;
+        fetch_history_page(
+            manager.store(),
+            &url,
+            &thread,
+            before,
+            Some(before_message_id),
+        )
+        .await
+        .ok()
     }
     .await;
     let (page, more, note) = older_page_outcome(loaded);
@@ -1597,15 +1945,13 @@ fn widen_history_span(before: u64, span: u64) -> u64 {
 }
 
 async fn fetch_history_page(
-    manager: &Manager<SqliteStore, Registered>,
+    store: &SqliteStore,
+    url: &str,
     thread: &Thread,
     before: u64,
     before_id: Option<&str>,
 ) -> Result<(Vec<Content>, bool), ()> {
-    let Some(url) = history_store_url() else {
-        return Err(());
-    };
-    let pool = open_history_read(&url).await?;
+    let pool = open_history_read(url).await?;
     let outcome = async {
         let mut span = HISTORY_WINDOW_MS;
         let mut page = NewestBound::new(HISTORY_PAGE);
@@ -1645,7 +1991,7 @@ async fn fetch_history_page(
             let fresh = observe_history_rows(&mut seen, &timestamps);
             let oldest = timestamps.last().copied();
             for ts in fresh {
-                let loaded = manager.store().message(thread, ts).await.map_err(|_| ());
+                let loaded = store.message(thread, ts).await.map_err(|_| ());
                 if note_history_row(&mut page, loaded, before, before_id, content_history_key) {
                     good += 1;
                 }
@@ -2385,6 +2731,27 @@ mod tests {
 
     use super::*;
 
+    fn envelope_at(sender: Uuid, body: &str, millis: i64) -> Content {
+        Content::from_body(
+            DataMessage {
+                body: Some(body.into()),
+                ..Default::default()
+            },
+            Metadata {
+                sender: ServiceId::Aci(sender.into()),
+                destination: ServiceId::Aci(Uuid::nil().into()),
+                sender_device: DeviceId::new(1).expect("device"),
+                pni_verified: None,
+                client_timestamp: chrono::DateTime::from_timestamp_millis(millis).expect("time"),
+                server_timestamp: chrono::DateTime::from_timestamp_millis(millis).expect("time"),
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+            },
+        )
+    }
+
     fn envelope(sender: Uuid, body: DataMessage) -> Content {
         Content::from_body(
             body,
@@ -3113,7 +3480,23 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "the same number does not add a second account row"
         );
         drop(tx);
-        assert!(rx.recv().await.is_none(), "no retained events");
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, AdapterEvent::Status { .. })),
+            "the same number publishes no chats: {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_PREVIOUS_ACCOUNT
+            )),
+            "the same number is not a previous account: {events:?}"
+        );
 
         let store = SqliteStore::open(&url, OnNewIdentity::Trust)
             .await
@@ -3526,6 +3909,328 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Two retained stores whose directory names sort opposite to link order.
+    /// The slot file keeps the link order. A later publish does not renumber.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_slots_follow_link_order_not_directory_name() {
+        let dir = temp_session_dir("slot-order");
+        let first_aci = Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("aci");
+        let second_aci = Uuid::parse_str("00000000-0000-4000-8000-00000000000b").expect("aci");
+        let third_aci = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("aci");
+        assert!(
+            second_aci.to_string() < first_aci.to_string(),
+            "the second directory name sorts first"
+        );
+        let first_contact = named_contact(1, "First");
+        let second_contact = named_contact(2, "Second");
+
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        insert_registration(&pool, &registration_for(first_aci)).await;
+        save_contact_message(&mut store, &first_contact, "first number").await;
+        assert!(forget_rejected_registration(&mut store, &url).await);
+        pool.close().await;
+        store.close().await;
+
+        let (pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, &registration_for(second_aci)).await;
+        pending_pool.close().await;
+        pending.close().await;
+        separate_previous_account(&dir)
+            .await
+            .expect("the first number moves aside");
+
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        save_contact_message(&mut store, &second_contact, "second number").await;
+        assert!(forget_rejected_registration(&mut store, &url).await);
+        pool.close().await;
+        store.close().await;
+
+        let (pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, &registration_for(third_aci)).await;
+        pending_pool.close().await;
+        pending.close().await;
+        separate_previous_account(&dir)
+            .await
+            .expect("the second number moves aside");
+
+        let first_slot = std::fs::read_to_string(
+            dir.join(RETAINED_DIR)
+                .join(first_aci.to_string())
+                .join(RETAINED_SLOT_FILE),
+        )
+        .expect("slot");
+        let second_slot = std::fs::read_to_string(
+            dir.join(RETAINED_DIR)
+                .join(second_aci.to_string())
+                .join(RETAINED_SLOT_FILE),
+        )
+        .expect("slot");
+        assert_eq!(first_slot, "1\n", "the first link keeps slot 1");
+        assert_eq!(second_slot, "2\n", "the second link keeps slot 2");
+        assert!(
+            !first_slot.contains(&first_aci.to_string())
+                && !second_slot.contains(&second_aci.to_string()),
+            "a slot file has no account id"
+        );
+
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(publish_retained_accounts(&dir, &tx).await);
+        drop(tx);
+        let log = logged(&bytes);
+        drop(guard);
+        let events = collect_events(&mut rx).await;
+        let first_id = signal_retained_chat_id(1, &first_contact.uuid.to_string());
+        let second_id = signal_retained_chat_id(2, &second_contact.uuid.to_string());
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation } if conversation.id == first_id
+            )),
+            "the first link stays on slot 1"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation } if conversation.id == second_id
+            )),
+            "the second link stays on slot 2"
+        );
+        let swapped_first = signal_retained_chat_id(1, &second_contact.uuid.to_string());
+        let swapped_second = signal_retained_chat_id(2, &first_contact.uuid.to_string());
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation }
+                    if conversation.id == swapped_first || conversation.id == swapped_second
+            )),
+            "directory order does not renumber the slots"
+        );
+        let debug = format!("{events:?}{log}");
+        assert!(
+            !debug.contains(&first_aci.to_string())
+                && !debug.contains(&second_aci.to_string())
+                && !debug.contains(&third_aci.to_string()),
+            "the log and the events have no account id"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A, then B, then A again. A's retained copy moves back into the live
+    /// store. A is not also a previous-account row. B stays read-only.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_return_to_an_earlier_number_keeps_one_history() {
+        let dir = temp_session_dir("return-number");
+        let aci_a = Uuid::from_u128(0xaaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa);
+        let aci_b = Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb);
+        let ada = kept_contact();
+        let bea = named_contact(8, "Bea");
+
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        insert_registration(&pool, &registration_for(aci_a)).await;
+        save_contact_message(&mut store, &ada, "kept on A").await;
+        assert!(forget_rejected_registration(&mut store, &url).await);
+        pool.close().await;
+        store.close().await;
+
+        let (mut pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, &registration_for(aci_b)).await;
+        save_contact_message(&mut pending, &bea, "on B").await;
+        pending_pool.close().await;
+        pending.close().await;
+        separate_previous_account(&dir).await.expect("B replaces A");
+
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        assert!(forget_rejected_registration(&mut store, &url).await);
+        pool.close().await;
+        store.close().await;
+
+        let (pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, &registration_for(aci_a)).await;
+        pending_pool.close().await;
+        pending.close().await;
+        separate_previous_account(&dir).await.expect("A returns");
+
+        assert!(
+            !dir.join(RETAINED_DIR).join(aci_a.to_string()).exists(),
+            "A is not left under retained/"
+        );
+        assert!(
+            dir.join(RETAINED_DIR)
+                .join(aci_b.to_string())
+                .join(RETAINED_SLOT_FILE)
+                .is_file(),
+            "B stays retained"
+        );
+
+        let active = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("live store");
+        assert_eq!(
+            active
+                .load_registration_data()
+                .await
+                .expect("registration")
+                .expect("A is registered")
+                .service_ids
+                .aci,
+            aci_a
+        );
+        let thread = Thread::Contact(ServiceId::Aci(ada.uuid.into()));
+        let kept = active
+            .message(&thread, 1_700_000_000_000)
+            .await
+            .expect("history read")
+            .expect("A's history is in the live store");
+        match kept.body {
+            ContentBody::DataMessage(message) => {
+                assert_eq!(message.body.as_deref(), Some("kept on A"));
+            }
+            _ => panic!("stored history is a data message"),
+        }
+        assert_eq!(contact_names_of(&active).await, vec!["Ada".to_string()]);
+        active.close().await;
+
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(publish_retained_accounts(&dir, &tx).await);
+        drop(tx);
+        let log = logged(&bytes);
+        drop(guard);
+        let events = collect_events(&mut rx).await;
+        let bea_id = signal_retained_chat_id(2, &bea.uuid.to_string());
+        let ada_retained = signal_retained_chat_id(1, &ada.uuid.to_string());
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation } if conversation.id == bea_id
+            )),
+            "B stays a previous account on its original slot"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation } if conversation.id == ada_retained
+                    || conversation.title == "Ada"
+            )),
+            "A is not also a previous-account row"
+        );
+        let debug = format!("{events:?}{log}");
+        assert!(
+            !debug.contains(&aci_a.to_string()) && !debug.contains(&aci_b.to_string()),
+            "the log and the events have no account id"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A retained chat with more than one page loads the older page.
+    /// The messages stay in order. The store is not sent to.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retained_chat_pages_past_the_first_page() {
+        let dir = temp_session_dir("retained-pages");
+        let aci = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").expect("aci");
+        let contact = named_contact(42, "Ada");
+        let aside = dir.join(RETAINED_DIR).join(aci.to_string());
+        std::fs::create_dir_all(&aside).expect("dir");
+        let url = sqlite_store_path(&aside)
+            .to_str()
+            .expect("path")
+            .to_string();
+        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("store");
+        let count = HISTORY_PAGE + 10;
+        let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
+        store.save_contact(&contact).await.expect("contact");
+        for n in 1..=count {
+            let body = format!("m-{n:02}");
+            store
+                .save_message(
+                    &thread,
+                    envelope_at(
+                        contact.uuid,
+                        &body,
+                        1_700_000_000_000 + i64::try_from(n).expect("n"),
+                    ),
+                )
+                .await
+                .expect("history");
+        }
+        store.close().await;
+        std::fs::write(aside.join(RETAINED_SLOT_FILE), "1\n").expect("slot");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(publish_retained_accounts(&dir, &tx).await);
+        drop(tx);
+        let events = collect_events(&mut rx).await;
+        let chat_id = signal_retained_chat_id(1, &contact.uuid.to_string());
+        let first: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessageReceived { message } if message.conversation_id == chat_id => {
+                    Some(message.body.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first.len(), HISTORY_PAGE, "the first publish is one page");
+        assert_eq!(first.first().copied(), Some("m-11"));
+        assert_eq!(first.last().copied(), Some("m-60"));
+        let oldest = events
+            .iter()
+            .find_map(|event| match event {
+                AdapterEvent::MessageReceived { message }
+                    if message.conversation_id == chat_id && message.body == "m-11" =>
+                {
+                    Some(message.id.clone())
+                }
+                _ => None,
+            })
+            .expect("oldest id of the first page");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        load_retained_older_page(&dir, &tx, &chat_id, &oldest).await;
+        drop(tx);
+        let events = collect_events(&mut rx).await;
+        let second: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessageReceived { message } if message.conversation_id == chat_id => {
+                    Some(message.body.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let older: Vec<String> = (1..=10).map(|n| format!("m-{n:02}")).collect();
+        assert_eq!(second, older, "the older page is the rest, oldest first");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::OlderHistoryLoaded {
+                    more: false,
+                    note: None,
+                    ..
+                }
+            )),
+            "the older page reaches the start of the chat"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::SendRejected { .. } | AdapterEvent::SendAccepted { .. }
+            )),
+            "paging does not send"
+        );
+        let debug = format!("{events:?}");
+        assert!(
+            !debug.contains(&aci.to_string()),
+            "events have no account id: {debug}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Retained files exist and the rows are not published yet.
     /// The status names no phone number and no account id.
     #[tokio::test(flavor = "current_thread")]
@@ -3707,6 +4412,48 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .expect("registration");
         pool.close().await;
         count
+    }
+
+    fn named_contact(id: u128, name: &str) -> Contact {
+        Contact {
+            uuid: Uuid::from_u128(id),
+            phone_number: None,
+            name: name.into(),
+            verified: Default::default(),
+            profile_key: vec![1; 32],
+            expire_timer: 0,
+            expire_timer_version: 2,
+            inbox_position: 0,
+            avatar: None,
+        }
+    }
+
+    async fn save_contact_message(store: &mut SqliteStore, contact: &Contact, body: &str) {
+        let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
+        store.save_contact(contact).await.expect("contact");
+        store
+            .save_message(
+                &thread,
+                envelope(
+                    contact.uuid,
+                    DataMessage {
+                        body: Some(body.into()),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("history");
+    }
+
+    async fn collect_events(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<AdapterEvent>,
+    ) -> Vec<AdapterEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
     }
 
     fn kept_contact() -> Contact {

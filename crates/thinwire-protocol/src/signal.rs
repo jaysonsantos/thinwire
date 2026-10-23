@@ -55,9 +55,24 @@ pub const SIGNAL_PREVIOUS_ACCOUNT: &str =
 pub const SIGNAL_HISTORY_KEPT: &str =
     "Old Signal history for the previous number is kept. It shows again after you link.";
 
+/// The helper is about to publish `retained/` again.
+/// The core drops the previous retained rows first, then the new rows arrive.
+/// This line is not a status of the live account.
+pub const SIGNAL_RETAINED_RESET: &str = "Signal is loading previous history.";
+
+/// The helper finished the retained publish for this link.
+/// The core drops a selected slot that was not published.
+/// This line is not a status of the live account.
+pub const SIGNAL_RETAINED_SETTLED: &str = "Signal finished loading previous history.";
+
+/// No previous account remains under `retained/`.
+/// The core clears the held line. This line is not a status of the live account.
+pub const SIGNAL_HISTORY_NOT_KEPT: &str = "No old Signal history is waiting.";
+
 /// Chat id prefix for a previous Signal account in `retained/`.
 /// The form is `retained:<slot>:<chat id>`. The slot is a count, not an
-/// account id.
+/// account id. The helper writes the count when it moves a store aside.
+/// A later link keeps that count.
 const SIGNAL_RETAINED_MARK: &str = "retained:";
 
 /// Chat id for one chat of a previous Signal account.
@@ -65,6 +80,15 @@ const SIGNAL_RETAINED_MARK: &str = "retained:";
 #[must_use]
 pub fn signal_retained_chat_id(slot: u32, chat_id: &str) -> String {
     format!("{SIGNAL_RETAINED_MARK}{slot}:{chat_id}")
+}
+
+/// The chat id inside a retained id, with the slot prefix removed.
+/// `None` for a live chat. The result is not an account id.
+#[must_use]
+pub fn signal_retained_chat(conversation_id: &str) -> Option<&str> {
+    signal_retained_slot(conversation_id)?;
+    let rest = conversation_id.strip_prefix(SIGNAL_RETAINED_MARK)?;
+    rest.split_once(':').map(|(_, chat)| chat)
 }
 
 /// The previous-account slot of `conversation_id`, when it has one.
@@ -242,8 +266,10 @@ mod tests {
         let group = "signal:group:abcd";
         let id = signal_retained_chat_id(2, group);
         assert_eq!(signal_retained_slot(&id), Some(2));
+        assert_eq!(signal_retained_chat(&id), Some(group));
         assert!(id.ends_with(group));
         assert_eq!(signal_retained_slot("ada"), None);
+        assert_eq!(signal_retained_chat("ada"), None);
         assert_eq!(signal_retained_slot("retained:0:ada"), None);
         assert_eq!(signal_retained_slot("retained:01:ada"), None);
         assert!(
