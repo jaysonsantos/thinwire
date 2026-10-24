@@ -60,6 +60,9 @@ enum LinkedEnd {
     Stopped,
     /// Cancel or shutdown moved the generation. The owner emits `Unlinked`.
     Superseded,
+    /// A remembered notice found no registration. The helper stays idle.
+    /// This end emits nothing: it is not a cancelled link.
+    Absent,
 }
 
 /// What a failed `receive_messages` means for this generation.
@@ -124,6 +127,8 @@ pub(super) struct Session {
     /// First-page cursors, keyed by chat id. `OpenChat` sends one on
     /// `HistoryLoaded`, then drops it.
     history_resume: std::sync::Mutex<HashMap<String, thinwire_protocol::HistoryStoreCursor>>,
+    /// The next worker loads a registration and does not start a new link.
+    resume_only: AtomicBool,
 }
 
 impl Session {
@@ -138,6 +143,7 @@ impl Session {
             groups: Mutex::new(super::group::GroupKeys::default()),
             viewed: std::sync::Mutex::new(None),
             history_resume: std::sync::Mutex::new(HashMap::new()),
+            resume_only: AtomicBool::new(false),
         }
     }
 
@@ -156,6 +162,14 @@ impl Session {
             .lock()
             .expect("history resume")
             .remove(chat_id)
+    }
+
+    pub(super) fn set_resume_only(&self, resume_only: bool) {
+        self.resume_only.store(resume_only, Ordering::SeqCst);
+    }
+
+    pub(super) fn resume_only(&self) -> bool {
+        self.resume_only.load(Ordering::SeqCst)
     }
 
     pub(super) fn set_pairing(&self, generation: u64) {
@@ -283,8 +297,22 @@ pub(super) async fn run(
     token: u64,
     wake: Arc<tokio::sync::Notify>,
     events: EventTx,
+    resume_only: bool,
 ) {
-    let end = run_linked(Arc::clone(&session), token, wake, events.clone()).await;
+    // No session file: do not create one, and do not start a QR link.
+    let end = if resume_only && !default_session_file_present() {
+        session.active.store(false, Ordering::SeqCst);
+        LinkedEnd::Absent
+    } else {
+        run_linked(
+            Arc::clone(&session),
+            token,
+            wake,
+            events.clone(),
+            resume_only,
+        )
+        .await
+    };
     let end = if session.is_current(token) {
         end
     } else {
@@ -373,6 +401,33 @@ fn store_link(registered: bool) -> StoreLink {
     } else {
         StoreLink::New
     }
+}
+
+/// What a helper start does with the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchOpen {
+    /// The store has a registration. Load it. No new QR.
+    Existing,
+    /// The user started a link and the store has no registration.
+    Provision,
+    /// A remembered notice, and the store has no registration. Stay idle.
+    ///
+    /// [`recover_pending_link`] runs first. A finished pending link is
+    /// already the registration by the time this arm is chosen.
+    Idle,
+}
+
+fn launch_open(registered: bool, resume_only: bool) -> LaunchOpen {
+    match (store_link(registered), resume_only) {
+        (StoreLink::Existing, _) => LaunchOpen::Existing,
+        (StoreLink::New, false) => LaunchOpen::Provision,
+        (StoreLink::New, true) => LaunchOpen::Idle,
+    }
+}
+
+/// `true` when the default session folder already has a sqlite file.
+fn default_session_file_present() -> bool {
+    signal_session_path().is_ok_and(|dir| sqlite_store_path(&dir).is_file())
 }
 
 /// Drop the registration Signal rejected, and the identity rows that belong
@@ -593,8 +648,10 @@ async fn park_previous_store(session_dir: &Path, aci: Option<Uuid>) -> Result<()
 /// When `session.sqlite` is missing and a pending link file is present, the
 /// pending file becomes `session.sqlite`.
 ///
-/// Startup uses [`recover_pending_link`]. That path restores a retained
-/// store for the pending account before this rename.
+/// This does nothing when `session.sqlite` is already there. Startup uses
+/// [`recover_pending_link`]. That path restores a retained store for the
+/// pending account before this rename, and it places a finished pending
+/// link when this file has no registration.
 async fn adopt_pending_store(session_dir: &Path) -> Result<(), ()> {
     let pending = pending_store_path(session_dir);
     if pending.exists()
@@ -876,8 +933,14 @@ async fn set_aside_store_without_aci(session_dir: &Path) -> Result<bool, ()> {
 /// same placement a live relink uses. A retained store for that account moves
 /// back, and the pending link merges into it. A later crash, once that store
 /// is the session file again, merges the pending link when the account is the
-/// same. A pending link for a different open account stays on disk. A second
-/// call leaves the files where the first call put them.
+/// same.
+///
+/// `session.sqlite` can also still be there with no registration. Resume
+/// would open that file and stay idle, so the linked device stays offline.
+/// This places that finished link the same way, including a retained store
+/// for that number. A pending link for a different registered account stays
+/// on disk. An unfinished pending file stays. A second call leaves the files
+/// where the first call put them.
 async fn recover_pending_link(session_dir: &Path) -> Result<(), ()> {
     if !pending_store_path(session_dir).exists() {
         return Ok(());
@@ -902,6 +965,12 @@ async fn recover_pending_link(session_dir: &Path) -> Result<(), ()> {
     let same_account = live == Some(linked) || (live.is_none() && prior == Some(linked));
     if same_account {
         return merge_linked_account(session_dir, &session_url, &pending_url, linked).await;
+    }
+    // No registration, and the pending link finished. A crash between writing
+    // that file and placing it leaves this shape. Place it the way a live
+    // relink does. A remembered notice then loads the registration.
+    if live.is_none() {
+        return separate_previous_account(session_dir).await;
     }
     Ok(())
 }
@@ -1358,6 +1427,7 @@ async fn run_linked(
     token: u64,
     wake: Arc<tokio::sync::Notify>,
     events: EventTx,
+    resume_only: bool,
 ) -> LinkedEnd {
     if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
@@ -1391,9 +1461,10 @@ async fn run_linked(
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
     };
-    // A crash can park the open account and leave the finished link in the
-    // pending file. Restore a retained store for that account before open
-    // creates a session file.
+    // A crash can leave a finished link in the pending file. Restore a
+    // retained store for that account, and place the link when
+    // `session.sqlite` has no registration, before open treats it as new.
+    // A remembered notice then loads that registration and does not stay idle.
     if recover_pending_link(&store_path).await.is_err() {
         fail(&events, STORE_FAILED);
         session.active.store(false, Ordering::SeqCst);
@@ -1407,7 +1478,7 @@ async fn run_linked(
             return LinkedEnd::Stopped;
         }
     };
-    if sled_session_present(&store_path) && !store.is_registered().await {
+    if !resume_only && sled_session_present(&store_path) && !store.is_registered().await {
         emit_status(
             &events,
             ProtocolId::Signal,
@@ -1420,8 +1491,13 @@ async fn run_linked(
         return LinkedEnd::Stopped;
     }
 
-    let mut manager = match store_link(store.is_registered().await) {
-        StoreLink::Existing => {
+    let mut manager = match launch_open(store.is_registered().await, resume_only) {
+        LaunchOpen::Idle => {
+            store.close().await;
+            session.active.store(false, Ordering::SeqCst);
+            return LinkedEnd::Absent;
+        }
+        LaunchOpen::Existing => {
             let manager = match Manager::load_registered(store).await {
                 Ok(manager) => manager,
                 Err(_) => {
@@ -1434,7 +1510,7 @@ async fn run_linked(
             discard_pending_scratch(&store_path, aci).await;
             manager
         }
-        StoreLink::New => {
+        LaunchOpen::Provision => {
             match link_unregistered(
                 &events,
                 session.as_ref(),
@@ -6029,6 +6105,77 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             none.is_empty(),
             "cancel and shutdown emit no account end from the worker: {none:?}"
         );
+        let absent = events_of(LinkedEnd::Absent);
+        assert!(
+            absent.is_empty(),
+            "a remembered notice with no registration emits nothing: {absent:?}"
+        );
+    }
+
+    /// A remembered notice loads a registration and does not start a QR link.
+    /// A link the user starts still provisions when the store is new.
+    #[test]
+    fn a_remembered_notice_opens_a_registered_store_and_stays_idle_otherwise() {
+        assert_eq!(launch_open(true, true), LaunchOpen::Existing);
+        assert_eq!(launch_open(false, true), LaunchOpen::Idle);
+        assert_eq!(launch_open(true, false), LaunchOpen::Existing);
+        assert_eq!(launch_open(false, false), LaunchOpen::Provision);
+        let dir = std::env::temp_dir().join(format!(
+            "thinwire-signal-resume-absent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert!(
+            !sqlite_store_path(&dir).exists(),
+            "a resume must not need a new session file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash registered the pending file and left `session.sqlite` with no
+    /// registration. Resume places that link and opens it. It does not stay
+    /// idle, and it does not start a QR link.
+    #[tokio::test]
+    async fn a_remembered_notice_places_a_registered_pending_store() {
+        let dir = temp_session_dir("resume-pending");
+        let (store, url, pool) = open_session_db(&dir).await;
+        assert!(
+            !store.is_registered().await,
+            "the session file has no registration"
+        );
+        pool.close().await;
+        store.close().await;
+
+        let (pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, REJECTED_REGISTRATION).await;
+        let linked = registered_aci(&pending).await;
+        pending_pool.close().await;
+        pending.close().await;
+
+        recover_pending_link(&dir)
+            .await
+            .expect("resume places the finished pending link");
+
+        let store = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("placed store");
+        assert!(
+            store.is_registered().await,
+            "the pending registration is now the session"
+        );
+        assert_eq!(registered_aci(&store).await, linked);
+        assert_eq!(
+            launch_open(store.is_registered().await, true),
+            LaunchOpen::Existing,
+            "a remembered notice loads this registration and does not start a QR link"
+        );
+        assert!(
+            !pending_store_path(&dir).exists(),
+            "the pending link is placed in the session store"
+        );
+        store.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #174 item 14: the worker itself fails (the session folder cannot be
@@ -6045,7 +6192,9 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let session = Arc::new(Session::new());
         let (token, wake) = session.begin_attempt();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        super::run(session, token, wake, tx).await;
+        // A fresh session still opens the store. `resume_only` would stop
+        // first when no session file exists, and this failure would not run.
+        super::run(session, token, wake, tx, false).await;
         super::super::path::set_test_session_dir(None);
         let _ = std::fs::remove_file(&blocker);
         let mut events = Vec::new();

@@ -688,10 +688,18 @@ pub struct Snapshot {
     /// Startup and linking failures happen before this and keep the link error.
     #[cfg(feature = "signal-local")]
     signal_inbox_open: bool,
-    /// The user accepted the full-screen Signal notice in this session.
-    /// Linking needs it; showing the notice again or cancelling clears it.
+    /// The user accepted the full-screen Signal notice for the current notice
+    /// copy ([`crate::signal_notice::SIGNAL_NOTICE_VERSION`]). Linking needs
+    /// it. The settings file keeps that acceptance, so the next launch starts
+    /// the helper without the notice. The acceptance covers the notice text.
+    /// A session end clears this flag and leaves the saved hash. Cancel, and
+    /// opening the notice again while the account is not linked, clear both.
     #[cfg(feature = "signal-local")]
     signal_notice_acknowledged: bool,
+    /// Cancel, or an explicit re-show while the account is not linked. The
+    /// settings sync drops the saved hash. A session end does not set this.
+    #[cfg(feature = "signal-local")]
+    signal_notice_forget: bool,
     /// The phone removed this linked device. The row and the open chat stay.
     /// Local history stays. Sending is off until the user links again.
     #[cfg(feature = "signal-local")]
@@ -928,6 +936,8 @@ impl Snapshot {
             signal_inbox_open: false,
             #[cfg(feature = "signal-local")]
             signal_notice_acknowledged: false,
+            #[cfg(feature = "signal-local")]
+            signal_notice_forget: false,
             #[cfg(feature = "signal-local")]
             signal_removed: false,
             #[cfg(feature = "signal-local")]
@@ -4370,6 +4380,8 @@ impl Snapshot {
             self.signal_inbox_open = false;
             self.signal_checking = false;
             self.end_signal_pairing();
+            // The acceptance is of the notice text, not of this session.
+            // The saved hash stays. The next launch can start the helper.
             self.signal_notice_acknowledged = false;
             self.signal_screen = SignalScreen::Hidden;
         }
@@ -5107,8 +5119,45 @@ impl Snapshot {
         self.signal_qr = None;
     }
 
+    /// The user accepted the current Signal notice copy.
+    #[cfg(feature = "signal-local")]
+    #[must_use]
+    pub const fn signal_notice_acknowledged(&self) -> bool {
+        self.signal_notice_acknowledged
+    }
+
+    /// Cancel or an explicit re-show asked to drop the saved hash. One read.
+    #[cfg(feature = "signal-local")]
+    pub(crate) fn take_signal_notice_forget(&mut self) -> bool {
+        std::mem::take(&mut self.signal_notice_forget)
+    }
+
+    /// A saved acceptance of the current notice copy. The notice stays off
+    /// the screen. The helper starts. A link still starts only from the link
+    /// screen.
+    #[cfg(feature = "signal-local")]
+    pub(crate) fn restore_signal_notice(&mut self) {
+        self.signal_notice_acknowledged = true;
+        self.pending.push(AdapterCommand::SignalAcknowledgeNotice);
+    }
+
+    /// The user opened the notice. While the account is not linked, this
+    /// drops the saved acceptance. While it is linked, the screen opens and
+    /// the acceptance stays.
     #[cfg(feature = "signal-local")]
     pub fn open_signal_notice(&mut self) {
+        self.reveal_signal_notice(true);
+    }
+
+    /// The saved hash is for an older notice copy. Show that notice. The
+    /// saved hash stays until the user accepts the current copy or clears it.
+    #[cfg(feature = "signal-local")]
+    pub(crate) fn show_outdated_signal_notice(&mut self) {
+        self.reveal_signal_notice(false);
+    }
+
+    #[cfg(feature = "signal-local")]
+    fn reveal_signal_notice(&mut self, forget: bool) {
         // With no helper program the entry is disabled (ADR 0013 decision
         // 6), and a frontend cannot open the notice another way.
         if !self.signal_linking_available() || self.helper_missing(ProtocolId::Signal) {
@@ -5127,6 +5176,9 @@ impl Snapshot {
         self.signal_started = false;
         self.signal_inbox_open = false;
         self.signal_notice_acknowledged = false;
+        if forget {
+            self.signal_notice_forget = true;
+        }
     }
 
     #[cfg(feature = "signal-local")]
@@ -5236,6 +5288,7 @@ impl Snapshot {
         self.signal_started = false;
         self.signal_inbox_open = false;
         self.signal_notice_acknowledged = false;
+        self.signal_notice_forget = true;
         self.signal_screen = SignalScreen::Hidden;
         self.status_text = "Signal linking cancelled.".into();
         self.pending.push(AdapterCommand::SignalCancelLink);
@@ -5635,6 +5688,40 @@ mod tests {
         assert!(snapshot.helper_missing(ProtocolId::Signal));
         assert!(!snapshot.helper_missing(ProtocolId::WhatsApp));
         assert_eq!(snapshot.error, None, "no error for a user with no Signal");
+    }
+
+    /// A saved acceptance starts the helper and leaves the notice off the
+    /// screen. The first link still needs the notice, and a link does not
+    /// start from the hidden screen.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_restored_signal_notice_starts_the_helper_without_showing_the_notice() {
+        let mut snapshot = Snapshot::new();
+        snapshot.begin_signal_link();
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "the first link needs the notice"
+        );
+        snapshot.open_signal_notice();
+        snapshot.begin_signal_link();
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "an open notice is not an acceptance"
+        );
+
+        let mut snapshot = Snapshot::new();
+        snapshot.restore_signal_notice();
+        assert!(snapshot.signal_notice_acknowledged());
+        assert_eq!(snapshot.signal_screen, SignalScreen::Hidden);
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![AdapterCommand::SignalAcknowledgeNotice]
+        );
+        snapshot.begin_signal_link();
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "a remembered acceptance does not start a link on its own"
+        );
     }
 
     /// #248: with no Signal helper program the notice does not open. When

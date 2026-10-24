@@ -2,11 +2,16 @@
 //!
 //! Compiled only with `signal-local`. The provisioning URL is unreachable
 //! until the notice is accepted. The client runs in the Signal helper
-//! process (ADR 0013), which starts only after that acknowledgement.
+//! process (ADR 0013). The helper starts after that acceptance. A saved
+//! acceptance of the same notice copy starts the helper at the next launch.
 
 use eframe::egui::{self, RichText};
 
 use super::theme;
+use thinwire_core::signal_notice::{
+    SIGNAL_NOTICE_ACCEPT, SIGNAL_NOTICE_BODY, SIGNAL_NOTICE_HEADING, SIGNAL_NOTICE_HELPER,
+    SIGNAL_NOTICE_NO_URL, SIGNAL_RISK,
+};
 use thinwire_core::state::{SignalScreen, Snapshot};
 use thinwire_core::{Intent, ProtocolId, SignalIntent, View};
 
@@ -33,9 +38,6 @@ pub(crate) fn notice_entry(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec
 /// Why the Signal entry is disabled.
 const HELPER_MISSING_REASON: &str = "Needs the Signal helper. Reinstall thinwire.";
 
-/// The Signal risk line of the README (ADR 0013 decision 9).
-const SIGNAL_RISK: &str = "Signal: no supported third-party API, expect breakage.";
-
 pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     egui::CentralPanel::default().show(ui, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| match snapshot.signal_screen {
@@ -47,23 +49,16 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>
 }
 
 fn notice(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
-    ui.heading("Signal experimental client");
+    ui.heading(SIGNAL_NOTICE_HEADING);
     ui.colored_label(theme::palette(ui).warn, SIGNAL_RISK);
     ui.add_space(8.0);
-    ui.label(
-        "thinwire links as a secondary device with presage and libsignal. Signal can change its service at any time, and this client can then stop.",
-    );
+    ui.label(SIGNAL_NOTICE_BODY);
     ui.add_space(6.0);
-    ui.label(
-        "The Signal client is AGPL-3.0 code. It runs in a separate program, thinwire-signal-helper, which starts after you accept this notice.",
-    );
+    ui.label(SIGNAL_NOTICE_HELPER);
     ui.add_space(8.0);
-    ui.label("No provisioning URL is shown on this screen.");
+    ui.label(SIGNAL_NOTICE_NO_URL);
     ui.add_space(12.0);
-    if ui
-        .button("I understand — Signal can break at any time")
-        .clicked()
-    {
+    if ui.button(SIGNAL_NOTICE_ACCEPT).clicked() {
         out.push(Intent::Signal(SignalIntent::AcknowledgeNotice));
     }
     if ui.button("Back").clicked() {

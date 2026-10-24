@@ -392,7 +392,14 @@ fn signal_ui_is_feature_gated_and_uses_the_helper() {
     assert!(ui.contains("signal_gate::notice_entry"));
     let gate = include_str!("signal_gate.rs");
     // ADR 0013 decision 9: the gate shows the same text as the README.
-    assert!(gate.contains("Signal: no supported third-party API, expect breakage."));
+    // The copy lives next to SIGNAL_NOTICE_VERSION so a text change shows
+    // the notice again.
+    assert!(gate.contains("SIGNAL_RISK"));
+    assert!(gate.contains("SIGNAL_NOTICE_NO_URL"));
+    let notice = include_str!("../../../thinwire-core/src/signal_notice.rs");
+    assert!(notice.contains("SIGNAL_NOTICE_VERSION"));
+    assert!(notice.contains("Signal: no supported third-party API, expect breakage."));
+    assert!(notice.contains("No provisioning URL is shown on this screen."));
     let readme = include_str!("../../../../README.md");
     assert!(readme.contains("Signal: no supported third-party API, expect breakage."));
     // A previous Signal number shows why sending is off, and the same risk line.
@@ -407,7 +414,6 @@ fn signal_ui_is_feature_gated_and_uses_the_helper() {
             "Old Signal history for the previous number is kept. It shows again after you link."
         )
     );
-    assert!(gate.contains("No provisioning URL is shown on this screen."));
     assert!(!gate.contains("local build"), "Signal is in release builds");
     // With no helper program the entry stays, disabled, with the reason.
     assert!(gate.contains("helper_missing(ProtocolId::Signal)"));
