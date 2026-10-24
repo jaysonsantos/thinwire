@@ -3,8 +3,9 @@
 # actions/upload-artifact wraps downloads in an outer zip and stores loose
 # files as 644. The tar.gz is what keeps executable bits and the .app tree.
 # macOS: sign Thinwire.app with the identity in MACOS_SIGNING_P12 when that
-# variable is set. An empty variable keeps the ad-hoc signature. There is
-# no notarization. Linux and Windows: flat binaries plus notices.
+# variable is set. An empty variable keeps the ad-hoc signature. Hardened
+# runtime is only for a Developer ID Application identity. There is no
+# notarization. Linux and Windows: flat binaries plus notices.
 #
 # The payload has three programs (ADR 0013): the MIT app, and next to it
 # the AGPL-3.0-only WhatsApp helper and the AGPL-3.0-only Signal helper. The
@@ -168,7 +169,8 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 # Temporary keychain used when MACOS_SIGNING_P12 is set. The EXIT trap
-# deletes the decoded p12 and the keychain, and restores the search list.
+# below deletes the decoded p12 and the keychain, and restores the search
+# list. It is a no-op until import creates those files.
 signing_p12_file=""
 signing_keychain=""
 signing_keychain_dir=""
@@ -177,6 +179,8 @@ signing_search_saved=0
 signing_search_list=()
 signing_xtrace=0
 sign_identity=""
+# 1 only for Developer ID Application. A self-signed identity has no Team ID.
+sign_use_hardened_runtime=0
 identity_hashes=()
 identity_names=()
 identity_subject_dn=""
@@ -204,6 +208,10 @@ cleanup_macos_signing() {
     fi
   fi
 }
+
+# Install cleanup before import. A failure in security list-keychains
+# still deletes the temporary keychain and the decoded certificate.
+trap cleanup_macos_signing EXIT
 
 trim_spaces() {
   local value="$1"
@@ -419,7 +427,6 @@ log_parsed_identities() {
 
 import_macos_signing_identity() {
   local decoded_ok=0 count index chosen hash name kind want_lc
-  trap cleanup_macos_signing EXIT
   save_keychain_search_list
 
   signing_p12_file="$(mktemp)"
@@ -506,6 +513,7 @@ import_macos_signing_identity() {
     sign_identity="${identity_hashes[0]}"
   fi
 
+  sign_use_hardened_runtime=0
   if [[ "$chosen" -ge 0 ]]; then
     hash="${identity_hashes[$chosen]}"
     name="${identity_names[$chosen]}"
@@ -516,9 +524,18 @@ import_macos_signing_identity() {
       echo "codesign identity subject: ${identity_subject_dn}"
       echo "codesign identity issuer: ${identity_issuer_dn}"
     fi
+    if [[ "$kind" == "Developer ID Application" ]]; then
+      sign_use_hardened_runtime=1
+    fi
   else
     echo "::warning::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
     log_parsed_identities
+    kind="unmatched identity"
+  fi
+  if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
+    echo "codesign hardened runtime: on (Developer ID Application)"
+  else
+    echo "codesign hardened runtime: off (${kind})"
   fi
   if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
     echo "codesign sign argument: ${MACOS_SIGNING_IDENTITY}"
@@ -537,22 +554,29 @@ macho_file() {
 
 # Sign one bundle or Mach-O with the stable identity. Keep an existing
 # entitlement plist when the target already has one.
+# Hardened runtime checks the Team ID of every library. A self-signed
+# identity has no Team ID, so dlopen of a bundled libtdjson fails.
+# --options runtime is only for Developer ID Application.
 sign_with_identity() {
   local target="$1"
   local entitlements_from="${2:-$1}"
   local entitlements status
   local -a args
   entitlements="$(mktemp)"
-  args=(--force --options runtime --timestamp=none --sign "$sign_identity")
+  args=(--force)
+  if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
+    args+=(--options runtime)
+  fi
+  args+=(--timestamp=none --sign "$sign_identity")
   if codesign -d --entitlements :- "$entitlements_from" >"$entitlements" 2>/dev/null \
     && grep -q '<plist' "$entitlements"; then
     args+=(--entitlements "$entitlements")
   fi
   echo "codesign: ${target}"
   status=0
-  if ! codesign "${args[@]}" "$target"; then
-    status=$?
-  fi
+  # Keep the codesign status. A negated command in an if-test stores 0.
+  # Delete the entitlements file before exit. The EXIT trap does not cover it.
+  codesign "${args[@]}" "$target" || status=$?
   rm -f "$entitlements"
   if [[ "$status" -ne 0 ]]; then
     exit "$status"

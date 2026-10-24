@@ -339,6 +339,31 @@ mod tests {
         assert!(stage.contains("--options runtime"));
         assert!(stage.contains("--timestamp=none"));
         assert!(
+            stage.contains(r#"codesign "${args[@]}" "$target" || status=$?"#),
+            "sign_with_identity must keep the codesign status"
+        );
+        assert!(
+            !stage.contains("if ! codesign"),
+            "a negated codesign in an if-test stores status 0"
+        );
+        assert!(stage.contains("codesign hardened runtime: on (Developer ID Application)"));
+        assert!(stage.contains("codesign hardened runtime: off"));
+        let trap_at = stage
+            .find("trap cleanup_macos_signing EXIT")
+            .expect("cleanup trap");
+        let import_at = stage
+            .find("import_macos_signing_identity()")
+            .expect("import");
+        assert!(
+            trap_at < import_at,
+            "set the signing EXIT trap before import_macos_signing_identity"
+        );
+        assert_eq!(
+            stage.matches("trap cleanup_macos_signing EXIT").count(),
+            1,
+            "one top-level EXIT trap"
+        );
+        assert!(
             !stage.contains("echo \"$MACOS_SIGNING_P12\""),
             "the stage script must not print the p12"
         );
@@ -410,6 +435,25 @@ mod tests {
         );
         assert!(
             notice.contains("must be included in all copies of the Software, in whole or in part")
+        );
+    }
+
+    /// `sign_with_identity` used to store 0 from `if ! codesign`.
+    /// A fake `codesign` that exits 42 must make the function exit 42.
+    #[cfg(unix)]
+    #[test]
+    fn sign_with_identity_propagates_a_codesign_failure() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test-sign-with-identity.sh");
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .output()
+            .expect("run the sign_with_identity bash test");
+        assert!(
+            output.status.success(),
+            "sign_with_identity bash test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
