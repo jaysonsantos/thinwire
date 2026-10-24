@@ -116,12 +116,17 @@ pub struct Settings {
     /// Path of the Signal helper program (ADR 0013, #248). Same rules as
     /// [`Self::whatsapp_helper`].
     signal_helper: Option<PathBuf>,
+    /// Accepted Signal notice copy. `0` means the user has not accepted the
+    /// current notice. Any other value is the version they accepted.
+    signal_notice_version: u64,
 }
 
 /// Settings key of the WhatsApp helper path.
 const WHATSAPP_HELPER_KEY: &str = "whatsapp_helper";
 /// Settings key of the Signal helper path.
 const SIGNAL_HELPER_KEY: &str = "signal_helper";
+/// Settings key of the accepted Signal notice copy.
+const SIGNAL_NOTICE_VERSION_KEY: &str = "signal_notice_version";
 
 impl Settings {
     /// Load from the platform config dir, and the muted chats from the
@@ -144,6 +149,7 @@ impl Settings {
         let theme = read_theme(&path).unwrap_or(ThemeMode::System);
         let whatsapp_helper = read_path(&path, WHATSAPP_HELPER_KEY);
         let signal_helper = read_path(&path, SIGNAL_HELPER_KEY);
+        let signal_notice_version = read_u64(&path, SIGNAL_NOTICE_VERSION_KEY).unwrap_or(0);
         Self {
             theme,
             notifications: read_bool(&path, "notifications").unwrap_or(true),
@@ -157,6 +163,7 @@ impl Settings {
             mutes: ChatMutes::in_memory(),
             whatsapp_helper,
             signal_helper,
+            signal_notice_version,
         }
     }
 
@@ -177,6 +184,22 @@ impl Settings {
             mutes: ChatMutes::in_memory(),
             whatsapp_helper: None,
             signal_helper: None,
+            signal_notice_version: 0,
+        }
+    }
+
+    /// The Signal notice copy the user accepted. `0` means none.
+    #[must_use]
+    pub const fn signal_notice_version(&self) -> u64 {
+        self.signal_notice_version
+    }
+
+    /// Remember which Signal notice copy the user accepted. `0` clears it.
+    /// Disk persist is queued.
+    pub fn set_signal_notice_version(&mut self, version: u64) {
+        if self.signal_notice_version != version {
+            self.signal_notice_version = version;
+            self.persist_pending = true;
         }
     }
 
@@ -299,6 +322,12 @@ impl Settings {
             self.notifications,
             self.notification_preview,
         );
+        if self.signal_notice_version != 0 {
+            text.push_str(&format!(
+                "{SIGNAL_NOTICE_VERSION_KEY} = {}\n",
+                self.signal_notice_version
+            ));
+        }
         // Keep the helper paths of the user when another setting changes.
         for (key, path) in [
             (WHATSAPP_HELPER_KEY, &self.whatsapp_helper),
@@ -320,6 +349,18 @@ fn default_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("thinwire")
         .join("settings.toml")
+}
+
+/// A `key = <integer>` line. Anything else is `None`.
+fn read_u64(path: &std::path::Path, wanted: &str) -> Option<u64> {
+    let contents = fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        if key.trim() != wanted {
+            return None;
+        }
+        value.trim().parse().ok()
+    })
 }
 
 /// A `key = true|false` line. Anything else is `None`.
@@ -483,6 +524,44 @@ mod tests {
         settings.set_theme(ThemeMode::System);
         settings.persist_now().expect("save system");
         assert_eq!(Settings::load_from(path).theme(), ThemeMode::System);
+    }
+
+    #[test]
+    fn the_signal_notice_version_persists_and_defaults_to_none() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.signal_notice_version(), 0);
+        settings.set_signal_notice_version(42);
+        settings.set_theme(ThemeMode::Dark);
+        settings.persist_now().expect("save");
+        let loaded = Settings::load_from(path.clone());
+        assert_eq!(loaded.signal_notice_version(), 42);
+        assert_eq!(loaded.theme(), ThemeMode::Dark, "the theme still reads");
+        settings.set_signal_notice_version(0);
+        settings.persist_now().expect("clear");
+        assert_eq!(Settings::load_from(path.clone()).signal_notice_version(), 0);
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.contains("signal_notice_version"),
+            "a cleared acceptance leaves no version key"
+        );
+        fs::write(
+            &path,
+            "theme = light\nsignal_notice_version = older\nwhatsapp_helper = \"/opt/helper\"\n",
+        )
+        .expect("write");
+        let bad = Settings::load_from(path);
+        assert_eq!(
+            bad.signal_notice_version(),
+            0,
+            "a bad value is not accepted"
+        );
+        assert_eq!(
+            bad.whatsapp_helper(),
+            Some(std::path::Path::new("/opt/helper")),
+            "the helper path still reads"
+        );
+        assert_eq!(Settings::in_memory().signal_notice_version(), 0);
     }
 
     #[test]

@@ -18,6 +18,7 @@ mod sends;
 pub mod settings;
 mod show;
 mod signal;
+pub mod signal_notice;
 pub mod state;
 mod theme;
 mod view;

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! One task owns a Signal link attempt.
 //!
-//! Begin, Cancel, Shutdown, and worker results are messages. The task handles
-//! them one at a time. A new Begin runs only after the previous cleanup
-//! finished, so a late shutdown cannot clear the next attempt.
+//! Begin, Resume, Cancel, Shutdown, and worker results are messages. The task
+//! handles them one at a time. A new Begin runs only after the previous
+//! cleanup finished, so a late shutdown cannot clear the next attempt.
 
 use std::sync::Arc;
 
@@ -18,6 +18,10 @@ use super::{SHUTDOWN_LIMIT, SignalWorker, finish_worker};
 enum Msg {
     Begin {
         pairing: u64,
+        events: EventTx,
+    },
+    /// Open a registration that is already on disk. No new QR link.
+    Resume {
         events: EventTx,
     },
     Cancel {
@@ -65,6 +69,13 @@ impl Handle {
         });
     }
 
+    /// Load a linked device after a remembered notice. No new provisioning.
+    pub(super) fn resume(&self, events: &EventTx) {
+        let _ = self.tx.send(Msg::Resume {
+            events: events.clone(),
+        });
+    }
+
     pub(super) fn cancel(&self, events: &EventTx) {
         let _ = self.tx.send(Msg::Cancel {
             events: events.clone(),
@@ -105,6 +116,7 @@ impl Owner {
         while let Some(msg) = rx.recv().await {
             match msg {
                 Msg::Begin { pairing, events } => self.begin(pairing, &events).await,
+                Msg::Resume { events } => self.resume(&events).await,
                 Msg::Cancel { events } => self.cancel(&events).await,
                 Msg::Shutdown { events, done } => {
                     self.shutdown(&events).await;
@@ -126,6 +138,8 @@ impl Owner {
         if self.worker.is_some() {
             self.cleanup().await;
         }
+        // A link the user starts can provision. A resume must not leak into it.
+        self.session.set_resume_only(false);
         self.session.set_pairing(pairing);
         self.worker = (self.start)(&self.session, events);
         self.generation = self.session.generation();
@@ -148,6 +162,20 @@ impl Owner {
             AdapterStatus::Connecting,
             "Signal linking was queued on the worker.",
         );
+    }
+
+    /// Load the registration when one exists. A missing store stays idle:
+    /// no QR, and no link-failure status.
+    async fn resume(&mut self, events: &EventTx) {
+        if self.worker.is_some() {
+            return;
+        }
+        self.session.set_resume_only(true);
+        self.worker = (self.start)(&self.session, events);
+        self.generation = self.session.generation();
+        if self.worker.is_none() {
+            self.session.shutdown();
+        }
     }
 
     async fn cancel(&mut self, events: &EventTx) {
@@ -183,7 +211,7 @@ impl Owner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use thinwire_protocol::{AccountState, AdapterEvent, AdapterStatus, ProtocolId};
 
@@ -317,6 +345,47 @@ mod tests {
             order,
             ["error", "unlinked"],
             "Unlinked clears signal_started before the link failure dialog is created"
+        );
+    }
+
+    /// A remembered notice asks the worker to load a registration. A failed
+    /// start stays quiet: it is not a link the user just started.
+    #[tokio::test]
+    async fn a_resume_loads_only_a_registered_session() {
+        let session = Arc::new(Session::new());
+        let saw = Arc::new(AtomicBool::new(false));
+        let saw_in_start = Arc::clone(&saw);
+        let handle = Handle::spawn(Arc::clone(&session), {
+            Box::new(move |session, _events| {
+                saw_in_start.store(session.resume_only(), Ordering::SeqCst);
+                let _ = session.begin_attempt();
+                None
+            })
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle.resume(&tx);
+        handle.flush().await;
+        assert!(saw.load(Ordering::SeqCst), "resume does not provision");
+        assert!(rx.try_recv().is_err(), "no link-failure status");
+
+        session.set_resume_only(true);
+        let provisioning = Arc::new(AtomicBool::new(true));
+        let provisioning_in_start = Arc::clone(&provisioning);
+        let handle = Handle::spawn(Arc::clone(&session), {
+            Box::new(move |session, _events| {
+                provisioning_in_start.store(session.resume_only(), Ordering::SeqCst);
+                let _ = session.begin_attempt();
+                session.mark_active();
+                let thread = std::thread::spawn(|| {});
+                let abort = tokio::spawn(async {}).abort_handle();
+                Some(SignalWorker { thread, abort })
+            })
+        });
+        handle.begin(1, &tx);
+        handle.flush().await;
+        assert!(
+            !provisioning.load(Ordering::SeqCst),
+            "a link the user starts can provision"
         );
     }
 }
