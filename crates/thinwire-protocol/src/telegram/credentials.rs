@@ -321,12 +321,46 @@ mod tests {
         assert!(stage.contains("Contents/Resources"));
         assert!(
             stage.contains("codesign --force --sign - \"$app\""),
-            "Thinwire.app needs an ad-hoc signature for the notification center (#161)"
+            "an empty MACOS_SIGNING_P12 keeps the ad-hoc bundle signature (#161)"
         );
         assert!(
-            stage.contains("codesign --verify --strict \"$app\""),
+            stage.contains("codesign --verify --strict --deep --verbose=2 \"$app\""),
             "the stage script must check the bundle signature"
         );
+        assert!(
+            stage.contains("security find-identity -p codesigning"),
+            "the stage script must read the signing identity from the temporary keychain"
+        );
+        assert!(
+            stage.contains("set-key-partition-list -S apple-tool:,apple:"),
+            "the stage script must allow codesign to use the temporary keychain"
+        );
+        assert!(stage.contains("-T /usr/bin/codesign"));
+        assert!(stage.contains("--options runtime"));
+        assert!(stage.contains("--timestamp=none"));
+        assert!(
+            !stage.contains("echo \"$MACOS_SIGNING_P12\""),
+            "the stage script must not print the p12"
+        );
+        assert!(
+            !stage.contains("echo \"$MACOS_SIGNING_P12_PASSWORD\""),
+            "the stage script must not print the p12 password"
+        );
+        for line in stage.lines() {
+            let code = line.split('#').next().unwrap_or("");
+            if code.contains("find-identity") {
+                assert!(
+                    !code.contains(" -v"),
+                    "find-identity must list untrusted identities too: {line}"
+                );
+            }
+            if code.contains("--deep") {
+                assert!(
+                    code.contains("--verify"),
+                    "use --deep only on codesign --verify: {line}"
+                );
+            }
+        }
         assert!(
             !os_zips.contains("tr -d"),
             "TELEGRAM_API_ID check must not strip embedded whitespace"
