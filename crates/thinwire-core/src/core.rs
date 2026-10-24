@@ -262,7 +262,7 @@ impl Core {
         watch_keychain(runtime, Arc::clone(&secrets), &notifier);
         let mut state = Snapshot::new();
         state.status_text = secret_store_status_text(secrets.backend_name());
-        Self {
+        let mut core = Self {
             runtime: runtime.clone(),
             commands,
             events,
@@ -278,6 +278,44 @@ impl Core {
             send_wake: None,
             notify: Notifications::new(),
             held_topic_notices: Vec::new(),
+        };
+        core.restore_signal_notice();
+        core
+    }
+
+    /// A saved acceptance of the current Signal notice starts the helper.
+    /// A different saved version shows the notice again and does not start
+    /// the helper. No saved version leaves the notice closed until the user
+    /// opens it. Accepting the notice is the opt-in.
+    fn restore_signal_notice(&mut self) {
+        #[cfg(feature = "signal-local")]
+        {
+            let stored = self.settings.signal_notice_version();
+            let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+            if stored == current {
+                self.state.restore_signal_notice();
+            } else if stored != 0 {
+                // The copy changed. Show the notice. This is not a user
+                // re-show, so the saved hash stays until they accept or clear.
+                self.state.show_outdated_signal_notice();
+            }
+        }
+    }
+
+    /// Write the Signal notice acceptance when the user accepts it. Drop the
+    /// saved hash only after Cancel or an explicit re-show. A session end
+    /// clears the in-memory flag and leaves the saved hash. A stored hash of
+    /// an older copy stays until the user accepts the new one or clears it.
+    fn sync_signal_notice(&mut self) {
+        #[cfg(feature = "signal-local")]
+        {
+            let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+            let forget = self.state.take_signal_notice_forget();
+            if self.state.signal_notice_acknowledged() {
+                self.settings.set_signal_notice_version(current);
+            } else if forget {
+                self.settings.set_signal_notice_version(0);
+            }
         }
     }
 
@@ -903,6 +941,7 @@ impl Core {
     }
 
     fn flush(&mut self) {
+        self.sync_signal_notice();
         let commands = self.state.take_commands();
         // While the clients close, a click must not reach a protocol worker.
         if !self.closing {
@@ -1516,6 +1555,260 @@ mod tests {
         } else {
             assert!(got.is_empty(), "feature off: Signal intents do nothing");
         }
+    }
+
+    /// #385: an accepted Signal notice is still accepted after a reload, and
+    /// the helper start does not wait for the notice. A different notice
+    /// version shows the notice again. Cancel and an explicit re-show clear
+    /// the saved acceptance. A session end does not.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_signal_notice_survives_reload_and_a_new_version_shows_it_again() {
+        use crate::state::SignalScreen;
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let mut core = core_with_signal_notice(current);
+        assert!(
+            core.view().signal_notice_acknowledged(),
+            "the saved acceptance is loaded"
+        );
+        assert_eq!(core.view().signal_screen, SignalScreen::Hidden);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (_events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        assert_eq!(
+            std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>(),
+            vec![AdapterCommand::SignalAcknowledgeNotice],
+            "the helper starts without the notice"
+        );
+
+        let mut core = core_with_signal_notice(current.wrapping_add(1));
+        assert!(
+            !core.view().signal_notice_acknowledged(),
+            "a different notice version is not accepted"
+        );
+        assert_eq!(
+            core.view().signal_screen,
+            SignalScreen::Notice,
+            "a changed notice version shows the notice again"
+        );
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (_events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        assert!(
+            sent.try_recv().is_err(),
+            "the helper waits for the new notice"
+        );
+        core.dispatch(Intent::Signal(SignalIntent::BeginLink));
+        assert!(
+            sent.try_recv().is_err(),
+            "the first link of this notice still needs it"
+        );
+        assert_eq!(
+            core.settings.signal_notice_version(),
+            current.wrapping_add(1),
+            "the automatic show keeps the old version until the user accepts or clears"
+        );
+        core.dispatch(Intent::Signal(SignalIntent::AcknowledgeNotice));
+        assert!(core.view().signal_notice_acknowledged());
+        assert_eq!(core.settings.signal_notice_version(), current);
+
+        core.dispatch(Intent::Signal(SignalIntent::CancelLink));
+        assert!(!core.view().signal_notice_acknowledged());
+        assert_eq!(core.settings.signal_notice_version(), 0, "cancel clears it");
+
+        core.dispatch(Intent::Signal(SignalIntent::OpenNotice));
+        core.dispatch(Intent::Signal(SignalIntent::AcknowledgeNotice));
+        assert_eq!(core.settings.signal_notice_version(), current);
+        core.dispatch(Intent::Signal(SignalIntent::OpenNotice));
+        assert_eq!(core.view().signal_screen, SignalScreen::Notice);
+        assert_eq!(
+            core.settings.signal_notice_version(),
+            0,
+            "showing the notice again clears it"
+        );
+
+        core.dispatch(Intent::Signal(SignalIntent::AcknowledgeNotice));
+        assert_eq!(core.settings.signal_notice_version(), current);
+    }
+
+    /// A network reconnect and a helper restart keep the saved notice hash.
+    /// Those events do not end the acceptance.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signal_reconnect_or_helper_restart_keeps_the_saved_notice() {
+        use thinwire_protocol::{AccountState, AdapterEvent, HelperState};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let mut core = core_with_signal_notice(current);
+        let (probe, _sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linked,
+            })
+            .expect("linked");
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linking,
+            })
+            .expect("reconnect");
+        events_tx
+            .send(AdapterEvent::Helper {
+                protocol: ProtocolId::Signal,
+                state: HelperState::Restarting,
+            })
+            .expect("helper restart");
+        core.pump();
+        assert!(
+            core.view().signal_notice_acknowledged(),
+            "a reconnect leaves the in-memory acceptance"
+        );
+        assert_eq!(core.settings.signal_notice_version(), current);
+    }
+
+    /// An unlink and a device removal clear no saved hash. The next launch
+    /// starts the helper without the notice. Retained rows need #384, which
+    /// is not on main.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unlinked_or_removed_signal_keeps_the_notice_for_the_next_launch() {
+        use crate::state::SignalScreen;
+        use thinwire_protocol::{AccountState, AdapterEvent};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+
+        let path = notice_settings_path("unlink");
+        let mut core = core_with_notice_at(&path, current);
+        let (probe, _sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linked,
+            })
+            .expect("linked");
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Unlinked,
+            })
+            .expect("unlinked");
+        core.pump();
+        assert!(
+            !core.view().signal_notice_acknowledged(),
+            "an unlink still clears the in-memory flag"
+        );
+        assert_eq!(core.settings.signal_notice_version(), current);
+        drop(core);
+
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(Settings::load_from(path)).with_memory_secrets(),
+        );
+        assert!(core.view().signal_notice_acknowledged());
+        assert_eq!(core.view().signal_screen, SignalScreen::Hidden);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (_events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        assert_eq!(
+            std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>(),
+            vec![AdapterCommand::SignalAcknowledgeNotice],
+            "after an unlink, the next launch starts the helper without the notice"
+        );
+
+        let path = notice_settings_path("removed");
+        let mut core = core_with_notice_at(&path, current);
+        let (probe, _sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linked,
+            })
+            .expect("linked");
+        events_tx
+            .send(AdapterEvent::AccountEnded {
+                protocol: ProtocolId::Signal,
+            })
+            .expect("removed");
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Unlinked,
+            })
+            .expect("unlinked after removal");
+        core.pump();
+        assert!(
+            core.view().signal_notice_acknowledged(),
+            "device removal parks the row and keeps the in-memory acceptance"
+        );
+        assert_eq!(core.settings.signal_notice_version(), current);
+        drop(core);
+
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(Settings::load_from(path)).with_memory_secrets(),
+        );
+        assert!(core.view().signal_notice_acknowledged());
+        assert_eq!(core.view().signal_screen, SignalScreen::Hidden);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (_events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        assert_eq!(
+            std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>(),
+            vec![AdapterCommand::SignalAcknowledgeNotice],
+            "after device removal, the next launch starts the helper without the notice"
+        );
+    }
+
+    #[cfg(feature = "signal-local")]
+    fn notice_settings_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("thinwire-core-tests")
+            .join(format!(
+                "notice-{}-{:?}-{label}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .join("settings.toml")
+    }
+
+    #[cfg(feature = "signal-local")]
+    fn core_with_signal_notice(version: u64) -> Core {
+        core_with_notice_at(&notice_settings_path(&version.to_string()), version)
+    }
+
+    #[cfg(feature = "signal-local")]
+    fn core_with_notice_at(path: &std::path::Path, version: u64) -> Core {
+        let mut settings = Settings::load_from(path.to_path_buf());
+        settings.set_signal_notice_version(version);
+        if let Some(job) = settings.take_persist_job() {
+            job.run();
+        }
+        Core::new(
+            &Handle::current(),
+            CoreConfig::new(Settings::load_from(path.to_path_buf())).with_memory_secrets(),
+        )
     }
 
     /// PR #48 review: the keychain watch must not outlive the core. After a

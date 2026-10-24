@@ -91,6 +91,12 @@ pub struct SignalAdapter {
     link: Option<owner::Handle>,
 }
 
+/// Library tests keep this off so an acknowledgement does not open the
+/// user's Signal session. The helper process leaves it on.
+#[cfg(all(test, feature = "signal-local"))]
+static RESUME_ON_ACKNOWLEDGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl SignalAdapter {
     #[must_use]
     pub fn new() -> Self {
@@ -130,7 +136,26 @@ impl SignalAdapter {
             AdapterStatus::Stubbed,
             "Signal notice accepted. No session has started.",
         );
+        self.resume_linked_session(events);
         Ok(())
+    }
+
+    /// A remembered notice starts the helper with this command. When a
+    /// registration is already on disk, open it. A new link still waits for
+    /// `SignalBeginLink`, so this does not show a QR code.
+    fn resume_linked_session(&mut self, events: &EventTx) {
+        #[cfg(feature = "signal-local")]
+        {
+            #[cfg(test)]
+            if !RESUME_ON_ACKNOWLEDGE.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            if matches!(self.engine, Engine::Live(_)) {
+                self.owner_handle().resume(events);
+            }
+        }
+        #[cfg(not(feature = "signal-local"))]
+        let _ = (self, events);
     }
 
     #[cfg(feature = "signal-local")]
@@ -430,6 +455,7 @@ fn link_owner(session: &Arc<live::Session>) -> owner::Handle {
 
 #[cfg(feature = "signal-local")]
 fn spawn_worker(session: &Arc<live::Session>, events: &EventTx) -> Option<SignalWorker> {
+    let resume_only = session.resume_only();
     let (token, wake) = session.begin_attempt();
     session.mark_active();
     let session = Arc::clone(session);
@@ -454,7 +480,13 @@ fn spawn_worker(session: &Arc<live::Session>, events: &EventTx) -> Option<Signal
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&runtime, async move {
-                let task = tokio::task::spawn_local(live::run(session, token, wake, task_events));
+                let task = tokio::task::spawn_local(live::run(
+                    session,
+                    token,
+                    wake,
+                    task_events,
+                    resume_only,
+                ));
                 let _ = abort_tx.send(task.abort_handle());
                 let _ = task.await;
             });
