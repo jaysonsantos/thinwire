@@ -61,11 +61,15 @@ pub const SIGNAL_RETAINED_RESET: &str = "Signal is loading previous history.";
 pub const SIGNAL_RETAINED_SETTLED: &str = "Signal finished loading previous history.";
 
 /// This publish could not read one previous-account store.
-/// The files stay on disk. The core keeps that slot and shows this sentence
-/// on the row. The wire detail is this sentence, one space, and the slot
-/// count. The slot is not an account id.
+/// The files stay on disk. The core keeps that slot.
+/// The row stays in the list. The row is disabled.
+/// The row has no Send control and no composer.
+/// The row shows this sentence. The sentence has no slot count.
+/// The wire detail is this sentence, one space, and the slot count.
+/// The core does not show the slot count. The helper log keeps the count.
+/// The slot is not an account id.
 /// This line is not a status of the live account.
-pub const SIGNAL_RETAINED_UNREADABLE: &str = "Signal could not read previous history.";
+pub const SIGNAL_RETAINED_UNREADABLE: &str = "This history could not be read. It was not deleted.";
 
 /// Status detail for one previous-account store this publish could not read.
 #[must_use]
@@ -314,15 +318,25 @@ mod tests {
             Some(4)
         );
         assert_eq!(
+            SIGNAL_RETAINED_UNREADABLE,
+            "This history could not be read. It was not deleted."
+        );
+        assert!(
+            !SIGNAL_RETAINED_UNREADABLE
+                .chars()
+                .any(|ch| ch.is_ascii_digit()),
+            "the user-facing text has no slot count"
+        );
+        assert_eq!(
             signal_retained_unreadable_slot(SIGNAL_RETAINED_UNREADABLE),
             None
         );
         assert_eq!(
-            signal_retained_unreadable_slot("Signal could not read previous history. 0"),
+            signal_retained_unreadable_slot(&format!("{SIGNAL_RETAINED_UNREADABLE} 0")),
             None
         );
         assert_eq!(
-            signal_retained_unreadable_slot("Signal could not read previous history. 01"),
+            signal_retained_unreadable_slot(&format!("{SIGNAL_RETAINED_UNREADABLE} 01")),
             None
         );
         assert!(

@@ -372,6 +372,14 @@ impl AccountRow {
         self.state == AccountState::Linked
     }
 
+    /// This previous-account store could not be read.
+    /// The row stays in the list. It is disabled. It has no composer.
+    #[must_use]
+    pub fn history_unreadable(&self) -> bool {
+        self.signal_retained.is_some()
+            && self.detail == thinwire_protocol::SIGNAL_RETAINED_UNREADABLE
+    }
+
     /// The helper stopped and does not start again by itself. The row
     /// shows "Helper stopped." and Restart.
     #[must_use]
@@ -1434,22 +1442,47 @@ impl Snapshot {
     }
 
     /// Why the open Signal chat cannot send, when it is a previous number.
+    /// An unreadable store uses the history sentence.
     /// `None` for the live number and for every other protocol.
     #[must_use]
     pub fn signal_read_only_reason(&self) -> Option<&'static str> {
-        if self.selected_protocol == ProtocolId::Signal && self.selected_signal_retained.is_some() {
-            Some(thinwire_protocol::SIGNAL_PREVIOUS_ACCOUNT)
-        } else {
-            None
+        if self.selected_protocol != ProtocolId::Signal {
+            return None;
         }
+        let slot = self.selected_signal_retained?;
+        let unreadable = self
+            .accounts
+            .iter()
+            .any(|row| row.signal_retained == Some(slot) && row.history_unreadable());
+        if unreadable {
+            Some(thinwire_protocol::SIGNAL_RETAINED_UNREADABLE)
+        } else {
+            Some(thinwire_protocol::SIGNAL_PREVIOUS_ACCOUNT)
+        }
+    }
+
+    /// The open row could not be read.
+    /// That row has no composer and no Send control.
+    #[must_use]
+    pub fn hides_composer(&self) -> bool {
+        self.signal_read_only_reason() == Some(thinwire_protocol::SIGNAL_RETAINED_UNREADABLE)
     }
 
     /// Chip text for one previous Signal account.
     /// One previous account keeps the reason line. Two or more use
     /// "Previous account N". N is the slot. It is not a phone number and
     /// it is not an account id.
+    /// A store that could not be read shows the history sentence.
+    /// That sentence has no slot count.
     #[must_use]
     pub fn signal_retained_chip_label(&self, slot: u32) -> String {
+        if self
+            .accounts
+            .iter()
+            .any(|row| row.signal_retained == Some(slot) && row.history_unreadable())
+        {
+            return thinwire_protocol::SIGNAL_RETAINED_UNREADABLE.to_owned();
+        }
         let count = self
             .accounts
             .iter()
@@ -9268,9 +9301,22 @@ mod tests {
             .accounts
             .iter()
             .find(|row| row.signal_retained == Some(1))
-            .expect("unreadable slot stays");
+            .expect("the row stays in the list");
         assert_eq!(kept.status, AdapterStatus::Error);
+        assert_eq!(
+            kept.detail, "This history could not be read. It was not deleted.",
+            "the row shows this text"
+        );
         assert_eq!(kept.detail, SIGNAL_RETAINED_UNREADABLE);
+        assert!(
+            !kept.detail.chars().any(|ch| ch.is_ascii_digit()),
+            "the user-facing text has no slot count"
+        );
+        assert!(kept.history_unreadable(), "the row is disabled");
+        assert_eq!(snapshot.signal_retained_chip_label(1), kept.detail);
+        snapshot.compose = "hello".into();
+        assert!(!snapshot.can_send(), "the row has no Send");
+        assert!(snapshot.hides_composer(), "the row has no composer");
         assert!(
             snapshot
                 .accounts
@@ -9304,6 +9350,9 @@ mod tests {
             .find(|row| row.signal_retained == Some(1))
             .expect("row");
         assert_eq!(restored.detail, SIGNAL_PREVIOUS_ACCOUNT);
+        assert!(!restored.history_unreadable());
+        assert!(!snapshot.hides_composer());
+        assert!(!snapshot.can_send(), "a previous account still cannot send");
         assert_eq!(snapshot.selected_messages()[0].body, "kept");
     }
 

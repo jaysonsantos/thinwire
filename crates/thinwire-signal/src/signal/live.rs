@@ -2106,7 +2106,9 @@ async fn publish_retained_body(
             // The files stay on disk. Tell the core to keep this slot.
             // A missing store is not in this loop, so settle still drops it.
             Err(()) => {
-                tracing::error!("{}", RETAINED_HISTORY_NOT_READ);
+                // The slot is a count. It is not an account id.
+                // The user-facing sentence does not include it.
+                tracing::error!(slot, "{}", RETAINED_HISTORY_NOT_READ);
                 if !current() {
                     return false;
                 }
@@ -5427,6 +5429,17 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             )),
             "the core is told to keep slot 4: {events:?}"
         );
+        assert_eq!(
+            thinwire_protocol::SIGNAL_RETAINED_UNREADABLE,
+            "This history could not be read. It was not deleted.",
+            "the row shows this text"
+        );
+        assert!(
+            !thinwire_protocol::SIGNAL_RETAINED_UNREADABLE
+                .chars()
+                .any(|ch| ch.is_ascii_digit()),
+            "the user-facing text has no slot count"
+        );
         assert!(
             events.iter().all(|event| !matches!(
                 event,
@@ -5445,8 +5458,10 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "the publish still brackets the stores: {events:?}"
         );
         assert!(
-            log.contains(RETAINED_HISTORY_NOT_READ) && !log.contains(account),
-            "the log names no account id: {log}"
+            log.contains(RETAINED_HISTORY_NOT_READ)
+                && log.contains("slot=4")
+                && !log.contains(account),
+            "the log keeps the slot count and names no account id: {log}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
