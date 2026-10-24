@@ -51,6 +51,7 @@ impl InboxUi {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: thinwire_protocol::ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            store_cursor: None,
         });
         snapshot.take_commands();
         let settings = Settings::load_from(std::env::temp_dir().join("thinwire-inbox-keys-test"));
@@ -292,6 +293,7 @@ fn the_row_menu_mutes_a_chat_and_a_protocol_mute_wins() {
         .apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:3".into(),
+            store_cursor: None,
         });
     harness.run();
     let header = harness.get_by_role_and_label(egui::accesskit::Role::Button, "Muted in Telegram");
@@ -1076,6 +1078,7 @@ fn a_message_in_another_chat_keeps_the_open_chat_and_the_composer() {
     state.snapshot.apply(AdapterEvent::HistoryLoaded {
         protocol: ProtocolId::Telegram,
         conversation_id: "telegram:2".into(),
+        store_cursor: None,
     });
     // Bob starts above Ada, so her message has to move past him.
     let mut bob_row = telegram_chat(2, "Bob", 20);
@@ -1169,6 +1172,7 @@ fn a_scrolled_inbox_keeps_the_row_under_the_pointer() {
     state.snapshot.apply(AdapterEvent::HistoryLoaded {
         protocol: ProtocolId::Telegram,
         conversation_id: "telegram:1".into(),
+        store_cursor: None,
     });
     state.snapshot.compose = "draft for Ada".into();
     let mut harness = harness(state);
