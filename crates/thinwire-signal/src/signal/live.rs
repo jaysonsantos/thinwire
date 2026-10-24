@@ -6373,11 +6373,11 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
     async fn insert_unreadable_copies(pool: &sqlx::SqlitePool, count: u64, newest_ts: i64) {
         use sqlx::Row;
 
-        let sample = sqlx::query(
-            "SELECT thread_id, sender_service_id, sender_device_id, destination_service_id,
-                needs_receipt, unidentified_sender, was_plaintext
-             FROM thread_messages LIMIT 1",
-        )
+        let sample = sqlx::query(concat!(
+            "SELECT thread_id, sender_service_id, sender_device_id, destination_service_id, ",
+            "needs_receipt, unidentified_sender, was_plaintext ",
+            "FROM thread_messages LIMIT 1",
+        ))
         .fetch_one(pool)
         .await
         .expect("a real row to copy");
