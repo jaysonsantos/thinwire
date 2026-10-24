@@ -3540,6 +3540,7 @@ mod tests {
             .send(AdapterEvent::HistoryLoaded {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
+                store_cursor: None,
             })
             .expect("queue");
         assert!(core.pump());

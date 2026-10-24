@@ -128,6 +128,7 @@ impl ProtocolAdapter for FakeAdapter {
                     AdapterEvent::HistoryLoaded {
                         protocol: ProtocolId::Telegram,
                         conversation_id,
+                        store_cursor: None,
                     }
                 } else {
                     AdapterEvent::CommandFailed {

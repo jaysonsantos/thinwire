@@ -179,6 +179,7 @@ mod tests {
                 protocol,
                 conversation_id: id.clone(),
                 before_message_id: "1000".into(),
+                store_cursor: None,
             },
             AdapterCommand::ResendMessage {
                 protocol,
@@ -296,10 +297,12 @@ mod tests {
                 more: false,
                 note: Some(id.clone()),
                 topic: None,
+                store_cursor: None,
             },
             AdapterEvent::HistoryLoaded {
                 protocol,
                 conversation_id: id.clone(),
+                store_cursor: None,
             },
             AdapterEvent::WhatsAppQr {
                 code: RedactedPairingSecret::new("qr"),

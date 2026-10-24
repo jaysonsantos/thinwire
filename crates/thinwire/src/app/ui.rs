@@ -1771,6 +1771,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
             // The next successful page clears it (#57).
             ui.label(RichText::new(note).small().color(theme::palette(ui).warn));
         }
+        let runs = snapshot.unreadable_runs();
         match state {
             ThreadState::Loading => {
                 ui.horizontal(|ui| {
@@ -1778,15 +1779,24 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
                     ui.label(RichText::new("Loading messages…").weak());
                 });
             }
-            ThreadState::Empty => {
+            ThreadState::Empty if runs.is_empty() => {
                 ui.label(RichText::new("No messages in this chat.").italics().weak());
             }
-            ThreadState::NoSelection | ThreadState::Rows => {}
+            ThreadState::Empty | ThreadState::NoSelection | ThreadState::Rows => {}
         }
         let mut gap_before = None;
         for message in &messages {
+            for run in runs
+                .iter()
+                .filter(|run| run.before_id.as_deref() == Some(message.id))
+            {
+                unreadable_run_label(ui, run.skipped);
+            }
             bubble(ui, message, &mut retry, gap_before, out);
             gap_before = Some(message.layout.run_end);
+        }
+        for run in runs.iter().filter(|run| run.before_id.is_none()) {
+            unreadable_run_label(ui, run.skipped);
         }
         if scroll.jump {
             ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
@@ -1867,6 +1877,12 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     }
 
     compose(ui, snapshot, hints, compose_height, out);
+}
+
+/// One weak line for a run of stored rows that could not be read.
+fn unreadable_run_label(ui: &mut egui::Ui, skipped: u32) {
+    let text = thinwire_core::state::unreadable_messages_line(skipped);
+    ui.label(RichText::new(text).small().weak());
 }
 
 /// What the thread remembers between frames for its scroll motion.
@@ -3003,6 +3019,14 @@ mod tests {
             "the chat note shows"
         );
         assert!(thread.contains("out.push(Intent::LoadOlderMessages {"));
+        assert!(thread.contains("snapshot.unreadable_runs()"));
+        assert!(thread.contains("unreadable_run_label"));
+        let label = &ui[ui.find("fn unreadable_run_label").expect("label")..];
+        let label = &label[..=label.find("\n}").expect("end")];
+        assert!(label.contains("unreadable_messages_line"));
+        assert!(label.contains(".small().weak()"));
+        assert!(!label.contains("button"));
+        assert!(!label.contains(".link"));
         assert!(
             thread.contains("older == OlderState::Idle"),
             "one request at a time"

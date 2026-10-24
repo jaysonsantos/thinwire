@@ -519,6 +519,7 @@ fn a_ready_loading_line_stays_busy_until_the_history_loads() {
     snapshot.apply(AdapterEvent::HistoryLoaded {
         protocol: ProtocolId::Telegram,
         conversation_id: "telegram:1".into(),
+        store_cursor: None,
     });
     assert!(!snapshot.is_loading());
     // Open a chat: its history starts to load.
@@ -544,6 +545,7 @@ fn a_ready_loading_line_stays_busy_until_the_history_loads() {
     snapshot.apply(AdapterEvent::HistoryLoaded {
         protocol: ProtocolId::Telegram,
         conversation_id: "telegram:2".into(),
+        store_cursor: None,
     });
     assert!(!snapshot.is_loading());
     assert!(snapshot.status_is_idle());
@@ -633,6 +635,7 @@ fn settled(store: &SecretStore) -> Snapshot {
     snapshot.apply(AdapterEvent::HistoryLoaded {
         protocol: ProtocolId::Telegram,
         conversation_id: "telegram:1".into(),
+        store_cursor: None,
     });
     assert!(!snapshot.is_loading());
     snapshot

@@ -12,7 +12,23 @@ use crate::SecretText;
 
 /// Version of the wire protocol. The app refuses a helper with another
 /// version.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 adds `store_cursor` on `load_older_messages`, `history_loaded`,
+/// and `older_history_loaded`. An older peer rejects that field.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Exclusive store position for the next history read, and how many rows
+/// this page could not read. `before_ms` is not a shown message id.
+/// `skipped` rides in this value so the wire adds one field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireHistoryCursor {
+    pub before_ms: u64,
+    pub skipped: u32,
+    /// The next read starts at `before_ms`. `false`: the count is only a
+    /// marker, and the next read still uses the shown message id.
+    pub resume: bool,
+}
 
 /// A protocol that a helper carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -90,6 +106,9 @@ pub enum WireCommand {
     LoadOlderMessages {
         conversation_id: String,
         before_message_id: String,
+        /// Exclusive store timestamp. `None` reads before `before_message_id`.
+        #[serde(default)]
+        store_cursor: Option<u64>,
     },
     SendText {
         conversation_id: String,
@@ -285,12 +304,18 @@ pub enum WireEvent {
     ChatListLoaded,
     HistoryLoaded {
         conversation_id: String,
+        /// Set when the first page stopped on unreadable rows.
+        #[serde(default)]
+        store_cursor: Option<WireHistoryCursor>,
     },
     OlderHistoryLoaded {
         conversation_id: String,
         before_message_id: String,
         more: bool,
         note: Option<String>,
+        /// Set when this page skipped rows or must continue from the store.
+        #[serde(default)]
+        store_cursor: Option<WireHistoryCursor>,
     },
     /// A QR payload of the pairing `generation`.
     Qr {

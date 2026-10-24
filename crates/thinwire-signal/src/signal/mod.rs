@@ -246,12 +246,16 @@ impl SignalAdapter {
         &mut self,
         conversation_id: &str,
         before_message_id: &str,
+        store_cursor: Option<u64>,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
         #[cfg(feature = "signal-local")]
         if let Engine::Live(session) = &self.engine {
-            let queued =
-                session.request_older(conversation_id.to_string(), before_message_id.to_string());
+            let queued = session.request_older(
+                conversation_id.to_string(),
+                before_message_id.to_string(),
+                store_cursor,
+            );
             if !queued {
                 let _ = events.send(AdapterEvent::OlderHistoryLoaded {
                     protocol: ProtocolId::Signal,
@@ -260,11 +264,12 @@ impl SignalAdapter {
                     more: true,
                     note: Some("Signal is not linked".to_string()),
                     topic: None,
+                    store_cursor: None,
                 });
             }
             return Ok(());
         }
-        let _ = (conversation_id, before_message_id);
+        let _ = (conversation_id, before_message_id, store_cursor);
         let _ = events.send(AdapterEvent::OlderHistoryLoaded {
             protocol: ProtocolId::Signal,
             conversation_id: conversation_id.to_string(),
@@ -272,6 +277,7 @@ impl SignalAdapter {
             more: false,
             note: None,
             topic: None,
+            store_cursor: None,
         });
         Ok(())
     }
@@ -297,14 +303,19 @@ impl SignalAdapter {
                 Ok(())
             }
             #[cfg(feature = "signal-local")]
-            Engine::Live(_) => {
+            Engine::Live(session) => {
+                let cursor = session.take_history_resume(conversation_id);
                 emit_status(
                     events,
                     ProtocolId::Signal,
                     AdapterStatus::Ready,
                     "Signal history was loaded with the chat list.",
                 );
-                emit_history_loaded(events, ProtocolId::Signal, conversation_id);
+                let _ = events.send(AdapterEvent::HistoryLoaded {
+                    protocol: ProtocolId::Signal,
+                    conversation_id: conversation_id.to_string(),
+                    store_cursor: cursor,
+                });
                 Ok(())
             }
         }
@@ -581,7 +592,8 @@ impl ProtocolAdapter for SignalAdapter {
                 protocol: ProtocolId::Signal,
                 conversation_id,
                 before_message_id,
-            } => self.load_older(&conversation_id, &before_message_id, events),
+                store_cursor,
+            } => self.load_older(&conversation_id, &before_message_id, store_cursor, events),
             AdapterCommand::SendText {
                 protocol: ProtocolId::Signal,
                 conversation_id,
@@ -825,6 +837,7 @@ mod tests {
             AdapterEvent::HistoryLoaded {
                 protocol: ProtocolId::Signal,
                 conversation_id,
+                ..
             } if conversation_id == "chat-1"
         )));
     }
@@ -905,6 +918,7 @@ mod tests {
             AdapterEvent::HistoryLoaded {
                 protocol: ProtocolId::Signal,
                 conversation_id,
+                ..
             } if conversation_id == "chat-1"
         )));
 

@@ -6,12 +6,12 @@
 
 use thinwire_ipc::{
     SecretText, WireAccountState, WireArrival, WireCommand, WireConversation, WireDelivery,
-    WireEvent, WireMessage, WireProtocol, WireStatus,
+    WireEvent, WireHistoryCursor, WireMessage, WireProtocol, WireStatus,
 };
 
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, Arrival, ChatMessage, Conversation,
-    Delivery, ProtocolId, RedactedPairingSecret,
+    Delivery, HistoryStoreCursor, ProtocolId, RedactedPairingSecret,
 };
 
 /// The wire name of a protocol that runs in a helper. `None` for a protocol
@@ -50,10 +50,12 @@ pub(crate) fn command_to_wire(
         AdapterCommand::LoadOlderMessages {
             conversation_id,
             before_message_id,
+            store_cursor,
             ..
         } => WireCommand::LoadOlderMessages {
             conversation_id: conversation_id.clone(),
             before_message_id: before_message_id.clone(),
+            store_cursor: *store_cursor,
         },
         AdapterCommand::SendText {
             conversation_id,
@@ -122,10 +124,12 @@ pub(crate) fn command_from_wire(
         WireCommand::LoadOlderMessages {
             conversation_id,
             before_message_id,
+            store_cursor,
         } => AdapterCommand::LoadOlderMessages {
             protocol,
             conversation_id,
             before_message_id,
+            store_cursor,
         },
         WireCommand::SendText {
             conversation_id,
@@ -281,7 +285,11 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
         AdapterEvent::HistoryLoaded {
             protocol: seen,
             conversation_id,
-        } if own(seen) => WireEvent::HistoryLoaded { conversation_id },
+            store_cursor,
+        } if own(seen) => WireEvent::HistoryLoaded {
+            conversation_id,
+            store_cursor: store_cursor.map(cursor_to_wire),
+        },
         AdapterEvent::OlderHistoryLoaded {
             protocol: seen,
             conversation_id,
@@ -289,11 +297,13 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
             more,
             note,
             topic: _,
+            store_cursor,
         } if own(seen) => WireEvent::OlderHistoryLoaded {
             conversation_id,
             before_message_id,
             more,
             note,
+            store_cursor: store_cursor.map(cursor_to_wire),
         },
         AdapterEvent::WhatsAppQr { code, generation } if own(ProtocolId::WhatsApp) => {
             WireEvent::Qr {
@@ -400,15 +410,20 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
         },
         WireEvent::Notice { text } => AdapterEvent::Notice { protocol, text },
         WireEvent::ChatListLoaded => AdapterEvent::ChatListLoaded { protocol },
-        WireEvent::HistoryLoaded { conversation_id } => AdapterEvent::HistoryLoaded {
+        WireEvent::HistoryLoaded {
+            conversation_id,
+            store_cursor,
+        } => AdapterEvent::HistoryLoaded {
             protocol,
             conversation_id,
+            store_cursor: store_cursor.map(cursor_from_wire),
         },
         WireEvent::OlderHistoryLoaded {
             conversation_id,
             before_message_id,
             more,
             note,
+            store_cursor,
         } => AdapterEvent::OlderHistoryLoaded {
             protocol,
             conversation_id,
@@ -416,6 +431,7 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
             more,
             note,
             topic: None,
+            store_cursor: store_cursor.map(cursor_from_wire),
         },
         WireEvent::Qr { code, generation } => {
             let code = RedactedPairingSecret::new(code.expose());
@@ -438,6 +454,22 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
 // endregion: events
 
 // region: values
+
+const fn cursor_to_wire(cursor: HistoryStoreCursor) -> WireHistoryCursor {
+    WireHistoryCursor {
+        before_ms: cursor.before_ms,
+        skipped: cursor.skipped,
+        resume: cursor.resume,
+    }
+}
+
+const fn cursor_from_wire(cursor: WireHistoryCursor) -> HistoryStoreCursor {
+    HistoryStoreCursor {
+        before_ms: cursor.before_ms,
+        skipped: cursor.skipped,
+        resume: cursor.resume,
+    }
+}
 
 const fn status_to_wire(status: AdapterStatus) -> WireStatus {
     match status {
@@ -685,6 +717,11 @@ mod tests {
             AdapterEvent::HistoryLoaded {
                 protocol,
                 conversation_id: CHAT.into(),
+                store_cursor: Some(HistoryStoreCursor {
+                    before_ms: 10,
+                    skipped: 1,
+                    resume: true,
+                }),
             },
             AdapterEvent::OlderHistoryLoaded {
                 protocol,
@@ -693,6 +730,11 @@ mod tests {
                 more: true,
                 note: Some("try again".into()),
                 topic: None,
+                store_cursor: Some(HistoryStoreCursor {
+                    before_ms: 9,
+                    skipped: 208,
+                    resume: true,
+                }),
             },
             AdapterEvent::WhatsAppQr {
                 code: RedactedPairingSecret::new("qr-fixture"),
@@ -779,6 +821,7 @@ mod tests {
                 protocol,
                 conversation_id: CHAT.into(),
                 before_message_id: "m1".into(),
+                store_cursor: None,
             },
             AdapterCommand::SendText {
                 protocol,
