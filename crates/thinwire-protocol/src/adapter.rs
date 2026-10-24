@@ -705,12 +705,24 @@ impl AdapterEvent {
     }
 }
 
+/// One unreadable stretch on a history page, and the shown message it sits
+/// older than.
+///
+/// `after_id` is that message's id. `None` means the stretch is newer than
+/// every row this page shows, so the core places it at the request anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySkipRun {
+    pub after_id: Option<String>,
+    pub skipped: u32,
+}
+
 /// Where the next Signal history read starts, and how many rows this page
 /// could not read.
 ///
 /// `before_ms` is an exclusive store timestamp. It is not a shown message id.
-/// The skip count is part of this value. The wire adds this one field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The skip count and the position of each stretch are part of this value.
+/// The wire adds this one field.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryStoreCursor {
     pub before_ms: u64,
     /// Rows in this page that the store could not read.
@@ -718,6 +730,9 @@ pub struct HistoryStoreCursor {
     /// The next read starts at `before_ms`. `false` means the next read still
     /// uses the oldest shown message id. The count is still shown.
     pub resume: bool,
+    /// Where those rows sit among the rows this page shows. Empty: one run
+    /// of `skipped` at the request anchor.
+    pub runs: Vec<HistorySkipRun>,
 }
 
 /// Pairing material shown only on the experimental WhatsApp screen.

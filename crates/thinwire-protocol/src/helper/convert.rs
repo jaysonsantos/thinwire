@@ -6,12 +6,12 @@
 
 use thinwire_ipc::{
     SecretText, WireAccountState, WireArrival, WireCommand, WireConversation, WireDelivery,
-    WireEvent, WireHistoryCursor, WireMessage, WireProtocol, WireStatus,
+    WireEvent, WireHistoryCursor, WireHistorySkip, WireMessage, WireProtocol, WireStatus,
 };
 
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, Arrival, ChatMessage, Conversation,
-    Delivery, HistoryStoreCursor, ProtocolId, RedactedPairingSecret,
+    Delivery, HistorySkipRun, HistoryStoreCursor, ProtocolId, RedactedPairingSecret,
 };
 
 /// The wire name of a protocol that runs in a helper. `None` for a protocol
@@ -455,19 +455,35 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
 
 // region: values
 
-const fn cursor_to_wire(cursor: HistoryStoreCursor) -> WireHistoryCursor {
+fn cursor_to_wire(cursor: HistoryStoreCursor) -> WireHistoryCursor {
     WireHistoryCursor {
         before_ms: cursor.before_ms,
         skipped: cursor.skipped,
         resume: cursor.resume,
+        runs: cursor
+            .runs
+            .into_iter()
+            .map(|run| WireHistorySkip {
+                after_id: run.after_id,
+                skipped: run.skipped,
+            })
+            .collect(),
     }
 }
 
-const fn cursor_from_wire(cursor: WireHistoryCursor) -> HistoryStoreCursor {
+fn cursor_from_wire(cursor: WireHistoryCursor) -> HistoryStoreCursor {
     HistoryStoreCursor {
         before_ms: cursor.before_ms,
         skipped: cursor.skipped,
         resume: cursor.resume,
+        runs: cursor
+            .runs
+            .into_iter()
+            .map(|run| HistorySkipRun {
+                after_id: run.after_id,
+                skipped: run.skipped,
+            })
+            .collect(),
     }
 }
 
@@ -721,6 +737,7 @@ mod tests {
                     before_ms: 10,
                     skipped: 1,
                     resume: true,
+                    runs: Vec::new(),
                 }),
             },
             AdapterEvent::OlderHistoryLoaded {
@@ -734,6 +751,10 @@ mod tests {
                     before_ms: 9,
                     skipped: 208,
                     resume: true,
+                    runs: vec![HistorySkipRun {
+                        after_id: Some("8000:ada".into()),
+                        skipped: 1,
+                    }],
                 }),
             },
             AdapterEvent::WhatsAppQr {

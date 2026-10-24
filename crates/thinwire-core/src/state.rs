@@ -2255,28 +2255,53 @@ impl Snapshot {
             return self.queue_store_page(protocol, chat, request_before, cursor.before_ms);
         }
         let pending = self.open_unreadable.remove(&key);
-        let skipped = pending
-            .as_ref()
-            .map(|open| open.skipped)
-            .unwrap_or(0)
-            .saturating_add(cursor.skipped);
-        if skipped > 0 {
-            let before_id = pending.map_or_else(
-                || {
-                    if initial {
-                        oldest
-                    } else if request_before.is_empty() {
-                        None
-                    } else {
-                        Some(request_before.to_string())
+        if cursor.runs.is_empty() {
+            let skipped = pending
+                .as_ref()
+                .map(|open| open.skipped)
+                .unwrap_or(0)
+                .saturating_add(cursor.skipped);
+            if skipped > 0 {
+                let before_id = pending.map_or_else(
+                    || Self::unreadable_anchor(initial, request_before, oldest),
+                    |open| open.before_id,
+                );
+                self.unreadable
+                    .entry(key.clone())
+                    .or_default()
+                    .push(UnreadableRun { before_id, skipped });
+            }
+        } else {
+            let mut leading = pending.as_ref().map(|open| open.skipped).unwrap_or(0);
+            let pending_anchor = pending.map(|open| open.before_id);
+            for run in cursor.runs {
+                if run.skipped == 0 {
+                    continue;
+                }
+                match run.after_id {
+                    None => leading = leading.saturating_add(run.skipped),
+                    Some(id) => {
+                        self.unreadable
+                            .entry(key.clone())
+                            .or_default()
+                            .push(UnreadableRun {
+                                before_id: Some(id),
+                                skipped: run.skipped,
+                            });
                     }
-                },
-                |open| open.before_id,
-            );
-            self.unreadable
-                .entry(key.clone())
-                .or_default()
-                .push(UnreadableRun { before_id, skipped });
+                }
+            }
+            if leading > 0 {
+                let before_id = pending_anchor
+                    .unwrap_or_else(|| Self::unreadable_anchor(initial, request_before, oldest));
+                self.unreadable
+                    .entry(key.clone())
+                    .or_default()
+                    .push(UnreadableRun {
+                        before_id,
+                        skipped: leading,
+                    });
+            }
         }
         if cursor.resume && moves && more && added && topic.is_none() {
             self.history_resume.insert(key, cursor.before_ms);
@@ -2284,6 +2309,20 @@ impl Snapshot {
             self.history_resume.remove(&key);
         }
         false
+    }
+
+    fn unreadable_anchor(
+        initial: bool,
+        request_before: &str,
+        oldest: Option<String>,
+    ) -> Option<String> {
+        if initial {
+            oldest
+        } else if request_before.is_empty() {
+            None
+        } else {
+            Some(request_before.to_string())
+        }
     }
 
     fn close_open_run(&mut self, key: &OlderPageKey) {
@@ -14107,6 +14146,7 @@ mod tests {
                 before_ms: 5_000,
                 skipped: 208,
                 resume: true,
+                runs: Vec::new(),
             }),
         });
         assert_eq!(snapshot.older_state(), OlderState::Loading);
@@ -14128,6 +14168,7 @@ mod tests {
                 before_ms: 1_000,
                 skipped: 92,
                 resume: false,
+                runs: Vec::new(),
             }),
         });
         let runs = snapshot.unreadable_runs();
@@ -14150,6 +14191,7 @@ mod tests {
                 before_ms: 4_000,
                 skipped: 208,
                 resume: true,
+                runs: Vec::new(),
             }),
         });
         assert_eq!(older_store_cursors(&mut snapshot), vec![Some(4_000)]);
@@ -14167,6 +14209,7 @@ mod tests {
                 before_ms: 50,
                 skipped: 0,
                 resume: false,
+                runs: Vec::new(),
             }),
         });
         assert_eq!(snapshot.unreadable_runs().len(), 1);
@@ -14200,6 +14243,7 @@ mod tests {
                 before_ms: 3_000,
                 skipped: 208,
                 resume: true,
+                runs: Vec::new(),
             }),
         });
         assert!(snapshot.unreadable_runs().is_empty());
@@ -14221,6 +14265,7 @@ mod tests {
                 before_ms: 1,
                 skipped: 92,
                 resume: false,
+                runs: Vec::new(),
             }),
         });
         let runs = snapshot.unreadable_runs();
@@ -14259,6 +14304,7 @@ mod tests {
                 before_ms: 3_000,
                 skipped: 1,
                 resume: false,
+                runs: Vec::new(),
             }),
         });
         assert_eq!(snapshot.unreadable_runs()[0].skipped, 1);
@@ -14283,6 +14329,7 @@ mod tests {
                 before_ms: 100,
                 skipped: 10,
                 resume: true,
+                runs: Vec::new(),
             }),
         });
         assert_eq!(older_store_cursors(&mut snapshot), vec![Some(100)]);
@@ -14297,6 +14344,7 @@ mod tests {
                 before_ms: 100,
                 skipped: 10,
                 resume: true,
+                runs: Vec::new(),
             }),
         });
         assert!(older_store_cursors(&mut snapshot).is_empty());
@@ -14329,6 +14377,7 @@ mod tests {
                 before_ms: 3_000,
                 skipped: 208,
                 resume: true,
+                runs: Vec::new(),
             }),
         });
         assert_eq!(older_store_cursors(&mut snapshot), vec![Some(3_000)]);
@@ -14351,6 +14400,60 @@ mod tests {
             vec![Some(3_000)],
             "the retry sends the same store cursor"
         );
+    }
+
+    #[test]
+    fn unreadable_runs_sit_between_the_readable_rows() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 9_000, "anchor"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        for (millis, body) in [(8_000, "newer"), (6_000, "middle"), (4_000, "older")] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: signal_row(chat, millis, body),
+            });
+        }
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 3_000,
+                skipped: 3,
+                resume: false,
+                runs: vec![
+                    thinwire_protocol::HistorySkipRun {
+                        after_id: Some("8000:ada".into()),
+                        skipped: 1,
+                    },
+                    thinwire_protocol::HistorySkipRun {
+                        after_id: Some("6000:ada".into()),
+                        skipped: 2,
+                    },
+                ],
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].before_id.as_deref(), Some("8000:ada"));
+        assert_eq!(runs[0].skipped, 1);
+        assert_eq!(runs[1].before_id.as_deref(), Some("6000:ada"));
+        assert_eq!(runs[1].skipped, 2);
+        assert!(
+            runs.iter()
+                .all(|run| run.before_id.as_deref() != Some("9000:ada")),
+            "the runs do not collapse onto the request anchor"
+        );
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
     }
 
     // endregion: #135

@@ -35,7 +35,7 @@ use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::AttemptCancel;
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    HistoryStoreCursor, ProtocolId, RedactedPairingSecret, SIGNAL_HISTORY_KEPT,
+    HistorySkipRun, HistoryStoreCursor, ProtocolId, RedactedPairingSecret, SIGNAL_HISTORY_KEPT,
     SIGNAL_HISTORY_NOT_KEPT, SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_RESET,
     SIGNAL_RETAINED_SETTLED, emit_account, emit_conversation, emit_message, emit_status,
     signal_retained_chat, signal_retained_chat_id, signal_retained_slot,
@@ -2334,7 +2334,7 @@ async fn fetch_history_page(
         let mut span = HISTORY_WINDOW_MS;
         let mut page = NewestBound::new(HISTORY_PAGE);
         let mut good = 0usize;
-        let mut skipped = 0u32;
+        let mut skips = SkipRuns::new();
         let mut oldest_scanned: Option<u64> = None;
         let mut seen = HashSet::new();
         let mut cursor_before = before;
@@ -2373,11 +2373,19 @@ async fn fetch_history_page(
             for ts in fresh {
                 oldest_scanned = Some(oldest_scanned.map_or(ts, |old| old.min(ts)));
                 let loaded = store.message(thread, ts).await.map_err(|_| ());
-                if matches!(loaded, Ok(None) | Err(())) {
-                    skipped = skipped.saturating_add(1);
-                }
-                if note_history_row(&mut page, loaded, before, before_id, content_history_key) {
+                let kept_id = match &loaded {
+                    Ok(Some(value)) => Some(content_history_key(value).1),
+                    Ok(None) | Err(()) => None,
+                };
+                let kept =
+                    note_history_row(&mut page, loaded, before, before_id, content_history_key);
+                if kept {
                     good += 1;
+                    if let Some(id) = kept_id {
+                        skips.kept(id);
+                    }
+                } else if kept_id.is_none() {
+                    skips.skip();
                 }
             }
             match history_read_after(good, timestamps.len(), seen.len(), reached_start) {
@@ -2396,6 +2404,7 @@ async fn fetch_history_page(
                 }
             }
         }
+        let shown = page.ids();
         let (rows, overflow) = page.finish(true);
         // A continuation timestamp is safe when every kept row is on the
         // page. A fuller read drops the oldest good rows, so the next page
@@ -2404,11 +2413,7 @@ async fn fetch_history_page(
             hit_cap && good <= HISTORY_PAGE && oldest_scanned.is_some_and(|ts| ts < before);
         let more = history_page_more(hit_cap, exhausted, rows.is_empty(), resume)
             || (!rows.is_empty() && overflow);
-        let cursor = (skipped > 0 || resume).then_some(HistoryStoreCursor {
-            before_ms: oldest_scanned.unwrap_or(0),
-            skipped,
-            resume,
-        });
+        let cursor = cursor_for_page(oldest_scanned, resume, more, skips, &shown);
         Ok(HistoryPage { rows, more, cursor })
     }
     .await;
@@ -2654,10 +2659,111 @@ impl<T> NewestBound<T> {
         self.rows.insert(index, OrderedRow { millis, id, value });
     }
 
+    fn ids(&self) -> Vec<String> {
+        self.rows.iter().map(|row| row.id.clone()).collect()
+    }
+
     fn finish(self, reached_start: bool) -> (Vec<T>, bool) {
         let more = self.overflow || !reached_start;
         (self.rows.into_iter().map(|row| row.value).collect(), more)
     }
+}
+
+/// Unreadable rows in scan order, newest first. Each run names the shown
+/// message it sits older than. `None` means the run is newer than every
+/// kept row.
+struct SkipRuns {
+    runs: Vec<HistorySkipRun>,
+    last_kept: Option<String>,
+    open: Option<HistorySkipRun>,
+}
+
+impl SkipRuns {
+    fn new() -> Self {
+        Self {
+            runs: Vec::new(),
+            last_kept: None,
+            open: None,
+        }
+    }
+
+    fn skip(&mut self) {
+        if let Some(run) = self.open.as_mut() {
+            run.skipped = run.skipped.saturating_add(1);
+        } else {
+            self.open = Some(HistorySkipRun {
+                after_id: self.last_kept.clone(),
+                skipped: 1,
+            });
+        }
+    }
+
+    fn kept(&mut self, id: String) {
+        self.close();
+        self.last_kept = Some(id);
+    }
+
+    fn close(&mut self) {
+        if let Some(run) = self.open.take()
+            && run.skipped > 0
+        {
+            self.runs.push(run);
+        }
+    }
+
+    /// `shown` is oldest first. A run older than every shown row is reported
+    /// only when the next read will not scan it again.
+    fn finish(mut self, shown: &[String], report_trailing: bool) -> (Vec<HistorySkipRun>, u32) {
+        self.close();
+        let oldest = shown.first().map(String::as_str);
+        let shown_ids: HashSet<&str> = shown.iter().map(String::as_str).collect();
+        let mut out: Vec<HistorySkipRun> = Vec::new();
+        for run in self.runs {
+            if run.skipped == 0 {
+                continue;
+            }
+            let after_id = match run.after_id.as_deref() {
+                Some(id) if shown_ids.contains(id) => Some(id),
+                Some(_) => oldest,
+                None => None,
+            };
+            let trailing = matches!(after_id, Some(id) if Some(id) == oldest);
+            if trailing && !report_trailing {
+                continue;
+            }
+            let after_id = after_id.map(str::to_string);
+            if let Some(last) = out.last_mut()
+                && last.after_id == after_id
+            {
+                last.skipped = last.skipped.saturating_add(run.skipped);
+            } else {
+                out.push(HistorySkipRun {
+                    after_id,
+                    skipped: run.skipped,
+                });
+            }
+        }
+        let skipped = out
+            .iter()
+            .fold(0u32, |sum, run| sum.saturating_add(run.skipped));
+        (out, skipped)
+    }
+}
+
+fn cursor_for_page(
+    oldest_scanned: Option<u64>,
+    resume: bool,
+    more: bool,
+    skips: SkipRuns,
+    shown: &[String],
+) -> Option<HistoryStoreCursor> {
+    let (runs, skipped) = skips.finish(shown, resume || !more);
+    (skipped > 0 || resume).then_some(HistoryStoreCursor {
+        before_ms: oldest_scanned.unwrap_or(0),
+        skipped,
+        resume,
+        runs,
+    })
 }
 
 fn content_history_key(content: &Content) -> (u64, String) {
@@ -6155,7 +6261,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .collect();
         let mut page = NewestBound::new(HISTORY_PAGE);
         let mut good = 0usize;
-        let mut skipped = 0u32;
+        let mut skips = SkipRuns::new();
         let mut oldest_scanned: Option<u64> = None;
         let mut seen = HashSet::new();
         let mut index = 0usize;
@@ -6189,13 +6295,20 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
                     .find(|(stamp, _)| *stamp == ts)
                     .map(|(_, row)| *row)
                     .expect("scanned row");
-                if matches!(row, Ok(None) | Err(())) {
-                    skipped = skipped.saturating_add(1);
-                }
-                if note_history_row(&mut page, row, before, None, |value| {
+                let kept_id = match row {
+                    Ok(Some(value)) => Some(format!("{value}:a")),
+                    Ok(None) | Err(()) => None,
+                };
+                let kept = note_history_row(&mut page, row, before, None, |value| {
                     (*value, format!("{value}:a"))
-                }) {
+                });
+                if kept {
                     good += 1;
+                    if let Some(id) = kept_id {
+                        skips.kept(id);
+                    }
+                } else if kept_id.is_none() {
+                    skips.skip();
                 }
             }
             index = end;
@@ -6211,16 +6324,13 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
                 break;
             }
         }
+        let shown = page.ids();
         let (kept, overflow) = page.finish(true);
         let resume =
             hit_cap && good <= HISTORY_PAGE && oldest_scanned.is_some_and(|ts| ts < before);
         let more = history_page_more(hit_cap, exhausted, kept.is_empty(), resume)
             || (!kept.is_empty() && overflow);
-        let cursor = (skipped > 0 || resume).then_some(HistoryStoreCursor {
-            before_ms: oldest_scanned.unwrap_or(0),
-            skipped,
-            resume,
-        });
+        let cursor = cursor_for_page(oldest_scanned, resume, more, skips, &shown);
         (kept, more, seen.len(), cursor)
     }
 
@@ -6325,7 +6435,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             );
             asked.push(before);
             let (kept, more, _, cursor) = page_before(&rows, before);
-            if let Some(cursor) = cursor {
+            if let Some(cursor) = cursor.as_ref() {
                 assert!(cursor.before_ms < before, "the store cursor moves older");
                 skipped = skipped.saturating_add(cursor.skipped);
                 if cursor.resume {
@@ -6368,6 +6478,44 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let (page, _, _, next) = page_before(&rows, cursor.before_ms);
         assert_eq!(page, vec![996, 997, 998, 999, 1_000]);
         assert!(next.is_none_or(|cursor| cursor.skipped == 0));
+    }
+
+    #[test]
+    fn a_skip_between_readable_rows_names_the_newer_message() {
+        let rows = vec![
+            (8_000, Ok(Some(8_000))),
+            (7_000, Err(())),
+            (6_000, Ok(Some(6_000))),
+            (5_500, Err(())),
+            (5_400, Err(())),
+            (5_000, Ok(Some(5_000))),
+        ];
+        let (page, more, _, cursor) = page_before(&rows, 9_000);
+        assert_eq!(page, vec![5_000, 6_000, 8_000]);
+        assert!(!more);
+        let cursor = cursor.expect("the skips are on this page");
+        assert_eq!(cursor.skipped, 3);
+        assert_eq!(cursor.runs.len(), 2);
+        assert_eq!(cursor.runs[0].after_id.as_deref(), Some("8000:a"));
+        assert_eq!(cursor.runs[0].skipped, 1);
+        assert_eq!(cursor.runs[1].after_id.as_deref(), Some("6000:a"));
+        assert_eq!(cursor.runs[1].skipped, 2);
+    }
+
+    #[test]
+    fn a_trailing_skip_on_an_open_page_is_left_for_the_next_read() {
+        let mut rows = Vec::new();
+        for ts in (1..=(HISTORY_PAGE as u64 + 1)).rev() {
+            rows.push((ts + 10, Ok(Some(ts + 10))));
+        }
+        rows.push((1, Err(())));
+        let (page, more, _, cursor) = page_before(&rows, u64::MAX);
+        assert_eq!(page.len(), HISTORY_PAGE);
+        assert!(more);
+        assert!(
+            cursor.is_none_or(|cursor| cursor.skipped == 0 && cursor.runs.is_empty()),
+            "the older skip is scanned again with the next page"
+        );
     }
 
     async fn insert_unreadable_copies(pool: &sqlx::SqlitePool, count: u64, newest_ts: i64) {
@@ -6513,7 +6661,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
                     more: true,
                     store_cursor: Some(cursor),
                     ..
-                } if cursor.resume && cursor.skipped == 208 => Some(*cursor),
+                } if cursor.resume && cursor.skipped == 208 => Some(cursor.clone()),
                 _ => None,
             });
             let cursor = cursor.expect("the first retained page resumes");

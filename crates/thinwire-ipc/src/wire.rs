@@ -14,13 +14,26 @@ use crate::SecretText;
 /// version.
 ///
 /// Version 2 adds `store_cursor` on `load_older_messages`, `history_loaded`,
-/// and `older_history_loaded`. An older peer rejects that field.
+/// and `older_history_loaded`. `runs` on that cursor names the shown message
+/// each unreadable stretch sits older than. An older peer rejects the field.
 pub const PROTOCOL_VERSION: u32 = 2;
+
+/// One unreadable stretch on a history page.
+///
+/// `after_id` is the shown message the stretch sits older than. Absent means
+/// the stretch is newer than every row this page shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireHistorySkip {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_id: Option<String>,
+    pub skipped: u32,
+}
 
 /// Exclusive store position for the next history read, and how many rows
 /// this page could not read. `before_ms` is not a shown message id.
-/// `skipped` rides in this value so the wire adds one field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `skipped` and `runs` ride in this value so the wire adds one field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireHistoryCursor {
     pub before_ms: u64,
@@ -28,6 +41,10 @@ pub struct WireHistoryCursor {
     /// The next read starts at `before_ms`. `false`: the count is only a
     /// marker, and the next read still uses the shown message id.
     pub resume: bool,
+    /// Where the unreadable rows sit among the rows this page shows.
+    /// Empty: one run of `skipped` at the request anchor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<WireHistorySkip>,
 }
 
 /// A protocol that a helper carries.
@@ -538,5 +555,26 @@ mod tests {
                 assert!(!shown.contains(secret), "{shown}");
             }
         }
+    }
+
+    #[test]
+    fn a_history_cursor_without_runs_still_decodes() {
+        let line = "{\"before_ms\":8,\"skipped\":1,\"resume\":false}\n";
+        let cursor: WireHistoryCursor = decode(line.trim_end()).expect("decode");
+        assert!(cursor.runs.is_empty());
+        let with_run = WireHistoryCursor {
+            before_ms: 8,
+            skipped: 1,
+            resume: false,
+            runs: vec![WireHistorySkip {
+                after_id: Some("8000:ada".into()),
+                skipped: 1,
+            }],
+        };
+        let encoded = encode(&with_run).expect("encode");
+        assert_eq!(
+            decode::<WireHistoryCursor>(encoded.trim_end()).expect("decode"),
+            with_run
+        );
     }
 }
