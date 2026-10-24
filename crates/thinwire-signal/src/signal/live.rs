@@ -269,20 +269,23 @@ pub(super) async fn run(
     events: EventTx,
     resume_only: bool,
 ) {
-    // No session file: do not create one, and do not start a QR link.
-    let end = if resume_only && !default_session_file_present() {
-        session.active.store(false, Ordering::SeqCst);
-        LinkedEnd::Absent
-    } else {
-        run_linked(
-            Arc::clone(&session),
-            token,
-            wake,
-            events.clone(),
-            resume_only,
-        )
-        .await
-    };
+    // No session file and no pending link file: do not create one, and do
+    // not start a QR link. A crash can leave only the pending file.
+    // [`run_linked`] places that file. This check does not open it.
+    let end =
+        if let Some(end) = resume_end_without_store(resume_only, default_session_file_present()) {
+            session.active.store(false, Ordering::SeqCst);
+            end
+        } else {
+            run_linked(
+                Arc::clone(&session),
+                token,
+                wake,
+                events.clone(),
+                resume_only,
+            )
+            .await
+        };
     let end = if session.is_current(token) {
         end
     } else {
@@ -395,9 +398,32 @@ fn launch_open(registered: bool, resume_only: bool) -> LaunchOpen {
     }
 }
 
-/// `true` when the default session folder already has a sqlite file.
+/// `true` when the default session folder already has a store file.
+///
+/// `session.sqlite` is the open store. A crash after the old file moves
+/// aside can leave only `session.sqlite.pending`. [`adopt_pending_store`]
+/// places that file when [`run_linked`] runs. This check does not open it.
 fn default_session_file_present() -> bool {
-    signal_session_path().is_ok_and(|dir| sqlite_store_path(&dir).is_file())
+    signal_session_path().is_ok_and(|dir| session_store_present(&dir))
+}
+
+/// `true` when this folder has `session.sqlite` or `session.sqlite.pending`.
+///
+/// The check is the file name on disk. It does not open either file.
+fn session_store_present(dir: &Path) -> bool {
+    sqlite_store_path(dir).is_file() || pending_store_path(dir).is_file()
+}
+
+/// `Some(Absent)` when a resume launch has no store file.
+///
+/// A link the user starts still runs when both files are missing. That
+/// launch creates the store. Resume does not.
+fn resume_end_without_store(resume_only: bool, store_present: bool) -> Option<LinkedEnd> {
+    if resume_only && !store_present {
+        Some(LinkedEnd::Absent)
+    } else {
+        None
+    }
 }
 
 /// Drop the registration Signal rejected, and the identity rows that belong
@@ -997,6 +1023,96 @@ fn classify_open<E: std::error::Error>(
     }
 }
 
+/// Open the registration after the resume guard.
+///
+/// [`run`] enters [`run_linked`] when this guard does not return
+/// [`LinkedEnd::Absent`]. [`run_linked`] calls this function. It places a
+/// pending link file, then loads the registration. It stops before the
+/// receive loop. That loop opens a socket to Signal.
+async fn open_linked_store(
+    session: &Session,
+    token: u64,
+    events: &EventTx,
+    store_path: &Path,
+    resume_only: bool,
+) -> Result<Manager<SqliteStore, Registered>, LinkedEnd> {
+    if let Some(end) = resume_end_without_store(resume_only, session_store_present(store_path)) {
+        session.active.store(false, Ordering::SeqCst);
+        return Err(end);
+    }
+    let Some(store_url) = sqlite_store_path(store_path).to_str().map(str::to_string) else {
+        fail(events, STORE_FAILED);
+        session.active.store(false, Ordering::SeqCst);
+        return Err(LinkedEnd::Stopped);
+    };
+    // A previous attempt may have moved the old store aside and left the new
+    // link under the pending name. Place that file before open creates one.
+    if adopt_pending_store(store_path).await.is_err() {
+        fail(events, STORE_FAILED);
+        session.active.store(false, Ordering::SeqCst);
+        return Err(LinkedEnd::Stopped);
+    }
+    // A crash can register the pending file and leave this file with no
+    // registration. Place that link before resume treats the store as new.
+    // Pull request 368 replaces this call with `recover_pending_link`.
+    if resume_only && place_finished_pending_for_resume(store_path).await.is_err() {
+        fail(events, STORE_FAILED);
+        session.active.store(false, Ordering::SeqCst);
+        return Err(LinkedEnd::Stopped);
+    }
+    let store = match SqliteStore::open(&store_url, OnNewIdentity::Trust).await {
+        Ok(store) => store,
+        Err(_) => {
+            fail(events, STORE_FAILED);
+            session.active.store(false, Ordering::SeqCst);
+            return Err(LinkedEnd::Stopped);
+        }
+    };
+    if !resume_only && sled_session_present(store_path) && !store.is_registered().await {
+        emit_status(
+            events,
+            ProtocolId::Signal,
+            AdapterStatus::Connecting,
+            SLED_RELINK,
+        );
+    }
+    if !session.is_current(token) {
+        session.active.store(false, Ordering::SeqCst);
+        return Err(LinkedEnd::Stopped);
+    }
+
+    match launch_open(store.is_registered().await, resume_only) {
+        LaunchOpen::Idle => {
+            store.close().await;
+            session.active.store(false, Ordering::SeqCst);
+            Err(LinkedEnd::Absent)
+        }
+        LaunchOpen::Existing => {
+            let manager = match Manager::load_registered(store).await {
+                Ok(manager) => manager,
+                Err(_) => {
+                    fail(events, LINK_FAILED);
+                    session.active.store(false, Ordering::SeqCst);
+                    return Err(LinkedEnd::Stopped);
+                }
+            };
+            let aci = manager.registration_data().service_ids.aci;
+            discard_pending_scratch(store_path, aci).await;
+            Ok(manager)
+        }
+        LaunchOpen::Provision => {
+            match link_unregistered(events, session, token, store_path, store, &store_url).await {
+                Ok(manager) => Ok(manager),
+                Err(()) => {
+                    fail(events, LINK_FAILED);
+                    session.active.store(false, Ordering::SeqCst);
+                    Err(LinkedEnd::Stopped)
+                }
+            }
+        }
+    }
+}
+
 async fn run_linked(
     session: Arc<Session>,
     token: u64,
@@ -1028,89 +1144,15 @@ async fn run_linked(
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
     };
+    let mut manager =
+        match open_linked_store(session.as_ref(), token, &events, &store_path, resume_only).await {
+            Ok(manager) => manager,
+            Err(end) => return end,
+        };
     let Some(store_url) = sqlite_store_path(&store_path).to_str().map(str::to_string) else {
         fail(&events, STORE_FAILED);
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
-    };
-    // A previous attempt may have moved the old store aside and left the new
-    // link under the pending name. Place that file before open creates one.
-    if adopt_pending_store(&store_path).await.is_err() {
-        fail(&events, STORE_FAILED);
-        session.active.store(false, Ordering::SeqCst);
-        return LinkedEnd::Stopped;
-    }
-    // A crash can register the pending file and leave this file with no
-    // registration. Place that link before resume treats the store as new.
-    // Pull request 368 replaces this call with `recover_pending_link`.
-    if resume_only
-        && place_finished_pending_for_resume(&store_path)
-            .await
-            .is_err()
-    {
-        fail(&events, STORE_FAILED);
-        session.active.store(false, Ordering::SeqCst);
-        return LinkedEnd::Stopped;
-    }
-    let store = match SqliteStore::open(&store_url, OnNewIdentity::Trust).await {
-        Ok(store) => store,
-        Err(_) => {
-            fail(&events, STORE_FAILED);
-            session.active.store(false, Ordering::SeqCst);
-            return LinkedEnd::Stopped;
-        }
-    };
-    if !resume_only && sled_session_present(&store_path) && !store.is_registered().await {
-        emit_status(
-            &events,
-            ProtocolId::Signal,
-            AdapterStatus::Connecting,
-            SLED_RELINK,
-        );
-    }
-    if !session.is_current(token) {
-        session.active.store(false, Ordering::SeqCst);
-        return LinkedEnd::Stopped;
-    }
-
-    let mut manager = match launch_open(store.is_registered().await, resume_only) {
-        LaunchOpen::Idle => {
-            store.close().await;
-            session.active.store(false, Ordering::SeqCst);
-            return LinkedEnd::Absent;
-        }
-        LaunchOpen::Existing => {
-            let manager = match Manager::load_registered(store).await {
-                Ok(manager) => manager,
-                Err(_) => {
-                    fail(&events, LINK_FAILED);
-                    session.active.store(false, Ordering::SeqCst);
-                    return LinkedEnd::Stopped;
-                }
-            };
-            let aci = manager.registration_data().service_ids.aci;
-            discard_pending_scratch(&store_path, aci).await;
-            manager
-        }
-        LaunchOpen::Provision => {
-            match link_unregistered(
-                &events,
-                session.as_ref(),
-                token,
-                &store_path,
-                store,
-                &store_url,
-            )
-            .await
-            {
-                Ok(manager) => manager,
-                Err(()) => {
-                    fail(&events, LINK_FAILED);
-                    session.active.store(false, Ordering::SeqCst);
-                    return LinkedEnd::Stopped;
-                }
-            }
-        }
     };
     if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
@@ -3566,6 +3608,96 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "a resume must not need a new session file"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash can move `session.sqlite` aside and leave a registered
+    /// `session.sqlite.pending`. Resume loads that registration. It does not
+    /// start a QR link, and it does not end as [`LinkedEnd::Absent`].
+    /// No store file still ends as [`LinkedEnd::Absent`].
+    ///
+    /// [`run`] reads the process session folder, then [`run_linked`] enters
+    /// the receive loop. That loop opens a socket to Signal. This test calls
+    /// [`open_linked_store`], which is the function [`run_linked`] calls
+    /// after the same guard.
+    #[tokio::test]
+    async fn a_remembered_notice_resumes_when_only_the_pending_link_file_is_on_disk() {
+        let dir = temp_session_dir("resume-pending-only");
+        assert!(
+            !sqlite_store_path(&dir).exists(),
+            "the crash leaves no session file"
+        );
+        let (pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, REJECTED_REGISTRATION).await;
+        let linked = registered_aci(&pending).await;
+        pending_pool.close().await;
+        pending.close().await;
+        assert!(
+            pending_store_path(&dir).is_file(),
+            "the pending link file is the only store file"
+        );
+        assert!(!sqlite_store_path(&dir).exists());
+
+        let session = Session::new();
+        session.set_resume_only(true);
+        let (token, _wake) = session.begin_attempt();
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let opened = open_linked_store(&session, token, &events, &dir, session.resume_only()).await;
+        let manager = match opened {
+            Ok(manager) => manager,
+            Err(LinkedEnd::Absent) => panic!("resume ends as Absent"),
+            Err(_) => panic!("resume does not open the registration"),
+        };
+        assert!(
+            manager.store().is_registered().await,
+            "the pending registration is now the session"
+        );
+        assert_eq!(manager.registration_data().service_ids.aci, linked);
+        assert_eq!(
+            launch_open(manager.store().is_registered().await, true),
+            LaunchOpen::Existing,
+            "resume loads this registration and does not start a QR link"
+        );
+        let mut saw_qr = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AdapterEvent::SignalQr { .. }) {
+                saw_qr = true;
+            }
+        }
+        assert!(!saw_qr, "resume does not emit a QR code");
+        assert!(
+            sqlite_store_path(&dir).is_file(),
+            "the pending link file is now the session file"
+        );
+        assert!(
+            !pending_store_path(&dir).exists(),
+            "the pending link file is gone"
+        );
+        manager.store().close().await;
+
+        let neither = temp_session_dir("resume-no-store");
+        let idle = Session::new();
+        idle.set_resume_only(true);
+        let (idle_token, _idle_wake) = idle.begin_attempt();
+        let (idle_events, _idle_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            matches!(
+                open_linked_store(
+                    &idle,
+                    idle_token,
+                    &idle_events,
+                    &neither,
+                    idle.resume_only(),
+                )
+                .await,
+                Err(LinkedEnd::Absent)
+            ),
+            "resume with no store file ends as Absent"
+        );
+        assert!(!sqlite_store_path(&neither).exists());
+        assert!(!pending_store_path(&neither).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&neither);
     }
 
     /// A crash registered the pending file and left `session.sqlite` with no
