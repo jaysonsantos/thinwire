@@ -662,9 +662,11 @@ pub struct Snapshot {
     /// Signal number, or another protocol. The number is a slot, not an
     /// account id.
     selected_signal_retained: Option<u32>,
-    /// Slots this retained publish has sent. `None` when no publish is open.
-    /// The rows stay on screen until the publish settles. A slot that was
-    /// not sent is dropped then. The values are counts, not account ids.
+    /// Slots this retained publish has sent. A slot whose store could not
+    /// be read is in the set too, so its row stays. `None` when no publish
+    /// is open. A helper that has stopped, and an account end, clear it.
+    /// A slot that this publish did not send is dropped when it settles.
+    /// The values are counts, not account ids.
     retained_publish: Option<HashSet<u32>>,
 }
 
@@ -945,6 +947,12 @@ impl Snapshot {
                         self.drop_retained_slots_except(&published);
                     }
                     self.settle_retained_signal_selection();
+                } else if protocol == ProtocolId::Signal
+                    && let Some(slot) = thinwire_protocol::signal_retained_unreadable_slot(&detail)
+                {
+                    // The store is still on disk. Keep the row. A missing
+                    // slot sends nothing here, so settle still drops that row.
+                    self.keep_unreadable_retained_slot(slot);
                 } else {
                     // The status line only. It never changes the link state: a
                     // recoverable error must not hide the inbox (shell plan 1, 11).
@@ -1005,10 +1013,7 @@ impl Snapshot {
                     // The previous number cannot send. The helper says so,
                     // and the core keeps that even if an event forgets it.
                     conversation.writable = false;
-                    if let Some(published) = &mut self.retained_publish {
-                        published.insert(slot);
-                    }
-                    self.ensure_retained_signal_row(slot);
+                    self.note_retained_slot(slot);
                 }
                 if self.window_focused
                     && !conversation.has_topics
@@ -1210,6 +1215,11 @@ impl Snapshot {
             AdapterEvent::TelegramSessionEnded => self.end_telegram_session(),
             AdapterEvent::AccountEnded { protocol } => {
                 self.ended_accounts.push(protocol);
+                if protocol == ProtocolId::Signal {
+                    // The account is gone. An open retained publish must not
+                    // settle afterwards and drop a row that is still on disk.
+                    self.retained_publish = None;
+                }
                 #[cfg(feature = "signal-local")]
                 if protocol == ProtocolId::Signal {
                     self.signal_removed = true;
@@ -3585,6 +3595,19 @@ impl Snapshot {
         if let Some(row) = self.live_account_mut(protocol) {
             row.helper = Some(state);
         }
+        // A publish that was open when the helper left cannot settle.
+        // Leave the rows. The next publish starts from an empty set.
+        if protocol == ProtocolId::Signal
+            && matches!(
+                state,
+                HelperState::Idle
+                    | HelperState::Restarting
+                    | HelperState::Stopped(_)
+                    | HelperState::Missing
+            )
+        {
+            self.retained_publish = None;
+        }
         // The error of an older stop is not true for the new state.
         self.helper_errors.remove(&protocol);
         if matches!(
@@ -3833,6 +3856,7 @@ impl Snapshot {
     }
 
     /// Drop previous-account slots that this publish did not send.
+    /// A slot whose store could not be read is in `published` and stays.
     /// Slots that were sent stay, so the rows do not vanish and return.
     fn drop_retained_slots_except(&mut self, published: &HashSet<u32>) {
         let stale: Vec<u32> = self
@@ -3938,6 +3962,43 @@ impl Snapshot {
         }
     }
 
+    /// Remember one previous-account slot from this publish.
+    /// A later chat row clears the unreadable line. The history stays.
+    fn note_retained_slot(&mut self, slot: u32) {
+        if let Some(published) = &mut self.retained_publish {
+            published.insert(slot);
+        }
+        self.ensure_retained_signal_row(slot);
+        let Some(row) = self
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Signal && row.signal_retained == Some(slot))
+        else {
+            return;
+        };
+        if row.detail == thinwire_protocol::SIGNAL_RETAINED_UNREADABLE {
+            row.detail = thinwire_protocol::SIGNAL_PREVIOUS_ACCOUNT.to_owned();
+        }
+    }
+
+    /// The store for this slot is still on disk, and this publish could not
+    /// read it. Keep the row and the history already on screen.
+    fn keep_unreadable_retained_slot(&mut self, slot: u32) {
+        if let Some(published) = &mut self.retained_publish {
+            published.insert(slot);
+        }
+        self.ensure_retained_signal_row(slot);
+        let Some(row) = self
+            .accounts
+            .iter_mut()
+            .find(|row| row.caps.id == ProtocolId::Signal && row.signal_retained == Some(slot))
+        else {
+            return;
+        };
+        row.status = AdapterStatus::Error;
+        row.detail = thinwire_protocol::SIGNAL_RETAINED_UNREADABLE.to_owned();
+    }
+
     /// One read-only row for a previous Signal number. The live row stays.
     fn ensure_retained_signal_row(&mut self, slot: u32) {
         if self
@@ -4005,6 +4066,8 @@ impl Snapshot {
         self.signal_screen = SignalScreen::Hidden;
         self.signal_removed = true;
         self.signal_checking = false;
+        // The account ended. An open retained publish must not settle later.
+        self.retained_publish = None;
         // The line is on the row and in the open chat. No error block, and
         // the strip does not repeat it.
         self.error = None;
@@ -4068,6 +4131,8 @@ impl Snapshot {
             // The live number ends. Previous numbers stay. Their history
             // is in `retained/` on this computer.
             self.retire_live_signal_chats();
+            // An open publish must not settle after this and drop a row.
+            self.retained_publish = None;
         } else {
             self.conversations.remove(&protocol);
         }
@@ -9143,6 +9208,209 @@ mod tests {
             snapshot.selected_conversation.as_deref(),
             Some(old_id.as_str())
         );
+    }
+
+    /// A store that is still on disk and cannot be read keeps its row.
+    /// A slot this publish does not send is still dropped.
+    #[test]
+    fn a_failed_retained_read_keeps_the_row_and_its_history() {
+        use thinwire_protocol::{
+            SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_RESET, SIGNAL_RETAINED_SETTLED,
+            SIGNAL_RETAINED_UNREADABLE, signal_retained_chat_id, signal_retained_unreadable_detail,
+        };
+
+        let mut snapshot = Snapshot::new();
+        show_only(&mut snapshot, &[ProtocolId::Signal]);
+        show_protocol(&mut snapshot, ProtocolId::Signal);
+        let kept_id = signal_retained_chat_id(1, "ada");
+        let missing_id = signal_retained_chat_id(2, "bea");
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, &kept_id, false),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, &missing_id, false),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                protocol: ProtocolId::Signal,
+                conversation_id: kept_id.clone(),
+                id: format!("{kept_id}:1"),
+                sender: "Ada".into(),
+                body: "kept".into(),
+                outbound: false,
+                delivery: Delivery::Sent,
+                sent_at: 1,
+                arrival: thinwire_protocol::Arrival::History,
+                topic: None,
+                links: Vec::new(),
+                photo: None,
+            },
+        });
+        snapshot.select_retained_signal(1);
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: SIGNAL_RETAINED_RESET.into(),
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: signal_retained_unreadable_detail(1),
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: SIGNAL_RETAINED_SETTLED.into(),
+        });
+
+        let kept = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.signal_retained == Some(1))
+            .expect("unreadable slot stays");
+        assert_eq!(kept.status, AdapterStatus::Error);
+        assert_eq!(kept.detail, SIGNAL_RETAINED_UNREADABLE);
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .all(|row| row.signal_retained != Some(2)),
+            "a slot this publish did not send is dropped"
+        );
+        assert!(
+            snapshot
+                .conversations
+                .get(&ProtocolId::Signal)
+                .is_some_and(|rows| rows.iter().all(|row| row.id != missing_id)),
+            "the missing slot's chats go with the row"
+        );
+        assert_eq!(snapshot.selected_signal_retained, Some(1));
+        assert_eq!(snapshot.selected_messages().len(), 1);
+        assert_eq!(snapshot.selected_messages()[0].body, "kept");
+        let live = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal && row.signal_retained.is_none())
+            .expect("live row");
+        assert_ne!(live.detail, SIGNAL_RETAINED_UNREADABLE);
+
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, &kept_id, false),
+        });
+        let restored = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.signal_retained == Some(1))
+            .expect("row");
+        assert_eq!(restored.detail, SIGNAL_PREVIOUS_ACCOUNT);
+        assert_eq!(snapshot.selected_messages()[0].body, "kept");
+    }
+
+    /// A helper that leaves, and an account that ends, close an open
+    /// retained publish. A later settled line does not drop the row.
+    #[test]
+    fn a_helper_stop_or_account_end_closes_an_open_retained_publish() {
+        use thinwire_protocol::{
+            SIGNAL_RETAINED_RESET, SIGNAL_RETAINED_SETTLED, signal_retained_chat_id,
+        };
+
+        fn open_publish() -> (Snapshot, String) {
+            let mut snapshot = Snapshot::new();
+            let kept_id = signal_retained_chat_id(1, "ada");
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: chat(ProtocolId::Signal, &kept_id, false),
+            });
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: ChatMessage {
+                    protocol: ProtocolId::Signal,
+                    conversation_id: kept_id.clone(),
+                    id: format!("{kept_id}:1"),
+                    sender: "Ada".into(),
+                    body: "kept".into(),
+                    outbound: false,
+                    delivery: Delivery::Sent,
+                    sent_at: 1,
+                    arrival: thinwire_protocol::Arrival::History,
+                    topic: None,
+                    links: Vec::new(),
+                    photo: None,
+                },
+            });
+            snapshot.apply(AdapterEvent::Status {
+                protocol: ProtocolId::Signal,
+                status: AdapterStatus::Ready,
+                detail: SIGNAL_RETAINED_RESET.into(),
+            });
+            assert!(snapshot.retained_publish.is_some());
+            (snapshot, kept_id)
+        }
+
+        fn settled_keeps_the_row(snapshot: &mut Snapshot, kept_id: &str) {
+            snapshot.apply(AdapterEvent::Status {
+                protocol: ProtocolId::Signal,
+                status: AdapterStatus::Ready,
+                detail: SIGNAL_RETAINED_SETTLED.into(),
+            });
+            assert!(snapshot.retained_publish.is_none());
+            assert!(
+                snapshot
+                    .accounts
+                    .iter()
+                    .any(|row| row.signal_retained == Some(1)),
+                "the row stays after the publish is closed"
+            );
+            assert!(
+                snapshot
+                    .messages
+                    .values()
+                    .flatten()
+                    .any(|message| message.conversation_id == kept_id && message.body == "kept"),
+                "the history stays"
+            );
+        }
+
+        for state in [
+            HelperState::Idle,
+            HelperState::Restarting,
+            HelperState::Stopped(HelperFault::Crashed),
+            HelperState::Missing,
+        ] {
+            let (mut snapshot, kept_id) = open_publish();
+            snapshot.apply(AdapterEvent::Helper {
+                protocol: ProtocolId::Signal,
+                state,
+            });
+            assert!(
+                snapshot.retained_publish.is_none(),
+                "the helper left, so the open publish is closed: {state:?}"
+            );
+            settled_keeps_the_row(&mut snapshot, &kept_id);
+        }
+
+        let (mut ended, kept_id) = open_publish();
+        ended.apply(AdapterEvent::AccountEnded {
+            protocol: ProtocolId::Signal,
+        });
+        assert!(ended.retained_publish.is_none());
+        settled_keeps_the_row(&mut ended, &kept_id);
+
+        let (mut unlinked, kept_id) = open_publish();
+        unlinked.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        unlinked.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: SIGNAL_RETAINED_RESET.into(),
+        });
+        unlinked.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+        assert!(unlinked.retained_publish.is_none());
+        settled_keeps_the_row(&mut unlinked, &kept_id);
     }
 
     /// After the session ends, the retained rows and their history stay.
