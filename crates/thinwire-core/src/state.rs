@@ -2736,6 +2736,32 @@ impl Snapshot {
             .collect()
     }
 
+    /// Rejected text and text still in flight. Collected before a Signal
+    /// session end removes the live chats: that removal drops the rejected
+    /// body, so a later read would find nothing (#135, #384).
+    fn texts_to_keep_on_session_end(
+        &self,
+        protocol: ProtocolId,
+    ) -> Vec<(String, Option<MessageTopic>, String)> {
+        if protocol == ProtocolId::Telegram {
+            return Vec::new();
+        }
+        let mut keep: Vec<(String, Option<MessageTopic>, String)> = self
+            .rejected_bodies
+            .iter()
+            .filter_map(|((owner, chat), rejected)| {
+                if *owner != protocol {
+                    return None;
+                }
+                self.text_to_keep(protocol, chat, rejected)
+                    .map(|text| (chat.clone(), rejected.topic, text))
+            })
+            .collect();
+        // A send in flight is newer than an earlier rejection of its chat.
+        keep.extend(self.pending_texts_to_keep(protocol));
+        keep
+    }
+
     fn text_to_keep(
         &self,
         protocol: ProtocolId,
@@ -3841,6 +3867,51 @@ impl Snapshot {
         }
     }
 
+    /// The retained chat of the same conversation, when one is open.
+    /// The highest slot wins. The open previous account wins over that.
+    /// The slot is a count, not an account id.
+    fn retained_chat_for_live(&self, live_id: &str) -> Option<String> {
+        let mut best: Option<(u32, String)> = None;
+        let rows = self.conversations.get(&ProtocolId::Signal)?;
+        for row in rows {
+            let Some(slot) = thinwire_protocol::signal_retained_slot(&row.id) else {
+                continue;
+            };
+            if thinwire_protocol::signal_retained_chat(&row.id) != Some(live_id) {
+                continue;
+            }
+            if self.selected_signal_retained == Some(slot) {
+                return Some(row.id.clone());
+            }
+            if best.as_ref().is_none_or(|(kept, _)| slot > *kept) {
+                best = Some((slot, row.id.clone()));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// Copy kept send text onto the previous-account chat of the same
+    /// conversation. A different draft already on that chat stays.
+    fn retained_drafts_for(
+        &self,
+        keep: &[(String, Option<MessageTopic>, String)],
+    ) -> Vec<(String, Option<MessageTopic>, String)> {
+        keep.iter()
+            .filter_map(|(chat, topic, text)| {
+                if thinwire_protocol::signal_retained_slot(chat).is_some() {
+                    return None;
+                }
+                let retained = self.retained_chat_for_live(chat)?;
+                let current = self.current_text(ProtocolId::Signal, &retained, *topic);
+                (current.is_empty() || current == text.as_str()).then_some((
+                    retained,
+                    *topic,
+                    text.clone(),
+                ))
+            })
+            .collect()
+    }
+
     /// Move the live Signal chats out of the inbox. The previous number is
     /// already published under `retained:<slot>:`.
     fn retire_live_signal_chats(&mut self) {
@@ -3976,35 +4047,20 @@ impl Snapshot {
             row.state = AccountState::Unlinked;
         }
         self.sessions.remove(&protocol);
+        // Read the rejected text first. Retiring a live Signal chat removes
+        // that text, and the previous-account row must still show it.
+        // Telegram drops every draft (the next account on this machine must
+        // not see them). Another protocol keeps a rejected send's text, and
+        // the text of a send still in flight (#102, #135).
+        let mut keep = self.texts_to_keep_on_session_end(protocol);
         if protocol == ProtocolId::Signal {
+            keep.extend(self.retained_drafts_for(&keep));
             // The live number ends. Previous numbers stay. Their history
             // is in `retained/` on this computer.
             self.retire_live_signal_chats();
         } else {
             self.conversations.remove(&protocol);
         }
-        // Telegram drops every draft (the next account on this machine must
-        // not see them). Another protocol keeps a rejected send's text, and
-        // the text of a send still in flight (#102, #135).
-        let keep: Vec<(String, Option<MessageTopic>, String)> = if protocol == ProtocolId::Telegram
-        {
-            Vec::new()
-        } else {
-            let mut keep: Vec<(String, Option<MessageTopic>, String)> = self
-                .rejected_bodies
-                .iter()
-                .filter_map(|((owner, chat), rejected)| {
-                    if *owner != protocol {
-                        return None;
-                    }
-                    self.text_to_keep(protocol, chat, rejected)
-                        .map(|text| (chat.clone(), rejected.topic, text))
-                })
-                .collect();
-            // A send in flight is newer than an earlier rejection of its chat.
-            keep.extend(self.pending_texts_to_keep(protocol));
-            keep
-        };
         self.rejected_bodies
             .retain(|(owner, _), _| *owner != protocol);
         self.drafts.retain(|(owner, _, _), _| *owner != protocol);
@@ -9112,6 +9168,73 @@ mod tests {
                     .iter()
                     .all(|row| !row.detail.contains("shows again after you link")),
             "the held line is gone"
+        );
+    }
+
+    /// A rejected Signal send stays on the previous-account row after the
+    /// session ends. The live chat is gone. Sending stays off.
+    #[test]
+    fn a_rejected_signal_send_stays_on_the_retained_row() {
+        use thinwire_protocol::signal_retained_chat_id;
+
+        let mut snapshot = shell_with(&[ProtocolId::Signal]);
+        link(&mut snapshot, ProtocolId::Signal);
+        allow_send(&mut snapshot, ProtocolId::Signal);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, "ada", true),
+        });
+        let kept_id = signal_retained_chat_id(1, "ada");
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, &kept_id, false),
+        });
+        snapshot.select_conversation("ada".into());
+        snapshot.compose = "unsent".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendText { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("send");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Signal,
+            conversation_id: "ada".into(),
+            request,
+        });
+        assert_eq!(snapshot.compose, "unsent");
+
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Unlinked,
+        });
+
+        let draft = |(id, text): (&str, &str)| {
+            snapshot
+                .drafts
+                .get(&(ProtocolId::Signal, id.to_owned(), None))
+                .map(String::as_str)
+                == Some(text)
+        };
+        assert!(draft(("ada", "unsent")), "a later link still has the text");
+        assert!(
+            draft((&kept_id, "unsent")),
+            "the previous-account row keeps the text"
+        );
+        snapshot.select_retained_signal(1);
+        assert_eq!(
+            snapshot.selected_conversation.as_deref(),
+            Some(kept_id.as_str())
+        );
+        assert_eq!(snapshot.compose, "unsent");
+        assert!(!snapshot.can_send(), "the retained row cannot send");
+        assert!(
+            snapshot
+                .conversations
+                .get(&ProtocolId::Signal)
+                .is_some_and(|rows| rows.iter().all(|row| row.id != "ada")),
+            "the live chat ends with the session"
         );
     }
 
