@@ -705,6 +705,12 @@ impl AdapterEvent {
     }
 }
 
+/// Most unreadable runs one store cursor may carry.
+///
+/// One history page scans at most 208 rows, so a cursor cannot honestly name
+/// more runs than that. The helper decode drops a longer list.
+pub const MAX_HISTORY_CURSOR_RUNS: usize = 208;
+
 /// One unreadable stretch on a history page, and the shown message it sits
 /// older than.
 ///

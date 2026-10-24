@@ -11,7 +11,8 @@ use thinwire_ipc::{
 
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, Arrival, ChatMessage, Conversation,
-    Delivery, HistorySkipRun, HistoryStoreCursor, ProtocolId, RedactedPairingSecret,
+    Delivery, HistorySkipRun, HistoryStoreCursor, MAX_HISTORY_CURSOR_RUNS, ProtocolId,
+    RedactedPairingSecret,
 };
 
 /// The wire name of a protocol that runs in a helper. `None` for a protocol
@@ -476,15 +477,34 @@ fn cursor_from_wire(cursor: WireHistoryCursor) -> HistoryStoreCursor {
         before_ms: cursor.before_ms,
         skipped: cursor.skipped,
         resume: cursor.resume,
-        runs: cursor
-            .runs
-            .into_iter()
-            .map(|run| HistorySkipRun {
-                after_id: run.after_id,
-                skipped: run.skipped,
-            })
-            .collect(),
+        runs: bounded_skip_runs(cursor.runs, cursor.skipped),
     }
+}
+
+/// Keep at most [`MAX_HISTORY_CURSOR_RUNS`] runs, and only when their counts
+/// add up to `skipped`. A longer list is cut there. A list that still does
+/// not add up is dropped. `skipped` stays, so the core draws one line for
+/// the total.
+fn bounded_skip_runs(runs: Vec<WireHistorySkip>, skipped: u32) -> Vec<HistorySkipRun> {
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let runs: Vec<HistorySkipRun> = runs
+        .into_iter()
+        .filter(|run| run.skipped > 0)
+        .take(MAX_HISTORY_CURSOR_RUNS)
+        .map(|run| HistorySkipRun {
+            after_id: run.after_id,
+            skipped: run.skipped,
+        })
+        .collect();
+    let sum = runs
+        .iter()
+        .fold(0u32, |sum, run| sum.saturating_add(run.skipped));
+    if sum != skipped {
+        return Vec::new();
+    }
+    runs
 }
 
 const fn status_to_wire(status: AdapterStatus) -> WireStatus {
@@ -753,7 +773,7 @@ mod tests {
                     resume: true,
                     runs: vec![HistorySkipRun {
                         after_id: Some("8000:ada".into()),
-                        skipped: 1,
+                        skipped: 208,
                     }],
                 }),
             },
@@ -898,5 +918,58 @@ mod tests {
             wire_protocol(ProtocolId::WhatsApp),
             Some(WireProtocol::WhatsApp)
         );
+    }
+
+    #[test]
+    fn a_history_cursor_keeps_at_most_the_scan_cap_of_runs() {
+        let runs = (0..MAX_HISTORY_CURSOR_RUNS + 5)
+            .map(|n| WireHistorySkip {
+                after_id: Some(format!("m{n}")),
+                skipped: 1,
+            })
+            .collect();
+        let skipped = u32::try_from(MAX_HISTORY_CURSOR_RUNS + 5).expect("cap");
+        let cursor = cursor_from_wire(WireHistoryCursor {
+            before_ms: 1,
+            skipped,
+            resume: false,
+            runs,
+        });
+        assert!(cursor.runs.is_empty(), "a cut list no longer adds up");
+        assert_eq!(cursor.skipped, skipped);
+        let honest: Vec<WireHistorySkip> = (0..MAX_HISTORY_CURSOR_RUNS)
+            .map(|n| WireHistorySkip {
+                after_id: Some(format!("m{n}")),
+                skipped: 1,
+            })
+            .collect();
+        let kept = cursor_from_wire(WireHistoryCursor {
+            before_ms: 1,
+            skipped: u32::try_from(MAX_HISTORY_CURSOR_RUNS).expect("cap"),
+            resume: false,
+            runs: honest,
+        });
+        assert_eq!(kept.runs.len(), MAX_HISTORY_CURSOR_RUNS);
+    }
+
+    #[test]
+    fn history_runs_that_do_not_add_up_are_dropped() {
+        let cursor = cursor_from_wire(WireHistoryCursor {
+            before_ms: 4,
+            skipped: 9,
+            resume: false,
+            runs: vec![
+                WireHistorySkip {
+                    after_id: Some("8000:ada".into()),
+                    skipped: 2,
+                },
+                WireHistorySkip {
+                    after_id: Some("6000:ada".into()),
+                    skipped: 2,
+                },
+            ],
+        });
+        assert!(cursor.runs.is_empty());
+        assert_eq!(cursor.skipped, 9);
     }
 }

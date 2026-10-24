@@ -191,6 +191,17 @@ pub fn unreadable_messages_line(skipped: u32) -> String {
     }
 }
 
+fn push_unreadable(runs: &mut Vec<UnreadableRun>, before_id: Option<String>, skipped: u32) {
+    if skipped == 0 {
+        return;
+    }
+    if let Some(run) = runs.iter_mut().find(|run| run.before_id == before_id) {
+        run.skipped = run.skipped.saturating_add(skipped);
+        return;
+    }
+    runs.push(UnreadableRun { before_id, skipped });
+}
+
 /// Skips not drawn yet. Empty pages add to it until a page shows rows or
 /// the store ends.
 struct OpenUnreadable {
@@ -2274,33 +2285,38 @@ impl Snapshot {
         } else {
             let mut leading = pending.as_ref().map(|open| open.skipped).unwrap_or(0);
             let pending_anchor = pending.map(|open| open.before_id);
+            let mut edge = 0u32;
+            let mut placed = Vec::new();
             for run in cursor.runs {
                 if run.skipped == 0 {
                     continue;
                 }
                 match run.after_id {
                     None => leading = leading.saturating_add(run.skipped),
-                    Some(id) => {
-                        self.unreadable
-                            .entry(key.clone())
-                            .or_default()
-                            .push(UnreadableRun {
-                                before_id: Some(id),
-                                skipped: run.skipped,
-                            });
+                    Some(id) if self.message_is_loaded(protocol, chat, topic, &id) => {
+                        push_unreadable(&mut placed, Some(id), run.skipped);
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            "history run names a message that is not loaded; the count joins the oldest line"
+                        );
+                        edge = edge.saturating_add(run.skipped);
                     }
                 }
+            }
+            if edge > 0 {
+                push_unreadable(&mut placed, oldest.clone(), edge);
             }
             if leading > 0 {
                 let before_id = pending_anchor
                     .unwrap_or_else(|| Self::unreadable_anchor(initial, request_before, oldest));
+                push_unreadable(&mut placed, before_id, leading);
+            }
+            if !placed.is_empty() {
                 self.unreadable
                     .entry(key.clone())
                     .or_default()
-                    .push(UnreadableRun {
-                        before_id,
-                        skipped: leading,
-                    });
+                    .extend(placed);
             }
         }
         if cursor.resume && moves && more && added && topic.is_none() {
@@ -2309,6 +2325,18 @@ impl Snapshot {
             self.history_resume.remove(&key);
         }
         false
+    }
+
+    fn message_is_loaded(
+        &self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        id: &str,
+    ) -> bool {
+        self.messages
+            .get(&thread_key(protocol, chat, topic))
+            .is_some_and(|rows| rows.iter().any(|row| row.id == id))
     }
 
     fn unreadable_anchor(
@@ -14454,6 +14482,162 @@ mod tests {
             "the runs do not collapse onto the request anchor"
         );
         assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+    }
+
+    #[test]
+    fn an_oldest_unreadable_run_stays_when_the_store_ends() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 8_000, "oldest readable"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "8000:ada".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 1_000,
+                skipped: 3,
+                resume: false,
+                runs: vec![thinwire_protocol::HistorySkipRun {
+                    after_id: Some("8000:ada".into()),
+                    skipped: 3,
+                }],
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 1, "the oldest run is still drawn");
+        assert_eq!(runs[0].skipped, 3);
+        assert_eq!(runs[0].before_id.as_deref(), Some("8000:ada"));
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+    }
+
+    #[test]
+    fn a_run_across_a_page_edge_is_one_line() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 9_000, "anchor"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 8_000, "page edge"),
+        });
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: None,
+        });
+        assert!(
+            snapshot.unreadable_runs().is_empty(),
+            "the trailing part of the run is not drawn on this page"
+        );
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 5_000, "older"),
+        });
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "8000:ada".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 4_000,
+                skipped: 4,
+                resume: false,
+                runs: vec![thinwire_protocol::HistorySkipRun {
+                    after_id: None,
+                    skipped: 4,
+                }],
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].skipped, 4, "the whole run is counted once");
+        assert_eq!(runs[0].before_id.as_deref(), Some("8000:ada"));
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+    }
+
+    #[test]
+    fn a_run_for_an_unknown_message_joins_the_oldest_line() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 8_000, "newer"),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 6_000, "oldest"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 1,
+                skipped: 5,
+                resume: false,
+                runs: vec![
+                    thinwire_protocol::HistorySkipRun {
+                        after_id: Some("8000:ada".into()),
+                        skipped: 2,
+                    },
+                    thinwire_protocol::HistorySkipRun {
+                        after_id: Some("missing".into()),
+                        skipped: 3,
+                    },
+                ],
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs.iter()
+                .all(|run| run.before_id.as_deref() != Some("missing")),
+            "an unknown id is not a draw position"
+        );
+        assert_eq!(
+            runs.iter()
+                .find(|run| run.before_id.as_deref() == Some("6000:ada"))
+                .map(|run| run.skipped),
+            Some(3),
+            "the unknown count joins the oldest message"
+        );
+        assert_eq!(
+            runs.iter()
+                .find(|run| run.before_id.as_deref() == Some("8000:ada"))
+                .map(|run| run.skipped),
+            Some(2)
+        );
+        assert_eq!(
+            runs.iter().map(|run| run.skipped).sum::<u32>(),
+            5,
+            "the count is not dropped"
+        );
     }
 
     // endregion: #135

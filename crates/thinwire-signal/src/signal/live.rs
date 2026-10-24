@@ -6518,6 +6518,56 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         );
     }
 
+    #[test]
+    fn an_oldest_unreadable_run_stays_on_the_last_page() {
+        let rows = vec![
+            (8_000, Ok(Some(8_000))),
+            (1_000, Err(())),
+            (999, Err(())),
+            (998, Err(())),
+        ];
+        let (page, more, _, cursor) = page_before(&rows, 9_000);
+        assert_eq!(page, vec![8_000]);
+        assert!(!more, "the store ends after the unreadable rows");
+        let cursor = cursor.expect("the oldest run is not dropped");
+        assert_eq!(cursor.skipped, 3);
+        assert_eq!(cursor.runs.len(), 1);
+        assert_eq!(cursor.runs[0].after_id.as_deref(), Some("8000:a"));
+        assert_eq!(cursor.runs[0].skipped, 3);
+    }
+
+    #[test]
+    fn a_run_across_a_page_edge_is_counted_once() {
+        let mut rows = Vec::new();
+        for ts in (1_000..1_000 + HISTORY_PAGE as u64).rev() {
+            rows.push((ts, Ok(Some(ts))));
+        }
+        for ts in (996..=999).rev() {
+            rows.push((ts, Err(())));
+        }
+        for ts in (993..=995).rev() {
+            rows.push((ts, Ok(Some(ts))));
+        }
+        let (page, more, _, cursor) = page_before(&rows, 10_000);
+        assert_eq!(page.len(), HISTORY_PAGE);
+        assert!(more);
+        let first_skipped = cursor.as_ref().map(|cursor| cursor.skipped).unwrap_or(0);
+        assert_eq!(first_skipped, 0, "page one leaves the trailing run off");
+        let oldest = page[0];
+        let (older, older_more, _, next) = page_before(&rows, oldest);
+        assert_eq!(older, vec![993, 994, 995]);
+        assert!(!older_more);
+        let next = next.expect("page two reports the run");
+        assert_eq!(next.runs.len(), 1);
+        assert_eq!(next.runs[0].skipped, 4);
+        assert_eq!(next.skipped, 4);
+        assert_eq!(
+            first_skipped + next.skipped,
+            4,
+            "the run is not counted twice"
+        );
+    }
+
     async fn insert_unreadable_copies(pool: &sqlx::SqlitePool, count: u64, newest_ts: i64) {
         use sqlx::Row;
 
