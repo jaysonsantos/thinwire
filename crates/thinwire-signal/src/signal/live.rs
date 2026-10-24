@@ -381,6 +381,9 @@ enum LaunchOpen {
     /// The user started a link and the store has no registration.
     Provision,
     /// A remembered notice, and the store has no registration. Stay idle.
+    ///
+    /// [`place_finished_pending_for_resume`] runs first. A finished pending
+    /// link is already the registration by the time this arm is chosen.
     Idle,
 }
 
@@ -601,6 +604,10 @@ async fn park_previous_store(session_dir: &Path, aci: Option<Uuid>) -> Result<()
 
 /// When `session.sqlite` is missing and a pending link file is present, the
 /// pending file becomes `session.sqlite`.
+///
+/// This does nothing when `session.sqlite` is already there. A crash can
+/// leave that file with no registration and a finished link in the pending
+/// file. [`place_finished_pending_for_resume`] places that link.
 async fn adopt_pending_store(session_dir: &Path) -> Result<(), ()> {
     let pending = pending_store_path(session_dir);
     if pending.exists()
@@ -832,6 +839,37 @@ fn table_name_ok(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Place a finished pending link when `session.sqlite` has no registration.
+///
+/// A relink writes the new registration to `session.sqlite.pending`, then
+/// [`separate_previous_account`] places that file. A crash between those
+/// steps leaves the old file with no registration. Resume would open that
+/// file and stay idle, so the linked device stays offline. This calls the
+/// same placement a live relink uses. An unfinished pending file stays.
+/// A session file that already has a registration stays the open store.
+///
+/// Pull request 368 adds `recover_pending_link` for this crash. That
+/// function replaces this call on merge.
+async fn place_finished_pending_for_resume(session_dir: &Path) -> Result<(), ()> {
+    if !pending_store_path(session_dir).exists() || !sqlite_store_path(session_dir).exists() {
+        return Ok(());
+    }
+    let session_url = session_sqlite_url(session_dir)?;
+    let Ok(store) = SqliteStore::open(&session_url, OnNewIdentity::Trust).await else {
+        return Err(());
+    };
+    let registered = store.is_registered().await;
+    store.close().await;
+    if registered {
+        return Ok(());
+    }
+    let pending_url = pending_sqlite_url(session_dir)?;
+    let Ok(Some(_)) = read_registration_aci(&pending_url).await else {
+        return Ok(());
+    };
+    separate_previous_account(session_dir).await
+}
+
 /// Drop a pending file that repeats the open account, or that never finished
 /// linking. A pending file for another account stays on disk.
 async fn discard_pending_scratch(session_dir: &Path, aci: Uuid) {
@@ -998,6 +1036,18 @@ async fn run_linked(
     // A previous attempt may have moved the old store aside and left the new
     // link under the pending name. Place that file before open creates one.
     if adopt_pending_store(&store_path).await.is_err() {
+        fail(&events, STORE_FAILED);
+        session.active.store(false, Ordering::SeqCst);
+        return LinkedEnd::Stopped;
+    }
+    // A crash can register the pending file and leave this file with no
+    // registration. Place that link before resume treats the store as new.
+    // Pull request 368 replaces this call with `recover_pending_link`.
+    if resume_only
+        && place_finished_pending_for_resume(&store_path)
+            .await
+            .is_err()
+    {
         fail(&events, STORE_FAILED);
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
@@ -3515,6 +3565,51 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             !sqlite_store_path(&dir).exists(),
             "a resume must not need a new session file"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash registered the pending file and left `session.sqlite` with no
+    /// registration. Resume places that link and opens it. It does not stay
+    /// idle, and it does not start a QR link.
+    #[tokio::test]
+    async fn a_remembered_notice_places_a_registered_pending_store() {
+        let dir = temp_session_dir("resume-pending");
+        let (store, url, pool) = open_session_db(&dir).await;
+        assert!(
+            !store.is_registered().await,
+            "the session file has no registration"
+        );
+        pool.close().await;
+        store.close().await;
+
+        let (pending, _pending_url, pending_pool) = open_pending_db(&dir).await;
+        insert_registration(&pending_pool, REJECTED_REGISTRATION).await;
+        let linked = registered_aci(&pending).await;
+        pending_pool.close().await;
+        pending.close().await;
+
+        place_finished_pending_for_resume(&dir)
+            .await
+            .expect("resume places the finished pending link");
+
+        let store = SqliteStore::open(&url, OnNewIdentity::Trust)
+            .await
+            .expect("placed store");
+        assert!(
+            store.is_registered().await,
+            "the pending registration is now the session"
+        );
+        assert_eq!(registered_aci(&store).await, linked);
+        assert_eq!(
+            launch_open(store.is_registered().await, true),
+            LaunchOpen::Existing,
+            "a remembered notice loads this registration and does not start a QR link"
+        );
+        assert!(
+            !pending_store_path(&dir).exists(),
+            "the pending link is placed in the session store"
+        );
+        store.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
