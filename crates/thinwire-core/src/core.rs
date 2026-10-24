@@ -610,6 +610,7 @@ impl Core {
     pub fn dispatch(&mut self, intent: Intent) {
         match intent {
             Intent::SelectProtocol(protocol) => self.state.select_protocol(protocol),
+            Intent::SelectRetainedSignal(slot) => self.state.select_retained_signal(slot),
             Intent::SelectConversation { id } => self.state.select_conversation(id),
             Intent::SelectTopic {
                 conversation_id,
