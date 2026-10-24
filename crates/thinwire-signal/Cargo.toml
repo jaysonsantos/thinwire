@@ -26,6 +26,9 @@ signal-local = [
   "dep:futures",
   "dep:libsqlite3-sys",
   "dep:sqlx",
+  "dep:rusqlite",
+  "dep:thinwire-core",
+  "thinwire-protocol/session-cipher",
 ]
 
 [dependencies]
@@ -40,14 +43,18 @@ tracing.workspace = true
 # The log of the helper program.
 tracing-subscriber.workspace = true
 presage = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c", optional = true, default-features = false }
-# Default features build SQLCipher and need OpenSSL headers. The session file
-# is mode 0700 under app-data, same as the old sled directory. No passphrase.
+# Default features of this crate build SQLCipher. This edge stays off so the
+# helper picks the SQLCipher build below, not a second SQLite.
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c", optional = true, default-features = false }
-# Bundled SQLite, same 0.36 line as WhatsApp. A signal-local build does not
-# need a system libsqlite. SQLCipher stays off (no OpenSSL headers).
+# Bundled SQLCipher and vendored OpenSSL. The helper does not need a system
+# libsqlite or libssl. The key lives in the OS keychain, not in this file.
 libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
-  "bundled",
+  "bundled-sqlcipher-vendored-openssl",
 ] }
+rusqlite = { version = "0.38", optional = true, default-features = false, features = [
+  "bundled-sqlcipher-vendored-openssl",
+] }
+thinwire-core = { workspace = true, optional = true }
 futures = { version = "0.3", optional = true, default-features = false, features = [
   "std",
 ] }

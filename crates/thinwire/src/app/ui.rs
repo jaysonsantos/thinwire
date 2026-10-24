@@ -6,8 +6,8 @@ use eframe::egui::{self, RichText};
 use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
-    AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, topic_mute_id,
+    AccountState, AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic,
+    ProtocolId, SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, StoreAccessReason, topic_mute_id,
 };
 
 use super::auth;
@@ -15,8 +15,6 @@ use super::motion;
 use super::theme::{self, radius, size, space};
 use super::theme_mode::ThemeModeEgui;
 use super::thread_layout::{RowLayout, list_time, thread_rows};
-#[cfg(feature = "signal-local")]
-use thinwire_core::SignalIntent;
 #[cfg(feature = "slack-oauth")]
 use thinwire_core::SlackIntent;
 use thinwire_core::secrets::Persistence;
@@ -25,6 +23,7 @@ use thinwire_core::state::{
     OlderState, RESUME_CONNECTING, Snapshot, ThreadState,
 };
 use thinwire_core::{Intent, TelegramIntent, ThemeMode, View};
+use thinwire_core::{SignalIntent, WhatsAppIntent};
 
 /// Shown while the OS keychain is not available. Secrets stay in memory.
 pub(crate) const KEYCHAIN_UNAVAILABLE_NOTICE: &str =
@@ -583,6 +582,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                 ) {
                     clicked = Some(account.caps.id);
                 }
+                store_protection_line(ui, account, out);
                 helper_actions(ui, account, out);
                 removed_signal_link(ui, snapshot, account, out);
                 ui.add_space(4.0);
@@ -714,6 +714,74 @@ fn removed_signal_link(
     _account: &AccountRow,
     _out: &mut Vec<Intent>,
 ) {
+}
+
+/// The keychain or encryption sentence, under the chip. The chip label stays short.
+///
+/// A denied keychain read shows Retry. Retry reads the key again
+/// (`RetryStoreKey`). A failed move shows Retry too. That Retry opens the
+/// saved session and, on a wrong key, tries the move again. Nothing is
+/// deleted. A wrong key that already moved shows Link. Link starts the same
+/// flow as a removed Signal device, and the WhatsApp risk gate.
+fn store_protection_line(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
+    if account.status != AdapterStatus::Error && account.store_access.is_none() {
+        return;
+    }
+    if !thinwire_protocol::is_store_protection_detail(&account.detail) {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(theme::ROW_INSET.x);
+        ui.label(
+            RichText::new(&account.detail)
+                .small()
+                .color(theme::palette(ui).warn),
+        );
+        if let Some(intent) = store_row_intent(account)
+            && ui
+                .small_button(store_row_button(account))
+                .on_hover_text(store_row_hover(account))
+                .clicked()
+        {
+            out.push(intent);
+        }
+    });
+}
+
+/// Retry reads the key again. A failed move uses the same command to try
+/// the move again. Link starts the existing link flow.
+fn store_row_intent(account: &AccountRow) -> Option<Intent> {
+    match account.store_access {
+        Some(StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed) => {
+            Some(Intent::RetryStoreKey(account.caps.id))
+        }
+        Some(StoreAccessReason::WrongKey) if account.caps.id == ProtocolId::Signal => {
+            Some(Intent::Signal(SignalIntent::Relink))
+        }
+        Some(StoreAccessReason::WrongKey) if account.caps.id == ProtocolId::WhatsApp => {
+            Some(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate))
+        }
+        Some(StoreAccessReason::WrongKey) | None => None,
+    }
+}
+
+fn store_row_button(account: &AccountRow) -> &'static str {
+    match account.store_access {
+        Some(StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed) => "Retry",
+        Some(StoreAccessReason::WrongKey) => "Link",
+        None => "",
+    }
+}
+
+fn store_row_hover(account: &AccountRow) -> &'static str {
+    match account.store_access {
+        Some(StoreAccessReason::KeychainDenied) => "Read the session key from Keychain again",
+        Some(StoreAccessReason::MoveFailed) => {
+            "Tries to move the saved session aside again. Nothing is deleted."
+        }
+        Some(StoreAccessReason::WrongKey) => "Link again. The old data stays.",
+        None => "",
+    }
 }
 
 fn helper_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
@@ -1454,6 +1522,20 @@ fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
     // The helper state wins: with no helper, the adapter status is old.
     if let Some(label) = account.helper_label() {
         return label;
+    }
+    // A denied read or a wrong key has its own sentence under the chip.
+    if account.store_access.is_some() {
+        return "Connection problem";
+    }
+    // A store migration runs while the account is Linking. The row stays
+    // on Connecting until that work finishes.
+    if account.state == AccountState::Linking
+        && !matches!(
+            account.status,
+            AdapterStatus::Error | AdapterStatus::Refused | AdapterStatus::Ready
+        )
+    {
+        return "Connecting…";
     }
     let session_moving = snapshot.auth != AuthScreen::Idle
         || matches!(snapshot.center_view(), CenterView::Resuming { .. });
@@ -3264,6 +3346,187 @@ mod tests {
             .find(|account| account.caps.id == ProtocolId::Telegram)
             .expect("telegram");
         assert_eq!(chip_label(&snapshot, account), "Connecting…");
+    }
+
+    /// A store migration keeps the row on Connecting. A denied keychain
+    /// read is its own chip, even before the account is linked.
+    #[test]
+    fn chip_shows_connecting_during_migration_and_the_denied_key() {
+        use super::chip_label;
+        use thinwire_core::state::Snapshot;
+        use thinwire_protocol::{AccountState, ProtocolId, StoreAccessReason};
+
+        let mut snapshot = Snapshot::new();
+        snapshot.poll_resume(&thinwire_core::secrets::SecretStore::memory());
+        {
+            let account = snapshot
+                .accounts
+                .iter_mut()
+                .find(|account| account.caps.id == ProtocolId::WhatsApp)
+                .expect("whatsapp");
+            account.state = AccountState::Linking;
+            account.status = AdapterStatus::Stubbed;
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.caps.id == ProtocolId::WhatsApp)
+            .expect("whatsapp");
+        assert_eq!(chip_label(&snapshot, account), "Connecting…");
+
+        {
+            let account = snapshot
+                .accounts
+                .iter_mut()
+                .find(|account| account.caps.id == ProtocolId::Signal)
+                .expect("signal");
+            account.state = AccountState::Linking;
+            account.status = AdapterStatus::Error;
+            account.detail = thinwire_protocol::KEYCHAIN_ACCESS_DENIED.into();
+            account.store_access = Some(StoreAccessReason::KeychainDenied);
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.caps.id == ProtocolId::Signal)
+            .expect("signal");
+        assert_eq!(chip_label(&snapshot, account), "Connection problem");
+        assert_eq!(account.detail, thinwire_protocol::KEYCHAIN_ACCESS_DENIED);
+
+        {
+            let account = snapshot
+                .accounts
+                .iter_mut()
+                .find(|account| account.caps.id == ProtocolId::Signal)
+                .expect("signal");
+            account.state = AccountState::Linked;
+            account.status = AdapterStatus::Connecting;
+            account.store_access = None;
+            account.detail = "Opening the saved session.".into();
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.caps.id == ProtocolId::Signal)
+            .expect("signal");
+        assert_eq!(chip_label(&snapshot, account), "Connecting…");
+    }
+
+    /// Retry restarts the key read. Link on a wrong key is the removed-device
+    /// relink (`SignalIntent::Relink`), which starts the QR flow.
+    #[test]
+    fn a_wrong_key_link_button_starts_the_relink() {
+        use super::{store_row_button, store_row_hover, store_row_intent};
+        use thinwire_core::state::AccountRow;
+        use thinwire_core::{Intent, SignalIntent, WhatsAppIntent};
+        use thinwire_protocol::{
+            AccountState, AdapterStatus, ProtocolId, StoreAccessReason, catalog,
+        };
+
+        let signal = catalog()
+            .into_iter()
+            .find(|caps| caps.id == ProtocolId::Signal)
+            .expect("signal");
+        let whatsapp = catalog()
+            .into_iter()
+            .find(|caps| caps.id == ProtocolId::WhatsApp)
+            .expect("whatsapp");
+        let mut account = AccountRow {
+            caps: signal,
+            status: AdapterStatus::Error,
+            detail: thinwire_protocol::signal_session_kept().into(),
+            state: AccountState::Unlinked,
+            helper: None,
+            store_access: Some(StoreAccessReason::WrongKey),
+        };
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::Signal(SignalIntent::Relink))
+        );
+        assert_eq!(store_row_button(&account), "Link");
+        account.store_access = Some(StoreAccessReason::KeychainDenied);
+        account.state = AccountState::Linked;
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::RetryStoreKey(ProtocolId::Signal))
+        );
+        assert_eq!(store_row_button(&account), "Retry");
+        account.caps = whatsapp;
+        account.store_access = Some(StoreAccessReason::WrongKey);
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate))
+        );
+        account.store_access = Some(StoreAccessReason::MoveFailed);
+        account.state = AccountState::Linked;
+        account.detail = thinwire_protocol::whatsapp_key_wrong_kept().into();
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::RetryStoreKey(ProtocolId::WhatsApp))
+        );
+        assert_eq!(store_row_button(&account), "Retry");
+        assert_eq!(
+            store_row_hover(&account),
+            "Tries to move the saved session aside again. Nothing is deleted."
+        );
+        account.caps = signal;
+        account.detail = thinwire_protocol::signal_key_wrong_kept().into();
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::RetryStoreKey(ProtocolId::Signal))
+        );
+    }
+
+    /// The failed-move row draws Retry. The click sends `RetryStoreKey`.
+    #[test]
+    fn a_failed_move_row_draws_retry() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use thinwire_core::Intent;
+        use thinwire_core::state::AccountRow;
+        use thinwire_protocol::{
+            AccountState, AdapterStatus, ProtocolId, StoreAccessReason, catalog,
+        };
+
+        use super::{store_protection_line, store_row_hover};
+        use crate::app::theme;
+
+        let signal = catalog()
+            .into_iter()
+            .find(|caps| caps.id == ProtocolId::Signal)
+            .expect("signal");
+        let account = AccountRow {
+            caps: signal,
+            status: AdapterStatus::Error,
+            detail: thinwire_protocol::signal_key_wrong_kept().into(),
+            state: AccountState::Linked,
+            helper: None,
+            store_access: Some(StoreAccessReason::MoveFailed),
+        };
+        assert_eq!(
+            store_row_hover(&account),
+            "Tries to move the saved session aside again. Nothing is deleted."
+        );
+        let intents = Rc::new(RefCell::new(Vec::new()));
+        let intents_ui = Rc::clone(&intents);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(520.0, 96.0))
+            .build_ui(move |ui| {
+                theme::install(ui.ctx());
+                let mut out = Vec::new();
+                store_protection_line(ui, &account, &mut out);
+                intents_ui.borrow_mut().extend(out);
+            });
+        harness.run_steps(3);
+        harness.get_by_role_and_label(Role::Button, "Retry").click();
+        harness.run_steps(2);
+        assert_eq!(
+            intents.borrow().as_slice(),
+            [Intent::RetryStoreKey(ProtocolId::Signal)]
+        );
     }
 
     /// Shell plan 11: a linked account with an error is not "Not signed in".

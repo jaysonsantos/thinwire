@@ -22,7 +22,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use super::session::{LinkEvent, Session, WhatsAppSender, account};
-use thinwire_protocol::{AccountState, AdapterStatus, EventTx, ProtocolId, emit_status};
+use thinwire_protocol::{
+    AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, StoreAccessReason, emit_status,
+};
 
 /// Longest wait of [`LinkHandle::shutdown`]. Below the 5 s close limit of
 /// the app, so `Stopped` still fits (#44).
@@ -47,22 +49,37 @@ const BUILD_FAILED: &str =
     "WhatsApp pairing client could not be built. No session material was logged.";
 
 /// Why a start failed. No path, OS text, or session material.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum StartError {
     DataDir,
     Store,
     Build,
     /// An earlier client did not stop yet. Two clients on one store break it.
     StillRunning,
+    /// The keychain refused the read. The store stays where it is.
+    KeychainDenied,
+    /// The encrypted store did not open. The folder was moved aside.
+    WrongKey,
+    /// The store files could not be moved aside. They stay. Nothing was deleted.
+    MoveFailed,
+    /// The keychain or the store encryption stopped the link. The text is the
+    /// account-row sentence. It does not contain the key.
+    #[cfg(feature = "whatsapp-web")]
+    Reported(String),
 }
 
 impl StartError {
-    const fn detail(self) -> &'static str {
+    fn detail(&self) -> &str {
         match self {
             Self::DataDir => DATA_DIR_MISSING,
             Self::Store => STORE_FAILED,
             Self::Build => BUILD_FAILED,
             Self::StillRunning => STILL_RUNNING,
+            Self::KeychainDenied => thinwire_protocol::KEYCHAIN_ACCESS_DENIED,
+            Self::WrongKey => thinwire_protocol::whatsapp_session_kept(),
+            Self::MoveFailed => thinwire_protocol::whatsapp_key_wrong_kept(),
+            #[cfg(feature = "whatsapp-web")]
+            Self::Reported(text) => text,
         }
     }
 }
@@ -110,6 +127,8 @@ enum Msg {
         /// and pair code of it carries this number (ADR 0010 rule 8).
         pairing: u64,
     },
+    /// Read the session key again. This is not a new link.
+    Retry,
     Client {
         generation: u64,
         event: LinkEvent,
@@ -181,6 +200,8 @@ impl LinkHandle {
             stop_wait,
             stops: 0,
             stopping: None,
+            last_phone: None,
+            last_pairing: None,
         };
         tokio::spawn(owner.run(rx));
         Self { tx, active }
@@ -190,6 +211,11 @@ impl LinkHandle {
     pub(super) fn begin(&self, phone: Option<String>, pairing: u64) {
         self.active.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Msg::Begin { phone, pairing });
+    }
+
+    /// Read the session key again. Does not delete the store.
+    pub(super) fn retry(&self) {
+        let _ = self.tx.send(Msg::Retry);
     }
 
     /// Stop the link. Later callbacks of the old generation are dropped.
@@ -253,13 +279,17 @@ struct Owner<B: LinkBackend> {
     /// A stop that did not end within `stop_wait`, with its number. It keeps
     /// running; no new client starts before it ends (#98).
     stopping: Option<(u64, tokio::task::JoinHandle<()>)>,
+    /// Phone and pairing of the last Begin. A key retry uses these again.
+    last_phone: Option<String>,
+    last_pairing: Option<u64>,
 }
 
 impl<B: LinkBackend> Owner<B> {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Msg>) {
         while let Some(msg) = rx.recv().await {
             match msg {
-                Msg::Begin { phone, pairing } => self.begin(phone, pairing).await,
+                Msg::Begin { phone, pairing } => self.begin(phone, pairing, true).await,
+                Msg::Retry => self.retry_key().await,
                 Msg::Client { generation, event } => self.client(generation, event).await,
                 Msg::Cancel => {
                     self.stop().await;
@@ -282,7 +312,21 @@ impl<B: LinkBackend> Owner<B> {
         let _ = self.stop().await;
     }
 
-    async fn begin(&mut self, phone: Option<String>, pairing: u64) {
+    /// Read the key again with the saved phone and pairing.
+    /// This does not delete the store and does not start a new shell link.
+    /// The new open tries the move-aside again when the key is wrong.
+    async fn retry_key(&mut self) {
+        let Some(pairing) = self.last_pairing else {
+            self.fail(StartError::KeychainDenied);
+            return;
+        };
+        let phone = self.last_phone.clone();
+        self.begin(phone, pairing, false).await;
+    }
+
+    async fn begin(&mut self, phone: Option<String>, pairing: u64, allow_delete: bool) {
+        self.last_phone.clone_from(&phone);
+        self.last_pairing = Some(pairing);
         self.generation += 1;
         let generation = self.generation;
         // A client that did not stop yet still holds the store (#98).
@@ -301,7 +345,7 @@ impl<B: LinkBackend> Owner<B> {
         // A first login: the shell drops inbox events until Linked.
         let _ = self.events.send(account(AccountState::Linking));
         // The mark on disk covers a delete that failed before a restart.
-        if self.stale || self.backend.is_revoked().await {
+        if allow_delete && (self.stale || self.backend.is_revoked().await) {
             if self.backend.delete_store().await.is_err() {
                 // The revoked store is still there. Do not open it; the next
                 // Begin tries the delete again.
@@ -451,8 +495,35 @@ impl<B: LinkBackend> Owner<B> {
 
     fn fail(&self, error: StartError) {
         self.active.store(false, Ordering::SeqCst);
-        self.status(AdapterStatus::Error, error.detail());
-        let _ = self.events.send(account(AccountState::Unlinked));
+        match error {
+            StartError::KeychainDenied => {
+                // The store stays. Retry reads the key again.
+                let _ = self.events.send(AdapterEvent::StoreAccess {
+                    protocol: ProtocolId::WhatsApp,
+                    reason: StoreAccessReason::KeychainDenied,
+                });
+            }
+            StartError::WrongKey => {
+                // The store files are aside. Nothing here deletes them.
+                // The account is not linked.
+                let _ = self.events.send(AdapterEvent::StoreAccess {
+                    protocol: ProtocolId::WhatsApp,
+                    reason: StoreAccessReason::WrongKey,
+                });
+                let _ = self.events.send(account(AccountState::Unlinked));
+            }
+            StartError::MoveFailed => {
+                // The files stayed. This is not a wrong key. The account stays.
+                self.status(
+                    AdapterStatus::Error,
+                    thinwire_protocol::whatsapp_key_wrong_kept(),
+                );
+            }
+            other => {
+                self.status(AdapterStatus::Error, other.detail());
+                let _ = self.events.send(account(AccountState::Unlinked));
+            }
+        }
     }
 
     fn status(&self, status: AdapterStatus, detail: &str) {
@@ -519,7 +590,7 @@ pub(super) mod tests {
             if let Some(gate) = &self.0.start_gate {
                 gate.notified().await;
             }
-            if let Some(error) = self.0.start_error {
+            if let Some(error) = self.0.start_error.clone() {
                 return Err(error);
             }
             Ok(Started {
@@ -688,7 +759,7 @@ pub(super) mod tests {
             let gate = Arc::new(Notify::new());
             let (fake, handle, session, mut rx) = owner(Fake {
                 start_gate: Some(Arc::clone(&gate)),
-                start_error,
+                start_error: start_error.clone(),
                 ..Fake::default()
             });
             handle.begin(None, 7);
@@ -858,6 +929,134 @@ pub(super) mod tests {
             assert!(handle.shutdown().await);
             assert_eq!(fake.log(), vec!["start 1"], "nothing to stop");
         }
+    }
+
+    /// A denied keychain read keeps the account and does not delete the store.
+    /// Retry asks `start` again, which is where the key is read.
+    /// A wrong key leaves the account unlinked and still deletes nothing.
+    #[tokio::test]
+    async fn denied_and_wrong_key_keep_the_store_and_retry_reads_again() {
+        for (error, reason, unlinked) in [
+            (
+                StartError::KeychainDenied,
+                StoreAccessReason::KeychainDenied,
+                false,
+            ),
+            (StartError::WrongKey, StoreAccessReason::WrongKey, true),
+        ] {
+            let (fake, handle, _session, mut rx) = owner(Fake {
+                start_error: Some(error),
+                ..Fake::default()
+            });
+            handle.begin(Some("15551212".into()), 3);
+            handle.flush().await;
+            let events = drain(&mut rx);
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::StoreAccess { reason: seen, .. } if *seen == reason
+            )));
+            assert_eq!(
+                events.iter().any(|event| matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )),
+                unlinked
+            );
+            assert!(
+                !fake.log().iter().any(|line| line.contains("delete")),
+                "the store stays, log {:?}",
+                fake.log()
+            );
+            handle.retry();
+            handle.flush().await;
+            assert_eq!(fake.log(), vec!["start 1", "start 2"]);
+            let retry = drain(&mut rx);
+            assert!(retry.iter().any(|event| matches!(
+                event,
+                AdapterEvent::StoreAccess { reason: seen, .. } if *seen == reason
+            )));
+            assert_eq!(
+                retry.iter().any(|event| matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                )),
+                unlinked
+            );
+        }
+    }
+
+    /// The files stayed. The helper does not unlink and does not send a wrong key.
+    #[tokio::test]
+    async fn a_failed_move_aside_does_not_unlink_or_offer_a_link() {
+        let (fake, handle, _session, mut rx) = owner(Fake {
+            start_error: Some(StartError::MoveFailed),
+            ..Fake::default()
+        });
+        handle.begin(Some("15551212".into()), 3);
+        handle.flush().await;
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Error,
+                detail,
+                ..
+            } if detail == thinwire_protocol::whatsapp_key_wrong_kept()
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::StoreAccess { .. }
+                | AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                }
+        )));
+        let states: Vec<AccountState> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Account { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, vec![AccountState::Linking]);
+        assert!(
+            !fake.log().iter().any(|line| line.contains("delete")),
+            "nothing is deleted, log {:?}",
+            fake.log()
+        );
+        // Retry opens again. `start` is the open, and a wrong key there
+        // tries the move. This start still fails the move. Nothing is deleted.
+        handle.retry();
+        handle.flush().await;
+        assert_eq!(fake.log(), vec!["start 1", "start 2"]);
+        let retry = drain(&mut rx);
+        assert!(retry.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Error,
+                detail,
+                ..
+            } if detail == thinwire_protocol::whatsapp_key_wrong_kept()
+        )));
+        assert!(!retry.iter().any(|event| matches!(
+            event,
+            AdapterEvent::StoreAccess { .. }
+                | AdapterEvent::Account {
+                    state: AccountState::Unlinked,
+                    ..
+                }
+        )));
+        assert!(
+            !fake.log().iter().any(|line| line.contains("delete")),
+            "retry deletes nothing, log {:?}",
+            fake.log()
+        );
     }
 
     #[tokio::test]

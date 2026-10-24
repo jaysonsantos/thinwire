@@ -714,6 +714,7 @@ impl Core {
                 }
             }
             Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
+            Intent::RetryStoreKey(protocol) => self.state.retry_store_key(protocol),
             Intent::LoadPhoto {
                 protocol,
                 conversation_id,

@@ -17,6 +17,8 @@ mod time;
 mod wake;
 
 #[cfg(feature = "signal-local")]
+mod cipher;
+#[cfg(feature = "signal-local")]
 mod live;
 #[cfg(feature = "signal-local")]
 mod owner;
@@ -181,6 +183,25 @@ impl SignalAdapter {
             self.owner_handle().begin(generation, events);
             return Ok(());
         }
+        self.link_device(events, generation)
+    }
+
+    /// Read the session key again and open the saved session. This is not a
+    /// new link. A wrong key tries the move-aside again and deletes nothing.
+    fn retry_store_key(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        #[cfg(feature = "signal-local")]
+        if matches!(self.engine, Engine::Live(_)) {
+            self.owner_handle().retry_key(events);
+            return Ok(());
+        }
+        let _ = events;
+        Err(AdapterError::Unavailable {
+            protocol: ProtocolId::Signal,
+            reason: "Signal is not reading a session key",
+        })
+    }
+
+    fn link_device(&mut self, events: &EventTx, generation: u64) -> Result<(), AdapterError> {
         match &mut self.engine {
             Engine::Sync(device) => match device.link() {
                 Ok(Some(url)) => {
@@ -596,6 +617,9 @@ impl ProtocolAdapter for SignalAdapter {
             | AdapterCommand::SignalCancelLink => self.cancel_link(events),
             AdapterCommand::SignalAcknowledgeNotice => self.acknowledge(events),
             AdapterCommand::SignalBeginLink { generation } => self.begin_link(events, generation),
+            AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::Signal,
+            } => self.retry_store_key(events),
             AdapterCommand::ResendMessage {
                 protocol: ProtocolId::Signal,
                 conversation_id,
@@ -716,13 +740,13 @@ mod tests {
             .join("\n");
         assert!(
             signal_local.contains("libsqlite3-sys"),
-            "signal-local enables bundled sqlite"
+            "signal-local enables bundled sqlcipher"
         );
-        assert!(manifest.contains("features = [\n  \"bundled\",\n]"));
+        assert!(manifest.contains("features = [\n  \"bundled-sqlcipher-vendored-openssl\",\n]"));
         assert!(
             manifest.contains("presage-store-sqlite")
                 && manifest.contains("default-features = false"),
-            "SQLCipher stays off"
+            "presage-store-sqlite does not turn on its own SQLCipher feature"
         );
     }
 

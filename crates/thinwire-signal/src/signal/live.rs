@@ -57,6 +57,12 @@ enum LinkedEnd {
     Stopped,
     /// Cancel or shutdown moved the generation. The owner emits `Unlinked`.
     Superseded,
+    /// The keychain refused the read. The account stays. The store stays.
+    KeychainDenied,
+    /// The encrypted store did not open. The folder was moved aside.
+    WrongKey,
+    /// The store files could not be moved aside. They stay. The account stays.
+    MoveFailed,
     /// A remembered notice found no registration. The helper stays idle.
     /// This end emits nothing: it is not a cancelled link.
     Absent,
@@ -152,7 +158,7 @@ impl Session {
         self.pairing.store(generation, Ordering::SeqCst);
     }
 
-    fn pairing(&self) -> u64 {
+    pub(super) fn pairing(&self) -> u64 {
         self.pairing.load(Ordering::SeqCst)
     }
 
@@ -308,7 +314,27 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
             protocol: ProtocolId::Signal,
         });
     }
-    if matches!(end, LinkedEnd::DeviceRemoved | LinkedEnd::Stopped) {
+    if let LinkedEnd::KeychainDenied = end {
+        let _ = events.send(AdapterEvent::StoreAccess {
+            protocol: ProtocolId::Signal,
+            reason: thinwire_protocol::StoreAccessReason::KeychainDenied,
+        });
+    }
+    if let LinkedEnd::WrongKey = end {
+        let _ = events.send(AdapterEvent::StoreAccess {
+            protocol: ProtocolId::Signal,
+            reason: thinwire_protocol::StoreAccessReason::WrongKey,
+        });
+    }
+    // The files stayed. This is not a wrong key, and the account stays linked.
+    if let LinkedEnd::MoveFailed = end {
+        fail(events, thinwire_protocol::signal_key_wrong_kept());
+    }
+    // A wrong key moved the store files aside. The account is not linked.
+    if matches!(
+        end,
+        LinkedEnd::DeviceRemoved | LinkedEnd::Stopped | LinkedEnd::WrongKey
+    ) {
         emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
     }
 }
@@ -505,12 +531,15 @@ async fn remember_prior_aci(url: &str, aci: Uuid) {
     tracing::error!("{}", PRIOR_ACI_NOT_STORED);
 }
 
+async fn open_signal_store(url: &str) -> Result<SqliteStore, ()> {
+    let options = super::cipher::connect_options(url, true, false)?;
+    SqliteStore::open_with_options(options, OnNewIdentity::Trust)
+        .await
+        .map_err(|_| ())
+}
+
 async fn open_kv_write(url: &str) -> Result<sqlx::SqlitePool, ()> {
-    let options = url
-        .parse::<sqlx::sqlite::SqliteConnectOptions>()
-        .map_err(|_| ())?
-        .create_if_missing(false)
-        .busy_timeout(std::time::Duration::from_secs(2));
+    let options = super::cipher::connect_options(url, false, false)?;
     sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
@@ -597,9 +626,7 @@ async fn store_has_previous_content(url: &str) -> Result<bool, ()> {
 }
 
 async fn read_registration_aci(url: &str) -> Result<Option<Uuid>, ()> {
-    let store = SqliteStore::open(url, OnNewIdentity::Trust)
-        .await
-        .map_err(|_| ())?;
+    let store = open_signal_store(url).await.map_err(|_| ())?;
     let aci = registration_aci(&store).await;
     store.close().await;
     Ok(aci)
@@ -816,11 +843,17 @@ async fn merge_pending_into_session(session_url: &str, pending_url: &str) -> Res
             .map_err(|_| ())?;
         // `escaped` doubles quotes in a path this process built. The table
         // names below come from this database and `table_name_ok` checks them.
-        let attach = format!("ATTACH DATABASE '{escaped}' AS pending");
-        sqlx::query(sqlx::AssertSqlSafe(attach))
+        // The query holds the key text until it runs. This code does not log it.
+        let mut key_sql = super::cipher::raw_key_sql()?;
+        let mut keyed = format!("ATTACH DATABASE '{escaped}' AS pending KEY {key_sql}");
+        wipe_secret(&mut key_sql);
+        let statement = keyed.clone();
+        let attached = sqlx::query(sqlx::AssertSqlSafe(statement))
             .execute(&mut *conn)
             .await
-            .map_err(|_| ())?;
+            .map(|_| ());
+        wipe_secret(&mut keyed);
+        attached.map_err(|_| ())?;
         let list_tables = "SELECT name FROM pending.sqlite_master \
             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'";
         let tables: Vec<String> = sqlx::query_scalar(list_tables)
@@ -856,6 +889,13 @@ async fn merge_pending_into_session(session_url: &str, pending_url: &str) -> Res
     merged
 }
 
+fn wipe_secret(text: &mut String) {
+    let width = text.len();
+    text.clear();
+    text.extend(std::iter::repeat_n('\0', width));
+    text.clear();
+}
+
 fn sqlite_attach_path(path: &Path) -> Result<String, ()> {
     let text = path.to_str().ok_or(())?;
     Ok(text.replace('\\', "/").replace('\'', "''"))
@@ -881,7 +921,7 @@ async fn place_finished_pending_for_resume(session_dir: &Path) -> Result<(), ()>
         return Ok(());
     }
     let session_url = session_sqlite_url(session_dir)?;
-    let Ok(store) = SqliteStore::open(&session_url, OnNewIdentity::Trust).await else {
+    let Ok(store) = open_signal_store(&session_url).await else {
         return Err(());
     };
     let registered = store.is_registered().await;
@@ -936,9 +976,7 @@ async fn link_unregistered(
         if pending_aci.is_some() {
             store.close().await;
             separate_previous_account(session_dir).await?;
-            let opened = SqliteStore::open(store_url, OnNewIdentity::Trust)
-                .await
-                .map_err(|_| ())?;
+            let opened = open_signal_store(store_url).await.map_err(|_| ())?;
             return Manager::load_registered(opened).await.map_err(|_| ());
         }
         if remove_sqlite_files(&pending_store_path(session_dir)).is_err() {
@@ -951,16 +989,14 @@ async fn link_unregistered(
     let content = store_has_previous_content(store_url).await?;
     if prior.is_some() && content {
         store.close().await;
-        let pending = SqliteStore::open(&pending_sqlite_url(session_dir)?, OnNewIdentity::Trust)
+        let pending = open_signal_store(&pending_sqlite_url(session_dir)?)
             .await
             .map_err(|_| ())?;
         let linked = link_new(events, session, token, pending).await?;
         linked.store().close().await;
         drop(linked);
         separate_previous_account(session_dir).await?;
-        let opened = SqliteStore::open(store_url, OnNewIdentity::Trust)
-            .await
-            .map_err(|_| ())?;
+        let opened = open_signal_store(store_url).await.map_err(|_| ())?;
         return Manager::load_registered(opened).await.map_err(|_| ());
     }
     if prior.is_none() && content {
@@ -969,9 +1005,7 @@ async fn link_unregistered(
             tracing::error!("{}", PREVIOUS_STORE_NOT_SET_ASIDE);
             return Err(());
         }
-        let fresh = SqliteStore::open(store_url, OnNewIdentity::Trust)
-            .await
-            .map_err(|_| ())?;
+        let fresh = open_signal_store(store_url).await.map_err(|_| ())?;
         return link_new(events, session, token, fresh).await;
     }
     if prior.is_some() {
@@ -1026,9 +1060,9 @@ fn classify_open<E: std::error::Error>(
 /// Open the registration after the resume guard.
 ///
 /// [`run`] enters [`run_linked`] when this guard does not return
-/// [`LinkedEnd::Absent`]. [`run_linked`] calls this function. It places a
-/// pending link file, then loads the registration. It stops before the
-/// receive loop. That loop opens a socket to Signal.
+/// [`LinkedEnd::Absent`]. [`run_linked`] calls this function. It encrypts
+/// the stores, places a pending link file, then loads the registration. It
+/// stops before the receive loop. That loop opens a socket to Signal.
 async fn open_linked_store(
     session: &Session,
     token: u64,
@@ -1045,6 +1079,49 @@ async fn open_linked_store(
         session.active.store(false, Ordering::SeqCst);
         return Err(LinkedEnd::Stopped);
     };
+    // Encrypt the live store, the pending file, and every retained store
+    // before any open. This runs off the UI thread. The row stays on
+    // Connecting until this returns. [`adopt_pending_store`] then places a
+    // pending file that is already encrypted.
+    emit_status(
+        events,
+        ProtocolId::Signal,
+        AdapterStatus::Connecting,
+        "Opening the saved session.",
+    );
+    let protect_dir = store_path.to_path_buf();
+    let protected =
+        tokio::task::spawn_blocking(move || super::cipher::protect_session(&protect_dir)).await;
+    match protected {
+        Ok(Ok(())) => {}
+        Ok(Err(super::cipher::ProtectFail::KeychainDenied)) => {
+            session.active.store(false, Ordering::SeqCst);
+            return Err(LinkedEnd::KeychainDenied);
+        }
+        Ok(Err(super::cipher::ProtectFail::WrongKey)) => {
+            session.active.store(false, Ordering::SeqCst);
+            return Err(LinkedEnd::WrongKey);
+        }
+        Ok(Err(super::cipher::ProtectFail::NotMoved)) => {
+            session.active.store(false, Ordering::SeqCst);
+            return Err(LinkedEnd::MoveFailed);
+        }
+        Ok(Err(super::cipher::ProtectFail::NotSaved)) => {
+            fail(events, thinwire_protocol::signal_key_not_saved());
+            session.active.store(false, Ordering::SeqCst);
+            return Err(LinkedEnd::Stopped);
+        }
+        Ok(Err(super::cipher::ProtectFail::EncryptFailed)) => {
+            fail(events, thinwire_protocol::signal_encrypt_failed());
+            session.active.store(false, Ordering::SeqCst);
+            return Err(LinkedEnd::Stopped);
+        }
+        Err(_) => {
+            fail(events, STORE_FAILED);
+            session.active.store(false, Ordering::SeqCst);
+            return Err(LinkedEnd::Stopped);
+        }
+    }
     // A previous attempt may have moved the old store aside and left the new
     // link under the pending name. Place that file before open creates one.
     if adopt_pending_store(store_path).await.is_err() {
@@ -1060,7 +1137,7 @@ async fn open_linked_store(
         session.active.store(false, Ordering::SeqCst);
         return Err(LinkedEnd::Stopped);
     }
-    let store = match SqliteStore::open(&store_url, OnNewIdentity::Trust).await {
+    let store = match open_signal_store(&store_url).await {
         Ok(store) => store,
         Err(_) => {
             fail(events, STORE_FAILED);
@@ -1721,12 +1798,7 @@ fn history_store_url() -> Option<String> {
 }
 
 async fn open_history_read(url: &str) -> Result<sqlx::SqlitePool, ()> {
-    let options = url
-        .parse::<sqlx::sqlite::SqliteConnectOptions>()
-        .map_err(|_| ())?
-        .create_if_missing(false)
-        .read_only(true)
-        .busy_timeout(std::time::Duration::from_secs(2));
+    let options = super::cipher::connect_options(url, false, true)?;
     sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)
@@ -2515,19 +2587,8 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let url = path.to_str().expect("temp path").to_string();
-        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
-            .await
-            .expect("store");
-        let options = url
-            .parse::<sqlx::sqlite::SqliteConnectOptions>()
-            .expect("url")
-            .create_if_missing(false)
-            .busy_timeout(std::time::Duration::from_secs(2));
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("pool");
+        let mut store = open_signal_store(&url).await.expect("store");
+        let pool = open_test_pool(&url).await;
         sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
             .bind(REJECTED_REGISTRATION.as_bytes())
             .execute(&pool)
@@ -2714,19 +2775,8 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         ));
         let _ = std::fs::remove_file(&path);
         let url = path.to_str().expect("temp path").to_string();
-        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
-            .await
-            .expect("store");
-        let options = url
-            .parse::<sqlx::sqlite::SqliteConnectOptions>()
-            .expect("url")
-            .create_if_missing(false)
-            .busy_timeout(std::time::Duration::from_secs(2));
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("pool");
+        let mut store = open_signal_store(&url).await.expect("store");
+        let pool = open_test_pool(&url).await;
         sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
             .bind(REJECTED_REGISTRATION.as_bytes())
             .execute(&pool)
@@ -2901,19 +2951,8 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         ));
         let _ = std::fs::remove_file(&path);
         let url = path.to_str().expect("temp path").to_string();
-        let mut store = SqliteStore::open(&url, OnNewIdentity::Trust)
-            .await
-            .expect("store");
-        let options = url
-            .parse::<sqlx::sqlite::SqliteConnectOptions>()
-            .expect("url")
-            .create_if_missing(false)
-            .busy_timeout(std::time::Duration::from_secs(2));
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .expect("pool");
+        let mut store = open_signal_store(&url).await.expect("store");
+        let pool = open_test_pool(&url).await;
         sqlx::query("INSERT INTO kv (key, value) VALUES ('registration', ?)")
             .bind(REJECTED_REGISTRATION.as_bytes())
             .execute(&pool)
@@ -3065,9 +3104,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "the same account keeps the session file"
         );
 
-        let store = SqliteStore::open(&url, OnNewIdentity::Trust)
-            .await
-            .expect("store");
+        let store = open_signal_store(&url).await.expect("store");
         assert_eq!(
             store
                 .load_registration_data()
@@ -3179,7 +3216,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             0,
             "the new account credentials stay out of the previous store"
         );
-        let aside_store = SqliteStore::open(aside.to_str().expect("path"), OnNewIdentity::Trust)
+        let aside_store = open_signal_store(aside.to_str().expect("path"))
             .await
             .expect("aside store");
         let old = aside_store
@@ -3203,9 +3240,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         );
         aside_store.close().await;
 
-        let active = SqliteStore::open(&url, OnNewIdentity::Trust)
-            .await
-            .expect("active store");
+        let active = open_signal_store(&url).await.expect("active store");
         assert_eq!(
             active
                 .load_registration_data()
@@ -3347,9 +3382,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "the previous rows stay in the moved store"
         );
 
-        let fresh = SqliteStore::open(&url, OnNewIdentity::Trust)
-            .await
-            .expect("fresh store");
+        let fresh = open_signal_store(&url).await.expect("fresh store");
         assert!(
             contact_names_of(&fresh).await.is_empty(),
             "publish_chats has no previous contact"
@@ -3390,28 +3423,20 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
 
     async fn open_session_db(dir: &std::path::Path) -> (SqliteStore, String, sqlx::SqlitePool) {
         let url = sqlite_store_path(dir).to_str().expect("path").to_string();
-        let store = SqliteStore::open(&url, OnNewIdentity::Trust)
-            .await
-            .expect("store");
+        let store = open_signal_store(&url).await.expect("store");
         let pool = open_test_pool(&url).await;
         (store, url, pool)
     }
 
     async fn open_pending_db(dir: &std::path::Path) -> (SqliteStore, String, sqlx::SqlitePool) {
         let url = pending_store_path(dir).to_str().expect("path").to_string();
-        let store = SqliteStore::open(&url, OnNewIdentity::Trust)
-            .await
-            .expect("pending");
+        let store = open_signal_store(&url).await.expect("pending");
         let pool = open_test_pool(&url).await;
         (store, url, pool)
     }
 
     async fn open_test_pool(url: &str) -> sqlx::SqlitePool {
-        let options = url
-            .parse::<sqlx::sqlite::SqliteConnectOptions>()
-            .expect("url")
-            .create_if_missing(false)
-            .busy_timeout(std::time::Duration::from_secs(2));
+        let options = super::super::cipher::connect_options(url, false, false).expect("key");
         sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -3560,6 +3585,25 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
 
     fn registration_for(aci: Uuid) -> String {
         REJECTED_REGISTRATION.replacen("11111111-1111-1111-1111-111111111111", &aci.to_string(), 1)
+    }
+
+    /// A failed move is a status line. It does not unlink and it is not a wrong key.
+    #[test]
+    fn a_failed_move_aside_does_not_unlink() {
+        let events = events_of(LinkedEnd::MoveFailed);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Status {
+                status: AdapterStatus::Error,
+                detail,
+                ..
+            } if detail == thinwire_protocol::signal_key_wrong_kept()
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account { .. } | AdapterEvent::StoreAccess { .. }
+        )));
     }
 
     /// #174 item 14: a worker failure is `Unlinked` only.
@@ -3724,9 +3768,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .await
             .expect("resume places the finished pending link");
 
-        let store = SqliteStore::open(&url, OnNewIdentity::Trust)
-            .await
-            .expect("placed store");
+        let store = open_signal_store(&url).await.expect("placed store");
         assert!(
             store.is_registered().await,
             "the pending registration is now the session"
