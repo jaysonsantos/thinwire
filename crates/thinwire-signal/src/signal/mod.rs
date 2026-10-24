@@ -253,14 +253,24 @@ impl SignalAdapter {
             let queued =
                 session.request_older(conversation_id.to_string(), before_message_id.to_string());
             if !queued {
-                let _ = events.send(AdapterEvent::OlderHistoryLoaded {
-                    protocol: ProtocolId::Signal,
-                    conversation_id: conversation_id.to_string(),
-                    before_message_id: before_message_id.to_string(),
-                    more: true,
-                    note: Some("Signal is not linked".to_string()),
-                    topic: None,
-                });
+                // The retained store is local. Page it with no live worker.
+                // A live chat still reports that Signal is not linked.
+                let retained = thinwire_protocol::signal_retained_slot(conversation_id).is_some()
+                    && live::spawn_retained_older_page(
+                        conversation_id.to_string(),
+                        before_message_id.to_string(),
+                        events.clone(),
+                    );
+                if !retained {
+                    let _ = events.send(AdapterEvent::OlderHistoryLoaded {
+                        protocol: ProtocolId::Signal,
+                        conversation_id: conversation_id.to_string(),
+                        before_message_id: before_message_id.to_string(),
+                        more: true,
+                        note: Some("Signal is not linked".to_string()),
+                        topic: None,
+                    });
+                }
             }
             return Ok(());
         }

@@ -35,10 +35,9 @@ use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::AttemptCancel;
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolId, RedactedPairingSecret, SIGNAL_HISTORY_KEPT, SIGNAL_HISTORY_NOT_KEPT,
-    SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_RESET, SIGNAL_RETAINED_SETTLED, emit_account,
-    emit_conversation, emit_message, emit_status, signal_retained_chat, signal_retained_chat_id,
-    signal_retained_slot,
+    ProtocolId, RedactedPairingSecret, SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_RESET,
+    SIGNAL_RETAINED_SETTLED, emit_account, emit_conversation, emit_message, emit_status,
+    signal_retained_chat, signal_retained_chat_id, signal_retained_slot,
 };
 
 const DATA_DIR_MISSING: &str =
@@ -1356,9 +1355,6 @@ async fn run_linked(
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
     };
-    // Old history can sit under `retained/` while this link is still open.
-    // Tell the core before the rows exist. The line names no phone number.
-    note_retained_history(&store_path, &events);
     let Some(store_url) = sqlite_store_path(&store_path).to_str().map(str::to_string) else {
         fail(&events, STORE_FAILED);
         session.active.store(false, Ordering::SeqCst);
@@ -1369,6 +1365,15 @@ async fn run_linked(
     // creates a session file.
     if recover_pending_link(&store_path).await.is_err() {
         fail(&events, STORE_FAILED);
+        session.active.store(false, Ordering::SeqCst);
+        return LinkedEnd::Stopped;
+    }
+    // Retained history is local. Publish it before this link has a session.
+    // Each store sends its rows when that store is open. This task is not
+    // the UI thread. `retire_live` stays false so a same-number inbox is
+    // not cleared before the link knows the number.
+    let _ = publish_retained_stores(&store_path, &events, false).await;
+    if !session.is_current(token) {
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
     }
@@ -1790,18 +1795,10 @@ async fn publish_chats(
 
 const RETAINED_HISTORY_NOT_READ: &str = "signal could not read a previous account store";
 
-/// Tell the core that `retained/` has a previous account.
-/// The status names no phone number and no account id.
-/// The core shows one line until the rows are published.
-fn note_retained_history(session_dir: &Path, events: &EventTx) {
-    if retained_store_dirs(session_dir).is_empty() {
-        return;
-    }
-    let _ = events.send(AdapterEvent::Status {
-        protocol: ProtocolId::Signal,
-        status: AdapterStatus::Ready,
-        detail: SIGNAL_HISTORY_KEPT.to_owned(),
-    });
+/// Publish every store under `retained/` as a read-only account.
+/// The post-link call drops the live copy of those chats.
+async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool {
+    publish_retained_stores(session_dir, events, true).await
 }
 
 /// Publish every store under `retained/` as a read-only account.
@@ -1813,40 +1810,36 @@ fn note_retained_history(session_dir: &Path, events: &EventTx) {
 /// live account id is skipped, so that number is not also a previous-account
 /// row.
 /// Returns `true` when at least one previous account was published.
-/// The status line tells the core to drop the live copy of those chats.
-async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool {
+///
+/// `retire_live` tells the core to drop the live chats. The publish that
+/// runs before a link passes `false`. Each store sends its rows when that
+/// store is open. The core keeps rows that this publish sends again.
+async fn publish_retained_stores(session_dir: &Path, events: &EventTx, retire_live: bool) -> bool {
     let _ = events.send(AdapterEvent::Status {
         protocol: ProtocolId::Signal,
         status: AdapterStatus::Ready,
         detail: SIGNAL_RETAINED_RESET.to_owned(),
     });
     // A directory with no store is not an account. Do not create the file.
+    // The directory read is on this task. The UI thread does not open the store.
     log_missing_retained_stores(session_dir);
     let live = live_registration_aci(session_dir).await;
     let mut published = false;
-    let mut kept = false;
     for (slot, dir) in retained_slots(session_dir) {
         if retained_dir_is_live(&dir, live) {
             continue;
         }
-        kept = true;
         match publish_one_retained(slot, &dir, events).await {
             Ok(true) => published = true,
             Ok(false) => {}
             Err(()) => tracing::error!("{}", RETAINED_HISTORY_NOT_READ),
         }
     }
-    if published {
+    if published && retire_live {
         let _ = events.send(AdapterEvent::Status {
             protocol: ProtocolId::Signal,
             status: AdapterStatus::Ready,
             detail: SIGNAL_PREVIOUS_ACCOUNT.to_owned(),
-        });
-    } else if !kept {
-        let _ = events.send(AdapterEvent::Status {
-            protocol: ProtocolId::Signal,
-            status: AdapterStatus::Ready,
-            detail: SIGNAL_HISTORY_NOT_KEPT.to_owned(),
         });
     }
     let _ = events.send(AdapterEvent::Status {
@@ -2193,6 +2186,34 @@ fn older_page_outcome<T>(loaded: Option<(Vec<T>, bool)>) -> (Vec<T>, bool, Optio
 fn history_window(before: u64, span: u64) -> (u64, bool) {
     let start = before.saturating_sub(span);
     (start, start == 0)
+}
+
+/// Read one older page of a retained chat when no live worker is running.
+/// The read is a task. `handle` does not wait on the store.
+/// `false` when this thread has no tokio runtime, so the caller can answer.
+pub(super) fn spawn_retained_older_page(
+    conversation_id: String,
+    before_message_id: String,
+    events: EventTx,
+) -> bool {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return false;
+    }
+    tokio::spawn(async move {
+        let Ok(dir) = signal_session_path() else {
+            let _ = events.send(AdapterEvent::OlderHistoryLoaded {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+                before_message_id,
+                more: true,
+                note: Some(HISTORY_READ_FAILED.to_string()),
+                topic: None,
+            });
+            return;
+        };
+        load_retained_older_page(&dir, &events, &conversation_id, &before_message_id).await;
+    });
+    true
 }
 
 /// Exclusive end of the first history page. The store orders by timestamp and
@@ -5136,47 +5157,34 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Retained files exist and the rows are not published yet.
-    /// The status names no phone number and no account id.
+    /// A publish with no live session does not tell the user to link first.
+    /// The status lines name no phone number.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_retained_hold_names_no_phone_and_no_account_id() {
-        let dir = temp_session_dir("held-history");
-        let aci = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
-        let aside = dir.join(RETAINED_DIR).join(aci.to_string());
-        std::fs::create_dir_all(&aside).expect("dir");
-        std::fs::write(sqlite_store_path(&aside), []).expect("file");
-
-        let (bytes, guard) = capture_logs();
-        tracing::callsite::rebuild_interest_cache();
+    async fn a_startup_publish_does_not_wait_for_a_link() {
+        let dir = temp_session_dir("startup-history");
+        std::fs::create_dir_all(dir.join(RETAINED_DIR)).expect("dir");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        note_retained_history(&dir, &tx);
+        assert!(!publish_retained_stores(&dir, &tx, false).await);
         drop(tx);
-        let log = logged(&bytes);
-        drop(guard);
+        let events = collect_events(&mut rx).await;
+        let debug = format!("{events:?}");
         assert!(
-            !log.contains(&aci.to_string()) && !log.contains("2025550100"),
-            "the log has no account id and no phone number: {log}"
+            !debug.contains("shows again after you link")
+                && !debug.contains(SIGNAL_PREVIOUS_ACCOUNT)
+                && !debug.chars().any(|ch| ch.is_ascii_digit()),
+            "a publish with no link does not retire the live inbox: {debug}"
         );
-
-        let event = rx.recv().await.expect("held status");
-        assert!(matches!(
-            &event,
-            AdapterEvent::Status { detail, .. } if detail == SIGNAL_HISTORY_KEPT
-        ));
-        let debug = format!("{event:?}");
         assert!(
-            !debug.contains(&aci.to_string()) && !debug.contains("2025550100"),
-            "the event has no account id and no phone number: {debug}"
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_RETAINED_RESET
+            )) && events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_RETAINED_SETTLED
+            )),
+            "the publish still brackets the stores: {events:?}"
         );
-        assert!(rx.recv().await.is_none(), "one line, not the rows");
-
-        let empty = temp_session_dir("held-empty");
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        note_retained_history(&empty, &tx);
-        drop(tx);
-        assert!(rx.recv().await.is_none(), "no retained store, no line");
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&empty);
     }
 
     fn temp_session_dir(label: &str) -> std::path::PathBuf {

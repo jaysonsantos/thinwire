@@ -569,12 +569,6 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                 if !snapshot.shows_in_switcher(account.caps.id) {
                     continue;
                 }
-                // The old rows are hidden. The line under the list says why.
-                if account.signal_retained.is_some()
-                    && snapshot.signal_history_kept_line().is_some()
-                {
-                    continue;
-                }
                 let unread = snapshot.account_row_unread(account);
                 if account_chip(
                     ui,
@@ -595,11 +589,6 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
             }
             if let Some(protocol) = clicked {
                 out.push(Intent::SelectProtocol(protocol));
-            }
-            if let Some(line) = snapshot.signal_history_kept_line() {
-                let palette = theme::palette(ui);
-                ui.label(RichText::new(line).small().color(palette.text2));
-                ui.add_space(4.0);
             }
 
             #[cfg(feature = "whatsapp-web")]
