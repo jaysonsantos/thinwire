@@ -1144,9 +1144,12 @@ impl Snapshot {
                 }
                 self.older_loading.remove(&key);
                 // A failed page keeps the open run and the store cursor, so
-                // the retry sends the same read. A success closes or continues
-                // the run.
+                // the retry sends the same read. The asked timestamp is the
+                // in-flight cursor; leaving it set makes that retry look like
+                // a cursor that did not move. A success closes or continues
+                // the run, and a success that does not move still drops it.
                 let continued = if failed {
+                    self.history_asked.remove(&key);
                     false
                 } else if let Some(cursor) = store_cursor {
                     self.note_unreadable(
@@ -2336,7 +2339,9 @@ impl Snapshot {
         true
     }
 
-    /// The saved store cursor, when it is older than the last request.
+    /// The saved store cursor, when it is older than the last finished
+    /// request. A failed read clears that timestamp, so the same cursor is
+    /// sent again. A cursor that a finished read did not move is dropped.
     fn take_resume_cursor(
         &mut self,
         protocol: ProtocolId,
@@ -14297,6 +14302,55 @@ mod tests {
         assert!(older_store_cursors(&mut snapshot).is_empty());
         assert_eq!(snapshot.unreadable_runs()[0].skipped, 20);
         assert_ne!(snapshot.older_state(), OlderState::Loading);
+    }
+
+    #[test]
+    fn a_failed_store_cursor_continuation_is_asked_again() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 9_000, "on screen"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.load_older();
+        assert_eq!(older_store_cursors(&mut snapshot), vec![None]);
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 3_000,
+                skipped: 208,
+                resume: true,
+            }),
+        });
+        assert_eq!(older_store_cursors(&mut snapshot), vec![Some(3_000)]);
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: true,
+            note: Some("the store read failed".into()),
+            topic: None,
+            store_cursor: None,
+        });
+        assert!(
+            snapshot.unreadable_runs().is_empty(),
+            "a failed continuation does not close the run"
+        );
+        snapshot.load_older_at(Instant::now() + OLDER_RETRY_DELAY + Duration::from_secs(1));
+        assert_eq!(
+            older_store_cursors(&mut snapshot),
+            vec![Some(3_000)],
+            "the retry sends the same store cursor"
+        );
     }
 
     // endregion: #135
