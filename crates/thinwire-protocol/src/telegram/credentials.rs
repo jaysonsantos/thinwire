@@ -361,6 +361,36 @@ mod tests {
                 );
             }
         }
+        assert_eq!(
+            os_zips.matches("MACOS_SIGNING_P12:").count(),
+            1,
+            "the p12 secret belongs only on the macOS stage step"
+        );
+        assert!(os_zips.contains("MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}"));
+        assert!(
+            os_zips
+                .contains("MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}")
+        );
+        assert!(os_zips.contains("MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}"));
+        for (name, src) in [
+            ("ci.yml", ci),
+            ("release-tag.yml", release),
+            ("claude.yml", claude),
+            ("claude-code-review.yml", review),
+        ] {
+            assert!(
+                !src.contains("MACOS_SIGNING"),
+                "{name} must not read the macOS signing secrets"
+            );
+        }
+        for line in os_zips.lines() {
+            if line.contains("if:") {
+                assert!(
+                    !line.contains("secrets."),
+                    "do not read secrets from an if condition: {line}"
+                );
+            }
+        }
         assert!(
             !os_zips.contains("tr -d"),
             "TELEGRAM_API_ID check must not strip embedded whitespace"
