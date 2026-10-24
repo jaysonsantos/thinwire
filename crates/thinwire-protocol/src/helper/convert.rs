@@ -484,7 +484,7 @@ fn cursor_from_wire(cursor: WireHistoryCursor) -> HistoryStoreCursor {
 /// Keep at most [`MAX_HISTORY_CURSOR_RUNS`] runs, and only when their counts
 /// add up to `skipped`. A longer list is cut there. A list that still does
 /// not add up is dropped. `skipped` stays, so the core draws one line for
-/// the total.
+/// the total at the oldest edge of the page.
 fn bounded_skip_runs(runs: Vec<WireHistorySkip>, skipped: u32) -> Vec<HistorySkipRun> {
     if runs.is_empty() {
         return Vec::new();

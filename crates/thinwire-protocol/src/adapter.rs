@@ -736,8 +736,9 @@ pub struct HistoryStoreCursor {
     /// The next read starts at `before_ms`. `false` means the next read still
     /// uses the oldest shown message id. The count is still shown.
     pub resume: bool,
-    /// Where those rows sit among the rows this page shows. Empty: one run
-    /// of `skipped` at the request anchor.
+    /// Where those rows sit among the rows this page shows. When `runs` is
+    /// empty, the core draws one line for `skipped` at the oldest edge of
+    /// the page.
     pub runs: Vec<HistorySkipRun>,
 }
 

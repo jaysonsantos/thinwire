@@ -42,7 +42,8 @@ pub struct WireHistoryCursor {
     /// marker, and the next read still uses the shown message id.
     pub resume: bool,
     /// Where the unreadable rows sit among the rows this page shows.
-    /// Empty: one run of `skipped` at the request anchor.
+    /// When `runs` is empty, the core draws one line for `skipped` at the
+    /// oldest edge of the page.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<WireHistorySkip>,
 }
