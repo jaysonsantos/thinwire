@@ -35,10 +35,10 @@ use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::AttemptCancel;
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolId, RedactedPairingSecret, SIGNAL_HISTORY_KEPT, SIGNAL_HISTORY_NOT_KEPT,
-    SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_RESET, SIGNAL_RETAINED_SETTLED, emit_account,
-    emit_conversation, emit_message, emit_status, signal_retained_chat, signal_retained_chat_id,
-    signal_retained_slot,
+    ProtocolId, RedactedPairingSecret, SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_RESET,
+    SIGNAL_RETAINED_SETTLED, emit_account, emit_conversation, emit_message, emit_status,
+    signal_retained_chat, signal_retained_chat_id, signal_retained_slot,
+    signal_retained_unreadable_detail,
 };
 
 const DATA_DIR_MISSING: &str =
@@ -126,6 +126,12 @@ pub(super) struct Session {
     viewed: std::sync::Mutex<Option<String>>,
     /// The next worker loads a registration and does not start a new link.
     resume_only: AtomicBool,
+    /// One retained publish at a time. The pre-link task and the post-link
+    /// publish share it, so their reset and settled lines cannot cross.
+    retained_lock: Arc<Mutex<()>>,
+    /// Tests pause the pre-link publish here. Production builds have no pause.
+    #[cfg(test)]
+    prelink_hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl Session {
@@ -140,6 +146,26 @@ impl Session {
             groups: Mutex::new(super::group::GroupKeys::default()),
             viewed: std::sync::Mutex::new(None),
             resume_only: AtomicBool::new(false),
+            retained_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            prelink_hold: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Pause the next pre-link retained publish until the notify fires.
+    /// The live store open does not wait on this.
+    #[cfg(test)]
+    fn hold_prelink_publish(&self) -> Arc<tokio::sync::Notify> {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        *self.prelink_hold.lock().expect("prelink hold") = Some(Arc::clone(&notify));
+        notify
+    }
+
+    #[cfg(test)]
+    async fn wait_prelink_hold(&self) {
+        let notify = self.prelink_hold.lock().expect("prelink hold").clone();
+        if let Some(notify) = notify {
+            notify.notified().await;
         }
     }
 
@@ -275,9 +301,16 @@ pub(super) async fn run(
     // No session file and no pending link file: do not create one, and do
     // not start a QR link. A crash can leave only the pending file.
     // [`run_linked`] places that file. This check does not open it.
+    // Previous accounts under `retained/` still publish. The read does not
+    // create a session file, and it does not start a link.
     let end =
         if let Some(end) = resume_end_without_store(resume_only, default_session_file_present()) {
             session.active.store(false, Ordering::SeqCst);
+            if session.is_current(token)
+                && let Ok(store_path) = signal_session_path()
+            {
+                let _ = publish_retained_stores(&store_path, &events, false).await;
+            }
             end
         } else {
             run_linked(
@@ -1425,10 +1458,12 @@ fn classify_open<E: std::error::Error>(
 ///
 /// [`run`] enters [`run_linked`] when this guard does not return
 /// [`LinkedEnd::Absent`]. [`run_linked`] calls this function. It places a
-/// pending link file, then loads the registration. It stops before the
-/// receive loop. That loop opens a socket to Signal.
+/// pending link file, starts a publish of `retained/` beside the live
+/// store, then loads the registration. It stops before the receive loop.
+/// That loop opens a socket to Signal. The retained publish is its own
+/// task, so a large or locked store does not delay this open.
 async fn open_linked_store(
-    session: &Session,
+    session: &Arc<Session>,
     token: u64,
     events: &EventTx,
     store_path: &Path,
@@ -1462,6 +1497,26 @@ async fn open_linked_store(
         session.active.store(false, Ordering::SeqCst);
         return Err(LinkedEnd::Stopped);
     }
+    // Retained history is local. Start the publish beside the live open.
+    // A large or locked store in `retained/` must not delay this open.
+    // This task is not the UI thread. The publish task is not either.
+    // `retire_live` stays false so a same-number inbox is not cleared
+    // before the link knows the number. The task checks the session
+    // token, so a newer session does not finish this publish.
+    // The account id is read here. The publish task does not open the
+    // live store, so the two opens do not share that file.
+    let live = live_registration_aci(store_path).await;
+    if !session.is_current(token) {
+        session.active.store(false, Ordering::SeqCst);
+        return Err(LinkedEnd::Stopped);
+    }
+    spawn_prelink_retained_publish(
+        Arc::clone(session),
+        token,
+        store_path.to_path_buf(),
+        events.clone(),
+        live,
+    );
     let store = match SqliteStore::open(&store_url, OnNewIdentity::Trust).await {
         Ok(store) => store,
         Err(_) => {
@@ -1546,11 +1601,10 @@ async fn run_linked(
         session.active.store(false, Ordering::SeqCst);
         return LinkedEnd::Stopped;
     };
-    // Old history can sit under `retained/` while this link is still open.
-    // Tell the core before the rows exist. The line names no phone number.
-    note_retained_history(&store_path, &events);
+    // [`open_linked_store`] recovers a pending link, starts the retained
+    // publish beside the live store, then loads the registration.
     let mut manager =
-        match open_linked_store(session.as_ref(), token, &events, &store_path, resume_only).await {
+        match open_linked_store(&session, token, &events, &store_path, resume_only).await {
             Ok(manager) => manager,
             Err(end) => return end,
         };
@@ -1576,7 +1630,15 @@ async fn run_linked(
         Ok(Ok(())) => {}
         _ => tracing::error!("{}", RETAINED_SLOT_NOT_STORED),
     }
-    let _ = publish_retained_accounts(&store_path, &events).await;
+    let _ = publish_retained_for_session(
+        &session,
+        token,
+        &store_path,
+        &events,
+        true,
+        LiveAccount::Lookup,
+    )
+    .await;
     let mut rows = std::collections::HashMap::<String, Conversation>::new();
     let mut unread = std::collections::HashMap::<String, u32>::new();
     let (mut known, mut group_titles) =
@@ -1922,18 +1984,73 @@ async fn publish_chats(
 
 const RETAINED_HISTORY_NOT_READ: &str = "signal could not read a previous account store";
 
-/// Tell the core that `retained/` has a previous account.
-/// The status names no phone number and no account id.
-/// The core shows one line until the rows are published.
-fn note_retained_history(session_dir: &Path, events: &EventTx) {
-    if retained_store_dirs(session_dir).is_empty() {
-        return;
-    }
-    let _ = events.send(AdapterEvent::Status {
-        protocol: ProtocolId::Signal,
-        status: AdapterStatus::Ready,
-        detail: SIGNAL_HISTORY_KEPT.to_owned(),
+/// Publish every store under `retained/` and retire the live copy.
+/// Tests call this. The linked worker uses [`publish_retained_for_session`].
+#[cfg(test)]
+async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool {
+    publish_retained_stores(session_dir, events, true).await
+}
+
+/// The live account id for a retained publish.
+enum LiveAccount {
+    /// Open the live store and read the account id.
+    Lookup,
+    /// The caller already read it. Do not open the live store.
+    Known(Option<Uuid>),
+}
+
+/// Start the pre-link retained publish. The caller does not wait.
+/// The task checks `token` before it sends, so a newer session does not
+/// finish this publish. It does not open the live store.
+fn spawn_prelink_retained_publish(
+    session: Arc<Session>,
+    token: u64,
+    store_path: PathBuf,
+    events: EventTx,
+    live: Option<Uuid>,
+) {
+    tokio::spawn(async move {
+        #[cfg(test)]
+        session.wait_prelink_hold().await;
+        let _ = publish_retained_for_session(
+            &session,
+            token,
+            &store_path,
+            &events,
+            false,
+            LiveAccount::Known(live),
+        )
+        .await;
     });
+}
+
+/// Publish `retained/` for this session.
+/// One publish runs at a time. A superseded session sends no settled line.
+async fn publish_retained_for_session(
+    session: &Arc<Session>,
+    token: u64,
+    session_dir: &Path,
+    events: &EventTx,
+    retire_live: bool,
+    live: LiveAccount,
+) -> bool {
+    let _guard = session.retained_lock.lock().await;
+    if !session.is_current(token) {
+        return false;
+    }
+    let live = match live {
+        LiveAccount::Lookup => live_registration_aci(session_dir).await,
+        LiveAccount::Known(live) => live,
+    };
+    publish_retained_body(
+        session_dir,
+        events,
+        retire_live,
+        live,
+        Some(session.as_ref()),
+        token,
+    )
+    .await
 }
 
 /// Publish every store under `retained/` as a read-only account.
@@ -1945,40 +2062,72 @@ fn note_retained_history(session_dir: &Path, events: &EventTx) {
 /// live account id is skipped, so that number is not also a previous-account
 /// row.
 /// Returns `true` when at least one previous account was published.
-/// The status line tells the core to drop the live copy of those chats.
-async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool {
+///
+/// `retire_live` tells the core to drop the live chats. The publish that
+/// runs before a link passes `false`. Each store sends its rows when that
+/// store is open. The core keeps rows that this publish sends again.
+/// A store that cannot be read keeps its slot. A missing store does not.
+async fn publish_retained_stores(session_dir: &Path, events: &EventTx, retire_live: bool) -> bool {
+    let live = live_registration_aci(session_dir).await;
+    publish_retained_body(session_dir, events, retire_live, live, None, 0).await
+}
+
+async fn publish_retained_body(
+    session_dir: &Path,
+    events: &EventTx,
+    retire_live: bool,
+    live: Option<Uuid>,
+    session: Option<&Session>,
+    token: u64,
+) -> bool {
+    let current = || session.is_none_or(|session| session.is_current(token));
+    if !current() {
+        return false;
+    }
     let _ = events.send(AdapterEvent::Status {
         protocol: ProtocolId::Signal,
         status: AdapterStatus::Ready,
         detail: SIGNAL_RETAINED_RESET.to_owned(),
     });
     // A directory with no store is not an account. Do not create the file.
+    // The directory read is on this task. The UI thread does not open the store.
     log_missing_retained_stores(session_dir);
-    let live = live_registration_aci(session_dir).await;
     let mut published = false;
-    let mut kept = false;
     for (slot, dir) in retained_slots(session_dir) {
+        if !current() {
+            return false;
+        }
         if retained_dir_is_live(&dir, live) {
             continue;
         }
-        kept = true;
         match publish_one_retained(slot, &dir, events).await {
             Ok(true) => published = true,
             Ok(false) => {}
-            Err(()) => tracing::error!("{}", RETAINED_HISTORY_NOT_READ),
+            // The files stay on disk. Tell the core to keep this slot.
+            // A missing store is not in this loop, so settle still drops it.
+            Err(()) => {
+                // The slot is a count. It is not an account id.
+                // The user-facing sentence does not include it.
+                tracing::error!(slot, "{}", RETAINED_HISTORY_NOT_READ);
+                if !current() {
+                    return false;
+                }
+                let _ = events.send(AdapterEvent::Status {
+                    protocol: ProtocolId::Signal,
+                    status: AdapterStatus::Error,
+                    detail: signal_retained_unreadable_detail(slot),
+                });
+            }
         }
     }
-    if published {
+    if !current() {
+        return false;
+    }
+    if published && retire_live {
         let _ = events.send(AdapterEvent::Status {
             protocol: ProtocolId::Signal,
             status: AdapterStatus::Ready,
             detail: SIGNAL_PREVIOUS_ACCOUNT.to_owned(),
-        });
-    } else if !kept {
-        let _ = events.send(AdapterEvent::Status {
-            protocol: ProtocolId::Signal,
-            status: AdapterStatus::Ready,
-            detail: SIGNAL_HISTORY_NOT_KEPT.to_owned(),
         });
     }
     let _ = events.send(AdapterEvent::Status {
@@ -2041,6 +2190,8 @@ fn log_missing_retained_stores(session_dir: &Path) {
 }
 
 /// `Ok(true)` when this store published at least one chat.
+/// `Err(())` when the store is on disk and this read failed. The caller
+/// keeps the slot. An empty store is `Ok(false)`.
 async fn publish_one_retained(slot: u32, dir: &Path, events: &EventTx) -> Result<bool, ()> {
     let url = path_url(&sqlite_store_path(dir))?;
     let store = open_retained_store(&url).await?;
@@ -2325,6 +2476,34 @@ fn older_page_outcome<T>(loaded: Option<(Vec<T>, bool)>) -> (Vec<T>, bool, Optio
 fn history_window(before: u64, span: u64) -> (u64, bool) {
     let start = before.saturating_sub(span);
     (start, start == 0)
+}
+
+/// Read one older page of a retained chat when no live worker is running.
+/// The read is a task. `handle` does not wait on the store.
+/// `false` when this thread has no tokio runtime, so the caller can answer.
+pub(super) fn spawn_retained_older_page(
+    conversation_id: String,
+    before_message_id: String,
+    events: EventTx,
+) -> bool {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return false;
+    }
+    tokio::spawn(async move {
+        let Ok(dir) = signal_session_path() else {
+            let _ = events.send(AdapterEvent::OlderHistoryLoaded {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+                before_message_id,
+                more: true,
+                note: Some(HISTORY_READ_FAILED.to_string()),
+                topic: None,
+            });
+            return;
+        };
+        load_retained_older_page(&dir, &events, &conversation_id, &before_message_id).await;
+    });
+    true
 }
 
 /// Exclusive end of the first history page. The store orders by timestamp and
@@ -5212,6 +5391,81 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A store file that cannot be opened keeps its slot.
+    /// The file stays on disk. The publish tells the core to keep the row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_unreadable_retained_store_keeps_its_slot() {
+        let dir = temp_session_dir("retained-unreadable");
+        let account = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let aside = dir.join(RETAINED_DIR).join(account);
+        std::fs::create_dir_all(&aside).expect("dir");
+        let store_path = sqlite_store_path(&aside);
+        std::fs::write(&store_path, b"not a sqlite database").expect("file");
+        std::fs::write(aside.join(RETAINED_SLOT_FILE), "4\n").expect("slot");
+
+        let (bytes, guard) = capture_logs();
+        tracing::callsite::rebuild_interest_cache();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(
+            !publish_retained_stores(&dir, &tx, false).await,
+            "a failed read publishes no chats"
+        );
+        drop(tx);
+        let log = logged(&bytes);
+        drop(guard);
+        let events = collect_events(&mut rx).await;
+
+        assert!(store_path.is_file(), "a failed read leaves the store file");
+        assert_eq!(
+            std::fs::read(&store_path).expect("file"),
+            b"not a sqlite database",
+            "a failed read does not replace the file"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. }
+                    if detail == &signal_retained_unreadable_detail(4)
+            )),
+            "the core is told to keep slot 4: {events:?}"
+        );
+        assert_eq!(
+            thinwire_protocol::SIGNAL_RETAINED_UNREADABLE,
+            "This history could not be read. It was not deleted.",
+            "the row shows this text"
+        );
+        assert!(
+            !thinwire_protocol::SIGNAL_RETAINED_UNREADABLE
+                .chars()
+                .any(|ch| ch.is_ascii_digit()),
+            "the user-facing text has no slot count"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::ConversationUpsert { .. } | AdapterEvent::MessageReceived { .. }
+            )),
+            "a failed read adds no chat: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_RETAINED_RESET
+            )) && events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_RETAINED_SETTLED
+            )),
+            "the publish still brackets the stores: {events:?}"
+        );
+        assert!(
+            log.contains(RETAINED_HISTORY_NOT_READ)
+                && log.contains("slot=4")
+                && !log.contains(account),
+            "the log keeps the slot count and names no account id: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Reading a previous account does not change its rows.
     /// The store starts on the schema of the migrations through
     /// `base_keys_seen`. The open applies the later presage migrations.
@@ -5268,47 +5522,43 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Retained files exist and the rows are not published yet.
-    /// The status names no phone number and no account id.
+    /// A publish with no live session does not tell the user to link first.
+    /// The status lines name no phone number.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_retained_hold_names_no_phone_and_no_account_id() {
-        let dir = temp_session_dir("held-history");
-        let aci = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
-        let aside = dir.join(RETAINED_DIR).join(aci.to_string());
-        std::fs::create_dir_all(&aside).expect("dir");
-        std::fs::write(sqlite_store_path(&aside), []).expect("file");
-
-        let (bytes, guard) = capture_logs();
-        tracing::callsite::rebuild_interest_cache();
+    async fn a_startup_publish_does_not_wait_for_a_link() {
+        let dir = temp_session_dir("startup-history");
+        std::fs::create_dir_all(dir.join(RETAINED_DIR)).expect("dir");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        note_retained_history(&dir, &tx);
+        assert!(!publish_retained_stores(&dir, &tx, false).await);
         drop(tx);
-        let log = logged(&bytes);
-        drop(guard);
+        let events = collect_events(&mut rx).await;
         assert!(
-            !log.contains(&aci.to_string()) && !log.contains("2025550100"),
-            "the log has no account id and no phone number: {log}"
+            events.iter().all(|event| match event {
+                AdapterEvent::Status {
+                    protocol,
+                    status,
+                    detail,
+                } => {
+                    *protocol == ProtocolId::Signal
+                        && *status == AdapterStatus::Ready
+                        && (detail == SIGNAL_RETAINED_RESET || detail == SIGNAL_RETAINED_SETTLED)
+                        && !detail.contains("shows again after you link")
+                }
+                _ => false,
+            }),
+            "a publish with no link sends only the retained brackets: {events:?}"
         );
-
-        let event = rx.recv().await.expect("held status");
-        assert!(matches!(
-            &event,
-            AdapterEvent::Status { detail, .. } if detail == SIGNAL_HISTORY_KEPT
-        ));
-        let debug = format!("{event:?}");
         assert!(
-            !debug.contains(&aci.to_string()) && !debug.contains("2025550100"),
-            "the event has no account id and no phone number: {debug}"
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_RETAINED_RESET
+            )) && events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_RETAINED_SETTLED
+            )),
+            "the publish still brackets the stores: {events:?}"
         );
-        assert!(rx.recv().await.is_none(), "one line, not the rows");
-
-        let empty = temp_session_dir("held-empty");
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        note_retained_history(&empty, &tx);
-        drop(tx);
-        assert!(rx.recv().await.is_none(), "no retained store, no line");
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&empty);
     }
 
     fn temp_session_dir(label: &str) -> std::path::PathBuf {
@@ -5996,7 +6246,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         );
         assert!(!sqlite_store_path(&dir).exists());
 
-        let session = Session::new();
+        let session = Arc::new(Session::new());
         session.set_resume_only(true);
         let (token, _wake) = session.begin_attempt();
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6034,7 +6284,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         manager.store().close().await;
 
         let neither = temp_session_dir("resume-no-store");
-        let idle = Session::new();
+        let idle = Arc::new(Session::new());
         idle.set_resume_only(true);
         let (idle_token, _idle_wake) = idle.begin_attempt();
         let (idle_events, _idle_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6057,6 +6307,57 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&neither);
+    }
+
+    /// A retained publish that has not finished does not hold the live open.
+    /// The open returns while the publish is still waiting. The publish
+    /// then sends its bracket lines.
+    #[tokio::test]
+    async fn a_prelink_publish_does_not_block_the_live_open() {
+        let dir = temp_session_dir("prelink-hold");
+        let (store, _url, pool) = open_session_db(&dir).await;
+        insert_registration(&pool, REJECTED_REGISTRATION).await;
+        pool.close().await;
+        store.close().await;
+        std::fs::create_dir_all(dir.join(RETAINED_DIR)).expect("dir");
+
+        let session = Arc::new(Session::new());
+        session.set_resume_only(true);
+        let hold = session.hold_prelink_publish();
+        let (token, _wake) = session.begin_attempt();
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let opened = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            open_linked_store(&session, token, &events, &dir, true),
+        )
+        .await
+        .expect("the live open does not wait for the retained publish");
+        let Ok(manager) = opened else {
+            panic!("the registered store opens");
+        };
+        assert!(
+            rx.try_recv().is_err(),
+            "the retained publish has not sent while it is held"
+        );
+        manager.store().close().await;
+
+        hold.notify_one();
+        drop(events);
+        let published =
+            tokio::time::timeout(std::time::Duration::from_secs(10), collect_events(&mut rx))
+                .await
+                .expect("the retained publish finishes after the live open");
+        assert!(
+            published.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_RETAINED_RESET
+            )) && published.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status { detail, .. } if detail == SIGNAL_RETAINED_SETTLED
+            )),
+            "the publish still brackets the stores: {published:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A crash registered the pending file and left `session.sqlite` with no
