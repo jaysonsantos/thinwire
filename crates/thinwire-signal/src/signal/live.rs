@@ -269,20 +269,23 @@ pub(super) async fn run(
     events: EventTx,
     resume_only: bool,
 ) {
-    // No session file: do not create one, and do not start a QR link.
-    let end = if resume_only && !default_session_file_present() {
-        session.active.store(false, Ordering::SeqCst);
-        LinkedEnd::Absent
-    } else {
-        run_linked(
-            Arc::clone(&session),
-            token,
-            wake,
-            events.clone(),
-            resume_only,
-        )
-        .await
-    };
+    // No session file and no pending link file: do not create one, and do
+    // not start a QR link. A crash can leave only the pending file.
+    // [`run_linked`] places that file. This check does not open it.
+    let end =
+        if let Some(end) = resume_end_without_store(resume_only, default_session_file_present()) {
+            session.active.store(false, Ordering::SeqCst);
+            end
+        } else {
+            run_linked(
+                Arc::clone(&session),
+                token,
+                wake,
+                events.clone(),
+                resume_only,
+            )
+            .await
+        };
     let end = if session.is_current(token) {
         end
     } else {
@@ -395,9 +398,32 @@ fn launch_open(registered: bool, resume_only: bool) -> LaunchOpen {
     }
 }
 
-/// `true` when the default session folder already has a sqlite file.
+/// `true` when the default session folder already has a store file.
+///
+/// `session.sqlite` is the open store. A crash after the old file moves
+/// aside can leave only `session.sqlite.pending`. [`adopt_pending_store`]
+/// places that file when [`run_linked`] runs. This check does not open it.
 fn default_session_file_present() -> bool {
-    signal_session_path().is_ok_and(|dir| sqlite_store_path(&dir).is_file())
+    signal_session_path().is_ok_and(|dir| session_store_present(&dir))
+}
+
+/// `true` when this folder has `session.sqlite` or `session.sqlite.pending`.
+///
+/// The check is the file name on disk. It does not open either file.
+fn session_store_present(dir: &Path) -> bool {
+    sqlite_store_path(dir).is_file() || pending_store_path(dir).is_file()
+}
+
+/// `Some(Absent)` when a resume launch has no store file.
+///
+/// A link the user starts still runs when both files are missing. That
+/// launch creates the store. Resume does not.
+fn resume_end_without_store(resume_only: bool, store_present: bool) -> Option<LinkedEnd> {
+    if resume_only && !store_present {
+        Some(LinkedEnd::Absent)
+    } else {
+        None
+    }
 }
 
 /// Drop the registration Signal rejected, and the identity rows that belong
@@ -3566,6 +3592,61 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "a resume must not need a new session file"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash can move `session.sqlite` aside and leave only the pending
+    /// link file. Resume must see that file and must not end as
+    /// [`LinkedEnd::Absent`]. No store file still ends as
+    /// [`LinkedEnd::Absent`]. This test does not open the pending file.
+    #[test]
+    fn a_remembered_notice_resumes_when_only_the_pending_link_file_is_on_disk() {
+        let pending_only = temp_session_dir("resume-pending-only");
+        let pending = pending_store_path(&pending_only);
+        std::fs::write(&pending, []).expect("pending file");
+        assert!(
+            !sqlite_store_path(&pending_only).exists(),
+            "the crash leaves no session file"
+        );
+        assert!(pending.is_file(), "the pending link file is on disk");
+        assert!(
+            session_store_present(&pending_only),
+            "resume sees the pending link file"
+        );
+        assert!(
+            resume_end_without_store(true, session_store_present(&pending_only)).is_none(),
+            "resume does not end as Absent"
+        );
+        assert!(
+            resume_end_without_store(false, false).is_none(),
+            "a link the user starts still runs when no file is on disk"
+        );
+
+        let session_only = temp_session_dir("resume-session-only");
+        std::fs::write(sqlite_store_path(&session_only), []).expect("session file");
+        assert!(
+            session_store_present(&session_only),
+            "resume still sees session.sqlite"
+        );
+        assert!(
+            resume_end_without_store(true, session_store_present(&session_only)).is_none(),
+            "resume does not end as Absent when the session file is on disk"
+        );
+
+        let neither = temp_session_dir("resume-no-store");
+        assert!(!sqlite_store_path(&neither).exists());
+        assert!(!pending_store_path(&neither).exists());
+        assert!(!session_store_present(&neither));
+        assert!(
+            matches!(
+                resume_end_without_store(true, session_store_present(&neither)),
+                Some(LinkedEnd::Absent)
+            ),
+            "resume with no store file ends as Absent"
+        );
+
+        let _ = std::fs::remove_dir_all(&pending_only);
+        let _ = std::fs::remove_dir_all(&session_only);
+        let _ = std::fs::remove_dir_all(&neither);
     }
 
     /// A crash registered the pending file and left `session.sqlite` with no
