@@ -66,7 +66,26 @@ pub(crate) fn sled_session_present(session_dir: &Path) -> bool {
     session_dir.join("db").is_file() || session_dir.join("conf").is_file()
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_SESSION_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Use `dir` as the session folder on this thread. `None` restores the normal path.
+/// Other tests do not see it. The helper process still uses [`set_session_dir`].
+#[cfg(test)]
+pub(crate) fn set_test_session_dir(dir: Option<PathBuf>) {
+    TEST_SESSION_DIR.with(|slot| *slot.borrow_mut() = dir);
+}
+
 pub(crate) fn signal_session_path() -> Result<PathBuf, ()> {
+    #[cfg(test)]
+    {
+        let overridden = TEST_SESSION_DIR.with(|slot| slot.borrow().clone());
+        if let Some(dir) = overridden {
+            return Ok(dir);
+        }
+    }
     if let Some(dir) = SESSION_DIR.get() {
         return Ok(dir.clone());
     }

@@ -5811,6 +5811,54 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         );
     }
 
+    /// #174 item 14: the worker itself fails (the session folder cannot be
+    /// created). `run` emits `Unlinked`. It does not emit `AccountEnded`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_worker_run_that_cannot_open_the_store_emits_no_account_ended() {
+        let blocker = std::env::temp_dir().join(format!(
+            "thinwire-signal-worker-fail-{}",
+            std::process::id()
+        ));
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+        let dir = blocker.join("session");
+        super::super::path::set_test_session_dir(Some(dir));
+        let session = Arc::new(Session::new());
+        let (token, wake) = session.begin_attempt();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        super::run(session, token, wake, tx).await;
+        super::super::path::set_test_session_dir(None);
+        let _ = std::fs::remove_file(&blocker);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            !account_ended(&events),
+            "a worker failure does not end the account: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Account {
+                    protocol: ProtocolId::Signal,
+                    state: AccountState::Unlinked,
+                }
+            )),
+            "the worker stops as unlinked: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status {
+                    protocol: ProtocolId::Signal,
+                    status: AdapterStatus::Error,
+                    ..
+                }
+            )),
+            "the worker reports the store failure: {events:?}"
+        );
+    }
+
     /// #174 item 14: a dropped receive stream reconnects. It does not end
     /// the account.
     #[test]
