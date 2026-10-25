@@ -42,10 +42,10 @@ tokio = { workspace = true, features = ["io-std"] }
 tracing.workspace = true
 # The log of the helper program.
 tracing-subscriber.workspace = true
-presage = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c", optional = true, default-features = false }
+presage = { git = "https://github.com/whisperfish/presage", rev = "291c7ee10d2fd3ae04cea48e586ad55bdb89cd23", optional = true, default-features = false }
 # Default features of this crate build SQLCipher. This edge stays off so the
 # helper picks the SQLCipher build below, not a second SQLite.
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "6f630791b2c7bf3d5b00c75f5a6c94131bf79c8c", optional = true, default-features = false }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "291c7ee10d2fd3ae04cea48e586ad55bdb89cd23", optional = true, default-features = false }
 # Bundled SQLCipher and vendored OpenSSL. The helper does not need a system
 # libsqlite or libssl. The key lives in the OS keychain, not in this file.
 libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [

@@ -327,12 +327,101 @@ mod tests {
         assert!(stage.contains("Contents/Resources"));
         assert!(
             stage.contains("codesign --force --sign - \"$app\""),
-            "Thinwire.app needs an ad-hoc signature for the notification center (#161)"
+            "an empty MACOS_SIGNING_P12 keeps the ad-hoc bundle signature (#161)"
         );
         assert!(
-            stage.contains("codesign --verify --strict \"$app\""),
+            stage.contains("codesign --verify --strict --deep --verbose=2 \"$app\""),
             "the stage script must check the bundle signature"
         );
+        assert!(
+            stage.contains("security find-identity -p codesigning"),
+            "the stage script must read the signing identity from the temporary keychain"
+        );
+        assert!(
+            stage.contains("set-key-partition-list -S apple-tool:,apple:"),
+            "the stage script must allow codesign to use the temporary keychain"
+        );
+        assert!(stage.contains("-T /usr/bin/codesign"));
+        assert!(stage.contains("--options runtime"));
+        assert!(stage.contains("--timestamp=none"));
+        assert!(
+            stage.contains(r#"codesign "${args[@]}" "$target" || status=$?"#),
+            "sign_with_identity must keep the codesign status"
+        );
+        assert!(
+            !stage.contains("if ! codesign"),
+            "a negated codesign in an if-test stores status 0"
+        );
+        assert!(stage.contains("codesign hardened runtime: on (Developer ID Application)"));
+        assert!(stage.contains("codesign hardened runtime: off"));
+        let trap_at = stage
+            .find("trap cleanup_macos_signing EXIT")
+            .expect("cleanup trap");
+        let import_at = stage
+            .find("import_macos_signing_identity()")
+            .expect("import");
+        assert!(
+            trap_at < import_at,
+            "set the signing EXIT trap before import_macos_signing_identity"
+        );
+        assert_eq!(
+            stage.matches("trap cleanup_macos_signing EXIT").count(),
+            1,
+            "one top-level EXIT trap"
+        );
+        assert!(
+            !stage.contains("echo \"$MACOS_SIGNING_P12\""),
+            "the stage script must not print the p12"
+        );
+        assert!(
+            !stage.contains("echo \"$MACOS_SIGNING_P12_PASSWORD\""),
+            "the stage script must not print the p12 password"
+        );
+        for line in stage.lines() {
+            let code = line.split('#').next().unwrap_or("");
+            if code.contains("find-identity") {
+                assert!(
+                    !code.contains(" -v"),
+                    "find-identity must list untrusted identities too: {line}"
+                );
+            }
+            if code.contains("--deep") {
+                assert!(
+                    code.contains("--verify"),
+                    "use --deep only on codesign --verify: {line}"
+                );
+            }
+        }
+        assert_eq!(
+            os_zips.matches("MACOS_SIGNING_P12:").count(),
+            1,
+            "the p12 secret belongs only on the macOS stage step"
+        );
+        assert!(os_zips.contains("MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}"));
+        assert!(
+            os_zips
+                .contains("MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}")
+        );
+        assert!(os_zips.contains("MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}"));
+        for (name, src) in [
+            ("ci.yml", ci),
+            ("release-tag.yml", release),
+            ("claude.yml", claude),
+            ("claude-code-review.yml", review),
+        ] {
+            assert!(
+                !src.contains("MACOS_SIGNING"),
+                "{name} must not read the macOS signing secrets"
+            );
+        }
+        for line in os_zips.lines() {
+            if line.contains("if:") {
+                assert!(
+                    !line.contains("secrets."),
+                    "do not read secrets from an if condition: {line}"
+                );
+            }
+        }
         assert!(
             !os_zips.contains("tr -d"),
             "TELEGRAM_API_ID check must not strip embedded whitespace"
@@ -352,6 +441,44 @@ mod tests {
         );
         assert!(
             notice.contains("must be included in all copies of the Software, in whole or in part")
+        );
+    }
+
+    /// `sign_with_identity` used to store 0 from `if ! codesign`.
+    /// A fake `codesign` that exits 42 must make the function exit 42.
+    #[cfg(unix)]
+    #[test]
+    fn sign_with_identity_propagates_a_codesign_failure() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test-sign-with-identity.sh");
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .output()
+            .expect("run the sign_with_identity bash test");
+        assert!(
+            output.status.success(),
+            "sign_with_identity bash test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A name that starts with `Apple Development` is that type.
+    /// `--options runtime` stays limited to `Developer ID Application`.
+    #[cfg(unix)]
+    #[test]
+    fn identity_kind_labels_apple_development() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test-identity-kind.sh");
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .output()
+            .expect("run the identity kind bash test");
+        assert!(
+            output.status.success(),
+            "identity kind bash test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

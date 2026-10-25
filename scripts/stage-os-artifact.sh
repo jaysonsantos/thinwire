@@ -2,8 +2,10 @@
 # Stage dist/, then write one mode-preserving thinwire-$ARTIFACT.tar.gz.
 # actions/upload-artifact wraps downloads in an outer zip and stores loose
 # files as 644. The tar.gz is what keeps executable bits and the .app tree.
-# macOS: Thinwire.app with an ad-hoc signature only (no Developer ID). Linux
-# and Windows: flat binaries plus notices.
+# macOS: sign Thinwire.app with the identity in MACOS_SIGNING_P12 when that
+# variable is set. An empty variable keeps the ad-hoc signature. Hardened
+# runtime is only for a Developer ID Application identity. There is no
+# notarization. Linux and Windows: flat binaries plus notices.
 #
 # The payload has three programs (ADR 0013): the MIT app, and next to it
 # the AGPL-3.0-only WhatsApp helper and the AGPL-3.0-only Signal helper. The
@@ -169,6 +171,474 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   patchelf --set-rpath '$ORIGIN' "$bin"
 fi
 
+# Temporary keychain used when MACOS_SIGNING_P12 is set. The EXIT trap
+# below deletes the decoded p12 and the keychain, and restores the search
+# list. It is a no-op until import creates those files.
+signing_p12_file=""
+signing_keychain=""
+signing_keychain_dir=""
+signing_keychain_password=""
+signing_search_saved=0
+signing_search_list=()
+signing_xtrace=0
+sign_identity=""
+# 1 only for Developer ID Application. Apple Development, self-signed, and
+# unknown do not get --options runtime. A self-signed identity has no Team ID.
+sign_use_hardened_runtime=0
+identity_hashes=()
+identity_names=()
+identity_subject_dn=""
+identity_issuer_dn=""
+identity_kind_result=""
+
+cleanup_macos_signing() {
+  if [[ -n "$signing_keychain" ]]; then
+    security delete-keychain "$signing_keychain" >/dev/null 2>&1 || true
+    signing_keychain=""
+  fi
+  if [[ -n "$signing_p12_file" ]]; then
+    rm -f "$signing_p12_file"
+    signing_p12_file=""
+  fi
+  if [[ -n "$signing_keychain_dir" ]]; then
+    rm -rf "$signing_keychain_dir"
+    signing_keychain_dir=""
+  fi
+  signing_keychain_password=""
+  if [[ "$signing_search_saved" -eq 1 ]]; then
+    signing_search_saved=0
+    if [[ ${#signing_search_list[@]} -gt 0 ]]; then
+      security list-keychains -d user -s "${signing_search_list[@]}" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+# Install cleanup before import. A failure in security list-keychains
+# still deletes the temporary keychain and the decoded certificate.
+trap cleanup_macos_signing EXIT
+
+trim_spaces() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+silence_xtrace() {
+  signing_xtrace=0
+  case $- in
+    *x*)
+      signing_xtrace=1
+      set +x
+      ;;
+  esac
+}
+
+restore_xtrace() {
+  if [[ "$signing_xtrace" -eq 1 ]]; then
+    set -x
+  fi
+}
+
+save_keychain_search_list() {
+  local line trimmed
+  signing_search_list=()
+  while IFS= read -r line; do
+    trimmed="$(trim_spaces "$line")"
+    case "$trimmed" in
+      \"*\")
+        trimmed="${trimmed#\"}"
+        trimmed="${trimmed%\"}"
+        ;;
+    esac
+    if [[ -n "$trimmed" ]]; then
+      signing_search_list+=("$trimmed")
+    fi
+  done < <(security list-keychains -d user)
+  if [[ ${#signing_search_list[@]} -eq 0 ]]; then
+    echo "::error::The user keychain search list is empty. Refusing to replace it."
+    exit 1
+  fi
+  signing_search_saved=1
+}
+
+is_sha1() {
+  local value="$1"
+  [[ ${#value} -eq 40 ]] || return 1
+  case "$value" in
+    *[!0-9A-Fa-f]*) return 1 ;;
+  esac
+  return 0
+}
+
+lower_hex() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# Read `security find-identity -p codesigning` on stdin.
+# Print one matching identity per line: hash<TAB>name.
+# Ignore the valid-only section. A self-signed certificate is not trusted
+# in a new keychain, so that section can list zero identities.
+parse_matching_identities() {
+  local line in_matching=0 rest hash name
+  in_matching=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      *"Matching identities"*)
+        in_matching=1
+        continue
+        ;;
+      *"Valid identities only"*)
+        break
+        ;;
+    esac
+    [[ "$in_matching" -eq 1 ]] || continue
+    rest="$(trim_spaces "$line")"
+    case "$rest" in
+      [0-9]*) ;;
+      *) continue ;;
+    esac
+    case "$rest" in
+      *")"*) ;;
+      *) continue ;;
+    esac
+    rest="${rest#*\)}"
+    rest="$(trim_spaces "$rest")"
+    hash="${rest%%[[:space:]]*}"
+    if ! is_sha1 "$hash"; then
+      continue
+    fi
+    rest="${rest#"$hash"}"
+    rest="$(trim_spaces "$rest")"
+    case "$rest" in
+      \"*) ;;
+      *) continue ;;
+    esac
+    rest="${rest#\"}"
+    name="${rest%%\"*}"
+    if [[ -z "$name" ]]; then
+      continue
+    fi
+    printf '%s\t%s\n' "$hash" "$name"
+  done
+}
+
+load_matching_identities() {
+  local report line hash name
+  identity_hashes=()
+  identity_names=()
+  report="$(mktemp)"
+  # Do not pass the valid-only flag. See parse_matching_identities.
+  security find-identity -p codesigning "$signing_keychain" >"$report"
+  while IFS= read -r line; do
+    hash="${line%%$'\t'*}"
+    name="${line#*$'\t'}"
+    if [[ -z "$hash" || -z "$name" ]]; then
+      continue
+    fi
+    identity_hashes+=("$hash")
+    identity_names+=("$name")
+  done < <(parse_matching_identities <"$report")
+  rm -f "$report"
+}
+
+# Set identity_kind_result to Developer ID Application, Apple Development,
+# self-signed, or unknown.
+# A name that starts with "Apple Development" is that type. The next
+# character is the end of the name, ":", or a space.
+# Name prefix wins. Otherwise compare certificate subject and issuer.
+# Writes globals. Do not call this function inside a command substitution.
+identity_kind() {
+  local hash="$1" name="$2"
+  local pem line current want_lc in_pem found subject issuer
+  identity_subject_dn=""
+  identity_issuer_dn=""
+  identity_kind_result="unknown"
+  case "$name" in
+    "Developer ID Application:"*)
+      identity_kind_result="Developer ID Application"
+      return 0
+      ;;
+    "Apple Development" | "Apple Development:"* | "Apple Development "*)
+      identity_kind_result="Apple Development"
+      return 0
+      ;;
+  esac
+  pem="$(mktemp)"
+  : >"$pem"
+  current=""
+  in_pem=0
+  found=0
+  want_lc="$(lower_hex "$hash")"
+  while IFS= read -r line; do
+    case "$line" in
+      "SHA-1 hash: "*)
+        current="$(trim_spaces "${line#"SHA-1 hash: "}")"
+        current="$(lower_hex "$current")"
+        : >"$pem"
+        in_pem=0
+        ;;
+      "-----BEGIN CERTIFICATE-----")
+        in_pem=1
+        printf '%s\n' "$line" >>"$pem"
+        ;;
+      "-----END CERTIFICATE-----")
+        if [[ "$in_pem" -eq 1 ]]; then
+          printf '%s\n' "$line" >>"$pem"
+        fi
+        in_pem=0
+        if [[ -n "$current" && "$current" == "$want_lc" ]]; then
+          found=1
+          break
+        fi
+        ;;
+      *)
+        if [[ "$in_pem" -eq 1 ]]; then
+          printf '%s\n' "$line" >>"$pem"
+        fi
+        ;;
+    esac
+  done < <(security find-certificate -a -Z -p "$signing_keychain")
+  if [[ "$found" -ne 1 ]]; then
+    rm -f "$pem"
+    identity_kind_result="unknown"
+    return 0
+  fi
+  subject=""
+  issuer=""
+  if openssl x509 -in "$pem" -noout -subject -issuer -nameopt RFC2253 >"${pem}.dn" 2>/dev/null; then
+    {
+      IFS= read -r subject
+      IFS= read -r issuer
+    } <"${pem}.dn"
+  fi
+  rm -f "$pem" "${pem}.dn"
+  identity_subject_dn="$(trim_spaces "${subject#subject=}")"
+  identity_issuer_dn="$(trim_spaces "${issuer#issuer=}")"
+  case "$identity_subject_dn" in
+    *"Developer ID Application"*)
+      identity_kind_result="Developer ID Application"
+      return 0
+      ;;
+  esac
+  if [[ -n "$identity_subject_dn" && "$identity_subject_dn" == "$identity_issuer_dn" ]]; then
+    identity_kind_result="self-signed"
+    return 0
+  fi
+  identity_kind_result="unknown"
+}
+
+log_parsed_identities() {
+  local index=0
+  while [[ "$index" -lt ${#identity_hashes[@]} ]]; do
+    echo "codesign identity: ${identity_hashes[$index]} \"${identity_names[$index]}\""
+    index=$((index + 1))
+  done
+}
+
+import_macos_signing_identity() {
+  local decoded_ok=0 count index chosen hash name kind want_lc
+  save_keychain_search_list
+
+  signing_p12_file="$(mktemp)"
+  chmod 600 "$signing_p12_file"
+  silence_xtrace
+  if printf '%s' "$MACOS_SIGNING_P12" | tr -d '[:space:]' | base64 -D >"$signing_p12_file"; then
+    decoded_ok=1
+  fi
+  restore_xtrace
+  if [[ "$decoded_ok" -ne 1 || ! -s "$signing_p12_file" ]]; then
+    echo "::error::MACOS_SIGNING_P12 is empty or is not valid base64."
+    exit 1
+  fi
+
+  signing_keychain_password="$(openssl rand -base64 32)"
+  signing_keychain_dir="$(mktemp -d)"
+  signing_keychain="${signing_keychain_dir}/signing.keychain-db"
+  silence_xtrace
+  if ! security create-keychain -p "$signing_keychain_password" "$signing_keychain"; then
+    restore_xtrace
+    echo "::error::Could not create the temporary signing keychain."
+    exit 1
+  fi
+  if ! security unlock-keychain -p "$signing_keychain_password" "$signing_keychain"; then
+    restore_xtrace
+    echo "::error::Could not unlock the temporary signing keychain."
+    exit 1
+  fi
+  restore_xtrace
+  chmod 600 "$signing_keychain"
+  # Keep the keychain unlocked for the rest of this step.
+  security set-keychain-settings -lut 21600 "$signing_keychain"
+  security list-keychains -d user -s "$signing_keychain" "${signing_search_list[@]}" >/dev/null
+
+  silence_xtrace
+  if ! security import "$signing_p12_file" \
+    -k "$signing_keychain" \
+    -P "${MACOS_SIGNING_P12_PASSWORD-}" \
+    -T /usr/bin/codesign \
+    -f pkcs12; then
+    restore_xtrace
+    echo "::error::Could not import MACOS_SIGNING_P12 into the temporary keychain."
+    exit 1
+  fi
+  if ! security set-key-partition-list -S apple-tool:,apple: -s \
+    -k "$signing_keychain_password" "$signing_keychain"; then
+    restore_xtrace
+    echo "::error::Could not allow codesign to use the temporary keychain."
+    exit 1
+  fi
+  restore_xtrace
+  rm -f "$signing_p12_file"
+  signing_p12_file=""
+  signing_keychain_password=""
+  unset MACOS_SIGNING_P12
+  unset MACOS_SIGNING_P12_PASSWORD
+
+  load_matching_identities
+  count="${#identity_hashes[@]}"
+  if [[ "$count" -eq 0 ]]; then
+    echo "::error::The temporary keychain has no code signing identity."
+    exit 1
+  fi
+
+  chosen=-1
+  if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+    sign_identity="$MACOS_SIGNING_IDENTITY"
+    want_lc="$(lower_hex "$MACOS_SIGNING_IDENTITY")"
+    index=0
+    while [[ "$index" -lt "$count" ]]; do
+      if [[ "$(lower_hex "${identity_hashes[$index]}")" == "$want_lc" || "${identity_names[$index]}" == "$MACOS_SIGNING_IDENTITY" ]]; then
+        chosen=$index
+        break
+      fi
+      index=$((index + 1))
+    done
+  elif [[ "$count" -ne 1 ]]; then
+    echo "::error::Expected exactly one code signing identity in the temporary keychain. Found ${count}."
+    log_parsed_identities
+    echo "Set MACOS_SIGNING_IDENTITY to one hash, or import a p12 that contains one identity."
+    exit 1
+  else
+    chosen=0
+    sign_identity="${identity_hashes[0]}"
+  fi
+
+  sign_use_hardened_runtime=0
+  if [[ "$chosen" -ge 0 ]]; then
+    hash="${identity_hashes[$chosen]}"
+    name="${identity_names[$chosen]}"
+    identity_kind "$hash" "$name"
+    kind="$identity_kind_result"
+    echo "codesign identity: ${hash} \"${name}\" (${kind})"
+    if [[ "$kind" == "unknown" && -n "$identity_subject_dn" ]]; then
+      echo "codesign identity subject: ${identity_subject_dn}"
+      echo "codesign identity issuer: ${identity_issuer_dn}"
+    fi
+    if [[ "$kind" == "Developer ID Application" ]]; then
+      sign_use_hardened_runtime=1
+    fi
+  else
+    echo "::warning::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
+    log_parsed_identities
+    kind="unmatched identity"
+  fi
+  if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
+    echo "codesign hardened runtime: on (Developer ID Application)"
+  else
+    echo "codesign hardened runtime: off (${kind})"
+  fi
+  if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+    echo "codesign sign argument: ${MACOS_SIGNING_IDENTITY}"
+  fi
+}
+
+macho_file() {
+  local path="$1" magic
+  [[ -f "$path" ]] || return 1
+  magic="$(od -An -t x1 -N 4 "$path" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  case "$magic" in
+    feedface | feedfacf | cefaedfe | cffaedfe | cafebabe | bebafeca) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Sign one bundle or Mach-O with the stable identity. Keep an existing
+# entitlement plist when the target already has one.
+# Hardened runtime checks the Team ID of every library. A self-signed
+# identity has no Team ID, so dlopen of a bundled libtdjson fails.
+# --options runtime is only for Developer ID Application.
+sign_with_identity() {
+  local target="$1"
+  local entitlements_from="${2:-$1}"
+  local entitlements status
+  local -a args
+  entitlements="$(mktemp)"
+  args=(--force)
+  if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
+    args+=(--options runtime)
+  fi
+  args+=(--timestamp=none --sign "$sign_identity")
+  if codesign -d --entitlements :- "$entitlements_from" >"$entitlements" 2>/dev/null \
+    && grep -q '<plist' "$entitlements"; then
+    args+=(--entitlements "$entitlements")
+  fi
+  echo "codesign: ${target}"
+  status=0
+  # Keep the codesign status. A negated command in an if-test stores 0.
+  # Delete the entitlements file before exit. The EXIT trap does not cover it.
+  codesign "${args[@]}" "$target" || status=$?
+  rm -f "$entitlements"
+  if [[ "$status" -ne 0 ]]; then
+    exit "$status"
+  fi
+}
+
+# Deepest Mach-O first. The bundle itself is not a file, so it is signed
+# by the caller after this function returns.
+sign_nested_machos() {
+  local app="$1" mode="$2"
+  local list depth path
+  list="$(mktemp)"
+  while IFS= read -r -d '' path; do
+    if macho_file "$path"; then
+      depth="$(printf '%s' "$path" | awk -F/ '{print NF}')"
+      printf '%s\t%s\n' "$depth" "$path" >>"$list"
+    fi
+  done < <(find "$app" -type f -print0)
+  while IFS=$'\t' read -r depth path; do
+    if [[ -z "$path" ]]; then
+      continue
+    fi
+    if [[ "$mode" == "identity" ]]; then
+      sign_with_identity "$path"
+    else
+      echo "codesign: ${path}"
+      codesign --force --sign - "$path"
+    fi
+  done < <(sort -nr "$list")
+  rm -f "$list"
+}
+
+sign_macos_app() {
+  local app="$1"
+  if [[ -n "${MACOS_SIGNING_P12:-}" ]]; then
+    echo "macOS signing: stable identity"
+    import_macos_signing_identity
+    sign_nested_machos "$app" identity
+    sign_with_identity "$app" "$app/Contents/MacOS/thinwire"
+  else
+    echo "macOS signing: ad-hoc signature (MACOS_SIGNING_P12 is empty)"
+    sign_nested_machos "$app" adhoc
+    # Ad-hoc signature for the whole bundle. The notification center needs
+    # it (#161). It is not a Developer ID signature and there is no
+    # notarization (ADR 0003).
+    codesign --force --sign - "$app"
+  fi
+  codesign --verify --strict --deep --verbose=2 "$app"
+  codesign -dvv "$app" 2>&1
+}
+
 if [[ "$(uname -s)" == "Darwin" ]]; then
   version="$(workspace_version)"
   if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -270,19 +740,10 @@ EOF
     printf '%s\n' "$leftover"
     exit 1
   fi
-  # Each helper gets the same ad-hoc signature as the app (ADR 0013). It is
-  # code inside the bundle, so it gets its signature first.
-  for helper_name in "${helper_names[@]}"; do
-    codesign --force --sign - "$app/Contents/MacOS/${helper_name}"
-  done
-  # Ad-hoc signature for the whole bundle, so macOS knows its bundle id.
-  # The notification center needs it (#161). It is not a Developer ID
-  # signature and there is no notarization (ADR 0003).
-  codesign --force --sign - "$app"
-  codesign --verify --strict "$app"
-  for helper_name in "${helper_names[@]}"; do
-    codesign --verify --strict "$app/Contents/MacOS/${helper_name}"
-  done
+  # Each helper gets the same signature as the app (ADR 0013). Nested
+  # Mach-O files are signed from the inside out, then the bundle. --deep
+  # is only used on the verify inside sign_macos_app.
+  sign_macos_app "$app"
 fi
 
 if [[ -f dist/thinwire.exe ]]; then

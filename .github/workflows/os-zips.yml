@@ -1,7 +1,13 @@
-# Unsigned OS artifacts on main only. These are not releases.
+# OS artifacts on main only. These are not releases.
 # GitHub wraps every artifact download in an outer zip. The uploaded file is
 # one mode-preserving .tar.gz so executable bits and the macOS .app survive.
 # pull_request never triggers this workflow, and the job also refuses non-main pushes.
+#
+# Linux and Windows binaries stay unsigned. On macOS, the stage step signs
+# Thinwire.app with the identity in MACOS_SIGNING_P12 when that secret is
+# set. An empty secret keeps the ad-hoc signature. There is no notarization.
+# Those secrets are step env on the macOS stage step only. Do not put them
+# in an if: condition, and do not copy them into a pull_request workflow.
 #
 # Each archive holds the MIT app and two AGPL-3.0-only helper programs: the
 # WhatsApp helper and the Signal helper (ADR 0013). The app does not link a
@@ -121,11 +127,26 @@ jobs:
       - name: Build the Signal helper
         run: cargo build --release -p thinwire-signal --features signal-local --bin thinwire-signal-helper
 
-      - name: Stage and archive unsigned payload
+      - name: Stage and archive payload
+        if: runner.os != 'macOS'
         shell: bash
         env:
           ARTIFACT: ${{ matrix.artifact }}
           SOURCE_REF: ${{ github.sha }}
+        run: scripts/stage-os-artifact.sh
+
+      # Push to main only: the job if above rejects every other event.
+      # Map secrets to env here, then let the script test the variables.
+      # An empty MACOS_SIGNING_P12 keeps the ad-hoc signature.
+      - name: Stage, sign, and archive the macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+          SOURCE_REF: ${{ github.sha }}
+          MACOS_SIGNING_P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: scripts/stage-os-artifact.sh
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
