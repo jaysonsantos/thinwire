@@ -179,7 +179,8 @@ signing_search_saved=0
 signing_search_list=()
 signing_xtrace=0
 sign_identity=""
-# 1 only for Developer ID Application. A self-signed identity has no Team ID.
+# 1 only for Developer ID Application. Apple Development, self-signed, and
+# unknown do not get --options runtime. A self-signed identity has no Team ID.
 sign_use_hardened_runtime=0
 identity_hashes=()
 identity_names=()
@@ -338,7 +339,10 @@ load_matching_identities() {
   rm -f "$report"
 }
 
-# Set identity_kind_result to Developer ID Application, self-signed, or unknown.
+# Set identity_kind_result to Developer ID Application, Apple Development,
+# self-signed, or unknown.
+# A name that starts with "Apple Development" is that type. The next
+# character is the end of the name, ":", or a space.
 # Name prefix wins. Otherwise compare certificate subject and issuer.
 # Writes globals. Do not call this function inside a command substitution.
 identity_kind() {
@@ -350,6 +354,10 @@ identity_kind() {
   case "$name" in
     "Developer ID Application:"*)
       identity_kind_result="Developer ID Application"
+      return 0
+      ;;
+    "Apple Development" | "Apple Development:"* | "Apple Development "*)
+      identity_kind_result="Apple Development"
       return 0
       ;;
   esac

@@ -456,4 +456,23 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    /// A name that starts with `Apple Development` is that type.
+    /// `--options runtime` stays limited to `Developer ID Application`.
+    #[cfg(unix)]
+    #[test]
+    fn identity_kind_labels_apple_development() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test-identity-kind.sh");
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .output()
+            .expect("run the identity kind bash test");
+        assert!(
+            output.status.success(),
+            "identity kind bash test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
