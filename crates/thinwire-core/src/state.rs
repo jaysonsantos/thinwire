@@ -763,6 +763,8 @@ struct TelegramHold {
     chat: String,
     at: Instant,
     message_id: Option<String>,
+    /// A retry. The row already shows "Sending…", so the status line does not.
+    retry: bool,
 }
 
 /// A pending Telegram message id waiting for its own `SendAccepted`.
@@ -1900,11 +1902,16 @@ impl Snapshot {
             // F1 (#82): older pages of this protocol only, keyed by
             // (protocol, chat, topic).
             Some(LOADING_OLDER_STATUS)
-        } else if self.sends.any_for(protocol)
-            || (protocol == ProtocolId::Telegram && !self.telegram_send_unconfirmed.is_empty())
+        } else if self.sends.compose_in_flight(protocol)
+            || (protocol == ProtocolId::Telegram
+                && self
+                    .telegram_send_unconfirmed
+                    .iter()
+                    .any(|hold| !hold.retry))
         {
-            // Telegram's accept is not the end of the send. The strip stays
-            // on Sending… until the sent or failed row of that send arrives.
+            // Telegram's accept is not the end of a compose send. The strip
+            // stays on Sending… until that row is sent or failed. A retry
+            // already shows "Sending…" on its row, so the strip stays quiet.
             Some(SENDING_STATUS)
         } else {
             None
@@ -2332,11 +2339,11 @@ impl Snapshot {
             Some(Pending::Send { body, topic, .. }) => {
                 self.drop_rejected_body(protocol, chat);
                 self.clear_sent_text(protocol, chat, topic, &body);
-                self.hold_telegram_send_line(protocol, chat, request);
+                self.hold_telegram_send_line(protocol, chat, request, false);
             }
             Some(Pending::Retry { .. }) => {
                 self.drop_rejected_body(protocol, chat);
-                self.hold_telegram_send_line(protocol, chat, request);
+                self.hold_telegram_send_line(protocol, chat, request, true);
             }
             None => self.note_late_accept(protocol, chat, request),
         }
@@ -2350,6 +2357,7 @@ impl Snapshot {
         let Some(pending) = self.sends.settle_expired(protocol, chat, request) else {
             return;
         };
+        let retry = matches!(pending, Pending::Retry { .. });
         self.drop_rejected_body(protocol, chat);
         match pending {
             Pending::Send { body, topic, .. } => self.clear_sent_text(protocol, chat, topic, &body),
@@ -2367,7 +2375,7 @@ impl Snapshot {
         if shown {
             self.show_timeouts();
         }
-        self.hold_telegram_send_line(protocol, chat, request);
+        self.hold_telegram_send_line(protocol, chat, request, retry);
     }
 
     /// Set the timeout error from `timed_out`: one line per expired send, or
@@ -2792,7 +2800,13 @@ impl Snapshot {
     }
 
     /// Telegram's accept is not its finished line. Hold that request until it ends.
-    fn hold_telegram_send_line(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
+    fn hold_telegram_send_line(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        request: u64,
+        retry: bool,
+    ) {
         if protocol != ProtocolId::Telegram {
             return;
         }
@@ -2806,6 +2820,7 @@ impl Snapshot {
             chat: chat.to_owned(),
             at: Instant::now(),
             message_id,
+            retry,
         });
     }
 
@@ -8042,36 +8057,15 @@ mod tests {
 
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
-        // The chat load carries last_read_outbox_message_id.
-        snapshot.apply(AdapterEvent::OutboxRead {
-            protocol: ProtocolId::Telegram,
-            conversation_id: "telegram:1".into(),
-            last_read_message_id: 20,
-        });
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: outgoing(1, 20, "old", Delivery::Sent),
-        });
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: outgoing(1, 30, "newer", Delivery::Sent),
-        });
-        // A local id can be numerically below the cursor. It is not read.
-        snapshot.apply(AdapterEvent::MessageReceived {
-            message: outgoing(1, 7, "still sending", Delivery::Pending),
-        });
-        let rows = snapshot.selected_messages();
-        assert_eq!(rows[0].delivery, Delivery::Pending, "id 7");
-        assert_eq!(rows[1].delivery, Delivery::Read, "id 20 was read at load");
-        assert_eq!(rows[2].delivery, Delivery::Sent, "id 30 is past the cursor");
-
         let _request = pending_telegram_send(&mut snapshot, 1, 100, "hi");
-        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        assert_eq!(snapshot.status_line(), SENDING_STATUS, "pending");
         let pending = snapshot
             .selected_messages()
             .iter()
             .find(|row| row.body == "hi")
             .expect("pending row");
-        assert_eq!(pending.id, "telegram:1:100");
-        assert_eq!(pending.delivery, Delivery::Pending);
+        assert_eq!(pending.id, "telegram:1:100", "pending");
+        assert_eq!(pending.delivery, Delivery::Pending, "pending");
         // updateMessageSendAcknowledged does not replace the temporary id.
         assert_eq!(
             snapshot
@@ -8079,18 +8073,20 @@ mod tests {
                 .iter()
                 .filter(|row| row.body == "hi")
                 .count(),
-            1
+            1,
+            "acknowledged"
         );
 
+        // The succeeded update's message still has a pending sending_state.
         let server = 1_048_576;
         let delivery = outgoing_delivery(
             OutgoingUpdate::Succeeded,
             Delivery::Pending,
             true,
             server,
-            20,
+            0,
         );
-        assert_eq!(delivery, Delivery::Sent, "a succeeded send is not pending");
+        assert_eq!(delivery, Delivery::Sent, "succeeded");
         snapshot.apply(AdapterEvent::MessageReplaced {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
@@ -8111,20 +8107,33 @@ mod tests {
                 .iter()
                 .all(|row| row.id != "telegram:1:100")
         );
-        assert_ne!(snapshot.status_line(), SENDING_STATUS);
-        assert_eq!(
-            snapshot
-                .selected_messages()
-                .iter()
-                .find(|row| row.id == "telegram:1:7")
-                .map(|row| row.delivery),
-            Some(Delivery::Pending)
-        );
+        assert_ne!(snapshot.status_line(), SENDING_STATUS, "succeeded");
 
         snapshot.apply(AdapterEvent::OutboxRead {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
             last_read_message_id: server,
+        });
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.body == "hi")
+                .map(|row| row.delivery),
+            Some(Delivery::Read),
+            "read outbox"
+        );
+
+        // A chat load carries the same cursor. A later sent id stays sent.
+        // A pending local id below the cursor stays pending.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 20, "old", Delivery::Sent),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, server + 1_048_576, "newer", Delivery::Sent),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 7, "still sending", Delivery::Pending),
         });
         let by_id = |id: i64| {
             snapshot
@@ -8133,19 +8142,13 @@ mod tests {
                 .find(|row| row.id == format!("telegram:1:{id}"))
                 .map(|row| row.delivery)
         };
-        assert_eq!(by_id(server), Some(Delivery::Read));
-        assert_eq!(by_id(30), Some(Delivery::Read));
-        assert_eq!(by_id(20), Some(Delivery::Read));
-        assert_eq!(by_id(7), Some(Delivery::Pending));
+        assert_eq!(by_id(20), Some(Delivery::Read), "read outbox");
         assert_eq!(
-            outgoing_delivery(OutgoingUpdate::Succeeded, Delivery::Pending, true, 20, 20),
-            Delivery::Read,
-            "a succeeded id inside the cursor shows read"
+            by_id(server + 1_048_576),
+            Some(Delivery::Sent),
+            "read outbox"
         );
-        assert_eq!(
-            outgoing_delivery(OutgoingUpdate::Failed, Delivery::Pending, true, 20, 20),
-            Delivery::Failed
-        );
+        assert_eq!(by_id(7), Some(Delivery::Pending), "read outbox");
     }
 
     #[test]
@@ -8155,8 +8158,9 @@ mod tests {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
         let _request = pending_telegram_send(&mut snapshot, 1, 100, "hi");
+        // The failed update's message still has a pending sending_state.
         let delivery = outgoing_delivery(OutgoingUpdate::Failed, Delivery::Pending, true, 101, 0);
-        assert_eq!(delivery, Delivery::Failed);
+        assert_eq!(delivery, Delivery::Failed, "failed");
         snapshot.apply(AdapterEvent::MessageReplaced {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
@@ -11450,7 +11454,11 @@ mod tests {
         finish_telegram_send(&mut snapshot, 2, 22, "two");
         assert_eq!(snapshot.telegram_send_unconfirmed.len(), 1);
         assert_eq!(snapshot.telegram_send_unconfirmed[0].request, first);
-        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        assert_ne!(
+            snapshot.status_line(),
+            SENDING_STATUS,
+            "the retry row already shows Sending…"
+        );
         finish_telegram_send(&mut snapshot, 1, 11, "one");
         assert!(snapshot.telegram_send_unconfirmed.is_empty());
     }

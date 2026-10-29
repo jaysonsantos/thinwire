@@ -2519,15 +2519,14 @@ fn bubble(
                                                 );
                                             }
                                             Delivery::Sent => {
-                                                ui.label(
-                                                    RichText::new(SENT_MARK).small().color(meta),
-                                                );
+                                                delivery_mark(ui, SENT_MARK, "Sent", meta);
                                             }
                                             Delivery::Read => {
-                                                ui.label(
-                                                    RichText::new(READ_MARK)
-                                                        .small()
-                                                        .color(palette.accent),
+                                                delivery_mark(
+                                                    ui,
+                                                    READ_MARK,
+                                                    "Read",
+                                                    palette.accent,
                                                 );
                                             }
                                             Delivery::Failed => {
@@ -2599,6 +2598,15 @@ fn bubble(
 fn hide_from_accesskit(ui: &egui::Ui, id: egui::Id) {
     ui.ctx().accesskit_node_builder(id, |node| {
         node.set_hidden();
+    });
+}
+
+/// A check mark. The painted glyph stays `glyph`. A screen reader reads `access`.
+fn delivery_mark(ui: &mut egui::Ui, glyph: &str, access: &str, color: egui::Color32) {
+    let response = ui.label(RichText::new(glyph).small().color(color));
+    let access = access.to_owned();
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_label(access);
     });
 }
 

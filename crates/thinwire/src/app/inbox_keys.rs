@@ -807,8 +807,7 @@ fn outgoing_telegram_marks_follow_send_read_and_failure() {
         });
     harness.run();
     assert!(harness.query_by_label("Sending…").is_none());
-    harness.get_by_role_and_label(egui::accesskit::Role::Label, "✓");
-    assert!(harness.query_by_label("✓✓").is_none());
+    assert_mark(&harness, "Sent", "✓");
     assert_eq!(label_count(&harness, "outbox-line"), 1);
 
     harness
@@ -820,8 +819,8 @@ fn outgoing_telegram_marks_follow_send_read_and_failure() {
             last_read_message_id: server,
         });
     harness.run();
-    harness.get_by_role_and_label(egui::accesskit::Role::Label, "✓✓");
-    assert!(harness.query_by_label("✓").is_none());
+    assert_mark(&harness, "Read", "✓✓");
+    assert!(access_name_count(&harness, "Sent") == 0);
     assert_eq!(label_count(&harness, "outbox-line"), 1);
 
     let mut failed = InboxUi::ready();
@@ -863,8 +862,35 @@ fn outgoing_telegram_marks_follow_send_read_and_failure() {
                     if message_id == "telegram:1:101"
             ))
     );
-    // The row and the status line both say Sending… while the retry is queued.
-    assert_eq!(label_count(&harness, "Sending…"), 2);
+    // The bubble says Sending…. The status line does not repeat it.
+    assert_eq!(label_count(&harness, "Sending…"), 1);
+}
+
+/// The access name of a delivery mark. A `Role::Label` stores its spoken
+/// name in the accesskit label and the glyph in the value. `By::label`
+/// reads the value, so this query reads the label.
+fn access_name_count(harness: &Harness<'_, InboxUi>, name: &str) -> usize {
+    harness
+        .query_all(By::new().predicate({
+            let name = name.to_owned();
+            move |node| node.label().as_deref() == Some(name.as_str())
+        }))
+        .count()
+}
+
+fn assert_mark(harness: &Harness<'_, InboxUi>, name: &str, glyph: &str) {
+    let nodes: Vec<_> = harness
+        .query_all(By::new().predicate({
+            let name = name.to_owned();
+            move |node| node.label().as_deref() == Some(name.as_str())
+        }))
+        .collect();
+    assert_eq!(nodes.len(), 1, "{name}");
+    assert_eq!(
+        nodes[0].accesskit_node().value().as_deref(),
+        Some(glyph),
+        "{name}"
+    );
 }
 
 fn label_count(harness: &Harness<'_, InboxUi>, label: &str) -> usize {

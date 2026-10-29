@@ -154,9 +154,12 @@ impl SendTracker {
         self.open.is_empty()
     }
 
-    /// A send or retry of this protocol is in flight, in any chat.
-    pub(crate) fn any_for(&self, protocol: ProtocolId) -> bool {
-        self.open.keys().any(|(owner, _)| *owner == protocol)
+    /// A compose send of this protocol is in flight. A retry is not: its row
+    /// already shows "Sending…".
+    pub(crate) fn compose_in_flight(&self, protocol: ProtocolId) -> bool {
+        self.open
+            .iter()
+            .any(|(key, open)| key.0 == protocol && matches!(open.pending, Pending::Send { .. }))
     }
 
     /// A send or retry of this chat is in flight.
