@@ -774,8 +774,9 @@ fn a_pending_message_keeps_the_time_on_the_last_line() {
     );
 }
 
-/// The marks the thread paints after the TDLib send sequence, and after a
-/// failed send. Retry queues one command. It does not wait on the network.
+/// Defensive marks. The succeeded object here is still pending. `td_api.tl`
+/// describes that message as sent (`sending_state` null). The glyphs and
+/// the Retry button are what this test checks.
 #[test]
 fn outgoing_telegram_marks_follow_send_read_and_failure() {
     let server = 1_048_576_i64;

@@ -8044,13 +8044,9 @@ mod tests {
         assert!(snapshot.error.is_none());
     }
 
-    /// TDLib sequence for one outgoing message: the chat's read cursor,
-    /// a pending row, send acknowledged (no change), send succeeded
-    /// (temporary id replaced), then read outbox.
-    ///
-    /// `updateMessageSendSucceeded` can still carry a pending sending state.
-    /// The result is sent, not that state. `rebind_telegram_message` only
-    /// renames the send hold. It does not keep the old row.
+    /// Defensive. `td_api.tl` calls the succeeded message the sent message.
+    /// Main maps a null `sending_state` to `Sent`. This case is the extra
+    /// path: the succeeded object is still pending, and the update still wins.
     #[test]
     fn an_outgoing_telegram_message_follows_the_tdlib_send_sequence() {
         use thinwire_protocol::{OutgoingUpdate, outgoing_delivery};
@@ -8077,7 +8073,7 @@ mod tests {
             "acknowledged"
         );
 
-        // The succeeded update's message still has a pending sending_state.
+        // Defensive fixture: sending_state is still Pending on the succeeded message.
         let server = 1_048_576;
         let delivery = outgoing_delivery(
             OutgoingUpdate::Succeeded,
@@ -8151,6 +8147,8 @@ mod tests {
         assert_eq!(by_id(7), Some(Delivery::Pending), "read outbox");
     }
 
+    /// Defensive. Main maps `messageSendingStateFailed` to `Failed`.
+    /// This case still checks a pending object on `updateMessageSendFailed`.
     #[test]
     fn a_failed_telegram_send_shows_not_sent_and_queues_retry() {
         use thinwire_protocol::{OutgoingUpdate, outgoing_delivery};
@@ -8158,7 +8156,7 @@ mod tests {
         let store = SecretStore::memory();
         let mut snapshot = ready_with_chats(&store);
         let _request = pending_telegram_send(&mut snapshot, 1, 100, "hi");
-        // The failed update's message still has a pending sending_state.
+        // Defensive fixture: sending_state is still Pending on the failed message.
         let delivery = outgoing_delivery(OutgoingUpdate::Failed, Delivery::Pending, true, 101, 0);
         assert_eq!(delivery, Delivery::Failed, "failed");
         snapshot.apply(AdapterEvent::MessageReplaced {
@@ -8185,6 +8183,97 @@ mod tests {
             } if conversation_id == "telegram:1" && message_id == "telegram:1:101"
         ));
         assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+    }
+
+    /// The payload `td_api.tl` describes. `updateMessageSendSucceeded.message`
+    /// is the sent message: `sending_state` is null, which main maps to
+    /// `Sent`. `updateMessageSendFailed.message` has a failed sending state,
+    /// which main maps to `Failed`.
+    #[test]
+    fn a_null_sending_state_on_success_replaces_the_pending_row() {
+        use thinwire_protocol::{OutgoingUpdate, outgoing_delivery};
+
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let _request = pending_telegram_send(&mut snapshot, 1, 100, "hi");
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.body == "hi")
+                .map(|row| row.delivery),
+            Some(Delivery::Pending),
+            "pending"
+        );
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .filter(|row| row.body == "hi")
+                .count(),
+            1,
+            "acknowledged"
+        );
+
+        let server = 1_048_576;
+        // sending_state = null.
+        let delivery =
+            outgoing_delivery(OutgoingUpdate::Succeeded, Delivery::Sent, true, server, 0);
+        assert_eq!(delivery, Delivery::Sent, "succeeded");
+        snapshot.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing(1, server, "hi", delivery),
+        });
+        // The chat's last message is the same server message, still null.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, server, "hi", Delivery::Sent),
+        });
+        let hi: Vec<_> = snapshot
+            .selected_messages()
+            .iter()
+            .filter(|row| row.body == "hi")
+            .collect();
+        assert_eq!(hi.len(), 1, "succeeded");
+        assert_eq!(hi[0].id, format!("telegram:1:{server}"));
+        assert_eq!(hi[0].delivery, Delivery::Sent, "succeeded");
+        assert_ne!(snapshot.status_line(), SENDING_STATUS, "succeeded");
+
+        snapshot.apply(AdapterEvent::OutboxRead {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            last_read_message_id: server,
+        });
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.body == "hi")
+                .map(|row| row.delivery),
+            Some(Delivery::Read),
+            "read outbox"
+        );
+
+        let mut failed = ready_with_chats(&store);
+        let _request = pending_telegram_send(&mut failed, 1, 100, "nope");
+        // sending_state = Failed.
+        let failed_delivery =
+            outgoing_delivery(OutgoingUpdate::Failed, Delivery::Failed, true, 101, 0);
+        assert_eq!(failed_delivery, Delivery::Failed, "failed");
+        failed.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing(1, 101, "nope", failed_delivery),
+        });
+        assert_eq!(failed.selected_messages().len(), 1, "failed");
+        assert_eq!(
+            failed.selected_messages()[0].delivery,
+            Delivery::Failed,
+            "failed"
+        );
+        assert_ne!(failed.status_line(), SENDING_STATUS, "failed");
     }
 
     #[test]
