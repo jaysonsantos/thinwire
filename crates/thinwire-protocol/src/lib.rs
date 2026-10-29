@@ -69,7 +69,8 @@ pub use telegram::{
     resolve_telegram_api, telegram_api_available,
 };
 pub use whatsapp::{
-    WHATSAPP_HELPER_PROGRAM, WhatsAppAdapter, WhatsAppPhoneVault, whatsapp_helper_adapter,
+    WHATSAPP_HELPER_PROGRAM, WHATSAPP_QR_EXHAUSTED, WhatsAppAdapter, WhatsAppPhoneVault,
+    whatsapp_helper_adapter,
 };
 
 /// Shell protocols in display order. Signal is hidden unless `signal-local` is on.
