@@ -11,11 +11,12 @@ pub const SIGNAL_NOTICE_HEADING: &str = "Signal experimental client";
 /// The Signal risk line of the README (ADR 0013 decision 9).
 pub const SIGNAL_RISK: &str = "Signal: no supported third-party API, expect breakage.";
 
-/// What this client is.
-pub const SIGNAL_NOTICE_BODY: &str = "thinwire links as a secondary device with presage and libsignal. Signal can change its service at any time, and this client can then stop.";
+/// The Signal risk bullet of the README, in full. The link gate and the
+/// Unofficial label show this text. Do not soften it.
+pub const SIGNAL_README_RISK: &str = "Signal: no supported third-party API, expect breakage. thinwire links as a secondary device with an unofficial client. The app shows a full-screen notice with this text before any provisioning QR code.";
 
-/// Where the client runs.
-pub const SIGNAL_NOTICE_HELPER: &str = "The Signal client is AGPL-3.0 code. It runs in a separate program, thinwire-signal-helper, which starts after you accept this notice.";
+/// The review window and the account-row label show this slice.
+pub const SIGNAL_NOTICE_REVIEW: [&str; 1] = [SIGNAL_README_RISK];
 
 /// The notice shows no provisioning URL.
 pub const SIGNAL_NOTICE_NO_URL: &str = "No provisioning URL is shown on this screen.";
@@ -24,11 +25,9 @@ pub const SIGNAL_NOTICE_NO_URL: &str = "No provisioning URL is shown on this scr
 pub const SIGNAL_NOTICE_ACCEPT: &str = "I understand — Signal can break at any time";
 
 /// The notice copy, in screen order. The version hash covers these strings.
-pub const SIGNAL_NOTICE_PARTS: [&str; 6] = [
+pub const SIGNAL_NOTICE_PARTS: [&str; 4] = [
     SIGNAL_NOTICE_HEADING,
-    SIGNAL_RISK,
-    SIGNAL_NOTICE_BODY,
-    SIGNAL_NOTICE_HELPER,
+    SIGNAL_README_RISK,
     SIGNAL_NOTICE_NO_URL,
     SIGNAL_NOTICE_ACCEPT,
 ];
@@ -71,5 +70,6 @@ mod tests {
     fn the_readme_keeps_the_signal_risk_line() {
         let readme = include_str!("../../../README.md");
         assert!(readme.contains(SIGNAL_RISK));
+        assert!(readme.contains(SIGNAL_README_RISK));
     }
 }

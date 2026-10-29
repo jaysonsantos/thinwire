@@ -13,23 +13,24 @@ use super::ui::edited;
 use thinwire_core::state::{Snapshot, WhatsAppScreen};
 use thinwire_core::{Intent, ProtocolId, SecretText, View, WhatsAppIntent};
 
-/// The WhatsApp entry under the accounts. With no helper program the entry
-/// stays, disabled, with the reason (ADR 0013 decision 6).
-pub(crate) fn risk_entry(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
+/// Start of the link flow, in the middle column. The full notice is the next
+/// step. With no helper program there is no button: the account row already
+/// says to reinstall (ADR 0013 decision 6).
+pub(crate) fn link_offer(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
+    if snapshot.selected_protocol != ProtocolId::WhatsApp || !snapshot.whatsapp_pairing_available()
+    {
+        return;
+    }
+    let linked = snapshot
+        .accounts
+        .iter()
+        .any(|row| row.caps.id == ProtocolId::WhatsApp && row.linked());
+    if linked || snapshot.helper_missing(ProtocolId::WhatsApp) {
+        return;
+    }
     ui.add_space(8.0);
-    ui.label(
-        RichText::new("WhatsApp spike — experimental, ban risk")
-            .small()
-            .color(theme::palette(ui).warn),
-    );
-    let missing = snapshot.helper_missing(ProtocolId::WhatsApp);
-    let entry = ui.add_enabled(!missing, egui::Button::new("Review WhatsApp ban risk"));
-    if missing {
-        entry.on_disabled_hover_text(HELPER_MISSING_REASON);
-        ui.label(RichText::new(HELPER_MISSING_REASON).small().weak());
-    } else if entry.clicked() {
+    if ui.button("Link").clicked() {
         out.push(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate));
-        ui.ctx().request_repaint();
     }
 }
 
@@ -47,14 +48,10 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>
 }
 
 fn risk_gate(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
-    ui.heading("WhatsApp experimental spike");
-    ui.colored_label(
-        theme::palette(ui).warn,
-        "Unofficial linked-device pairing can get a personal account banned. This is not a supported messenger.",
-    );
+    ui.heading("WhatsApp");
     ui.add_space(8.0);
-    for (index, bullet) in CRITIC_RISK_BULLETS.iter().enumerate() {
-        ui.label(format!("{}. {bullet}", index + 1));
+    for bullet in CRITIC_RISK_BULLETS {
+        ui.label(bullet);
         ui.add_space(6.0);
     }
     ui.label("No QR code and no pair code are shown on this screen.");

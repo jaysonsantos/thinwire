@@ -25,15 +25,22 @@ use thinwire_core::state::*;
 #[test]
 fn inbox_and_thread_scroll_and_show_load_states() {
     let ui = include_str!("ui.rs");
-    let left = &ui[ui.find("fn left_panel").expect("left panel")..];
-    let left = &left[..left.find("\nfn ").expect("next fn")];
-    assert!(left.contains("inbox_scroll("));
+    let rail = &ui[ui.find("fn account_rail").expect("account rail")..];
+    let rail = &rail[..rail.find("\nfn ").expect("next fn")];
+    assert!(
+        !rail.contains("inbox_scroll("),
+        "the chat list is not under the account list"
+    );
+    let chats = &ui[ui.find("fn chat_column").expect("chat column")..];
+    let chats = &chats[..chats.find("\nfn ").expect("next fn")];
+    assert!(chats.contains("inbox_scroll("));
     let scroll = &ui[ui.find("fn inbox_scroll(").expect("inbox scroll")..];
     let scroll = &scroll[..scroll.find("\nfn inbox(").expect("inbox")];
     assert!(scroll.contains("ScrollArea::vertical()"));
     assert!(ui.contains(".stick_to_bottom(true)"));
     assert!(ui.contains("scroll_to_me"));
-    assert!(ui.contains("Loading chats…"));
+    assert!(ui.contains("LOADING_CHATS_STATUS"));
+    assert!(ui.contains("inbox_placeholder"));
     assert!(ui.contains("Loading messages…"));
     assert!(ui.contains("No messages in this chat."));
     assert!(!ui.contains("No conversations yet."));
@@ -388,13 +395,15 @@ fn signal_ui_is_feature_gated_and_uses_the_helper() {
     assert!(app.contains("#[cfg(feature = \"signal-local\")]\nmod signal_gate;"));
     let ui = include_str!("ui.rs");
     assert!(ui.contains("signal_linking_available"));
-    assert!(ui.contains("signal_gate::notice_entry"));
+    assert!(ui.contains("signal_gate::link_offer"));
+    assert!(!ui.contains("Review Signal notice"));
     let gate = include_str!("signal_gate.rs");
     // ADR 0013 decision 9: the gate shows the same text as the README.
     // The copy lives next to SIGNAL_NOTICE_VERSION so a text change shows
     // the notice again.
-    assert!(gate.contains("SIGNAL_RISK"));
+    assert!(gate.contains("SIGNAL_README_RISK"));
     assert!(gate.contains("SIGNAL_NOTICE_NO_URL"));
+    assert!(!gate.contains("Review Signal notice"));
     let notice = include_str!("../../../thinwire-core/src/signal_notice.rs");
     assert!(notice.contains("SIGNAL_NOTICE_VERSION"));
     assert!(notice.contains("Signal: no supported third-party API, expect breakage."));
@@ -427,10 +436,13 @@ fn whatsapp_spike_ui_is_feature_gated() {
     let ui = include_str!("ui.rs");
     assert!(ui.contains("not ready"));
     assert!(ui.contains("whatsapp_pairing_available"));
-    assert!(ui.contains("whatsapp_gate::risk_entry"));
+    assert!(ui.contains("whatsapp_gate::link_offer"));
+    assert!(ui.contains("\"Unofficial\""));
+    assert!(ui.contains("\"Ban risk\""));
+    assert!(!ui.contains("Review WhatsApp ban risk"));
     let gate = include_str!("whatsapp_gate.rs");
     assert!(gate.contains("CRITIC_RISK_BULLETS"));
-    assert!(gate.contains("Review WhatsApp ban risk"));
+    assert!(!gate.contains("Review WhatsApp ban risk"));
     assert!(gate.contains("No QR code and no pair code are shown on this screen."));
     assert!(
         !gate

@@ -8,7 +8,8 @@ use thinwire_core::state::test_support::{
 };
 use thinwire_core::{Intent, View};
 use thinwire_protocol::{
-    AdapterEvent, ChatMessage, Delivery, HelperFault, HelperState, MessageLink, ProtocolId,
+    AccountState, AdapterEvent, ChatMessage, Delivery, HelperFault, HelperState, MessageLink,
+    ProtocolId,
 };
 
 use super::theme;
@@ -100,6 +101,9 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
                 state.snapshot.select_conversation(id);
             }
             Intent::RestartHelper(protocol) => state.restarts.push(protocol),
+            Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
+            Intent::ShowNotice(protocol) => state.snapshot.open_notice_review(protocol),
+            Intent::CloseNotice => state.snapshot.close_notice_review(),
             Intent::MoveInbox { delta } => state.snapshot.move_inbox_selection(delta),
             Intent::FocusInbox { id } => state.snapshot.focus_inbox_row(id),
             Intent::SetChatMute {
@@ -210,6 +214,140 @@ fn a_missing_signal_helper_row_says_reinstall() {
     harness.get_by_label("Helper missing");
     harness.get_by_label("Signal helper missing. Reinstall thinwire.");
     assert!(harness.query_by_label("Restart").is_none());
+}
+
+/// The chat list is the middle column of the selected account. It is to the
+/// right of the account rail, and it is not stacked under that rail.
+#[test]
+fn the_chat_list_sits_beside_the_account_rail() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    let account = harness
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Button)
+                .label("Telegram"),
+        )
+        .map(|node| node.rect())
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("account rail");
+    let chat = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Ada")
+        .rect();
+    assert!(
+        chat.left() >= account.right() - 1.0,
+        "chat {:?} account {:?}",
+        chat,
+        account
+    );
+    assert!(
+        chat.top() < account.bottom(),
+        "the chat list is under the account list: chat {:?} account {:?}",
+        chat,
+        account
+    );
+}
+
+/// A linked unofficial account shows Unofficial. A click opens the README text
+/// and does not start a link.
+#[test]
+fn unofficial_opens_the_notice() {
+    let mut state = InboxUi::ready();
+    show_protocol(&mut state.snapshot, ProtocolId::WhatsApp);
+    state.snapshot.apply(AdapterEvent::Account {
+        protocol: ProtocolId::WhatsApp,
+        state: AccountState::Linked,
+    });
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Unofficial")
+        .click();
+    harness.run();
+    assert_eq!(
+        harness.state().snapshot.notice_review(),
+        Some(ProtocolId::WhatsApp)
+    );
+    harness.get_by_label(thinwire_protocol::CRITIC_BULLET_1);
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Close")
+        .click();
+    harness.run();
+    assert!(harness.state().snapshot.notice_review().is_none());
+}
+
+/// The account info view keeps Ban risk. It opens the same README text.
+#[test]
+fn ban_risk_opens_the_same_notice() {
+    let mut state = InboxUi::ready();
+    show_protocol(&mut state.snapshot, ProtocolId::WhatsApp);
+    state.snapshot.apply(AdapterEvent::Account {
+        protocol: ProtocolId::WhatsApp,
+        state: AccountState::Linked,
+    });
+    state.snapshot.select_protocol(ProtocolId::WhatsApp);
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Ban risk")
+        .click();
+    harness.run();
+    assert_eq!(
+        harness.state().snapshot.notice_review(),
+        Some(ProtocolId::WhatsApp)
+    );
+    harness.get_by_label(thinwire_protocol::CRITIC_BULLET_1);
+}
+
+/// "Loading chats…" while the linked account still syncs. "No chats yet."
+/// after that sync, when the account has no chats.
+#[test]
+fn the_middle_column_empty_states_are_on_screen() {
+    use thinwire_core::state::{LOADING_CHATS_STATUS, NO_CHATS_YET};
+
+    let mut loading = InboxUi::ready();
+    clear_telegram_chats(&mut loading);
+    loading.snapshot.refresh_visible();
+    assert_eq!(
+        loading.snapshot.inbox_placeholder(),
+        Some(LOADING_CHATS_STATUS)
+    );
+    let mut loading_ui = harness(loading);
+    // The loading row draws a spinner, so `run` does not settle.
+    loading_ui.run_steps(2);
+    let account = loading_ui
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Button)
+                .label("Telegram"),
+        )
+        .map(|node| node.rect())
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("account rail");
+    let in_the_chat_column = loading_ui
+        .query_all(By::new().label(LOADING_CHATS_STATUS))
+        .any(|node| node.rect().left() >= account.right() - 1.0);
+    assert!(in_the_chat_column, "Loading chats… is in the middle column");
+
+    let mut empty = InboxUi::ready();
+    clear_telegram_chats(&mut empty);
+    empty.snapshot.apply(AdapterEvent::ChatListLoaded {
+        protocol: ProtocolId::Telegram,
+    });
+    assert_eq!(empty.snapshot.inbox_placeholder(), Some(NO_CHATS_YET));
+    let mut empty_ui = harness(empty);
+    empty_ui.run_steps(2);
+    empty_ui.get_by_label(NO_CHATS_YET);
+    assert!(empty_ui.query_by_label(LOADING_CHATS_STATUS).is_none());
+}
+
+fn clear_telegram_chats(state: &mut InboxUi) {
+    for id in ["telegram:1", "telegram:2"] {
+        state.snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Telegram,
+            id: id.into(),
+        });
+    }
 }
 
 /// A helper that runs changes nothing on the row.
@@ -1174,7 +1312,8 @@ fn a_scrolled_inbox_keeps_the_row_under_the_pointer() {
     let mut harness = harness(state);
     harness.run();
     let start = row_top(&harness, "Ada");
-    let inbox_point = egui::pos2(120.0, 480.0);
+    // The chat list is the middle column. Hover a row in that column.
+    let inbox_point = row_rect(&harness, "Ada").center();
     harness.hover_at(inbox_point);
     harness.event(egui::Event::MouseWheel {
         unit: egui::MouseWheelUnit::Point,
