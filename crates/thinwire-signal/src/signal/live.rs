@@ -35,10 +35,10 @@ use super::reconnect::{ReceiveLoop, Relink, StreamPoll};
 use super::wake::AttemptCancel;
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, ChatMessage, Conversation, Delivery, EventTx,
-    ProtocolId, RedactedPairingSecret, SIGNAL_HISTORY_KEPT, SIGNAL_HISTORY_NOT_KEPT,
-    SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_RESET, SIGNAL_RETAINED_SETTLED, emit_account,
-    emit_conversation, emit_message, emit_status, signal_retained_chat, signal_retained_chat_id,
-    signal_retained_slot,
+    HistorySkipRun, HistoryStoreCursor, ProtocolId, RedactedPairingSecret, SIGNAL_HISTORY_KEPT,
+    SIGNAL_HISTORY_NOT_KEPT, SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_RESET,
+    SIGNAL_RETAINED_SETTLED, emit_account, emit_conversation, emit_message, emit_status,
+    signal_retained_chat, signal_retained_chat_id, signal_retained_slot,
 };
 
 const DATA_DIR_MISSING: &str =
@@ -94,12 +94,10 @@ const HISTORY_READ_LIMIT: usize = HISTORY_PAGE + 2;
 const HISTORY_SQL_INCLUDES_CURSOR: bool = false;
 /// How many distinct store rows one page may scan. Each read is still at
 /// most [`HISTORY_READ_LIMIT`]. A widened window does not count a row twice.
-/// A non-empty page at this cap keeps `more` true, and the next request
-/// starts before that page's oldest row. An empty page at the cap sets
-/// `more` false: the rest is unreadable, and the same cursor is not asked again.
-/// That takes more than 208 unreadable rows in a row. Those rows stay in the
-/// store. Continuing past them needs a store cursor in the protocol
-/// (#174 item 15).
+/// The check is `seen.len() >= HISTORY_SCAN_CAP`, so an empty page happens
+/// at 208 unreadable rows, not only past 208. That page keeps `more` true
+/// and returns a store cursor. The next read starts before the oldest
+/// scanned row. A shown message id cannot name those rows.
 const HISTORY_SCAN_CAP: usize = HISTORY_READ_LIMIT * 4;
 
 pub(super) enum WorkerJob {
@@ -107,6 +105,8 @@ pub(super) enum WorkerJob {
     Older {
         conversation_id: String,
         before_message_id: String,
+        /// Exclusive store timestamp. `None` reads before `before_message_id`.
+        store_cursor: Option<u64>,
     },
     /// Reread contacts and groups. `LoadChats` sends this.
     Refresh,
@@ -124,6 +124,9 @@ pub(super) struct Session {
     sent: Mutex<std::collections::HashMap<String, String>>,
     groups: Mutex<super::group::GroupKeys>,
     viewed: std::sync::Mutex<Option<String>>,
+    /// First-page cursors, keyed by chat id. `OpenChat` sends one on
+    /// `HistoryLoaded`, then drops it.
+    history_resume: std::sync::Mutex<HashMap<String, thinwire_protocol::HistoryStoreCursor>>,
     /// The next worker loads a registration and does not start a new link.
     resume_only: AtomicBool,
 }
@@ -139,8 +142,26 @@ impl Session {
             sent: Mutex::new(std::collections::HashMap::new()),
             groups: Mutex::new(super::group::GroupKeys::default()),
             viewed: std::sync::Mutex::new(None),
+            history_resume: std::sync::Mutex::new(HashMap::new()),
             resume_only: AtomicBool::new(false),
         }
+    }
+
+    fn stash_history_resume(&self, chat_id: String, cursor: thinwire_protocol::HistoryStoreCursor) {
+        self.history_resume
+            .lock()
+            .expect("history resume")
+            .insert(chat_id, cursor);
+    }
+
+    pub(super) fn take_history_resume(
+        &self,
+        chat_id: &str,
+    ) -> Option<thinwire_protocol::HistoryStoreCursor> {
+        self.history_resume
+            .lock()
+            .expect("history resume")
+            .remove(chat_id)
     }
 
     pub(super) fn set_resume_only(&self, resume_only: bool) {
@@ -227,10 +248,16 @@ impl Session {
         self.enqueue(WorkerJob::Send(message))
     }
 
-    pub(super) fn request_older(&self, conversation_id: String, before_message_id: String) -> bool {
+    pub(super) fn request_older(
+        &self,
+        conversation_id: String,
+        before_message_id: String,
+        store_cursor: Option<u64>,
+    ) -> bool {
         self.enqueue(WorkerJob::Older {
             conversation_id,
             before_message_id,
+            store_cursor,
         })
     }
 
@@ -1576,7 +1603,7 @@ async fn run_linked(
         Ok(Ok(())) => {}
         _ => tracing::error!("{}", RETAINED_SLOT_NOT_STORED),
     }
-    let _ = publish_retained_accounts(&store_path, &events).await;
+    let _ = publish_retained_in(&store_path, &events, Some(session.as_ref())).await;
     let mut rows = std::collections::HashMap::<String, Conversation>::new();
     let mut unread = std::collections::HashMap::<String, u32>::new();
     let (mut known, mut group_titles) =
@@ -1770,6 +1797,7 @@ async fn run_linked(
             Some(WorkerJob::Older {
                 conversation_id,
                 before_message_id,
+                store_cursor,
             }) => {
                 if signal_retained_slot(&conversation_id).is_some() {
                     // The retained store is not the live manager. Page it
@@ -1779,6 +1807,7 @@ async fn run_linked(
                         &events,
                         &conversation_id,
                         &before_message_id,
+                        store_cursor,
                     )
                     .await;
                 } else {
@@ -1790,6 +1819,7 @@ async fn run_linked(
                         &group_titles,
                         &conversation_id,
                         &before_message_id,
+                        store_cursor,
                         &mut rows,
                     )
                     .await;
@@ -1875,7 +1905,8 @@ async fn publish_chats(
     let contacts = manager.store().contacts().await.map_err(|_| ())?;
     for contact in contacts.flatten() {
         let conversation = conversation_from_contact(&contact);
-        known.insert(conversation.id.clone());
+        let chat_id = conversation.id.clone();
+        known.insert(chat_id.clone());
         emit_refreshed_row(events, rows, unread, conversation);
         let Some(before) = history_before else {
             continue;
@@ -1884,12 +1915,13 @@ async fn publish_chats(
         let Some(url) = history_url.as_deref() else {
             continue;
         };
-        let Ok((messages, _)) =
-            fetch_history_page(manager.store(), url, &thread, before, None).await
-        else {
+        let Ok(page) = fetch_history_page(manager.store(), url, &thread, before, None).await else {
             continue;
         };
-        for message in messages {
+        if let Some(cursor) = page.cursor {
+            session.stash_history_resume(chat_id, cursor);
+        }
+        for message in page.rows {
             emit_content(events, &message, &names, &group_titles, rows, Some(unread));
         }
     }
@@ -1897,9 +1929,10 @@ async fn publish_chats(
     for group in groups.flatten() {
         let (key, group) = group;
         let conversation = conversation_from_group(&key, &group);
+        let chat_id = conversation.id.clone();
         session.remember_group(&key).await;
-        group_titles.insert(conversation.id.clone(), conversation.title.clone());
-        known.insert(conversation.id.clone());
+        group_titles.insert(chat_id.clone(), conversation.title.clone());
+        known.insert(chat_id.clone());
         emit_refreshed_row(events, rows, unread, conversation);
         let Some(before) = history_before else {
             continue;
@@ -1908,12 +1941,13 @@ async fn publish_chats(
         let Some(url) = history_url.as_deref() else {
             continue;
         };
-        let Ok((messages, _)) =
-            fetch_history_page(manager.store(), url, &thread, before, None).await
-        else {
+        let Ok(page) = fetch_history_page(manager.store(), url, &thread, before, None).await else {
             continue;
         };
-        for message in messages {
+        if let Some(cursor) = page.cursor {
+            session.stash_history_resume(chat_id, cursor);
+        }
+        for message in page.rows {
             emit_content(events, &message, &names, &group_titles, rows, Some(unread));
         }
     }
@@ -1936,6 +1970,12 @@ fn note_retained_history(session_dir: &Path, events: &EventTx) {
     });
 }
 
+/// Tests publish with no live session, so a first page does not stash a cursor.
+#[cfg(test)]
+async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool {
+    publish_retained_in(session_dir, events, None).await
+}
+
 /// Publish every store under `retained/` as a read-only account.
 ///
 /// This path does not build a presage `Manager`. It does not sync, send,
@@ -1946,7 +1986,12 @@ fn note_retained_history(session_dir: &Path, events: &EventTx) {
 /// row.
 /// Returns `true` when at least one previous account was published.
 /// The status line tells the core to drop the live copy of those chats.
-async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool {
+/// `session` receives the first-page cursor of each chat.
+async fn publish_retained_in(
+    session_dir: &Path,
+    events: &EventTx,
+    session: Option<&Session>,
+) -> bool {
     let _ = events.send(AdapterEvent::Status {
         protocol: ProtocolId::Signal,
         status: AdapterStatus::Ready,
@@ -1962,7 +2007,7 @@ async fn publish_retained_accounts(session_dir: &Path, events: &EventTx) -> bool
             continue;
         }
         kept = true;
-        match publish_one_retained(slot, &dir, events).await {
+        match publish_one_retained(slot, &dir, events, session).await {
             Ok(true) => published = true,
             Ok(false) => {}
             Err(()) => tracing::error!("{}", RETAINED_HISTORY_NOT_READ),
@@ -2041,7 +2086,12 @@ fn log_missing_retained_stores(session_dir: &Path) {
 }
 
 /// `Ok(true)` when this store published at least one chat.
-async fn publish_one_retained(slot: u32, dir: &Path, events: &EventTx) -> Result<bool, ()> {
+async fn publish_one_retained(
+    slot: u32,
+    dir: &Path,
+    events: &EventTx,
+    session: Option<&Session>,
+) -> Result<bool, ()> {
     let url = path_url(&sqlite_store_path(dir))?;
     let store = open_retained_store(&url).await?;
     let contacts = store.contacts().await.map_err(|_| ())?;
@@ -2069,20 +2119,24 @@ async fn publish_one_retained(slot: u32, dir: &Path, events: &EventTx) -> Result
     for contact in &contact_list {
         let mut conversation = conversation_from_contact(contact);
         mark_retained_conversation(slot, &mut conversation);
+        let chat_id = conversation.id.clone();
         emit_refreshed_row(events, &mut rows, &unread, conversation);
         let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
-        let history = retained_history(&store, &url, &thread).await;
-        for message in history {
+        let page = retained_history(&store, &url, &thread).await;
+        stash_resume(session, &chat_id, page.cursor);
+        for message in page.rows {
             emit_retained_content(slot, events, &message, &names, &group_titles, &mut rows);
         }
     }
     for (key, group) in &group_list {
         let mut conversation = conversation_from_group(key, group);
         mark_retained_conversation(slot, &mut conversation);
+        let chat_id = conversation.id.clone();
         emit_refreshed_row(events, &mut rows, &unread, conversation);
         let thread = Thread::Group(*key);
-        let history = retained_history(&store, &url, &thread).await;
-        for message in history {
+        let page = retained_history(&store, &url, &thread).await;
+        stash_resume(session, &chat_id, page.cursor);
+        for message in page.rows {
             emit_retained_content(slot, events, &message, &names, &group_titles, &mut rows);
         }
     }
@@ -2118,16 +2172,26 @@ fn emit_retained_content(
     emit_message(events, message);
 }
 
+fn stash_resume(
+    session: Option<&Session>,
+    chat_id: &str,
+    cursor: Option<thinwire_protocol::HistoryStoreCursor>,
+) {
+    let (Some(session), Some(cursor)) = (session, cursor) else {
+        return;
+    };
+    session.stash_history_resume(chat_id.to_string(), cursor);
+}
+
 /// The newest page of one thread in a previous account.
 /// Older pages use the same read as the live chat list.
-async fn retained_history(store: &SqliteStore, url: &str, thread: &Thread) -> Vec<Content> {
+async fn retained_history(store: &SqliteStore, url: &str, thread: &Thread) -> HistoryPage {
     let Some(before) = unix_now_millis().map(initial_history_before) else {
-        return Vec::new();
+        return HistoryPage::empty();
     };
-    match fetch_history_page(store, url, thread, before, None).await {
-        Ok((page, _)) => page,
-        Err(()) => Vec::new(),
-    }
+    fetch_history_page(store, url, thread, before, None)
+        .await
+        .unwrap_or_else(|_| HistoryPage::empty())
 }
 
 /// One older page of a retained chat.
@@ -2138,17 +2202,24 @@ async fn load_retained_older_page(
     events: &EventTx,
     conversation_id: &str,
     before_message_id: &str,
+    store_cursor: Option<u64>,
 ) {
-    let loaded = read_retained_older_page(session_dir, conversation_id, before_message_id).await;
-    let (more, note) = match loaded {
-        Ok((slot, page, more, names, titles)) => {
+    let loaded = read_retained_older_page(
+        session_dir,
+        conversation_id,
+        before_message_id,
+        store_cursor,
+    )
+    .await;
+    let (more, note, cursor) = match loaded {
+        Ok((slot, page, names, titles)) => {
             let mut rows = HashMap::new();
-            for message in &page {
+            for message in &page.rows {
                 emit_retained_content(slot, events, message, &names, &titles, &mut rows);
             }
-            (more, None)
+            (page.more, None, page.cursor)
         }
-        Err(()) => (true, Some(HISTORY_READ_FAILED)),
+        Err(()) => (true, Some(HISTORY_READ_FAILED), None),
     };
     let _ = events.send(AdapterEvent::OlderHistoryLoaded {
         protocol: ProtocolId::Signal,
@@ -2157,6 +2228,7 @@ async fn load_retained_older_page(
         more,
         note: note.map(str::to_string),
         topic: None,
+        store_cursor: cursor,
     });
 }
 
@@ -2164,11 +2236,11 @@ async fn read_retained_older_page(
     session_dir: &Path,
     conversation_id: &str,
     before_message_id: &str,
+    store_cursor: Option<u64>,
 ) -> Result<
     (
         u32,
-        Vec<Content>,
-        bool,
+        HistoryPage,
         HashMap<String, String>,
         HashMap<String, String>,
     ),
@@ -2176,7 +2248,10 @@ async fn read_retained_older_page(
 > {
     let slot = signal_retained_slot(conversation_id).ok_or(())?;
     let chat_id = signal_retained_chat(conversation_id).ok_or(())?;
-    let before = message_millis(before_message_id).ok_or(())?;
+    let before = store_cursor
+        .or_else(|| message_millis(before_message_id))
+        .ok_or(())?;
+    let before_id = store_cursor.is_none().then_some(before_message_id);
     let dir = retained_dir_for_slot(session_dir, slot).ok_or(())?;
     let url = path_url(&sqlite_store_path(&dir))?;
     let store = open_retained_store(&url).await?;
@@ -2184,14 +2259,13 @@ async fn read_retained_older_page(
         let thread = thread_for_retained_chat(&store, chat_id).await.ok_or(())?;
         let names = retained_contact_names(&store).await;
         let titles = retained_group_titles(&store).await;
-        let (messages, more) =
-            fetch_history_page(&store, &url, &thread, before, Some(before_message_id)).await?;
-        Ok((messages, more, names, titles))
+        let page = fetch_history_page(&store, &url, &thread, before, before_id).await?;
+        Ok((page, names, titles))
     }
     .await;
     store.close().await;
-    let (messages, more, names, titles) = read?;
-    Ok((slot, messages, more, names, titles))
+    let (page, names, titles) = read?;
+    Ok((slot, page, names, titles))
 }
 
 fn retained_dir_for_slot(session_dir: &Path, slot: u32) -> Option<PathBuf> {
@@ -2277,24 +2351,20 @@ async fn load_older_page(
     group_titles: &HashMap<String, String>,
     conversation_id: &str,
     before_message_id: &str,
+    store_cursor: Option<u64>,
     rows: &mut HashMap<String, Conversation>,
 ) {
     let loaded = async {
-        let before = message_millis(before_message_id)?;
+        let before = store_cursor.or_else(|| message_millis(before_message_id))?;
+        let before_id = store_cursor.is_none().then_some(before_message_id);
         let thread = thread_of(conversation_id, session.group_key(conversation_id).await)?;
         let url = history_store_url()?;
-        fetch_history_page(
-            manager.store(),
-            &url,
-            &thread,
-            before,
-            Some(before_message_id),
-        )
-        .await
-        .ok()
+        fetch_history_page(manager.store(), &url, &thread, before, before_id)
+            .await
+            .ok()
     }
     .await;
-    let (page, more, note) = older_page_outcome(loaded);
+    let (page, more, note, cursor) = older_page_outcome(loaded);
     for message in page {
         emit_content(events, &message, names, group_titles, rows, None);
     }
@@ -2305,6 +2375,7 @@ async fn load_older_page(
         more,
         note: note.map(str::to_string),
         topic: None,
+        store_cursor: cursor,
     });
 }
 
@@ -2315,10 +2386,17 @@ const HISTORY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 const HISTORY_READ_FAILED: &str =
     "Signal could not load older messages. The request can be tried again.";
 
-fn older_page_outcome<T>(loaded: Option<(Vec<T>, bool)>) -> (Vec<T>, bool, Option<&'static str>) {
+fn older_page_outcome(
+    loaded: Option<HistoryPage>,
+) -> (
+    Vec<Content>,
+    bool,
+    Option<&'static str>,
+    Option<thinwire_protocol::HistoryStoreCursor>,
+) {
     match loaded {
-        Some((page, more)) => (page, more, None),
-        None => (Vec::new(), true, Some(HISTORY_READ_FAILED)),
+        Some(page) => (page.rows, page.more, None, page.cursor),
+        None => (Vec::new(), true, Some(HISTORY_READ_FAILED), None),
     }
 }
 
@@ -2357,18 +2435,39 @@ fn widen_history_span(before: u64, span: u64) -> u64 {
     }
 }
 
+/// One history read: the rows to show, whether an older page exists, and
+/// the store cursor when this read skipped rows or must continue from
+/// the store.
+struct HistoryPage {
+    rows: Vec<Content>,
+    more: bool,
+    cursor: Option<HistoryStoreCursor>,
+}
+
+impl HistoryPage {
+    fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            more: false,
+            cursor: None,
+        }
+    }
+}
+
 async fn fetch_history_page(
     store: &SqliteStore,
     url: &str,
     thread: &Thread,
     before: u64,
     before_id: Option<&str>,
-) -> Result<(Vec<Content>, bool), ()> {
+) -> Result<HistoryPage, ()> {
     let pool = open_history_read(url).await?;
     let outcome = async {
         let mut span = HISTORY_WINDOW_MS;
         let mut page = NewestBound::new(HISTORY_PAGE);
         let mut good = 0usize;
+        let mut skips = SkipRuns::new();
+        let mut oldest_scanned: Option<u64> = None;
         let mut seen = HashSet::new();
         let mut cursor_before = before;
         let mut cursor_inclusive = HISTORY_SQL_INCLUDES_CURSOR;
@@ -2404,9 +2503,21 @@ async fn fetch_history_page(
             let fresh = observe_history_rows(&mut seen, &timestamps);
             let oldest = timestamps.last().copied();
             for ts in fresh {
+                oldest_scanned = Some(oldest_scanned.map_or(ts, |old| old.min(ts)));
                 let loaded = store.message(thread, ts).await.map_err(|_| ());
-                if note_history_row(&mut page, loaded, before, before_id, content_history_key) {
+                let kept_id = match &loaded {
+                    Ok(Some(value)) => Some(content_history_key(value).1),
+                    Ok(None) | Err(()) => None,
+                };
+                let kept =
+                    note_history_row(&mut page, loaded, before, before_id, content_history_key);
+                if kept {
                     good += 1;
+                    if let Some(id) = kept_id {
+                        skips.kept(id);
+                    }
+                } else if kept_id.is_none() {
+                    skips.skip();
                 }
             }
             match history_read_after(good, timestamps.len(), seen.len(), reached_start) {
@@ -2425,9 +2536,17 @@ async fn fetch_history_page(
                 }
             }
         }
+        let shown = page.ids();
         let (rows, overflow) = page.finish(true);
-        let more = history_page_more(hit_cap, exhausted, rows.is_empty()) || overflow;
-        Ok((rows, more))
+        // A continuation timestamp is safe when every kept row is on the
+        // page. A fuller read drops the oldest good rows, so the next page
+        // must start at the oldest shown message id.
+        let resume =
+            hit_cap && good <= HISTORY_PAGE && oldest_scanned.is_some_and(|ts| ts < before);
+        let more = history_page_more(hit_cap, exhausted, rows.is_empty(), resume)
+            || (!rows.is_empty() && overflow);
+        let cursor = cursor_for_page(oldest_scanned, resume, more, skips, &shown);
+        Ok(HistoryPage { rows, more, cursor })
     }
     .await;
     pool.close().await;
@@ -2480,13 +2599,13 @@ fn observe_history_rows(seen: &mut HashSet<u64>, timestamps: &[u64]) -> Vec<u64>
     fresh
 }
 
-/// `more` is false when the page is empty. That includes the scan cap: the
-/// rest is unreadable, and asking the same cursor again would not move.
-/// A non-empty page at the cap stays open. Otherwise `more` is false only
-/// when a read returned fewer rows than asked.
-fn history_page_more(hit_cap: bool, exhausted: bool, page_empty: bool) -> bool {
+/// An empty page asks again only when `resume` is set. That cursor is older
+/// than this read, so the same request is not sent twice. A non-empty page
+/// at the cap stays open. Otherwise `more` is false only when a read
+/// returned fewer rows than asked.
+fn history_page_more(hit_cap: bool, exhausted: bool, page_empty: bool, resume: bool) -> bool {
     if page_empty {
-        false
+        resume
     } else {
         hit_cap || !exhausted
     }
@@ -2672,10 +2791,111 @@ impl<T> NewestBound<T> {
         self.rows.insert(index, OrderedRow { millis, id, value });
     }
 
+    fn ids(&self) -> Vec<String> {
+        self.rows.iter().map(|row| row.id.clone()).collect()
+    }
+
     fn finish(self, reached_start: bool) -> (Vec<T>, bool) {
         let more = self.overflow || !reached_start;
         (self.rows.into_iter().map(|row| row.value).collect(), more)
     }
+}
+
+/// Unreadable rows in scan order, newest first. Each run names the shown
+/// message it sits older than. `None` means the run is newer than every
+/// kept row.
+struct SkipRuns {
+    runs: Vec<HistorySkipRun>,
+    last_kept: Option<String>,
+    open: Option<HistorySkipRun>,
+}
+
+impl SkipRuns {
+    fn new() -> Self {
+        Self {
+            runs: Vec::new(),
+            last_kept: None,
+            open: None,
+        }
+    }
+
+    fn skip(&mut self) {
+        if let Some(run) = self.open.as_mut() {
+            run.skipped = run.skipped.saturating_add(1);
+        } else {
+            self.open = Some(HistorySkipRun {
+                after_id: self.last_kept.clone(),
+                skipped: 1,
+            });
+        }
+    }
+
+    fn kept(&mut self, id: String) {
+        self.close();
+        self.last_kept = Some(id);
+    }
+
+    fn close(&mut self) {
+        if let Some(run) = self.open.take()
+            && run.skipped > 0
+        {
+            self.runs.push(run);
+        }
+    }
+
+    /// `shown` is oldest first. A run older than every shown row is reported
+    /// only when the next read will not scan it again.
+    fn finish(mut self, shown: &[String], report_trailing: bool) -> (Vec<HistorySkipRun>, u32) {
+        self.close();
+        let oldest = shown.first().map(String::as_str);
+        let shown_ids: HashSet<&str> = shown.iter().map(String::as_str).collect();
+        let mut out: Vec<HistorySkipRun> = Vec::new();
+        for run in self.runs {
+            if run.skipped == 0 {
+                continue;
+            }
+            let after_id = match run.after_id.as_deref() {
+                Some(id) if shown_ids.contains(id) => Some(id),
+                Some(_) => oldest,
+                None => None,
+            };
+            let trailing = matches!(after_id, Some(id) if Some(id) == oldest);
+            if trailing && !report_trailing {
+                continue;
+            }
+            let after_id = after_id.map(str::to_string);
+            if let Some(last) = out.last_mut()
+                && last.after_id == after_id
+            {
+                last.skipped = last.skipped.saturating_add(run.skipped);
+            } else {
+                out.push(HistorySkipRun {
+                    after_id,
+                    skipped: run.skipped,
+                });
+            }
+        }
+        let skipped = out
+            .iter()
+            .fold(0u32, |sum, run| sum.saturating_add(run.skipped));
+        (out, skipped)
+    }
+}
+
+fn cursor_for_page(
+    oldest_scanned: Option<u64>,
+    resume: bool,
+    more: bool,
+    skips: SkipRuns,
+    shown: &[String],
+) -> Option<HistoryStoreCursor> {
+    let (runs, skipped) = skips.finish(shown, resume || !more);
+    (skipped > 0 || resume).then_some(HistoryStoreCursor {
+        before_ms: oldest_scanned.unwrap_or(0),
+        skipped,
+        resume,
+        runs,
+    })
 }
 
 fn content_history_key(content: &Content) -> (u64, String) {
@@ -4923,7 +5143,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let chat_id = signal_retained_chat_id(1, &contact.uuid.to_string());
         let before_id = signal_message_id(1_700_000_000_000, &contact.uuid.to_string());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        load_retained_older_page(&dir, &tx, &chat_id, &before_id).await;
+        load_retained_older_page(&dir, &tx, &chat_id, &before_id, None).await;
         drop(tx);
         let _ = collect_events(&mut rx).await;
 
@@ -5118,7 +5338,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             .expect("oldest id of the first page");
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        load_retained_older_page(&dir, &tx, &chat_id, &oldest).await;
+        load_retained_older_page(&dir, &tx, &chat_id, &oldest, None).await;
         drop(tx);
         let events = collect_events(&mut rx).await;
         let second: Vec<String> = events
@@ -5260,7 +5480,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             &contact.uuid.to_string(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
-        load_retained_older_page(&dir, &tx, &chat_id, &before_id).await;
+        load_retained_older_page(&dir, &tx, &chat_id, &before_id, None).await;
         drop(tx);
         let _paged = collect_events(&mut rx).await;
         let after_page = retained_kept_rows(&path).await;
@@ -6104,6 +6324,56 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #174 item 14: the worker itself fails (the session folder cannot be
+    /// created). `run` emits `Unlinked`. It does not emit `AccountEnded`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_worker_run_that_cannot_open_the_store_emits_no_account_ended() {
+        let blocker = std::env::temp_dir().join(format!(
+            "thinwire-signal-worker-fail-{}",
+            std::process::id()
+        ));
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+        let dir = blocker.join("session");
+        super::super::path::set_test_session_dir(Some(dir));
+        let session = Arc::new(Session::new());
+        let (token, wake) = session.begin_attempt();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // A fresh session still opens the store. `resume_only` would stop
+        // first when no session file exists, and this failure would not run.
+        super::run(session, token, wake, tx, false).await;
+        super::super::path::set_test_session_dir(None);
+        let _ = std::fs::remove_file(&blocker);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            !account_ended(&events),
+            "a worker failure does not end the account: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Account {
+                    protocol: ProtocolId::Signal,
+                    state: AccountState::Unlinked,
+                }
+            )),
+            "the worker stops as unlinked: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Status {
+                    protocol: ProtocolId::Signal,
+                    status: AdapterStatus::Error,
+                    ..
+                }
+            )),
+            "the worker reports the store failure: {events:?}"
+        );
+    }
+
     /// #174 item 14: a dropped receive stream reconnects. It does not end
     /// the account.
     #[test]
@@ -6273,9 +6543,21 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         ));
     }
 
-    fn page_from_store(rows_newest_first: &[Result<Option<u64>, ()>]) -> (Vec<u64>, bool, usize) {
+    /// `(store timestamp, row)`. Newest first. A row is skipped on `Err` or
+    /// `Ok(None)`. `Ok(Some)` is a readable message whose value is its id.
+    fn page_before(
+        rows_newest_first: &[(u64, Result<Option<u64>, ()>)],
+        before: u64,
+    ) -> (Vec<u64>, bool, usize, Option<HistoryStoreCursor>) {
+        let rows: Vec<(u64, Result<Option<u64>, ()>)> = rows_newest_first
+            .iter()
+            .copied()
+            .filter(|(ts, _)| *ts < before)
+            .collect();
         let mut page = NewestBound::new(HISTORY_PAGE);
         let mut good = 0usize;
+        let mut skips = SkipRuns::new();
+        let mut oldest_scanned: Option<u64> = None;
         let mut seen = HashSet::new();
         let mut index = 0usize;
         let mut hit_cap = false;
@@ -6288,30 +6570,45 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             if good >= HISTORY_READ_LIMIT {
                 break;
             }
-            if index >= rows_newest_first.len() {
+            if index >= rows.len() {
                 exhausted = true;
                 break;
             }
             let ask = (HISTORY_SCAN_CAP - seen.len()).min(HISTORY_READ_LIMIT);
-            let end = (index + ask).min(rows_newest_first.len());
-            let batch = &rows_newest_first[index..end];
+            let end = (index + ask).min(rows.len());
+            let batch = &rows[index..end];
             assert!(
                 batch.len() <= HISTORY_READ_LIMIT,
                 "each store read stays bounded"
             );
-            let positions: Vec<u64> = (index as u64..end as u64).collect();
-            let fresh = observe_history_rows(&mut seen, &positions);
-            for pos in fresh {
-                let row = rows_newest_first[pos as usize];
-                if note_history_row(&mut page, row, u64::MAX, None, |ts| {
-                    (*ts, format!("{ts}:a"))
-                }) {
+            let stamps: Vec<u64> = batch.iter().map(|(ts, _)| *ts).collect();
+            let fresh = observe_history_rows(&mut seen, &stamps);
+            for ts in fresh {
+                oldest_scanned = Some(oldest_scanned.map_or(ts, |old| old.min(ts)));
+                let row = rows
+                    .iter()
+                    .find(|(stamp, _)| *stamp == ts)
+                    .map(|(_, row)| *row)
+                    .expect("scanned row");
+                let kept_id = match row {
+                    Ok(Some(value)) => Some(format!("{value}:a")),
+                    Ok(None) | Err(()) => None,
+                };
+                let kept = note_history_row(&mut page, row, before, None, |value| {
+                    (*value, format!("{value}:a"))
+                });
+                if kept {
                     good += 1;
+                    if let Some(id) = kept_id {
+                        skips.kept(id);
+                    }
+                } else if kept_id.is_none() {
+                    skips.skip();
                 }
             }
             index = end;
             if matches!(
-                history_read_after(good, batch.len(), seen.len(), true),
+                history_read_after(good, batch.len(), seen.len(), index >= rows.len()),
                 HistoryRead::Stop
             ) {
                 if seen.len() >= HISTORY_SCAN_CAP && good < HISTORY_READ_LIMIT {
@@ -6322,43 +6619,47 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
                 break;
             }
         }
-        let (rows, overflow) = page.finish(true);
-        let more = history_page_more(hit_cap, exhausted, rows.is_empty()) || overflow;
-        (rows, more, seen.len())
+        let shown = page.ids();
+        let (kept, overflow) = page.finish(true);
+        let resume =
+            hit_cap && good <= HISTORY_PAGE && oldest_scanned.is_some_and(|ts| ts < before);
+        let more = history_page_more(hit_cap, exhausted, kept.is_empty(), resume)
+            || (!kept.is_empty() && overflow);
+        let cursor = cursor_for_page(oldest_scanned, resume, more, skips, &shown);
+        (kept, more, seen.len(), cursor)
     }
 
     #[test]
-    fn three_corrupt_rows_still_fill_the_page_and_a_corrupt_store_ends() {
+    fn three_corrupt_rows_still_fill_the_page_and_a_cap_page_resumes() {
         let mut rows = Vec::new();
         for ts in (1..=200).rev() {
             if ts >= 198 {
-                rows.push(Err(()));
+                rows.push((ts, Err(())));
             } else {
-                rows.push(Ok(Some(ts)));
+                rows.push((ts, Ok(Some(ts))));
             }
         }
-        let (page, more, scanned) = page_from_store(&rows);
+        let (page, more, scanned, _) = page_before(&rows, u64::MAX);
         assert_eq!(page.len(), HISTORY_PAGE);
         assert!(more, "older stored rows stay reachable");
         assert!(scanned <= HISTORY_SCAN_CAP);
         assert_eq!(page.last().copied(), Some(197));
         assert!(!page.contains(&198));
 
-        let corrupt = vec![Err(()); HISTORY_SCAN_CAP + HISTORY_READ_LIMIT];
-        let (page, more, scanned) = page_from_store(&corrupt);
+        let corrupt: Vec<_> = (0..HISTORY_SCAN_CAP + HISTORY_READ_LIMIT)
+            .map(|index| {
+                let ts = 10_000 - index as u64;
+                (ts, Err(()))
+            })
+            .collect();
+        let (page, more, scanned, cursor) = page_before(&corrupt, u64::MAX);
         assert!(page.is_empty());
         assert_eq!(scanned, HISTORY_SCAN_CAP);
-        assert!(!more, "an empty page at the cap does not ask again");
-    }
-
-    /// The next older-page request. `more == false` asks for nothing. A page
-    /// with rows continues before its oldest row. An empty page that still
-    /// says `more` would ask for `requested` again.
-    fn next_history_cursor(page: &[u64], more: bool, requested: u64) -> Option<u64> {
-        if !more {
-            return None;
-        }
-        Some(page.first().copied().unwrap_or(requested))
+        let cursor = cursor.expect("the cap page names where to resume");
+        assert!(more, "an empty page at the cap stays open");
+        assert!(cursor.resume);
+        assert_eq!(cursor.skipped, HISTORY_SCAN_CAP as u32);
+        assert!(cursor.before_ms < u64::MAX);
     }
 
     /// How many SQL reads one older page takes. The cursor row is not a page
@@ -6410,44 +6711,337 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
     }
 
     #[test]
-    fn a_corrupt_store_past_the_cap_does_not_repeat_the_cursor() {
-        let rows = vec![Err(()); HISTORY_SCAN_CAP + HISTORY_READ_LIMIT];
-        let mut cursor = Some(u64::MAX);
+    fn a_run_past_the_cap_continues_from_a_new_cursor() {
+        let mut rows = Vec::new();
+        for ts in (1_001..=1_300).rev() {
+            rows.push((ts, Err(())));
+        }
+        for ts in (996..=1_000).rev() {
+            rows.push((ts, Ok(Some(ts))));
+        }
+        let mut before = 10_000u64;
+        let mut skipped = 0u32;
         let mut asked = Vec::new();
-        for _ in 0..3 {
-            let Some(requested) = cursor else {
-                break;
-            };
+        let mut page = Vec::new();
+        for _ in 0..6 {
             assert!(
-                !asked.contains(&requested),
+                !asked.contains(&before),
                 "no request repeats the same cursor"
             );
-            asked.push(requested);
-            let (page, more, _) = page_from_store(&rows);
-            assert!(page.is_empty());
-            assert!(!more, "an empty page at the cap ends");
-            cursor = next_history_cursor(&page, more, requested);
+            asked.push(before);
+            let (kept, more, _, cursor) = page_before(&rows, before);
+            if let Some(cursor) = cursor.as_ref() {
+                assert!(cursor.before_ms < before, "the store cursor moves older");
+                skipped = skipped.saturating_add(cursor.skipped);
+                if cursor.resume {
+                    before = cursor.before_ms;
+                }
+            }
+            if !kept.is_empty() {
+                page = kept;
+                assert!(more || skipped == 300);
+                break;
+            }
+            assert!(more, "an empty page at the cap stays open");
+            assert!(
+                cursor.is_some_and(|cursor| cursor.resume),
+                "an empty cap page resumes from the store"
+            );
         }
-        assert!(cursor.is_none());
-        assert_eq!(asked, vec![u64::MAX]);
+        assert_eq!(page, vec![996, 997, 998, 999, 1_000]);
+        assert_eq!(skipped, 300, "every unreadable row is counted once");
+        assert!(asked.len() > 1);
+        assert_ne!(asked[0], asked[1]);
+    }
 
-        let mut mixed = Vec::new();
-        for ts in (1..=40).rev() {
-            mixed.push(Ok(Some(ts + 1_000)));
+    #[test]
+    fn an_empty_page_at_exactly_208_rows_reaches_the_good_rows() {
+        let mut rows = Vec::new();
+        for ts in (1_001..=1_208).rev() {
+            rows.push((ts, Err(())));
         }
-        while mixed.len() < HISTORY_SCAN_CAP + HISTORY_READ_LIMIT {
-            mixed.push(Err(()));
+        for ts in (996..=1_000).rev() {
+            rows.push((ts, Ok(Some(ts))));
         }
-        let requested = 9_999;
-        let (page, more, _) = page_from_store(&mixed);
-        assert!(!page.is_empty());
-        assert!(more, "a non-empty page at the cap can continue");
-        let next = next_history_cursor(&page, more, requested).expect("next cursor");
-        assert_eq!(next, *page.first().expect("oldest"));
-        assert_ne!(
-            next, requested,
-            "the next request starts before the oldest row"
+        let (page, more, scanned, cursor) = page_before(&rows, 10_000);
+        assert!(page.is_empty());
+        assert_eq!(scanned, HISTORY_SCAN_CAP);
+        assert_eq!(HISTORY_SCAN_CAP, 208);
+        let cursor = cursor.expect("cursor");
+        assert!(more && cursor.resume);
+        assert_eq!(cursor.skipped, 208);
+        let (page, _, _, next) = page_before(&rows, cursor.before_ms);
+        assert_eq!(page, vec![996, 997, 998, 999, 1_000]);
+        assert!(next.is_none_or(|cursor| cursor.skipped == 0));
+    }
+
+    #[test]
+    fn a_skip_between_readable_rows_names_the_newer_message() {
+        let rows = vec![
+            (8_000, Ok(Some(8_000))),
+            (7_000, Err(())),
+            (6_000, Ok(Some(6_000))),
+            (5_500, Err(())),
+            (5_400, Err(())),
+            (5_000, Ok(Some(5_000))),
+        ];
+        let (page, more, _, cursor) = page_before(&rows, 9_000);
+        assert_eq!(page, vec![5_000, 6_000, 8_000]);
+        assert!(!more);
+        let cursor = cursor.expect("the skips are on this page");
+        assert_eq!(cursor.skipped, 3);
+        assert_eq!(cursor.runs.len(), 2);
+        assert_eq!(cursor.runs[0].after_id.as_deref(), Some("8000:a"));
+        assert_eq!(cursor.runs[0].skipped, 1);
+        assert_eq!(cursor.runs[1].after_id.as_deref(), Some("6000:a"));
+        assert_eq!(cursor.runs[1].skipped, 2);
+    }
+
+    #[test]
+    fn a_trailing_skip_on_an_open_page_is_left_for_the_next_read() {
+        let mut rows = Vec::new();
+        for ts in (1..=(HISTORY_PAGE as u64 + 1)).rev() {
+            rows.push((ts + 10, Ok(Some(ts + 10))));
+        }
+        rows.push((1, Err(())));
+        let (page, more, _, cursor) = page_before(&rows, u64::MAX);
+        assert_eq!(page.len(), HISTORY_PAGE);
+        assert!(more);
+        assert!(
+            cursor.is_none_or(|cursor| cursor.skipped == 0 && cursor.runs.is_empty()),
+            "the older skip is scanned again with the next page"
         );
+    }
+
+    #[test]
+    fn an_oldest_unreadable_run_stays_on_the_last_page() {
+        let rows = vec![
+            (8_000, Ok(Some(8_000))),
+            (1_000, Err(())),
+            (999, Err(())),
+            (998, Err(())),
+        ];
+        let (page, more, _, cursor) = page_before(&rows, 9_000);
+        assert_eq!(page, vec![8_000]);
+        assert!(!more, "the store ends after the unreadable rows");
+        let cursor = cursor.expect("the oldest run is not dropped");
+        assert_eq!(cursor.skipped, 3);
+        assert_eq!(cursor.runs.len(), 1);
+        assert_eq!(cursor.runs[0].after_id.as_deref(), Some("8000:a"));
+        assert_eq!(cursor.runs[0].skipped, 3);
+    }
+
+    #[test]
+    fn a_run_across_a_page_edge_is_counted_once() {
+        let mut rows = Vec::new();
+        for ts in (1_000..1_000 + HISTORY_PAGE as u64).rev() {
+            rows.push((ts, Ok(Some(ts))));
+        }
+        for ts in (996..=999).rev() {
+            rows.push((ts, Err(())));
+        }
+        for ts in (993..=995).rev() {
+            rows.push((ts, Ok(Some(ts))));
+        }
+        let (page, more, _, cursor) = page_before(&rows, 10_000);
+        assert_eq!(page.len(), HISTORY_PAGE);
+        assert!(more);
+        let first_skipped = cursor.as_ref().map(|cursor| cursor.skipped).unwrap_or(0);
+        assert_eq!(first_skipped, 0, "page one leaves the trailing run off");
+        let oldest = page[0];
+        let (older, older_more, _, next) = page_before(&rows, oldest);
+        assert_eq!(older, vec![993, 994, 995]);
+        assert!(!older_more);
+        let next = next.expect("page two reports the run");
+        assert_eq!(next.runs.len(), 1);
+        assert_eq!(next.runs[0].skipped, 4);
+        assert_eq!(next.skipped, 4);
+        assert_eq!(
+            first_skipped + next.skipped,
+            4,
+            "the run is not counted twice"
+        );
+    }
+
+    async fn insert_unreadable_copies(pool: &sqlx::SqlitePool, count: u64, newest_ts: i64) {
+        use sqlx::Row;
+
+        let sample = sqlx::query(concat!(
+            "SELECT thread_id, sender_service_id, sender_device_id, destination_service_id, ",
+            "needs_receipt, unidentified_sender, was_plaintext ",
+            "FROM thread_messages LIMIT 1",
+        ))
+        .fetch_one(pool)
+        .await
+        .expect("a real row to copy");
+        let thread_id: i64 = sample.try_get(0).expect("thread");
+        let sender: String = sample.try_get(1).expect("sender");
+        let device: i64 = sample.try_get(2).expect("device");
+        let destination: String = sample.try_get(3).expect("destination");
+        let receipt: bool = sample.try_get(4).expect("receipt");
+        let unidentified: bool = sample.try_get(5).expect("unidentified");
+        let plaintext: bool = sample.try_get(6).expect("plaintext");
+        for n in 0..count {
+            let ts = newest_ts - i64::try_from(n).expect("n");
+            sqlx::query(
+                "INSERT INTO thread_messages (
+                    ts, thread_id, sender_service_id, sender_device_id, destination_service_id,
+                    needs_receipt, unidentified_sender, content_body, was_plaintext
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, x'00', ?)",
+            )
+            .bind(ts)
+            .bind(thread_id)
+            .bind(&sender)
+            .bind(device)
+            .bind(&destination)
+            .bind(receipt)
+            .bind(unidentified)
+            .bind(plaintext)
+            .execute(pool)
+            .await
+            .expect("unreadable row");
+        }
+    }
+
+    /// `bad_count` unreadable rows, newest, then five readable older rows.
+    async fn store_with_unreadable_prefix(
+        label: &str,
+        bad_count: u64,
+    ) -> (std::path::PathBuf, String) {
+        let dir = temp_session_dir(label);
+        let (mut store, url, pool) = open_session_db(&dir).await;
+        let contact = kept_contact();
+        let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
+        store.save_contact(&contact).await.expect("contact");
+        for n in 1..=5 {
+            store
+                .save_message(
+                    &thread,
+                    envelope_at(contact.uuid, &format!("good-{n}"), 1_600_000_000_000 + n),
+                )
+                .await
+                .expect("good row");
+        }
+        insert_unreadable_copies(&pool, bad_count, 1_600_000_100_000).await;
+        pool.close().await;
+        store.close().await;
+        (dir, url)
+    }
+
+    async fn pages_past_unreadable(url: &str, bad_count: u32) -> (Vec<String>, u32) {
+        let store = SqliteStore::open(url, OnNewIdentity::Trust)
+            .await
+            .expect("store");
+        let contact = kept_contact();
+        let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
+        let mut before = 1_600_000_100_000 + u64::from(bad_count);
+        let mut skipped = 0u32;
+        let mut bodies = Vec::new();
+        for _ in 0..6 {
+            let page = fetch_history_page(&store, url, &thread, before, None)
+                .await
+                .expect("page");
+            bodies.extend(page.rows.iter().filter_map(|content| match &content.body {
+                ContentBody::DataMessage(message) => message.body.clone(),
+                _ => None,
+            }));
+            if let Some(cursor) = page.cursor {
+                assert!(cursor.before_ms < before);
+                skipped = skipped.saturating_add(cursor.skipped);
+                if cursor.resume {
+                    before = cursor.before_ms;
+                }
+            }
+            if !page.rows.is_empty() {
+                assert!(page.more || skipped == bad_count);
+                break;
+            }
+            assert!(page.more, "an empty cap page stays open");
+        }
+        store.close().await;
+        (bodies, skipped)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_live_store_pages_past_208_and_300_unreadable_rows() {
+        for bad_count in [208u64, 300] {
+            let (dir, url) =
+                store_with_unreadable_prefix(&format!("live-unreadable-{bad_count}"), bad_count)
+                    .await;
+            let (bodies, skipped) = pages_past_unreadable(&url, bad_count as u32).await;
+            assert_eq!(
+                bodies,
+                vec!["good-1", "good-2", "good-3", "good-4", "good-5"]
+            );
+            assert_eq!(skipped, bad_count as u32);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_retained_store_pages_past_208_and_300_unreadable_rows() {
+        for bad_count in [208u64, 300] {
+            let (dir, _) = store_with_unreadable_prefix(
+                &format!("retained-unreadable-{bad_count}"),
+                bad_count,
+            )
+            .await;
+            let aci = Uuid::from_u128(9);
+            let aside = dir.join(RETAINED_DIR).join(aci.to_string());
+            std::fs::create_dir_all(&aside).expect("retained dir");
+            let from = sqlite_store_path(&dir);
+            let to = sqlite_store_path(&aside);
+            std::fs::rename(&from, &to).expect("move store");
+            std::fs::write(aside.join(RETAINED_SLOT_FILE), "1\n").expect("slot");
+            let contact = kept_contact();
+            let chat_id = signal_retained_chat_id(1, &contact.uuid.to_string());
+            let before_id =
+                signal_message_id(1_600_000_100_000 + bad_count, &contact.uuid.to_string());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            load_retained_older_page(&dir, &tx, &chat_id, &before_id, None).await;
+            drop(tx);
+            let first = collect_events(&mut rx).await;
+            let cursor = first.iter().find_map(|event| match event {
+                AdapterEvent::OlderHistoryLoaded {
+                    more: true,
+                    store_cursor: Some(cursor),
+                    ..
+                } if cursor.resume && cursor.skipped == 208 => Some(cursor.clone()),
+                _ => None,
+            });
+            let cursor = cursor.expect("the first retained page resumes");
+            assert!(
+                first
+                    .iter()
+                    .all(|event| !matches!(event, AdapterEvent::MessageReceived { .. }))
+            );
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            load_retained_older_page(&dir, &tx, &chat_id, &before_id, Some(cursor.before_ms)).await;
+            drop(tx);
+            let second = collect_events(&mut rx).await;
+            let bodies: Vec<String> = second
+                .iter()
+                .filter_map(|event| match event {
+                    AdapterEvent::MessageReceived { message } => Some(message.body.clone()),
+                    _ => None,
+                })
+                .collect();
+            let skipped = second.iter().find_map(|event| match event {
+                AdapterEvent::OlderHistoryLoaded { store_cursor, .. } => Some(
+                    store_cursor
+                        .as_ref()
+                        .map(|cursor| cursor.skipped)
+                        .unwrap_or(0),
+                ),
+                _ => None,
+            });
+            assert_eq!(
+                bodies,
+                vec!["good-1", "good-2", "good-3", "good-4", "good-5"]
+            );
+            assert_eq!(208 + skipped.expect("second page"), bad_count as u32);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -6479,20 +7073,24 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "a short batch is not the end of the store"
         );
         assert!(
-            history_page_more(false, false, false),
+            history_page_more(false, false, false, false),
             "older rows stay reachable"
         );
         assert!(
-            !history_page_more(false, true, false),
+            !history_page_more(false, true, false, false),
             "a short read ends the page only when the store is exhausted"
         );
         assert!(
-            history_page_more(true, true, false),
+            history_page_more(true, true, false, false),
             "a non-empty page at the cap still lets the user page"
         );
         assert!(
-            !history_page_more(true, true, true),
-            "an empty page at the cap does not ask again"
+            history_page_more(true, true, true, true),
+            "an empty page at the cap continues from the store cursor"
+        );
+        assert!(
+            !history_page_more(true, true, true, false),
+            "an empty page does not ask again when the cursor cannot move"
         );
     }
 
@@ -6899,14 +7497,16 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
 
     #[test]
     fn a_failed_history_read_stays_retryable() {
-        let (page, more, note) = older_page_outcome::<u8>(None);
+        let (page, more, note, cursor) = older_page_outcome(None);
         assert!(page.is_empty());
         assert!(more);
         assert_eq!(note, Some(HISTORY_READ_FAILED));
-        let (page, more, note) = older_page_outcome(Some((vec![1], false)));
-        assert_eq!(page, vec![1]);
+        assert!(cursor.is_none());
+        let (page, more, note, cursor) = older_page_outcome(Some(HistoryPage::empty()));
+        assert!(page.is_empty());
         assert!(!more);
         assert!(note.is_none());
+        assert!(cursor.is_none());
     }
 
     #[test]

@@ -625,6 +625,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 protocol: ProtocolId::WhatsApp,
                 conversation_id,
                 before_message_id,
+                store_cursor: _,
             } => {
                 self.load_older(&conversation_id, &before_message_id, events);
                 Ok(())
@@ -1131,6 +1132,7 @@ mod tests {
                 AdapterEvent::HistoryLoaded {
                     protocol: ProtocolId::WhatsApp,
                     conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    store_cursor: None,
                 },
                 AdapterEvent::SendRejected {
                     protocol: ProtocolId::WhatsApp,
@@ -2160,6 +2162,7 @@ mod tests {
                         protocol: ProtocolId::WhatsApp,
                         conversation_id: "whatsapp:111@s.whatsapp.net".into(),
                         before_message_id: before.into(),
+                        store_cursor: None,
                     },
                     &tx,
                 )
@@ -2199,6 +2202,7 @@ mod tests {
                 more: false,
                 note: None,
                 topic: None,
+                store_cursor: None,
             }]
         );
         // Codex r4103931208: a short drop does not end paging. The retained
@@ -2445,6 +2449,7 @@ mod tests {
                             protocol: ProtocolId::WhatsApp,
                             conversation_id: id.into(),
                             before_message_id: before.into(),
+                            store_cursor: None,
                         },
                         &tx,
                     )

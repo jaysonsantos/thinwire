@@ -1834,6 +1834,15 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     }
     let output = area.show(ui, |ui| {
         ui.multiply_opacity(fade);
+        let runs = snapshot.unreadable_runs();
+        let oldest_id = messages.first().map(|message| message.id);
+        // The run older than every loaded message sits above "Start of chat".
+        for run in runs
+            .iter()
+            .filter(|run| is_oldest_edge(run.before_id.as_deref(), oldest_id))
+        {
+            unreadable_run_label(ui, run.skipped);
+        }
         match older {
             OlderState::Loading => {
                 ui.horizontal(|ui| {
@@ -1862,15 +1871,24 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
                     ui.label(RichText::new("Loading messages…").weak());
                 });
             }
-            ThreadState::Empty => {
+            ThreadState::Empty if runs.is_empty() => {
                 ui.label(RichText::new("No messages in this chat.").italics().weak());
             }
-            ThreadState::NoSelection | ThreadState::Rows => {}
+            ThreadState::Empty | ThreadState::NoSelection | ThreadState::Rows => {}
         }
         let mut gap_before = None;
         for message in &messages {
+            for run in runs.iter().filter(|run| {
+                run.before_id.as_deref() == Some(message.id)
+                    && !is_oldest_edge(run.before_id.as_deref(), oldest_id)
+            }) {
+                unreadable_run_label(ui, run.skipped);
+            }
             bubble(ui, message, &mut retry, gap_before, out);
             gap_before = Some(message.layout.run_end);
+        }
+        for run in runs.iter().filter(|run| run.before_id.is_none()) {
+            unreadable_run_label(ui, run.skipped);
         }
         if scroll.jump {
             ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
@@ -1951,6 +1969,17 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     }
 
     compose(ui, snapshot, hints, compose_height, out);
+}
+
+/// `true` when the run is older than every loaded message.
+fn is_oldest_edge(before_id: Option<&str>, oldest_id: Option<&str>) -> bool {
+    oldest_id.is_some() && before_id == oldest_id
+}
+
+/// One weak line for a run of stored rows that could not be read.
+fn unreadable_run_label(ui: &mut egui::Ui, skipped: u32) {
+    let text = thinwire_core::state::unreadable_messages_line(skipped);
+    ui.label(RichText::new(text).small().weak());
 }
 
 /// What the thread remembers between frames for its scroll motion.
@@ -3087,10 +3116,29 @@ mod tests {
             "the chat note shows"
         );
         assert!(thread.contains("out.push(Intent::LoadOlderMessages {"));
+        assert!(thread.contains("snapshot.unreadable_runs()"));
+        assert!(thread.contains("unreadable_run_label"));
+        let edge = thread.find("is_oldest_edge(").expect("oldest edge");
+        let start = thread
+            .find("RichText::new(\"Start of chat\")")
+            .expect("start of chat");
+        assert!(
+            edge < start,
+            "an oldest unreadable run is drawn above Start of chat"
+        );
+        let label = &ui[ui.find("fn unreadable_run_label").expect("label")..];
+        let label = &label[..=label.find("\n}").expect("end")];
+        assert!(label.contains("unreadable_messages_line"));
+        assert!(label.contains(".small().weak()"));
+        assert!(!label.contains("button"));
+        assert!(!label.contains(".link"));
         assert!(
             thread.contains("older == OlderState::Idle"),
             "one request at a time"
         );
+        assert!(super::is_oldest_edge(Some("8000:ada"), Some("8000:ada")));
+        assert!(!super::is_oldest_edge(Some("6000:ada"), Some("8000:ada")));
+        assert!(!super::is_oldest_edge(None, Some("8000:ada")));
         assert!(thread.contains("vertical_scroll_offset(offset)"));
         assert!(thread.contains("ui.ctx().request_repaint()"));
         // Each pass dispatches its intents once, so no pass may be redone:

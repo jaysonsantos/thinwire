@@ -333,10 +333,13 @@ pub enum AdapterCommand {
     },
     /// Load one page of messages older than `before_message_id` (the oldest
     /// message the UI has for this chat). Ids are not secrets.
+    /// `store_cursor` is an exclusive store timestamp. It is not a message id.
+    /// `None` reads before `before_message_id`.
     LoadOlderMessages {
         protocol: ProtocolId,
         conversation_id: String,
         before_message_id: String,
+        store_cursor: Option<u64>,
     },
     /// One older page of one topic. Ids are not secrets.
     LoadOlderTopic {
@@ -632,11 +635,17 @@ pub enum AdapterEvent {
         /// Paging state is per topic, so an answer for one topic does not end
         /// another topic of the same chat.
         topic: Option<MessageTopic>,
+        /// Store position for the next page, and how many rows this page
+        /// could not read. `None` when this page skipped nothing and the
+        /// next page can use `before_message_id`.
+        store_cursor: Option<HistoryStoreCursor>,
     },
     /// A history load for one chat ended. The UI stops "Loading messages…".
     HistoryLoaded {
         protocol: ProtocolId,
         conversation_id: String,
+        /// Set when the first page stopped on rows it could not read.
+        store_cursor: Option<HistoryStoreCursor>,
     },
     /// Experimental WhatsApp QR payload. Debug output is redacted.
     /// Never log [`RedactedPairingSecret::reveal`].
@@ -694,6 +703,43 @@ impl AdapterEvent {
             _ => None,
         }
     }
+}
+
+/// Most unreadable runs one store cursor may carry.
+///
+/// One history page scans at most 208 rows, so a cursor cannot honestly name
+/// more runs than that. The helper decode drops a longer list.
+pub const MAX_HISTORY_CURSOR_RUNS: usize = 208;
+
+/// One unreadable stretch on a history page, and the shown message it sits
+/// older than.
+///
+/// `after_id` is that message's id. `None` means the stretch is newer than
+/// every row this page shows, so the core places it at the request anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySkipRun {
+    pub after_id: Option<String>,
+    pub skipped: u32,
+}
+
+/// Where the next Signal history read starts, and how many rows this page
+/// could not read.
+///
+/// `before_ms` is an exclusive store timestamp. It is not a shown message id.
+/// The skip count and the position of each stretch are part of this value.
+/// The wire adds this one field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryStoreCursor {
+    pub before_ms: u64,
+    /// Rows in this page that the store could not read.
+    pub skipped: u32,
+    /// The next read starts at `before_ms`. `false` means the next read still
+    /// uses the oldest shown message id. The count is still shown.
+    pub resume: bool,
+    /// Where those rows sit among the rows this page shows. When `runs` is
+    /// empty, the core draws one line for `skipped` at the oldest edge of
+    /// the page.
+    pub runs: Vec<HistorySkipRun>,
 }
 
 /// Pairing material shown only on the experimental WhatsApp screen.
@@ -1155,6 +1201,7 @@ pub fn emit_older_history_loaded(
         more,
         note,
         topic,
+        store_cursor: None,
     });
 }
 
@@ -1172,6 +1219,7 @@ pub fn emit_history_loaded(
     let _ = events.send(AdapterEvent::HistoryLoaded {
         protocol,
         conversation_id: conversation_id.into(),
+        store_cursor: None,
     });
 }
 
