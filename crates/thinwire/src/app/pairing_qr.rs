@@ -20,6 +20,9 @@ pub(crate) const DISPLAY_SIDE: f32 = 240.0;
 /// Accessible name of the image. It is not the payload.
 pub(crate) const QR_IMAGE_LABEL: &str = "Pairing QR code";
 
+/// Shown when the payload does not fit in a QR code. The payload is not drawn.
+pub(crate) const QR_UNDRAWN: &str = "Could not draw the code.";
+
 /// Texture name of the Signal code.
 #[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 pub(crate) const SIGNAL_QR: &str = "signal-provisioning-qr";
@@ -39,7 +42,7 @@ struct CachedQr {
 /// Encode `payload` as one square image.
 ///
 /// `None` when the text does not fit in a QR code. The caller then draws
-/// nothing: the raw payload is not a fallback.
+/// [`QR_UNDRAWN`]. The raw payload is not a fallback.
 pub(crate) fn provisioning_qr_image(payload: &str) -> Option<egui::ColorImage> {
     let code = qrcode::QrCode::new(payload.as_bytes()).ok()?;
     let modules = code.width();
@@ -69,8 +72,11 @@ pub(crate) fn provisioning_qr_image(payload: &str) -> Option<egui::ColorImage> {
 ///
 /// The same widget is used on the Signal link screen and the WhatsApp pair
 /// screen, so the two codes have the same size, quiet zone, and placement.
+/// When the payload does not fit in a QR code, draw [`QR_UNDRAWN`]. The
+/// payload text is not drawn.
 pub(crate) fn show_pairing_qr(ui: &mut egui::Ui, name: &str, generation: u64, payload: &str) {
     let Some(texture) = cached_texture(ui, name, generation, payload) else {
+        ui.label(egui::RichText::new(QR_UNDRAWN).small().weak());
         return;
     };
     let width = ui.available_width();
@@ -216,6 +222,44 @@ mod tests {
 
         forget_pairing_qr(&harness.ctx, "qr-cache");
         assert_eq!(cached_texture_id(&harness.ctx, "qr-cache"), None);
+    }
+
+    /// A payload that does not fit in a QR code draws a short line. The
+    /// payload text is not a fallback.
+    #[test]
+    fn a_payload_that_does_not_fit_draws_a_line_and_not_the_text() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{By, Queryable};
+
+        let payload = "2@not-drawn-payload-".repeat(300);
+        assert!(
+            provisioning_qr_image(&payload).is_none(),
+            "the fixture is too long for a QR code"
+        );
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(320.0, 200.0))
+            .build_ui_state(
+                |ui, payload: &mut String| {
+                    show_pairing_qr(ui, "qr-too-big", 1, payload);
+                },
+                payload,
+            );
+        harness.run_steps(2);
+        harness.get_by_label(QR_UNDRAWN);
+        assert!(
+            harness
+                .query_by_label_contains("not-drawn-payload")
+                .is_none()
+        );
+        assert!(harness.query_by_label_contains("2@").is_none());
+        assert!(
+            harness
+                .query_all(By::new().role(Role::Image))
+                .next()
+                .is_none(),
+            "no image when the code does not fit"
+        );
     }
 
     fn cached_texture_id(ctx: &egui::Context, name: &str) -> Option<egui::TextureId> {
