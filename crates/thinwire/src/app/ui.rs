@@ -2413,7 +2413,8 @@ fn bubble(
             .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
             .show(ui, |ui| {
                 ui.set_max_width(max_width);
-                let meta_width = meta_column_width(ui, &message.layout.time, message.delivery);
+                let meta_width =
+                    meta_column_width(ui, &message.layout.time, message.delivery, message.outbound);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     if message.layout.show_sender {
                         let response =
@@ -2477,11 +2478,7 @@ fn bubble(
                             .rect;
                         let line = ui.text_style_height(&egui::TextStyle::Small);
                         let has_time = !message.layout.time.is_empty();
-                        let extra = match message.delivery {
-                            Delivery::Pending => 1,
-                            Delivery::Failed => 2,
-                            Delivery::Sent => 0,
-                        };
+                        let extra = delivery_rows(message.delivery, message.outbound);
                         if has_time || extra > 0 {
                             let gap_y = ui.spacing().item_spacing.y;
                             let time_h = if has_time { line } else { 0.0 };
@@ -2514,29 +2511,44 @@ fn bubble(
                                             hide_from_accesskit(ui, response.id);
                                         }
                                     }
-                                    match message.delivery {
-                                        Delivery::Pending => {
-                                            ui.label(RichText::new("Sending…").small().color(meta));
-                                        }
-                                        Delivery::Failed => {
-                                            ui.colored_label(
-                                                palette.out_error,
-                                                RichText::new("Not sent").small(),
-                                            );
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        RichText::new("Retry")
-                                                            .color(palette.accent),
+                                    if message.outbound {
+                                        match message.delivery {
+                                            Delivery::Pending => {
+                                                ui.label(
+                                                    RichText::new(SENDING_MARK).small().color(meta),
+                                                );
+                                            }
+                                            Delivery::Sent => {
+                                                ui.label(
+                                                    RichText::new(SENT_MARK).small().color(meta),
+                                                );
+                                            }
+                                            Delivery::Read => {
+                                                ui.label(
+                                                    RichText::new(READ_MARK)
+                                                        .small()
+                                                        .color(palette.accent),
+                                                );
+                                            }
+                                            Delivery::Failed => {
+                                                ui.colored_label(
+                                                    palette.out_error,
+                                                    RichText::new(FAILED_MARK).small(),
+                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("Retry")
+                                                                .color(palette.accent),
+                                                        )
+                                                        .frame(false),
                                                     )
-                                                    .frame(false),
-                                                )
-                                                .clicked()
-                                            {
-                                                *retry = Some(message.id.to_owned());
+                                                    .clicked()
+                                                {
+                                                    *retry = Some(message.id.to_owned());
+                                                }
                                             }
                                         }
-                                        Delivery::Sent => {}
                                     }
                                 },
                             );
@@ -2590,8 +2602,28 @@ fn hide_from_accesskit(ui: &egui::Ui, id: egui::Id) {
     });
 }
 
+/// "Sending…" under an outgoing row that the server has not accepted.
+const SENDING_MARK: &str = "Sending…";
+/// One check. The server has the message. Small and gray. No animation.
+const SENT_MARK: &str = "✓";
+/// Two checks. The other party has read the message. Accent color.
+const READ_MARK: &str = "✓✓";
+/// The server did not accept the message.
+const FAILED_MARK: &str = "Not sent.";
+
+/// Extra lines under the time for an outgoing delivery mark.
+fn delivery_rows(delivery: Delivery, outbound: bool) -> i32 {
+    if !outbound {
+        return 0;
+    }
+    match delivery {
+        Delivery::Pending | Delivery::Sent | Delivery::Read => 1,
+        Delivery::Failed => 2,
+    }
+}
+
 /// Width of the time and delivery column. Empty when the row has neither.
-fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery) -> f32 {
+fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery, outbound: bool) -> f32 {
     let font = egui::FontId::new(size::CAPTION, egui::FontFamily::Proportional);
     let text_width = |text: &str| -> f32 {
         if text.is_empty() {
@@ -2604,14 +2636,17 @@ fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery) -> f32 {
         }
     };
     let mut width = text_width(time);
-    match delivery {
-        Delivery::Pending => width = width.max(text_width("Sending…")),
-        Delivery::Failed => {
-            width = width.max(text_width("Not sent"));
-            let pad = ui.spacing().button_padding.x * 2.0;
-            width = width.max(text_width("Retry") + pad);
+    if outbound {
+        match delivery {
+            Delivery::Pending => width = width.max(text_width(SENDING_MARK)),
+            Delivery::Sent => width = width.max(text_width(SENT_MARK)),
+            Delivery::Read => width = width.max(text_width(READ_MARK)),
+            Delivery::Failed => {
+                width = width.max(text_width(FAILED_MARK));
+                let pad = ui.spacing().button_padding.x * 2.0;
+                width = width.max(text_width("Retry") + pad);
+            }
         }
-        Delivery::Sent => {}
     }
     width
 }
@@ -2895,7 +2930,7 @@ mod tests {
         let mut output = ctx.run_ui(input.clone(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 stored = super::laid_out_width(ui, "thread-width");
-                meta = super::meta_column_width(ui, "10:00", Delivery::Sent);
+                meta = super::meta_column_width(ui, "10:00", Delivery::Sent, false);
             });
         });
         output.textures_delta.clear();

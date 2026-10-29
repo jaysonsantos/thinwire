@@ -25,12 +25,12 @@ use super::lifecycle::{
 use super::router::{self, Router};
 use crate::adapter::{
     AdapterStatus, Arrival, ChatMessage, ChatTopic, Delivery, EventTx, LoginEpoch, MessageTopic,
-    ProtocolId, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia,
-    emit_chat_list_loaded, emit_conversation, emit_conversation_removed, emit_history_loaded,
-    emit_message, emit_message_delivery, emit_message_links, emit_message_media,
-    emit_message_replaced, emit_messages_removed, emit_older_history_loaded, emit_photo_failed,
-    emit_photo_ready, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
-    emit_telegram_session_ended, emit_topic,
+    OutgoingUpdate, ProtocolId, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
+    TelegramCodeVia, emit_chat_list_loaded, emit_conversation, emit_conversation_removed,
+    emit_history_loaded, emit_message, emit_message_delivery, emit_message_links,
+    emit_message_media, emit_message_replaced, emit_messages_removed, emit_older_history_loaded,
+    emit_outbox_read, emit_photo_failed, emit_photo_ready, emit_send_accepted, emit_send_rejected,
+    emit_status, emit_stopped, emit_telegram_session_ended, emit_topic, outgoing_delivery,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -1405,8 +1405,18 @@ async fn apply_chat_update(
     let emit = live.linked();
     match update {
         tdlib_rs::enums::Update::NewChat(update) => {
+            let chat_id = update.chat.id;
             let effect = note_chat(&mut live.directory, &update.chat);
             live.publish(events, emit, effect);
+            let last_read = live.directory.last_read_outbox(chat_id);
+            if emit && last_read > 0 {
+                emit_outbox_read(
+                    events,
+                    ProtocolId::Telegram,
+                    inbox::conversation_id(chat_id),
+                    last_read,
+                );
+            }
         }
         tdlib_rs::enums::Update::ChatTitle(update) => {
             let effect = live.directory.set_title(update.chat_id, &update.title);
@@ -1454,6 +1464,21 @@ async fn apply_chat_update(
                 .set_unread(update.chat_id, update.unread_count);
             live.publish(events, emit, effect);
         }
+        tdlib_rs::enums::Update::ChatReadOutbox(update) => {
+            if live
+                .directory
+                .note_outbox_read(update.chat_id, update.last_read_outbox_message_id)
+                && emit
+                && update.last_read_outbox_message_id > 0
+            {
+                emit_outbox_read(
+                    events,
+                    ProtocolId::Telegram,
+                    inbox::conversation_id(update.chat_id),
+                    update.last_read_outbox_message_id,
+                );
+            }
+        }
         tdlib_rs::enums::Update::ChatLastMessage(update) => {
             // `positions` is the full list. No Main entry means the chat left
             // the main list (for example it was archived).
@@ -1468,7 +1493,14 @@ async fn apply_chat_update(
                         .set_preview(update.chat_id, &preview, i64::from(message.date));
                 live.publish(events, emit, effect);
                 if emit {
-                    emit_mapped_message(client_id, events, message, live, None);
+                    emit_mapped_message(
+                        client_id,
+                        events,
+                        message,
+                        live,
+                        None,
+                        OutgoingUpdate::Listed,
+                    );
                 }
             } else {
                 let effect = live.directory.set_preview(update.chat_id, "", 0);
@@ -1496,16 +1528,28 @@ async fn apply_chat_update(
                     &update.message,
                     live,
                     None,
+                    OutgoingUpdate::Listed,
                     Arrival::Live,
                 );
             }
             let effect = live.directory.set_preview(chat_id, &preview, at);
             live.publish(events, emit, effect);
         }
+        // The request reached the server. The temporary id stays, and the
+        // row stays pending. This update is sent only when `use_quick_ack`
+        // is on. Success and failure are the updates below.
+        tdlib_rs::enums::Update::MessageSendAcknowledged(_) => {}
         tdlib_rs::enums::Update::MessageSendSucceeded(update) => {
             if emit {
                 let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
-                emit_mapped_message(client_id, events, &update.message, live, Some(old_id));
+                emit_mapped_message(
+                    client_id,
+                    events,
+                    &update.message,
+                    live,
+                    Some(old_id),
+                    OutgoingUpdate::Succeeded,
+                );
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -1518,7 +1562,14 @@ async fn apply_chat_update(
             if emit {
                 log_tdlib_error("sendMessage (update)", &update.error);
                 let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
-                emit_mapped_message(client_id, events, &update.message, live, Some(old_id));
+                emit_mapped_message(
+                    client_id,
+                    events,
+                    &update.message,
+                    live,
+                    Some(old_id),
+                    OutgoingUpdate::Failed,
+                );
                 emit_status(
                     events,
                     ProtocolId::Telegram,
@@ -1735,6 +1786,7 @@ fn note_chat(directory: &mut ChatDirectory, chat: &tdlib_rs::types::Chat) -> Opt
             peer: chat_peer(&chat.r#type),
             photo_file_id: small_photo_id(chat.photo.as_ref()),
             accent: crate::media::ChatAvatar::accent_index(chat.accent_color_id),
+            last_read_outbox: chat.last_read_outbox_message_id,
         },
     )
 }
@@ -1772,6 +1824,7 @@ fn emit_mapped_message(
     message: &tdlib_rs::types::Message,
     live: &LiveInbox,
     replace_old: Option<String>,
+    update: OutgoingUpdate,
 ) {
     emit_mapped_message_as(
         client_id,
@@ -1779,6 +1832,7 @@ fn emit_mapped_message(
         message,
         live,
         replace_old,
+        update,
         Arrival::History,
     );
 }
@@ -1791,11 +1845,17 @@ fn emit_mapped_message_as(
     message: &tdlib_rs::types::Message,
     live: &LiveInbox,
     replace_old: Option<String>,
+    update: OutgoingUpdate,
     arrival: Arrival,
 ) {
     let party = match &message.sender_id {
         tdlib_rs::enums::MessageSender::User(user) => MessageParty::User(user.user_id),
         tdlib_rs::enums::MessageSender::Chat(chat) => MessageParty::Chat(chat.chat_id),
+    };
+    let sending = match &message.sending_state {
+        None => Delivery::Sent,
+        Some(tdlib_rs::enums::MessageSendingState::Pending(_)) => Delivery::Pending,
+        Some(tdlib_rs::enums::MessageSendingState::Failed(_)) => Delivery::Failed,
     };
     let media = super::media_map::map_content(&message.content);
     let mapped = inbox::to_chat_message(
@@ -1806,11 +1866,13 @@ fn emit_mapped_message_as(
             party,
             body: media.text.clone(),
             sent_at: i64::from(message.date),
-            delivery: match &message.sending_state {
-                None => Delivery::Sent,
-                Some(tdlib_rs::enums::MessageSendingState::Pending(_)) => Delivery::Pending,
-                Some(tdlib_rs::enums::MessageSendingState::Failed(_)) => Delivery::Failed,
-            },
+            delivery: outgoing_delivery(
+                update,
+                sending,
+                message.is_outgoing,
+                message.id,
+                live.directory.last_read_outbox(message.chat_id),
+            ),
             topic: message.topic_id.as_ref().and_then(app_topic),
         },
         &live.names,
@@ -2250,7 +2312,14 @@ async fn load_topic_history(
             let message_ids: Vec<i64> = messages.iter().map(|message| message.id).collect();
             let any = !messages.is_empty();
             for message in inbox::chronological(messages) {
-                emit_mapped_message(client_id, events, &message, live, None);
+                emit_mapped_message(
+                    client_id,
+                    events,
+                    &message,
+                    live,
+                    None,
+                    OutgoingUpdate::Listed,
+                );
             }
             if !message_ids.is_empty()
                 && inbox::should_mark_topic_viewed(
@@ -2289,7 +2358,14 @@ async fn load_history(client_id: i32, chat_id: i64, live: &mut LiveInbox, events
             let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
             let message_ids: Vec<i64> = messages.iter().map(|message| message.id).collect();
             for message in inbox::chronological(messages) {
-                emit_mapped_message(client_id, events, &message, live, None);
+                emit_mapped_message(
+                    client_id,
+                    events,
+                    &message,
+                    live,
+                    None,
+                    OutgoingUpdate::Listed,
+                );
             }
             // Read the cell after `getChatHistory`: `ViewChat` may have been
             // published while this call was in flight, and it is still queued.
@@ -2391,7 +2467,14 @@ async fn load_older(
     match page {
         Ok((outcome, older)) => {
             for message in &older {
-                emit_mapped_message(client_id, events, message, live, None);
+                emit_mapped_message(
+                    client_id,
+                    events,
+                    message,
+                    live,
+                    None,
+                    OutgoingUpdate::Listed,
+                );
             }
             let more = live.older.finish(chat_id, before, outcome);
             let (more, note) = inbox::older_end(Ok(more));
@@ -2485,7 +2568,14 @@ async fn send_text(
     .await
     {
         Ok(tdlib_rs::enums::Message::Message(message)) => {
-            emit_mapped_message(client_id, events, &message, live, None);
+            emit_mapped_message(
+                client_id,
+                events,
+                &message,
+                live,
+                None,
+                OutgoingUpdate::Listed,
+            );
             // After the pending row, name this send as accepted.
             emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request);
         }
@@ -2547,6 +2637,7 @@ async fn resend(
                         &message,
                         live,
                         Some(message_id.to_string()),
+                        OutgoingUpdate::Listed,
                     );
                     emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request);
                 }
@@ -2909,6 +3000,7 @@ mod tests {
                 peer: None,
                 photo_file_id: None,
                 accent: 0,
+                last_read_outbox: 0,
             },
         );
         assert!(
@@ -2968,6 +3060,7 @@ mod tests {
                 peer: None,
                 photo_file_id: None,
                 accent: 0,
+                last_read_outbox: 0,
             },
         );
         fake.view(Some("telegram:42"));
