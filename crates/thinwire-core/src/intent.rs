@@ -176,6 +176,8 @@ pub enum WhatsAppIntent {
     SetPhone(SecretText),
     /// Start linked-device pairing. The phone goes to the memory vault only.
     BeginLink,
+    /// Leave the QR and open the phone pair-code field. The risk gate stays accepted.
+    LinkWithPhone,
     /// Stop pairing and drop the risk acknowledgement.
     CancelLink,
 }
