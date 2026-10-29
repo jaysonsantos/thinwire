@@ -36,6 +36,11 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 /// File name of the WhatsApp helper program, without `.exe`.
 pub const WHATSAPP_HELPER_PROGRAM: &str = "thinwire-whatsapp-helper";
 
+/// Status detail when the helper reports that the pairing QR codes are used up
+/// (`PairingQrCodesExhausted`). The pair screen replaces the QR image.
+pub const WHATSAPP_QR_EXHAUSTED: &str =
+    "WhatsApp QR codes expired. Cancel, then start pairing again.";
+
 /// The capabilities of the client in the helper. The account row shows them
 /// also while no helper runs.
 const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {

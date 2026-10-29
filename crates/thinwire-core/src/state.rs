@@ -618,6 +618,10 @@ pub struct Snapshot {
     pub whatsapp_qr: Option<String>,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_pair_code: Option<String>,
+    /// The helper reported that the pairing QR codes are used up. The pair
+    /// screen hides the image and offers a new code. A new payload clears it.
+    #[cfg(feature = "whatsapp-web")]
+    pub whatsapp_qr_exhausted: bool,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_started: bool,
     /// The user accepted the full-screen ban gate in this session. Pairing
@@ -686,7 +690,8 @@ impl std::fmt::Debug for Snapshot {
             .field("pending_commands", &self.pending.len());
         #[cfg(feature = "whatsapp-web")]
         out.field("whatsapp_screen", &self.whatsapp_screen)
-            .field("whatsapp_started", &self.whatsapp_started);
+            .field("whatsapp_started", &self.whatsapp_started)
+            .field("whatsapp_qr_exhausted", &self.whatsapp_qr_exhausted);
         #[cfg(feature = "signal-local")]
         out.field("signal_screen", &self.signal_screen)
             .field("signal_started", &self.signal_started)
@@ -855,6 +860,8 @@ impl Snapshot {
             #[cfg(feature = "whatsapp-web")]
             whatsapp_pair_code: None,
             #[cfg(feature = "whatsapp-web")]
+            whatsapp_qr_exhausted: false,
+            #[cfg(feature = "whatsapp-web")]
             whatsapp_started: false,
             #[cfg(feature = "whatsapp-web")]
             whatsapp_risk_acknowledged: false,
@@ -920,6 +927,17 @@ impl Snapshot {
                     // Any other Signal line replaces the check. Removal uses
                     // its own flag, set below, and does not keep this one.
                     self.signal_checking = detail == thinwire_protocol::SIGNAL_LINK_CHECK;
+                }
+                #[cfg(feature = "whatsapp-web")]
+                if protocol == ProtocolId::WhatsApp
+                    && status == AdapterStatus::Error
+                    && detail == thinwire_protocol::WHATSAPP_QR_EXHAUSTED
+                    && self.whatsapp_started
+                {
+                    // The codes are used up. Drop the payload so the pair
+                    // screen cannot draw it, and show the expired notice.
+                    self.whatsapp_qr_exhausted = true;
+                    self.whatsapp_qr = None;
                 }
                 if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                     // A failed load does not send its end event. Stop the spinners.
@@ -1179,6 +1197,7 @@ impl Snapshot {
                 #[cfg(feature = "whatsapp-web")]
                 if self.current_pairing(ProtocolId::WhatsApp, generation) {
                     self.whatsapp_qr = Some(code.reveal().to_string());
+                    self.whatsapp_qr_exhausted = false;
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
@@ -4379,7 +4398,10 @@ impl Snapshot {
             tracing::warn!("whatsapp pairing dropped: the risk gate was not accepted");
             return;
         }
-        if self.whatsapp_started {
+        // A pairing that already runs stays as it is. The exception is an
+        // exhausted QR: "Get new code" starts a new pairing generation.
+        let fresh = !self.whatsapp_started;
+        if self.whatsapp_started && !self.whatsapp_qr_exhausted {
             return;
         }
         // The helper program can go away while the pair screen is open. No
@@ -4390,14 +4412,21 @@ impl Snapshot {
         }
         // A phone number has 15 digits at most. A longer text is not one,
         // and it must not go to the helper. The text stays, so the user can
-        // correct it.
-        if self.whatsapp_phone.chars().count() > WHATSAPP_PHONE_MAX_CHARS {
-            self.whatsapp_phone_note = Some(WHATSAPP_PHONE_TOO_LONG);
-            return;
+        // correct it. A restart keeps the number already in the vault: the
+        // field was cleared on the first start, and writing it again would
+        // replace that number with an empty field.
+        if fresh {
+            if self.whatsapp_phone.chars().count() > WHATSAPP_PHONE_MAX_CHARS {
+                self.whatsapp_phone_note = Some(WHATSAPP_PHONE_TOO_LONG);
+                return;
+            }
+            self.whatsapp_phone_note = None;
+            phone.set_phone(&self.whatsapp_phone);
+            self.whatsapp_phone.clear();
         }
-        self.whatsapp_phone_note = None;
-        phone.set_phone(&self.whatsapp_phone);
-        self.whatsapp_phone.clear();
+        self.whatsapp_qr_exhausted = false;
+        self.whatsapp_qr = None;
+        self.whatsapp_pair_code = None;
         self.whatsapp_started = true;
         self.error = None;
         self.status_text = "WhatsApp pairing requested.".into();
@@ -4407,6 +4436,17 @@ impl Snapshot {
             .insert(ProtocolId::WhatsApp, generation);
         self.pending
             .push(AdapterCommand::WhatsAppBeginLink { generation });
+    }
+
+    /// The shell id of the WhatsApp pairing that runs now. `0` when none runs.
+    /// The pair screen caches the QR image under this id.
+    #[cfg(feature = "whatsapp-web")]
+    #[must_use]
+    pub fn whatsapp_pairing_generation(&self) -> u64 {
+        self.pairing_generation
+            .get(&ProtocolId::WhatsApp)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// WhatsApp linked (`Account { Linked }`): close the pair screen the user
@@ -4429,6 +4469,7 @@ impl Snapshot {
         self.pairing_generation.remove(&ProtocolId::WhatsApp);
         self.whatsapp_qr = None;
         self.whatsapp_pair_code = None;
+        self.whatsapp_qr_exhausted = false;
     }
 
     /// A pairing payload belongs to the pairing of `protocol` that runs now.
@@ -4626,6 +4667,17 @@ impl Snapshot {
             .insert(ProtocolId::Signal, generation);
         self.pending
             .push(AdapterCommand::SignalBeginLink { generation });
+    }
+
+    /// The shell id of the Signal link that runs now. `0` when none runs.
+    /// The link screen caches the QR image under this id.
+    #[cfg(feature = "signal-local")]
+    #[must_use]
+    pub fn signal_pairing_generation(&self) -> u64 {
+        self.pairing_generation
+            .get(&ProtocolId::Signal)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Leave the link screen after `Account { Linked }`. The worker stays up.
@@ -5463,6 +5515,94 @@ mod tests {
             snapshot.take_commands().as_slice(),
             [AdapterCommand::WhatsAppBeginLink { .. }]
         ));
+    }
+
+    /// Pairing QR codes run out (`PairingQrCodesExhausted`). The payload
+    /// leaves the snapshot. A new code starts a new pairing and keeps the
+    /// phone already in the vault. A second start while the code is valid
+    /// does nothing.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn an_exhausted_qr_drops_the_payload_and_a_new_code_starts_again() {
+        use thinwire_protocol::WHATSAPP_QR_EXHAUSTED;
+
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.set_whatsapp_phone("15550100".into());
+        snapshot.begin_whatsapp_link(&phone);
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::WhatsAppBeginLink { generation }) = commands.last() else {
+            panic!("no pairing start: {commands:?}");
+        };
+        let first = *generation;
+        assert_eq!(phone.phone().as_deref(), Some("15550100"));
+        let payload = "2@one-line\n2@same-payload";
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new(payload),
+            generation: first,
+        });
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some(payload));
+        assert!(
+            !format!("{snapshot:?}").contains(payload),
+            "debug output has no payload"
+        );
+        assert!(!snapshot.whatsapp_qr_exhausted);
+
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "a second start while the code is valid does nothing"
+        );
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::WhatsApp,
+            status: AdapterStatus::Error,
+            detail: "some other failure".into(),
+        });
+        assert!(!snapshot.whatsapp_qr_exhausted);
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some(payload));
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::WhatsApp,
+            status: AdapterStatus::Error,
+            detail: WHATSAPP_QR_EXHAUSTED.into(),
+        });
+        assert!(snapshot.whatsapp_qr_exhausted);
+        assert_eq!(
+            snapshot.whatsapp_qr, None,
+            "the expired payload is not shown"
+        );
+        assert!(snapshot.whatsapp_started, "the pair screen stays open");
+        assert!(!format!("{snapshot:?}").contains(payload));
+
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(!snapshot.whatsapp_qr_exhausted);
+        assert_eq!(
+            phone.phone().as_deref(),
+            Some("15550100"),
+            "the vault keeps the number"
+        );
+        let commands = snapshot.take_commands();
+        let [AdapterCommand::WhatsAppBeginLink { generation }] = commands.as_slice() else {
+            panic!("no new pairing: {commands:?}");
+        };
+        assert_ne!(*generation, first, "the new code is a new pairing");
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("2@old"),
+            generation: first,
+        });
+        assert_eq!(
+            snapshot.whatsapp_qr, None,
+            "the old pairing does not return"
+        );
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("2@new"),
+            generation: *generation,
+        });
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("2@new"));
+        assert!(!snapshot.whatsapp_qr_exhausted);
     }
 
     /// ADR 0013 decision 6: with no helper program, the WhatsApp entry is
