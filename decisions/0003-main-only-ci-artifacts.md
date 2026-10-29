@@ -33,6 +33,6 @@ Amendment (2026-10-29, Developer ID identity): the owner replaced `MACOS_SIGNING
 Existing lint, test, build, and `check` jobs stay as they are. README states that the artifacts are not a release and are not notarized.
 
 ## Consequences
-A `main` push keeps three short-lived artifacts. Each download is an outer zip around one tar.gz. Reviewers do not get OS artifacts from pull-request CI. Users must not treat them as a release or as signed software. A later signed-release path needs a new council lock.
+A `main` push keeps three short-lived artifacts. Each download is an outer zip around one tar.gz. Reviewers do not get OS artifacts from pull-request CI. Users must not treat them as a release or as notarized software. A later signed-release path needs a new council lock.
 
 Rejected: PR artifact uploads; distroless GUI image; delete-on-new-main (short retention is enough); uploading the raw directory (it drops execute bits); a zip whose only member is an identical zip; notarization on these artifacts (a Developer ID signature is allowed since the 2026-10-29 amendment).
