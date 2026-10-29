@@ -715,6 +715,8 @@ impl Core {
                 }
             }
             Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
+            Intent::ShowNotice(protocol) => self.state.open_notice_review(protocol),
+            Intent::CloseNotice => self.state.close_notice_review(),
             Intent::LoadPhoto {
                 protocol,
                 conversation_id,

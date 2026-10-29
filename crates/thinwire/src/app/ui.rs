@@ -1,4 +1,4 @@
-//! Shell: account switcher + inbox on the left, thread in the center.
+//! Shell: account rail, the selected account's chat list, then the open chat.
 
 use std::time::Instant;
 
@@ -22,7 +22,8 @@ use thinwire_core::SlackIntent;
 use thinwire_core::secrets::Persistence;
 use thinwire_core::state::{
     AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
-    OlderState, RESUME_CONNECTING, Snapshot, ThreadState,
+    LOADING_CHATS_STATUS, OlderState, RESUME_CONNECTING, Snapshot, ThreadState, notice_label,
+    unofficial_notice,
 };
 use thinwire_core::{Intent, TelegramIntent, ThemeMode, View};
 
@@ -146,8 +147,10 @@ pub(crate) fn draw(
     }
     top_bar(ui, snapshot, out);
     status_strip(ui, snapshot, out);
-    left_panel(ui, snapshot, hints, out);
+    account_rail(ui, snapshot, out);
+    chat_column(ui, snapshot, hints, out);
     center_panel(ui, snapshot, hints, out);
+    notice_review(ui, snapshot, out);
     super::links::confirm(ui);
     super::photos::overlay(ui, snapshot.selected_messages());
 }
@@ -176,7 +179,7 @@ fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                 );
                 ui.add_space(space::S);
                 for filter in InboxFilter::chrome_filters() {
-                    let selected = snapshot.filter == *filter;
+                    let selected = filter.matches(snapshot.selected_protocol);
                     if filter_pill(ui, filter.label(), selected).clicked() {
                         out.push(Intent::SetFilter(*filter));
                     }
@@ -555,11 +558,12 @@ pub(super) fn status_strip_visible(snapshot: &Snapshot, notice: Option<&'static 
     !StripContent::of(snapshot, notice).is_empty()
 }
 
-fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
-    egui::Panel::left("switcher")
+/// Narrow left column. One row per account. The chat list is the next column.
+fn account_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    egui::Panel::left("accounts")
         .resizable(true)
-        .default_size(280.0)
-        .size_range(220.0..=400.0)
+        .default_size(168.0)
+        .size_range(120.0..=220.0)
         .frame(theme::chrome_panel(ui.style()))
         .show(ui, |ui| {
             section_header(ui, "Accounts");
@@ -582,6 +586,7 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
                     account,
                     snapshot.account_row_selected(account),
                     unread,
+                    out,
                 ) {
                     if let Some(slot) = account.signal_retained {
                         out.push(Intent::SelectRetainedSignal(slot));
@@ -596,25 +601,83 @@ fn left_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &m
             if let Some(protocol) = clicked {
                 out.push(Intent::SelectProtocol(protocol));
             }
+            // The old rows are hidden. The line under the list says why.
             if let Some(line) = snapshot.signal_history_kept_line() {
                 let palette = theme::palette(ui);
                 ui.label(RichText::new(line).small().color(palette.text2));
                 ui.add_space(4.0);
             }
+        });
+}
 
-            #[cfg(feature = "whatsapp-web")]
-            if snapshot.whatsapp_pairing_available() {
-                super::whatsapp_gate::risk_entry(ui, snapshot, out);
-            }
-
-            #[cfg(feature = "signal-local")]
-            if snapshot.signal_linking_available() {
-                super::signal_gate::notice_entry(ui, snapshot, out);
-            }
-
-            section_header(ui, "Inbox");
+/// Middle column: the selected account's chats, at the full height under the top bar.
+fn chat_column(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
+    egui::Panel::left("chats")
+        .resizable(true)
+        .default_size(300.0)
+        .size_range(240.0..=480.0)
+        .frame(theme::chrome_panel(ui.style()))
+        .show(ui, |ui| {
+            account_info(ui, snapshot, out);
+            section_header(ui, "Chats");
+            link_offer(ui, snapshot, out);
             let inbox_list_id = ui.make_persistent_id("inbox");
             inbox_scroll(ui, snapshot, hints, inbox_list_id, out);
+        });
+}
+
+/// Selected account. Ban risk opens the same README text as Unofficial.
+fn account_info(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    let protocol = snapshot.selected_protocol;
+    let palette = theme::palette(ui);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(protocol.display_name())
+                .text_style(theme::row_title())
+                .color(palette.text),
+        );
+        if let Some(label) = notice_label(protocol)
+            && ui.button(label).clicked()
+        {
+            out.push(Intent::ShowNotice(protocol));
+        }
+    });
+}
+
+/// Link starts here for an unlinked unofficial account. The notice is the next step.
+fn link_offer(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    #[cfg(feature = "whatsapp-web")]
+    super::whatsapp_gate::link_offer(ui, snapshot, out);
+    #[cfg(feature = "signal-local")]
+    super::signal_gate::link_offer(ui, snapshot, out);
+    #[cfg(not(any(feature = "whatsapp-web", feature = "signal-local")))]
+    let _ = (ui, snapshot, out);
+}
+
+/// Read-only README text. Closing it does not start or cancel a link.
+fn notice_review(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    let Some(protocol) = snapshot.notice_review() else {
+        return;
+    };
+    let Some(lines) = unofficial_notice(protocol) else {
+        return;
+    };
+    let Some(title) = notice_label(protocol) else {
+        return;
+    };
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(480.0);
+            for line in lines {
+                ui.label(*line);
+                ui.add_space(6.0);
+            }
+            if ui.button("Close").clicked() {
+                out.push(Intent::CloseNotice);
+            }
         });
 }
 
@@ -624,16 +687,23 @@ fn account_chip(
     account: &AccountRow,
     selected: bool,
     unread: u32,
+    out: &mut Vec<Intent>,
 ) -> bool {
     let caps = account.caps;
     let palette = theme::palette(ui);
     let width = ui.available_width();
-    let label = chip_label(snapshot, account);
-    // Two lines used 36 px. The removed-device line wraps, so that row is taller.
+    let detail = rail_detail(snapshot, account);
+    let unofficial = account.linked() && unofficial_notice(caps.id).is_some();
+    // One line is the name. A helper line or Unofficial needs a second line.
+    // The removed-device line wraps, so that row is taller.
+    // One previous Signal number uses the reason sentence, which wraps further.
     // [`theme::ROW_INSET`] adds 8 px above and below.
-    let lines = if label == SIGNAL_PREVIOUS_ACCOUNT {
+    let lines = if detail.as_deref() == Some(SIGNAL_PREVIOUS_ACCOUNT) {
         68.0
-    } else if label == SIGNAL_DEVICE_REMOVED {
+    } else if detail.as_deref() == Some(SIGNAL_DEVICE_REMOVED)
+        || unofficial
+        || account.signal_retained.is_some()
+    {
         52.0
     } else {
         36.0
@@ -645,6 +715,8 @@ fn account_chip(
     let chip_id = ui
         .scope_id()
         .with(("account-chip", caps.id, account.signal_retained));
+    // The row click is under the Unofficial button, so that button takes its own click.
+    let response = ui.interact(rect, chip_id, egui::Sense::click());
     row_backdrop(ui, chip_id, rect, selected, hover.hovered());
     let inner = theme::row_content_rect(rect, 0.0);
     let mut child = ui.new_child(
@@ -671,32 +743,58 @@ fn account_chip(
         },
     );
     child.add_space(space::S);
+    let mut unofficial_hit = false;
     child.vertical(|ui| {
         ui.label(
             RichText::new(caps.id.display_name())
                 .text_style(theme::row_title())
                 .color(palette.text),
         );
-        let color = if account.status == AdapterStatus::Ready {
-            palette.ok
-        } else {
-            palette.text3
-        };
-        ui.label(RichText::new(label).small().color(color));
+        if unofficial {
+            let button = ui.small_button("Unofficial");
+            let pointer = ui.input(|input| input.pointer.interact_pos());
+            unofficial_hit = button.clicked()
+                || response.clicked() && pointer.is_some_and(|pos| button.rect.contains(pos));
+            if unofficial_hit {
+                out.push(Intent::ShowNotice(caps.id));
+            }
+        }
+        if let Some(label) = detail {
+            let color = if account.status == AdapterStatus::Ready {
+                palette.ok
+            } else {
+                palette.text3
+            };
+            ui.label(RichText::new(label).small().color(color));
+        }
     });
     if let Some(text) = badge_text(unread) {
         child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             unread_badge(ui, &text, false);
         });
     }
-    let response = ui.interact(rect, chip_id, egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::Role::Button, true, selected, caps.id.display_name())
     });
     if let Some(note) = account_footnote(caps.id, account.linked()) {
         ui.label(RichText::new(note).small().weak());
     }
-    response.clicked()
+    response.clicked() && !unofficial_hit
+}
+
+/// Extra line on the rail. The normal row is only the name, the status dot,
+/// and the unread badge. A previous Signal account, a helper fault, and a
+/// removed Signal device stay, because the row is where Restart and Link are.
+fn rail_detail(snapshot: &Snapshot, account: &AccountRow) -> Option<String> {
+    if account.signal_retained.is_some()
+        || account.helper_label().is_some()
+        || (account.caps.id == ProtocolId::Signal
+            && (snapshot.signal_link_checking() || snapshot.signal_device_removed()))
+    {
+        Some(chip_label(snapshot, account))
+    } else {
+        None
+    }
 }
 
 /// Under the chip of a protocol that runs in a helper process (ADR 0013).
@@ -784,16 +882,6 @@ fn section_header(ui: &mut egui::Ui, title: &str) {
             .color(theme::palette(ui).text3),
     );
     ui.separator();
-}
-
-/// "No chats." is a finished load with zero rows. Before the selected
-/// protocol is linked the list stays blank.
-#[must_use]
-fn show_no_chats(snapshot: &Snapshot) -> bool {
-    snapshot
-        .accounts
-        .iter()
-        .any(|row| row.caps.id == snapshot.selected_protocol && row.linked())
 }
 
 /// The chat-list time of `at`, in the zone of the view's clock (#120).
@@ -918,7 +1006,7 @@ fn inbox(
         InboxState::Loading => {
             ui.horizontal(|ui| {
                 motion::spinner(ui);
-                ui.label(RichText::new("Loading chats…").weak());
+                ui.label(RichText::new(LOADING_CHATS_STATUS).weak());
             });
             return DrawnInbox {
                 anchor: None,
@@ -926,8 +1014,8 @@ fn inbox(
             };
         }
         InboxState::Empty => {
-            if show_no_chats(snapshot) {
-                ui.label(RichText::new("No chats.").italics().weak());
+            if let Some(text) = snapshot.inbox_placeholder() {
+                ui.label(RichText::new(text).italics().weak());
             }
             return DrawnInbox {
                 anchor: None,
@@ -1438,19 +1526,15 @@ fn badge_text(unread: u32) -> Option<String> {
     }
 }
 
-/// Line under an account chip. A linked account has no "not ready" note.
-/// Signal and WhatsApp keep their risk lines. The chip itself shows the
-/// status, so a hover popup is not drawn over the next account.
+/// Line under an account chip for a protocol that has no login in this build.
+/// A linked account has no "not ready" note. WhatsApp and Signal use the
+/// Unofficial label and the Ban risk link instead of a permanent risk line.
 #[must_use]
 fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
-    if id == ProtocolId::Signal && cfg!(feature = "signal-local") {
-        return Some("experimental — expect breakage");
-    }
-    if id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web") {
-        return Some("experimental spike — ban risk");
-    }
     let slack_sign_in = id == ProtocolId::Slack && cfg!(feature = "slack-oauth");
-    if linked || id == ProtocolId::Telegram || slack_sign_in {
+    let has_link_ui = (id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web"))
+        || (id == ProtocolId::Signal && cfg!(feature = "signal-local"));
+    if linked || id == ProtocolId::Telegram || slack_sign_in || has_link_ui {
         None
     } else {
         Some("not ready — no login UI this beat")
@@ -3337,16 +3421,15 @@ mod tests {
 
     #[test]
     fn inbox_stays_blank_before_sign_in() {
-        use super::show_no_chats;
-        use thinwire_core::state::Snapshot;
+        use thinwire_core::state::{NO_CHATS_YET, Snapshot};
 
         let mut snapshot = Snapshot::new();
-        assert!(!show_no_chats(&snapshot));
+        assert_eq!(snapshot.inbox_placeholder(), None);
         snapshot.apply(thinwire_protocol::AdapterEvent::Account {
             protocol: thinwire_protocol::ProtocolId::Telegram,
             state: thinwire_protocol::AccountState::Linked,
         });
-        assert!(show_no_chats(&snapshot), "the selected protocol is linked");
+        assert_eq!(snapshot.inbox_placeholder(), Some(NO_CHATS_YET));
     }
 
     #[test]
