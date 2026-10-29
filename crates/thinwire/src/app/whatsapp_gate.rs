@@ -48,7 +48,11 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>
 }
 
 fn risk_gate(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
-    ui.heading("WhatsApp");
+    ui.heading("WhatsApp: unofficial, ban risk");
+    ui.colored_label(
+        theme::palette(ui).warn,
+        "Unofficial linked-device pairing can get a personal account banned. This is not a supported messenger.",
+    );
     ui.add_space(8.0);
     for bullet in CRITIC_RISK_BULLETS {
         ui.label(bullet);

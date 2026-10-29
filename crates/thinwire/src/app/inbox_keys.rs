@@ -297,6 +297,52 @@ fn ban_risk_opens_the_same_notice() {
         Some(ProtocolId::WhatsApp)
     );
     harness.get_by_label(thinwire_protocol::CRITIC_BULLET_1);
+    assert!(
+        harness.query_all_by_label("Ban risk").count() >= 2,
+        "the button and the window title both say Ban risk"
+    );
+}
+
+/// Signal account info says Risk. The review window uses that title and
+/// omits the README sentence that only describes the screen.
+#[test]
+fn signal_risk_opens_the_same_notice() {
+    use thinwire_core::signal_notice::SIGNAL_NOTICE_RISK;
+
+    let mut state = InboxUi::ready();
+    show_protocol(&mut state.snapshot, ProtocolId::Signal);
+    state.snapshot.apply(AdapterEvent::Account {
+        protocol: ProtocolId::Signal,
+        state: AccountState::Linked,
+    });
+    state.snapshot.select_protocol(ProtocolId::Signal);
+    let mut harness = harness(state);
+    harness.run();
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::Button, "Ban risk")
+            .is_none()
+    );
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Risk")
+        .click();
+    harness.run();
+    assert_eq!(
+        harness.state().snapshot.notice_review(),
+        Some(ProtocolId::Signal)
+    );
+    harness.get_by_label(SIGNAL_NOTICE_RISK);
+    assert!(
+        harness.query_all_by_label("Risk").count() >= 2,
+        "the button and the window title both say Risk"
+    );
+    assert!(
+        harness
+            .query_by_label(
+                "The app shows a full-screen notice with this text before any provisioning QR code.",
+            )
+            .is_none()
+    );
 }
 
 /// "Loading chats…" while the linked account still syncs. "No chats yet."

@@ -95,12 +95,24 @@ impl InboxFilter {
 }
 
 /// README risk text for an unofficial account. `None` for an official path.
-/// The link gate, the Unofficial label, and Ban risk use these lines.
+/// The review window shows these lines. Signal omits the README sentence
+/// that only describes the screen.
 #[must_use]
 pub fn unofficial_notice(protocol: ProtocolId) -> Option<&'static [&'static str]> {
     match protocol {
         ProtocolId::WhatsApp => Some(thinwire_protocol::CRITIC_RISK_BULLETS.as_slice()),
         ProtocolId::Signal => Some(crate::signal_notice::SIGNAL_NOTICE_REVIEW.as_slice()),
+        ProtocolId::Telegram | ProtocolId::Discord | ProtocolId::Slack => None,
+    }
+}
+
+/// Label of the account-info button and of the review window.
+/// WhatsApp is "Ban risk". Signal is "Risk".
+#[must_use]
+pub const fn notice_label(protocol: ProtocolId) -> Option<&'static str> {
+    match protocol {
+        ProtocolId::WhatsApp => Some("Ban risk"),
+        ProtocolId::Signal => Some("Risk"),
         ProtocolId::Telegram | ProtocolId::Discord | ProtocolId::Slack => None,
     }
 }
@@ -6253,8 +6265,15 @@ mod tests {
             assert!(!lines.is_empty());
             for line in lines {
                 assert!(readme.contains(line), "{line}");
+                assert!(
+                    !line.contains("full-screen notice with this text"),
+                    "{line}"
+                );
             }
         }
+        assert_eq!(notice_label(ProtocolId::WhatsApp), Some("Ban risk"));
+        assert_eq!(notice_label(ProtocolId::Signal), Some("Risk"));
+        assert_eq!(notice_label(ProtocolId::Telegram), None);
         assert!(snapshot.take_commands().is_empty());
         snapshot.close_notice_review();
         assert!(snapshot.notice_review().is_none());

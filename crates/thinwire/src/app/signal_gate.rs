@@ -9,7 +9,8 @@ use eframe::egui::{self, RichText};
 
 use super::theme;
 use thinwire_core::signal_notice::{
-    SIGNAL_NOTICE_ACCEPT, SIGNAL_NOTICE_HEADING, SIGNAL_NOTICE_NO_URL, SIGNAL_README_RISK,
+    SIGNAL_NOTICE_ACCEPT, SIGNAL_NOTICE_HEADING, SIGNAL_NOTICE_HELPER, SIGNAL_NOTICE_NO_URL,
+    SIGNAL_NOTICE_RISK,
 };
 use thinwire_core::state::{SignalScreen, Snapshot};
 use thinwire_core::{Intent, ProtocolId, SignalIntent, View};
@@ -50,8 +51,10 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>
 fn notice(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
     ui.heading(SIGNAL_NOTICE_HEADING);
     ui.add_space(8.0);
-    ui.label(SIGNAL_README_RISK);
+    ui.colored_label(theme::palette(ui).warn, SIGNAL_NOTICE_RISK);
     ui.add_space(8.0);
+    ui.label(SIGNAL_NOTICE_HELPER);
+    ui.add_space(6.0);
     ui.label(SIGNAL_NOTICE_NO_URL);
     ui.add_space(12.0);
     if ui.button(SIGNAL_NOTICE_ACCEPT).clicked() {

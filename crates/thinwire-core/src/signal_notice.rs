@@ -11,12 +11,20 @@ pub const SIGNAL_NOTICE_HEADING: &str = "Signal experimental client";
 /// The Signal risk line of the README (ADR 0013 decision 9).
 pub const SIGNAL_RISK: &str = "Signal: no supported third-party API, expect breakage.";
 
-/// The Signal risk bullet of the README, in full. The link gate and the
-/// Unofficial label show this text. Do not soften it.
+/// The first two sentences of the README Signal bullet. The gate and the
+/// review window show this text. The last README sentence is about the
+/// screen itself, so it is not repeated on the screen.
+pub const SIGNAL_NOTICE_RISK: &str = "Signal: no supported third-party API, expect breakage. thinwire links as a secondary device with an unofficial client.";
+
+/// The Signal risk bullet of the README, in full. Tests check this against
+/// the README. The gate does not show the last sentence.
 pub const SIGNAL_README_RISK: &str = "Signal: no supported third-party API, expect breakage. thinwire links as a secondary device with an unofficial client. The app shows a full-screen notice with this text before any provisioning QR code.";
 
-/// The review window and the account-row label show this slice.
-pub const SIGNAL_NOTICE_REVIEW: [&str; 1] = [SIGNAL_README_RISK];
+/// Where the client runs. The gate shows this before the helper starts.
+pub const SIGNAL_NOTICE_HELPER: &str = "The Signal client is AGPL-3.0 code. It runs in a separate program, thinwire-signal-helper, which starts after you accept this notice.";
+
+/// The review window shows this slice.
+pub const SIGNAL_NOTICE_REVIEW: [&str; 1] = [SIGNAL_NOTICE_RISK];
 
 /// The notice shows no provisioning URL.
 pub const SIGNAL_NOTICE_NO_URL: &str = "No provisioning URL is shown on this screen.";
@@ -25,9 +33,10 @@ pub const SIGNAL_NOTICE_NO_URL: &str = "No provisioning URL is shown on this scr
 pub const SIGNAL_NOTICE_ACCEPT: &str = "I understand — Signal can break at any time";
 
 /// The notice copy, in screen order. The version hash covers these strings.
-pub const SIGNAL_NOTICE_PARTS: [&str; 4] = [
+pub const SIGNAL_NOTICE_PARTS: [&str; 5] = [
     SIGNAL_NOTICE_HEADING,
-    SIGNAL_README_RISK,
+    SIGNAL_NOTICE_RISK,
+    SIGNAL_NOTICE_HELPER,
     SIGNAL_NOTICE_NO_URL,
     SIGNAL_NOTICE_ACCEPT,
 ];
@@ -71,5 +80,7 @@ mod tests {
         let readme = include_str!("../../../README.md");
         assert!(readme.contains(SIGNAL_RISK));
         assert!(readme.contains(SIGNAL_README_RISK));
+        assert!(SIGNAL_README_RISK.starts_with(SIGNAL_NOTICE_RISK));
+        assert!(!SIGNAL_NOTICE_RISK.contains("full-screen notice"));
     }
 }

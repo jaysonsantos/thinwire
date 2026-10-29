@@ -22,7 +22,8 @@ use thinwire_core::SlackIntent;
 use thinwire_core::secrets::Persistence;
 use thinwire_core::state::{
     AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
-    LOADING_CHATS_STATUS, OlderState, RESUME_CONNECTING, Snapshot, ThreadState, unofficial_notice,
+    LOADING_CHATS_STATUS, OlderState, RESUME_CONNECTING, Snapshot, ThreadState, notice_label,
+    unofficial_notice,
 };
 use thinwire_core::{Intent, TelegramIntent, ThemeMode, View};
 
@@ -623,7 +624,9 @@ fn account_info(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                 .text_style(theme::row_title())
                 .color(palette.text),
         );
-        if unofficial_notice(protocol).is_some() && ui.button("Ban risk").clicked() {
+        if let Some(label) = notice_label(protocol)
+            && ui.button(label).clicked()
+        {
             out.push(Intent::ShowNotice(protocol));
         }
     });
@@ -647,7 +650,10 @@ fn notice_review(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
     let Some(lines) = unofficial_notice(protocol) else {
         return;
     };
-    egui::Window::new("Ban risk")
+    let Some(title) = notice_label(protocol) else {
+        return;
+    };
+    egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
