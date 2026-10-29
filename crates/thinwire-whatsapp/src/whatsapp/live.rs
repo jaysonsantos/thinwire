@@ -8,14 +8,15 @@
 
 use std::sync::Arc;
 
-use whatsapp_rust::bot::{Bot, BotHandle};
+use whatsapp_rust::bot::{Bot, BotHandle, BotRunOutcome, BotShutdownReport};
 use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust::send::SendError;
 use whatsapp_rust::store::SqliteStore;
+use whatsapp_rust::store::error::StoreError;
 use whatsapp_rust::types::events::{Event, EventKind};
 use whatsapp_rust::wacore::proto_helpers::{MessageBuilderExt, MessageExt};
 use whatsapp_rust::waproto::whatsapp as wa;
-use whatsapp_rust::{Client, ClientError, Jid};
+use whatsapp_rust::{Client, ClientError, Jid, RunCompletionReason};
 
 use super::inbox::{HistoryChat, Mute, WaMessage};
 use super::link::{Callbacks, LinkBackend, StartError, Started};
@@ -81,7 +82,7 @@ impl LinkBackend for LiveBackend {
     }
 
     async fn stop(&self, bot: BotHandle) {
-        bot.shutdown().await;
+        note_shutdown(bot.shutdown().await);
     }
 
     async fn delete_store(&self) -> Result<(), ()> {
@@ -300,6 +301,64 @@ fn non_empty(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Read the shutdown report. A device flush that failed, a message-secret
+/// batch that did not persist, or a background run that did not finish is
+/// logged as a fixed class. The report text can carry a path or a server
+/// string, so it stays out of the log.
+fn note_shutdown(report: BotShutdownReport) {
+    if let Err(error) = &report.shutdown.device {
+        tracing::warn!(
+            error = store_error_class(error),
+            "whatsapp shutdown did not save the device"
+        );
+    }
+    let secrets = &report.shutdown.message_secrets;
+    if secrets.failed_batches > 0 {
+        tracing::warn!(
+            failed_batches = secrets.failed_batches,
+            error = secrets.first_error.as_deref().map(store_error_class),
+            "whatsapp shutdown did not save message secrets"
+        );
+    }
+    if let Some(outcome) = run_failure(&report.run) {
+        tracing::warn!(outcome, "whatsapp background run did not finish cleanly");
+    }
+}
+
+fn store_error_class(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::Io(_) => "io",
+        StoreError::Serialization(_) => "serialization",
+        StoreError::Validation(_) => "validation",
+        StoreError::InvalidMessageSecret(_) => "invalid message secret",
+        StoreError::Connection(_) => "connection",
+        StoreError::Database(_) => "database",
+        StoreError::RetriesExhausted { .. } => "retries exhausted",
+        StoreError::Migration(_) => "migration",
+        StoreError::InvalidConfig(_) => "invalid config",
+        StoreError::DeviceNotFound(_) => "device not found",
+        _ => "store",
+    }
+}
+
+/// `None` when the background run was observed to finish. An abort, a lost
+/// task, and a run loop this handle did not own are failures. A session that
+/// ended on its own (`Stopped`, reconnect disabled) is not.
+fn run_failure(run: &BotRunOutcome) -> Option<&'static str> {
+    match run {
+        BotRunOutcome::Completed(
+            RunCompletionReason::ShutdownRequested
+            | RunCompletionReason::Stopped
+            | RunCompletionReason::AutoReconnectDisabled { .. },
+        ) => None,
+        BotRunOutcome::Completed(RunCompletionReason::AlreadyRunning) => Some("already running"),
+        BotRunOutcome::AbortRequested => Some("aborted"),
+        BotRunOutcome::Unobserved => Some("unobserved"),
+        BotRunOutcome::Completed(_) => Some("unexpected"),
+        _ => Some("unexpected"),
+    }
+}
+
 /// Class of a send error. The error text is dropped: it can hold JIDs.
 fn classify_send_error(error: &SendError) -> SendFailure {
     match error {
@@ -332,6 +391,64 @@ impl WhatsAppSender for LiveSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_classes_drop_the_report_text() {
+        let planted = "15551212 pair ABCD hello";
+        let errors = [
+            StoreError::Io(std::io::Error::other(planted)),
+            StoreError::Validation(planted.into()),
+            StoreError::InvalidConfig(planted.into()),
+            StoreError::Database(Box::new(std::io::Error::other(planted))),
+            StoreError::RetriesExhausted {
+                op: planted.into(),
+                attempts: 2,
+                source: Box::new(std::io::Error::other(planted)),
+            },
+            StoreError::DeviceNotFound(7),
+        ];
+        for error in &errors {
+            let class = store_error_class(error);
+            assert!(!class.contains("1555"), "{class}");
+            assert!(!class.contains("ABCD"), "{class}");
+            assert!(!class.contains('7'), "{class}");
+        }
+        assert_eq!(
+            store_error_class(&StoreError::Validation(planted.into())),
+            "validation"
+        );
+        assert_eq!(
+            store_error_class(&StoreError::DeviceNotFound(7)),
+            "device not found"
+        );
+
+        let ended = BotRunOutcome::Completed(RunCompletionReason::AutoReconnectDisabled {
+            connection: Some(whatsapp_rust::wacore::net::DisconnectReason::ReadError(
+                planted.into(),
+            )),
+            connect_error: None,
+            protocol_error: None,
+        });
+        assert_eq!(run_failure(&ended), None);
+        assert_eq!(
+            run_failure(&BotRunOutcome::Completed(
+                RunCompletionReason::ShutdownRequested
+            )),
+            None
+        );
+        assert_eq!(
+            run_failure(&BotRunOutcome::Completed(RunCompletionReason::Stopped)),
+            None
+        );
+        assert_eq!(
+            run_failure(&BotRunOutcome::Completed(
+                RunCompletionReason::AlreadyRunning
+            )),
+            Some("already running")
+        );
+        assert_eq!(run_failure(&BotRunOutcome::AbortRequested), Some("aborted"));
+        assert_eq!(run_failure(&BotRunOutcome::Unobserved), Some("unobserved"));
+    }
 
     #[test]
     fn send_errors_map_to_failure_classes_without_text() {
