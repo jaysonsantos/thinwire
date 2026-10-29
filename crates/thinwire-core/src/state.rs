@@ -43,25 +43,24 @@ pub fn stub_banner(snapshot: &Snapshot) -> Option<&'static str> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboxFilter {
-    All,
     Telegram,
     #[cfg(feature = "slack-oauth")]
     Slack,
 }
 
 impl InboxFilter {
-    /// Top-bar filters for this build. Spike tabs stay out until their feature is on.
+    /// Top-bar filters for this build. There is no All filter: the middle
+    /// column is one account. Spike tabs stay out until their feature is on.
     #[must_use]
     pub fn chrome_filters() -> &'static [Self] {
         #[cfg(feature = "slack-oauth")]
         {
-            const FILTERS: &[InboxFilter] =
-                &[InboxFilter::All, InboxFilter::Telegram, InboxFilter::Slack];
+            const FILTERS: &[InboxFilter] = &[InboxFilter::Telegram, InboxFilter::Slack];
             FILTERS
         }
         #[cfg(not(feature = "slack-oauth"))]
         {
-            const FILTERS: &[InboxFilter] = &[InboxFilter::All, InboxFilter::Telegram];
+            const FILTERS: &[InboxFilter] = &[InboxFilter::Telegram];
             FILTERS
         }
     }
@@ -69,7 +68,6 @@ impl InboxFilter {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::All => "All",
             Self::Telegram => "Telegram",
             #[cfg(feature = "slack-oauth")]
             Self::Slack => "Slack",
@@ -79,20 +77,43 @@ impl InboxFilter {
     #[must_use]
     pub const fn matches(self, protocol: ProtocolId) -> bool {
         match self {
-            Self::All => true,
             Self::Telegram => matches!(protocol, ProtocolId::Telegram),
             #[cfg(feature = "slack-oauth")]
             Self::Slack => matches!(protocol, ProtocolId::Slack),
         }
     }
 
-    /// Account chip visibility for the current filter. Off-feature spikes stay out.
-    ///
-    /// Cargo features decide which protocols exist. Callers still AND
-    /// [`Snapshot::account_surface_visible`].
+    /// The protocol this pill selects.
     #[must_use]
-    pub const fn shows_in_switcher(self, protocol: ProtocolId) -> bool {
-        self.matches(protocol)
+    pub const fn protocol(self) -> ProtocolId {
+        match self {
+            Self::Telegram => ProtocolId::Telegram,
+            #[cfg(feature = "slack-oauth")]
+            Self::Slack => ProtocolId::Slack,
+        }
+    }
+}
+
+/// README risk text for an unofficial account. `None` for an official path.
+/// The review window shows these lines. Signal omits the README sentence
+/// that only describes the screen.
+#[must_use]
+pub fn unofficial_notice(protocol: ProtocolId) -> Option<&'static [&'static str]> {
+    match protocol {
+        ProtocolId::WhatsApp => Some(thinwire_protocol::CRITIC_RISK_BULLETS.as_slice()),
+        ProtocolId::Signal => Some(crate::signal_notice::SIGNAL_NOTICE_REVIEW.as_slice()),
+        ProtocolId::Telegram | ProtocolId::Discord | ProtocolId::Slack => None,
+    }
+}
+
+/// Label of the account-info button and of the review window.
+/// WhatsApp is "Ban risk". Signal is "Risk".
+#[must_use]
+pub const fn notice_label(protocol: ProtocolId) -> Option<&'static str> {
+    match protocol {
+        ProtocolId::WhatsApp => Some("Ban risk"),
+        ProtocolId::Signal => Some("Risk"),
+        ProtocolId::Telegram | ProtocolId::Discord | ProtocolId::Slack => None,
     }
 }
 
@@ -264,6 +285,8 @@ pub const KEYCHAIN_READ_FAILED: &str = "The keychain could not be read. Your sav
 /// Status lines of a running load (#80). The strip shows them before any
 /// finished line.
 pub const LOADING_CHATS_STATUS: &str = "Loading chats…";
+/// Middle column after a link, when that account has no chats.
+pub const NO_CHATS_YET: &str = "No chats yet.";
 pub const LOADING_MESSAGES_STATUS: &str = "Loading messages…";
 pub const LOADING_OLDER_STATUS: &str = "Loading older messages…";
 
@@ -469,6 +492,9 @@ pub struct Snapshot {
     /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
     pub focused_row: Option<String>,
     pub filter: InboxFilter,
+    /// Read-only notice opened from Unofficial or Ban risk. It does not
+    /// start a link and it does not cancel one.
+    notice_review: Option<ProtocolId>,
     pub search: String,
     pub auth: AuthScreen,
     pub telegram_api_id: String,
@@ -671,6 +697,7 @@ impl std::fmt::Debug for Snapshot {
         out.field("accounts", &accounts)
             .field("selected_protocol", &self.selected_protocol)
             .field("filter", &self.filter)
+            .field("notice_review", &self.notice_review)
             .field("auth", &self.auth)
             .field("auth_busy", &self.auth_busy)
             .field("telegram_authorized", &self.telegram_authorized)
@@ -783,7 +810,8 @@ impl Snapshot {
             selected_conversation: None,
             selected_topic: None,
             focused_row: None,
-            filter: InboxFilter::All,
+            filter: InboxFilter::Telegram,
+            notice_review: None,
             search: String::new(),
             auth: AuthScreen::Idle,
             telegram_api_id: String::new(),
@@ -1616,22 +1644,16 @@ impl Snapshot {
     }
 
     pub fn set_filter(&mut self, filter: InboxFilter) {
-        if self.filter == filter {
+        let changed = self.filter != filter;
+        self.filter = filter;
+        let protocol = filter.protocol();
+        if !filter.matches(self.selected_protocol) && self.account_surface_visible(protocol) {
+            self.select_protocol(protocol);
             return;
         }
-        self.filter = filter;
-        if !filter.matches(self.selected_protocol)
-            && let Some(first) = self
-                .accounts
-                .iter()
-                .find(|row| {
-                    filter.matches(row.caps.id) && self.account_surface_visible(row.caps.id)
-                })
-                .map(|row| row.caps.id)
-        {
-            self.select_protocol(first);
+        if changed {
+            self.sync_focused_row(FocusFollow::List);
         }
-        self.sync_focused_row(FocusFollow::List);
     }
 
     /// New inbox search. A highlight that the query hides is cleared.
@@ -1671,11 +1693,16 @@ impl Snapshot {
         }
     }
 
+    /// The account rail lists every account this build shows. A filter pill
+    /// does not hide the others. The middle column is still only the
+    /// selected account ([`Self::visible_conversations`]).
     #[must_use]
     pub fn shows_in_switcher(&self, protocol: ProtocolId) -> bool {
-        self.filter.shows_in_switcher(protocol) && self.account_surface_visible(protocol)
+        self.account_surface_visible(protocol)
     }
 
+    /// Chats in the middle column: the selected account only. There is no
+    /// combined inbox.
     pub fn visible_conversations(&self) -> Vec<&Conversation> {
         if !self.account_surface_visible(self.selected_protocol)
             || !self.has_session(self.selected_protocol)
@@ -1771,6 +1798,40 @@ impl Snapshot {
             return InboxState::Loading;
         }
         InboxState::Empty
+    }
+
+    /// The line in an empty middle column.
+    ///
+    /// `Some(LOADING_CHATS_STATUS)` while an online account still syncs.
+    /// `Some(NO_CHATS_YET)` only after a link, when that account has no chats.
+    /// `None` before the account is linked, and when rows or a search fill
+    /// the column.
+    #[must_use]
+    pub fn inbox_placeholder(&self) -> Option<&'static str> {
+        match self.inbox_state() {
+            InboxState::Loading => Some(LOADING_CHATS_STATUS),
+            InboxState::Empty if self.protocol_linked(self.selected_protocol) => Some(NO_CHATS_YET),
+            InboxState::Rows | InboxState::Empty | InboxState::NoMatch => None,
+        }
+    }
+
+    /// Open the README risk text. A protocol with no unofficial notice is ignored.
+    /// The link screens and the worker commands stay as they are.
+    pub fn open_notice_review(&mut self, protocol: ProtocolId) {
+        if unofficial_notice(protocol).is_none() {
+            return;
+        }
+        self.notice_review = Some(protocol);
+    }
+
+    pub fn close_notice_review(&mut self) {
+        self.notice_review = None;
+    }
+
+    /// The protocol whose README risk text is open, if any.
+    #[must_use]
+    pub const fn notice_review(&self) -> Option<ProtocolId> {
+        self.notice_review
     }
 
     /// The status line is a finished success: the adapter sent it with
@@ -2068,7 +2129,7 @@ impl Snapshot {
             .accounts
             .iter()
             .map(|row| row.caps.id)
-            .filter(|id| self.filter.matches(*id) && self.account_surface_visible(*id))
+            .filter(|id| self.account_surface_visible(*id))
             .collect();
         for protocol in protocols {
             if self.protocol_linked(protocol) {
@@ -6144,6 +6205,152 @@ mod tests {
         assert_eq!(snapshot.inbox_state(), InboxState::Empty);
     }
 
+    /// The middle column lists the selected account. Another account's chats
+    /// stay off that list. Both accounts stay on the rail.
+    #[test]
+    fn the_middle_column_lists_only_the_selected_account() {
+        let mut snapshot = Snapshot::new();
+        test_support::show_protocol(&mut snapshot, ProtocolId::Slack);
+        link(&mut snapshot, ProtocolId::Telegram);
+        link(&mut snapshot, ProtocolId::Slack);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Telegram, "ada", true),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Slack, "general", true),
+        });
+        snapshot.select_protocol(ProtocolId::Telegram);
+        assert_eq!(visible_ids(&snapshot), ["ada"]);
+        snapshot.select_protocol(ProtocolId::Slack);
+        assert_eq!(visible_ids(&snapshot), ["general"]);
+        assert!(snapshot.shows_in_switcher(ProtocolId::Telegram));
+        assert!(snapshot.shows_in_switcher(ProtocolId::Slack));
+        assert!(
+            !InboxFilter::chrome_filters()
+                .iter()
+                .any(|filter| filter.label() == "All")
+        );
+    }
+
+    /// Loading while the account syncs. "No chats yet." only after the link,
+    /// when the list is empty. Before the link the column has no empty line.
+    #[test]
+    fn the_middle_column_empty_states_follow_the_link() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        assert_eq!(snapshot.inbox_placeholder(), None);
+        complete_telegram(&mut snapshot, &store);
+        assert_eq!(snapshot.inbox_placeholder(), Some(LOADING_CHATS_STATUS));
+        snapshot.apply(AdapterEvent::ChatListLoaded {
+            protocol: ProtocolId::Telegram,
+        });
+        assert_eq!(snapshot.inbox_placeholder(), Some(NO_CHATS_YET));
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: telegram_chat(1, "Ada", 1),
+        });
+        assert_eq!(snapshot.inbox_placeholder(), None);
+    }
+
+    /// Unofficial and Ban risk open the README text. They do not start a link.
+    #[test]
+    fn unofficial_opens_the_readme_notice_without_starting_a_link() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_notice_review(ProtocolId::Telegram);
+        assert!(snapshot.notice_review().is_none());
+        snapshot.open_notice_review(ProtocolId::WhatsApp);
+        assert_eq!(snapshot.notice_review(), Some(ProtocolId::WhatsApp));
+        let readme = include_str!("../../../README.md");
+        for protocol in [ProtocolId::WhatsApp, ProtocolId::Signal] {
+            let lines = unofficial_notice(protocol).expect("notice");
+            assert!(!lines.is_empty());
+            for line in lines {
+                assert!(readme.contains(line), "{line}");
+                assert!(
+                    !line.contains("full-screen notice with this text"),
+                    "{line}"
+                );
+            }
+        }
+        assert_eq!(notice_label(ProtocolId::WhatsApp), Some("Ban risk"));
+        assert_eq!(notice_label(ProtocolId::Signal), Some("Risk"));
+        assert_eq!(notice_label(ProtocolId::Telegram), None);
+        assert!(snapshot.take_commands().is_empty());
+        snapshot.close_notice_review();
+        assert!(snapshot.notice_review().is_none());
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn the_whatsapp_notice_gates_linking_and_a_review_does_not_cancel_it() {
+        let phone = thinwire_protocol::WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(
+            !snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::WhatsAppBeginLink { .. })),
+            "linking waits for the notice"
+        );
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(!snapshot.whatsapp_started);
+        assert!(snapshot.whatsapp_qr.is_none());
+        snapshot.acknowledge_whatsapp_risk();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        assert!(snapshot.whatsapp_qr.is_none(), "confirm is before any QR");
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(snapshot.whatsapp_started);
+        let _ = snapshot.take_commands();
+        snapshot.open_notice_review(ProtocolId::WhatsApp);
+        assert_eq!(snapshot.notice_review(), Some(ProtocolId::WhatsApp));
+        assert!(snapshot.whatsapp_started);
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::WhatsAppCancelLink)
+        );
+    }
+
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn the_signal_notice_gates_linking() {
+        let mut snapshot = Snapshot::new();
+        snapshot.begin_signal_link();
+        assert!(
+            !snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. }))
+        );
+        snapshot.open_signal_notice();
+        snapshot.begin_signal_link();
+        assert!(!snapshot.signal_started);
+        assert!(snapshot.signal_qr.is_none());
+        snapshot.acknowledge_signal_notice();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Link);
+        assert!(snapshot.signal_qr.is_none());
+        snapshot.begin_signal_link();
+        assert!(snapshot.signal_started);
+        let _ = snapshot.take_commands();
+        snapshot.open_notice_review(ProtocolId::Signal);
+        assert_eq!(snapshot.notice_review(), Some(ProtocolId::Signal));
+        assert!(snapshot.signal_started);
+        assert!(
+            !snapshot
+                .take_commands()
+                .contains(&AdapterCommand::SignalCancelLink)
+        );
+    }
+
+    fn visible_ids(snapshot: &Snapshot) -> Vec<&str> {
+        snapshot
+            .visible_conversations()
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect()
+    }
+
     #[test]
     fn thread_state_covers_loading_rows_and_empty() {
         let store = SecretStore::memory();
@@ -7891,12 +8098,15 @@ mod tests {
             cfg!(feature = "signal-local")
         );
         let filters = InboxFilter::chrome_filters();
-        assert!(filters.contains(&InboxFilter::All));
+        assert!(
+            !filters.iter().any(|filter| filter.label() == "All"),
+            "there is no combined inbox"
+        );
         assert!(filters.contains(&InboxFilter::Telegram));
         #[cfg(feature = "slack-oauth")]
         assert!(filters.contains(&InboxFilter::Slack));
         #[cfg(not(feature = "slack-oauth"))]
-        assert_eq!(filters.len(), 2);
+        assert_eq!(filters.len(), 1);
         assert!(
             !filters
                 .iter()
@@ -9098,14 +9308,14 @@ mod tests {
     fn filter_matches_supported_protocols_without_an_experimental_tab() {
         assert!(InboxFilter::Telegram.matches(ProtocolId::Telegram));
         assert!(!InboxFilter::Telegram.matches(ProtocolId::Slack));
+        assert!(!InboxFilter::Telegram.matches(ProtocolId::WhatsApp));
+        assert!(!InboxFilter::Telegram.matches(ProtocolId::Discord));
         #[cfg(feature = "slack-oauth")]
         assert!(InboxFilter::Slack.matches(ProtocolId::Slack));
-        assert!(InboxFilter::All.matches(ProtocolId::Discord));
-        assert!(InboxFilter::All.matches(ProtocolId::WhatsApp));
         assert!(
             !InboxFilter::chrome_filters()
                 .iter()
-                .any(|filter| filter.label() == "Experimental")
+                .any(|filter| filter.label() == "All" || filter.label() == "Experimental")
         );
     }
 
@@ -9254,34 +9464,37 @@ mod tests {
     }
 
     #[test]
-    fn off_feature_spikes_stay_out_of_the_switcher() {
+    fn the_account_rail_lists_every_account_and_has_no_all_filter() {
+        assert!(
+            !InboxFilter::chrome_filters()
+                .iter()
+                .any(|filter| filter.label() == "All")
+        );
         for filter in InboxFilter::chrome_filters() {
             let mut view = Snapshot::new();
             view.set_filter(*filter);
             assert_eq!(
                 view.shows_in_switcher(ProtocolId::WhatsApp),
-                cfg!(feature = "whatsapp-web") && filter.matches(ProtocolId::WhatsApp)
+                cfg!(feature = "whatsapp-web"),
+                "a pill does not hide other accounts"
             );
             assert_eq!(
                 view.shows_in_switcher(ProtocolId::Discord),
-                DiscordAdapter::bot_inbox_compiled() && filter.matches(ProtocolId::Discord)
+                DiscordAdapter::bot_inbox_compiled()
             );
             assert_eq!(
                 view.shows_in_switcher(ProtocolId::Slack),
-                cfg!(feature = "slack-oauth") && filter.matches(ProtocolId::Slack)
+                cfg!(feature = "slack-oauth")
             );
             assert_eq!(
                 view.shows_in_switcher(ProtocolId::Signal),
-                cfg!(feature = "signal-local") && filter.matches(ProtocolId::Signal)
+                cfg!(feature = "signal-local")
             );
-            assert_eq!(
-                view.shows_in_switcher(ProtocolId::Telegram),
-                filter.matches(ProtocolId::Telegram)
-            );
+            assert!(view.shows_in_switcher(ProtocolId::Telegram));
         }
-        assert!(!InboxFilter::Telegram.shows_in_switcher(ProtocolId::Slack));
+        assert!(!InboxFilter::Telegram.matches(ProtocolId::Slack));
         #[cfg(feature = "slack-oauth")]
-        assert!(!InboxFilter::Slack.shows_in_switcher(ProtocolId::Telegram));
+        assert!(!InboxFilter::Slack.matches(ProtocolId::Telegram));
     }
 
     #[test]
