@@ -21,7 +21,7 @@ pub(crate) const DISPLAY_SIDE: f32 = 240.0;
 pub(crate) const QR_IMAGE_LABEL: &str = "Pairing QR code";
 
 /// Shown when the payload does not fit in a QR code. The payload is not drawn.
-pub(crate) const QR_UNDRAWN: &str = "Could not draw the code.";
+pub(crate) const QR_UNDRAWN: &str = "Cannot show this QR code.";
 
 /// Texture name of the Signal code.
 #[cfg_attr(not(feature = "signal-local"), allow(dead_code))]

@@ -498,7 +498,7 @@ mod tests {
     }
 
     /// A payload that does not fit is not drawn as text. The phone link is
-    /// the filled button under "Could not draw the code."
+    /// the filled button under "Cannot show this QR code."
     #[test]
     fn a_payload_that_does_not_fit_hides_the_text_and_highlights_the_phone_link() {
         let mut payload = String::from("2@too-large-secret-");
