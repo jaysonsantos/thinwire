@@ -21,9 +21,11 @@ pub(crate) const DISPLAY_SIDE: f32 = 240.0;
 pub(crate) const QR_IMAGE_LABEL: &str = "Pairing QR code";
 
 /// Texture name of the Signal code.
+#[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
 pub(crate) const SIGNAL_QR: &str = "signal-provisioning-qr";
 
 /// Texture name of the WhatsApp code.
+#[cfg_attr(not(feature = "whatsapp-web"), allow(dead_code))]
 pub(crate) const WHATSAPP_QR: &str = "whatsapp-pairing-qr";
 
 #[derive(Clone)]

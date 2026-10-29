@@ -4499,6 +4499,29 @@ impl Snapshot {
             .push(AdapterCommand::WhatsAppBeginLink { generation });
     }
 
+    /// Leave the QR and open the phone pair-code field.
+    ///
+    /// The pair screen stays open and the ban gate stays accepted. A pairing
+    /// that is running stops, so the phone field can start a new one.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn open_whatsapp_phone_link(&mut self, phone: &WhatsAppPhoneVault) {
+        if self.whatsapp_screen != WhatsAppScreen::Pair || !self.whatsapp_risk_acknowledged {
+            tracing::warn!("whatsapp phone link dropped: the risk gate was not accepted");
+            return;
+        }
+        if self.helper_missing(ProtocolId::WhatsApp) {
+            return;
+        }
+        if self.whatsapp_started {
+            self.pending.push(AdapterCommand::WhatsAppCancelLink);
+        }
+        phone.clear();
+        self.end_pairing();
+        self.whatsapp_started = false;
+        self.whatsapp_phone.clear();
+        self.whatsapp_phone_note = None;
+    }
+
     /// The shell id of the WhatsApp pairing that runs now. `0` when none runs.
     /// The pair screen caches the QR image under this id.
     #[cfg(feature = "whatsapp-web")]

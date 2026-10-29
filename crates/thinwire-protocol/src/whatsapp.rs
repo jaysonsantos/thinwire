@@ -38,8 +38,7 @@ pub const WHATSAPP_HELPER_PROGRAM: &str = "thinwire-whatsapp-helper";
 
 /// Status detail when the helper reports that the pairing QR codes are used up
 /// (`PairingQrCodesExhausted`). The pair screen replaces the QR image.
-pub const WHATSAPP_QR_EXHAUSTED: &str =
-    "WhatsApp QR codes expired. Cancel, then start pairing again.";
+pub const WHATSAPP_QR_EXHAUSTED: &str = "WhatsApp QR codes expired. Click Get new code.";
 
 /// The capabilities of the client in the helper. The account row shows them
 /// also while no helper runs.
