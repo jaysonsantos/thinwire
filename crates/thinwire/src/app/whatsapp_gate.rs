@@ -201,8 +201,8 @@ mod tests {
     use thinwire_core::state::Snapshot;
     use thinwire_core::{Intent, View, WhatsAppIntent};
     use thinwire_protocol::{
-        AdapterEvent, AdapterStatus, ProtocolId, RedactedPairingSecret, WHATSAPP_QR_EXHAUSTED,
-        WhatsAppPhoneVault,
+        AccountState, AdapterEvent, AdapterStatus, ProtocolId, RedactedPairingSecret,
+        WHATSAPP_QR_EXHAUSTED, WhatsAppPhoneVault,
     };
 
     use super::{
@@ -246,10 +246,19 @@ mod tests {
         }
 
         fn exhaust(&mut self) {
+            // The helper reports Linking, then the used-up codes, then Unlinked.
+            self.snapshot.apply(AdapterEvent::Account {
+                protocol: ProtocolId::WhatsApp,
+                state: AccountState::Linking,
+            });
             self.snapshot.apply(AdapterEvent::Status {
                 protocol: ProtocolId::WhatsApp,
                 status: AdapterStatus::Error,
                 detail: WHATSAPP_QR_EXHAUSTED.into(),
+            });
+            self.snapshot.apply(AdapterEvent::Account {
+                protocol: ProtocolId::WhatsApp,
+                state: AccountState::Unlinked,
             });
         }
 
