@@ -1465,6 +1465,16 @@ async fn apply_chat_update(
             live.publish(events, emit, effect);
         }
         tdlib_rs::enums::Update::ChatReadOutbox(update) => {
+            // Ids and the link flag only. No title and no message text.
+            tracing::debug!(
+                update = "ChatReadOutbox",
+                chat_id = update.chat_id,
+                old_message_id = Option::<i64>::None,
+                message_id = update.last_read_outbox_message_id,
+                sending_state = "absent",
+                emit,
+                "telegram outgoing update"
+            );
             // Not emitted while the account is not linked. NewChat keeps the
             // cursor the same way. The directory stores it. Rows loaded later
             // get Read. Rows already in the snapshot update on the next
@@ -1542,8 +1552,27 @@ async fn apply_chat_update(
         // The request reached the server. The temporary id stays, and the
         // row stays pending. This update is sent only when `use_quick_ack`
         // is on. Success and failure are the updates below.
-        tdlib_rs::enums::Update::MessageSendAcknowledged(_) => {}
+        tdlib_rs::enums::Update::MessageSendAcknowledged(update) => {
+            tracing::debug!(
+                update = "MessageSendAcknowledged",
+                chat_id = update.chat_id,
+                old_message_id = Option::<i64>::None,
+                message_id = update.message_id,
+                sending_state = "absent",
+                emit,
+                "telegram outgoing update"
+            );
+        }
         tdlib_rs::enums::Update::MessageSendSucceeded(update) => {
+            tracing::debug!(
+                update = "MessageSendSucceeded",
+                chat_id = update.message.chat_id,
+                old_message_id = Some(update.old_message_id),
+                message_id = update.message.id,
+                sending_state = sending_state_name(&update.message.sending_state),
+                emit,
+                "telegram outgoing update"
+            );
             if emit {
                 let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
                 emit_mapped_message(
@@ -1563,6 +1592,15 @@ async fn apply_chat_update(
             }
         }
         tdlib_rs::enums::Update::MessageSendFailed(update) => {
+            tracing::debug!(
+                update = "MessageSendFailed",
+                chat_id = update.message.chat_id,
+                old_message_id = Some(update.old_message_id),
+                message_id = update.message.id,
+                sending_state = sending_state_name(&update.message.sending_state),
+                emit,
+                "telegram outgoing update"
+            );
             if emit {
                 log_tdlib_error("sendMessage (update)", &update.error);
                 let old_id = inbox::message_id(update.message.chat_id, update.old_message_id);
@@ -2832,6 +2870,16 @@ fn move_aside(result: std::io::Result<Option<PathBuf>>) -> Option<String> {
             tracing::warn!(%error, "telegram data folder could not be moved aside");
             None
         }
+    }
+}
+
+/// Variant name of a TDLib sending state. `None` is a null state.
+/// The failed state's error text stays out of the log.
+fn sending_state_name(state: &Option<tdlib_rs::enums::MessageSendingState>) -> &'static str {
+    match state {
+        None => "None",
+        Some(tdlib_rs::enums::MessageSendingState::Pending(_)) => "Pending",
+        Some(tdlib_rs::enums::MessageSendingState::Failed(_)) => "Failed",
     }
 }
 
