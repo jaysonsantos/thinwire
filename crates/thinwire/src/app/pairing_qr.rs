@@ -65,13 +65,30 @@ pub(crate) fn provisioning_qr_image(payload: &str) -> Option<egui::ColorImage> {
     Some(egui::ColorImage::new([size, size], pixels))
 }
 
+/// Whether the image was drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairingQr {
+    /// The payload fit in one code.
+    Shown,
+    /// The payload does not fit in a QR code. Callers must not draw the text.
+    TooLarge,
+}
+
 /// Draw the cached code, centered, at [`DISPLAY_SIDE`].
 ///
 /// The same widget is used on the Signal link screen and the WhatsApp pair
 /// screen, so the two codes have the same size, quiet zone, and placement.
-pub(crate) fn show_pairing_qr(ui: &mut egui::Ui, name: &str, generation: u64, payload: &str) {
+/// [`PairingQr::TooLarge`] means the payload does not fit. This function
+/// draws nothing in that case, and it does not draw the payload text.
+#[must_use]
+pub(crate) fn show_pairing_qr(
+    ui: &mut egui::Ui,
+    name: &str,
+    generation: u64,
+    payload: &str,
+) -> PairingQr {
     let Some(texture) = cached_texture(ui, name, generation, payload) else {
-        return;
+        return PairingQr::TooLarge;
     };
     let width = ui.available_width();
     let inset = ((width - DISPLAY_SIDE) * 0.5).max(0.0);
@@ -84,6 +101,7 @@ pub(crate) fn show_pairing_qr(ui: &mut egui::Ui, name: &str, generation: u64, pa
                 .alt_text(QR_IMAGE_LABEL),
         );
     });
+    PairingQr::Shown
 }
 
 /// Drop a cached code. The next draw of that name builds it again.
@@ -174,6 +192,13 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_longer_than_a_qr_code_is_not_an_image() {
+        let mut payload = String::from("2@");
+        payload.extend(std::iter::repeat_n('a', 8_000));
+        assert!(provisioning_qr_image(&payload).is_none());
+    }
+
+    #[test]
     fn the_texture_is_reused_until_the_generation_or_the_payload_changes() {
         use egui_kittest::Harness;
 
@@ -186,7 +211,7 @@ mod tests {
             .with_size(egui::vec2(320.0, 320.0))
             .build_ui_state(
                 |ui, state: &mut State| {
-                    show_pairing_qr(ui, "qr-cache", state.generation, state.payload);
+                    let _ = show_pairing_qr(ui, "qr-cache", state.generation, state.payload);
                 },
                 State {
                     generation: 1,

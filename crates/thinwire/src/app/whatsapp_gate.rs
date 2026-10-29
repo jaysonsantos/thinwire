@@ -47,6 +47,9 @@ const BAN_WARN: &str = "Unofficial linked-device pairing can get a personal acco
 /// Shown directly under the QR image. The payload itself is not drawn.
 const QR_WARNING: &str = "Scan this code only with your own phone. It links this app to the WhatsApp account that scans it.";
 
+/// Shown in place of the image when the payload does not fit in a QR code.
+const QR_TOO_LARGE: &str = "Cannot show this QR code.";
+
 /// Opens the phone pair-code field. The ban gate stays accepted.
 const PHONE_LINK: &str = "Link with phone number instead";
 
@@ -156,21 +159,30 @@ fn pair_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
     } else if let Some(qr) = snapshot.whatsapp_qr.as_deref() {
         ui.add_space(8.0);
         ui.label(SCAN_STEP);
-        pairing_qr::show_pairing_qr(
+        match pairing_qr::show_pairing_qr(
             ui,
             pairing_qr::WHATSAPP_QR,
             snapshot.whatsapp_pairing_generation(),
             qr,
-        );
-        ui.add_space(8.0);
-        ui.colored_label(theme::palette(ui).warn, QR_WARNING);
-        ui.heading(BAN_HEADING);
-        ui.colored_label(theme::palette(ui).warn, BAN_WARN);
-        if ui
-            .add(egui::Button::new(RichText::new(PHONE_LINK).small().weak()).frame(false))
-            .clicked()
-        {
-            out.push(Intent::WhatsApp(WhatsAppIntent::LinkWithPhone));
+        ) {
+            pairing_qr::PairingQr::Shown => {
+                ui.add_space(8.0);
+                ui.colored_label(theme::palette(ui).warn, QR_WARNING);
+                ui.heading(BAN_HEADING);
+                ui.colored_label(theme::palette(ui).warn, BAN_WARN);
+                if phone_link(ui, false).clicked() {
+                    out.push(Intent::WhatsApp(WhatsAppIntent::LinkWithPhone));
+                }
+            }
+            // The payload does not fit. Draw neither the image nor the text.
+            pairing_qr::PairingQr::TooLarge => {
+                ui.label(QR_TOO_LARGE);
+                if phone_link(ui, true).clicked() {
+                    out.push(Intent::WhatsApp(WhatsAppIntent::LinkWithPhone));
+                }
+                ui.heading(BAN_HEADING);
+                ui.colored_label(theme::palette(ui).warn, BAN_WARN);
+            }
         }
     } else {
         pairing_qr::forget_pairing_qr(ui.ctx(), pairing_qr::WHATSAPP_QR);
@@ -191,6 +203,20 @@ fn pair_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
     }
 }
 
+/// The phone pair-code action. `highlighted` is the filled button used when
+/// the QR image cannot be drawn.
+fn phone_link(ui: &mut egui::Ui, highlighted: bool) -> egui::Response {
+    if highlighted {
+        let palette = theme::palette(ui);
+        ui.add(
+            egui::Button::new(RichText::new(PHONE_LINK).color(palette.on_accent))
+                .fill(palette.accent),
+        )
+    } else {
+        ui.add(egui::Button::new(RichText::new(PHONE_LINK).small().weak()).frame(false))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use eframe::egui::accesskit::Role;
@@ -206,7 +232,8 @@ mod tests {
     };
 
     use super::{
-        BAN_HEADING, BAN_WARN, PHONE_LINK, QR_EXPIRED, QR_NEW_CODE, QR_WARNING, SCAN_STEP,
+        BAN_HEADING, BAN_WARN, PHONE_LINK, QR_EXPIRED, QR_NEW_CODE, QR_TOO_LARGE, QR_WARNING,
+        SCAN_STEP,
     };
     use crate::app::pairing_qr::{self, QR_IMAGE_LABEL};
     use crate::app::theme;
@@ -463,5 +490,55 @@ mod tests {
         harness.get_by_label("1234-5678");
         assert!(harness.query_by_label(PAYLOAD).is_none());
         assert!(harness.query_by_label_contains("2@").is_none());
+    }
+
+    /// A payload that does not fit is not drawn as text. The phone link is
+    /// the filled button under "Cannot show this QR code."
+    #[test]
+    fn a_payload_that_does_not_fit_hides_the_text_and_highlights_the_phone_link() {
+        let mut payload = String::from("2@too-large-secret-");
+        payload.extend(std::iter::repeat_n('a', 8_000));
+        assert!(
+            pairing_qr::provisioning_qr_image(&payload).is_none(),
+            "the fixture does not fit in a QR code"
+        );
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(720.0, 1100.0))
+            .build_ui_state(draw_gate, PairUi::risk_gate());
+        harness.state_mut().show_payload(&payload);
+        harness.run_steps(2);
+
+        assert!(image_rects(&harness).is_empty(), "no QR image");
+        let message = harness.get_by_label(QR_TOO_LARGE).rect();
+        let link = harness
+            .get_by_role_and_label(Role::Button, PHONE_LINK)
+            .rect();
+        assert!(
+            link.top() + 1.0 >= message.bottom(),
+            "the phone link is under the message"
+        );
+        assert!(
+            harness.query_by_label(QR_WARNING).is_none(),
+            "the screenshot warning stays off"
+        );
+        assert!(harness.query_by_label(&payload).is_none());
+        assert!(
+            harness
+                .query_by_label_contains("2@too-large-secret")
+                .is_none()
+        );
+        assert!(harness.query_by_label_contains("show raw").is_none());
+        assert!(harness.query_by_label("Copy").is_none());
+
+        harness.state_mut().intents.clear();
+        harness
+            .get_by_role_and_label(Role::Button, PHONE_LINK)
+            .click();
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().intents,
+            vec![Intent::WhatsApp(WhatsAppIntent::LinkWithPhone)]
+        );
     }
 }
