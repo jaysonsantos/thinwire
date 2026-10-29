@@ -40,6 +40,72 @@ pub const SIGNAL_DEVICE_REMOVED: &str = "Signal removed this device. Link again"
 /// goes back to its normal line if that open succeeds or fails another way.
 pub const SIGNAL_LINK_CHECK: &str = "Checking Signal link…";
 
+/// A previous Signal number after you link a different number.
+/// The old account row and its open chat show this line. Sending stays off.
+/// The history stays on this computer. Signal has no supported third-party
+/// API. Expect breakage.
+pub const SIGNAL_PREVIOUS_ACCOUNT: &str =
+    "You linked a different number. This history stays. Sending is off.";
+
+/// Shown in the account list while old Signal history is on disk and its
+/// rows are not on screen. The rows come back after the next link.
+///
+/// Signal does not show an account phone number, and no phone number
+/// crosses the helper pipe, so this line names no digits.
+pub const SIGNAL_HISTORY_KEPT: &str =
+    "Old Signal history for the previous number is kept. It shows again after you link.";
+
+/// The helper is about to publish `retained/` again.
+/// The core drops the previous retained rows first, then the new rows arrive.
+/// This line is not a status of the live account.
+pub const SIGNAL_RETAINED_RESET: &str = "Signal is loading previous history.";
+
+/// The helper finished the retained publish for this link.
+/// The core drops a selected slot that was not published.
+/// This line is not a status of the live account.
+pub const SIGNAL_RETAINED_SETTLED: &str = "Signal finished loading previous history.";
+
+/// No previous account remains under `retained/`.
+/// The core clears the held line. This line is not a status of the live account.
+pub const SIGNAL_HISTORY_NOT_KEPT: &str = "No old Signal history is waiting.";
+
+/// Chat id prefix for a previous Signal account in `retained/`.
+/// The form is `retained:<slot>:<chat id>`. The slot is a count, not an
+/// account id. The helper writes the count when it moves a store aside.
+/// A later link keeps that count.
+const SIGNAL_RETAINED_MARK: &str = "retained:";
+
+/// Chat id for one chat of a previous Signal account.
+/// `slot` starts at 1. `chat_id` is the live chat id.
+#[must_use]
+pub fn signal_retained_chat_id(slot: u32, chat_id: &str) -> String {
+    format!("{SIGNAL_RETAINED_MARK}{slot}:{chat_id}")
+}
+
+/// The chat id inside a retained id, with the slot prefix removed.
+/// `None` for a live chat. The result is not an account id.
+#[must_use]
+pub fn signal_retained_chat(conversation_id: &str) -> Option<&str> {
+    signal_retained_slot(conversation_id)?;
+    let rest = conversation_id.strip_prefix(SIGNAL_RETAINED_MARK)?;
+    rest.split_once(':').map(|(_, chat)| chat)
+}
+
+/// The previous-account slot of `conversation_id`, when it has one.
+/// `None` for a live chat. The slot is not an account id.
+#[must_use]
+pub fn signal_retained_slot(conversation_id: &str) -> Option<u32> {
+    let rest = conversation_id.strip_prefix(SIGNAL_RETAINED_MARK)?;
+    let (slot, chat) = rest.split_once(':')?;
+    if chat.is_empty() || slot.is_empty() || slot.starts_with('+') {
+        return None;
+    }
+    if slot.len() > 1 && slot.starts_with('0') {
+        return None;
+    }
+    slot.parse().ok().filter(|slot| *slot > 0)
+}
+
 /// The capabilities of the client in the helper. The account row shows them
 /// also while no helper runs.
 const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
@@ -188,5 +254,41 @@ impl ProtocolAdapter for SignalAdapter {
                 reason: FEATURE_OFF,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_retained_chat_id_keeps_the_slot_and_the_chat() {
+        let group = "signal:group:abcd";
+        let id = signal_retained_chat_id(2, group);
+        assert_eq!(signal_retained_slot(&id), Some(2));
+        assert_eq!(signal_retained_chat(&id), Some(group));
+        assert!(id.ends_with(group));
+        assert_eq!(signal_retained_slot("ada"), None);
+        assert_eq!(signal_retained_chat("ada"), None);
+        assert_eq!(signal_retained_slot("retained:0:ada"), None);
+        assert_eq!(signal_retained_slot("retained:01:ada"), None);
+        assert!(
+            !SIGNAL_PREVIOUS_ACCOUNT
+                .to_ascii_lowercase()
+                .contains("reliable"),
+            "the row must not call Signal reliable"
+        );
+        assert!(SIGNAL_PREVIOUS_ACCOUNT.contains("Sending is off."));
+        assert!(
+            !SIGNAL_HISTORY_KEPT
+                .to_ascii_lowercase()
+                .contains("reliable"),
+            "the held line must not call Signal reliable"
+        );
+        assert!(SIGNAL_HISTORY_KEPT.contains("It shows again after you link."));
+        assert!(
+            !SIGNAL_HISTORY_KEPT.chars().any(|ch| ch.is_ascii_digit()),
+            "the held line has no phone number"
+        );
     }
 }

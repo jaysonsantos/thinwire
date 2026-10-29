@@ -7,7 +7,7 @@ use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
     AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, topic_mute_id,
+    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, SIGNAL_PREVIOUS_ACCOUNT, topic_mute_id,
 };
 
 use super::auth;
@@ -568,25 +568,31 @@ fn account_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         .show(ui, |ui| {
             section_header(ui, "Accounts");
 
-            let unread_by_protocol: Vec<u32> = snapshot
-                .accounts
-                .iter()
-                .map(|account| snapshot.account_unread(account.caps.id))
-                .collect();
             let mut clicked: Option<ProtocolId> = None;
-            for (account, unread) in snapshot.accounts.iter().zip(unread_by_protocol) {
+            for account in snapshot.accounts.iter() {
                 if !snapshot.shows_in_switcher(account.caps.id) {
                     continue;
                 }
+                // The old rows are hidden. The line under the list says why.
+                if account.signal_retained.is_some()
+                    && snapshot.signal_history_kept_line().is_some()
+                {
+                    continue;
+                }
+                let unread = snapshot.account_row_unread(account);
                 if account_chip(
                     ui,
                     snapshot,
                     account,
-                    snapshot.selected_protocol == account.caps.id,
+                    snapshot.account_row_selected(account),
                     unread,
                     out,
                 ) {
-                    clicked = Some(account.caps.id);
+                    if let Some(slot) = account.signal_retained {
+                        out.push(Intent::SelectRetainedSignal(slot));
+                    } else {
+                        clicked = Some(account.caps.id);
+                    }
                 }
                 helper_actions(ui, account, out);
                 removed_signal_link(ui, snapshot, account, out);
@@ -594,6 +600,12 @@ fn account_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
             }
             if let Some(protocol) = clicked {
                 out.push(Intent::SelectProtocol(protocol));
+            }
+            // The old rows are hidden. The line under the list says why.
+            if let Some(line) = snapshot.signal_history_kept_line() {
+                let palette = theme::palette(ui);
+                ui.label(RichText::new(line).small().color(palette.text2));
+                ui.add_space(4.0);
             }
         });
 }
@@ -684,8 +696,14 @@ fn account_chip(
     let unofficial = account.linked() && unofficial_notice(caps.id).is_some();
     // One line is the name. A helper line or Unofficial needs a second line.
     // The removed-device line wraps, so that row is taller.
+    // One previous Signal number uses the reason sentence, which wraps further.
     // [`theme::ROW_INSET`] adds 8 px above and below.
-    let lines = if detail == Some(SIGNAL_DEVICE_REMOVED) || unofficial {
+    let lines = if detail.as_deref() == Some(SIGNAL_PREVIOUS_ACCOUNT) {
+        68.0
+    } else if detail.as_deref() == Some(SIGNAL_DEVICE_REMOVED)
+        || unofficial
+        || account.signal_retained.is_some()
+    {
         52.0
     } else {
         36.0
@@ -694,7 +712,9 @@ fn account_chip(
         egui::vec2(width, lines + space::S * 2.0),
         egui::Sense::hover(),
     );
-    let chip_id = ui.scope_id().with(("account-chip", caps.id));
+    let chip_id = ui
+        .scope_id()
+        .with(("account-chip", caps.id, account.signal_retained));
     // The row click is under the Unofficial button, so that button takes its own click.
     let response = ui.interact(rect, chip_id, egui::Sense::click());
     row_backdrop(ui, chip_id, rect, selected, hover.hovered());
@@ -703,7 +723,7 @@ fn account_chip(
         egui::UiBuilder::new()
             .max_rect(inner)
             .layout(egui::Layout::left_to_right(egui::Align::Center))
-            .id_salt(("account-chip", caps.id)),
+            .id_salt(("account-chip", caps.id, account.signal_retained)),
     );
     let (dot, dot_response) =
         child.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
@@ -763,10 +783,11 @@ fn account_chip(
 }
 
 /// Extra line on the rail. The normal row is only the name, the status dot,
-/// and the unread badge. A helper fault and a removed Signal device stay,
-/// because the row is where Restart and Link are.
-fn rail_detail(snapshot: &Snapshot, account: &AccountRow) -> Option<&'static str> {
-    if account.helper_label().is_some()
+/// and the unread badge. A previous Signal account, a helper fault, and a
+/// removed Signal device stay, because the row is where Restart and Link are.
+fn rail_detail(snapshot: &Snapshot, account: &AccountRow) -> Option<String> {
+    if account.signal_retained.is_some()
+        || account.helper_label().is_some()
         || (account.caps.id == ProtocolId::Signal
             && (snapshot.signal_link_checking() || snapshot.signal_device_removed()))
     {
@@ -788,7 +809,10 @@ fn removed_signal_link(
     account: &AccountRow,
     out: &mut Vec<Intent>,
 ) {
-    if account.caps.id != ProtocolId::Signal || !snapshot.signal_device_removed() {
+    if account.signal_retained.is_some()
+        || account.caps.id != ProtocolId::Signal
+        || !snapshot.signal_device_removed()
+    {
         return;
     }
     ui.horizontal(|ui| {
@@ -1519,19 +1543,25 @@ fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
 
 /// Chip text. A compiled client reports Connecting at launch. That is
 /// "Not signed in" until a login or a resume starts.
+///
+/// One previous Signal account uses the reason sentence. Two or more use
+/// "Previous account N". N is the slot. It is not a phone number.
 #[must_use]
-fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
+fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> String {
     // The check is the first unauthorized open. Removal, and its Link
     // button, wait for the second one.
+    if let Some(slot) = account.signal_retained {
+        return snapshot.signal_retained_chip_label(slot);
+    }
     if account.caps.id == ProtocolId::Signal && snapshot.signal_link_checking() {
-        return SIGNAL_LINK_CHECK;
+        return SIGNAL_LINK_CHECK.to_owned();
     }
     if account.caps.id == ProtocolId::Signal && snapshot.signal_device_removed() {
-        return SIGNAL_DEVICE_REMOVED;
+        return SIGNAL_DEVICE_REMOVED.to_owned();
     }
     // The helper state wins: with no helper, the adapter status is old.
     if let Some(label) = account.helper_label() {
-        return label;
+        return label.to_owned();
     }
     let session_moving = snapshot.auth != AuthScreen::Idle
         || matches!(snapshot.center_view(), CenterView::Resuming { .. });
@@ -1540,7 +1570,7 @@ fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
         && !snapshot.telegram_ready()
         && !session_moving
     {
-        "Not signed in"
+        "Not signed in".to_owned()
     } else if account.linked()
         && matches!(
             account.status,
@@ -1548,9 +1578,9 @@ fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> &'static str {
         )
     {
         // Still signed in: an error status never unlinks (shell plan 11).
-        "Connection problem"
+        "Connection problem".to_owned()
     } else {
-        account_label(account.status)
+        account_label(account.status).to_owned()
     }
 }
 
@@ -1719,7 +1749,15 @@ fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<
 
 fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     thread_header(ui, snapshot, out);
-    if snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal {
+    if let Some(reason) = snapshot.signal_read_only_reason() {
+        let palette = theme::palette(ui);
+        ui.label(RichText::new(reason).color(palette.warn));
+        // The README risk line. The previous number stays read-only.
+        ui.label(
+            RichText::new("Signal: no supported third-party API, expect breakage.")
+                .color(palette.text2),
+        );
+    } else if snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal {
         let palette = theme::palette(ui);
         ui.label(RichText::new(SIGNAL_DEVICE_REMOVED).color(palette.warn));
         ui.label(RichText::new(thinwire_core::state::SIGNAL_SENDING_OFF).color(palette.text2));
@@ -2703,8 +2741,8 @@ fn compose(
     let closed = snapshot.topic_closed();
     // A closed topic already disables this field. Sending is off after the
     // phone removes the device, so the field uses that same switch.
-    let sending_off =
-        snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal;
+    let sending_off = snapshot.selected_protocol == ProtocolId::Signal
+        && (snapshot.signal_device_removed() || snapshot.signal_read_only_reason().is_some());
     let compose_open = !closed && !sending_off;
     if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
@@ -3816,6 +3854,130 @@ mod tests {
                 .next()
                 .is_none(),
             "Link waits for the second unauthorized open"
+        );
+    }
+
+    /// Two previous Signal numbers. The view marks the open row, blocks
+    /// sending, and labels each row by slot. The label has no phone number.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn previous_signal_rows_are_labeled_and_read_only() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{By, Queryable};
+        use thinwire_core::View;
+        use thinwire_core::secrets::SecretStore;
+        use thinwire_core::settings::Settings;
+        use thinwire_core::state::Snapshot;
+        use thinwire_core::state::test_support::show_only;
+        use thinwire_protocol::{
+            AccountState, AdapterEvent, Conversation, ProtocolId, SIGNAL_PREVIOUS_ACCOUNT,
+            signal_retained_chat_id,
+        };
+
+        use super::{Hints, chip_label, draw};
+        use crate::app::theme;
+
+        let store = SecretStore::memory();
+        let settings = Settings::in_memory();
+        let mut snapshot = Snapshot::new();
+        show_only(&mut snapshot, &[ProtocolId::Signal]);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        for (slot, name) in [(1u32, "ada"), (2, "bea")] {
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: Conversation {
+                    protocol: ProtocolId::Signal,
+                    id: signal_retained_chat_id(slot, name),
+                    title: name.into(),
+                    participant: name.into(),
+                    preview: String::new(),
+                    unread: 0,
+                    order: i64::from(slot),
+                    last_at: 0,
+                    is_group: false,
+                    writable: false,
+                    placeholder: false,
+                    muted: false,
+                    has_topics: false,
+                    avatar: Default::default(),
+                },
+            });
+        }
+        snapshot.select_retained_signal(1);
+        let view = View::from_parts(&snapshot, &store, &settings);
+        let slot_one = view
+            .accounts
+            .iter()
+            .find(|row| row.signal_retained == Some(1))
+            .expect("slot 1")
+            .clone();
+        let slot_two = view
+            .accounts
+            .iter()
+            .find(|row| row.signal_retained == Some(2))
+            .expect("slot 2")
+            .clone();
+        let live = view
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal && row.signal_retained.is_none())
+            .expect("live row")
+            .clone();
+        assert!(view.account_row_selected(&slot_one));
+        assert!(!view.account_row_selected(&slot_two));
+        assert!(!view.account_row_selected(&live));
+        assert_eq!(
+            view.signal_read_only_reason(),
+            Some(SIGNAL_PREVIOUS_ACCOUNT)
+        );
+        assert_eq!(chip_label(&snapshot, &slot_one), "Previous account 1");
+        assert_eq!(chip_label(&snapshot, &slot_two), "Previous account 2");
+        assert!(
+            !chip_label(&snapshot, &slot_one).contains('+')
+                && !chip_label(&snapshot, &slot_two).contains('-'),
+            "a chip has no phone number and no account id"
+        );
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 720.0))
+            .build_ui(|ui| {
+                theme::install(ui.ctx());
+                if !ui.style().text_styles.contains_key(&theme::row_title()) {
+                    return;
+                }
+                let view = View::from_parts(&snapshot, &store, &settings);
+                let mut hints = Hints::default();
+                let mut out = Vec::new();
+                draw(ui, &view, &mut hints, &mut out);
+            });
+        harness.run_steps(4);
+        for label in [
+            "Previous account 1",
+            "Previous account 2",
+            SIGNAL_PREVIOUS_ACCOUNT,
+        ] {
+            assert!(
+                harness
+                    .query_all(By::new().role(Role::Label).label(label).include_labels())
+                    .next()
+                    .is_some(),
+                "{label} is on screen"
+            );
+        }
+        assert!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Label)
+                        .label("Signal: no supported third-party API, expect breakage.")
+                        .include_labels(),
+                )
+                .next()
+                .is_some(),
+            "the open previous account keeps the Signal risk line"
         );
     }
 }
