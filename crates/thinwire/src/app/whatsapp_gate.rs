@@ -45,7 +45,7 @@ const BAN_HEADING: &str = "WhatsApp: unofficial, ban risk";
 const BAN_WARN: &str = "Unofficial linked-device pairing can get a personal account banned. This is not a supported messenger.";
 
 /// Shown directly under the QR image. The payload itself is not drawn.
-const QR_WARNING: &str = "Do not share a screenshot of this code. Anyone who scans it can link a device to your WhatsApp.";
+const QR_WARNING: &str = "Scan this code only with your own phone. It links this app to the WhatsApp account that scans it.";
 
 /// Opens the phone pair-code field. The ban gate stays accepted.
 const PHONE_LINK: &str = "Link with phone number instead";
