@@ -31,8 +31,7 @@ pub(super) const PAIR_THROTTLED: &str = "WhatsApp limited pair-code requests. Wa
 pub(super) const SEND_NETWORK: &str = "WhatsApp send failed: no connection. Nothing was sent. Try again when the status is connected.";
 pub(super) const SEND_UNLINKED: &str = "WhatsApp unlinked this device. Nothing was sent. Open the ban gate again to pair a new session.";
 pub(super) const SEND_REJECTED: &str = "WhatsApp did not accept the message. Nothing was sent.";
-pub(super) const QR_EXHAUSTED: &str =
-    "WhatsApp QR codes expired. Cancel, then start pairing again.";
+pub(super) const QR_EXHAUSTED: &str = thinwire_protocol::WHATSAPP_QR_EXHAUSTED;
 
 /// Boxed send future. Resolves to the server message id.
 pub(super) type SendFuture<'a> =

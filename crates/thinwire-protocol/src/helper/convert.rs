@@ -499,7 +499,7 @@ const fn account_from_wire(state: WireAccountState) -> AccountState {
 
 const fn delivery_to_wire(delivery: Delivery) -> WireDelivery {
     match delivery {
-        Delivery::Sent => WireDelivery::Sent,
+        Delivery::Sent | Delivery::Read => WireDelivery::Sent,
         Delivery::Pending => WireDelivery::Pending,
         Delivery::Failed => WireDelivery::Failed,
     }
@@ -599,6 +599,11 @@ mod tests {
     use super::*;
 
     const CHAT: &str = "whatsapp:111@s.whatsapp.net";
+
+    #[test]
+    fn a_read_receipt_crosses_the_pipe_as_sent() {
+        assert_eq!(delivery_to_wire(Delivery::Read), WireDelivery::Sent);
+    }
 
     fn message(protocol: ProtocolId) -> ChatMessage {
         ChatMessage {

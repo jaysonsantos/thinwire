@@ -23,12 +23,12 @@ mod whatsapp;
 pub use adapter::{
     APP_CLOSE_LIMIT, AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus,
     Arrival, ChatMessage, ChatTopic, Conversation, Delivery, DiscordAuthMode, EventTx, HelperFault,
-    HelperState, MessageTopic, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
+    HelperState, MessageTopic, OutgoingUpdate, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
     RedactedPairingSecret, StoreAccessReason, SupportClass, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, command_reads_session_key, emit_account,
     emit_chat_list_loaded, emit_conversation, emit_history_loaded, emit_message,
     emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
-    ordered_topics, topic_mute_id,
+    ordered_topics, outgoing_delivery, topic_mute_id, with_outbox_read,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -84,7 +84,8 @@ pub use telegram::{
     resolve_telegram_api, telegram_api_available,
 };
 pub use whatsapp::{
-    WHATSAPP_HELPER_PROGRAM, WhatsAppAdapter, WhatsAppPhoneVault, whatsapp_helper_adapter,
+    WHATSAPP_HELPER_PROGRAM, WHATSAPP_QR_EXHAUSTED, WhatsAppAdapter, WhatsAppPhoneVault,
+    whatsapp_helper_adapter,
 };
 
 /// Shell protocols in display order. Signal is hidden unless `signal-local` is on.

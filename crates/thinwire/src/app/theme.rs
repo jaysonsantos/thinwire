@@ -62,7 +62,7 @@ pub(crate) struct Palette {
     pub warn: Color32,
     /// Errors.
     pub error: Color32,
-    /// "Not sent" inside an outbound bubble.
+    /// "Not sent." inside an outbound bubble.
     pub out_error: Color32,
     /// Online dot and label.
     pub ok: Color32,

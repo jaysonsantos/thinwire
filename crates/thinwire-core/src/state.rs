@@ -10,7 +10,7 @@ use thinwire_protocol::{
     Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, MessageTopic,
     ProtocolCapabilities, ProtocolId, StoreAccessReason, TelegramApiSource, TelegramAuthError,
     TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, TelegramSecretVault, catalog,
-    ordered_topics, telegram_api_available, topic_mute_id,
+    ordered_topics, telegram_api_available, topic_mute_id, with_outbox_read,
 };
 
 use crate::mutes::{ChatMute, ChatMutes};
@@ -566,6 +566,9 @@ pub struct Snapshot {
     /// a late accept reclaims its own id and a newer send does not. One id for
     /// each request, kept only while the send tracker keeps that request.
     telegram_unbound_messages: Vec<TelegramQueuedId>,
+    /// Last outgoing message id the other party has read, per chat.
+    /// Telegram `last_read_outbox_message_id`. A later id does not move it back.
+    outbox_read: HashMap<(ProtocolId, String), i64>,
     pub compose: String,
     pub auth_busy: bool,
     /// One line above the active login form. Never holds a secret.
@@ -687,6 +690,11 @@ pub struct Snapshot {
     pub whatsapp_qr: Option<String>,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_pair_code: Option<String>,
+    /// The helper reported that the pairing QR codes are used up. The pair
+    /// screen hides the image and offers a new code. `Unlinked` follows that
+    /// report, and the flag stays. A new code or a new payload clears it.
+    #[cfg(feature = "whatsapp-web")]
+    pub whatsapp_qr_exhausted: bool,
     #[cfg(feature = "whatsapp-web")]
     pub whatsapp_started: bool,
     /// The user accepted the full-screen ban gate in this session. Pairing
@@ -756,7 +764,8 @@ impl std::fmt::Debug for Snapshot {
             .field("pending_commands", &self.pending.len());
         #[cfg(feature = "whatsapp-web")]
         out.field("whatsapp_screen", &self.whatsapp_screen)
-            .field("whatsapp_started", &self.whatsapp_started);
+            .field("whatsapp_started", &self.whatsapp_started)
+            .field("whatsapp_qr_exhausted", &self.whatsapp_qr_exhausted);
         #[cfg(feature = "signal-local")]
         out.field("signal_screen", &self.signal_screen)
             .field("signal_started", &self.signal_started)
@@ -797,6 +806,8 @@ struct TelegramHold {
     chat: String,
     at: Instant,
     message_id: Option<String>,
+    /// A retry. The row already shows "Sending…", so the status line does not.
+    retry: bool,
 }
 
 /// A pending Telegram message id waiting for its own `SendAccepted`.
@@ -869,6 +880,7 @@ impl Snapshot {
             failure_status: None,
             telegram_send_unconfirmed: Vec::new(),
             telegram_unbound_messages: Vec::new(),
+            outbox_read: HashMap::new(),
             compose: String::new(),
             auth_busy: false,
             auth_notice: None,
@@ -926,6 +938,8 @@ impl Snapshot {
             whatsapp_qr: None,
             #[cfg(feature = "whatsapp-web")]
             whatsapp_pair_code: None,
+            #[cfg(feature = "whatsapp-web")]
+            whatsapp_qr_exhausted: false,
             #[cfg(feature = "whatsapp-web")]
             whatsapp_started: false,
             #[cfg(feature = "whatsapp-web")]
@@ -1009,6 +1023,17 @@ impl Snapshot {
                     // its own flag, set below, and does not keep this one.
                     self.signal_checking = detail == thinwire_protocol::SIGNAL_LINK_CHECK;
                 }
+                #[cfg(feature = "whatsapp-web")]
+                if protocol == ProtocolId::WhatsApp
+                    && status == AdapterStatus::Error
+                    && detail == thinwire_protocol::WHATSAPP_QR_EXHAUSTED
+                    && self.whatsapp_started
+                {
+                    // The codes are used up. Drop the payload so the pair
+                    // screen cannot draw it, and show the expired notice.
+                    self.whatsapp_qr_exhausted = true;
+                    self.whatsapp_qr = None;
+                }
                 if matches!(status, AdapterStatus::Error | AdapterStatus::Refused) {
                     // A failed load does not send its end event. Stop the spinners.
                     self.stop_spinners(protocol, None);
@@ -1087,10 +1112,17 @@ impl Snapshot {
                 delivery,
             } => {
                 self.set_delivery(protocol, &conversation_id, &message_id, delivery);
-                if protocol == ProtocolId::Telegram && delivery == Delivery::Sent {
+                if protocol == ProtocolId::Telegram
+                    && matches!(delivery, Delivery::Sent | Delivery::Read | Delivery::Failed)
+                {
                     self.release_telegram_for_message(&message_id);
                 }
             }
+            AdapterEvent::OutboxRead {
+                protocol,
+                conversation_id,
+                last_read_message_id,
+            } => self.note_outbox_read(protocol, &conversation_id, last_read_message_id),
             AdapterEvent::SendAccepted {
                 protocol,
                 conversation_id,
@@ -1267,6 +1299,7 @@ impl Snapshot {
                 #[cfg(feature = "whatsapp-web")]
                 if self.current_pairing(ProtocolId::WhatsApp, generation) {
                     self.whatsapp_qr = Some(code.reveal().to_string());
+                    self.whatsapp_qr_exhausted = false;
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
@@ -1966,11 +1999,16 @@ impl Snapshot {
             // F1 (#82): older pages of this protocol only, keyed by
             // (protocol, chat, topic).
             Some(LOADING_OLDER_STATUS)
-        } else if self.sends.any_for(protocol)
-            || (protocol == ProtocolId::Telegram && !self.telegram_send_unconfirmed.is_empty())
+        } else if self.sends.compose_in_flight(protocol)
+            || (protocol == ProtocolId::Telegram
+                && self
+                    .telegram_send_unconfirmed
+                    .iter()
+                    .any(|hold| !hold.retry))
         {
-            // Telegram's accept is not the end of the send. The strip stays
-            // on Sending… until the sent or failed row of that send arrives.
+            // Telegram's accept is not the end of a compose send. The strip
+            // stays on Sending… until that row is sent or failed. A retry
+            // already shows "Sending…" on its row, so the strip stays quiet.
             Some(SENDING_STATUS)
         } else {
             None
@@ -2398,11 +2436,11 @@ impl Snapshot {
             Some(Pending::Send { body, topic, .. }) => {
                 self.drop_rejected_body(protocol, chat);
                 self.clear_sent_text(protocol, chat, topic, &body);
-                self.hold_telegram_send_line(protocol, chat, request);
+                self.hold_telegram_send_line(protocol, chat, request, false);
             }
             Some(Pending::Retry { .. }) => {
                 self.drop_rejected_body(protocol, chat);
-                self.hold_telegram_send_line(protocol, chat, request);
+                self.hold_telegram_send_line(protocol, chat, request, true);
             }
             None => self.note_late_accept(protocol, chat, request),
         }
@@ -2416,6 +2454,7 @@ impl Snapshot {
         let Some(pending) = self.sends.settle_expired(protocol, chat, request) else {
             return;
         };
+        let retry = matches!(pending, Pending::Retry { .. });
         self.drop_rejected_body(protocol, chat);
         match pending {
             Pending::Send { body, topic, .. } => self.clear_sent_text(protocol, chat, topic, &body),
@@ -2433,7 +2472,7 @@ impl Snapshot {
         if shown {
             self.show_timeouts();
         }
-        self.hold_telegram_send_line(protocol, chat, request);
+        self.hold_telegram_send_line(protocol, chat, request, retry);
     }
 
     /// Set the timeout error from `timed_out`: one line per expired send, or
@@ -2858,7 +2897,13 @@ impl Snapshot {
     }
 
     /// Telegram's accept is not its finished line. Hold that request until it ends.
-    fn hold_telegram_send_line(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
+    fn hold_telegram_send_line(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        request: u64,
+        retry: bool,
+    ) {
         if protocol != ProtocolId::Telegram {
             return;
         }
@@ -2872,6 +2917,7 @@ impl Snapshot {
             chat: chat.to_owned(),
             at: Instant::now(),
             message_id,
+            retry,
         });
     }
 
@@ -2968,7 +3014,7 @@ impl Snapshot {
                     self.note_telegram_pending(message);
                 }
             }
-            Delivery::Sent | Delivery::Failed => {
+            Delivery::Sent | Delivery::Read | Delivery::Failed => {
                 if let Some(old_id) = replaced {
                     self.release_telegram_for_message(old_id);
                 }
@@ -3615,6 +3661,7 @@ impl Snapshot {
     /// helper starts again, the pair screen drops it: the new helper sends a
     /// new one for the same pairing. When the helper stopped for good, the
     /// pairing ends, so the user can start it again from the pair screen.
+    /// Codes that are used up keep the expired screen.
     #[cfg(feature = "whatsapp-web")]
     fn note_whatsapp_helper(&mut self, state: HelperState) {
         match state {
@@ -3622,10 +3669,7 @@ impl Snapshot {
                 self.whatsapp_qr = None;
                 self.whatsapp_pair_code = None;
             }
-            HelperState::Stopped(_) | HelperState::Missing => {
-                self.end_pairing();
-                self.whatsapp_started = false;
-            }
+            HelperState::Stopped(_) | HelperState::Missing => self.stop_whatsapp_pairing(),
             HelperState::Idle | HelperState::Busy | HelperState::Running => {}
         }
     }
@@ -3885,6 +3929,7 @@ impl Snapshot {
             self.drafts.insert((protocol, chat, topic), body);
         }
         self.messages.retain(|(owner, _, _), _| *owner != protocol);
+        self.outbox_read.retain(|(owner, _), _| *owner != protocol);
         self.topics.retain(|(owner, _), _| *owner != protocol);
         if self.selected_protocol == protocol {
             self.selected_topic = None;
@@ -3913,11 +3958,10 @@ impl Snapshot {
         self.end_telegram_send(protocol, TelegramSendEnd::All);
         #[cfg(feature = "whatsapp-web")]
         if protocol == ProtocolId::WhatsApp {
-            self.end_pairing();
             // The adapter ended the pairing itself (a pair code that
-            // failed, no QR left, a ban). No pairing runs, so the pair
-            // screen can start a new one.
-            self.whatsapp_started = false;
+            // failed, or a ban). QR codes that ran out keep the expired
+            // screen: `Unlinked` follows that status.
+            self.stop_whatsapp_pairing();
         }
         #[cfg(feature = "signal-local")]
         if protocol == ProtocolId::Signal {
@@ -4006,6 +4050,7 @@ impl Snapshot {
         }
         self.messages
             .retain(|key, _| !(key.0 == protocol && key.1 == id));
+        self.outbox_read.remove(&(protocol, id.to_owned()));
         self.topics.remove(&(protocol, id.to_owned()));
         // Every removed chat loses its draft, selected or not (#43).
         self.drafts
@@ -4109,6 +4154,10 @@ impl Snapshot {
         delivery: Delivery,
     ) {
         let before = self.delivery_of(protocol, conversation_id, message_id);
+        let last_read = self
+            .outbox_read
+            .get(&(protocol, conversation_id.to_owned()))
+            .copied();
         let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
             return;
         };
@@ -4120,8 +4169,90 @@ impl Snapshot {
             return;
         };
         message.delivery = delivery;
+        // Incoming and outgoing Telegram rows share one id space. The cursor
+        // marks only a row this account sent.
+        if message.outbound
+            && let Some(last_read) = last_read
+            && let Some(id) = Self::message_number(&message.id)
+        {
+            message.delivery = with_outbox_read(message.delivery, id, last_read);
+        }
         let message = message.clone();
         self.note_delivery(before, &message);
+    }
+
+    /// The numeric id at the end of `telegram:<chat>:<id>`. Other id shapes
+    /// are not a Telegram message id.
+    fn message_number(id: &str) -> Option<i64> {
+        let number = id.rsplit_once(':')?.1;
+        if number.is_empty() || number.starts_with('+') {
+            return None;
+        }
+        number.parse().ok()
+    }
+
+    /// Raise the read cursor and mark outgoing rows the other party has read.
+    /// An incoming row keeps its delivery.
+    fn note_outbox_read(&mut self, protocol: ProtocolId, conversation_id: &str, last_read: i64) {
+        let key = (protocol, conversation_id.to_owned());
+        let last = {
+            let stored = self.outbox_read.entry(key).or_insert(0);
+            if last_read > *stored {
+                *stored = last_read;
+            }
+            *stored
+        };
+        let keys: Vec<_> = self
+            .messages
+            .keys()
+            .filter(|key| key.0 == protocol && key.1 == conversation_id)
+            .cloned()
+            .collect();
+        let mut read = Vec::new();
+        for key in keys {
+            let Some(list) = self.messages.get_mut(&key) else {
+                continue;
+            };
+            for message in list.iter_mut() {
+                if !message.outbound {
+                    continue;
+                }
+                let Some(id) = Self::message_number(&message.id) else {
+                    continue;
+                };
+                let next = with_outbox_read(message.delivery, id, last);
+                if next != message.delivery {
+                    message.delivery = next;
+                    if next == Delivery::Read {
+                        read.push(message.id.clone());
+                    }
+                }
+            }
+        }
+        if protocol == ProtocolId::Telegram {
+            for id in read {
+                self.release_telegram_for_message(&id);
+            }
+        }
+    }
+
+    /// A sent outbound row the other party has already read shows read.
+    /// An incoming row keeps its delivery.
+    fn apply_outbox_cursor(&self, message: &mut ChatMessage) {
+        if !message.outbound {
+            return;
+        }
+        let Some(last) = self
+            .outbox_read
+            .get(&(message.protocol, message.conversation_id.clone()))
+            .copied()
+        else {
+            return;
+        };
+        let Some(id) = Self::message_number(&message.id) else {
+            return;
+        };
+        message.delivery = with_outbox_read(message.delivery, id, last);
     }
 
     /// A send that was pending and now failed: show the error block and keep the text.
@@ -4212,7 +4343,8 @@ impl Snapshot {
         })
     }
 
-    fn upsert_message(&mut self, message: ChatMessage) {
+    fn upsert_message(&mut self, mut message: ChatMessage) {
+        self.apply_outbox_cursor(&mut message);
         let key = thread_key(message.protocol, &message.conversation_id, message.topic);
         let list = self.messages.entry(key).or_default();
         if let Some(existing) = list.iter_mut().find(|row| row.id == message.id) {
@@ -4560,7 +4692,10 @@ impl Snapshot {
             tracing::warn!("whatsapp pairing dropped: the risk gate was not accepted");
             return;
         }
-        if self.whatsapp_started {
+        // A pairing that already runs stays as it is. The exception is an
+        // exhausted QR: "Get new code" starts a new pairing generation.
+        let fresh = !self.whatsapp_started;
+        if self.whatsapp_started && !self.whatsapp_qr_exhausted {
             return;
         }
         // The helper program can go away while the pair screen is open. No
@@ -4571,14 +4706,21 @@ impl Snapshot {
         }
         // A phone number has 15 digits at most. A longer text is not one,
         // and it must not go to the helper. The text stays, so the user can
-        // correct it.
-        if self.whatsapp_phone.chars().count() > WHATSAPP_PHONE_MAX_CHARS {
-            self.whatsapp_phone_note = Some(WHATSAPP_PHONE_TOO_LONG);
-            return;
+        // correct it. A restart keeps the number already in the vault: the
+        // field was cleared on the first start, and writing it again would
+        // replace that number with an empty field.
+        if fresh {
+            if self.whatsapp_phone.chars().count() > WHATSAPP_PHONE_MAX_CHARS {
+                self.whatsapp_phone_note = Some(WHATSAPP_PHONE_TOO_LONG);
+                return;
+            }
+            self.whatsapp_phone_note = None;
+            phone.set_phone(&self.whatsapp_phone);
+            self.whatsapp_phone.clear();
         }
-        self.whatsapp_phone_note = None;
-        phone.set_phone(&self.whatsapp_phone);
-        self.whatsapp_phone.clear();
+        self.whatsapp_qr_exhausted = false;
+        self.whatsapp_qr = None;
+        self.whatsapp_pair_code = None;
         self.whatsapp_started = true;
         self.error = None;
         self.status_text = "WhatsApp pairing requested.".into();
@@ -4588,6 +4730,40 @@ impl Snapshot {
             .insert(ProtocolId::WhatsApp, generation);
         self.pending
             .push(AdapterCommand::WhatsAppBeginLink { generation });
+    }
+
+    /// Leave the QR and open the phone pair-code field.
+    ///
+    /// The pair screen stays open and the ban gate stays accepted. A pairing
+    /// that is running stops, so the phone field can start a new one.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn open_whatsapp_phone_link(&mut self, phone: &WhatsAppPhoneVault) {
+        if self.whatsapp_screen != WhatsAppScreen::Pair || !self.whatsapp_risk_acknowledged {
+            tracing::warn!("whatsapp phone link dropped: the risk gate was not accepted");
+            return;
+        }
+        if self.helper_missing(ProtocolId::WhatsApp) {
+            return;
+        }
+        if self.whatsapp_started {
+            self.pending.push(AdapterCommand::WhatsAppCancelLink);
+        }
+        phone.clear();
+        self.end_pairing();
+        self.whatsapp_started = false;
+        self.whatsapp_phone.clear();
+        self.whatsapp_phone_note = None;
+    }
+
+    /// The shell id of the WhatsApp pairing that runs now. `0` when none runs.
+    /// The pair screen caches the QR image under this id.
+    #[cfg(feature = "whatsapp-web")]
+    #[must_use]
+    pub fn whatsapp_pairing_generation(&self) -> u64 {
+        self.pairing_generation
+            .get(&ProtocolId::WhatsApp)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// WhatsApp linked (`Account { Linked }`): close the pair screen the user
@@ -4603,6 +4779,23 @@ impl Snapshot {
         self.whatsapp_phone.clear();
     }
 
+    /// The pairing stopped. Drop its QR and its pair code.
+    ///
+    /// When the QR codes are used up, the expired screen stays.
+    /// `whatsapp_started` stays true, so Get new code does not write the
+    /// empty phone field over the vault number. Any other stop enables
+    /// Start again.
+    #[cfg(feature = "whatsapp-web")]
+    fn stop_whatsapp_pairing(&mut self) {
+        let exhausted = self.whatsapp_qr_exhausted;
+        self.end_pairing();
+        if exhausted {
+            self.whatsapp_qr_exhausted = true;
+        } else {
+            self.whatsapp_started = false;
+        }
+    }
+
     /// No pairing runs any more: drop the shown QR and pair code, and every
     /// later payload of the old pairing.
     #[cfg(feature = "whatsapp-web")]
@@ -4610,6 +4803,7 @@ impl Snapshot {
         self.pairing_generation.remove(&ProtocolId::WhatsApp);
         self.whatsapp_qr = None;
         self.whatsapp_pair_code = None;
+        self.whatsapp_qr_exhausted = false;
     }
 
     /// A pairing payload belongs to the pairing of `protocol` that runs now.
@@ -4814,6 +5008,17 @@ impl Snapshot {
             .insert(ProtocolId::Signal, generation);
         self.pending
             .push(AdapterCommand::SignalBeginLink { generation });
+    }
+
+    /// The shell id of the Signal link that runs now. `0` when none runs.
+    /// The link screen caches the QR image under this id.
+    #[cfg(feature = "signal-local")]
+    #[must_use]
+    pub fn signal_pairing_generation(&self) -> u64 {
+        self.pairing_generation
+            .get(&ProtocolId::Signal)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Leave the link screen after `Account { Linked }`. The worker stays up.
@@ -5858,9 +6063,10 @@ mod tests {
     }
 
     /// PR #256 review: the adapter ends a pairing itself (`Linking`, then
-    /// `Unlinked`: a pair code that failed, no QR left, a ban), and the
-    /// helper stays `Running`. The pair screen stays open, the old QR goes,
-    /// and Start is enabled again. A new start sends a new pairing.
+    /// `Unlinked`: a pair code that failed, or a ban), and the helper stays
+    /// `Running`. The pair screen stays open, the old QR goes, and Start is
+    /// enabled again. A new start sends a new pairing. QR codes that ran out
+    /// are a different end: the expired screen stays.
     #[cfg(feature = "whatsapp-web")]
     #[test]
     fn a_pairing_that_the_adapter_ended_enables_start_again() {
@@ -5966,6 +6172,218 @@ mod tests {
         helper(&mut snapshot, HelperState::Idle);
         snapshot.begin_whatsapp_link(&phone);
         assert!(snapshot.whatsapp_started);
+        assert!(matches!(
+            snapshot.take_commands().as_slice(),
+            [AdapterCommand::WhatsAppBeginLink { .. }]
+        ));
+    }
+
+    /// Pairing QR codes run out (`PairingQrCodesExhausted`). The payload
+    /// leaves the snapshot. A new code starts a new pairing and keeps the
+    /// phone already in the vault. A second start while the code is valid
+    /// does nothing.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn an_exhausted_qr_drops_the_payload_and_a_new_code_starts_again() {
+        use thinwire_protocol::WHATSAPP_QR_EXHAUSTED;
+
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.set_whatsapp_phone("15550100".into());
+        snapshot.begin_whatsapp_link(&phone);
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::WhatsAppBeginLink { generation }) = commands.last() else {
+            panic!("no pairing start: {commands:?}");
+        };
+        let first = *generation;
+        assert_eq!(phone.phone().as_deref(), Some("15550100"));
+        let payload = "2@one-line\n2@same-payload";
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new(payload),
+            generation: first,
+        });
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some(payload));
+        assert!(
+            !format!("{snapshot:?}").contains(payload),
+            "debug output has no payload"
+        );
+        assert!(!snapshot.whatsapp_qr_exhausted);
+
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "a second start while the code is valid does nothing"
+        );
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::WhatsApp,
+            status: AdapterStatus::Error,
+            detail: "some other failure".into(),
+        });
+        assert!(!snapshot.whatsapp_qr_exhausted);
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some(payload));
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::WhatsApp,
+            status: AdapterStatus::Error,
+            detail: WHATSAPP_QR_EXHAUSTED.into(),
+        });
+        assert!(snapshot.whatsapp_qr_exhausted);
+        assert_eq!(
+            snapshot.whatsapp_qr, None,
+            "the expired payload is not shown"
+        );
+        assert!(snapshot.whatsapp_started, "the pair screen stays open");
+        assert!(!format!("{snapshot:?}").contains(payload));
+
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(!snapshot.whatsapp_qr_exhausted);
+        assert_eq!(
+            phone.phone().as_deref(),
+            Some("15550100"),
+            "the vault keeps the number"
+        );
+        let commands = snapshot.take_commands();
+        let [AdapterCommand::WhatsAppBeginLink { generation }] = commands.as_slice() else {
+            panic!("no new pairing: {commands:?}");
+        };
+        assert_ne!(*generation, first, "the new code is a new pairing");
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("2@old"),
+            generation: first,
+        });
+        assert_eq!(
+            snapshot.whatsapp_qr, None,
+            "the old pairing does not return"
+        );
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("2@new"),
+            generation: *generation,
+        });
+        assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("2@new"));
+        assert!(!snapshot.whatsapp_qr_exhausted);
+    }
+
+    /// The helper sends `Status` for used-up QR codes, then `Account`
+    /// `Unlinked`, while the row is `Linking`. The expired screen stays.
+    /// Get new code starts a new pairing and keeps the vault number.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn an_unlinked_account_keeps_the_expired_qr_screen() {
+        use thinwire_protocol::WHATSAPP_QR_EXHAUSTED;
+
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.set_whatsapp_phone("15550100".into());
+        snapshot.begin_whatsapp_link(&phone);
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::WhatsAppBeginLink { generation }) = commands.last() else {
+            panic!("no pairing start: {commands:?}");
+        };
+        let first = *generation;
+        let account = |state| AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state,
+        };
+        snapshot.apply(account(AccountState::Linking));
+        let payload = "2@one-line\n2@same-payload";
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new(payload),
+            generation: first,
+        });
+
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::WhatsApp,
+            status: AdapterStatus::Error,
+            detail: WHATSAPP_QR_EXHAUSTED.into(),
+        });
+        snapshot.apply(account(AccountState::Unlinked));
+
+        assert!(snapshot.whatsapp_qr_exhausted, "the expired screen stays");
+        assert!(
+            snapshot.whatsapp_started,
+            "Get new code does not start from an empty field"
+        );
+        assert_eq!(snapshot.whatsapp_qr, None, "the payload is dropped");
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        assert!(snapshot.whatsapp_phone.is_empty());
+        assert_eq!(phone.phone().as_deref(), Some("15550100"));
+        assert!(!format!("{snapshot:?}").contains(payload));
+
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(!snapshot.whatsapp_qr_exhausted);
+        assert_eq!(
+            phone.phone().as_deref(),
+            Some("15550100"),
+            "the vault keeps the number"
+        );
+        let commands = snapshot.take_commands();
+        let [AdapterCommand::WhatsAppBeginLink { generation }] = commands.as_slice() else {
+            panic!("no new pairing: {commands:?}");
+        };
+        assert_ne!(*generation, first, "Get new code is a new pairing");
+        snapshot.apply(AdapterEvent::WhatsAppQr {
+            code: thinwire_protocol::RedactedPairingSecret::new("2@old"),
+            generation: first,
+        });
+        assert_eq!(
+            snapshot.whatsapp_qr, None,
+            "the old pairing does not return"
+        );
+    }
+
+    /// The helper stops while the codes are used up. The expired screen
+    /// stays, and Get new code does not write the empty phone field over
+    /// the vault number.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_stopped_helper_keeps_the_expired_qr_screen_and_the_phone() {
+        use thinwire_protocol::WHATSAPP_QR_EXHAUSTED;
+
+        let phone = WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.set_whatsapp_phone("15550100".into());
+        snapshot.begin_whatsapp_link(&phone);
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linking,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::WhatsApp,
+            status: AdapterStatus::Error,
+            detail: WHATSAPP_QR_EXHAUSTED.into(),
+        });
+        assert!(snapshot.whatsapp_qr_exhausted);
+        assert!(snapshot.whatsapp_started);
+        assert!(snapshot.whatsapp_phone.is_empty());
+
+        helper(&mut snapshot, HelperState::Stopped(HelperFault::Crashed));
+        assert!(
+            snapshot.whatsapp_qr_exhausted,
+            "the expired screen stays after the helper stops"
+        );
+        assert!(
+            snapshot.whatsapp_started,
+            "Start stays off, so the empty field is not sent"
+        );
+        assert_eq!(snapshot.whatsapp_qr, None);
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        assert_eq!(phone.phone().as_deref(), Some("15550100"));
+
+        snapshot.begin_whatsapp_link(&phone);
+        assert!(!snapshot.whatsapp_qr_exhausted);
+        assert_eq!(
+            phone.phone().as_deref(),
+            Some("15550100"),
+            "Get new code keeps the vault number"
+        );
         assert!(matches!(
             snapshot.take_commands().as_slice(),
             [AdapterCommand::WhatsAppBeginLink { .. }]
@@ -8081,6 +8499,326 @@ mod tests {
         assert_eq!(messages[0].id, "telegram:1:200");
         assert_eq!(messages[0].delivery, Delivery::Sent);
         assert!(snapshot.error.is_none());
+    }
+
+    /// Defensive. `td_api.tl` calls the succeeded message the sent message.
+    /// Main maps a null `sending_state` to `Sent`. This case is the extra
+    /// path: the succeeded object is still pending, and the update still wins.
+    #[test]
+    fn an_outgoing_telegram_message_follows_the_tdlib_send_sequence() {
+        use thinwire_protocol::{OutgoingUpdate, outgoing_delivery};
+
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let _request = pending_telegram_send(&mut snapshot, 1, 100, "hi");
+        assert_eq!(snapshot.status_line(), SENDING_STATUS, "pending");
+        let pending = snapshot
+            .selected_messages()
+            .iter()
+            .find(|row| row.body == "hi")
+            .expect("pending row");
+        assert_eq!(pending.id, "telegram:1:100", "pending");
+        assert_eq!(pending.delivery, Delivery::Pending, "pending");
+        // updateMessageSendAcknowledged does not replace the temporary id.
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .filter(|row| row.body == "hi")
+                .count(),
+            1,
+            "acknowledged"
+        );
+
+        // Defensive fixture: sending_state is still Pending on the succeeded message.
+        let server = 1_048_576;
+        let delivery = outgoing_delivery(
+            OutgoingUpdate::Succeeded,
+            Delivery::Pending,
+            true,
+            server,
+            0,
+        );
+        assert_eq!(delivery, Delivery::Sent, "succeeded");
+        snapshot.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing(1, server, "hi", delivery),
+        });
+        let hi: Vec<_> = snapshot
+            .selected_messages()
+            .iter()
+            .filter(|row| row.body == "hi")
+            .collect();
+        assert_eq!(hi.len(), 1, "the temporary id is not a second row");
+        assert_eq!(hi[0].id, format!("telegram:1:{server}"));
+        assert_eq!(hi[0].delivery, Delivery::Sent);
+        assert!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .all(|row| row.id != "telegram:1:100")
+        );
+        assert_ne!(snapshot.status_line(), SENDING_STATUS, "succeeded");
+
+        snapshot.apply(AdapterEvent::OutboxRead {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            last_read_message_id: server,
+        });
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.body == "hi")
+                .map(|row| row.delivery),
+            Some(Delivery::Read),
+            "read outbox"
+        );
+
+        // A chat load carries the same cursor. A later sent id stays sent.
+        // A pending local id below the cursor stays pending.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 20, "old", Delivery::Sent),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, server + 1_048_576, "newer", Delivery::Sent),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 7, "still sending", Delivery::Pending),
+        });
+        let by_id = |id: i64| {
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.id == format!("telegram:1:{id}"))
+                .map(|row| row.delivery)
+        };
+        assert_eq!(by_id(20), Some(Delivery::Read), "read outbox");
+        assert_eq!(
+            by_id(server + 1_048_576),
+            Some(Delivery::Sent),
+            "read outbox"
+        );
+        assert_eq!(by_id(7), Some(Delivery::Pending), "read outbox");
+    }
+
+    /// Incoming and outgoing Telegram rows share one message id space.
+    /// The outbox cursor marks only an outbound row as Read.
+    #[test]
+    fn an_outbox_cursor_does_not_mark_an_incoming_row_read() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let cursor = 50;
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: telegram_text(1, 10, "from Ada"),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 20, "to Ada", Delivery::Sent),
+        });
+        snapshot.apply(AdapterEvent::OutboxRead {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            last_read_message_id: cursor,
+        });
+        let delivery = |snapshot: &Snapshot, id: i64| {
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.id == format!("telegram:1:{id}"))
+                .map(|row| row.delivery)
+        };
+        assert_eq!(
+            delivery(&snapshot, 10),
+            Some(Delivery::Sent),
+            "an incoming row already loaded stays sent"
+        );
+        assert_eq!(
+            delivery(&snapshot, 20),
+            Some(Delivery::Read),
+            "an outbound row already loaded becomes read"
+        );
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: telegram_text(1, 30, "later from Ada"),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 40, "later to Ada", Delivery::Sent),
+        });
+        assert_eq!(
+            delivery(&snapshot, 30),
+            Some(Delivery::Sent),
+            "an incoming row loaded after the cursor stays sent"
+        );
+        assert_eq!(
+            delivery(&snapshot, 40),
+            Some(Delivery::Read),
+            "an outbound row loaded after the cursor becomes read"
+        );
+
+        // A delivery update uses the same rule.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                delivery: Delivery::Pending,
+                ..telegram_text(1, 12, "from Ada pending")
+            },
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 14, "to Ada pending", Delivery::Pending),
+        });
+        snapshot.apply(AdapterEvent::MessageDelivery {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:12".into(),
+            delivery: Delivery::Sent,
+        });
+        snapshot.apply(AdapterEvent::MessageDelivery {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:14".into(),
+            delivery: Delivery::Sent,
+        });
+        assert_eq!(
+            delivery(&snapshot, 12),
+            Some(Delivery::Sent),
+            "an incoming delivery update stays sent"
+        );
+        assert_eq!(
+            delivery(&snapshot, 14),
+            Some(Delivery::Read),
+            "an outbound delivery update becomes read"
+        );
+    }
+
+    /// Defensive. Main maps `messageSendingStateFailed` to `Failed`.
+    /// This case still checks a pending object on `updateMessageSendFailed`.
+    #[test]
+    fn a_failed_telegram_send_shows_not_sent_and_queues_retry() {
+        use thinwire_protocol::{OutgoingUpdate, outgoing_delivery};
+
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let _request = pending_telegram_send(&mut snapshot, 1, 100, "hi");
+        // Defensive fixture: sending_state is still Pending on the failed message.
+        let delivery = outgoing_delivery(OutgoingUpdate::Failed, Delivery::Pending, true, 101, 0);
+        assert_eq!(delivery, Delivery::Failed, "failed");
+        snapshot.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing(1, 101, "hi", delivery),
+        });
+        assert_eq!(snapshot.selected_messages().len(), 1);
+        assert_eq!(snapshot.selected_messages()[0].id, "telegram:1:101");
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Failed);
+        assert_ne!(snapshot.status_line(), SENDING_STATUS);
+
+        snapshot.retry_send("telegram:1:101");
+        let commands = snapshot.take_commands();
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(
+            &commands[0],
+            AdapterCommand::ResendMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                message_id,
+                ..
+            } if conversation_id == "telegram:1" && message_id == "telegram:1:101"
+        ));
+        assert_eq!(snapshot.selected_messages()[0].delivery, Delivery::Pending);
+    }
+
+    /// The payload `td_api.tl` describes. `updateMessageSendSucceeded.message`
+    /// is the sent message: `sending_state` is null, which main maps to
+    /// `Sent`. `updateMessageSendFailed.message` has a failed sending state,
+    /// which main maps to `Failed`.
+    #[test]
+    fn a_null_sending_state_on_success_replaces_the_pending_row() {
+        use thinwire_protocol::{OutgoingUpdate, outgoing_delivery};
+
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let _request = pending_telegram_send(&mut snapshot, 1, 100, "hi");
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.body == "hi")
+                .map(|row| row.delivery),
+            Some(Delivery::Pending),
+            "pending"
+        );
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .filter(|row| row.body == "hi")
+                .count(),
+            1,
+            "acknowledged"
+        );
+
+        let server = 1_048_576;
+        // sending_state = null.
+        let delivery =
+            outgoing_delivery(OutgoingUpdate::Succeeded, Delivery::Sent, true, server, 0);
+        assert_eq!(delivery, Delivery::Sent, "succeeded");
+        snapshot.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing(1, server, "hi", delivery),
+        });
+        // The chat's last message is the same server message, still null.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, server, "hi", Delivery::Sent),
+        });
+        let hi: Vec<_> = snapshot
+            .selected_messages()
+            .iter()
+            .filter(|row| row.body == "hi")
+            .collect();
+        assert_eq!(hi.len(), 1, "succeeded");
+        assert_eq!(hi[0].id, format!("telegram:1:{server}"));
+        assert_eq!(hi[0].delivery, Delivery::Sent, "succeeded");
+        assert_ne!(snapshot.status_line(), SENDING_STATUS, "succeeded");
+
+        snapshot.apply(AdapterEvent::OutboxRead {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            last_read_message_id: server,
+        });
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.body == "hi")
+                .map(|row| row.delivery),
+            Some(Delivery::Read),
+            "read outbox"
+        );
+
+        let mut failed = ready_with_chats(&store);
+        let _request = pending_telegram_send(&mut failed, 1, 100, "nope");
+        // sending_state = Failed.
+        let failed_delivery =
+            outgoing_delivery(OutgoingUpdate::Failed, Delivery::Failed, true, 101, 0);
+        assert_eq!(failed_delivery, Delivery::Failed, "failed");
+        failed.apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing(1, 101, "nope", failed_delivery),
+        });
+        assert_eq!(failed.selected_messages().len(), 1, "failed");
+        assert_eq!(
+            failed.selected_messages()[0].delivery,
+            Delivery::Failed,
+            "failed"
+        );
+        assert_ne!(failed.status_line(), SENDING_STATUS, "failed");
     }
 
     #[test]
@@ -11350,7 +12088,11 @@ mod tests {
         finish_telegram_send(&mut snapshot, 2, 22, "two");
         assert_eq!(snapshot.telegram_send_unconfirmed.len(), 1);
         assert_eq!(snapshot.telegram_send_unconfirmed[0].request, first);
-        assert_eq!(snapshot.status_line(), SENDING_STATUS);
+        assert_ne!(
+            snapshot.status_line(),
+            SENDING_STATUS,
+            "the retry row already shows Sending…"
+        );
         finish_telegram_send(&mut snapshot, 1, 11, "one");
         assert!(snapshot.telegram_send_unconfirmed.is_empty());
     }

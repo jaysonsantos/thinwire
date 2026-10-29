@@ -649,6 +649,14 @@ pub enum AdapterEvent {
         message_id: String,
         delivery: Delivery,
     },
+    /// The other party has read outgoing messages through this id.
+    /// Telegram `last_read_outbox_message_id` and `updateChatReadOutbox`.
+    /// The id is the protocol message id, not the app's `telegram:chat:id` string.
+    OutboxRead {
+        protocol: ProtocolId,
+        conversation_id: String,
+        last_read_message_id: i64,
+    },
     /// A chat-list page load ended (loaded, already complete, or failed).
     /// The UI stops its "Loading chats…" state.
     ChatListLoaded {
@@ -725,6 +733,7 @@ impl AdapterEvent {
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }
             | Self::MessageDelivery { protocol, .. }
+            | Self::OutboxRead { protocol, .. }
             | Self::ChatListLoaded { protocol }
             | Self::HistoryLoaded { protocol, .. }
             | Self::OlderHistoryLoaded { protocol, .. } => Some(*protocol),
@@ -859,6 +868,67 @@ pub enum Delivery {
     Pending,
     /// The server did not accept it. The user can retry.
     Failed,
+    /// The other party has read this outgoing message.
+    Read,
+}
+
+/// What a Telegram update says about one outgoing message.
+///
+/// `updateMessageSendSucceeded` and `updateMessageSendFailed` are the result.
+/// Their message object can still carry a pending `sending_state`. The result
+/// decides the row. A listed message (a new message, history, or the chat's
+/// last message) uses `sending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutgoingUpdate {
+    /// A message already stored or just inserted. `sending` is its state.
+    Listed,
+    /// `updateMessageSendSucceeded`. The server has the message.
+    Succeeded,
+    /// `updateMessageSendFailed`.
+    Failed,
+}
+
+/// Delivery the thread shows for one Telegram message.
+///
+/// A succeeded update is sent, then read when `message_id` is at or below
+/// `last_read_outbox_message_id`. A failed update is failed. A pending or
+/// failed message is not read. An incoming message is sent.
+#[must_use]
+pub fn outgoing_delivery(
+    update: OutgoingUpdate,
+    sending: Delivery,
+    outgoing: bool,
+    message_id: i64,
+    last_read_outbox_message_id: i64,
+) -> Delivery {
+    if !outgoing {
+        return Delivery::Sent;
+    }
+    let delivery = match update {
+        OutgoingUpdate::Listed => sending,
+        OutgoingUpdate::Succeeded => Delivery::Sent,
+        OutgoingUpdate::Failed => Delivery::Failed,
+    };
+    with_outbox_read(delivery, message_id, last_read_outbox_message_id)
+}
+
+/// `Sent` becomes `Read` when the other party has read through `message_id`.
+/// Pending and failed stay as they are. A zero cursor has read nothing.
+#[must_use]
+pub fn with_outbox_read(
+    delivery: Delivery,
+    message_id: i64,
+    last_read_outbox_message_id: i64,
+) -> Delivery {
+    if delivery == Delivery::Sent
+        && last_read_outbox_message_id > 0
+        && message_id > 0
+        && message_id <= last_read_outbox_message_id
+    {
+        Delivery::Read
+    } else {
+        delivery
+    }
 }
 
 /// Message shown in the right pane.
@@ -1098,6 +1168,20 @@ pub(crate) fn emit_photo_ready(
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
 pub(crate) fn emit_photo_failed(events: &EventTx, protocol: ProtocolId, file_id: i32) {
     let _ = events.send(AdapterEvent::PhotoFailed { protocol, file_id });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_outbox_read(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    last_read_message_id: i64,
+) {
+    let _ = events.send(AdapterEvent::OutboxRead {
+        protocol,
+        conversation_id: conversation_id.into(),
+        last_read_message_id,
+    });
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
