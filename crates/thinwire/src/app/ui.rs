@@ -7,7 +7,8 @@ use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
     AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, SIGNAL_PREVIOUS_ACCOUNT, topic_mute_id,
+    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_UNREADABLE,
+    topic_mute_id,
 };
 
 use super::auth;
@@ -573,12 +574,6 @@ fn account_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                 if !snapshot.shows_in_switcher(account.caps.id) {
                     continue;
                 }
-                // The old rows are hidden. The line under the list says why.
-                if account.signal_retained.is_some()
-                    && snapshot.signal_history_kept_line().is_some()
-                {
-                    continue;
-                }
                 let unread = snapshot.account_row_unread(account);
                 if account_chip(
                     ui,
@@ -600,12 +595,6 @@ fn account_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
             }
             if let Some(protocol) = clicked {
                 out.push(Intent::SelectProtocol(protocol));
-            }
-            // The old rows are hidden. The line under the list says why.
-            if let Some(line) = snapshot.signal_history_kept_line() {
-                let palette = theme::palette(ui);
-                ui.label(RichText::new(line).small().color(palette.text2));
-                ui.add_space(4.0);
             }
         });
 }
@@ -694,11 +683,16 @@ fn account_chip(
     let width = ui.available_width();
     let detail = rail_detail(snapshot, account);
     let unofficial = account.linked() && unofficial_notice(caps.id).is_some();
+    // A store that could not be read stays in the list and takes no click.
+    let enabled = !account.history_unreadable();
     // One line is the name. A helper line or Unofficial needs a second line.
     // The removed-device line wraps, so that row is taller.
-    // One previous Signal number uses the reason sentence, which wraps further.
+    // One previous Signal number, and a store that could not be read, use a
+    // sentence that wraps further.
     // [`theme::ROW_INSET`] adds 8 px above and below.
-    let lines = if detail.as_deref() == Some(SIGNAL_PREVIOUS_ACCOUNT) {
+    let lines = if detail.as_deref() == Some(SIGNAL_PREVIOUS_ACCOUNT)
+        || detail.as_deref() == Some(SIGNAL_RETAINED_UNREADABLE)
+    {
         68.0
     } else if detail.as_deref() == Some(SIGNAL_DEVICE_REMOVED)
         || unofficial
@@ -716,7 +710,16 @@ fn account_chip(
         .scope_id()
         .with(("account-chip", caps.id, account.signal_retained));
     // The row click is under the Unofficial button, so that button takes its own click.
-    let response = ui.interact(rect, chip_id, egui::Sense::click());
+    // A store that could not be read takes no click.
+    let response = ui.interact(
+        rect,
+        chip_id,
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
     row_backdrop(ui, chip_id, rect, selected, hover.hovered());
     let inner = theme::row_content_rect(rect, 0.0);
     let mut child = ui.new_child(
@@ -774,12 +777,17 @@ fn account_chip(
         });
     }
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::Button, true, selected, caps.id.display_name())
+        egui::WidgetInfo::selected(
+            egui::Role::Button,
+            enabled,
+            selected,
+            caps.id.display_name(),
+        )
     });
     if let Some(note) = account_footnote(caps.id, account.linked()) {
         ui.label(RichText::new(note).small().weak());
     }
-    response.clicked() && !unofficial_hit
+    enabled && response.clicked() && !unofficial_hit
 }
 
 /// Extra line on the rail. The normal row is only the name, the status dot,
@@ -1795,10 +1803,16 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
 
     // Compose grows to COMPOSE_MAX_ROWS lines, then scrolls. Leave the whole
     // bar inside the panel when the message list hits its max height.
+    // An unreadable history row has no composer and no Send control.
+    let hide_compose = snapshot.hides_composer();
     let row_height = ui.text_style_height(&egui::TextStyle::Body);
     let compose_rows = compose_line_count(&snapshot.compose);
     let compose_height = compose_row_height(row_height, COMPOSE_MAX_ROWS);
-    let reserve = compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y);
+    let reserve = if hide_compose {
+        0.0
+    } else {
+        compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y)
+    };
 
     let state = snapshot.thread_state();
     let older = snapshot.older_state();
@@ -1950,7 +1964,9 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         out.push(Intent::Retry { message_id });
     }
 
-    compose(ui, snapshot, hints, compose_height, out);
+    if !hide_compose {
+        compose(ui, snapshot, hints, compose_height, out);
+    }
 }
 
 /// What the thread remembers between frames for its scroll motion.
@@ -3978,6 +3994,106 @@ mod tests {
                 .next()
                 .is_some(),
             "the open previous account keeps the Signal risk line"
+        );
+    }
+
+    /// A store that cannot be read stays in the list.
+    /// The row is disabled. It has no Send control and no composer.
+    /// The row shows the history sentence. The sentence has no slot count.
+    #[test]
+    fn an_unreadable_retained_row_is_disabled_and_has_no_send() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{By, Queryable};
+        use thinwire_core::View;
+        use thinwire_core::secrets::SecretStore;
+        use thinwire_core::settings::Settings;
+        use thinwire_core::state::Snapshot;
+        use thinwire_core::state::test_support::{show_only, show_protocol};
+        use thinwire_protocol::{
+            AdapterEvent, AdapterStatus, ProtocolId, SIGNAL_RETAINED_UNREADABLE,
+            signal_retained_unreadable_detail,
+        };
+
+        use super::{Hints, draw};
+        use crate::app::theme;
+
+        let store = SecretStore::memory();
+        let settings = Settings::in_memory();
+        let mut snapshot = Snapshot::new();
+        show_only(&mut snapshot, &[ProtocolId::Signal]);
+        show_protocol(&mut snapshot, ProtocolId::Signal);
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: signal_retained_unreadable_detail(1),
+        });
+        snapshot.select_retained_signal(1);
+        snapshot.compose = "hello".into();
+        let kept = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.signal_retained == Some(1))
+            .expect("the row stays in the list");
+        assert!(kept.history_unreadable(), "the row is disabled");
+        assert_eq!(kept.detail, SIGNAL_RETAINED_UNREADABLE);
+        assert_eq!(
+            kept.detail,
+            "This history could not be read. It was not deleted."
+        );
+        assert!(!snapshot.can_send(), "the row has no Send");
+        assert!(snapshot.hides_composer(), "the row has no composer");
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 720.0))
+            .build_ui(|ui| {
+                theme::install(ui.ctx());
+                if !ui.style().text_styles.contains_key(&theme::row_title()) {
+                    return;
+                }
+                let view = View::from_parts(&snapshot, &store, &settings);
+                let mut hints = Hints::default();
+                let mut out = Vec::new();
+                draw(ui, &view, &mut hints, &mut out);
+            });
+        harness.run_steps(4);
+        assert!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Label)
+                        .label("This history could not be read. It was not deleted.")
+                        .include_labels(),
+                )
+                .next()
+                .is_some(),
+            "the row shows this text"
+        );
+        assert_eq!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Button)
+                        .label("Signal")
+                        .predicate(|node| node.is_disabled()),
+                )
+                .count(),
+            1,
+            "the row is disabled"
+        );
+        assert!(
+            harness
+                .query_all(By::new().role(Role::Button).label("Send"))
+                .next()
+                .is_none(),
+            "the row has no Send"
+        );
+        assert!(
+            harness
+                .query_all(By::new().role(Role::MultilineTextInput))
+                .next()
+                .is_none(),
+            "the row has no composer"
         );
     }
 }

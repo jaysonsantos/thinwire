@@ -47,27 +47,51 @@ pub const SIGNAL_LINK_CHECK: &str = "Checking Signal link…";
 pub const SIGNAL_PREVIOUS_ACCOUNT: &str =
     "You linked a different number. This history stays. Sending is off.";
 
-/// Shown in the account list while old Signal history is on disk and its
-/// rows are not on screen. The rows come back after the next link.
-///
-/// Signal does not show an account phone number, and no phone number
-/// crosses the helper pipe, so this line names no digits.
-pub const SIGNAL_HISTORY_KEPT: &str =
-    "Old Signal history for the previous number is kept. It shows again after you link.";
-
 /// The helper is about to publish `retained/` again.
-/// The core drops the previous retained rows first, then the new rows arrive.
+/// The core keeps the rows that are already on screen.
+/// A slot whose store this publish could not read stays.
+/// A slot this publish does not send is dropped when the publish settles.
 /// This line is not a status of the live account.
 pub const SIGNAL_RETAINED_RESET: &str = "Signal is loading previous history.";
 
 /// The helper finished the retained publish for this link.
-/// The core drops a selected slot that was not published.
+/// The core drops a selected slot that was not published and whose store
+/// this publish could read. A store that could not be read keeps its slot.
 /// This line is not a status of the live account.
 pub const SIGNAL_RETAINED_SETTLED: &str = "Signal finished loading previous history.";
 
-/// No previous account remains under `retained/`.
-/// The core clears the held line. This line is not a status of the live account.
-pub const SIGNAL_HISTORY_NOT_KEPT: &str = "No old Signal history is waiting.";
+/// This publish could not read one previous-account store.
+/// The files stay on disk. The core keeps that slot.
+/// The row stays in the list. The row is disabled.
+/// The row has no Send control and no composer.
+/// The row shows this sentence. The sentence has no slot count.
+/// The wire detail is this sentence, one space, and the slot count.
+/// The core does not show the slot count. The helper log keeps the count.
+/// The slot is not an account id.
+/// This line is not a status of the live account.
+pub const SIGNAL_RETAINED_UNREADABLE: &str = "This history could not be read. It was not deleted.";
+
+/// Status detail for one previous-account store this publish could not read.
+#[must_use]
+pub fn signal_retained_unreadable_detail(slot: u32) -> String {
+    format!("{SIGNAL_RETAINED_UNREADABLE} {slot}")
+}
+
+/// The slot in a [`signal_retained_unreadable_detail`] line.
+/// `None` when `detail` is a different status. The slot is a count.
+#[must_use]
+pub fn signal_retained_unreadable_slot(detail: &str) -> Option<u32> {
+    let rest = detail
+        .strip_prefix(SIGNAL_RETAINED_UNREADABLE)?
+        .strip_prefix(' ')?;
+    if rest.is_empty() || rest.starts_with('+') || (rest.len() > 1 && rest.starts_with('0')) {
+        return None;
+    }
+    if !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok().filter(|slot: &u32| *slot > 0)
+}
 
 /// Chat id prefix for a previous Signal account in `retained/`.
 /// The form is `retained:<slot>:<chat id>`. The slot is a count, not an
@@ -280,15 +304,46 @@ mod tests {
         );
         assert!(SIGNAL_PREVIOUS_ACCOUNT.contains("Sending is off."));
         assert!(
-            !SIGNAL_HISTORY_KEPT
+            !SIGNAL_PREVIOUS_ACCOUNT
+                .to_ascii_lowercase()
+                .contains("link again"),
+            "the previous-account line does not ask the user to link"
+        );
+    }
+
+    #[test]
+    fn a_unreadable_retained_slot_is_a_count() {
+        assert_eq!(
+            signal_retained_unreadable_slot(&signal_retained_unreadable_detail(4)),
+            Some(4)
+        );
+        assert_eq!(
+            SIGNAL_RETAINED_UNREADABLE,
+            "This history could not be read. It was not deleted."
+        );
+        assert!(
+            !SIGNAL_RETAINED_UNREADABLE
+                .chars()
+                .any(|ch| ch.is_ascii_digit()),
+            "the user-facing text has no slot count"
+        );
+        assert_eq!(
+            signal_retained_unreadable_slot(SIGNAL_RETAINED_UNREADABLE),
+            None
+        );
+        assert_eq!(
+            signal_retained_unreadable_slot(&format!("{SIGNAL_RETAINED_UNREADABLE} 0")),
+            None
+        );
+        assert_eq!(
+            signal_retained_unreadable_slot(&format!("{SIGNAL_RETAINED_UNREADABLE} 01")),
+            None
+        );
+        assert!(
+            !SIGNAL_RETAINED_UNREADABLE
                 .to_ascii_lowercase()
                 .contains("reliable"),
-            "the held line must not call Signal reliable"
-        );
-        assert!(SIGNAL_HISTORY_KEPT.contains("It shows again after you link."));
-        assert!(
-            !SIGNAL_HISTORY_KEPT.chars().any(|ch| ch.is_ascii_digit()),
-            "the held line has no phone number"
+            "the unreadable line must not call Signal reliable"
         );
     }
 }
