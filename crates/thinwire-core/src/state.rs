@@ -4049,7 +4049,10 @@ impl Snapshot {
             return;
         };
         message.delivery = delivery;
-        if let Some(last_read) = last_read
+        // Incoming and outgoing Telegram rows share one id space. The cursor
+        // marks only a row this account sent.
+        if message.outbound
+            && let Some(last_read) = last_read
             && let Some(id) = Self::message_number(&message.id)
         {
             message.delivery = with_outbox_read(message.delivery, id, last_read);
@@ -4069,6 +4072,7 @@ impl Snapshot {
     }
 
     /// Raise the read cursor and mark outgoing rows the other party has read.
+    /// An incoming row keeps its delivery.
     fn note_outbox_read(&mut self, protocol: ProtocolId, conversation_id: &str, last_read: i64) {
         let key = (protocol, conversation_id.to_owned());
         let last = {
@@ -4090,6 +4094,9 @@ impl Snapshot {
                 continue;
             };
             for message in list.iter_mut() {
+                if !message.outbound {
+                    continue;
+                }
                 let Some(id) = Self::message_number(&message.id) else {
                     continue;
                 };
@@ -4109,8 +4116,12 @@ impl Snapshot {
         }
     }
 
-    /// A sent row the other party has already read shows read.
+    /// A sent outbound row the other party has already read shows read.
+    /// An incoming row keeps its delivery.
     fn apply_outbox_cursor(&self, message: &mut ChatMessage) {
+        if !message.outbound {
+            return;
+        }
         let Some(last) = self
             .outbox_read
             .get(&(message.protocol, message.conversation_id.clone()))
@@ -8145,6 +8156,94 @@ mod tests {
             "read outbox"
         );
         assert_eq!(by_id(7), Some(Delivery::Pending), "read outbox");
+    }
+
+    /// Incoming and outgoing Telegram rows share one message id space.
+    /// The outbox cursor marks only an outbound row as Read.
+    #[test]
+    fn an_outbox_cursor_does_not_mark_an_incoming_row_read() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let cursor = 50;
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: telegram_text(1, 10, "from Ada"),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 20, "to Ada", Delivery::Sent),
+        });
+        snapshot.apply(AdapterEvent::OutboxRead {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            last_read_message_id: cursor,
+        });
+        let delivery = |snapshot: &Snapshot, id: i64| {
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.id == format!("telegram:1:{id}"))
+                .map(|row| row.delivery)
+        };
+        assert_eq!(
+            delivery(&snapshot, 10),
+            Some(Delivery::Sent),
+            "an incoming row already loaded stays sent"
+        );
+        assert_eq!(
+            delivery(&snapshot, 20),
+            Some(Delivery::Read),
+            "an outbound row already loaded becomes read"
+        );
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: telegram_text(1, 30, "later from Ada"),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 40, "later to Ada", Delivery::Sent),
+        });
+        assert_eq!(
+            delivery(&snapshot, 30),
+            Some(Delivery::Sent),
+            "an incoming row loaded after the cursor stays sent"
+        );
+        assert_eq!(
+            delivery(&snapshot, 40),
+            Some(Delivery::Read),
+            "an outbound row loaded after the cursor becomes read"
+        );
+
+        // A delivery update uses the same rule.
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: ChatMessage {
+                delivery: Delivery::Pending,
+                ..telegram_text(1, 12, "from Ada pending")
+            },
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 14, "to Ada pending", Delivery::Pending),
+        });
+        snapshot.apply(AdapterEvent::MessageDelivery {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:12".into(),
+            delivery: Delivery::Sent,
+        });
+        snapshot.apply(AdapterEvent::MessageDelivery {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:14".into(),
+            delivery: Delivery::Sent,
+        });
+        assert_eq!(
+            delivery(&snapshot, 12),
+            Some(Delivery::Sent),
+            "an incoming delivery update stays sent"
+        );
+        assert_eq!(
+            delivery(&snapshot, 14),
+            Some(Delivery::Read),
+            "an outbound delivery update becomes read"
+        );
     }
 
     /// Defensive. Main maps `messageSendingStateFailed` to `Failed`.

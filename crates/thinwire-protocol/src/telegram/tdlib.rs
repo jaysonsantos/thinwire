@@ -1465,6 +1465,10 @@ async fn apply_chat_update(
             live.publish(events, emit, effect);
         }
         tdlib_rs::enums::Update::ChatReadOutbox(update) => {
+            // Not emitted while the account is not linked. NewChat keeps the
+            // cursor the same way. The directory stores it. Rows loaded later
+            // get Read. Rows already in the snapshot update on the next
+            // ChatReadOutbox.
             if live
                 .directory
                 .note_outbox_read(update.chat_id, update.last_read_outbox_message_id)
