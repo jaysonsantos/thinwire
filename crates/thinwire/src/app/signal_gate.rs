@@ -10,29 +10,29 @@ use eframe::egui::{self, RichText};
 use super::pairing_qr;
 use super::theme;
 use thinwire_core::signal_notice::{
-    SIGNAL_NOTICE_ACCEPT, SIGNAL_NOTICE_BODY, SIGNAL_NOTICE_HEADING, SIGNAL_NOTICE_HELPER,
-    SIGNAL_NOTICE_NO_URL, SIGNAL_RISK,
+    SIGNAL_NOTICE_ACCEPT, SIGNAL_NOTICE_HEADING, SIGNAL_NOTICE_HELPER, SIGNAL_NOTICE_NO_URL,
+    SIGNAL_NOTICE_RISK,
 };
 use thinwire_core::state::{SignalScreen, Snapshot};
 use thinwire_core::{Intent, ProtocolId, SignalIntent, View};
 
-/// The Signal entry under the accounts. With no helper program the entry
-/// stays, disabled, with the reason (ADR 0013 decision 6).
-pub(crate) fn notice_entry(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
+/// Start of the link flow, in the middle column. The full notice is the next
+/// step. With no helper program there is no button: the account row already
+/// says to reinstall (ADR 0013 decision 6).
+pub(crate) fn link_offer(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
+    if snapshot.selected_protocol != ProtocolId::Signal || !snapshot.signal_linking_available() {
+        return;
+    }
+    let linked = snapshot
+        .accounts
+        .iter()
+        .any(|row| row.caps.id == ProtocolId::Signal && row.linked());
+    if linked || snapshot.helper_missing(ProtocolId::Signal) {
+        return;
+    }
     ui.add_space(8.0);
-    ui.label(
-        RichText::new("Signal — experimental, expect breakage")
-            .small()
-            .color(theme::palette(ui).warn),
-    );
-    let missing = snapshot.helper_missing(ProtocolId::Signal);
-    let entry = ui.add_enabled(!missing, egui::Button::new("Review Signal notice"));
-    if missing {
-        entry.on_disabled_hover_text(HELPER_MISSING_REASON);
-        ui.label(RichText::new(HELPER_MISSING_REASON).small().weak());
-    } else if entry.clicked() {
+    if ui.button("Link").clicked() {
         out.push(Intent::Signal(SignalIntent::OpenNotice));
-        ui.ctx().request_repaint();
     }
 }
 
@@ -54,12 +54,11 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>
 
 fn notice(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
     ui.heading(SIGNAL_NOTICE_HEADING);
-    ui.colored_label(theme::palette(ui).warn, SIGNAL_RISK);
     ui.add_space(8.0);
-    ui.label(SIGNAL_NOTICE_BODY);
-    ui.add_space(6.0);
+    ui.colored_label(theme::palette(ui).warn, SIGNAL_NOTICE_RISK);
+    ui.add_space(8.0);
     ui.label(SIGNAL_NOTICE_HELPER);
-    ui.add_space(8.0);
+    ui.add_space(6.0);
     ui.label(SIGNAL_NOTICE_NO_URL);
     ui.add_space(12.0);
     if ui.button(SIGNAL_NOTICE_ACCEPT).clicked() {
