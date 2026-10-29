@@ -1293,9 +1293,7 @@ mod tests {
             4,
             "not ready, bad chat id, empty text, and TDLib error each name the send"
         );
-        let pending = send
-            .find("emit_mapped_message(client_id, events, &message, live, None)")
-            .expect("pending row");
+        let pending = send.find("OutgoingUpdate::Listed").expect("pending row");
         let accepted = send
             .find("emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request)")
             .expect("acceptance names the send");

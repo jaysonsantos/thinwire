@@ -106,6 +106,8 @@ pub(super) struct ChatSeed<'a> {
     pub photo_file_id: Option<i32>,
     /// `accent_color_id` in palette 0–6.
     pub accent: u8,
+    /// `chat.last_read_outbox_message_id`. Zero when nothing outgoing is read.
+    pub last_read_outbox: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +125,7 @@ struct ChatRecord {
     peer: Option<i64>,
     photo_file_id: Option<i32>,
     accent: u8,
+    last_read_outbox: i64,
 }
 
 /// Main-list chats keyed by TDLib chat id. `order == 0` is not listed.
@@ -197,6 +200,7 @@ impl ChatDirectory {
     /// Insert or replace a chat. Listed only when `order` is positive.
     pub(super) fn upsert(&mut self, chat_id: i64, seed: ChatSeed<'_>) -> Option<ChatEffect> {
         let previous = self.chats.get(&chat_id).map(|chat| chat.order);
+        let last_read_outbox = seed.last_read_outbox.max(self.last_read_outbox(chat_id));
         self.chats.insert(
             chat_id,
             ChatRecord {
@@ -213,9 +217,31 @@ impl ChatDirectory {
                 peer: seed.peer,
                 photo_file_id: seed.photo_file_id,
                 accent: seed.accent,
+                last_read_outbox,
             },
         );
         self.effect(chat_id, previous)
+    }
+
+    /// `chat.last_read_outbox_message_id`, or zero when this chat is unknown.
+    pub(super) fn last_read_outbox(&self, chat_id: i64) -> i64 {
+        self.chats
+            .get(&chat_id)
+            .map(|chat| chat.last_read_outbox)
+            .unwrap_or(0)
+    }
+
+    /// Raise the read cursor. A lower id does not move it back.
+    /// `true` when the stored id changed.
+    pub(super) fn note_outbox_read(&mut self, chat_id: i64, last_read: i64) -> bool {
+        let current = self.ensure(chat_id).last_read_outbox;
+        if last_read <= current {
+            return false;
+        }
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.last_read_outbox = last_read;
+        }
+        true
     }
 
     /// This bot user has topics. Private chats of that user follow.
@@ -396,6 +422,7 @@ impl ChatDirectory {
             peer: None,
             photo_file_id: None,
             accent: 0,
+            last_read_outbox: 0,
         })
     }
 
@@ -952,6 +979,7 @@ mod tests {
             peer: None,
             photo_file_id: None,
             accent: 0,
+            last_read_outbox: 0,
         }
     }
 

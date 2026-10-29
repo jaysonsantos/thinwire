@@ -67,7 +67,7 @@ fn compose_ui_uses_enter_multiline_and_disabled_send() {
     assert!(compose.contains(".interactive(compose_open)"));
     assert!(compose.contains("add_enabled(snapshot.can_send()"));
     assert!(ui.contains("request_focus(compose_id)"));
-    assert!(ui.contains("\"Not sent\""));
+    assert!(ui.contains("\"Not sent.\""));
     assert!(ui.contains("\"Retry\""));
 }
 
