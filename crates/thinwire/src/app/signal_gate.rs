@@ -119,7 +119,7 @@ fn link_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
             theme::palette(ui).warn,
             "Provisioning URL. Do not commit it, log it, or paste it into a ticket.",
         );
-        pairing_qr::show_pairing_qr(
+        let _ = pairing_qr::show_pairing_qr(
             ui,
             pairing_qr::SIGNAL_QR,
             snapshot.signal_pairing_generation(),
