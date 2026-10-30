@@ -714,6 +714,7 @@ impl Core {
                 }
             }
             Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
+            Intent::RetryStoreKey(protocol) => self.state.retry_store_key(protocol),
             Intent::ShowNotice(protocol) => self.state.open_notice_review(protocol),
             Intent::CloseNotice => self.state.close_notice_review(),
             Intent::LoadPhoto {

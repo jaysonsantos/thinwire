@@ -50,8 +50,26 @@ impl LinkBackend for LiveBackend {
             .ok()
             .and_then(Result::ok)
             .ok_or(StartError::Store)?;
+        let store_path = path.clone();
+        let protected =
+            tokio::task::spawn_blocking(move || super::cipher::protect_store(&store_path))
+                .await
+                .map_err(|_| StartError::Store)?;
+        protected.map_err(|fail| match fail {
+            super::cipher::ProtectFail::KeychainDenied => StartError::KeychainDenied,
+            super::cipher::ProtectFail::WrongKey => StartError::WrongKey,
+            super::cipher::ProtectFail::NotMoved => StartError::MoveFailed,
+            super::cipher::ProtectFail::NotSaved => {
+                StartError::Reported(thinwire_protocol::whatsapp_key_not_saved().to_string())
+            }
+            super::cipher::ProtectFail::EncryptFailed => {
+                StartError::Reported(thinwire_protocol::whatsapp_encrypt_failed().to_string())
+            }
+        })?;
         let db = path.to_str().ok_or(StartError::Store)?;
-        let backend = SqliteStore::open(db).await.map_err(|_| StartError::Store)?;
+        let backend = super::cipher::open_store(db)
+            .await
+            .map_err(|()| StartError::Store)?;
         let _ = restrict_store_file(&path);
         let bot = build_bot(backend, digits_only(phone), callbacks)
             .await

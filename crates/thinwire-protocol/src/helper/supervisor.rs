@@ -703,6 +703,16 @@ impl Supervisor {
             WireCommand::ViewChat { .. } => {}
             // A start that failed: `launch` reported it.
             WireCommand::AcknowledgeGate | WireCommand::BeginLink { .. } => {}
+            // The helper is not running. Do not start it: a start would
+            // replay the link. A running helper receives `RetryStoreKey`
+            // and opens the saved session. A wrong key then tries the move
+            // again. This arm only covers a helper that is already down.
+            WireCommand::RetryStoreKey => {
+                let _ = self.events.send(AdapterEvent::StoreAccess {
+                    protocol,
+                    reason: crate::StoreAccessReason::KeychainDenied,
+                });
+            }
         }
     }
 

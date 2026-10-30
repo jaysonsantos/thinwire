@@ -102,8 +102,9 @@ pub struct ProtocolCapabilities {
     pub pages_history: bool,
 }
 
-/// Link state of the account of one protocol. Only
-/// [`AdapterEvent::Account`] changes it; a `Status` never does.
+/// Link state of the account of one protocol.
+/// [`AdapterEvent::Account`] changes it. A wrong key also leaves `Linked`.
+/// A `Status` never does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccountState {
     /// No account, or the account ended. The shell shows no rows for it.
@@ -412,6 +413,12 @@ pub enum AdapterCommand {
     RestartHelper {
         protocol: ProtocolId,
     },
+    /// Read the session key again and open the saved session. This does not
+    /// start a link and it does not delete a store. A wrong key tries the
+    /// move-aside again.
+    RetryStoreKey {
+        protocol: ProtocolId,
+    },
     /// Download one Telegram photo file. `secret` means the file is deleted
     /// after the bytes are read, and the UI does not open the full view.
     /// The file id is not a secret.
@@ -440,6 +447,7 @@ impl AdapterCommand {
             | Self::ViewChat { protocol, .. }
             | Self::ViewTopic { protocol, .. }
             | Self::RestartHelper { protocol }
+            | Self::RetryStoreKey { protocol }
             | Self::DownloadFile { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
@@ -453,6 +461,30 @@ impl AdapterCommand {
     }
 }
 
+/// Why the helper could not use the session key. The account stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreAccessReason {
+    /// The keychain refused the read. The store was not moved.
+    KeychainDenied,
+    /// The encrypted store did not open. The folder was moved aside.
+    WrongKey,
+    /// The store files could not be moved aside. They stay. Nothing was deleted.
+    MoveFailed,
+}
+
+/// `true` when this command makes a helper read the session key.
+///
+/// A start with no Signal or WhatsApp account does not send one of these.
+#[must_use]
+pub const fn command_reads_session_key(command: &AdapterCommand) -> bool {
+    matches!(
+        command,
+        AdapterCommand::SignalBeginLink { .. }
+            | AdapterCommand::WhatsAppBeginLink { .. }
+            | AdapterCommand::RetryStoreKey { .. }
+    )
+}
+
 /// Events a worker may push. The UI is the only consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterEvent {
@@ -460,6 +492,11 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         status: AdapterStatus,
         detail: String,
+    },
+    /// The session key could not be used. This does not end the account.
+    StoreAccess {
+        protocol: ProtocolId,
+        reason: StoreAccessReason,
     },
     ConversationUpsert {
         conversation: Conversation,

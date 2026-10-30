@@ -949,13 +949,13 @@ impl fmt::Debug for SecretStore {
     }
 }
 
-fn memory_requested() -> bool {
+pub(crate) fn memory_requested() -> bool {
     std::env::var_os(KEYRING_ENV).is_some_and(|value| value == KEYRING_MEMORY)
 }
 
 /// Why no OS store settled.
 #[derive(Debug)]
-enum AttachError {
+pub(crate) enum AttachError {
     /// No usable OS store: memory-only for this session.
     Absent(SecretError),
     /// A store is present but failed (locked, prompt dismissed, timeout, D-Bus
@@ -1026,7 +1026,7 @@ fn no_bus_at_connect(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-fn probe_os() -> Result<OsBackend, AttachError> {
+pub(crate) fn probe_os() -> Result<OsBackend, AttachError> {
     if keyring_core::get_default_store().is_none() {
         let backend = install_platform_store()?;
         let _ = OS_BACKEND.set(backend);
@@ -1253,7 +1253,7 @@ impl SecretStore {
     }
 }
 
-fn map_keyring_error(error: keyring_core::Error) -> SecretError {
+pub(crate) fn map_keyring_error(error: keyring_core::Error) -> SecretError {
     let kind = match error {
         keyring_core::Error::NoEntry => "not found",
         keyring_core::Error::NoStorageAccess(_) => "no storage access",

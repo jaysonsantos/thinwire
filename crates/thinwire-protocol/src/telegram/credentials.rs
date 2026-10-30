@@ -295,6 +295,12 @@ mod tests {
                 "os-zips must ship the chat-photo notice {notice}"
             );
         }
+        for notice in ["sqlcipher-LICENSE.txt", "openssl-LICENSE-APACHE.txt"] {
+            assert!(
+                stage.contains(notice),
+                "os-zips must ship the helper cipher notice {notice}"
+            );
+        }
         assert!(
             stage.contains("/usr/share/doc/"),
             "Linux payloads must attach the LLVM runtime package copyright files"

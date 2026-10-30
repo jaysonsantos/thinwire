@@ -12,7 +12,10 @@ use crate::SecretText;
 
 /// Version of the wire protocol. The app refuses a helper with another
 /// version.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 adds [`WireCommand::RetryStoreKey`] and
+/// [`WireEvent::StoreAccess`]. An older peer cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A protocol that a helper carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -115,6 +118,9 @@ pub enum WireCommand {
     },
     /// Stop a pairing that is not complete.
     CancelLink,
+    /// Read the session key again. This is not a new link and it does not
+    /// move the store.
+    RetryStoreKey,
 }
 
 impl WireCommand {
@@ -133,7 +139,25 @@ impl WireCommand {
             Self::AcknowledgeGate => "acknowledge_gate",
             Self::BeginLink { .. } => "begin_link",
             Self::CancelLink => "cancel_link",
+            Self::RetryStoreKey => "retry_store_key",
         }
+    }
+
+    /// `true` when this command makes the helper read the session key.
+    ///
+    /// `Connect` and the gate do not. A start with no Signal or WhatsApp
+    /// account sends neither of the commands that read the key.
+    #[must_use]
+    pub const fn reads_session_key(&self) -> bool {
+        matches!(self, Self::BeginLink { .. } | Self::RetryStoreKey)
+    }
+
+    /// `true` when this command starts the helper process.
+    ///
+    /// [`Self::RetryStoreKey`] does not. A retry must not start a new link.
+    #[must_use]
+    pub const fn wakes_helper(&self) -> bool {
+        matches!(self, Self::AcknowledgeGate | Self::BeginLink { .. })
     }
 }
 
@@ -302,6 +326,21 @@ pub enum WireEvent {
         code: SecretText,
         generation: u64,
     },
+    /// The session key could not be used. This is not an account end.
+    /// `KeychainDenied` did not move the store. `WrongKey` did.
+    StoreAccess {
+        reason: WireStoreAccess,
+    },
+}
+
+/// Why the helper could not use the session key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireStoreAccess {
+    /// The keychain refused the read. The store stays where it is.
+    KeychainDenied,
+    /// The encrypted store did not open. The folder was moved aside.
+    WrongKey,
 }
 
 impl WireEvent {
@@ -328,6 +367,7 @@ impl WireEvent {
             Self::OlderHistoryLoaded { .. } => "older_history_loaded",
             Self::Qr { .. } => "qr",
             Self::PairCode { .. } => "pair_code",
+            Self::StoreAccess { .. } => "store_access",
         }
     }
 }
@@ -409,6 +449,11 @@ mod tests {
                     request: 900_001,
                 },
             },
+            AppLine::Request {
+                id: 4,
+                protocol: WireProtocol::Signal,
+                command: WireCommand::RetryStoreKey,
+            },
             AppLine::Shutdown,
         ];
         for line in app {
@@ -442,6 +487,18 @@ mod tests {
             HelperLine::Event {
                 protocol: WireProtocol::WhatsApp,
                 event: WireEvent::ChatListLoaded,
+            },
+            HelperLine::Event {
+                protocol: WireProtocol::Signal,
+                event: WireEvent::StoreAccess {
+                    reason: WireStoreAccess::KeychainDenied,
+                },
+            },
+            HelperLine::Event {
+                protocol: WireProtocol::WhatsApp,
+                event: WireEvent::StoreAccess {
+                    reason: WireStoreAccess::WrongKey,
+                },
             },
             HelperLine::Stopped {
                 protocol: WireProtocol::WhatsApp,
@@ -513,5 +570,28 @@ mod tests {
                 assert!(!shown.contains(secret), "{shown}");
             }
         }
+    }
+
+    #[test]
+    fn the_session_key_is_read_only_for_an_account_command() {
+        let begin = WireCommand::BeginLink {
+            generation: 1,
+            phone: None,
+        };
+        assert!(begin.reads_session_key());
+        assert!(begin.wakes_helper());
+        assert!(WireCommand::RetryStoreKey.reads_session_key());
+        assert!(!WireCommand::RetryStoreKey.wakes_helper());
+        for command in [
+            WireCommand::Connect,
+            WireCommand::Disconnect,
+            WireCommand::AcknowledgeGate,
+            WireCommand::CancelLink,
+            WireCommand::LoadChats,
+        ] {
+            assert!(!command.reads_session_key(), "{}", command.kind());
+        }
+        assert!(WireCommand::AcknowledgeGate.wakes_helper());
+        assert!(!WireCommand::Connect.wakes_helper());
     }
 }
