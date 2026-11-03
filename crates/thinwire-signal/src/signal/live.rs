@@ -124,8 +124,8 @@ pub(super) struct Session {
     sent: Mutex<std::collections::HashMap<String, String>>,
     groups: Mutex<super::group::GroupKeys>,
     viewed: std::sync::Mutex<Option<String>>,
-    /// First-page cursors, keyed by chat id. `OpenChat` sends one on
-    /// `HistoryLoaded`, then drops it.
+    /// First-page cursors, keyed by chat id. Each `OpenChat` sends the
+    /// same cursor. The map keeps one value per chat for this session.
     history_resume: std::sync::Mutex<HashMap<String, thinwire_protocol::HistoryStoreCursor>>,
     /// The next worker loads a registration and does not start a new link.
     resume_only: AtomicBool,
@@ -147,21 +147,26 @@ impl Session {
         }
     }
 
-    fn stash_history_resume(&self, chat_id: String, cursor: thinwire_protocol::HistoryStoreCursor) {
+    fn history_resume_map(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, thinwire_protocol::HistoryStoreCursor>> {
+        // A poisoned lock still holds the cursors. A panic must not drop them.
         self.history_resume
             .lock()
-            .expect("history resume")
-            .insert(chat_id, cursor);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(super) fn take_history_resume(
+    fn stash_history_resume(&self, chat_id: String, cursor: thinwire_protocol::HistoryStoreCursor) {
+        self.history_resume_map().insert(chat_id, cursor);
+    }
+
+    /// The first-page cursor for `chat_id`. A second `OpenChat` returns the
+    /// same value. This does not remove it.
+    pub(super) fn history_resume_cursor(
         &self,
         chat_id: &str,
     ) -> Option<thinwire_protocol::HistoryStoreCursor> {
-        self.history_resume
-            .lock()
-            .expect("history resume")
-            .remove(chat_id)
+        self.history_resume_map().get(chat_id).cloned()
     }
 
     pub(super) fn set_resume_only(&self, resume_only: bool) {
@@ -2949,6 +2954,9 @@ fn cursor_for_page(
     shown: &[String],
 ) -> Option<HistoryStoreCursor> {
     let (runs, skipped) = skips.finish(shown, resume || !more);
+    // `resume` is true only when `oldest_scanned` is `Some`.
+    // The core reads `before_ms` only when `resume` is true.
+    // Zero is the value when this page scanned no row.
     (skipped > 0 || resume).then_some(HistoryStoreCursor {
         before_ms: oldest_scanned.unwrap_or(0),
         skipped,
@@ -7290,6 +7298,58 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         assert!(!rows.contains(&4));
         assert_eq!(rows.first().copied(), Some(2));
         assert_eq!(rows.last().copied(), Some(HISTORY_PAGE as u64 + 2));
+    }
+
+    /// A second `OpenChat` still has the first-page cursor. The map keeps it.
+    #[test]
+    fn a_second_open_keeps_the_first_page_cursor() {
+        let session = Session::new();
+        let cursor = thinwire_protocol::HistoryStoreCursor {
+            before_ms: 40,
+            skipped: 2,
+            resume: true,
+            runs: vec![thinwire_protocol::HistorySkipRun {
+                after_id: Some("9".into()),
+                skipped: 2,
+            }],
+        };
+        session.stash_history_resume("chat".into(), cursor.clone());
+        assert_eq!(session.history_resume_cursor("chat"), Some(cursor.clone()));
+        assert_eq!(session.history_resume_cursor("chat"), Some(cursor));
+        assert_eq!(session.history_resume_cursor("other"), None);
+    }
+
+    /// Unreadable rows older than the shown page are not counted on this page
+    /// when the next read will scan them. The next page counts them once.
+    #[test]
+    fn a_trailing_skip_is_counted_once_when_the_page_overflows() {
+        let mut skips = SkipRuns::new();
+        for n in (11..=60).rev() {
+            skips.kept(n.to_string());
+        }
+        skips.skip();
+        skips.skip();
+        skips.skip();
+        for n in (1..=10).rev() {
+            skips.kept(n.to_string());
+        }
+        let shown: Vec<String> = (11..=60).map(|n| n.to_string()).collect();
+        let (runs, skipped) = skips.finish(&shown, false);
+        assert!(
+            runs.is_empty(),
+            "an overflow page does not count rows the next read scans"
+        );
+        assert_eq!(skipped, 0);
+
+        let mut next = SkipRuns::new();
+        next.kept("10".into());
+        next.skip();
+        next.skip();
+        next.skip();
+        next.kept("1".into());
+        let (runs, skipped) = next.finish(&["1".into(), "10".into()], true);
+        assert_eq!(skipped, 3, "the next page counts those rows once");
+        assert_eq!(runs.len(), 1);
     }
 
     #[test]

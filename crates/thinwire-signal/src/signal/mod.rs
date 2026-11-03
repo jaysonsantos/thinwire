@@ -329,7 +329,7 @@ impl SignalAdapter {
             }
             #[cfg(feature = "signal-local")]
             Engine::Live(session) => {
-                let cursor = session.take_history_resume(conversation_id);
+                let cursor = session.history_resume_cursor(conversation_id);
                 emit_status(
                     events,
                     ProtocolId::Signal,

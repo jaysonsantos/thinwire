@@ -189,6 +189,17 @@ pub enum OlderState {
     StartOfChat,
 }
 
+/// One history page that records unreadable rows.
+struct UnreadablePage<'a> {
+    protocol: ProtocolId,
+    chat: &'a str,
+    topic: Option<MessageTopic>,
+    request_before: &'a str,
+    cursor: HistoryStoreCursor,
+    more: bool,
+    initial: bool,
+}
+
 /// One closed run of stored rows the thread could not read.
 ///
 /// The line is drawn once. `before_id` is the message the run sits older
@@ -1233,15 +1244,15 @@ impl Snapshot {
                     self.history_asked.remove(&key);
                     false
                 } else if let Some(cursor) = store_cursor {
-                    self.note_unreadable(
+                    self.note_unreadable(UnreadablePage {
                         protocol,
-                        &conversation_id,
+                        chat: &conversation_id,
                         topic,
-                        &before_message_id,
+                        request_before: &before_message_id,
                         cursor,
                         more,
-                        false,
-                    )
+                        initial: false,
+                    })
                 } else {
                     self.close_open_run(&key);
                     self.history_resume.remove(&key);
@@ -1290,7 +1301,15 @@ impl Snapshot {
                     let chat = key.1.clone();
                     let more =
                         cursor.resume || self.oldest_message_id(protocol, &chat, None).is_some();
-                    self.note_unreadable(protocol, &chat, None, "", cursor, more, true);
+                    self.note_unreadable(UnreadablePage {
+                        protocol,
+                        chat: &chat,
+                        topic: None,
+                        request_before: "",
+                        cursor,
+                        more,
+                        initial: true,
+                    });
                 }
             }
             AdapterEvent::ConversationRemoved { protocol, id } => {
@@ -2328,20 +2347,16 @@ impl Snapshot {
 
     /// Record one page's store cursor. `true` when the next page was queued
     /// at once, because this page held no rows.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one history page names the chat, the anchor, and the cursor"
-    )]
-    fn note_unreadable(
-        &mut self,
-        protocol: ProtocolId,
-        chat: &str,
-        topic: Option<MessageTopic>,
-        request_before: &str,
-        cursor: HistoryStoreCursor,
-        more: bool,
-        initial: bool,
-    ) -> bool {
+    fn note_unreadable(&mut self, page: UnreadablePage<'_>) -> bool {
+        let UnreadablePage {
+            protocol,
+            chat,
+            topic,
+            request_before,
+            cursor,
+            more,
+            initial,
+        } = page;
         let key = older_key(protocol, chat, topic);
         let oldest = self.oldest_message_id(protocol, chat, topic);
         let added = if initial {
