@@ -914,6 +914,7 @@ impl Core {
                 self.state.set_whatsapp_phone(value.expose().to_owned());
             }
             WhatsAppIntent::BeginLink => self.state.begin_whatsapp_link(phone),
+            WhatsAppIntent::LinkWithPhone => self.state.open_whatsapp_phone_link(phone),
             WhatsAppIntent::CancelLink => self.state.cancel_whatsapp_link(phone),
         }
     }
