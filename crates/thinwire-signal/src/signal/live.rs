@@ -3596,6 +3596,45 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         REJECTED_REGISTRATION.replacen("11111111-1111-1111-1111-111111111111", &aci.to_string(), 1)
     }
 
+    /// A live file or a pending file is a saved store. A retained folder
+    /// alone is not. The check does not open the file.
+    #[test]
+    fn a_pending_file_is_a_saved_store_and_retained_alone_is_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "thinwire-signal-present-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert!(
+            !session_store_present(&dir),
+            "an empty folder is not a store"
+        );
+        let retained = dir.join(super::RETAINED_DIR).join("aci");
+        std::fs::create_dir_all(&retained).expect("retained");
+        std::fs::write(retained.join("session.sqlite"), b"x").expect("retained file");
+        assert!(
+            !session_store_present(&dir),
+            "a retained file alone is not the live store"
+        );
+        std::fs::write(super::pending_store_path(&dir), b"x").expect("pending");
+        assert!(
+            session_store_present(&dir),
+            "a pending file is a saved store"
+        );
+        std::fs::remove_file(super::pending_store_path(&dir)).expect("drop pending");
+        assert!(!session_store_present(&dir));
+        std::fs::write(super::sqlite_store_path(&dir), b"x").expect("live");
+        assert!(
+            session_store_present(&dir),
+            "the live file is a saved store"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A store file is a linked account. A key denial marks it linked, then
     /// reports the denial. A first link has no file, so it stays unlinked.
     #[test]

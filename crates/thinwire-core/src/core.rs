@@ -371,6 +371,10 @@ impl Core {
     pub fn pump(&mut self) -> bool {
         // Expire first, then apply the queued events. A late answer then meets
         // an expired send, whatever the frontend's timing (PR #81 review).
+        // Record the keychain before those events. A denial in this pump
+        // then knows if the app keychain was already ready.
+        let keychain_ready = self.secrets.attach_settled() && !self.secrets.read_failed();
+        self.state.note_app_keychain_ready(keychain_ready);
         let expired = self.state.expire_sends();
         let mut applied = false;
         while let Ok(event) = self.events.try_recv() {
@@ -953,12 +957,17 @@ impl Core {
         let _ = intent;
     }
 
-    /// A saved Signal or WhatsApp account denied the session key. When the
-    /// OS keychain can be read, ask the helper to open that session again.
-    /// This sends `RetryStoreKey`. It does not send `BeginLink`.
+    /// A saved account denied the session key while the app keychain was
+    /// not settled. When that read succeeds, send `RetryStoreKey` once.
+    /// The flag is cleared by that send. A denial after the keychain is
+    /// ready does not arm it. The user clicks Retry for that denial.
+    /// This does not send `BeginLink`.
     fn resume_denied_store_keys(&mut self) {
         let ready = self.secrets.attach_settled() && !self.secrets.read_failed();
-        if !ready || !self.state.take_store_key_retry_due() {
+        if !ready {
+            return;
+        }
+        if !self.state.take_store_key_retry_due() {
             return;
         }
         self.state.retry_denied_store_keys();
@@ -1763,12 +1772,13 @@ mod tests {
         );
     }
 
-    /// Deny on a saved Signal session, then a keychain that can be read,
-    /// asks the helper to open that session. The command is `RetryStoreKey`.
-    /// It is not `BeginLink`, and the notice does not show again.
+    /// The app keychain is already settled. A saved-account denial does not
+    /// send `RetryStoreKey` by itself. The user's Retry click does. A second
+    /// denial still waits for that click. Link does not show the notice
+    /// again. Cancel still clears the saved hash.
     #[cfg(feature = "signal-local")]
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_denied_saved_signal_key_resumes_without_a_new_link_or_notice() {
+    async fn a_denied_saved_signal_key_waits_for_the_retry_click() {
         use crate::state::SignalScreen;
         use thinwire_protocol::{AccountState, AdapterEvent, StoreAccessReason};
 
@@ -1781,43 +1791,89 @@ mod tests {
         core.pump();
         while sent.try_recv().is_ok() {}
 
-        events_tx
-            .send(AdapterEvent::Account {
-                protocol: ProtocolId::Signal,
-                state: AccountState::Linked,
-            })
-            .expect("linked");
-        events_tx
-            .send(AdapterEvent::StoreAccess {
-                protocol: ProtocolId::Signal,
-                reason: StoreAccessReason::KeychainDenied,
-            })
-            .expect("denied");
-        core.pump();
-        let commands: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
-        assert!(
-            commands.iter().any(|command| matches!(
-                command,
-                AdapterCommand::RetryStoreKey {
-                    protocol: ProtocolId::Signal
+        let deny = || {
+            events_tx
+                .send(AdapterEvent::Account {
+                    protocol: ProtocolId::Signal,
+                    state: AccountState::Linked,
+                })
+                .expect("linked");
+            events_tx
+                .send(AdapterEvent::StoreAccess {
+                    protocol: ProtocolId::Signal,
+                    reason: StoreAccessReason::KeychainDenied,
+                })
+                .expect("denied");
+        };
+        let pumps =
+            |core: &mut Core, sent: &mut tokio::sync::mpsc::UnboundedReceiver<AdapterCommand>| {
+                let mut commands = Vec::new();
+                for _ in 0..5 {
+                    core.pump();
+                    commands.extend(std::iter::from_fn(|| sent.try_recv().ok()));
                 }
-            )),
-            "the saved session is opened again: {commands:?}"
-        );
+                commands
+            };
+
+        deny();
+        let idle = pumps(&mut core, &mut sent);
         assert!(
-            !commands
-                .iter()
-                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
-            "a key retry is not a new link: {commands:?}"
+            !idle.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "a settled keychain does not retry on its own: {idle:?}"
         );
-        assert_eq!(core.settings.signal_notice_version(), current);
-        assert_ne!(core.view().signal_screen, SignalScreen::Notice);
         assert!(
             core.view()
                 .accounts
                 .iter()
                 .any(|row| row.caps.id == ProtocolId::Signal && row.linked()),
             "a saved account stays linked"
+        );
+        assert_ne!(core.view().signal_screen, SignalScreen::Notice);
+        assert_eq!(core.settings.signal_notice_version(), current);
+
+        core.dispatch(Intent::RetryStoreKey(ProtocolId::Signal));
+        let clicked: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert_eq!(
+            clicked
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    AdapterCommand::RetryStoreKey {
+                        protocol: ProtocolId::Signal
+                    }
+                ))
+                .count(),
+            1,
+            "the Retry click sends one read: {clicked:?}"
+        );
+        assert!(
+            !clicked
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+            "Retry is not a new link: {clicked:?}"
+        );
+
+        deny();
+        let again = pumps(&mut core, &mut sent);
+        assert!(
+            !again.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "a second denial waits for another click: {again:?}"
+        );
+        core.dispatch(Intent::RetryStoreKey(ProtocolId::Signal));
+        let second: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert_eq!(
+            second
+                .iter()
+                .filter(|command| matches!(command, AdapterCommand::RetryStoreKey { .. }))
+                .count(),
+            1,
+            "the next Retry click still sends one read: {second:?}"
         );
 
         events_tx
@@ -1837,6 +1893,13 @@ mod tests {
         );
         assert_eq!(core.settings.signal_notice_version(), current);
         assert!(core.view().signal_notice_acknowledged());
+        core.dispatch(Intent::Signal(SignalIntent::CancelLink));
+        assert!(!core.view().signal_notice_acknowledged());
+        assert_eq!(
+            core.settings.signal_notice_version(),
+            0,
+            "Cancel still clears the saved hash"
+        );
     }
 
     /// A first link has no saved session. A key denial does not resume it
@@ -1953,6 +2016,35 @@ mod tests {
         assert_ne!(
             core.view().signal_screen,
             crate::state::SignalScreen::Notice
+        );
+
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("second denial");
+        let mut later = Vec::new();
+        for _ in 0..5 {
+            core.pump();
+            later.extend(std::iter::from_fn(|| sent.try_recv().ok()));
+        }
+        assert!(
+            !later.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "a denial after the keychain is ready waits for Retry: {later:?}"
+        );
+        core.dispatch(Intent::RetryStoreKey(ProtocolId::Signal));
+        let clicked: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert_eq!(
+            clicked
+                .iter()
+                .filter(|command| matches!(command, AdapterCommand::RetryStoreKey { .. }))
+                .count(),
+            1,
+            "the Retry click still sends one read: {clicked:?}"
         );
     }
 

@@ -585,9 +585,13 @@ pub struct Snapshot {
     keychain_failed: bool,
     /// The user asked to read the keychain again. The app runs it off the UI thread.
     keychain_retry: bool,
-    /// A saved account could not read its session key. The next pump sends
-    /// `RetryStoreKey` once the OS keychain read has succeeded.
+    /// A saved account could not read its session key while the app
+    /// keychain was not settled yet. One later pump sends `RetryStoreKey`
+    /// when that read succeeds. A denial after the keychain is ready does
+    /// not set this. The user clicks Retry for that one.
     store_key_retry_due: bool,
+    /// The app keychain could be read at the start of this pump.
+    app_keychain_ready: bool,
     /// Protocols whose chat list is loading.
     chat_list_loading: HashSet<ProtocolId>,
     /// Chats whose history is loading, per protocol.
@@ -895,6 +899,7 @@ impl Snapshot {
             keychain_failed: false,
             keychain_retry: false,
             store_key_retry_due: false,
+            app_keychain_ready: false,
             chat_list_loading: HashSet::new(),
             history_loading: HashSet::new(),
             older_loading: HashSet::new(),
@@ -1356,9 +1361,13 @@ impl Snapshot {
                     row.detail = detail.to_string();
                     row.store_access = Some(reason);
                 }
-                // A saved account. Retry once the keychain can be read.
-                // A first link has no session, so it does not resume itself.
-                if saved && reason == StoreAccessReason::KeychainDenied {
+                // A saved account, and the app keychain was not settled yet.
+                // One later pump sends RetryStoreKey when that read succeeds.
+                // A denial after the keychain is ready waits for the user's
+                // Retry click. A first link has no session, so it does not
+                // resume itself.
+                if saved && reason == StoreAccessReason::KeychainDenied && !self.app_keychain_ready
+                {
                     self.store_key_retry_due = true;
                 }
             }
@@ -3769,6 +3778,12 @@ impl Snapshot {
     /// One saved key denial is waiting for a keychain that can be read.
     pub(crate) fn take_store_key_retry_due(&mut self) -> bool {
         std::mem::take(&mut self.store_key_retry_due)
+    }
+
+    /// The app keychain state at the start of this pump. A saved-key denial
+    /// arms an automatic retry only when this is false.
+    pub(crate) fn note_app_keychain_ready(&mut self, ready: bool) {
+        self.app_keychain_ready = ready;
     }
 
     /// The helper program of this protocol is not installed.

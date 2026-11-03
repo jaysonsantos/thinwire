@@ -320,7 +320,9 @@ impl<B: LinkBackend> Owner<B> {
     /// The new open tries the move-aside again when the key is wrong.
     async fn retry_key(&mut self) {
         let Some(pairing) = self.last_pairing else {
-            self.fail(StartError::KeychainDenied { saved: false });
+            // No pairing id yet. A store file on disk is still a saved account.
+            let saved = super::path::whatsapp_device_store_path().is_ok_and(|path| path.is_file());
+            self.fail(StartError::KeychainDenied { saved });
             return;
         };
         let phone = self.last_phone.clone();
