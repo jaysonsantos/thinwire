@@ -17,6 +17,8 @@ mod time;
 mod wake;
 
 #[cfg(feature = "signal-local")]
+mod cipher;
+#[cfg(feature = "signal-local")]
 mod live;
 #[cfg(feature = "signal-local")]
 mod owner;
@@ -181,6 +183,25 @@ impl SignalAdapter {
             self.owner_handle().begin(generation, events);
             return Ok(());
         }
+        self.link_device(events, generation)
+    }
+
+    /// Read the session key again and open the saved session. This is not a
+    /// new link. A wrong key tries the move-aside again and deletes nothing.
+    fn retry_store_key(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        #[cfg(feature = "signal-local")]
+        if matches!(self.engine, Engine::Live(_)) {
+            self.owner_handle().retry_key(events);
+            return Ok(());
+        }
+        let _ = events;
+        Err(AdapterError::Unavailable {
+            protocol: ProtocolId::Signal,
+            reason: "Signal is not reading a session key",
+        })
+    }
+
+    fn link_device(&mut self, events: &EventTx, generation: u64) -> Result<(), AdapterError> {
         match &mut self.engine {
             Engine::Sync(device) => match device.link() {
                 Ok(Some(url)) => {
@@ -453,6 +474,14 @@ fn link_owner(session: &Arc<live::Session>) -> owner::Handle {
     owner::Handle::spawn(Arc::clone(&session), Box::new(spawn_worker))
 }
 
+/// Stack of the `thinwire-signal` thread.
+///
+/// The worker future value is small. A debug build of the Presage receive
+/// path still uses more than the 2 MiB default stack after `open_chat` /
+/// `view_chat`. 16 MiB is the size that kept that build up.
+#[cfg(feature = "signal-local")]
+const WORKER_STACK: usize = 16 * 1024 * 1024;
+
 #[cfg(feature = "signal-local")]
 fn spawn_worker(session: &Arc<live::Session>, events: &EventTx) -> Option<SignalWorker> {
     let resume_only = session.resume_only();
@@ -465,6 +494,8 @@ fn spawn_worker(session: &Arc<live::Session>, events: &EventTx) -> Option<Signal
     let (abort_tx, abort_rx) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::Builder::new()
         .name("thinwire-signal".into())
+        // Debug Presage calls use more than the 2 MiB default stack.
+        .stack_size(WORKER_STACK)
         .spawn(move || {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -478,15 +509,11 @@ fn spawn_worker(session: &Arc<live::Session>, events: &EventTx) -> Option<Signal
                 );
                 return;
             };
+            // Keep the worker future on the heap. This stack is for the poll.
+            let worker = Box::pin(live::run(session, token, wake, task_events, resume_only));
             let local = tokio::task::LocalSet::new();
             local.block_on(&runtime, async move {
-                let task = tokio::task::spawn_local(live::run(
-                    session,
-                    token,
-                    wake,
-                    task_events,
-                    resume_only,
-                ));
+                let task = tokio::task::spawn_local(worker);
                 let _ = abort_tx.send(task.abort_handle());
                 let _ = task.await;
             });
@@ -596,6 +623,9 @@ impl ProtocolAdapter for SignalAdapter {
             | AdapterCommand::SignalCancelLink => self.cancel_link(events),
             AdapterCommand::SignalAcknowledgeNotice => self.acknowledge(events),
             AdapterCommand::SignalBeginLink { generation } => self.begin_link(events, generation),
+            AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::Signal,
+            } => self.retry_store_key(events),
             AdapterCommand::ResendMessage {
                 protocol: ProtocolId::Signal,
                 conversation_id,
@@ -716,13 +746,13 @@ mod tests {
             .join("\n");
         assert!(
             signal_local.contains("libsqlite3-sys"),
-            "signal-local enables bundled sqlite"
+            "signal-local enables bundled sqlcipher"
         );
-        assert!(manifest.contains("features = [\n  \"bundled\",\n]"));
+        assert!(manifest.contains("features = [\n  \"bundled-sqlcipher-vendored-openssl\",\n]"));
         assert!(
             manifest.contains("presage-store-sqlite")
                 && manifest.contains("default-features = false"),
-            "SQLCipher stays off"
+            "presage-store-sqlite does not turn on its own SQLCipher feature"
         );
     }
 
@@ -1249,6 +1279,78 @@ mod tests {
                 state: AccountState::Unlinked,
             }
         ));
+    }
+
+    /// The `thinwire-signal` thread must name its stack. The default is 2 MiB.
+    #[test]
+    fn the_signal_worker_thread_sets_its_stack_size() {
+        let src = include_str!("mod.rs");
+        assert!(
+            src.contains(".stack_size(WORKER_STACK)"),
+            "the thinwire-signal thread must set WORKER_STACK"
+        );
+    }
+
+    /// Build the worker future on the worker stack, and run open and view there.
+    ///
+    /// A stack overflow aborts the process, so this test fails the run when
+    /// the debug future does not fit `WORKER_STACK`. A full linked Presage
+    /// session is not available here. The future value is the part this
+    /// thread has to build before the task stores it on the heap.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn the_worker_open_and_view_path_fits_the_worker_stack() {
+        fn size_of_run<F, Fut>(_: F) -> usize
+        where
+            F: Fn(
+                std::sync::Arc<live::Session>,
+                u64,
+                std::sync::Arc<tokio::sync::Notify>,
+                thinwire_protocol::EventTx,
+                bool,
+            ) -> Fut,
+            Fut: std::future::Future,
+        {
+            std::mem::size_of::<Fut>()
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("thinwire-signal".into())
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                let (events, mut event_rx) = unbounded_channel();
+                let mut adapter = SignalAdapter::new();
+                adapter
+                    .handle(
+                        AdapterCommand::OpenChat {
+                            protocol: ProtocolId::Signal,
+                            conversation_id: "chat-1".into(),
+                        },
+                        &events,
+                    )
+                    .expect("open");
+                adapter.view_chat(Some("chat-1"), &events);
+                adapter.view_chat(None, &events);
+                let _ = event_rx.try_recv();
+
+                let size = size_of_run(live::run);
+                let session = std::sync::Arc::new(live::Session::new());
+                let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+                let (task_events, _task_rx) = unbounded_channel();
+                drop(live::run(session, 1, wake, task_events, true));
+                tx.send(size).expect("size");
+            })
+            .expect("worker thread");
+        thread
+            .join()
+            .expect("the worker stack holds the open and view path");
+        let size = rx.recv().expect("size");
+        assert!(
+            size < WORKER_STACK / 2,
+            "the worker future is {size} bytes; raise WORKER_STACK"
+        );
+        println!("worker future {size} bytes; worker stack {WORKER_STACK} bytes");
     }
 }
 

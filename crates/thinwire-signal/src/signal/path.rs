@@ -118,6 +118,11 @@ pub fn lock_session() -> Result<SessionLock, SessionLockError> {
     lock_session_dir(&dir)
 }
 
+#[cfg(all(test, feature = "signal-local"))]
+pub(crate) fn lock_session_at(dir: &Path) -> Result<SessionLock, SessionLockError> {
+    lock_session_dir(dir)
+}
+
 fn lock_session_dir(dir: &Path) -> Result<SessionLock, SessionLockError> {
     let io = |error: std::io::Error| SessionLockError::Io(error.kind());
     prepare_session_dir(dir).map_err(io)?;

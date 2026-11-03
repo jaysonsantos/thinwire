@@ -23,4 +23,5 @@ pub use secret::SecretText;
 pub use wire::{
     AppLine, HelperLine, HelperRefusal, PROTOCOL_VERSION, WireAccountState, WireArrival,
     WireCommand, WireConversation, WireDelivery, WireEvent, WireMessage, WireProtocol, WireStatus,
+    WireStoreAccess,
 };

@@ -30,6 +30,8 @@ test-support = []
 [dependencies]
 chrono.workspace = true
 dirs.workspace = true
+# Random bytes for a Signal or WhatsApp session key. The key stays in the OS keychain.
+getrandom = "0.4"
 keyring-core.workspace = true
 thinwire-protocol.workspace = true
 tokio.workspace = true
