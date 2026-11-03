@@ -23,6 +23,11 @@ app_features="${app_features%,}"
 cargo clippy "${app_packages[@]}" --features "$app_features" --all-targets -- -D warnings
 cargo test "${app_packages[@]}" --features "$app_features"
 
+# SQLCipher migration. The default workspace test stays feature-off.
+# The app build above does not turn this feature on.
+cargo clippy -p thinwire-protocol --features session-cipher --all-targets -- -D warnings
+cargo test -p thinwire-protocol --features session-cipher
+
 # The AGPL helper with its WhatsApp client. Its tests start the real helper
 # process. No test starts a pairing, so no test opens a network session.
 cargo clippy -p thinwire-whatsapp --features whatsapp-web --all-targets -- -D warnings

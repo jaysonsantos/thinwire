@@ -65,7 +65,9 @@ It holds:
 - The thinwire source of ${ref}. The helper crates are
   crates/thinwire-whatsapp and crates/thinwire-signal.
 - Every dependency in vendor/, from cargo vendor. This includes whatsapp-rust,
-  wacore-libsignal, presage, and libsignal.
+  wacore-libsignal, presage, and libsignal. vendor/ also holds the SQLCipher
+  amalgamation (libsqlite3-sys) and the OpenSSL source (openssl-src). The
+  helpers link both.
 - .cargo/config.toml, which points cargo at vendor/.
 
 Build the WhatsApp helper with the Rust toolchain of rust-toolchain.toml:
@@ -111,5 +113,25 @@ for vendored in wacore-libsignal whatsapp-rust presage presage-store-sqlite libs
     exit 1
   fi
 done
+for needed in \
+  "${name}/vendor/libsqlite3-sys-" \
+  "${name}/vendor/openssl-src-"; do
+  if ! grep -qE "^${needed}[^/]+/" <<<"$listing"; then
+    echo "the source tarball is missing ${needed}" >&2
+    exit 1
+  fi
+done
+if ! grep -qE "^${name}/vendor/libsqlite3-sys-[^/]+/sqlcipher/sqlite3.c$" <<<"$listing"; then
+  echo "the source tarball is missing the SQLCipher amalgamation" >&2
+  exit 1
+fi
+if ! grep -qE "^${name}/vendor/libsqlite3-sys-[^/]+/sqlcipher/LICENSE$" <<<"$listing"; then
+  echo "the source tarball is missing the SQLCipher license" >&2
+  exit 1
+fi
+if ! grep -qE "^${name}/vendor/openssl-src-[^/]+/openssl/LICENSE.txt$" <<<"$listing"; then
+  echo "the source tarball is missing the OpenSSL license" >&2
+  exit 1
+fi
 
 echo "Source tarball: ${archive}"
