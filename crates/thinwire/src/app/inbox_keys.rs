@@ -9,7 +9,7 @@ use thinwire_core::state::test_support::{
 use thinwire_core::{Intent, View};
 use thinwire_protocol::{
     AccountState, AdapterEvent, ChatMessage, Delivery, HelperFault, HelperState, MessageLink,
-    ProtocolId,
+    OutgoingUpdate, ProtocolId, outgoing_delivery,
 };
 
 use super::theme;
@@ -104,6 +104,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
             Intent::ShowNotice(protocol) => state.snapshot.open_notice_review(protocol),
             Intent::CloseNotice => state.snapshot.close_notice_review(),
+            Intent::Retry { message_id } => state.snapshot.retry_send(&message_id),
             Intent::MoveInbox { delta } => state.snapshot.move_inbox_selection(delta),
             Intent::FocusInbox { id } => state.snapshot.focus_inbox_row(id),
             Intent::SetChatMute {
@@ -771,6 +772,140 @@ fn a_pending_message_keeps_the_time_on_the_last_line() {
         sending.rect().top() + 2.0 >= time.rect().bottom(),
         "Sending… sits under the time"
     );
+}
+
+/// Defensive marks. The succeeded object here is still pending. `td_api.tl`
+/// describes that message as sent (`sending_state` null). The glyphs and
+/// the Retry button are what this test checks.
+#[test]
+fn outgoing_telegram_marks_follow_send_read_and_failure() {
+    let server = 1_048_576_i64;
+    let build = harness;
+    let mut state = InboxUi::ready();
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: outgoing_row(100, "outbox-line", Delivery::Pending),
+    });
+    let mut harness = build(state);
+    harness.run();
+    harness.get_by_role_and_label(egui::accesskit::Role::Label, "Sending…");
+    assert_eq!(label_count(&harness, "outbox-line"), 1);
+
+    let delivery = outgoing_delivery(
+        OutgoingUpdate::Succeeded,
+        Delivery::Pending,
+        true,
+        server,
+        0,
+    );
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing_row(server, "outbox-line", delivery),
+        });
+    harness.run();
+    assert!(harness.query_by_label("Sending…").is_none());
+    assert_mark(&harness, "Sent", "✓");
+    assert_eq!(label_count(&harness, "outbox-line"), 1);
+
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::OutboxRead {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            last_read_message_id: server,
+        });
+    harness.run();
+    assert_mark(&harness, "Read", "✓✓");
+    assert!(access_name_count(&harness, "Sent") == 0);
+    assert_eq!(label_count(&harness, "outbox-line"), 1);
+
+    let mut failed = InboxUi::ready();
+    failed.snapshot.apply(AdapterEvent::MessageReceived {
+        message: outgoing_row(100, "failed-line", Delivery::Pending),
+    });
+    let failed_delivery =
+        outgoing_delivery(OutgoingUpdate::Failed, Delivery::Pending, true, 101, 0);
+    failed.snapshot.apply(AdapterEvent::MessageReplaced {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+        old_id: "telegram:1:100".into(),
+        message: outgoing_row(101, "failed-line", failed_delivery),
+    });
+    let mut harness = build(failed);
+    harness.run();
+    harness.get_by_role_and_label(egui::accesskit::Role::Label, "Not sent.");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Retry")
+        .click();
+    // A send in flight shows the busy spinner, so `run` does not settle.
+    // The click frame applies Retry after the bubble is painted. The next
+    // frame shows "Sending…".
+    harness.step();
+    harness.step();
+    assert_eq!(
+        harness.state().snapshot.selected_messages()[0].delivery,
+        Delivery::Pending
+    );
+    assert!(
+        harness
+            .state_mut()
+            .snapshot
+            .take_commands()
+            .iter()
+            .any(|command| matches!(
+                command,
+                thinwire_protocol::AdapterCommand::ResendMessage { message_id, .. }
+                    if message_id == "telegram:1:101"
+            ))
+    );
+    // The bubble says Sending…. The status line does not repeat it.
+    assert_eq!(label_count(&harness, "Sending…"), 1);
+}
+
+/// The access name of a delivery mark. A `Role::Label` stores its spoken
+/// name in the accesskit label and the glyph in the value. `By::label`
+/// reads the value, so this query reads the label.
+fn access_name_count(harness: &Harness<'_, InboxUi>, name: &str) -> usize {
+    harness
+        .query_all(By::new().predicate({
+            let name = name.to_owned();
+            move |node| node.label().as_deref() == Some(name.as_str())
+        }))
+        .count()
+}
+
+fn assert_mark(harness: &Harness<'_, InboxUi>, name: &str, glyph: &str) {
+    let nodes: Vec<_> = harness
+        .query_all(By::new().predicate({
+            let name = name.to_owned();
+            move |node| node.label().as_deref() == Some(name.as_str())
+        }))
+        .collect();
+    assert_eq!(nodes.len(), 1, "{name}");
+    assert_eq!(
+        nodes[0].accesskit_node().value().as_deref(),
+        Some(glyph),
+        "{name}"
+    );
+}
+
+fn label_count(harness: &Harness<'_, InboxUi>, label: &str) -> usize {
+    harness
+        .query_all(By::new().role(egui::accesskit::Role::Label).label(label))
+        .count()
+}
+
+fn outgoing_row(id: i64, body: &str, delivery: Delivery) -> ChatMessage {
+    let mut message = chat_message(&format!("telegram:1:{id}"), body, 1_790_300_000);
+    message.sender = "you".into();
+    message.outbound = true;
+    message.delivery = delivery;
+    message
 }
 
 #[test]

@@ -6,6 +6,8 @@ mod dock;
 mod inbox_keys;
 mod links;
 mod motion;
+#[cfg(any(feature = "signal-local", feature = "whatsapp-web"))]
+mod pairing_qr;
 mod photos;
 mod reduce_motion;
 #[cfg(feature = "signal-local")]

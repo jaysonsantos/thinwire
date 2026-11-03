@@ -19,7 +19,7 @@ slack-oauth = ["thinwire-core/slack-oauth", "thinwire-protocol/slack-oauth"]
 # WhatsApp through the `thinwire-whatsapp-helper` process (ADR 0013). The
 # app does not link the AGPL client: it talks to the helper over a pipe.
 # Release builds turn this on. The default UI stays feature-off.
-whatsapp-web = ["thinwire-core/whatsapp-web"]
+whatsapp-web = ["dep:qrcode", "thinwire-core/whatsapp-web"]
 discord-bot = ["thinwire-core/discord-bot", "thinwire-protocol/discord-bot"]
 # Signal through the `thinwire-signal-helper` process (ADR 0013, #248). The
 # app does not link the AGPL client: it talks to the helper over a pipe.
@@ -53,7 +53,9 @@ winit.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# QR for the Signal provisioning URI. Feature `signal-local` only.
+# QR for the Signal provisioning URI and the WhatsApp pairing payload.
+# Features `signal-local` and `whatsapp-web` only. No new crate: `qrcode`
+# is already on the Signal feature (ADR 0013 license list is unchanged).
 qrcode = { version = "0.14", optional = true, default-features = false }
 
 # Linux: the settings portal reports reduce-motion and sends SettingChanged.
