@@ -34,7 +34,7 @@ pub enum Intent {
     /// Move the inbox highlight to the row that has keyboard focus.
     /// This does not open the chat.
     FocusInbox { id: String },
-    /// Limit the inbox to one protocol tab, or show All.
+    /// Select the account of one top-bar pill. There is no combined inbox.
     SetFilter(InboxFilter),
     /// Inbox search text. Matches chat title and participant only.
     /// `SecretText` keeps the typed text out of `Debug`.
@@ -96,6 +96,11 @@ pub enum Intent {
     /// Start the helper process of this protocol again (ADR 0013). It acts
     /// only while the account row shows "Helper stopped."
     RestartHelper(ProtocolId),
+    /// Open the README risk text for an unofficial account. This does not
+    /// start or cancel a link.
+    ShowNotice(ProtocolId),
+    /// Close the read-only risk text.
+    CloseNotice,
     /// Download one photo that is on screen. The core sends one request
     /// until that file finishes or fails.
     LoadPhoto {
@@ -174,6 +179,8 @@ pub enum WhatsAppIntent {
     SetPhone(SecretText),
     /// Start linked-device pairing. The phone goes to the memory vault only.
     BeginLink,
+    /// Leave the QR and open the phone pair-code field. The risk gate stays accepted.
+    LinkWithPhone,
     /// Stop pairing and drop the risk acknowledgement.
     CancelLink,
 }

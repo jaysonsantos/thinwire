@@ -8,7 +8,8 @@ use thinwire_core::state::test_support::{
 };
 use thinwire_core::{Intent, View};
 use thinwire_protocol::{
-    AdapterEvent, ChatMessage, Delivery, HelperFault, HelperState, MessageLink, ProtocolId,
+    AccountState, AdapterEvent, ChatMessage, Delivery, HelperFault, HelperState, MessageLink,
+    OutgoingUpdate, ProtocolId, outgoing_delivery,
 };
 
 use super::theme;
@@ -101,6 +102,10 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
                 state.snapshot.select_conversation(id);
             }
             Intent::RestartHelper(protocol) => state.restarts.push(protocol),
+            Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
+            Intent::ShowNotice(protocol) => state.snapshot.open_notice_review(protocol),
+            Intent::CloseNotice => state.snapshot.close_notice_review(),
+            Intent::Retry { message_id } => state.snapshot.retry_send(&message_id),
             Intent::MoveInbox { delta } => state.snapshot.move_inbox_selection(delta),
             Intent::FocusInbox { id } => state.snapshot.focus_inbox_row(id),
             Intent::SetChatMute {
@@ -211,6 +216,186 @@ fn a_missing_signal_helper_row_says_reinstall() {
     harness.get_by_label("Helper missing");
     harness.get_by_label("Signal helper missing. Reinstall thinwire.");
     assert!(harness.query_by_label("Restart").is_none());
+}
+
+/// The chat list is the middle column of the selected account. It is to the
+/// right of the account rail, and it is not stacked under that rail.
+#[test]
+fn the_chat_list_sits_beside_the_account_rail() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    let account = harness
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Button)
+                .label("Telegram"),
+        )
+        .map(|node| node.rect())
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("account rail");
+    let chat = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Ada")
+        .rect();
+    assert!(
+        chat.left() >= account.right() - 1.0,
+        "chat {:?} account {:?}",
+        chat,
+        account
+    );
+    assert!(
+        chat.top() < account.bottom(),
+        "the chat list is under the account list: chat {:?} account {:?}",
+        chat,
+        account
+    );
+}
+
+/// A linked unofficial account shows Unofficial. A click opens the README text
+/// and does not start a link.
+#[test]
+fn unofficial_opens_the_notice() {
+    let mut state = InboxUi::ready();
+    show_protocol(&mut state.snapshot, ProtocolId::WhatsApp);
+    state.snapshot.apply(AdapterEvent::Account {
+        protocol: ProtocolId::WhatsApp,
+        state: AccountState::Linked,
+    });
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Unofficial")
+        .click();
+    harness.run();
+    assert_eq!(
+        harness.state().snapshot.notice_review(),
+        Some(ProtocolId::WhatsApp)
+    );
+    harness.get_by_label(thinwire_protocol::CRITIC_BULLET_1);
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Close")
+        .click();
+    harness.run();
+    assert!(harness.state().snapshot.notice_review().is_none());
+}
+
+/// The account info view keeps Ban risk. It opens the same README text.
+#[test]
+fn ban_risk_opens_the_same_notice() {
+    let mut state = InboxUi::ready();
+    show_protocol(&mut state.snapshot, ProtocolId::WhatsApp);
+    state.snapshot.apply(AdapterEvent::Account {
+        protocol: ProtocolId::WhatsApp,
+        state: AccountState::Linked,
+    });
+    state.snapshot.select_protocol(ProtocolId::WhatsApp);
+    let mut harness = harness(state);
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Ban risk")
+        .click();
+    harness.run();
+    assert_eq!(
+        harness.state().snapshot.notice_review(),
+        Some(ProtocolId::WhatsApp)
+    );
+    harness.get_by_label(thinwire_protocol::CRITIC_BULLET_1);
+    assert!(
+        harness.query_all_by_label("Ban risk").count() >= 2,
+        "the button and the window title both say Ban risk"
+    );
+}
+
+/// Signal account info says Risk. The review window uses that title and
+/// omits the README sentence that only describes the screen.
+#[test]
+fn signal_risk_opens_the_same_notice() {
+    use thinwire_core::signal_notice::SIGNAL_NOTICE_RISK;
+
+    let mut state = InboxUi::ready();
+    show_protocol(&mut state.snapshot, ProtocolId::Signal);
+    state.snapshot.apply(AdapterEvent::Account {
+        protocol: ProtocolId::Signal,
+        state: AccountState::Linked,
+    });
+    state.snapshot.select_protocol(ProtocolId::Signal);
+    let mut harness = harness(state);
+    harness.run();
+    assert!(
+        harness
+            .query_by_role_and_label(egui::accesskit::Role::Button, "Ban risk")
+            .is_none()
+    );
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Risk")
+        .click();
+    harness.run();
+    assert_eq!(
+        harness.state().snapshot.notice_review(),
+        Some(ProtocolId::Signal)
+    );
+    harness.get_by_label(SIGNAL_NOTICE_RISK);
+    assert!(
+        harness.query_all_by_label("Risk").count() >= 2,
+        "the button and the window title both say Risk"
+    );
+    assert!(
+        harness
+            .query_by_label(
+                "The app shows a full-screen notice with this text before any provisioning QR code.",
+            )
+            .is_none()
+    );
+}
+
+/// "Loading chats…" while the linked account still syncs. "No chats yet."
+/// after that sync, when the account has no chats.
+#[test]
+fn the_middle_column_empty_states_are_on_screen() {
+    use thinwire_core::state::{LOADING_CHATS_STATUS, NO_CHATS_YET};
+
+    let mut loading = InboxUi::ready();
+    clear_telegram_chats(&mut loading);
+    loading.snapshot.refresh_visible();
+    assert_eq!(
+        loading.snapshot.inbox_placeholder(),
+        Some(LOADING_CHATS_STATUS)
+    );
+    let mut loading_ui = harness(loading);
+    // The loading row draws a spinner, so `run` does not settle.
+    loading_ui.run_steps(2);
+    let account = loading_ui
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Button)
+                .label("Telegram"),
+        )
+        .map(|node| node.rect())
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("account rail");
+    let in_the_chat_column = loading_ui
+        .query_all(By::new().label(LOADING_CHATS_STATUS))
+        .any(|node| node.rect().left() >= account.right() - 1.0);
+    assert!(in_the_chat_column, "Loading chats… is in the middle column");
+
+    let mut empty = InboxUi::ready();
+    clear_telegram_chats(&mut empty);
+    empty.snapshot.apply(AdapterEvent::ChatListLoaded {
+        protocol: ProtocolId::Telegram,
+    });
+    assert_eq!(empty.snapshot.inbox_placeholder(), Some(NO_CHATS_YET));
+    let mut empty_ui = harness(empty);
+    empty_ui.run_steps(2);
+    empty_ui.get_by_label(NO_CHATS_YET);
+    assert!(empty_ui.query_by_label(LOADING_CHATS_STATUS).is_none());
+}
+
+fn clear_telegram_chats(state: &mut InboxUi) {
+    for id in ["telegram:1", "telegram:2"] {
+        state.snapshot.apply(AdapterEvent::ConversationRemoved {
+            protocol: ProtocolId::Telegram,
+            id: id.into(),
+        });
+    }
 }
 
 /// A helper that runs changes nothing on the row.
@@ -589,6 +774,140 @@ fn a_pending_message_keeps_the_time_on_the_last_line() {
         sending.rect().top() + 2.0 >= time.rect().bottom(),
         "Sending… sits under the time"
     );
+}
+
+/// Defensive marks. The succeeded object here is still pending. `td_api.tl`
+/// describes that message as sent (`sending_state` null). The glyphs and
+/// the Retry button are what this test checks.
+#[test]
+fn outgoing_telegram_marks_follow_send_read_and_failure() {
+    let server = 1_048_576_i64;
+    let build = harness;
+    let mut state = InboxUi::ready();
+    state.snapshot.apply(AdapterEvent::MessageReceived {
+        message: outgoing_row(100, "outbox-line", Delivery::Pending),
+    });
+    let mut harness = build(state);
+    harness.run();
+    harness.get_by_role_and_label(egui::accesskit::Role::Label, "Sending…");
+    assert_eq!(label_count(&harness, "outbox-line"), 1);
+
+    let delivery = outgoing_delivery(
+        OutgoingUpdate::Succeeded,
+        Delivery::Pending,
+        true,
+        server,
+        0,
+    );
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "telegram:1:100".into(),
+            message: outgoing_row(server, "outbox-line", delivery),
+        });
+    harness.run();
+    assert!(harness.query_by_label("Sending…").is_none());
+    assert_mark(&harness, "Sent", "✓");
+    assert_eq!(label_count(&harness, "outbox-line"), 1);
+
+    harness
+        .state_mut()
+        .snapshot
+        .apply(AdapterEvent::OutboxRead {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            last_read_message_id: server,
+        });
+    harness.run();
+    assert_mark(&harness, "Read", "✓✓");
+    assert!(access_name_count(&harness, "Sent") == 0);
+    assert_eq!(label_count(&harness, "outbox-line"), 1);
+
+    let mut failed = InboxUi::ready();
+    failed.snapshot.apply(AdapterEvent::MessageReceived {
+        message: outgoing_row(100, "failed-line", Delivery::Pending),
+    });
+    let failed_delivery =
+        outgoing_delivery(OutgoingUpdate::Failed, Delivery::Pending, true, 101, 0);
+    failed.snapshot.apply(AdapterEvent::MessageReplaced {
+        protocol: ProtocolId::Telegram,
+        conversation_id: "telegram:1".into(),
+        old_id: "telegram:1:100".into(),
+        message: outgoing_row(101, "failed-line", failed_delivery),
+    });
+    let mut harness = build(failed);
+    harness.run();
+    harness.get_by_role_and_label(egui::accesskit::Role::Label, "Not sent.");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Retry")
+        .click();
+    // A send in flight shows the busy spinner, so `run` does not settle.
+    // The click frame applies Retry after the bubble is painted. The next
+    // frame shows "Sending…".
+    harness.step();
+    harness.step();
+    assert_eq!(
+        harness.state().snapshot.selected_messages()[0].delivery,
+        Delivery::Pending
+    );
+    assert!(
+        harness
+            .state_mut()
+            .snapshot
+            .take_commands()
+            .iter()
+            .any(|command| matches!(
+                command,
+                thinwire_protocol::AdapterCommand::ResendMessage { message_id, .. }
+                    if message_id == "telegram:1:101"
+            ))
+    );
+    // The bubble says Sending…. The status line does not repeat it.
+    assert_eq!(label_count(&harness, "Sending…"), 1);
+}
+
+/// The access name of a delivery mark. A `Role::Label` stores its spoken
+/// name in the accesskit label and the glyph in the value. `By::label`
+/// reads the value, so this query reads the label.
+fn access_name_count(harness: &Harness<'_, InboxUi>, name: &str) -> usize {
+    harness
+        .query_all(By::new().predicate({
+            let name = name.to_owned();
+            move |node| node.label().as_deref() == Some(name.as_str())
+        }))
+        .count()
+}
+
+fn assert_mark(harness: &Harness<'_, InboxUi>, name: &str, glyph: &str) {
+    let nodes: Vec<_> = harness
+        .query_all(By::new().predicate({
+            let name = name.to_owned();
+            move |node| node.label().as_deref() == Some(name.as_str())
+        }))
+        .collect();
+    assert_eq!(nodes.len(), 1, "{name}");
+    assert_eq!(
+        nodes[0].accesskit_node().value().as_deref(),
+        Some(glyph),
+        "{name}"
+    );
+}
+
+fn label_count(harness: &Harness<'_, InboxUi>, label: &str) -> usize {
+    harness
+        .query_all(By::new().role(egui::accesskit::Role::Label).label(label))
+        .count()
+}
+
+fn outgoing_row(id: i64, body: &str, delivery: Delivery) -> ChatMessage {
+    let mut message = chat_message(&format!("telegram:1:{id}"), body, 1_790_300_000);
+    message.sender = "you".into();
+    message.outbound = true;
+    message.delivery = delivery;
+    message
 }
 
 #[test]
@@ -1178,7 +1497,8 @@ fn a_scrolled_inbox_keeps_the_row_under_the_pointer() {
     let mut harness = harness(state);
     harness.run();
     let start = row_top(&harness, "Ada");
-    let inbox_point = egui::pos2(120.0, 480.0);
+    // The chat list is the middle column. Hover a row in that column.
+    let inbox_point = row_rect(&harness, "Ada").center();
     harness.hover_at(inbox_point);
     harness.event(egui::Event::MouseWheel {
         unit: egui::MouseWheelUnit::Point,

@@ -715,6 +715,8 @@ impl Core {
                 }
             }
             Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
+            Intent::ShowNotice(protocol) => self.state.open_notice_review(protocol),
+            Intent::CloseNotice => self.state.close_notice_review(),
             Intent::LoadPhoto {
                 protocol,
                 conversation_id,
@@ -912,6 +914,7 @@ impl Core {
                 self.state.set_whatsapp_phone(value.expose().to_owned());
             }
             WhatsAppIntent::BeginLink => self.state.begin_whatsapp_link(phone),
+            WhatsAppIntent::LinkWithPhone => self.state.open_whatsapp_phone_link(phone),
             WhatsAppIntent::CancelLink => self.state.cancel_whatsapp_link(phone),
         }
     }

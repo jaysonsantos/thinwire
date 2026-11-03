@@ -355,11 +355,12 @@ mod jump_to_latest {
     }
 }
 
-/// Header text, the account status dot, and the inbox avatar share one x.
+/// The account rail and the chat column are side by side.
+/// In the chat column, the header and the inbox avatar share one x.
 /// The chat title sits one [`theme::space::S`] past the avatar.
 /// The account unread badge sits inside the highlight by [`theme::ROW_INSET`].
 #[test]
-fn sidebar_content_lines_up_and_the_account_badge_clears_the_highlight() {
+fn the_chat_list_sits_beside_the_account_rail() {
     for theme in [ThemeMode::Light, ThemeMode::Dark] {
         let (runtime, built) = scene(Scenario::LongChat, theme);
         let mut harness = Harness::builder()
@@ -370,7 +371,7 @@ fn sidebar_content_lines_up_and_the_account_badge_clears_the_highlight() {
         let header = harness
             .get_by_role_and_label(Role::Label, "ACCOUNTS")
             .rect();
-        let inbox_header = harness.get_by_role_and_label(Role::Label, "INBOX").rect();
+        let chats_header = harness.get_by_role_and_label(Role::Label, "CHATS").rect();
         let dot = harness
             .get_by_role_and_label(Role::Label, "account status")
             .rect();
@@ -383,15 +384,27 @@ fn sidebar_content_lines_up_and_the_account_badge_clears_the_highlight() {
             .get_by_role_and_label(Role::Label, "avatar Ada Park")
             .rect();
         assert!(
+            chats_header.min.x > header.max.x,
+            "{theme:?} chats {} must sit to the right of accounts {}",
+            chats_header.min.x,
+            header.max.x
+        );
+        assert!(
+            (chats_header.min.y - header.min.y).abs() < 48.0,
+            "{theme:?} chats y {} accounts y {}: the list is not under the accounts",
+            chats_header.min.y,
+            header.min.y
+        );
+        assert!(
             (header.min.x - dot.min.x).abs() < 0.5,
             "{theme:?} header {} dot {}",
             header.min.x,
             dot.min.x
         );
         assert!(
-            (header.min.x - avatar.min.x).abs() < 0.5,
-            "{theme:?} header {} avatar {}",
-            header.min.x,
+            (chats_header.min.x - avatar.min.x).abs() < 0.5,
+            "{theme:?} chats header {} avatar {}",
+            chats_header.min.x,
             avatar.min.x
         );
         assert!(
@@ -421,13 +434,6 @@ fn sidebar_content_lines_up_and_the_account_badge_clears_the_highlight() {
             book_badge,
             book_avatar
         );
-        assert!(
-            (header.min.x - inbox_header.min.x).abs() < 0.5,
-            "{theme:?} ACCOUNTS {} INBOX {}",
-            header.min.x,
-            inbox_header.min.x
-        );
-
         let account = harness
             .query_all(By::new().role(Role::Button).label("Telegram"))
             .map(|node| node.rect())
