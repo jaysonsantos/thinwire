@@ -964,11 +964,15 @@ impl Supervisor {
             return;
         }
         if self.account != AccountState::Unlinked {
-            // A session that was up reconnects when the next helper gets its
-            // pairing again. The shell keeps its rows, ends its loads, and
-            // asks again after `Linked` (#163). With no pairing to send, no
-            // helper links this account again: it is unlinked.
-            let relinks = self.replay.link.is_some() || self.wake_link.is_some();
+            // A session that was up reconnects when the next helper starts.
+            // The shell keeps its rows, ends its loads, and asks again after
+            // `Linked` (#163). A resumed Signal account has the accepted gate
+            // and no `BeginLink`. The store links again. That is a reconnect.
+            // An unlink here drops the chats and the in-memory notice
+            // acceptance, and the Link button can then clear the saved hash.
+            let relinks = self.replay.link.is_some()
+                || self.wake_link.is_some()
+                || (self.linked_once && self.replay.acknowledged);
             self.account = if relinks {
                 AccountState::Linking
             } else {

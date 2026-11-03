@@ -4875,11 +4875,29 @@ impl Snapshot {
         self.pending.push(AdapterCommand::SignalAcknowledgeNotice);
     }
 
-    /// The user opened the notice. While the account is not linked, this
-    /// drops the saved acceptance. While it is linked, the screen opens and
-    /// the acceptance stays.
+    /// The user opened the notice.
+    ///
+    /// A linked account shows the notice and keeps the saved acceptance.
+    /// A remembered acceptance that is not already on screen also keeps
+    /// that acceptance. Link then opens the link screen. The account is
+    /// not linked yet after a keychain failure, and after a helper crash
+    /// that has not reported `Linked` again. That Link click must not drop
+    /// the saved hash. Cancel drops it. A re-show from the link screen
+    /// drops it too.
     #[cfg(feature = "signal-local")]
     pub fn open_signal_notice(&mut self) {
+        if self.signal_notice_acknowledged && self.signal_screen == SignalScreen::Hidden {
+            if !self.signal_linking_available() || self.helper_missing(ProtocolId::Signal) {
+                return;
+            }
+            self.signal_qr = None;
+            self.signal_screen = if self.protocol_linked(ProtocolId::Signal) {
+                SignalScreen::Notice
+            } else {
+                SignalScreen::Link
+            };
+            return;
+        }
         self.reveal_signal_notice(true);
     }
 
@@ -5792,6 +5810,31 @@ mod tests {
         assert!(
             snapshot.take_commands().is_empty(),
             "a remembered acceptance does not start a link on its own"
+        );
+    }
+
+    /// Link after a remembered notice must not drop that acceptance.
+    /// The account is not linked yet. A keychain failure leaves it there.
+    /// A re-show from the link screen still drops the acceptance.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn link_after_a_remembered_notice_keeps_the_acceptance() {
+        let mut snapshot = Snapshot::new();
+        snapshot.restore_signal_notice();
+        let _ = snapshot.take_commands();
+        snapshot.open_signal_notice();
+        assert!(snapshot.signal_notice_acknowledged());
+        assert!(
+            !snapshot.take_signal_notice_forget(),
+            "Link does not ask to clear the saved hash"
+        );
+        assert_eq!(snapshot.signal_screen, SignalScreen::Link);
+
+        snapshot.open_signal_notice();
+        assert!(!snapshot.signal_notice_acknowledged());
+        assert!(
+            snapshot.take_signal_notice_forget(),
+            "a re-show from the link screen still clears the saved hash"
         );
     }
 

@@ -1680,6 +1680,69 @@ mod tests {
         assert_eq!(core.settings.signal_notice_version(), current);
     }
 
+    /// A keychain denial, Retry, and a helper restart keep the saved notice.
+    /// The denial can arrive before the account is linked. Link on that row
+    /// must not clear the hash. Cancel still does.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_access_failure_keeps_the_saved_signal_notice() {
+        use crate::state::SignalScreen;
+        use thinwire_protocol::{AccountState, AdapterEvent, HelperState, StoreAccessReason};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let mut core = core_with_signal_notice(current);
+        let (probe, _sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        assert!(core.view().signal_notice_acknowledged());
+
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("keychain");
+        core.pump();
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert!(
+            core.view().signal_notice_acknowledged(),
+            "a keychain denial before Linked keeps the acceptance"
+        );
+
+        core.dispatch(Intent::Signal(SignalIntent::OpenNotice));
+        assert_eq!(core.view().signal_screen, SignalScreen::Link);
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert!(core.view().signal_notice_acknowledged());
+
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linked,
+            })
+            .expect("linked");
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("keychain while linked");
+        events_tx
+            .send(AdapterEvent::Helper {
+                protocol: ProtocolId::Signal,
+                state: HelperState::Restarting,
+            })
+            .expect("helper restart");
+        core.pump();
+        core.dispatch(Intent::RetryStoreKey(ProtocolId::Signal));
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert!(
+            core.view().signal_notice_acknowledged(),
+            "Retry and a helper restart keep the acceptance"
+        );
+    }
+
     /// An unlink and a device removal clear no saved hash. The next launch
     /// starts the helper without the notice. Retained rows need #384, which
     /// is not on main.
