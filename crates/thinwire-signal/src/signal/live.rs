@@ -57,8 +57,11 @@ enum LinkedEnd {
     Stopped,
     /// Cancel or shutdown moved the generation. The owner emits `Unlinked`.
     Superseded,
-    /// The keychain refused the read. The account stays. The store stays.
-    KeychainDenied,
+    /// The keychain refused the read. The store stays.
+    ///
+    /// `saved` is true when a store file is already on disk. That account
+    /// stays linked. A first link has no file, so it does not.
+    KeychainDenied { saved: bool },
     /// The encrypted store did not open. The folder was moved aside.
     WrongKey,
     /// The store files could not be moved aside. They stay. The account stays.
@@ -314,7 +317,12 @@ fn publish_link_end(events: &EventTx, end: LinkedEnd) {
             protocol: ProtocolId::Signal,
         });
     }
-    if let LinkedEnd::KeychainDenied = end {
+    if let LinkedEnd::KeychainDenied { saved } = end {
+        // A store file is a linked account. Mark it before the denial so
+        // the row stays linked and shows Retry, not Link.
+        if saved {
+            emit_account(events, ProtocolId::Signal, AccountState::Linked);
+        }
         let _ = events.send(AdapterEvent::StoreAccess {
             protocol: ProtocolId::Signal,
             reason: thinwire_protocol::StoreAccessReason::KeychainDenied,
@@ -1096,7 +1104,8 @@ async fn open_linked_store(
         Ok(Ok(())) => {}
         Ok(Err(super::cipher::ProtectFail::KeychainDenied)) => {
             session.active.store(false, Ordering::SeqCst);
-            return Err(LinkedEnd::KeychainDenied);
+            let saved = session_store_present(store_path);
+            return Err(LinkedEnd::KeychainDenied { saved });
         }
         Ok(Err(super::cipher::ProtectFail::WrongKey)) => {
             session.active.store(false, Ordering::SeqCst);
@@ -3585,6 +3594,43 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
 
     fn registration_for(aci: Uuid) -> String {
         REJECTED_REGISTRATION.replacen("11111111-1111-1111-1111-111111111111", &aci.to_string(), 1)
+    }
+
+    /// A store file is a linked account. A key denial marks it linked, then
+    /// reports the denial. A first link has no file, so it stays unlinked.
+    #[test]
+    fn a_saved_store_key_denial_keeps_the_account_linked() {
+        let saved = events_of(LinkedEnd::KeychainDenied { saved: true });
+        let states: Vec<AccountState> = saved
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Account { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, vec![AccountState::Linked]);
+        assert!(saved.iter().any(|event| matches!(
+            event,
+            AdapterEvent::StoreAccess {
+                reason: thinwire_protocol::StoreAccessReason::KeychainDenied,
+                ..
+            }
+        )));
+        let first = events_of(LinkedEnd::KeychainDenied { saved: false });
+        assert!(!first.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account {
+                state: AccountState::Linked,
+                ..
+            }
+        )));
+        assert!(first.iter().any(|event| matches!(
+            event,
+            AdapterEvent::StoreAccess {
+                reason: thinwire_protocol::StoreAccessReason::KeychainDenied,
+                ..
+            }
+        )));
     }
 
     /// A failed move is a status line. It does not unlink and it is not a wrong key.

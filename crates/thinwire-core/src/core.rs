@@ -413,6 +413,7 @@ impl Core {
             self.state.status_text = text;
         }
         self.state.poll_resume(&self.secrets);
+        self.resume_denied_store_keys();
         self.state.sync_viewed();
         self.state.sync_timeout_hint();
         self.sync_notifications();
@@ -929,7 +930,15 @@ impl Core {
     #[cfg(feature = "signal-local")]
     fn signal_gate(&mut self, intent: SignalIntent) {
         match intent {
-            SignalIntent::OpenNotice => self.state.open_signal_notice(),
+            SignalIntent::OpenNotice => {
+                // A saved acceptance of this notice copy. Link does not
+                // show the notice again. Only the first link shows it.
+                let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+                if self.settings.signal_notice_version() == current {
+                    self.state.keep_saved_signal_notice();
+                }
+                self.state.open_signal_notice();
+            }
             SignalIntent::CloseGate => self.state.close_signal_gate(),
             SignalIntent::AcknowledgeNotice => self.state.acknowledge_signal_notice(),
             SignalIntent::BeginLink => self.state.begin_signal_link(),
@@ -942,6 +951,17 @@ impl Core {
     #[cfg(not(feature = "signal-local"))]
     fn signal_gate(&mut self, intent: SignalIntent) {
         let _ = intent;
+    }
+
+    /// A saved Signal or WhatsApp account denied the session key. When the
+    /// OS keychain can be read, ask the helper to open that session again.
+    /// This sends `RetryStoreKey`. It does not send `BeginLink`.
+    fn resume_denied_store_keys(&mut self) {
+        let ready = self.secrets.attach_settled() && !self.secrets.read_failed();
+        if !ready || !self.state.take_store_key_retry_due() {
+            return;
+        }
+        self.state.retry_denied_store_keys();
     }
 
     fn flush(&mut self) {
@@ -1740,6 +1760,199 @@ mod tests {
         assert!(
             core.view().signal_notice_acknowledged(),
             "Retry and a helper restart keep the acceptance"
+        );
+    }
+
+    /// Deny on a saved Signal session, then a keychain that can be read,
+    /// asks the helper to open that session. The command is `RetryStoreKey`.
+    /// It is not `BeginLink`, and the notice does not show again.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_saved_signal_key_resumes_without_a_new_link_or_notice() {
+        use crate::state::SignalScreen;
+        use thinwire_protocol::{AccountState, AdapterEvent, StoreAccessReason};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let mut core = core_with_signal_notice(current);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        while sent.try_recv().is_ok() {}
+
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linked,
+            })
+            .expect("linked");
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("denied");
+        core.pump();
+        let commands: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey {
+                    protocol: ProtocolId::Signal
+                }
+            )),
+            "the saved session is opened again: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+            "a key retry is not a new link: {commands:?}"
+        );
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert_ne!(core.view().signal_screen, SignalScreen::Notice);
+        assert!(
+            core.view()
+                .accounts
+                .iter()
+                .any(|row| row.caps.id == ProtocolId::Signal && row.linked()),
+            "a saved account stays linked"
+        );
+
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Unlinked,
+            })
+            .expect("unlinked");
+        core.pump();
+        assert!(!core.view().signal_notice_acknowledged());
+        assert_eq!(core.settings.signal_notice_version(), current);
+        core.dispatch(Intent::Signal(SignalIntent::OpenNotice));
+        assert_ne!(
+            core.view().signal_screen,
+            SignalScreen::Notice,
+            "a saved acceptance does not show the notice again"
+        );
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert!(core.view().signal_notice_acknowledged());
+    }
+
+    /// A first link has no saved session. A key denial does not resume it
+    /// and does not mark it linked.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_link_key_denial_does_not_resume_the_session() {
+        use thinwire_protocol::{AdapterEvent, StoreAccessReason};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let mut core = core_with_signal_notice(current);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        while sent.try_recv().is_ok() {}
+
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("denied");
+        core.pump();
+        let commands: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert!(
+            !commands.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "a first link does not resume: {commands:?}"
+        );
+        assert!(
+            !core
+                .view()
+                .accounts
+                .iter()
+                .any(|row| row.caps.id == ProtocolId::Signal && row.linked())
+        );
+    }
+
+    /// The keychain is still denied when the helper reports the failure.
+    /// After the keychain can be read, the saved session is opened again.
+    /// The command is `RetryStoreKey`, not `BeginLink`.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_key_denial_waits_until_the_keychain_can_be_read() {
+        use thinwire_protocol::{AccountState, AdapterEvent, StoreAccessReason};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let path = notice_settings_path("defer-key");
+        let mut settings = Settings::load_from(path.clone());
+        settings.set_signal_notice_version(current);
+        if let Some(job) = settings.take_persist_job() {
+            job.run();
+        }
+        let secrets = SecretStore::detached_for_test();
+        let mut core = Core::with_store(
+            &Handle::current(),
+            CoreConfig::new(Settings::load_from(path)),
+            std::sync::Arc::clone(&secrets),
+            std::sync::Arc::new(WhatsAppPhoneVault::new()),
+            Vec::new(),
+        );
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        while sent.try_recv().is_ok() {}
+
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linked,
+            })
+            .expect("linked");
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("denied");
+        core.pump();
+        let early: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert!(
+            !early.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "no resume while the keychain cannot be read: {early:?}"
+        );
+
+        secrets.complete_ready_attach_for_test(&[]);
+        core.pump();
+        let commands: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey {
+                    protocol: ProtocolId::Signal
+                }
+            )),
+            "Allow opens the saved session: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+            "Allow does not start a new link: {commands:?}"
+        );
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert_ne!(
+            core.view().signal_screen,
+            crate::state::SignalScreen::Notice
         );
     }
 

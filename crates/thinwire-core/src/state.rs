@@ -585,6 +585,9 @@ pub struct Snapshot {
     keychain_failed: bool,
     /// The user asked to read the keychain again. The app runs it off the UI thread.
     keychain_retry: bool,
+    /// A saved account could not read its session key. The next pump sends
+    /// `RetryStoreKey` once the OS keychain read has succeeded.
+    store_key_retry_due: bool,
     /// Protocols whose chat list is loading.
     chat_list_loading: HashSet<ProtocolId>,
     /// Chats whose history is loading, per protocol.
@@ -891,6 +894,7 @@ impl Snapshot {
             keychain_wait_started: None,
             keychain_failed: false,
             keychain_retry: false,
+            store_key_retry_due: false,
             chat_list_loading: HashSet::new(),
             history_loading: HashSet::new(),
             older_loading: HashSet::new(),
@@ -1351,6 +1355,11 @@ impl Snapshot {
                     row.status = AdapterStatus::Error;
                     row.detail = detail.to_string();
                     row.store_access = Some(reason);
+                }
+                // A saved account. Retry once the keychain can be read.
+                // A first link has no session, so it does not resume itself.
+                if saved && reason == StoreAccessReason::KeychainDenied {
+                    self.store_key_retry_due = true;
                 }
             }
             AdapterEvent::SignalQr { code, generation } => {
@@ -3743,6 +3752,25 @@ impl Snapshot {
             .push(AdapterCommand::RetryStoreKey { protocol });
     }
 
+    /// Read the session key again for every saved account that was denied.
+    /// This is not a new link.
+    pub(crate) fn retry_denied_store_keys(&mut self) {
+        let protocols: Vec<ProtocolId> = self
+            .accounts
+            .iter()
+            .filter(|row| row.store_access == Some(StoreAccessReason::KeychainDenied))
+            .map(|row| row.caps.id)
+            .collect();
+        for protocol in protocols {
+            self.retry_store_key(protocol);
+        }
+    }
+
+    /// One saved key denial is waiting for a keychain that can be read.
+    pub(crate) fn take_store_key_retry_due(&mut self) -> bool {
+        std::mem::take(&mut self.store_key_retry_due)
+    }
+
     /// The helper program of this protocol is not installed.
     #[must_use]
     pub fn helper_missing(&self, protocol: ProtocolId) -> bool {
@@ -4873,6 +4901,13 @@ impl Snapshot {
     pub(crate) fn restore_signal_notice(&mut self) {
         self.signal_notice_acknowledged = true;
         self.pending.push(AdapterCommand::SignalAcknowledgeNotice);
+    }
+
+    /// The saved notice hash still matches. Link must not show the notice
+    /// again. This does not send a command and does not clear the hash.
+    #[cfg(feature = "signal-local")]
+    pub(crate) fn keep_saved_signal_notice(&mut self) {
+        self.signal_notice_acknowledged = true;
     }
 
     /// The user opened the notice.

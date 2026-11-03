@@ -56,7 +56,9 @@ impl LinkBackend for LiveBackend {
                 .await
                 .map_err(|_| StartError::Store)?;
         protected.map_err(|fail| match fail {
-            super::cipher::ProtectFail::KeychainDenied => StartError::KeychainDenied,
+            super::cipher::ProtectFail::KeychainDenied => StartError::KeychainDenied {
+                saved: path.is_file(),
+            },
             super::cipher::ProtectFail::WrongKey => StartError::WrongKey,
             super::cipher::ProtectFail::NotMoved => StartError::MoveFailed,
             super::cipher::ProtectFail::NotSaved => {

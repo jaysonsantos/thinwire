@@ -57,7 +57,10 @@ pub(super) enum StartError {
     /// An earlier client did not stop yet. Two clients on one store break it.
     StillRunning,
     /// The keychain refused the read. The store stays where it is.
-    KeychainDenied,
+    /// `saved` is true when `device.sqlite` is already on disk.
+    KeychainDenied {
+        saved: bool,
+    },
     /// The encrypted store did not open. The folder was moved aside.
     WrongKey,
     /// The store files could not be moved aside. They stay. Nothing was deleted.
@@ -75,7 +78,7 @@ impl StartError {
             Self::Store => STORE_FAILED,
             Self::Build => BUILD_FAILED,
             Self::StillRunning => STILL_RUNNING,
-            Self::KeychainDenied => thinwire_protocol::KEYCHAIN_ACCESS_DENIED,
+            Self::KeychainDenied { .. } => thinwire_protocol::KEYCHAIN_ACCESS_DENIED,
             Self::WrongKey => thinwire_protocol::whatsapp_session_kept(),
             Self::MoveFailed => thinwire_protocol::whatsapp_key_wrong_kept(),
             #[cfg(feature = "whatsapp-web")]
@@ -317,7 +320,7 @@ impl<B: LinkBackend> Owner<B> {
     /// The new open tries the move-aside again when the key is wrong.
     async fn retry_key(&mut self) {
         let Some(pairing) = self.last_pairing else {
-            self.fail(StartError::KeychainDenied);
+            self.fail(StartError::KeychainDenied { saved: false });
             return;
         };
         let phone = self.last_phone.clone();
@@ -496,8 +499,12 @@ impl<B: LinkBackend> Owner<B> {
     fn fail(&self, error: StartError) {
         self.active.store(false, Ordering::SeqCst);
         match error {
-            StartError::KeychainDenied => {
-                // The store stays. Retry reads the key again.
+            StartError::KeychainDenied { saved } => {
+                // A store file is a linked account. Mark it before the
+                // denial so the row stays linked and shows Retry, not Link.
+                if saved {
+                    let _ = self.events.send(account(AccountState::Linked));
+                }
                 let _ = self.events.send(AdapterEvent::StoreAccess {
                     protocol: ProtocolId::WhatsApp,
                     reason: StoreAccessReason::KeychainDenied,
@@ -931,6 +938,39 @@ pub(super) mod tests {
         }
     }
 
+    /// `device.sqlite` is already on disk. A key denial marks the account
+    /// linked and does not end it. Retry reads the key again.
+    #[tokio::test]
+    async fn a_saved_whatsapp_store_stays_linked_when_the_key_is_denied() {
+        let (fake, handle, _session, mut rx) = owner(Fake {
+            start_error: Some(StartError::KeychainDenied { saved: true }),
+            ..Fake::default()
+        });
+        handle.begin(Some("15551212".into()), 4);
+        handle.flush().await;
+        let events = drain(&mut rx);
+        let states: Vec<AccountState> = events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::Account { state, .. } => Some(*state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, vec![AccountState::Linking, AccountState::Linked]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::StoreAccess {
+                reason: StoreAccessReason::KeychainDenied,
+                ..
+            }
+        )));
+        assert!(
+            !fake.log().iter().any(|line| line.contains("delete")),
+            "the store stays, log {:?}",
+            fake.log()
+        );
+    }
+
     /// A denied keychain read keeps the account and does not delete the store.
     /// Retry asks `start` again, which is where the key is read.
     /// A wrong key leaves the account unlinked and still deletes nothing.
@@ -938,7 +978,7 @@ pub(super) mod tests {
     async fn denied_and_wrong_key_keep_the_store_and_retry_reads_again() {
         for (error, reason, unlinked) in [
             (
-                StartError::KeychainDenied,
+                StartError::KeychainDenied { saved: false },
                 StoreAccessReason::KeychainDenied,
                 false,
             ),
