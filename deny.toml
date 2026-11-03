@@ -19,4 +19,9 @@ ignore = [
   { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill: from heapless, postcard, and phonenumber in libsignal-service" },
   { id = "RUSTSEC-2025-0141", reason = "bincode 1: a direct dependency of libsignal-service and zkgroup" },
   { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: a build-time macro crate, from libcrux-ml-kem in libsignal-protocol" },
+  # zbus 5, through the OS keychain in thinwire-core (#291). These crates
+  # merged into zbus 6. A bump of zbus is out of scope. Not a vulnerability.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, merged into zbus 6. The helpers use zbus 5 through the thinwire-core keychain" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, merged into zbus 6. The helpers use zbus 5 through the thinwire-core keychain" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, merged into zbus 6. The helpers use zbus 5 through the thinwire-core keychain" },
 ]

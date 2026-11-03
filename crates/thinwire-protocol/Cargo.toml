@@ -35,6 +35,11 @@ discord-bot = ["dep:twilight-http", "dep:twilight-model", "dep:rustls"]
 # ADR 0010) for adapter crates such as thinwire-signal. Only a
 # dev-dependency turns it on. The app never does.
 contract-kit = []
+# SQLCipher for the helper session stores. The app does not turn this on.
+# A helper turns it on only in the client feature. The release helper links
+# the bundled SQLCipher and the vendored OpenSSL, so it does not need those
+# libraries on the system.
+session-cipher = ["dep:rusqlite"]
 
 [dependencies]
 # TDLib sends a minithumbnail as base64. Only the live client decodes it.
@@ -55,6 +60,11 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 ] }
 dirs.workspace = true
 getrandom = "0.4"
+# SQLCipher amalgamation plus vendored OpenSSL. `default-features = false`
+# keeps the vanilla bundled SQLite feature off. Only `session-cipher` links it.
+rusqlite = { version = "0.38", optional = true, default-features = false, features = [
+  "bundled-sqlcipher-vendored-openssl",
+] }
 # The wire lines to a helper process (ADR 0013). MIT, no AGPL code.
 thinwire-ipc.workspace = true
 # `process`: the app starts a helper process as a child.

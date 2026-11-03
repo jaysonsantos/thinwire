@@ -12,6 +12,8 @@ mod path;
 mod session;
 
 #[cfg(feature = "whatsapp-web")]
+mod cipher;
+#[cfg(feature = "whatsapp-web")]
 mod live;
 
 pub use path::{SessionLock, SessionLockError, lock_session, set_session_dir};
@@ -238,6 +240,26 @@ impl WhatsAppAdapter {
             AdapterStatus::Connecting,
             "Experimental WhatsApp pairing was queued on the worker. This is not a supported messenger.",
         );
+        Ok(())
+    }
+
+    /// Read the session key again and open the saved session. This is not a
+    /// new link and does not delete the store. A wrong key tries the
+    /// move-aside again. The row shows Connecting until the open ends.
+    fn retry_store_key(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        let Some(link) = &self.link else {
+            return Err(AdapterError::Unavailable {
+                protocol: ProtocolId::WhatsApp,
+                reason: "WhatsApp is not reading a session key",
+            });
+        };
+        emit_status(
+            events,
+            ProtocolId::WhatsApp,
+            AdapterStatus::Connecting,
+            "Opening the saved session.",
+        );
+        link.retry();
         Ok(())
     }
 
@@ -644,6 +666,9 @@ impl ProtocolAdapter for WhatsAppAdapter {
             | AdapterCommand::WhatsAppCancelLink => self.cancel_link(events),
             AdapterCommand::WhatsAppAcknowledgeRisk => self.acknowledge(events),
             AdapterCommand::WhatsAppBeginLink { generation } => self.begin_link(generation, events),
+            AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::WhatsApp,
+            } => self.retry_store_key(events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::WhatsApp,
                 reason: "command is not handled by the WhatsApp adapter",

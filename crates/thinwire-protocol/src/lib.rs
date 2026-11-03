@@ -12,8 +12,11 @@ mod log_id;
 mod media;
 mod risk;
 mod secrets;
+#[cfg(feature = "session-cipher")]
+mod session_cipher;
 mod signal;
 mod slack;
+mod store_protect;
 mod telegram;
 mod whatsapp;
 
@@ -21,10 +24,11 @@ pub use adapter::{
     APP_CLOSE_LIMIT, AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus,
     Arrival, ChatMessage, ChatTopic, Conversation, Delivery, DiscordAuthMode, EventTx, HelperFault,
     HelperState, MessageTopic, OutgoingUpdate, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    RedactedPairingSecret, SupportClass, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
-    TelegramCodeVia, emit_account, emit_chat_list_loaded, emit_conversation, emit_history_loaded,
-    emit_message, emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status,
-    emit_stopped, ordered_topics, outgoing_delivery, topic_mute_id, with_outbox_read,
+    RedactedPairingSecret, StoreAccessReason, SupportClass, TelegramAuthError, TelegramAuthPhase,
+    TelegramAuthStep, TelegramCodeVia, command_reads_session_key, emit_account,
+    emit_chat_list_loaded, emit_conversation, emit_history_loaded, emit_message,
+    emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
+    ordered_topics, outgoing_delivery, topic_mute_id, with_outbox_read,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -48,6 +52,11 @@ pub use secrets::{
     TELEGRAM_SECRET_PHONE, TELEGRAM_SECRET_SERVICE, TELEGRAM_SECRET_SESSION, TelegramSecretKey,
     TelegramSecretVault,
 };
+#[cfg(feature = "session-cipher")]
+pub use session_cipher::{
+    MigrateOptions, MigrateStop, MoveAsideError, PrepareError, PrepareOutcome, is_encrypted_store,
+    is_plaintext_sqlite, move_stores_aside, prepare_file, raw_key_literal, store_sibling,
+};
 pub use signal::{
     SIGNAL_DEVICE_REMOVED, SIGNAL_HELPER_PROGRAM, SIGNAL_LINK_CHECK, SignalAdapter,
     signal_helper_adapter,
@@ -64,6 +73,12 @@ pub use slack::{
 };
 #[cfg(feature = "slack-oauth")]
 pub use slack::{oauth_v2_access_request, socket_mode_config, workspace_bot_token};
+pub use store_protect::{
+    KEYCHAIN_ACCESS_DENIED, is_store_protection_detail, signal_encrypt_failed,
+    signal_key_not_saved, signal_key_wrong, signal_key_wrong_kept, signal_keychain_unavailable,
+    signal_session_kept, whatsapp_encrypt_failed, whatsapp_key_not_saved, whatsapp_key_wrong,
+    whatsapp_key_wrong_kept, whatsapp_keychain_unavailable, whatsapp_session_kept,
+};
 pub use telegram::{
     TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,
     resolve_telegram_api, telegram_api_available,
