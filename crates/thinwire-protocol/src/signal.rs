@@ -317,10 +317,6 @@ mod tests {
             signal_retained_unreadable_slot(&signal_retained_unreadable_detail(4)),
             Some(4)
         );
-        assert_eq!(
-            SIGNAL_RETAINED_UNREADABLE,
-            "This history could not be read. It was not deleted."
-        );
         assert!(
             !SIGNAL_RETAINED_UNREADABLE
                 .chars()

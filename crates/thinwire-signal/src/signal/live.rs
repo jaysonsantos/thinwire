@@ -5429,11 +5429,6 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             )),
             "the core is told to keep slot 4: {events:?}"
         );
-        assert_eq!(
-            thinwire_protocol::SIGNAL_RETAINED_UNREADABLE,
-            "This history could not be read. It was not deleted.",
-            "the row shows this text"
-        );
         assert!(
             !thinwire_protocol::SIGNAL_RETAINED_UNREADABLE
                 .chars()

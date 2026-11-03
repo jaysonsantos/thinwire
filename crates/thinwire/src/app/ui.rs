@@ -7,8 +7,7 @@ use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
     AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, SIGNAL_PREVIOUS_ACCOUNT, SIGNAL_RETAINED_UNREADABLE,
-    topic_mute_id,
+    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, SIGNAL_PREVIOUS_ACCOUNT, topic_mute_id,
 };
 
 use super::auth;
@@ -690,18 +689,17 @@ fn account_chip(
     // One previous Signal number, and a store that could not be read, use a
     // sentence that wraps further.
     // [`theme::ROW_INSET`] adds 8 px above and below.
-    let lines = if detail.as_deref() == Some(SIGNAL_PREVIOUS_ACCOUNT)
-        || detail.as_deref() == Some(SIGNAL_RETAINED_UNREADABLE)
-    {
-        68.0
-    } else if detail.as_deref() == Some(SIGNAL_DEVICE_REMOVED)
-        || unofficial
-        || account.signal_retained.is_some()
-    {
-        52.0
-    } else {
-        36.0
-    };
+    let lines =
+        if account.history_unreadable() || detail.as_deref() == Some(SIGNAL_PREVIOUS_ACCOUNT) {
+            68.0
+        } else if detail.as_deref() == Some(SIGNAL_DEVICE_REMOVED)
+            || unofficial
+            || account.signal_retained.is_some()
+        {
+            52.0
+        } else {
+            36.0
+        };
     let (rect, hover) = ui.allocate_exact_size(
         egui::vec2(width, lines + space::S * 2.0),
         egui::Sense::hover(),
@@ -4008,6 +4006,7 @@ mod tests {
         use thinwire_core::View;
         use thinwire_core::secrets::SecretStore;
         use thinwire_core::settings::Settings;
+        use thinwire_core::state::RetainedRead;
         use thinwire_core::state::Snapshot;
         use thinwire_core::state::test_support::{show_only, show_protocol};
         use thinwire_protocol::{
@@ -4035,12 +4034,9 @@ mod tests {
             .iter()
             .find(|row| row.signal_retained == Some(1))
             .expect("the row stays in the list");
+        assert_eq!(kept.retained_read, RetainedRead::Unreadable);
         assert!(kept.history_unreadable(), "the row is disabled");
         assert_eq!(kept.detail, SIGNAL_RETAINED_UNREADABLE);
-        assert_eq!(
-            kept.detail,
-            "This history could not be read. It was not deleted."
-        );
         assert!(!snapshot.can_send(), "the row has no Send");
         assert!(snapshot.hides_composer(), "the row has no composer");
 

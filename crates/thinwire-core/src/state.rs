@@ -371,6 +371,16 @@ pub struct UserError {
     pub next: String,
 }
 
+/// Whether a previous Signal store could be read.
+/// The core sets this. The row text is not this state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedRead {
+    /// The store can be read, or this row is the live account.
+    Readable,
+    /// This publish could not read the store. The row stays and is disabled.
+    Unreadable,
+}
+
 #[derive(Debug, Clone)]
 pub struct AccountRow {
     pub caps: ProtocolCapabilities,
@@ -386,6 +396,10 @@ pub struct AccountRow {
     /// account of every protocol, including the linked Signal number.
     /// The number is a slot, not an account id.
     pub signal_retained: Option<u32>,
+    /// Read state of a previous Signal store.
+    /// The core sets [`RetainedRead::Unreadable`] when it handles the
+    /// unreadable line. A later chat upsert clears it.
+    pub retained_read: RetainedRead,
 }
 
 impl AccountRow {
@@ -398,9 +412,8 @@ impl AccountRow {
     /// This previous-account store could not be read.
     /// The row stays in the list. It is disabled. It has no composer.
     #[must_use]
-    pub fn history_unreadable(&self) -> bool {
-        self.signal_retained.is_some()
-            && self.detail == thinwire_protocol::SIGNAL_RETAINED_UNREADABLE
+    pub const fn history_unreadable(&self) -> bool {
+        self.signal_retained.is_some() && matches!(self.retained_read, RetainedRead::Unreadable)
     }
 
     /// The helper stopped and does not start again by itself. The row
@@ -824,6 +837,7 @@ impl Snapshot {
                 state: AccountState::Unlinked,
                 helper: None,
                 signal_retained: None,
+                retained_read: RetainedRead::Readable,
             })
             .collect();
         Self {
@@ -1493,7 +1507,15 @@ impl Snapshot {
     /// That row has no composer and no Send control.
     #[must_use]
     pub fn hides_composer(&self) -> bool {
-        self.signal_read_only_reason() == Some(thinwire_protocol::SIGNAL_RETAINED_UNREADABLE)
+        if self.selected_protocol != ProtocolId::Signal {
+            return false;
+        }
+        let Some(slot) = self.selected_signal_retained else {
+            return false;
+        };
+        self.accounts
+            .iter()
+            .any(|row| row.signal_retained == Some(slot) && row.history_unreadable())
     }
 
     /// Chip text for one previous Signal account.
@@ -4057,7 +4079,7 @@ impl Snapshot {
     }
 
     /// Remember one previous-account slot from this publish.
-    /// A later chat row clears the unreadable line. The history stays.
+    /// A later chat row clears the unreadable state. The history stays.
     fn note_retained_slot(&mut self, slot: u32) {
         if let Some(published) = &mut self.retained_publish {
             published.insert(slot);
@@ -4070,7 +4092,8 @@ impl Snapshot {
         else {
             return;
         };
-        if row.detail == thinwire_protocol::SIGNAL_RETAINED_UNREADABLE {
+        if row.history_unreadable() {
+            row.retained_read = RetainedRead::Readable;
             row.detail = thinwire_protocol::SIGNAL_PREVIOUS_ACCOUNT.to_owned();
         }
     }
@@ -4091,6 +4114,7 @@ impl Snapshot {
         };
         row.status = AdapterStatus::Error;
         row.detail = thinwire_protocol::SIGNAL_RETAINED_UNREADABLE.to_owned();
+        row.retained_read = RetainedRead::Unreadable;
     }
 
     /// One read-only row for a previous Signal number. The live row stays.
@@ -4117,6 +4141,7 @@ impl Snapshot {
             state: AccountState::Unlinked,
             helper: None,
             signal_retained: Some(slot),
+            retained_read: RetainedRead::Readable,
         };
         // The highest slot is the most recent previous account. It sits
         // next to the live row. "Previous account N" stays the slot.
@@ -9513,10 +9538,7 @@ mod tests {
             .find(|row| row.signal_retained == Some(1))
             .expect("the row stays in the list");
         assert_eq!(kept.status, AdapterStatus::Error);
-        assert_eq!(
-            kept.detail, "This history could not be read. It was not deleted.",
-            "the row shows this text"
-        );
+        assert_eq!(kept.retained_read, RetainedRead::Unreadable);
         assert_eq!(kept.detail, SIGNAL_RETAINED_UNREADABLE);
         assert!(
             !kept.detail.chars().any(|ch| ch.is_ascii_digit()),
@@ -9560,10 +9582,43 @@ mod tests {
             .find(|row| row.signal_retained == Some(1))
             .expect("row");
         assert_eq!(restored.detail, SIGNAL_PREVIOUS_ACCOUNT);
+        assert_eq!(restored.retained_read, RetainedRead::Readable);
         assert!(!restored.history_unreadable());
         assert!(!snapshot.hides_composer());
         assert!(!snapshot.can_send(), "a previous account still cannot send");
         assert_eq!(snapshot.selected_messages()[0].body, "kept");
+    }
+
+    /// The disabled flag is the read state. The row text is not that state.
+    #[test]
+    fn an_unreadable_flag_ignores_the_detail_text() {
+        use thinwire_protocol::{SIGNAL_RETAINED_UNREADABLE, signal_retained_unreadable_detail};
+
+        let mut snapshot = Snapshot::new();
+        show_only(&mut snapshot, &[ProtocolId::Signal]);
+        show_protocol(&mut snapshot, ProtocolId::Signal);
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: signal_retained_unreadable_detail(1),
+        });
+        let row = snapshot
+            .accounts
+            .iter_mut()
+            .find(|row| row.signal_retained == Some(1))
+            .expect("row");
+        assert_eq!(row.retained_read, RetainedRead::Unreadable);
+        row.detail = "other line".into();
+        assert!(
+            row.history_unreadable(),
+            "a different detail leaves the row disabled"
+        );
+        row.retained_read = RetainedRead::Readable;
+        row.detail = SIGNAL_RETAINED_UNREADABLE.to_owned();
+        assert!(
+            !row.history_unreadable(),
+            "the sentence alone does not disable the row"
+        );
     }
 
     /// A helper that leaves, and an account that ends, close an open
