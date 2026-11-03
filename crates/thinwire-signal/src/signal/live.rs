@@ -1630,6 +1630,10 @@ async fn run_linked(
         Ok(Ok(())) => {}
         _ => tracing::error!("{}", RETAINED_SLOT_NOT_STORED),
     }
+    // Wait. `try_lock` would skip a store this link parked, and the
+    // retire of the live chats. This wait is on the Signal worker.
+    // The UI thread does not run it. The live open has returned.
+    // The receive loop does not take this lock.
     let _ = publish_retained_for_session(
         &session,
         token,
