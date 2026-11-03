@@ -421,7 +421,8 @@ fn signal_ui_is_feature_gated_and_uses_the_helper() {
     assert!(notice.contains("No provisioning URL is shown on this screen."));
     let readme = include_str!("../../../../README.md");
     assert!(readme.contains("Signal: no supported third-party API, expect breakage."));
-    // A previous Signal number shows why sending is off, and the same risk line.
+    // The harness tests draw the labels, the read-only line, and the kept line.
+    // These checks keep the same names on the draw path.
     assert!(ui.contains("SIGNAL_PREVIOUS_ACCOUNT"));
     assert!(ui.contains("signal_retained_chip_label"));
     assert!(ui.contains("Signal: no supported third-party API, expect breakage."));

@@ -4023,4 +4023,82 @@ mod tests {
             "the open previous account keeps the Signal risk line"
         );
     }
+
+    /// Old rows are hidden. The account list shows the kept line.
+    /// The line has no phone number.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_hidden_signal_history_shows_the_kept_line() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::{By, Queryable};
+        use thinwire_core::View;
+        use thinwire_core::secrets::SecretStore;
+        use thinwire_core::settings::Settings;
+        use thinwire_core::state::Snapshot;
+        use thinwire_core::state::test_support::show_only;
+        use thinwire_protocol::{
+            AccountState, AdapterEvent, AdapterStatus, ProtocolId, SIGNAL_HISTORY_KEPT,
+        };
+
+        use super::{Hints, draw};
+        use crate::app::theme;
+
+        let store = SecretStore::memory();
+        let settings = Settings::in_memory();
+        let mut snapshot = Snapshot::new();
+        show_only(&mut snapshot, &[ProtocolId::Signal]);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Ready,
+            detail: SIGNAL_HISTORY_KEPT.into(),
+        });
+        assert_eq!(
+            snapshot.signal_history_kept_line(),
+            Some(SIGNAL_HISTORY_KEPT)
+        );
+        assert!(snapshot.signal_read_only_reason().is_none());
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 720.0))
+            .build_ui(|ui| {
+                theme::install(ui.ctx());
+                if !ui.style().text_styles.contains_key(&theme::row_title()) {
+                    return;
+                }
+                let view = View::from_parts(&snapshot, &store, &settings);
+                let mut hints = Hints::default();
+                let mut out = Vec::new();
+                draw(ui, &view, &mut hints, &mut out);
+            });
+        harness.run_steps(4);
+        assert!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Label)
+                        .label(SIGNAL_HISTORY_KEPT)
+                        .include_labels(),
+                )
+                .next()
+                .is_some(),
+            "the kept line is on screen"
+        );
+        assert!(
+            harness
+                .query_all(
+                    By::new()
+                        .role(Role::Label)
+                        .label("Previous account 1")
+                        .include_labels(),
+                )
+                .next()
+                .is_none(),
+            "hidden rows are not chips"
+        );
+    }
 }
