@@ -122,6 +122,12 @@ nix develop --command scripts/update-snapshots.sh
 
 The script then shrinks the images with `oxipng`. That is lossless, and the snapshots are most of the repository, so commit the shrunk files.
 
+A Mac can make the images too. Metal and lavapipe round the anti-aliased edge of a circle differently: one pixel in one color channel is off by up to 3 of 255, and the picture looks the same. The default per-pixel `threshold` of egui_kittest (0.6) fails an image for that, so `kittest.toml` sets it to 5.0. That still flags a pixel that is off by about 3 levels of luminance or more: a moved border, a changed color, and a changed glyph are far above it. Keep `max_failed_pixels` at 0 (the default): a count above about 10 can hide a real change.
+
+If CI rejects an image anyway, the sticky PR comment names it. Download the artifact with `gh run download RUN_ID -n ui-snapshots`. It has the Linux render of each failing image as `NAME.new.png` and the pixels that differ as `NAME.diff.png`. A diff with a layout change is a real bug.
+
+A short window needs its own check. A login card that is taller than the window scrolls (the `login_scrolled` snapshots), so Change number and Cancel stay in reach.
+
 Live Telegram run in the Nix shell (Linux):
 
 ```bash
