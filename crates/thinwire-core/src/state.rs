@@ -41,59 +41,6 @@ pub fn stub_banner(snapshot: &Snapshot) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InboxFilter {
-    Telegram,
-    #[cfg(feature = "slack-oauth")]
-    Slack,
-}
-
-impl InboxFilter {
-    /// Top-bar filters for this build. There is no All filter: the middle
-    /// column is one account. Spike tabs stay out until their feature is on.
-    #[must_use]
-    pub fn chrome_filters() -> &'static [Self] {
-        #[cfg(feature = "slack-oauth")]
-        {
-            const FILTERS: &[InboxFilter] = &[InboxFilter::Telegram, InboxFilter::Slack];
-            FILTERS
-        }
-        #[cfg(not(feature = "slack-oauth"))]
-        {
-            const FILTERS: &[InboxFilter] = &[InboxFilter::Telegram];
-            FILTERS
-        }
-    }
-
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Telegram => "Telegram",
-            #[cfg(feature = "slack-oauth")]
-            Self::Slack => "Slack",
-        }
-    }
-
-    #[must_use]
-    pub const fn matches(self, protocol: ProtocolId) -> bool {
-        match self {
-            Self::Telegram => matches!(protocol, ProtocolId::Telegram),
-            #[cfg(feature = "slack-oauth")]
-            Self::Slack => matches!(protocol, ProtocolId::Slack),
-        }
-    }
-
-    /// The protocol this pill selects.
-    #[must_use]
-    pub const fn protocol(self) -> ProtocolId {
-        match self {
-            Self::Telegram => ProtocolId::Telegram,
-            #[cfg(feature = "slack-oauth")]
-            Self::Slack => ProtocolId::Slack,
-        }
-    }
-}
-
 /// README risk text for an unofficial account. `None` for an official path.
 /// The review window shows these lines. Signal omits the README sentence
 /// that only describes the screen.
@@ -538,7 +485,6 @@ pub struct Snapshot {
     pub selected_topic: Option<MessageTopic>,
     /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
     pub focused_row: Option<String>,
-    pub filter: InboxFilter,
     /// Read-only notice opened from Unofficial or Ban risk. It does not
     /// start a link and it does not cancel one.
     notice_review: Option<ProtocolId>,
@@ -765,7 +711,6 @@ impl std::fmt::Debug for Snapshot {
         let mut out = f.debug_struct("Snapshot");
         out.field("accounts", &accounts)
             .field("selected_protocol", &self.selected_protocol)
-            .field("filter", &self.filter)
             .field("notice_review", &self.notice_review)
             .field("auth", &self.auth)
             .field("auth_busy", &self.auth_busy)
@@ -886,7 +831,6 @@ impl Snapshot {
             selected_conversation: None,
             selected_topic: None,
             focused_row: None,
-            filter: InboxFilter::Telegram,
             notice_review: None,
             search: String::new(),
             auth: AuthScreen::Idle,
@@ -1931,19 +1875,6 @@ impl Snapshot {
         });
     }
 
-    pub fn set_filter(&mut self, filter: InboxFilter) {
-        let changed = self.filter != filter;
-        self.filter = filter;
-        let protocol = filter.protocol();
-        if !filter.matches(self.selected_protocol) && self.account_surface_visible(protocol) {
-            self.select_protocol(protocol);
-            return;
-        }
-        if changed {
-            self.sync_focused_row(FocusFollow::List);
-        }
-    }
-
     /// New inbox search. A highlight that the query hides is cleared.
     pub fn set_search(&mut self, text: String) {
         if self.search == text {
@@ -1981,7 +1912,7 @@ impl Snapshot {
         }
     }
 
-    /// The account rail lists every account this build shows. A filter pill
+    /// The account sidebar lists every account this build shows. Picking one
     /// does not hide the others. The middle column is still only the
     /// selected account ([`Self::visible_conversations`]).
     #[must_use]
@@ -7468,7 +7399,7 @@ mod tests {
     }
 
     /// The middle column lists the selected account. Another account's chats
-    /// stay off that list. Both accounts stay on the rail.
+    /// stay off that list. Both accounts stay in the sidebar.
     #[test]
     fn the_middle_column_lists_only_the_selected_account() {
         let mut snapshot = Snapshot::new();
@@ -7487,11 +7418,6 @@ mod tests {
         assert_eq!(visible_ids(&snapshot), ["general"]);
         assert!(snapshot.shows_in_switcher(ProtocolId::Telegram));
         assert!(snapshot.shows_in_switcher(ProtocolId::Slack));
-        assert!(
-            !InboxFilter::chrome_filters()
-                .iter()
-                .any(|filter| filter.label() == "All")
-        );
     }
 
     /// Loading while the account syncs. "No chats yet." only after the link,
@@ -9679,21 +9605,6 @@ mod tests {
             protocol_chrome_enabled(ProtocolId::Signal),
             cfg!(feature = "signal-local")
         );
-        let filters = InboxFilter::chrome_filters();
-        assert!(
-            !filters.iter().any(|filter| filter.label() == "All"),
-            "there is no combined inbox"
-        );
-        assert!(filters.contains(&InboxFilter::Telegram));
-        #[cfg(feature = "slack-oauth")]
-        assert!(filters.contains(&InboxFilter::Slack));
-        #[cfg(not(feature = "slack-oauth"))]
-        assert_eq!(filters.len(), 1);
-        assert!(
-            !filters
-                .iter()
-                .any(|filter| filter.label() == "Experimental")
-        );
         let snapshot = Snapshot::new();
         assert!(snapshot.shows_in_switcher(ProtocolId::Telegram));
         assert_eq!(
@@ -11339,21 +11250,6 @@ mod tests {
         assert_eq!(snapshot.status_text, "telegram api_id must be a number");
     }
 
-    #[test]
-    fn filter_matches_supported_protocols_without_an_experimental_tab() {
-        assert!(InboxFilter::Telegram.matches(ProtocolId::Telegram));
-        assert!(!InboxFilter::Telegram.matches(ProtocolId::Slack));
-        assert!(!InboxFilter::Telegram.matches(ProtocolId::WhatsApp));
-        assert!(!InboxFilter::Telegram.matches(ProtocolId::Discord));
-        #[cfg(feature = "slack-oauth")]
-        assert!(InboxFilter::Slack.matches(ProtocolId::Slack));
-        assert!(
-            !InboxFilter::chrome_filters()
-                .iter()
-                .any(|filter| filter.label() == "All" || filter.label() == "Experimental")
-        );
-    }
-
     fn discord_guild_placeholder() -> Conversation {
         Conversation {
             protocol: ProtocolId::Discord,
@@ -11499,37 +11395,25 @@ mod tests {
     }
 
     #[test]
-    fn the_account_rail_lists_every_account_and_has_no_all_filter() {
-        assert!(
-            !InboxFilter::chrome_filters()
-                .iter()
-                .any(|filter| filter.label() == "All")
+    fn the_account_sidebar_lists_every_account_of_this_build() {
+        let view = Snapshot::new();
+        assert_eq!(
+            view.shows_in_switcher(ProtocolId::WhatsApp),
+            cfg!(feature = "whatsapp-web")
         );
-        for filter in InboxFilter::chrome_filters() {
-            let mut view = Snapshot::new();
-            view.set_filter(*filter);
-            assert_eq!(
-                view.shows_in_switcher(ProtocolId::WhatsApp),
-                cfg!(feature = "whatsapp-web"),
-                "a pill does not hide other accounts"
-            );
-            assert_eq!(
-                view.shows_in_switcher(ProtocolId::Discord),
-                DiscordAdapter::bot_inbox_compiled()
-            );
-            assert_eq!(
-                view.shows_in_switcher(ProtocolId::Slack),
-                cfg!(feature = "slack-oauth")
-            );
-            assert_eq!(
-                view.shows_in_switcher(ProtocolId::Signal),
-                cfg!(feature = "signal-local")
-            );
-            assert!(view.shows_in_switcher(ProtocolId::Telegram));
-        }
-        assert!(!InboxFilter::Telegram.matches(ProtocolId::Slack));
-        #[cfg(feature = "slack-oauth")]
-        assert!(!InboxFilter::Slack.matches(ProtocolId::Telegram));
+        assert_eq!(
+            view.shows_in_switcher(ProtocolId::Discord),
+            DiscordAdapter::bot_inbox_compiled()
+        );
+        assert_eq!(
+            view.shows_in_switcher(ProtocolId::Slack),
+            cfg!(feature = "slack-oauth")
+        );
+        assert_eq!(
+            view.shows_in_switcher(ProtocolId::Signal),
+            cfg!(feature = "signal-local")
+        );
+        assert!(view.shows_in_switcher(ProtocolId::Telegram));
     }
 
     #[test]
