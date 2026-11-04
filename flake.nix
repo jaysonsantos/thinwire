@@ -53,6 +53,8 @@
                 pkgs.cargo-deny
                 pkgs.prek
                 pkgs.taplo
+                # Lossless PNG shrink for the UI snapshots (scripts/update-snapshots.sh).
+                pkgs.oxipng
                 pkgs.shellcheck
                 pkgs.nixfmt
                 pkgs.typos

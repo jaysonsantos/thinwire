@@ -120,6 +120,8 @@ UI snapshots (Linux, lavapipe). The default `cargo test` does not run them. CI j
 nix develop --command scripts/update-snapshots.sh
 ```
 
+The script then shrinks the images with `oxipng`. That is lossless, and the snapshots are most of the repository, so commit the shrunk files.
+
 Live Telegram run in the Nix shell (Linux):
 
 ```bash
