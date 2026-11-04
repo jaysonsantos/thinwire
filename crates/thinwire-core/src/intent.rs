@@ -8,7 +8,7 @@
 use crate::notify::NotifyKey;
 use thinwire_protocol::{MessageTopic, ProtocolId};
 
-use crate::state::{AuthKey, InboxFilter};
+use crate::state::AuthKey;
 use crate::{SecretText, ThemeMode};
 
 /// One user action. Frontends map clicks and keys to these values.
@@ -34,8 +34,6 @@ pub enum Intent {
     /// Move the inbox highlight to the row that has keyboard focus.
     /// This does not open the chat.
     FocusInbox { id: String },
-    /// Select the account of one top-bar pill. There is no combined inbox.
-    SetFilter(InboxFilter),
     /// Inbox search text. Matches chat title and participant only.
     /// `SecretText` keeps the typed text out of `Debug`.
     SetSearch(SecretText),

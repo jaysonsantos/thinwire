@@ -2,6 +2,7 @@
 
 mod auth;
 mod dock;
+mod icons;
 #[cfg(test)]
 mod inbox_keys;
 mod links;

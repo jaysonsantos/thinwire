@@ -66,7 +66,7 @@ fn compose_ui_uses_enter_multiline_and_disabled_send() {
     assert!(compose.contains("snapshot.signal_device_removed()"));
     assert!(compose.contains("snapshot.signal_read_only_reason()"));
     assert!(compose.contains(".interactive(compose_open)"));
-    assert!(compose.contains("add_enabled(snapshot.can_send()"));
+    assert!(compose.contains("add_enabled_ui(snapshot.can_send()"));
     assert!(ui.contains("request_focus(compose_id)"));
     assert!(ui.contains("\"Not sent.\""));
     assert!(ui.contains("\"Retry\""));
@@ -314,16 +314,18 @@ fn a_live_session_hides_add_account_and_cancel_keeps_it() {
     assert_eq!(snapshot.center_view(), CenterView::Thread);
 
     let ui = include_str!("ui.rs");
-    let bar = &ui[ui.find("fn top_bar(").expect("top bar")..];
-    let bar = &bar[..bar.find("\nfn ").expect("next")];
-    let guard = bar.find("can_add_account()").expect("guard");
-    let button = bar.find("\"Add account\"").expect("button");
+    let footer = &ui[ui.find("fn rail_footer(").expect("sidebar foot")..];
+    let footer = &footer[..footer.find("\nfn ").expect("next")];
+    let guard = footer.find("can_add_account()").expect("guard");
+    let button = footer.find("\"Add account\"").expect("button");
     assert!(guard < button, "Add account hides when Telegram is ready");
-    let advanced = bar.find("\"Advanced\"").expect("advanced");
-    let advanced_guard = bar[..advanced]
-        .rfind("can_add_account()")
-        .expect("advanced guard");
-    assert!(advanced_guard > button, "Advanced has its own guard");
+    let menu = &ui[ui.find("fn settings_menu(").expect("settings menu")..];
+    let menu = &menu[..menu.find("\nfn ").expect("next")];
+    let advanced = menu.find("\"Advanced\"").expect("advanced");
+    assert!(
+        menu[..advanced].contains("can_add_account()"),
+        "Advanced has its own guard"
+    );
 }
 
 #[test]
@@ -350,9 +352,9 @@ fn slack_sign_in_is_compiled_only_with_the_feature() {
     let first = &first[..first.find("\nfn ").expect("next")];
     assert!(first.contains("add_slack_workspace("));
     assert!(!first.contains("Add Slack workspace"));
-    let bar = &ui[ui.find("fn top_bar(").expect("bar")..];
-    let bar = &bar[..bar.find("\nfn ").expect("next")];
-    assert!(bar.contains("add_slack_workspace("));
+    let footer = &ui[ui.find("fn rail_footer(").expect("sidebar foot")..];
+    let footer = &footer[..footer.find("\nfn ").expect("next")];
+    assert!(footer.contains("add_slack_workspace("));
 }
 
 #[test]

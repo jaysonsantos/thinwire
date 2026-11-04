@@ -25,6 +25,19 @@ discord-bot = ["thinwire-core/discord-bot", "thinwire-protocol/discord-bot"]
 # app does not link the AGPL client: it talks to the helper over a pipe.
 # Release builds turn this on. The default UI stays feature-off.
 signal-local = ["dep:qrcode", "thinwire-core/signal-local"]
+# Every protocol of a release build, in one switch for a local build. It is the
+# list of `release_features` in `scripts/test-release-features.sh` without the
+# Cargo prefix, and `scripts/check-local-only-features.sh` keeps both the same.
+all-protocols = [
+  "telegram-tdlib",
+  "slack-oauth",
+  "discord-bot",
+  "whatsapp-web",
+  "signal-local",
+]
+# macOS Keychain through /usr/bin/security. LOCAL BUILDS ONLY (see
+# `thinwire-core`). `scripts/local-build.sh` is the one place that turns it on.
+keychain-security-cli = ["thinwire-core/keychain-security-cli"]
 # Pixel snapshots. Off in the default test job. The ui-snapshots CI job turns it on.
 ui-snapshots = ["egui_kittest/snapshot", "egui_kittest/wgpu"]
 

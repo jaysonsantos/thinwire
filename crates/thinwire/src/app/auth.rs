@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, RichText};
 
-use thinwire_protocol::{TelegramAuthError, TelegramCodeVia};
+use thinwire_protocol::{ProtocolId, TelegramAuthError, TelegramCodeVia};
 
 use super::motion;
 use super::theme::{self, space};
@@ -26,51 +26,110 @@ fn step_line(auth: AuthScreen) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+/// Place of the step among the three login steps. Other screens have none.
+#[must_use]
+fn step_number(auth: AuthScreen) -> Option<usize> {
+    match auth {
+        AuthScreen::TelegramPhone => Some(1),
+        AuthScreen::TelegramCode => Some(2),
+        AuthScreen::Telegram2fa => Some(3),
+        AuthScreen::Idle
+        | AuthScreen::NeedCredentials
+        | AuthScreen::TelegramApi
+        | AuthScreen::TelegramConnecting => None,
+    }
+}
+
+/// Three segments, one for each login step, then the step caption. The
+/// segments up to the current step are filled with the accent.
+fn step_progress(ui: &mut egui::Ui, auth: AuthScreen) {
+    let (Some(current), Some(caption)) = (step_number(auth), step_line(auth)) else {
+        return;
+    };
+    let palette = theme::palette(ui);
+    let card = if ui.visuals().dark_mode {
+        palette.surface
+    } else {
+        palette.bg
+    };
+    let track = motion::mix(card, palette.text3, 0.35);
+    ui.add_space(space::S);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::XS;
+        for step in 1..=3 {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 4.0), egui::Sense::hover());
+            let color = if step <= current {
+                palette.accent
+            } else {
+                track
+            };
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(2), color);
+        }
+        ui.add_space(space::XS);
+        ui.label(RichText::new(caption).small().color(palette.text3));
+    });
+}
+
+/// `room` is the height of the column on screen. A card taller than that
+/// starts at the top and the column scrolls.
+pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, room: f32, out: &mut Vec<Intent>) {
     if snapshot.auth == AuthScreen::Idle {
         return;
     }
-    theme::show_centered_card(ui, |ui| {
-        let palette = theme::palette(ui);
-        ui.label(
-            RichText::new(auth_heading(snapshot.auth))
-                .text_style(theme::display())
-                .color(palette.text),
-        );
-        if let Some(step) = step_line(snapshot.auth) {
-            ui.add_space(space::XS);
-            ui.label(RichText::new(step).small().color(palette.text3));
-        }
-        if let Some(banner) = stub_banner(snapshot) {
-            ui.add_space(space::S);
-            ui.colored_label(palette.warn, banner);
-        }
-        ui.add_space(space::S);
-        ui.label(
-            RichText::new("Your number and code stay on this device. They are never logged.")
-                .small()
-                .color(palette.text3),
-        );
+    // The card sits in the middle of the column. Its height is known from the
+    // last frame, so the first frame of a step does not jump.
+    let height_id = ui.scope_id().with("auth-card-height");
+    let known = ui.data(|data| data.get_temp::<f32>(height_id).unwrap_or(0.0));
+    ui.add_space(((room - known) * 0.4).max(0.0));
+    let card = ui
+        .scope(|ui| {
+            theme::show_centered_card(ui, |ui| card_body(ui, snapshot, out));
+        })
+        .response;
+    ui.data_mut(|data| data.insert_temp(height_id, card.rect.height()));
+}
+
+fn card_body(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    let palette = theme::palette(ui);
+    let (tile, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+    super::ui::paint_protocol_tile(ui, tile, ProtocolId::Telegram, None);
+    ui.add_space(space::M);
+    ui.label(
+        RichText::new(auth_heading(snapshot.auth))
+            .text_style(theme::display())
+            .color(palette.text),
+    );
+    step_progress(ui, snapshot.auth);
+    if let Some(banner) = stub_banner(snapshot) {
         ui.add_space(space::M);
-        let focus = take_focus(ui, snapshot);
-        match snapshot.auth {
-            AuthScreen::Idle => {}
-            AuthScreen::NeedCredentials => need_credentials(ui, out),
-            AuthScreen::TelegramApi => telegram_api(ui, snapshot, focus, out),
-            AuthScreen::TelegramConnecting => telegram_connecting(ui, snapshot, out),
-            AuthScreen::TelegramPhone => telegram_phone(ui, snapshot, focus, out),
-            AuthScreen::TelegramCode => telegram_code(ui, snapshot, focus, out),
-            AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot, focus, out),
-        }
-        inline_feedback(ui, snapshot);
-        ui.add_space(space::S);
-        if ui
-            .add(egui::Button::new(RichText::new("Cancel").color(palette.text2)).frame(false))
-            .clicked()
-        {
-            out.push(Intent::Telegram(TelegramIntent::Cancel));
-        }
-    });
+        super::ui::note_box(ui, palette.warn, banner);
+    }
+    ui.add_space(space::S);
+    ui.label(
+        RichText::new("Your number and code stay on this device. They are never logged.")
+            .small()
+            .color(palette.text3),
+    );
+    ui.add_space(space::M);
+    let focus = take_focus(ui, snapshot);
+    match snapshot.auth {
+        AuthScreen::Idle => {}
+        AuthScreen::NeedCredentials => need_credentials(ui, out),
+        AuthScreen::TelegramApi => telegram_api(ui, snapshot, focus, out),
+        AuthScreen::TelegramConnecting => telegram_connecting(ui, snapshot, out),
+        AuthScreen::TelegramPhone => telegram_phone(ui, snapshot, focus, out),
+        AuthScreen::TelegramCode => telegram_code(ui, snapshot, focus, out),
+        AuthScreen::Telegram2fa => telegram_2fa(ui, snapshot, focus, out),
+    }
+    inline_feedback(ui, snapshot);
+    ui.add_space(space::S);
+    if ui
+        .add(egui::Button::new(RichText::new("Cancel").color(palette.text2)).frame(false))
+        .clicked()
+    {
+        out.push(Intent::Telegram(TelegramIntent::Cancel));
+    }
 }
 
 /// Notice and error under the field. The status strip does not repeat them.
@@ -81,28 +140,32 @@ fn inline_feedback(ui: &mut egui::Ui, snapshot: &Snapshot) {
     }
     ui.add_space(space::S);
     if let Some(notice) = &snapshot.auth_notice {
-        ui.label(
-            RichText::new(notice)
-                .text_style(theme::secondary())
-                .color(palette.warn),
-        );
+        super::ui::note_box(ui, palette.warn, notice);
     }
     if let Some(error) = &snapshot.error {
-        ui.label(
-            RichText::new(&error.happened)
-                .text_style(theme::secondary())
-                .color(palette.error),
-        );
-        ui.label(
-            RichText::new(&error.why)
-                .text_style(theme::secondary())
-                .color(palette.text2),
-        );
-        ui.label(
-            RichText::new(format!("What to do: {}", error.next))
-                .text_style(theme::secondary())
-                .color(palette.text2),
-        );
+        egui::Frame::new()
+            .fill(super::motion::mix(palette.bg, palette.error, 0.12))
+            .corner_radius(egui::CornerRadius::same(theme::radius::ROW))
+            .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(&error.happened)
+                        .text_style(theme::secondary())
+                        .family(theme::semibold())
+                        .color(palette.error),
+                );
+                ui.label(
+                    RichText::new(&error.why)
+                        .text_style(theme::secondary())
+                        .color(palette.text2),
+                );
+                ui.label(
+                    RichText::new(format!("What to do: {}", error.next))
+                        .text_style(theme::secondary())
+                        .color(palette.text2),
+                );
+            });
     }
 }
 
@@ -127,12 +190,14 @@ fn field(
     edit: impl FnOnce(&mut String) -> egui::TextEdit<'_>,
 ) -> Option<String> {
     let id = egui::Id::unique(("auth-field", auth_field));
+    let palette = theme::palette(ui);
+    let margin = egui::Margin::symmetric(space::M as i8, space::M as i8);
+    let focused = ui.memory(|memory| memory.has_focus(id));
+    let ring = motion::toggle(ui.ctx(), id.with("ring"), focused, motion::STATE);
+    let frame = theme::field_frame(palette, ring, margin);
     let width = ui.available_width();
     let changed = edited(ui, current, |text| {
-        edit(text)
-            .id(id)
-            .desired_width(width)
-            .margin(egui::Margin::symmetric(space::M as i8, space::M as i8))
+        edit(text).id(id).frame(frame).desired_width(width)
     });
     if focus {
         ui.memory_mut(|memory| memory.request_focus(id));
@@ -362,6 +427,17 @@ fn continue_button(ui: &mut egui::Ui, snapshot: &Snapshot, label: &str, out: &mu
 #[cfg(test)]
 mod tests {
     use super::{AuthScreen, step_line};
+
+    #[test]
+    fn the_progress_segments_follow_the_three_login_steps() {
+        use super::step_number;
+
+        assert_eq!(step_number(AuthScreen::TelegramPhone), Some(1));
+        assert_eq!(step_number(AuthScreen::TelegramCode), Some(2));
+        assert_eq!(step_number(AuthScreen::Telegram2fa), Some(3));
+        assert_eq!(step_number(AuthScreen::TelegramConnecting), None);
+        assert_eq!(step_number(AuthScreen::Idle), None);
+    }
 
     #[test]
     fn step_line_names_the_three_login_steps() {

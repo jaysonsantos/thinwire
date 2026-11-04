@@ -1096,7 +1096,13 @@ fn try_linux_store(backend: OsBackend) -> Result<(), keyring_core::Error> {
 #[cfg(not(target_os = "linux"))]
 fn install_platform_store() -> Result<OsBackend, AttachError> {
     let store = {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "keychain-security-cli"))]
+        {
+            tracing::info!("Keychain access goes through the security command (local build)");
+            crate::security_cli::Store::new()
+                .map_err(|error| AttachError::Absent(map_keyring_error(error)))?
+        }
+        #[cfg(all(target_os = "macos", not(feature = "keychain-security-cli")))]
         {
             apple_native_keyring_store::keychain::Store::new()
                 .map_err(|error| AttachError::Absent(map_keyring_error(error)))?

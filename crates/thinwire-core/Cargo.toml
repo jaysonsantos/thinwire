@@ -26,6 +26,11 @@ discord-bot = ["thinwire-protocol/discord-bot"]
 signal-local = []
 # Test hooks on `SecretStore` for other workspace crates. Never in a release.
 test-support = []
+# macOS Keychain through /usr/bin/security, so a local rebuild does not ask for
+# permission again. LOCAL BUILDS ONLY: `build.rs` fails a build under CI, and
+# `scripts/check-local-only-features.sh` keeps it out of the workflows and out
+# of every other feature list. Only `scripts/local-build.sh` turns it on.
+keychain-security-cli = []
 
 [dependencies]
 chrono.workspace = true

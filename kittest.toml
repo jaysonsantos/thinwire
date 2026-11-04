@@ -1,0 +1,15 @@
+# egui_kittest settings for the UI snapshots in crates/thinwire/tests/snapshots.
+#
+# The images come from two renderers: Metal on a Mac, and lavapipe on Linux
+# (CI). They round the anti-aliased edge of a circle differently. For the 44
+# images that CI rejected on the first run, the worst pixel is off by 3 of 255
+# in one color channel, and the pictures look the same.
+#
+# The default `threshold` is 0.6. With `max_failed_pixels` at 0, it fails a
+# whole image for 8 to 20 such pixels, so an image made on a Mac failed on
+# Linux. 5.0 passes all of them. It is the weighted squared YIQ distance of
+# one pixel, so it still flags a pixel that is off by about 3 levels of
+# luminance or more. A moved border, a changed color, and a changed glyph are
+# all far above that. Keep `max_failed_pixels` at 0: a count above about 10
+# can hide a real change.
+threshold = 5.0
