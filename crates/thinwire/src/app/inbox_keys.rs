@@ -744,7 +744,7 @@ fn a_wrapped_message_keeps_the_time_on_the_bottom() {
 }
 
 #[test]
-fn a_pending_message_keeps_the_time_on_the_last_line() {
+fn a_pending_message_keeps_the_time_and_sending_on_the_last_line() {
     let body = "On my way with the long note that wraps onto another line in this thread.";
     let mut message = chat_message("telegram:1:pend", body, 1_790_300_000);
     message.outbound = true;
@@ -769,8 +769,13 @@ fn a_pending_message_keeps_the_time_on_the_last_line() {
     assert!(gap < 6.0, "the time stays on the last line, gap {gap}");
     let sending = harness.get_by_role_and_label(egui::accesskit::Role::Label, "Sending…");
     assert!(
-        sending.rect().top() + 2.0 >= time.rect().bottom(),
-        "Sending… sits under the time"
+        sending.rect().left() >= text.rect().right() - 2.0,
+        "Sending… sits beside the message"
+    );
+    let sending_gap = (sending.rect().bottom() - text.rect().bottom()).abs();
+    assert!(
+        sending_gap < 6.0,
+        "Sending… shares the time line, gap {sending_gap}"
     );
 }
 

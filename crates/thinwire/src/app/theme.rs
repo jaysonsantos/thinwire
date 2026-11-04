@@ -22,11 +22,13 @@ use eframe::egui::{
 pub(crate) struct Palette {
     /// Thread / center panel.
     pub bg: Color32,
-    /// Left panel and top bar.
+    /// Account sidebar. One step away from `sidebar`, so the two columns read as layers.
+    pub rail: Color32,
+    /// Chat list column and the status banner.
     pub sidebar: Color32,
     /// Inbound bubble, cards, buttons.
     pub surface: Color32,
-    /// Hover fill on rows and buttons.
+    /// Hover fill on list rows.
     pub hover: Color32,
     /// Text fields.
     pub input: Color32,
@@ -40,18 +42,21 @@ pub(crate) struct Palette {
     pub text2: Color32,
     /// Times, hints, meta, day breaks.
     pub text3: Color32,
-    /// Focus and the primary button.
+    /// Focus ring, the primary and Send buttons, and the brand mark.
     pub accent: Color32,
-    /// Underlined links. 4.5:1 on a bubble and on an outbound bubble.
+    /// Underlined links. 4.5:1 on an inbound bubble. An outbound bubble uses
+    /// `out_link`.
     pub link: Color32,
     /// Text on the primary button.
     pub on_accent: Color32,
-    /// Selected chat row.
+    /// Selected chat row, selected account row, and the pressed control.
     pub selected_row: Color32,
     /// Outbound bubble fill.
     pub out: Color32,
     /// Outbound body text.
     pub on_out: Color32,
+    /// Links inside an outbound bubble. Underlined, so color is not the only cue.
+    pub out_link: Color32,
     /// Outbound time and "Sending…".
     pub out_meta: Color32,
     /// Unread count pill.
@@ -74,54 +79,58 @@ const fn hex(rgb: u32) -> Color32 {
 
 impl Palette {
     pub(crate) const DARK: Self = Self {
-        bg: hex(0x16_17_1A),
-        sidebar: hex(0x1D_1E_22),
-        surface: hex(0x2A_2C_31),
-        hover: hex(0x33_36_3C),
-        input: hex(0x10_11_14),
-        border: hex(0x3A_3D_44),
+        bg: hex(0x1D_1E_23),
+        rail: hex(0x11_12_15),
+        sidebar: hex(0x17_18_1C),
+        surface: hex(0x2A_2C_33),
+        hover: hex(0x22_24_2A),
+        input: hex(0x13_14_17),
+        border: hex(0x2B_2D_34),
         border_strong: hex(0x6B_70_7A),
-        text: hex(0xE8_E9_EC),
-        text2: hex(0xB3_B7_BF),
-        text3: hex(0x9C_A1_AB),
-        accent: hex(0x5A_A2_FF),
+        text: hex(0xEC_ED_F0),
+        text2: hex(0xB6_BA_C3),
+        text3: hex(0x9A_A0_AB),
+        accent: hex(0x6A_A6_FF),
         link: hex(0xB7_D4_FF),
-        on_accent: hex(0x0B_1A_2E),
-        selected_row: hex(0x26_34_4A),
-        out: hex(0x2B_52_78),
-        on_out: hex(0xF2_F6_FB),
-        out_meta: hex(0xB9_CC_E3),
+        on_accent: hex(0x08_17_2B),
+        selected_row: hex(0x22_30_4A),
+        out: hex(0x2A_52_B8),
+        on_out: hex(0xFF_FF_FF),
+        out_link: hex(0xFF_FF_FF),
+        out_meta: hex(0xC9_D8_FF),
         badge: hex(0x2A_68_CC),
         on_badge: hex(0xFF_FF_FF),
         warn: hex(0xF0_B4_55),
         error: hex(0xFF_7A_7A),
-        out_error: hex(0xFF_C2_C2),
+        out_error: hex(0xFF_D0_CC),
         ok: hex(0x5F_D3_9A),
     };
 
     pub(crate) const LIGHT: Self = Self {
         bg: hex(0xFF_FF_FF),
-        sidebar: hex(0xF3_F4_F6),
-        surface: hex(0xEE_F0_F3),
-        hover: hex(0xE3_E6_EA),
+        rail: hex(0xEC_EE_F2),
+        sidebar: hex(0xF6_F7_F9),
+        surface: hex(0xEA_ED_F2),
+        hover: hex(0xE8_EB_F0),
         input: hex(0xFF_FF_FF),
-        border: hex(0xC4_C8_CF),
+        border: hex(0xE2_E5_EA),
         border_strong: hex(0x76_7C_87),
-        text: hex(0x17_18_1B),
-        text2: hex(0x45_4A_53),
-        text3: hex(0x5E_63_6D),
-        accent: hex(0x1A_63_D6),
+        text: hex(0x14_16_1A),
+        text2: hex(0x46_4C_56),
+        text3: hex(0x5C_62_6C),
+        accent: hex(0x1F_5B_DB),
         link: hex(0x0B_3D_91),
         on_accent: hex(0xFF_FF_FF),
-        selected_row: hex(0xDD_E8_FA),
-        out: hex(0xD6_E8_FF),
-        on_out: hex(0x17_18_1B),
-        out_meta: hex(0x3E_57_75),
-        badge: hex(0x1A_63_D6),
+        selected_row: hex(0xDF_E9_FC),
+        out: hex(0x1F_5B_DB),
+        on_out: hex(0xFF_FF_FF),
+        out_link: hex(0xFF_FF_FF),
+        out_meta: hex(0xDC_E8_FF),
+        badge: hex(0x1F_5B_DB),
         on_badge: hex(0xFF_FF_FF),
         warn: hex(0x8A_53_00),
         error: hex(0xB3_26_1E),
-        out_error: hex(0xB3_26_1E),
+        out_error: hex(0xFF_E1_DE),
         ok: hex(0x1B_6E_43),
     };
 
@@ -135,7 +144,7 @@ impl Palette {
 }
 
 /// Color behind an inbox row. A normal row is transparent and shows the
-/// sidebar. Hover paints `surface`. Selected paints `selected_row`, including
+/// sidebar. Hover paints `hover`. Selected paints `selected_row`, including
 /// when the pointer is also over that row.
 #[cfg(test)]
 #[must_use]
@@ -147,19 +156,27 @@ pub(crate) const fn inbox_row_backdrop(
     if selected {
         palette.selected_row
     } else if hovered {
-        palette.surface
+        palette.hover
     } else {
         palette.sidebar
     }
 }
 
-/// Inbox row and account chip highlight during a transition. `selected` and
-/// `hovered` go from 0 to 1. At 0 and 1 it is the row backdrop of that state:
-/// the sidebar, `surface` on hover, and `selected_row` when selected.
+/// Row highlight during a transition. `selected` and `hovered` run from 0 to
+/// one. At the ends it is the row backdrop of that state: `base`, then
+/// `hover`, then `selected_row`. `base` is the panel the row sits on:
+/// `sidebar` for chats, `rail` for accounts.
+#[must_use]
+pub(crate) fn row_fill(base: Color32, palette: &Palette, selected: f32, hovered: f32) -> Color32 {
+    let hover = super::motion::mix(base, palette.hover, hovered);
+    super::motion::mix(hover, palette.selected_row, selected)
+}
+
+/// [`row_fill`] on the chat list.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn inbox_row_fill(palette: &Palette, selected: f32, hovered: f32) -> Color32 {
-    let hover = super::motion::mix(palette.sidebar, palette.surface, hovered);
-    super::motion::mix(hover, palette.selected_row, selected)
+    row_fill(palette.sidebar, palette, selected, hovered)
 }
 
 /// Outline of a muted unread count (#206).
@@ -172,7 +189,8 @@ pub(crate) const fn muted_badge_ring(palette: &Palette) -> Color32 {
     palette.text
 }
 
-/// Circle behind inbox initials, and the initials color on that circle.
+/// Circle behind inbox initials, and the initials color on that circle. The
+/// protocol tile of the account sidebar uses the same pairs.
 ///
 /// One pair per `accent_color_id` in 0–6. The initials use the accent ink.
 /// Each pair is at least 4.5:1.
@@ -255,6 +273,17 @@ pub(crate) const fn avatar_ink(accent: u8, dark: bool) -> AvatarInk {
     }
 }
 
+/// Color of a sender's name in a group chat. The same name always gets the
+/// same color. It is the initials color of an [`avatar_ink`] pair, so it keeps
+/// 4.5:1 on the inbound bubble in both themes.
+#[must_use]
+pub(crate) fn sender_ink(sender: &str, dark: bool) -> Color32 {
+    let sum = sender.bytes().fold(0_u32, |sum, byte| {
+        sum.wrapping_mul(31).wrapping_add(u32::from(byte))
+    });
+    avatar_ink((sum % 7) as u8, dark).text
+}
+
 /// Ink for a disabled "Muted in {protocol}" control (#206).
 ///
 /// Title and reason are full palette colors on `bg` (the menu popup and the
@@ -276,19 +305,24 @@ pub(crate) const fn protocol_mute_ink(palette: &Palette) -> ProtocolMuteInk {
     }
 }
 
-/// Center a card. Dark uses `surface`. Light uses `bg` and a `border`.
+/// Center a card: `bg` fill, a hairline, and a soft shadow that lifts it off
+/// the page in both themes.
 pub(crate) fn show_centered_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     let palette = palette(ui);
     let dark = ui.visuals().dark_mode;
     let width = ui.available_width().min(LOGIN_CARD_WIDTH);
     let inset = ((ui.available_width() - width) * 0.5).max(0.0);
-    let mut frame = egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(if dark { palette.surface } else { palette.bg })
-        .corner_radius(egui::CornerRadius::same(radius::BUBBLE))
+        .stroke(egui::Stroke::new(1.0, palette.border))
+        .shadow(egui::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: Color32::from_black_alpha(if dark { 90 } else { 22 }),
+        })
+        .corner_radius(egui::CornerRadius::same(radius::CARD))
         .inner_margin(egui::Margin::same(space::XL as i8));
-    if !dark {
-        frame = frame.stroke(egui::Stroke::new(1.0, palette.border));
-    }
     ui.horizontal(|ui| {
         ui.add_space(inset);
         ui.vertical(|ui| {
@@ -296,6 +330,39 @@ pub(crate) fn show_centered_card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::
             frame.show(ui, add);
         });
     });
+}
+
+/// Frame of a text field. `focus` goes from 0 to 1: the hairline becomes
+/// the accent ring and grows from 1 to 2 px. The hairline is `border_strong`,
+/// which clears 3:1 on every panel (WCAG 1.4.11).
+pub(crate) fn field_frame(palette: &Palette, focus: f32, margin: Margin) -> egui::Frame {
+    let width = egui::lerp(1.0..=FIELD_RING, focus);
+    egui::Frame::new()
+        .fill(palette.input)
+        .stroke(Stroke::new(
+            width,
+            super::motion::mix(palette.border_strong, palette.accent, focus),
+        ))
+        .corner_radius(CornerRadius::same(radius::FIELD_BOX))
+        // The ring grows inward, so the text does not move when it appears.
+        .inner_margin(margin - Margin::from(width))
+}
+
+/// Widest focused field ring.
+pub(crate) const FIELD_RING: f32 = 2.0;
+
+/// Tint for the tile of a protocol in the account sidebar. An index into
+/// [`avatar_ink`], so the pair keeps its 4.5:1 initials contrast.
+#[must_use]
+pub(crate) const fn protocol_tile(protocol: thinwire_protocol::ProtocolId) -> u8 {
+    use thinwire_protocol::ProtocolId;
+    match protocol {
+        ProtocolId::Telegram => 5,
+        ProtocolId::WhatsApp => 3,
+        ProtocolId::Discord => 2,
+        ProtocolId::Slack => 6,
+        ProtocolId::Signal => 4,
+    }
 }
 
 /// Palette for the theme that `ui` draws with now.
@@ -315,6 +382,8 @@ pub(crate) mod space {
     pub(crate) const XS: f32 = 4.0;
     pub(crate) const S: f32 = 8.0;
     pub(crate) const M: f32 = 12.0;
+    /// Panel padding and the gap between a header and its content.
+    pub(crate) const L: f32 = 16.0;
     /// Login card padding.
     pub(crate) const XL: f32 = 24.0;
 }
@@ -324,14 +393,20 @@ pub(crate) const LOGIN_CARD_WIDTH: f32 = 400.0;
 
 /// Corner radii.
 pub(crate) mod radius {
-    /// Buttons, inputs, rows.
-    pub(crate) const CONTROL: u8 = 6;
-    /// Compose field. Tall enough to read as a pill at 40 px.
-    pub(crate) const FIELD: u8 = 20;
-    /// Bubbles and cards.
-    pub(crate) const BUBBLE: u8 = 12;
+    /// Buttons and menu items.
+    pub(crate) const CONTROL: u8 = 8;
+    /// Inbox rows, account rows, and their highlights.
+    pub(crate) const ROW: u8 = 10;
+    /// Search field and other single-line boxes.
+    pub(crate) const FIELD_BOX: u8 = 10;
+    /// Compose field. A full pill at one line.
+    pub(crate) const FIELD: u8 = 22;
+    /// Message bubbles.
+    pub(crate) const BUBBLE: u8 = 16;
     /// Sender-side bottom corner on the last bubble of a run.
-    pub(crate) const BUBBLE_TAIL: u8 = 4;
+    pub(crate) const BUBBLE_TAIL: u8 = 5;
+    /// Cards and banners.
+    pub(crate) const CARD: u8 = 16;
     /// Badges and pills. The spec value 999 does not fit in egui's `u8`
     /// radius. This value rounds any badge into a pill.
     pub(crate) const PILL: u8 = u8::MAX;
@@ -343,16 +418,10 @@ pub(crate) const MIN_TARGET: f32 = 32.0;
 const FOCUS_WIDTH: f32 = 2.0;
 /// Content inset inside a full-width row highlight.
 ///
-/// Section headers, account chips, and inbox rows share the x so the header
-/// text, the status dot, and the chat title start on one line. The highlight
+/// The list headers, account rows, and inbox rows share the x so the title,
+/// the protocol tile, and the chat avatar start on one line. The highlight
 /// fill stays the full row; only the content moves in.
 pub(crate) const ROW_INSET: Vec2 = Vec2::new(space::M, space::S);
-
-/// Left edge of a section header and of row content, from the panel's inner left.
-#[must_use]
-pub(crate) fn sidebar_content_x(panel_inner_left: f32) -> f32 {
-    panel_inner_left + ROW_INSET.x
-}
 
 /// Content rect of a row highlight.
 ///
@@ -366,17 +435,35 @@ pub(crate) fn row_content_rect(row: egui::Rect, right_gutter: f32) -> egui::Rect
     )
 }
 
-/// Frame for the top bar, the status strip, and the left panel.
-///
-/// [`egui::Frame::side_top_panel`] is 8 px by 2 px. Panels do not read
-/// `spacing.window_margin`, so the shell sets this frame itself.
-pub(crate) fn chrome_panel(style: &egui::Style) -> egui::Frame {
-    egui::Frame::side_top_panel(style).inner_margin(egui::Margin::same(space::S as i8))
+/// Frame of the account sidebar: the `rail` fill with a little air.
+pub(crate) fn rail_frame(palette: &Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(palette.rail)
+        .inner_margin(Margin::symmetric(space::S as i8, space::M as i8))
 }
 
-/// Padding inside the top-bar search field. The vertical 6 matches button padding.
+/// Frame of the chat list column. The rows inset themselves, so there is no
+/// margin at the bottom and the scroll bar sits at the panel edge.
+pub(crate) fn list_frame(palette: &Palette) -> egui::Frame {
+    egui::Frame::new()
+        .fill(palette.sidebar)
+        .inner_margin(Margin {
+            left: space::S as i8,
+            right: space::S as i8,
+            top: space::M as i8,
+            bottom: 0,
+        })
+}
+
+/// Side of the protocol tile in the account sidebar.
+pub(crate) const TILE_SIDE: f32 = 36.0;
+
+/// Height of the search field in the chat list.
+pub(crate) const SEARCH_HEIGHT: f32 = 38.0;
+
+/// Padding inside the search field: room for the glass, then the hint.
 pub(crate) fn search_field_margin() -> Margin {
-    Margin::symmetric(space::S as i8, 6)
+    Margin::symmetric(space::M as i8, 8)
 }
 
 /// Inter variable font (SIL OFL 1.1). Notice: `assets/fonts/OFL.txt`.
@@ -431,7 +518,8 @@ pub(crate) mod size {
     pub(crate) const MONO: f32 = 14.0;
     /// Message body, compose, form fields.
     pub(crate) const BODY: f32 = 15.0;
-    /// Thread header, section titles.
+    /// The brand name, the chat list header, the thread title, and empty-state
+    /// titles.
     pub(crate) const HEADING: f32 = 18.0;
     /// First-run and login step titles.
     pub(crate) const DISPLAY: f32 = 24.0;
@@ -527,7 +615,7 @@ fn style(palette: &Palette, theme: Theme) -> egui::Style {
     };
     let spacing = &mut style.spacing;
     spacing.item_spacing = Vec2::new(space::S, 6.0);
-    spacing.button_padding = Vec2::new(space::M, 6.0);
+    spacing.button_padding = Vec2::new(space::M + 2.0, 7.0);
     spacing.interact_size.y = MIN_TARGET;
     spacing.window_margin = Margin::same(space::M as i8);
     spacing.menu_margin = Margin::same(space::S as i8);
@@ -551,31 +639,23 @@ pub(crate) fn visuals(palette: &Palette, theme: Theme) -> egui::Visuals {
         expansion: 0.0,
     };
 
+    // Flat controls: a soft fill and no outline. Text fields draw their own
+    // hairline through `field_frame`, so the 3:1 boundary stays where it is
+    // needed. Keyboard focus and press show the accent ring on `active`.
+    let hover_fill = super::motion::mix(palette.surface, palette.text, 0.08);
     visuals.widgets.noninteractive = widget(
         palette.sidebar,
         Stroke::new(1.0, palette.border),
         palette.text,
     );
-    visuals.widgets.inactive = widget(
-        palette.surface,
-        Stroke::new(1.0, palette.border_strong),
-        palette.text,
-    );
-    visuals.widgets.hovered = widget(
-        palette.hover,
-        Stroke::new(1.0, palette.accent),
-        palette.text,
-    );
+    visuals.widgets.inactive = widget(palette.surface, Stroke::NONE, palette.text);
+    visuals.widgets.hovered = widget(hover_fill, Stroke::NONE, palette.text);
     visuals.widgets.active = widget(
         palette.selected_row,
-        Stroke::new(1.0, palette.accent),
+        Stroke::new(1.5, palette.accent),
         palette.text,
     );
-    visuals.widgets.open = widget(
-        palette.hover,
-        Stroke::new(1.0, palette.border_strong),
-        palette.text,
-    );
+    visuals.widgets.open = widget(hover_fill, Stroke::NONE, palette.text);
 
     visuals.selection.bg_fill = palette.selected_row;
     // Selected text and the focused text-field ring. `accent` on
@@ -590,8 +670,17 @@ pub(crate) fn visuals(palette: &Palette, theme: Theme) -> egui::Visuals {
     visuals.panel_fill = palette.sidebar;
     visuals.window_fill = palette.bg;
     visuals.window_stroke = Stroke::new(1.0, palette.border);
-    visuals.window_corner_radius = CornerRadius::same(radius::BUBBLE);
-    visuals.menu_corner_radius = control;
+    visuals.window_corner_radius = CornerRadius::same(radius::CARD);
+    visuals.menu_corner_radius = CornerRadius::same(radius::ROW);
+    let shadow = |blur: u8, alpha: u8| egui::Shadow {
+        offset: [0, 6],
+        blur,
+        spread: 0,
+        color: Color32::from_black_alpha(alpha),
+    };
+    let dark = theme == Theme::Dark;
+    visuals.popup_shadow = shadow(20, if dark { 110 } else { 38 });
+    visuals.window_shadow = shadow(28, if dark { 130 } else { 46 });
     visuals.faint_bg_color = palette.surface;
     visuals.extreme_bg_color = palette.input;
     visuals.text_edit_bg_color = Some(palette.input);
@@ -628,6 +717,14 @@ mod tests {
         vec![
             ("text/bg", p.text, p.bg),
             ("text/sidebar", p.text, p.sidebar),
+            ("text/rail", p.text, p.rail),
+            ("text2/rail", p.text2, p.rail),
+            ("text3/rail", p.text3, p.rail),
+            ("ok/rail", p.ok, p.rail),
+            ("warn/rail", p.warn, p.rail),
+            ("error/rail", p.error, p.rail),
+            ("accent/rail", p.accent, p.rail),
+            ("accent/hover", p.accent, p.hover),
             ("text/surface", p.text, p.surface),
             ("text/hover", p.text, p.hover),
             ("text/input", p.text, p.input),
@@ -646,7 +743,7 @@ mod tests {
             ("on_out/out", p.on_out, p.out),
             ("out_meta/out", p.out_meta, p.out),
             ("link/surface", p.link, p.surface),
-            ("link/out", p.link, p.out),
+            ("out_link/out", p.out_link, p.out),
             ("accent/bg", p.accent, p.bg),
             ("accent/sidebar", p.accent, p.sidebar),
             ("accent/input", p.accent, p.input),
@@ -667,6 +764,7 @@ mod tests {
         vec![
             ("border_strong/input", p.border_strong, p.input),
             ("border_strong/sidebar", p.border_strong, p.sidebar),
+            ("border_strong/rail", p.border_strong, p.rail),
             ("border_strong/bg", p.border_strong, p.bg),
             ("focus text/input", p.text, p.input),
             ("accent/surface", p.accent, p.surface),
@@ -786,13 +884,11 @@ mod tests {
     }
 
     #[test]
-    fn header_account_and_inbox_content_share_a_left_edge() {
+    fn account_and_inbox_content_share_a_left_edge() {
         let panel_left = 8.0;
         let row = egui::Rect::from_min_size(egui::pos2(panel_left, 20.0), egui::vec2(264.0, 52.0));
-        let header = sidebar_content_x(panel_left);
         let account = row_content_rect(row, 0.0);
         let inbox = row_content_rect(row, 10.0);
-        assert_eq!(header, account.min.x);
         assert_eq!(account.min.x, inbox.min.x);
         assert_eq!(account.min.y - row.min.y, space::S);
         assert_eq!(inbox.min.y - row.min.y, space::S);
@@ -801,22 +897,33 @@ mod tests {
     }
 
     #[test]
-    fn chrome_panel_insets_every_side_by_the_small_space() {
-        let frame = chrome_panel(&egui::Style::default());
-        let margin = frame.inner_margin;
-        assert_eq!(margin.left, space::S as i8);
-        assert_eq!(margin.right, space::S as i8);
-        assert_eq!(margin.top, space::S as i8);
-        assert_eq!(margin.bottom, space::S as i8);
+    fn sidebar_frames_fill_with_their_own_panel_color() {
+        for palette in [Palette::DARK, Palette::LIGHT] {
+            assert_eq!(rail_frame(&palette).fill, palette.rail);
+            assert_eq!(list_frame(&palette).fill, palette.sidebar);
+            assert_ne!(palette.rail, palette.sidebar, "two layers, not one");
+        }
+    }
+
+    #[test]
+    fn a_sender_keeps_one_color_and_it_is_readable_on_the_inbound_bubble() {
+        for (dark, palette) in [(true, Palette::DARK), (false, Palette::LIGHT)] {
+            for sender in ["Ada", "Nora", "Milo", "Ada Park", ""] {
+                let ink = sender_ink(sender, dark);
+                assert_eq!(ink, sender_ink(sender, dark));
+                let ratio = contrast(ink, palette.surface);
+                assert!(ratio >= TEXT_AA, "{sender:?} dark={dark}: {ratio:.2}");
+            }
+        }
     }
 
     #[test]
     fn search_field_margin_insets_the_icon_and_the_hint() {
         let margin = search_field_margin();
-        assert_eq!(margin.left, space::S as i8);
-        assert_eq!(margin.right, space::S as i8);
-        assert_eq!(margin.top, 6);
-        assert_eq!(margin.bottom, 6);
+        assert_eq!(margin.left, space::M as i8);
+        assert_eq!(margin.right, space::M as i8);
+        assert_eq!(margin.top, 8);
+        assert_eq!(margin.bottom, 8);
     }
 
     #[test]

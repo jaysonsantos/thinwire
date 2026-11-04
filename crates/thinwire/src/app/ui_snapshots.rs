@@ -33,7 +33,7 @@ fn runtime() -> Runtime {
 }
 
 /// A spinner keeps requesting frames, so [`Harness::run`] never finishes.
-/// A send in flight shows the busy spinner in the top bar.
+/// A send in flight shows the busy spinner in the chat list header.
 fn keeps_repainting(scenario: Scenario) -> bool {
     matches!(
         scenario,
@@ -311,6 +311,46 @@ mod mute_menu {
     }
 }
 
+/// The Settings button at the foot of the sidebar, clicked: the menu opens
+/// above it with Refresh, the theme choice, and the notification switches.
+mod settings_menu {
+    use super::*;
+
+    fn shoot_open(theme: ThemeMode, size: [f32; 2]) {
+        let name = format!(
+            "settings_menu-{}-{}x{}",
+            theme_slug(theme),
+            size[0] as u32,
+            size[1] as u32
+        );
+        let (runtime, built) = scene(Scenario::LongChat, theme);
+        let mut harness = Harness::builder()
+            .with_size(size)
+            .wgpu()
+            .build_ui_state(draw, built);
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Settings")
+            .click();
+        harness.run();
+        settle_images(&mut harness);
+        harness.get_by_role_and_label(Role::Button, "Refresh");
+        harness.snapshot(&name);
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_1100x720() {
+        shoot_open(ThemeMode::Light, [1100.0, 720.0]);
+    }
+
+    #[test]
+    fn dark_1100x720() {
+        shoot_open(ThemeMode::Dark, [1100.0, 720.0]);
+    }
+}
+
 /// A long chat scrolled up: the jump button sits over the bottom right of
 /// the messages. 480 high, so the chat is taller than the view.
 mod jump_to_latest {
@@ -325,7 +365,7 @@ mod jump_to_latest {
             .wgpu()
             .build_ui_state(draw, built);
         harness.run();
-        harness.hover_at(egui::pos2(size[0] * 0.65, size[1] * 0.5));
+        harness.hover_at(egui::pos2(size[0] * 0.85, size[1] * 0.5));
         harness.event(egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, 5_000.0),
@@ -355,9 +395,9 @@ mod jump_to_latest {
     }
 }
 
-/// The account rail and the chat column are side by side.
-/// In the chat column, the header and the inbox avatar share one x.
-/// The chat title sits one [`theme::space::S`] past the avatar.
+/// The account sidebar and the chat column are side by side.
+/// In the chat column, the list header, the search field and the inbox avatar
+/// share one x. The chat title sits one [`theme::space::M`] past the avatar.
 /// The account unread badge sits inside the highlight by [`theme::ROW_INSET`].
 #[test]
 fn the_chat_list_sits_beside_the_account_rail() {
@@ -368,11 +408,15 @@ fn the_chat_list_sits_beside_the_account_rail() {
             .wgpu()
             .build_ui_state(draw, built);
         harness.run();
-        let header = harness
-            .get_by_role_and_label(Role::Label, "ACCOUNTS")
+        let brand = harness
+            .get_by_role_and_label(Role::Label, "thinwire")
             .rect();
-        let chats_header = harness.get_by_role_and_label(Role::Label, "CHATS").rect();
-        let dot = harness
+        let list_title = harness
+            .query_all(By::new().role(Role::Label).label("Telegram"))
+            .map(|node| node.rect())
+            .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
+            .expect("chat list header");
+        let tile = harness
             .get_by_role_and_label(Role::Label, "account status")
             .rect();
         let title = harness
@@ -384,28 +428,27 @@ fn the_chat_list_sits_beside_the_account_rail() {
             .get_by_role_and_label(Role::Label, "avatar Ada Park")
             .rect();
         assert!(
-            chats_header.min.x > header.max.x,
-            "{theme:?} chats {} must sit to the right of accounts {}",
-            chats_header.min.x,
-            header.max.x
+            list_title.min.x > brand.max.x,
+            "{theme:?} chats {} must sit to the right of the sidebar {}",
+            list_title.min.x,
+            brand.max.x
         );
         assert!(
-            (chats_header.min.y - header.min.y).abs() < 48.0,
-            "{theme:?} chats y {} accounts y {}: the list is not under the accounts",
-            chats_header.min.y,
-            header.min.y
+            (list_title.min.y - brand.min.y).abs() < 48.0,
+            "{theme:?} list header y {} sidebar mark y {}",
+            list_title.min.y,
+            brand.min.y
         );
         assert!(
-            (header.min.x - dot.min.x).abs() < 0.5,
-            "{theme:?} header {} dot {}",
-            header.min.x,
-            dot.min.x
-        );
-        assert!(
-            (chats_header.min.x - avatar.min.x).abs() < 0.5,
-            "{theme:?} chats header {} avatar {}",
-            chats_header.min.x,
+            (list_title.min.x - avatar.min.x).abs() < 0.5,
+            "{theme:?} list header {} avatar {}",
+            list_title.min.x,
             avatar.min.x
+        );
+        assert!(
+            (tile.width() - theme::TILE_SIDE).abs() < 0.5,
+            "{theme:?} tile width {}",
+            tile.width()
         );
         assert!(
             (avatar.width() - super::photos::AVATAR_SIDE).abs() < 0.5,
@@ -414,7 +457,7 @@ fn the_chat_list_sits_beside_the_account_rail() {
         );
         let gap = title.min.x - avatar.max.x;
         assert!(
-            (gap - theme::space::S).abs() < 1.0,
+            (gap - theme::space::M).abs() < 1.0,
             "{theme:?} avatar-to-title gap {gap}"
         );
         let book = harness
@@ -437,7 +480,7 @@ fn the_chat_list_sits_beside_the_account_rail() {
         let account = harness
             .query_all(By::new().role(Role::Button).label("Telegram"))
             .map(|node| node.rect())
-            .find(|rect| rect.intersects(dot))
+            .find(|rect| rect.intersects(tile))
             .expect("account row");
         let badge = harness
             .query_all(By::new().role(Role::Label).label("unread 2"))
@@ -466,7 +509,7 @@ fn the_chat_list_sits_beside_the_account_rail() {
             .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
             .expect("search field");
         assert!(
-            search.height() + 0.5 >= theme::MIN_TARGET,
+            search.height() + 0.5 >= theme::SEARCH_HEIGHT,
             "{theme:?} search height {}",
             search.height()
         );
@@ -689,7 +732,15 @@ mod signal_removed {
                 .is_none(),
             "the status line does not say linked"
         );
-        harness.get_by_role_and_label(Role::Button, "Link");
+        // The sidebar row and the chat list both offer Link. The row's is
+        // the one that relinks the removed device.
+        assert!(
+            harness
+                .query_all(By::new().role(Role::Button).label("Link"))
+                .count()
+                >= 1,
+            "Link is on screen"
+        );
         harness.snapshot(&name);
         let field = harness.get_by_role(Role::MultilineTextInput);
         field.click();
@@ -699,7 +750,11 @@ mod signal_removed {
             harness.state().core.view().compose.is_empty(),
             "sending is off: the message input takes no text"
         );
-        harness.get_by_role_and_label(Role::Button, "Link").click();
+        let link = harness
+            .query_all(By::new().role(Role::Button).label("Link"))
+            .min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x))
+            .expect("Link on the account row");
+        link.click();
         harness.run();
         harness.get_by_role_and_label(Role::Label, "Link a secondary device");
         drop(harness);
