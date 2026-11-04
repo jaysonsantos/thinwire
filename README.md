@@ -153,6 +153,24 @@ Job `helper-os` does the helper steps on Windows and macOS. It runs only when th
 
 The Signal client needs the protobuf compiler `protoc` when it builds. The nix dev shell has it. The CI jobs that do not use nix run `scripts/install-protoc.sh`, which downloads one pinned release and checks its SHA-256.
 
+Local build on macOS, with every protocol on and the Keychain read through the `security` command:
+
+```bash
+nix develop --command scripts/local-build.sh             # debug build
+nix develop --command scripts/local-build.sh --release   # more arguments go to cargo build
+```
+
+The script builds the app and both helpers, each in its own cargo run like a release build (one run would let `telegram-tdlib` reach the helpers). The helpers land beside the app, where it looks for them. It uses two features:
+
+- `all-protocols` turns on every protocol of a release build: `telegram-tdlib`, `slack-oauth`, `discord-bot`, `whatsapp-web`, and `signal-local`. `scripts/check-local-only-features.sh` keeps this list the same as `release_features` in `scripts/test-release-features.sh`.
+- `keychain-security-cli` reads and writes the secrets through `/usr/bin/security` and not through the Keychain API. The Keychain API asks for permission for every new binary, and a local build is a new binary each time. Apple signs `/usr/bin/security` and its path never changes, so the Keychain item trusts it and asks once. The first read of an item that an older build made can still ask once.
+
+A secret is never on a command line. A write sends the command to `security -i` on stdin, with the value as hex. A value must be printable ASCII and at most 1 KiB, and a name must be letters, digits, `.`, `_` and `-`: `security` cuts a longer command, and a cut command would store a cut value.
+
+`keychain-security-cli` is **local only**. Never put it in a workflow, in `default`, in another feature, or in a release build. Three things enforce this: `crates/thinwire-core/build.rs` stops a build when `CI` or `GITHUB_ACTIONS` is set, `scripts/check-local-only-features.sh` runs in `scripts/test.sh` and keeps the name out of `.github/`, out of every other script, and out of every other feature list, and `scripts/local-build.sh` refuses to run under CI. `--all-features` would turn it on, so no CI call uses it, and the feature does not compile outside macOS.
+
+The tests of the store use a fake `security`. One more test runs the real command on a temporary keychain file, so it never touches your login keychain: `cargo test -p thinwire-core --features keychain-security-cli -- --ignored`.
+
 Live TDLib (local install; `tdlib-rs` downloads a prebuilt `tdjson`; never commit `api_id` / `api_hash` / session strings):
 
 ```bash
