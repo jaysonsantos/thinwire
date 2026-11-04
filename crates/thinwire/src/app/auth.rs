@@ -71,7 +71,9 @@ fn step_progress(ui: &mut egui::Ui, auth: AuthScreen) {
     });
 }
 
-pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+/// `room` is the height of the column on screen. A card taller than that
+/// starts at the top and the column scrolls.
+pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, room: f32, out: &mut Vec<Intent>) {
     if snapshot.auth == AuthScreen::Idle {
         return;
     }
@@ -79,7 +81,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>
     // last frame, so the first frame of a step does not jump.
     let height_id = ui.scope_id().with("auth-card-height");
     let known = ui.data(|data| data.get_temp::<f32>(height_id).unwrap_or(0.0));
-    ui.add_space(((ui.available_height() - known) * 0.4).max(0.0));
+    ui.add_space(((room - known) * 0.4).max(0.0));
     let card = ui
         .scope(|ui| {
             theme::show_centered_card(ui, |ui| card_body(ui, snapshot, out));

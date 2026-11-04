@@ -349,6 +349,79 @@ mod settings_menu {
     fn dark_1100x720() {
         shoot_open(ThemeMode::Dark, [1100.0, 720.0]);
     }
+
+    /// The menu is 232 px wide and the sidebar 188. It opens over the chat
+    /// list, so a narrow window must still show all of it.
+    #[test]
+    fn light_800x600() {
+        shoot_open(ThemeMode::Light, [800.0, 600.0]);
+    }
+
+    #[test]
+    fn dark_800x600() {
+        shoot_open(ThemeMode::Dark, [800.0, 600.0]);
+    }
+}
+
+/// The login card is taller than a short window. The column scrolls, so
+/// Change number and Cancel stay in reach. Before it scrolled, they were cut
+/// off at 800x600 with no way to get to them.
+mod login_scrolled {
+    use super::*;
+
+    fn shoot_scrolled(theme: ThemeMode) {
+        let size = [800.0, 480.0];
+        let height = size[1];
+        let name = format!("login_code_scrolled-{}-800x480", theme_slug(theme));
+        let (runtime, built) = scene(Scenario::LoginCode, theme);
+        let mut harness = Harness::builder()
+            .with_size(size)
+            .wgpu()
+            .build_ui_state(draw, built);
+        harness.run();
+        settle_images(&mut harness);
+        // Without a scroll, the card runs past the bottom of the window. If it
+        // fits, this test proves nothing, so it says so.
+        let cancel = harness.get_by_role_and_label(Role::Button, "Cancel").rect();
+        assert!(
+            cancel.bottom() > height,
+            "the card must overflow this window, or the test shows nothing: Cancel ends at {}",
+            cancel.bottom()
+        );
+        harness.hover_at(egui::pos2(size[0] * 0.8, size[1] * 0.5));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -5_000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+            source: egui::MouseWheelSource::Wheel,
+        });
+        // egui spreads a wheel step over several frames.
+        harness.run_steps(12);
+        harness.remove_cursor();
+        harness.run();
+        settle_images(&mut harness);
+        for label in ["Cancel", "Change number"] {
+            let rect = harness.get_by_label(label).rect();
+            assert!(
+                rect.top() >= 0.0 && rect.bottom() <= height,
+                "{label} is on screen after a scroll: {rect:?} in a window {height} high"
+            );
+        }
+        harness.snapshot(&name);
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_800x480() {
+        shoot_scrolled(ThemeMode::Light);
+    }
+
+    #[test]
+    fn dark_800x480() {
+        shoot_scrolled(ThemeMode::Dark);
+    }
 }
 
 /// A long chat scrolled up: the jump button sits over the bottom right of

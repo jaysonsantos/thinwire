@@ -1989,21 +1989,34 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: 
             thread(ui, snapshot, hints, out);
             return;
         }
-        egui::Frame::new()
-            .inner_margin(egui::Margin::same(space::L as i8))
-            .show(ui, |ui| match view {
-                CenterView::Auth => auth::draw(ui, snapshot, out),
-                CenterView::Resuming { connecting } => resuming(ui, snapshot, connecting),
-                CenterView::FirstRun => first_run(ui, snapshot, out),
-                CenterView::KeychainFailed => keychain_failed(ui, out),
-                CenterView::Thread => {}
+        // A card can be taller than a short window: a long error, or a notice
+        // that wraps. It scrolls then, so Cancel and Change number stay in
+        // reach. `room` is the height that is on screen. Inside a scroll area
+        // `available_height` is not, so each view gets it from here to center
+        // itself, and a card that does not fit starts at the top.
+        let room = (ui.available_height() - space::L * 2.0).max(0.0);
+        egui::ScrollArea::vertical()
+            .id_salt("center-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(space::L as i8))
+                    .show(ui, |ui| match view {
+                        CenterView::Auth => auth::draw(ui, snapshot, room, out),
+                        CenterView::Resuming { connecting } => {
+                            resuming(ui, snapshot, room, connecting);
+                        }
+                        CenterView::FirstRun => first_run(ui, snapshot, room, out),
+                        CenterView::KeychainFailed => keychain_failed(ui, room, out),
+                        CenterView::Thread => {}
+                    });
             });
     });
 }
 
-fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, connecting: bool) {
+fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, room: f32, connecting: bool) {
     let palette = theme::palette(ui);
-    let top = (ui.available_height() * 0.30).clamp(24.0, 160.0);
+    let top = (room * 0.30).clamp(24.0, 160.0);
     ui.add_space(top);
     ui.vertical_centered(|ui| {
         motion::spinner(ui);
@@ -2017,8 +2030,8 @@ fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, connecting: bool) {
     });
 }
 
-fn keychain_failed(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
-    let top = (ui.available_height() * 0.25).clamp(24.0, 140.0);
+fn keychain_failed(ui: &mut egui::Ui, room: f32, out: &mut Vec<Intent>) {
+    let top = (room * 0.25).clamp(24.0, 140.0);
     ui.add_space(top);
     ui.vertical_centered(|ui| {
         ui.set_max_width(theme::LOGIN_CARD_WIDTH);
@@ -2045,10 +2058,10 @@ pub(super) fn note_box(ui: &mut egui::Ui, ink: egui::Color32, text: &str) {
         });
 }
 
-fn first_run(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+fn first_run(ui: &mut egui::Ui, snapshot: &View<'_>, room: f32, out: &mut Vec<Intent>) {
     let id = ui.scope_id().with("first-run-card-height");
     let known = ui.data(|data| data.get_temp::<f32>(id).unwrap_or(0.0));
-    let spare = (ui.available_height() - known).max(0.0);
+    let spare = (room - known).max(0.0);
     ui.add_space(spare / 2.0);
     let response = ui
         .scope(|ui| {
