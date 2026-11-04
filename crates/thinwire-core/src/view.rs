@@ -96,6 +96,13 @@ impl View<'_> {
             .account_display_unread(protocol, self.settings.chat_mutes())
     }
 
+    /// Unread on one account chip, including a previous Signal number.
+    #[must_use]
+    pub fn account_row_unread(&self, account: &crate::state::AccountRow) -> u32 {
+        self.state
+            .account_display_unread_for(account, self.settings.chat_mutes())
+    }
+
     /// The mute of one topic. A protocol mute wins.
     #[must_use]
     pub fn topic_mute(&self, topic: &ChatTopic) -> ChatMute {

@@ -17,6 +17,9 @@ use crate::{SecretText, ThemeMode};
 pub enum Intent {
     /// Show the accounts and chats of one protocol.
     SelectProtocol(ProtocolId),
+    /// Show one previous Signal account. The slot is not an account id.
+    /// Sending stays off. The history stays.
+    SelectRetainedSignal(u32),
     /// Open a chat of the selected protocol and load its recent messages.
     SelectConversation { id: String },
     /// Open one topic of a chat. The chat id is named so a click in the
