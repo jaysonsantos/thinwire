@@ -233,6 +233,7 @@ pub(crate) fn paint_avatar(
     } else {
         paint_initials(ui, rect, title, ink.text);
     }
+    paint_protocol_badge(ui, rect, protocol);
     // One ask per file. A repeat each frame would dispatch each frame, and
     // each dispatch asks for a repaint. The core sets `requested` when it
     // queues the download.
@@ -250,6 +251,36 @@ pub(crate) fn paint_avatar(
             file_id,
         });
     }
+}
+
+/// Small protocol mark on the lower-right of a chat avatar.
+fn paint_protocol_badge(ui: &egui::Ui, avatar: egui::Rect, protocol: ProtocolId) {
+    let side = (avatar.width() * 0.32).clamp(11.0, 14.0);
+    let center = avatar.right_bottom() - egui::vec2(side * 0.22, side * 0.22);
+    let (fill, mark) = protocol_badge_ink(protocol);
+    let ring = if ui.visuals().dark_mode {
+        super::theme::palette(ui).sidebar
+    } else {
+        Color32::WHITE
+    };
+    let painter = ui.painter();
+    painter.circle_filled(center, side * 0.62, ring);
+    painter.circle_filled(center, side * 0.5, fill);
+    super::icons::protocol(painter, center, side * 0.62, protocol, mark);
+}
+
+/// Fill and mark for the avatar badge. Approximate brand hues, not the
+/// official assets.
+fn protocol_badge_ink(protocol: ProtocolId) -> (Color32, Color32) {
+    let mark = Color32::from_rgb(255, 255, 255);
+    let fill = match protocol {
+        ProtocolId::Telegram => Color32::from_rgb(0x2A, 0xAB, 0xEE),
+        ProtocolId::WhatsApp => Color32::from_rgb(0x25, 0xD3, 0x66),
+        ProtocolId::Signal => Color32::from_rgb(0x3A, 0x76, 0xF0),
+        ProtocolId::Discord => Color32::from_rgb(0x58, 0x65, 0xF2),
+        ProtocolId::Slack => Color32::from_rgb(0xE0, 0x1E, 0x5A),
+    };
+    (fill, mark)
 }
 
 /// Up to two initials from `title`. A title with no letters is "?".

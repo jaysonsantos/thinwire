@@ -966,7 +966,7 @@ fn unofficial_pill_width(ui: &egui::Ui) -> f32 {
         + space::S * 2.0
 }
 
-/// The protocol tile: a tinted square with the first letter. `dot` is the
+/// The protocol tile: a tinted square with the protocol mark. `dot` is the
 /// row fill and the account state: the dot is cut out of the corner in the
 /// row's own fill.
 pub(super) fn paint_protocol_tile(
@@ -979,17 +979,11 @@ pub(super) fn paint_protocol_tile(
     let corner = (tile.width() * 0.28).round().clamp(4.0, 24.0) as u8;
     ui.painter()
         .rect_filled(tile, egui::CornerRadius::same(corner), ink.fill);
-    let initial: String = protocol
-        .display_name()
-        .chars()
-        .take(1)
-        .flat_map(char::to_uppercase)
-        .collect();
-    ui.painter().text(
+    super::icons::protocol(
+        ui.painter(),
         tile.center(),
-        egui::Align2::CENTER_CENTER,
-        initial,
-        egui::FontId::new(tile.width() * 0.46, theme::semibold()),
+        tile.width() * 0.58,
+        protocol,
         ink.text,
     );
     if let Some((fill, color)) = dot {
