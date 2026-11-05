@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["diesel", "sqlx-sqlite", "presage-store-sqlite"]
