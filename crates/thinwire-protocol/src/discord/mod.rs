@@ -91,6 +91,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: cfg!(feature = "discord-bot"),
     pages_history: true,
     sends_media: cfg!(feature = "discord-bot"),
+    message_actions: crate::MessageActions::NONE,
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.
@@ -723,6 +724,7 @@ impl ProtocolAdapter for DiscordAdapter {
                 conversation_id,
                 body,
                 request,
+                ..
             } => self.send_text(conversation_id, body, request, events),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Discord,
@@ -1618,6 +1620,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "still sending".into(),
                     request: 3,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -1751,6 +1754,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "keep me".into(),
                     request: 7,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -1855,6 +1859,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "keep me".into(),
                     request: 7,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -1944,6 +1949,7 @@ mod tests {
                         conversation_id: id.clone(),
                         body: format!("m{request}"),
                         request,
+                        reply_to: None,
                     },
                     &tx,
                 )
@@ -1978,6 +1984,7 @@ mod tests {
                         conversation_id: id.clone(),
                         body: format!("m{request}"),
                         request,
+                        reply_to: None,
                     },
                     &tx,
                 )
@@ -1998,6 +2005,7 @@ mod tests {
                         conversation_id: id.clone(),
                         body: format!("m{request}"),
                         request,
+                        reply_to: None,
                     },
                     &tx,
                 )
@@ -2053,6 +2061,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "too late".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2086,6 +2095,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "hi from thinwire".into(),
                     request: 0,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2183,6 +2193,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "   ".into(),
                     request: 4,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2206,6 +2217,7 @@ mod tests {
                     conversation_id: id,
                     body: "kept text".into(),
                     request: 5,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2233,6 +2245,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "posted once".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2297,6 +2310,7 @@ mod tests {
                     conversation_id: id,
                     body: "still sending".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2342,6 +2356,7 @@ mod tests {
                         conversation_id: id.clone(),
                         body: format!("queued {request}"),
                         request,
+                        reply_to: None,
                     },
                     &tx,
                 )
@@ -2410,6 +2425,7 @@ mod tests {
                     conversation_id: id,
                     body: "after reconnect".into(),
                     request: 11,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2442,6 +2458,7 @@ mod tests {
                     conversation_id: conversation_id.clone(),
                     body: "blocked".into(),
                     request: 0,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2503,6 +2520,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "try later".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2559,6 +2577,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "just before".into(),
                     request: 3,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2668,6 +2687,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "went out".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2813,6 +2833,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "in flight".into(),
                     request: 3,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2867,6 +2888,7 @@ mod tests {
                     conversation_id: id,
                     body: "already out".into(),
                     request: 4,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -2942,6 +2964,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "already out".into(),
                     request: 4,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3205,6 +3228,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "in flight".into(),
                     request: 3,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3258,6 +3282,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "kept".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3325,6 +3350,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "landed".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3430,6 +3456,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "late".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3501,6 +3528,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "already out".into(),
                     request: 4,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3584,6 +3612,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "carried".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3658,6 +3687,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "still out".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3749,6 +3779,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "late row".into(),
                     request: 7,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3827,6 +3858,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "still out".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3881,6 +3913,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "after the relink".into(),
                     request: 2,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -3924,6 +3957,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "closing".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -4054,6 +4088,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "stuck".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -4143,6 +4178,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "stuck".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -4182,6 +4218,7 @@ mod tests {
                     conversation_id: conversation_id(GUILD, GENERAL),
                     body: "on the way".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -4224,6 +4261,7 @@ mod tests {
                     conversation_id: id,
                     body: "too late".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -4286,6 +4324,7 @@ mod tests {
                     conversation_id: id,
                     body: "keep me".into(),
                     request: 9,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -4417,6 +4456,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "went out".into(),
                     request: 7,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -4470,6 +4510,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "try again".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -4546,6 +4587,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "keep me".into(),
                     request: 7,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -4837,6 +4879,7 @@ mod tests {
                         conversation_id: id,
                         body: "nope".into(),
                         request: 0,
+                        reply_to: None,
                     },
                     &tx,
                 )
@@ -5227,6 +5270,7 @@ mod tests {
                     conversation_id: id.clone(),
                     body: "posted".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )

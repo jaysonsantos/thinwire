@@ -258,6 +258,93 @@ pub struct ProtocolCapabilities {
     /// The adapter answers `SendMedia`. The compose field takes photos and
     /// videos only for such a protocol.
     pub sends_media: bool,
+    /// What the message menu offers for this protocol.
+    pub message_actions: MessageActions,
+}
+
+/// What a user can do with one message, by protocol. The message menu shows
+/// only these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MessageActions {
+    /// `SendText` takes `reply_to`.
+    pub reply: bool,
+    /// The adapter answers `React` and sends `MessageReactions`.
+    pub react: bool,
+    /// `DeleteMessage` with `for_everyone: false` removes the message for
+    /// this account only.
+    pub delete_for_me: bool,
+    /// `DeleteMessage` with `for_everyone: true` removes an own message for
+    /// every member of the chat.
+    pub delete_for_everyone: bool,
+    /// A new reaction of this account takes the place of its old one.
+    pub one_reaction: bool,
+}
+
+impl MessageActions {
+    /// A protocol with no message action.
+    pub const NONE: Self = Self {
+        reply: false,
+        react: false,
+        delete_for_me: false,
+        delete_for_everyone: false,
+        one_reaction: false,
+    };
+
+    /// Every action, with one reaction for each person, as Telegram (with
+    /// no Premium), WhatsApp, and Signal count them.
+    pub const ALL: Self = Self {
+        reply: true,
+        react: true,
+        delete_for_me: true,
+        delete_for_everyone: true,
+        one_reaction: true,
+    };
+}
+
+impl Reaction {
+    /// Add or remove the reaction `emoji` of this account in `reactions`, as
+    /// the protocol will count it. `one_reaction` removes the old reaction of
+    /// this account first.
+    pub fn toggle(reactions: &mut Vec<Self>, emoji: &str, add: bool, one_reaction: bool) {
+        if add && one_reaction {
+            for reaction in reactions.iter_mut() {
+                if reaction.mine && reaction.emoji != emoji {
+                    reaction.mine = false;
+                    reaction.count = reaction.count.saturating_sub(1);
+                }
+            }
+        }
+        match reactions
+            .iter_mut()
+            .find(|reaction| reaction.emoji == emoji)
+        {
+            Some(reaction) if add && !reaction.mine => {
+                reaction.mine = true;
+                reaction.count = reaction.count.saturating_add(1);
+            }
+            Some(reaction) if !add && reaction.mine => {
+                reaction.mine = false;
+                reaction.count = reaction.count.saturating_sub(1);
+            }
+            Some(_) => {}
+            None if add => reactions.push(Self {
+                emoji: emoji.to_owned(),
+                count: 1,
+                mine: true,
+            }),
+            None => {}
+        }
+        reactions.retain(|reaction| reaction.count > 0);
+    }
+}
+
+/// One emoji on a message, with the number of people who chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reaction {
+    pub emoji: String,
+    pub count: u32,
+    /// This account chose it.
+    pub mine: bool,
 }
 
 /// Link state of the account of one protocol.
@@ -537,6 +624,8 @@ pub enum AdapterCommand {
         conversation_id: String,
         body: String,
         request: u64,
+        /// The message this one replies to. `None` is a plain message.
+        reply_to: Option<String>,
     },
     /// Send photos and videos, with the text as the caption. The caption can
     /// be empty. `topic` is the open topic, if any. A protocol that takes
@@ -623,6 +712,23 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         file_id: i32,
     },
+    /// Delete one message. `for_everyone` removes an own message for every
+    /// member, where the protocol allows it. The adapter answers with
+    /// `MessagesRemoved`, or with `CommandFailed`.
+    DeleteMessage {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        for_everyone: bool,
+    },
+    /// Add or remove the reaction `emoji` of this account on one message.
+    React {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        add: bool,
+    },
     /// Download one video file for the in-app player (ADR 0015). The file
     /// stays on disk. The adapter reports a path.
     DownloadVideo {
@@ -655,7 +761,9 @@ impl AdapterCommand {
             | Self::RemoveAccount { protocol }
             | Self::DownloadFile { protocol, .. }
             | Self::DownloadVoice { protocol, .. }
-            | Self::DownloadVideo { protocol, .. } => protocol,
+            | Self::DownloadVideo { protocol, .. }
+            | Self::DeleteMessage { protocol, .. }
+            | Self::React { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
@@ -719,7 +827,9 @@ impl AdapterCommand {
             | Self::RemoveAccount { protocol }
             | Self::DownloadFile { protocol, .. }
             | Self::DownloadVoice { protocol, .. }
-            | Self::DownloadVideo { protocol, .. } => {
+            | Self::DownloadVideo { protocol, .. }
+            | Self::DeleteMessage { protocol, .. }
+            | Self::React { protocol, .. } => {
                 *protocol = account;
                 true
             }
@@ -887,6 +997,13 @@ pub enum AdapterEvent {
     VoiceFailed {
         protocol: ProtocolId,
         file_id: i32,
+    },
+    /// The reactions of one message now. An empty list has none.
+    MessageReactions {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        reactions: Vec<Reaction>,
     },
     /// The small picture of a chat, as image bytes: a contact or a group
     /// picture. It changes only the picture of that row.
@@ -1078,6 +1195,7 @@ impl AdapterEvent {
             | Self::VideoReady { protocol, .. }
             | Self::VideoFailed { protocol, .. }
             | Self::ChatAvatar { protocol, .. }
+            | Self::MessageReactions { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }
@@ -1155,6 +1273,7 @@ impl AdapterEvent {
             | Self::VideoReady { protocol, .. }
             | Self::VideoFailed { protocol, .. }
             | Self::ChatAvatar { protocol, .. }
+            | Self::MessageReactions { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }
@@ -1418,6 +1537,11 @@ pub struct ChatMessage {
     pub audio: Option<crate::media::MessageAudio>,
     /// A video clip. `photo` is its first picture, when the protocol sends one.
     pub video: Option<crate::media::MessageVideo>,
+    /// The reactions on the message, as the protocol counts them.
+    pub reactions: Vec<Reaction>,
+    /// The id of the message that this one replies to. The shell finds its
+    /// sender and text in the open thread.
+    pub reply_to: Option<String>,
 }
 
 /// How a message reached the app.
@@ -1779,6 +1903,44 @@ mod inbox_protocol_tests {
     use super::*;
 
     #[test]
+    fn a_reaction_toggles_and_one_reaction_moves_the_old_one() {
+        let mut reactions = vec![Reaction {
+            emoji: "👍".into(),
+            count: 2,
+            mine: false,
+        }];
+        Reaction::toggle(&mut reactions, "👍", true, true);
+        assert_eq!(reactions[0].count, 3);
+        assert!(reactions[0].mine);
+        Reaction::toggle(&mut reactions, "👍", true, true);
+        assert_eq!(reactions[0].count, 3, "a second add changes nothing");
+        Reaction::toggle(&mut reactions, "❤️", true, true);
+        assert_eq!(
+            reactions,
+            vec![
+                Reaction {
+                    emoji: "👍".into(),
+                    count: 2,
+                    mine: false
+                },
+                Reaction {
+                    emoji: "❤️".into(),
+                    count: 1,
+                    mine: true
+                },
+            ]
+        );
+        Reaction::toggle(&mut reactions, "❤️", false, true);
+        assert_eq!(reactions.len(), 1, "a count of 0 leaves the list");
+        Reaction::toggle(&mut reactions, "😂", true, false);
+        Reaction::toggle(&mut reactions, "👍", true, false);
+        assert!(
+            reactions.iter().all(|reaction| reaction.mine),
+            "many reactions"
+        );
+    }
+
+    #[test]
     fn inbox_events_name_their_protocol_and_login_events_do_not() {
         assert_eq!(
             AdapterEvent::ChatListLoaded {
@@ -1939,6 +2101,8 @@ mod account_tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         let AdapterEvent::MessageReplaced {
             protocol, message, ..

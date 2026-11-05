@@ -58,6 +58,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: true,
     pages_history: true,
     sends_media: true,
+    message_actions: crate::MessageActions::ALL,
 };
 
 /// Official Telegram path. Default builds report TDLib unavailable.
@@ -370,6 +371,7 @@ impl ProtocolAdapter for TelegramAdapter {
                 conversation_id,
                 body,
                 request,
+                reply_to,
             } => {
                 let rejected = if body.trim().is_empty() {
                     Some("message text is empty")
@@ -389,6 +391,7 @@ impl ProtocolAdapter for TelegramAdapter {
                             conversation_id: conversation_id.clone(),
                             body,
                             request,
+                            reply_to,
                         },
                     ),
                 };
@@ -500,6 +503,34 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 file_id,
             } => self.dispatch_live(events, LiveCall::DownloadVideo { file_id }),
+            AdapterCommand::DeleteMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                message_id,
+                for_everyone,
+            } => self.dispatch_live(
+                events,
+                LiveCall::DeleteMessage {
+                    conversation_id,
+                    message_id,
+                    for_everyone,
+                },
+            ),
+            AdapterCommand::React {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                message_id,
+                emoji,
+                add,
+            } => self.dispatch_live(
+                events,
+                LiveCall::React {
+                    conversation_id,
+                    message_id,
+                    emoji,
+                    add,
+                },
+            ),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -581,6 +612,18 @@ enum LiveCall {
         conversation_id: String,
         body: String,
         request: u64,
+        reply_to: Option<String>,
+    },
+    DeleteMessage {
+        conversation_id: String,
+        message_id: String,
+        for_everyone: bool,
+    },
+    React {
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        add: bool,
     },
     Resend {
         conversation_id: String,
@@ -641,9 +684,17 @@ impl TelegramAdapter {
                     conversation_id,
                     body,
                     request,
+                    reply_to,
                 } => {
-                    self.tdlib
-                        .send_text(conversation_id, body, request, secrets, source, events);
+                    self.tdlib.send_text(
+                        conversation_id,
+                        body,
+                        request,
+                        reply_to,
+                        secrets,
+                        source,
+                        events,
+                    );
                 }
                 LiveCall::LoadOlder {
                     conversation_id,
@@ -717,6 +768,40 @@ impl TelegramAdapter {
                 }
                 LiveCall::DownloadVideo { file_id } => {
                     self.tdlib.download_video(file_id, secrets, source, events);
+                }
+                LiveCall::DeleteMessage {
+                    conversation_id,
+                    message_id,
+                    for_everyone,
+                } => {
+                    self.tdlib.enqueue_message_action(
+                        tdlib::TdlibCommand::DeleteMessage {
+                            conversation_id,
+                            message_id,
+                            for_everyone,
+                        },
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::React {
+                    conversation_id,
+                    message_id,
+                    emoji,
+                    add,
+                } => {
+                    self.tdlib.enqueue_message_action(
+                        tdlib::TdlibCommand::React {
+                            conversation_id,
+                            message_id,
+                            emoji,
+                            add,
+                        },
+                        secrets,
+                        source,
+                        events,
+                    );
                 }
                 LiveCall::SendMedia {
                     conversation_id,
@@ -1356,6 +1441,7 @@ mod tests {
                 conversation_id: "telegram:42".into(),
                 body: "   ".into(),
                 request: 7,
+                reply_to: None,
             },
             &tx,
         );
@@ -1838,6 +1924,7 @@ mod tests {
                 conversation_id: "telegram:42".into(),
                 body: "   ".into(),
                 request: 1,
+                reply_to: None,
             },
             &tx,
         );
@@ -1848,6 +1935,7 @@ mod tests {
                 conversation_id: "telegram:42".into(),
                 body: "hello".into(),
                 request: 2,
+                reply_to: None,
             },
             &tx,
         );
@@ -1882,6 +1970,7 @@ mod tests {
             conversation_id: "telegram:42".into(),
             body: "hello".into(),
             request: 3,
+            reply_to: None,
         };
         let debug = format!("{command:?}");
         assert!(debug.contains("hello"));

@@ -193,6 +193,7 @@ pub(crate) fn draw(
     super::links::confirm(ui);
     super::photos::overlay(ui, snapshot.selected_messages());
     player.video_overlay(ui, snapshot.selected_messages());
+    super::message_menu::delete_dialog(ui.ctx(), out);
 }
 
 /// Single-line or multiline text bound to a core value. A change becomes an intent.
@@ -2053,9 +2054,14 @@ fn center_panel(
             )
         });
         if escape {
-            let closed = player.take_video_escape()
+            let closed = super::message_menu::take_escape(ui.ctx())
+                || player.take_video_escape()
                 || super::photos::take_escape(ui.ctx())
-                || super::links::take_escape(ui.ctx());
+                || super::links::take_escape(ui.ctx())
+                || (snapshot.reply_target().is_some() && {
+                    out.push(Intent::CancelReply);
+                    true
+                });
             if !closed {
                 out.push(Intent::Key(AuthKey::Escape));
             }
@@ -2284,8 +2290,10 @@ fn thread(
         ViewNow::Local(now) => thread_rows(snapshot.selected_messages(), is_group, &now),
         ViewNow::Fixed(now) => thread_rows(snapshot.selected_messages(), is_group, &now),
     };
-    let messages: Vec<Bubble<'_>> = snapshot
-        .selected_messages()
+    let actions = snapshot.message_actions(snapshot.selected_protocol);
+    let thread = snapshot.selected_messages();
+    let replied = |id: &str| thread.iter().find(|message| message.id == id);
+    let messages: Vec<Bubble<'_>> = thread
         .iter()
         .zip(layout)
         .map(|(message, layout)| Bubble {
@@ -2299,6 +2307,9 @@ fn thread(
             photo: message.photo.as_ref(),
             audio: message.audio.as_ref(),
             video: message.video.as_ref(),
+            reactions: &message.reactions,
+            reply: message.reply_to.as_deref().map(replied),
+            actions,
             delivery: message.delivery,
             group: is_group,
             layout,
@@ -2317,6 +2328,7 @@ fn thread(
     } else {
         compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y)
             + super::attach::tray_height(ui, snapshot)
+            + super::message_menu::reply_bar_height(ui, snapshot)
     };
 
     let state = snapshot.thread_state();
@@ -2757,6 +2769,11 @@ struct Bubble<'a> {
     photo: Option<&'a MessagePhoto>,
     audio: Option<&'a thinwire_protocol::MessageAudio>,
     video: Option<&'a thinwire_protocol::MessageVideo>,
+    reactions: &'a [thinwire_protocol::Reaction],
+    /// A reply: the message it answers, when that message is in the thread.
+    reply: Option<Option<&'a thinwire_protocol::ChatMessage>>,
+    /// What the menu of the message offers.
+    actions: thinwire_protocol::MessageActions,
     delivery: Delivery,
     /// Group chat. The AccessKit name keeps the sender on every row.
     group: bool,
@@ -3266,6 +3283,9 @@ fn bubble(
                         // The pane name already includes the sender.
                         hide_from_accesskit(ui, response.id);
                     }
+                    if let Some(replied) = message.reply {
+                        super::message_menu::quote(ui, replied, message.outbound);
+                    }
                     // A tap on the thumbnail of a video plays the video, not
                     // the still picture.
                     let tapped = message.photo.is_some_and(|photo| {
@@ -3420,6 +3440,16 @@ fn bubble(
         frame.widget_info(|| {
             egui::WidgetInfo::labeled(egui::Role::Pane, true, bubble_access_label(message))
         });
+        let target = super::message_menu::Target {
+            protocol: message.protocol,
+            conversation_id: message.conversation_id,
+            message_id: message.id,
+            body: message.body,
+            outbound: message.outbound,
+            reactions: message.reactions,
+        };
+        super::message_menu::attach(&frame, &target, message.actions, out);
+        super::message_menu::reactions(ui, &target, message.actions, out);
     });
 }
 
@@ -3558,11 +3588,21 @@ fn bubble_access_label(message: &Bubble<'_>) -> String {
     } else {
         message.body
     };
-    if message.group {
+    let mut label = if message.group {
         format!("{} {} {body}", message.sender, message.layout.time)
     } else {
         body.to_owned()
+    };
+    if !message.reactions.is_empty() {
+        let list: Vec<String> = message
+            .reactions
+            .iter()
+            .map(|reaction| format!("{} {}", reaction.emoji, reaction.count))
+            .collect();
+        label.push_str(". Reactions: ");
+        label.push_str(&list.join(", "));
     }
+    label
 }
 
 /// [`radius::BUBBLE`] on every corner. The last bubble of a run uses
@@ -3698,6 +3738,7 @@ fn compose(
         .fill(palette.bg)
         .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::M as i8))
         .show(ui, |ui| {
+            super::message_menu::reply_bar(ui, snapshot, out);
             if let Some(thread) = chat.as_ref() {
                 super::attach::tray(ui, snapshot, thread, out);
             }

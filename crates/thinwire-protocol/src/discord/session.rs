@@ -1421,6 +1421,8 @@ impl Owner {
                         photo: None,
                         audio: None,
                         video: None,
+                        reactions: Vec::new(),
+                        reply_to: None,
                     },
                 );
                 (body, message_id, SendRow::Pending)
@@ -1461,6 +1463,8 @@ impl Owner {
                         photo: None,
                         audio: None,
                         video: None,
+                        reactions: Vec::new(),
+                        reply_to: None,
                     },
                 );
                 (body, message_id, SendRow::Pending)

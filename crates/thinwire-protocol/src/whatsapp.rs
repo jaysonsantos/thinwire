@@ -32,6 +32,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: false,
     pages_history: false,
     sends_media: false,
+    message_actions: crate::MessageActions::NONE,
 };
 
 /// File name of the WhatsApp helper program, without `.exe`.
@@ -53,6 +54,7 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: true,
     pages_history: true,
     sends_media: true,
+    message_actions: crate::MessageActions::NONE,
 };
 
 /// The WhatsApp adapter of a `whatsapp-web` build: it runs the AGPL client
@@ -374,6 +376,7 @@ mod tests {
                 conversation_id: chat.clone(),
                 body: "hello".into(),
                 request: 7,
+                reply_to: None,
             },
             AdapterCommand::ResendMessage {
                 protocol: ProtocolId::WhatsApp,

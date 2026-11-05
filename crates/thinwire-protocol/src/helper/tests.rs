@@ -51,6 +51,7 @@ const CAPS: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: true,
     pages_history: true,
     sends_media: true,
+    message_actions: crate::MessageActions::NONE,
 };
 
 /// Short waits, so a restart test takes milliseconds.
@@ -366,6 +367,8 @@ impl GatedFake {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 
@@ -892,6 +895,7 @@ async fn no_helper_starts_before_the_gate_and_every_command_ends() {
             conversation_id: CHAT.into(),
             body: "hello".into(),
             request: 7,
+            reply_to: None,
         },
         AdapterCommand::LoadOlderMessages {
             protocol: PROTOCOL,
@@ -1002,6 +1006,7 @@ async fn open_sends_are_rejected_when_the_helper_dies() {
             conversation_id: CHAT.into(),
             body: "hello".into(),
             request,
+            reply_to: None,
         });
     }
     probe.settle().await;

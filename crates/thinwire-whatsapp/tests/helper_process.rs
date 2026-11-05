@@ -254,6 +254,7 @@ async fn the_app_talks_to_the_helper_process() {
         conversation_id: CHAT.into(),
         body: "hello".into(),
         request: 31,
+        reply_to: None,
     });
     app.until("SendRejected", |event| {
         *event

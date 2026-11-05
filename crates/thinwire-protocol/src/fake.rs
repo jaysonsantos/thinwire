@@ -22,6 +22,7 @@ pub(crate) const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: true,
     pages_history: false,
     sends_media: false,
+    message_actions: crate::MessageActions::NONE,
 };
 
 /// Worker-side fake. Deliberately has no egui/eframe imports.
@@ -105,6 +106,8 @@ impl ProtocolAdapter for FakeAdapter {
                         photo: None,
                         audio: None,
                         video: None,
+                        reactions: Vec::new(),
+                        reply_to: None,
                     },
                 );
                 Ok(())

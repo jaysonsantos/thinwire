@@ -1249,6 +1249,7 @@ async fn a_rejected_post_marks_the_channel_read_only() {
         conversation_id: "slack:C1".into(),
         body: "nope".into(),
         request: 7,
+        reply_to: None,
     });
     let row = h
         .until("read only", |event| {
@@ -1277,6 +1278,7 @@ async fn a_read_only_post_error_marks_the_channel_read_only() {
         conversation_id: "slack:C1".into(),
         body: "nope".into(),
         request: 8,
+        reply_to: None,
     });
     h.until("read only", |event| {
         matches!(
@@ -1303,6 +1305,7 @@ async fn a_refresh_keeps_a_read_only_channel() {
         conversation_id: "slack:C1".into(),
         body: "nope".into(),
         request: 9,
+        reply_to: None,
     });
     h.until("read only", |event| {
         matches!(
@@ -1343,6 +1346,7 @@ async fn a_read_only_channel_can_post_again() {
         conversation_id: "slack:C1".into(),
         body: "nope".into(),
         request: 11,
+        reply_to: None,
     });
     h.until("policy refused", |event| {
         matches!(event, AdapterEvent::SendRejected { request: 11, .. })
@@ -1386,6 +1390,7 @@ async fn a_new_channel_stays_read_only_under_a_workspace_denial() {
         conversation_id: "slack:C1".into(),
         body: "nope".into(),
         request: 12,
+        reply_to: None,
     });
     h.until("policy refused", |event| {
         matches!(event, AdapterEvent::SendRejected { request: 12, .. })
@@ -1418,6 +1423,7 @@ async fn a_channel_added_during_denial_can_post_after_the_policy_lifts() {
         conversation_id: "slack:C1".into(),
         body: "nope".into(),
         request: 13,
+        reply_to: None,
     });
     h.until("policy refused", |event| {
         matches!(event, AdapterEvent::SendRejected { request: 13, .. })
@@ -1468,6 +1474,7 @@ async fn a_listed_channel_during_denial_follows_can_post_when_the_policy_lifts()
         conversation_id: "slack:C1".into(),
         body: "nope".into(),
         request: 14,
+        reply_to: None,
     });
     h.until("policy refused", |event| {
         matches!(event, AdapterEvent::SendRejected { request: 14, .. })
@@ -1534,6 +1541,7 @@ async fn a_rejoin_drops_the_old_posting_denial() {
         conversation_id: "slack:C1".into(),
         body: "nope".into(),
         request: 10,
+        reply_to: None,
     });
     h.until("read only", |event| {
         matches!(
@@ -2248,6 +2256,7 @@ async fn send_posts_as_the_app_and_shows_the_sent_message() {
         conversation_id: "slack:C1".into(),
         body: "hello from thinwire".into(),
         request: 1,
+        reply_to: None,
     });
     let sent = h.message("hello from thinwire").await;
     assert!(sent.outbound);
@@ -2273,6 +2282,7 @@ async fn send_without_socket_mode_updates_the_conversation_row() {
         conversation_id: "slack:C1".into(),
         body: "hello from thinwire".into(),
         request: 1,
+        reply_to: None,
     });
     h.message("hello from thinwire").await;
     let row = h
@@ -2356,6 +2366,7 @@ async fn resend_posts_the_same_text_again() {
         conversation_id: "slack:C1".into(),
         body: "hello from thinwire".into(),
         request: 1,
+        reply_to: None,
     });
     let sent = h.message("hello from thinwire").await;
     h.send(AdapterCommand::ResendMessage {
@@ -2885,6 +2896,7 @@ async fn rate_limit_on_send_keeps_the_install() {
         conversation_id: "slack:C1".into(),
         body: "not sent".into(),
         request: 1,
+        reply_to: None,
     });
     let failed = h
         .until("send failed", |event| {
@@ -2910,6 +2922,7 @@ async fn rate_limit_on_send_keeps_the_install() {
         conversation_id: "slack:C1".into(),
         body: "sent after the limit".into(),
         request: 2,
+        reply_to: None,
     });
     h.message("sent after the limit").await;
 }

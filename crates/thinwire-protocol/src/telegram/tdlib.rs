@@ -39,7 +39,7 @@ use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 pub const TDLIB_SESSION_MARKER: &str = "tdlib-ready";
 
 #[derive(Clone)]
-enum TdlibCommand {
+pub(super) enum TdlibCommand {
     Step(TelegramAuthStep),
     LoadChats,
     OpenChat(String),
@@ -47,6 +47,20 @@ enum TdlibCommand {
         conversation_id: String,
         body: String,
         request: u64,
+        reply_to: Option<String>,
+    },
+    /// Delete one message. `for_everyone` is TDLib `revoke`.
+    DeleteMessage {
+        conversation_id: String,
+        message_id: String,
+        for_everyone: bool,
+    },
+    /// Add or remove the emoji reaction of this account.
+    React {
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        add: bool,
     },
     Resend {
         conversation_id: String,
@@ -533,11 +547,13 @@ impl TdlibRuntime {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn send_text(
         &mut self,
         conversation_id: String,
         body: String,
         request: u64,
+        reply_to: Option<String>,
         secrets: Arc<dyn TelegramSecretVault>,
         source: TelegramApiSource,
         events: &EventTx,
@@ -547,11 +563,23 @@ impl TdlibRuntime {
                 conversation_id,
                 body,
                 request,
+                reply_to,
             },
             secrets,
             source,
             events,
         );
+    }
+
+    /// Queue a delete or a reaction of the message menu.
+    pub fn enqueue_message_action(
+        &mut self,
+        command: TdlibCommand,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(command, secrets, source, events);
     }
 
     pub fn load_older(
@@ -916,6 +944,7 @@ fn spawn_tdlib_worker(
                             conversation_id,
                             body,
                             request,
+                            reply_to,
                         } => {
                             send_text(
                                 client_id,
@@ -923,10 +952,34 @@ fn spawn_tdlib_worker(
                                 &body,
                                 request,
                                 None,
+                                reply_to.as_deref(),
                                 &live,
                                 &events,
                             )
                             .await;
+                        }
+                        TdlibCommand::DeleteMessage {
+                            conversation_id,
+                            message_id,
+                            for_everyone,
+                        } => {
+                            delete_message(
+                                client_id,
+                                &conversation_id,
+                                &message_id,
+                                for_everyone,
+                                &events,
+                            )
+                            .await;
+                        }
+                        TdlibCommand::React {
+                            conversation_id,
+                            message_id,
+                            emoji,
+                            add,
+                        } => {
+                            react(client_id, &conversation_id, &message_id, &emoji, add, &events)
+                                .await;
                         }
                         TdlibCommand::SendTopicText {
                             conversation_id,
@@ -940,6 +993,7 @@ fn spawn_tdlib_worker(
                                 &body,
                                 request,
                                 Some(topic),
+                                None,
                                 &live,
                                 &events,
                             )
@@ -1752,6 +1806,17 @@ async fn apply_chat_update(
                 );
             }
         }
+        tdlib_rs::enums::Update::MessageInteractionInfo(update) => {
+            if !emit {
+                return;
+            }
+            let _ = events.send(AdapterEvent::MessageReactions {
+                protocol: ProtocolId::Telegram,
+                conversation_id: inbox::conversation_id(update.chat_id),
+                message_id: inbox::message_id(update.chat_id, update.message_id),
+                reactions: super::media_map::reactions_of(update.interaction_info.as_ref()),
+            });
+        }
         tdlib_rs::enums::Update::DeleteMessages(update) => {
             // Cache eviction can be fetched again. Rows drop only when the chat lost them.
             if update.from_cache {
@@ -2056,6 +2121,8 @@ fn emit_mapped_message_as(
     mapped.photo = media.photo;
     mapped.audio = media.audio;
     mapped.video = media.video;
+    mapped.reactions = super::media_map::reactions_of(message.interaction_info.as_ref());
+    mapped.reply_to = super::media_map::reply_of(message);
     if media.scan {
         schedule_text_entities(
             client_id,
@@ -2935,12 +3002,72 @@ async fn send_media(
     }
 }
 
+/// Delete one message. TDLib sends `updateDeleteMessages`, and that update
+/// removes the row. A refusal names the chat in `CommandFailed`.
+async fn delete_message(
+    client_id: i32,
+    conversation_id: &str,
+    message_id: &str,
+    for_everyone: bool,
+    events: &EventTx,
+) {
+    let Some((chat_id, id)) = inbox::parse_message_id(message_id) else {
+        return;
+    };
+    if let Err(error) =
+        tdlib_rs::functions::delete_messages(chat_id, vec![id], for_everyone, client_id).await
+    {
+        log_tdlib_error("deleteMessages", &error);
+        crate::adapter::emit_command_failed(
+            events,
+            ProtocolId::Telegram,
+            Some(conversation_id.to_string()),
+            "Telegram did not delete the message.",
+        );
+    }
+}
+
+/// Add or remove an emoji reaction. TDLib sends the new counts in
+/// `updateMessageInteractionInfo`.
+async fn react(
+    client_id: i32,
+    conversation_id: &str,
+    message_id: &str,
+    emoji: &str,
+    add: bool,
+    events: &EventTx,
+) {
+    let Some((chat_id, id)) = inbox::parse_message_id(message_id) else {
+        return;
+    };
+    let reaction = tdlib_rs::enums::ReactionType::Emoji(tdlib_rs::types::ReactionTypeEmoji {
+        emoji: emoji.to_string(),
+    });
+    let result = if add {
+        tdlib_rs::functions::add_message_reaction(chat_id, id, reaction, false, true, client_id)
+            .await
+    } else {
+        tdlib_rs::functions::remove_message_reaction(chat_id, id, reaction, client_id).await
+    };
+    if let Err(error) = result {
+        log_tdlib_error("messageReaction", &error);
+        crate::adapter::emit_command_failed(
+            events,
+            ProtocolId::Telegram,
+            Some(conversation_id.to_string()),
+            "Telegram did not take the reaction.",
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn send_text(
     client_id: i32,
     conversation_id: &str,
     body: &str,
     request: u64,
     topic: Option<MessageTopic>,
+    reply_to: Option<&str>,
     live: &LiveInbox,
     events: &EventTx,
 ) {
@@ -2982,10 +3109,23 @@ async fn send_text(
             link_preview_options: None,
             clear_draft: true,
         });
+    // A reply in the same chat. A row id of another chat is not a reply.
+    let reply = reply_to
+        .and_then(inbox::parse_message_id)
+        .filter(|(reply_chat, _)| *reply_chat == chat_id)
+        .map(|(_, message_id)| {
+            tdlib_rs::enums::InputMessageReplyTo::Message(
+                tdlib_rs::types::InputMessageReplyToMessage {
+                    message_id,
+                    quote: None,
+                    checklist_task_id: 0,
+                },
+            )
+        });
     match tdlib_rs::functions::send_message(
         chat_id,
         topic.and_then(td_topic),
-        None,
+        reply,
         None,
         content,
         client_id,

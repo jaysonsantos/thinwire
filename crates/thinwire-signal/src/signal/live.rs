@@ -3624,6 +3624,8 @@ fn row_and_message(
         photo: None,
         audio: None,
         video: None,
+        reactions: Vec::new(),
+        reply_to: None,
     };
     if let Some(media) = media {
         media.dress(&mut message, attachments, caption);
@@ -3719,6 +3721,8 @@ async fn send_text(
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         },
     );
     // A media row keeps no files, so it cannot be sent again.

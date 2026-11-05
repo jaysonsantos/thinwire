@@ -742,6 +742,8 @@ fn message(chat: &str, index: usize, sender: &str, body: &str, sent_at: i64) -> 
         photo: None,
         audio: None,
         video: None,
+        reactions: Vec::new(),
+        reply_to: None,
     }
 }
 

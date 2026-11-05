@@ -59,6 +59,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     // The Signal adapter answers LoadOlderMessages (ADR 0010 rule 10).
     pages_history: true,
     sends_media: cfg!(feature = "signal-local"),
+    message_actions: thinwire_protocol::MessageActions::NONE,
 };
 
 const NOTICE_REQUIRED: &str =
@@ -715,6 +716,7 @@ impl ProtocolAdapter for SignalAdapter {
                 conversation_id,
                 body,
                 request,
+                ..
             } => self.send_text(&conversation_id, &body, request, events),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Signal,
@@ -804,6 +806,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 
@@ -1072,6 +1076,7 @@ mod tests {
                     conversation_id: "chat-1".into(),
                     body: "fixture reply".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -1107,6 +1112,7 @@ mod tests {
                     conversation_id: "missing".into(),
                     body: "nope".into(),
                     request: 2,
+                    reply_to: None,
                 },
                 &tx,
             )

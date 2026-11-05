@@ -160,6 +160,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         let commands = [
             AdapterCommand::Connect { protocol },
@@ -198,6 +200,7 @@ mod tests {
                 conversation_id: id.clone(),
                 body: "hi".into(),
                 request: 1,
+                reply_to: None,
             },
             AdapterCommand::WhatsAppAcknowledgeRisk,
             AdapterCommand::WhatsAppBeginLink { generation: 1 },

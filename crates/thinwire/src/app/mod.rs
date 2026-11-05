@@ -8,6 +8,7 @@ mod icons;
 #[cfg(test)]
 mod inbox_keys;
 mod links;
+mod message_menu;
 mod motion;
 #[cfg(any(feature = "signal-local", feature = "whatsapp-web"))]
 mod pairing_qr;

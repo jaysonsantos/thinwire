@@ -1025,6 +1025,31 @@ impl Core {
             } => self
                 .state
                 .play_video(protocol, &conversation_id, &message_id, file_id),
+            Intent::ReplyTo {
+                protocol,
+                conversation_id,
+                message_id,
+            } => self
+                .state
+                .begin_reply(protocol, &conversation_id, &message_id),
+            Intent::CancelReply => self.state.cancel_reply(),
+            Intent::DeleteMessage {
+                protocol,
+                conversation_id,
+                message_id,
+                for_everyone,
+            } => self
+                .state
+                .delete_message(protocol, &conversation_id, &message_id, for_everyone),
+            Intent::React {
+                protocol,
+                conversation_id,
+                message_id,
+                emoji,
+                add,
+            } => self
+                .state
+                .react(protocol, &conversation_id, &message_id, &emoji, add),
             Intent::Telegram(intent) => self.telegram(intent),
             Intent::WhatsApp(intent) => self.whatsapp(intent),
             Intent::Discord(DiscordIntent::Connect) => {
@@ -2906,6 +2931,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         });
         assert!(
             matches!(&core.take_notify()[..], [NotifyCommand::Show(note)] if note.title == "Bob"),
@@ -2944,6 +2971,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         core.notify_message(&live);
         assert!(
@@ -3003,6 +3032,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         // Chat 1 is open and the window has focus: nothing.
         core.notify_message(&live(1, "seen"));
@@ -3091,6 +3122,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         core.notify_message(&live(1, 3, "secret"));
         assert!(
@@ -3177,6 +3210,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
             for event in events {
@@ -3291,6 +3326,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
             for event in events {
@@ -3439,6 +3476,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         let general = |muted: bool| ChatTopic {
             protocol: ProtocolId::Telegram,
@@ -3733,6 +3772,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
@@ -4058,6 +4099,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         core.notify_message(&live(2));
         assert_eq!(core.take_notify().len(), 1);
@@ -4125,6 +4168,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         });
         assert_eq!(
             core.take_notify().len(),
@@ -4717,6 +4762,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         };
         events_tx.send(row(Delivery::Pending)).expect("queue");

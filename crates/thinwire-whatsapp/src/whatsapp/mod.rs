@@ -49,6 +49,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     // The session history pages from memory (LoadOlderMessages).
     pages_history: cfg!(feature = "whatsapp-web"),
     sends_media: cfg!(feature = "whatsapp-web"),
+    message_actions: thinwire_protocol::MessageActions::NONE,
 };
 
 /// Longest wait at shutdown for the sends in flight, before the client
@@ -764,6 +765,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 conversation_id,
                 body,
                 request,
+                ..
             } => {
                 self.send_text(&conversation_id, &body, request, events);
                 Ok(())
@@ -1275,6 +1277,7 @@ mod tests {
                 conversation_id: "whatsapp:111@s.whatsapp.net".into(),
                 body: "hi".into(),
                 request: 1,
+                reply_to: None,
             },
         ] {
             // ADR 0010 rule 5: no adapter error; the session stays up.
@@ -1328,6 +1331,7 @@ mod tests {
                     conversation_id: "whatsapp:111@s.whatsapp.net".into(),
                     body: "  hello  ".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -1378,6 +1382,7 @@ mod tests {
                     conversation_id: "whatsapp:111@s.whatsapp.net".into(),
                     body: "secret body".into(),
                     request: 1,
+                    reply_to: None,
                 },
                 &tx,
             )
@@ -1510,6 +1515,7 @@ mod tests {
                         conversation_id: id.into(),
                         body: body.into(),
                         request: 1,
+                        reply_to: None,
                     },
                     &tx,
                 )
@@ -1602,6 +1608,7 @@ mod tests {
             conversation_id: "whatsapp:111@s.whatsapp.net".into(),
             body: "hi".into(),
             request: 1,
+            reply_to: None,
         }
     }
 
@@ -1904,6 +1911,7 @@ mod tests {
                 conversation_id: PLACEHOLDER_ID.into(),
                 body: "hi".into(),
                 request: 1,
+                reply_to: None,
             },
             AdapterCommand::ResendMessage {
                 protocol: ProtocolId::WhatsApp,

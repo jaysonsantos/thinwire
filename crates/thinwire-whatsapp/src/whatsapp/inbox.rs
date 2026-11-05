@@ -1294,6 +1294,8 @@ impl Inbox {
                 )
             }),
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 }

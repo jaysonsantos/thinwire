@@ -143,7 +143,10 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::ViewTopic { .. }
         | AdapterCommand::DownloadFile { .. }
         // A helper sends no video yet (ADR 0015).
-        | AdapterCommand::DownloadVideo { .. } => return None,
+        | AdapterCommand::DownloadVideo { .. }
+        // The message menu of a helper protocol comes in a later wire version.
+        | AdapterCommand::DeleteMessage { .. }
+        | AdapterCommand::React { .. } => return None,
     })
 }
 
@@ -180,6 +183,7 @@ pub(crate) fn command_from_wire(
             conversation_id,
             body,
             request,
+            reply_to: None,
         },
         WireCommand::SendMedia {
             conversation_id,
@@ -824,6 +828,8 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
             .audio
             .and_then(|audio| MessageAudio::new(audio.duration_secs, audio.file_id, None)),
         video: None,
+        reactions: Vec::new(),
+        reply_to: None,
     }
 }
 
@@ -856,6 +862,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 
@@ -1178,6 +1186,7 @@ mod tests {
                 conversation_id: CHAT.into(),
                 body: "hello".into(),
                 request: 8,
+                reply_to: None,
             },
             AdapterCommand::ResendMessage {
                 protocol,

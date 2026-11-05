@@ -402,6 +402,7 @@ where
                 conversation_id,
                 body,
                 request,
+                ..
             } => self.send(&conversation_id, &body, request).await,
             AdapterCommand::ResendMessage {
                 protocol: ProtocolId::Slack,
@@ -1627,6 +1628,8 @@ where
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         })
     }
 }

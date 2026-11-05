@@ -91,6 +91,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: true,
     pages_history: true,
     sends_media: false,
+    message_actions: crate::MessageActions::NONE,
 };
 
 /// Official Slack path. Workspace install UI is out of scope for this spike.
@@ -164,6 +165,8 @@ impl SlackAdapter {
                 photo: None,
     audio: None,
     video: None,
+    reactions: Vec::new(),
+    reply_to: None,
 },
         );
     }

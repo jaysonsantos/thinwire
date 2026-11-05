@@ -719,6 +719,9 @@ pub struct Snapshot {
     /// Unsent compose text per chat and topic. `compose` holds the open
     /// thread's draft. A chat with no topics uses `None`.
     drafts: HashMap<(ProtocolId, String, Option<MessageTopic>), String>,
+    /// The message that the next send of its thread replies to. Another
+    /// open thread does not show it or use it.
+    replying: Option<ReplyTarget>,
     /// Photos and videos attached to a thread and not sent yet, in order.
     attachments: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<OutgoingFile>>,
     /// Why the last attach skipped files. The tray shows it until the next
@@ -832,6 +835,19 @@ pub struct Snapshot {
 }
 
 /// Redacted: login fields, the WhatsApp phone and pairing material, the
+/// The longest emoji a reaction may name, in bytes. A family or a flag with
+/// skin tones fits.
+const MAX_EMOJI_BYTES: usize = 32;
+
+/// The message that the next send of one thread replies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplyTarget {
+    protocol: ProtocolId,
+    conversation_id: String,
+    topic: Option<MessageTopic>,
+    message_id: String,
+}
+
 /// Signal provisioning URL, compose, drafts, search, chat titles, and
 /// message bodies never reach `Debug` (PR #48 review). Only screens, flags,
 /// and counts are printed.
@@ -1019,6 +1035,7 @@ impl Snapshot {
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
+            replying: None,
             attachments: HashMap::new(),
             attachment_note: None,
             rejected_bodies: HashMap::new(),
@@ -1510,6 +1527,16 @@ impl Snapshot {
                 path,
             } => self.video_ready(protocol, file_id, path),
             AdapterEvent::VideoFailed { protocol, file_id } => self.video_failed(protocol, file_id),
+            AdapterEvent::MessageReactions {
+                protocol,
+                conversation_id,
+                message_id,
+                reactions,
+            } => {
+                if let Some(message) = self.message_mut(protocol, &conversation_id, &message_id) {
+                    message.reactions = reactions;
+                }
+            }
             AdapterEvent::ChatAvatar {
                 protocol,
                 conversation_id,
@@ -2491,6 +2518,142 @@ impl Snapshot {
         topic: Option<MessageTopic>,
     ) -> bool {
         self.is_selected_chat(protocol, chat) && self.selected_topic == topic
+    }
+
+    /// What the message menu offers for the linked account of `protocol`.
+    #[must_use]
+    pub fn message_actions(&self, protocol: ProtocolId) -> thinwire_protocol::MessageActions {
+        self.accounts
+            .iter()
+            .find(|row| row.caps.id == protocol && row.linked())
+            .map_or(thinwire_protocol::MessageActions::NONE, |row| {
+                row.caps.message_actions
+            })
+    }
+
+    /// The message that the next send of the open thread replies to.
+    #[must_use]
+    pub fn reply_target(&self) -> Option<&ChatMessage> {
+        let target = self.replying.as_ref()?;
+        if !self.is_selected_thread(target.protocol, &target.conversation_id, target.topic) {
+            return None;
+        }
+        self.selected_messages()
+            .iter()
+            .find(|message| message.id == target.message_id)
+    }
+
+    /// The next send of the open thread replies to this message.
+    pub(crate) fn begin_reply(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+    ) {
+        if !self.message_actions(protocol).reply
+            || !self.is_selected_thread(protocol, conversation_id, self.selected_topic)
+            || !self
+                .selected_messages()
+                .iter()
+                .any(|row| row.id == message_id)
+        {
+            return;
+        }
+        self.replying = Some(ReplyTarget {
+            protocol,
+            conversation_id: conversation_id.to_owned(),
+            topic: self.selected_topic,
+            message_id: message_id.to_owned(),
+        });
+    }
+
+    /// The next send is a plain message again.
+    pub(crate) fn cancel_reply(&mut self) {
+        self.replying = None;
+    }
+
+    /// The reply id of a send in the open thread, when the user chose one.
+    fn take_reply(&mut self) -> Option<String> {
+        let id = self.reply_target().map(|message| message.id.clone());
+        if id.is_some() {
+            self.replying = None;
+        }
+        id
+    }
+
+    /// Ask the adapter to delete one message of the open chat. `for_everyone`
+    /// needs an own message and a protocol that allows it.
+    pub(crate) fn delete_message(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        for_everyone: bool,
+    ) {
+        let actions = self.message_actions(protocol);
+        let Some(message) = self.selected_messages().iter().find(|row| {
+            row.protocol == protocol
+                && row.conversation_id == conversation_id
+                && row.id == message_id
+        }) else {
+            return;
+        };
+        let allowed = if for_everyone {
+            actions.delete_for_everyone && message.outbound
+        } else {
+            actions.delete_for_me
+        };
+        if !allowed {
+            return;
+        }
+        if self
+            .replying
+            .as_ref()
+            .is_some_and(|target| target.message_id == message_id)
+        {
+            self.replying = None;
+        }
+        self.queue(AdapterCommand::DeleteMessage {
+            protocol,
+            conversation_id: conversation_id.to_owned(),
+            message_id: message_id.to_owned(),
+            for_everyone,
+        });
+    }
+
+    /// Add or remove the reaction `emoji` of this account. The row shows the
+    /// change at once. The next `MessageReactions` of the adapter replaces it.
+    pub(crate) fn react(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        emoji: &str,
+        add: bool,
+    ) {
+        let actions = self.message_actions(protocol);
+        if !actions.react || emoji.is_empty() || emoji.len() > MAX_EMOJI_BYTES {
+            return;
+        }
+        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+            return;
+        }
+        let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
+            return;
+        };
+        thinwire_protocol::Reaction::toggle(
+            &mut message.reactions,
+            emoji,
+            add,
+            actions.one_reaction,
+        );
+        self.queue(AdapterCommand::React {
+            protocol,
+            conversation_id: conversation_id.to_owned(),
+            message_id: message_id.to_owned(),
+            emoji: emoji.to_owned(),
+            add,
+        });
     }
 
     fn set_selected_conversation(&mut self, id: Option<String>) {
@@ -4082,11 +4245,13 @@ impl Snapshot {
                 request,
             });
         } else {
+            let reply_to = self.take_reply();
             self.push(AdapterCommand::SendText {
                 protocol,
                 conversation_id,
                 body,
                 request,
+                reply_to,
             });
         }
     }
@@ -8370,6 +8535,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 
@@ -8472,6 +8639,141 @@ mod tests {
                 .map(thinwire_protocol::ImageBytes::as_slice),
             Some([1, 2, 3].as_slice())
         );
+    }
+
+    fn telegram_chat_with_rows(rows: &[(i64, bool)]) -> Snapshot {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(1, "Ada", 1),
+        });
+        snapshot.select_conversation("telegram:1".into());
+        for &(id, outbound) in rows {
+            let mut message = telegram_text(1, id, "Hi");
+            message.outbound = outbound;
+            snapshot.apply(AdapterEvent::MessageReceived { message });
+        }
+        snapshot.take_commands();
+        snapshot
+    }
+
+    /// Reply binds the next text send of the same thread, once. Another
+    /// open chat does not show it or use it.
+    #[test]
+    fn a_reply_goes_with_the_next_send_of_its_thread() {
+        let mut snapshot = telegram_chat_with_rows(&[(5, false)]);
+        snapshot.begin_reply(ProtocolId::Telegram, "telegram:1", "telegram:1:9");
+        assert!(snapshot.reply_target().is_none(), "no such message");
+        snapshot.begin_reply(ProtocolId::Telegram, "telegram:1", "telegram:1:5");
+        assert_eq!(
+            snapshot.reply_target().map(|message| message.id.as_str()),
+            Some("telegram:1:5")
+        );
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(2, "Bob", 1),
+        });
+        snapshot.select_conversation("telegram:2".into());
+        assert!(snapshot.reply_target().is_none(), "another chat is open");
+        snapshot.select_conversation("telegram:1".into());
+        assert!(
+            snapshot.reply_target().is_some(),
+            "the reply stays with its chat"
+        );
+
+        snapshot.compose = "Yes".into();
+        snapshot.send_compose();
+        let replies: Vec<_> = snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::SendText { reply_to, .. } => Some(reply_to),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, vec![Some("telegram:1:5".to_string())]);
+        assert!(snapshot.reply_target().is_none(), "one send only");
+    }
+
+    /// Delete for everyone needs an own message. A reaction shows at once
+    /// and the adapter count replaces it.
+    #[test]
+    fn delete_and_react_check_the_message_and_the_protocol() {
+        let mut snapshot = telegram_chat_with_rows(&[(5, false), (6, true)]);
+        snapshot.delete_message(ProtocolId::Telegram, "telegram:1", "telegram:1:5", true);
+        assert!(snapshot.take_commands().is_empty(), "not an own message");
+        snapshot.delete_message(ProtocolId::Telegram, "telegram:1", "telegram:1:6", true);
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![AdapterCommand::DeleteMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                message_id: "telegram:1:6".into(),
+                for_everyone: true,
+            }]
+        );
+        snapshot.delete_message(ProtocolId::Telegram, "telegram:1", "telegram:1:5", false);
+        assert_eq!(snapshot.take_commands().len(), 1, "for me");
+
+        let reactions = |snapshot: &Snapshot| {
+            snapshot
+                .selected_messages()
+                .iter()
+                .find(|message| message.id == "telegram:1:5")
+                .map(|message| message.reactions.clone())
+                .expect("row")
+        };
+        snapshot.react(
+            ProtocolId::Telegram,
+            "telegram:1",
+            "telegram:1:5",
+            "👍",
+            true,
+        );
+        assert_eq!(
+            reactions(&snapshot),
+            vec![thinwire_protocol::Reaction {
+                emoji: "👍".into(),
+                count: 1,
+                mine: true
+            }]
+        );
+        assert!(matches!(
+            snapshot.take_commands().as_slice(),
+            [AdapterCommand::React { add: true, .. }]
+        ));
+        snapshot.apply(AdapterEvent::MessageReactions {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:5".into(),
+            reactions: Vec::new(),
+        });
+        assert!(reactions(&snapshot).is_empty(), "the adapter count wins");
+
+        snapshot.react(
+            ProtocolId::Telegram,
+            "telegram:1",
+            "telegram:1:5",
+            &"👍".repeat(20),
+            true,
+        );
+        assert!(snapshot.take_commands().is_empty(), "too long for an emoji");
+        for row in &mut snapshot.accounts {
+            row.caps.message_actions = thinwire_protocol::MessageActions::NONE;
+        }
+        snapshot.react(
+            ProtocolId::Telegram,
+            "telegram:1",
+            "telegram:1:5",
+            "👍",
+            true,
+        );
+        snapshot.delete_message(ProtocolId::Telegram, "telegram:1", "telegram:1:6", false);
+        snapshot.begin_reply(ProtocolId::Telegram, "telegram:1", "telegram:1:5");
+        assert!(snapshot.take_commands().is_empty(), "no message actions");
+        assert!(snapshot.reply_target().is_none());
     }
 
     /// Play on a clip with no file asks for its download once. The path
@@ -9977,6 +10279,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 
@@ -10265,6 +10569,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.apply(AdapterEvent::OlderHistoryLoaded {
@@ -10302,6 +10608,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -11663,6 +11971,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -11779,6 +12089,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -11876,6 +12188,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: conversation.clone(),
@@ -11977,6 +12291,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: previous,
@@ -12037,6 +12353,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
 
@@ -12230,6 +12548,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -12280,6 +12600,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -12364,6 +12686,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -12503,6 +12827,8 @@ mod tests {
                     photo: None,
                     audio: None,
                     video: None,
+                    reactions: Vec::new(),
+                    reply_to: None,
                 },
             });
             snapshot.apply(AdapterEvent::Status {
@@ -12618,6 +12944,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -12797,6 +13125,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -13710,6 +14040,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         assert_eq!(
@@ -14030,6 +14362,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -14048,6 +14382,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -14066,6 +14402,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -14093,6 +14431,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -14135,6 +14475,8 @@ mod tests {
                     photo: None,
                     audio: None,
                     video: None,
+                    reactions: Vec::new(),
+                    reply_to: None,
                 },
             });
         }
@@ -14195,6 +14537,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         let _ = snapshot.take_commands();
@@ -14384,6 +14728,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -14665,6 +15011,8 @@ mod tests {
                     photo: None,
                     audio: None,
                     video: None,
+                    reactions: Vec::new(),
+                    reply_to: None,
                 },
             });
             snapshot.apply(AdapterEvent::HistoryLoaded {
@@ -14746,6 +15094,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageDelivery {
@@ -15672,6 +16022,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.take_commands();
@@ -15720,6 +16072,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.take_commands();
@@ -16264,6 +16618,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.retry_send("discord:pending:2:1");
@@ -16335,6 +16691,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.retry_send("discord:row-b");
@@ -17504,6 +17862,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         });
         snapshot.retry_send("slack:C1:m1");
@@ -17589,6 +17949,8 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 

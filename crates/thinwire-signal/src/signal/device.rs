@@ -131,6 +131,8 @@ impl SignalDevice for FakeDevice {
             photo: None,
             audio: None,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         self.history
             .entry(conversation_id.to_string())

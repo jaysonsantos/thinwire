@@ -805,6 +805,8 @@ mod tests {
             photo: None,
             audio,
             video: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 

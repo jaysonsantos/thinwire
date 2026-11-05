@@ -370,6 +370,8 @@ mod tests {
             photo: None,
             audio: None,
             video,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 

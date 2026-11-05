@@ -273,6 +273,7 @@ impl Contract {
             conversation_id: chat.to_owned(),
             body: SEND_BODY.into(),
             request,
+            reply_to: None,
         });
         let answer = self
             .until("4", "answer to SendText", |event| {
@@ -645,6 +646,8 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         };
         let events = [

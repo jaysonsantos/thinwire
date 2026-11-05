@@ -31,6 +31,8 @@ struct InboxUi {
     restarts: Vec<ProtocolId>,
     /// The account intents of the clicks (ADR 0014).
     account_intents: Vec<Intent>,
+    /// The intents of the message menu.
+    message_intents: Vec<Intent>,
 }
 
 impl InboxUi {
@@ -68,6 +70,7 @@ impl InboxUi {
             apply_hints: false,
             restarts: Vec::new(),
             account_intents: Vec::new(),
+            message_intents: Vec::new(),
         }
     }
 
@@ -110,6 +113,10 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             @ (Intent::AddAccount(_) | Intent::LinkAccount(_) | Intent::RemoveAccount(_)) => {
                 state.account_intents.push(intent)
             }
+            intent @ (Intent::React { .. }
+            | Intent::ReplyTo { .. }
+            | Intent::DeleteMessage { .. }
+            | Intent::CancelReply) => state.message_intents.push(intent),
             Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
             Intent::AddAttachments {
                 protocol,
@@ -919,7 +926,70 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         photo: None,
         audio: None,
         video: None,
+        reactions: Vec::new(),
+        reply_to: None,
     }
+}
+
+/// A right click on a bubble opens its menu. Delete asks first, with "Also
+/// delete for everyone" for an own message. A reply shows the message it
+/// answers, and a click on a reaction adds it.
+#[test]
+fn a_right_click_opens_the_message_menu_and_delete_asks() {
+    let mut state = InboxUi::ready();
+    let mut theirs = chat_message("telegram:1:8", "Their line", 1_790_299_000);
+    theirs.reactions = vec![thinwire_protocol::Reaction {
+        emoji: "👍".into(),
+        count: 2,
+        mine: false,
+    }];
+    let mut own = chat_message("telegram:1:9", "My own line", 1_790_300_000);
+    own.outbound = true;
+    own.sender = "you".into();
+    own.reply_to = Some("telegram:1:8".into());
+    for message in [theirs, own] {
+        state
+            .snapshot
+            .apply(AdapterEvent::MessageReceived { message });
+    }
+    let mut harness = harness(state);
+    harness.run();
+    assert!(
+        harness.query_all_by_label("Their line").count() >= 2,
+        "the row and the quote of the reply"
+    );
+    harness.get_by_label("👍 2").click();
+    harness.run();
+    assert!(matches!(
+        harness.state_mut().message_intents.pop(),
+        Some(Intent::React { emoji, add: true, .. }) if emoji == "👍"
+    ));
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Pane, "My own line")
+        .click_secondary();
+    harness.run();
+    harness.get_by_label("Reply");
+    harness.get_by_label("Copy text");
+    harness.get_by_label("Delete…").click();
+    harness.run();
+    harness.get_by_label("Also delete for everyone").click();
+    harness.run();
+    harness.get_by_label("Delete").click();
+    harness.run();
+    assert_eq!(
+        harness.state_mut().message_intents,
+        vec![Intent::DeleteMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:9".into(),
+            for_everyone: true,
+        }]
+    );
+    assert!(
+        harness.query_by_label("Also delete for everyone").is_none(),
+        "the question closed"
+    );
 }
 
 #[test]

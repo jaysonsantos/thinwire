@@ -116,6 +116,39 @@ fn label(text: &str) -> Mapped {
     }
 }
 
+/// The emoji reactions of a message. A custom emoji or a paid reaction is
+/// not shown: the app draws plain emoji only.
+pub(super) fn reactions_of(
+    info: Option<&tdlib_rs::types::MessageInteractionInfo>,
+) -> Vec<crate::Reaction> {
+    let Some(reactions) = info.and_then(|info| info.reactions.as_ref()) else {
+        return Vec::new();
+    };
+    reactions
+        .reactions
+        .iter()
+        .filter_map(|reaction| match &reaction.r#type {
+            tdlib_rs::enums::ReactionType::Emoji(emoji) => Some(crate::Reaction {
+                emoji: emoji.emoji.clone(),
+                count: u32::try_from(reaction.total_count).unwrap_or(0),
+                mine: reaction.is_chosen,
+            }),
+            _ => None,
+        })
+        .filter(|reaction| reaction.count > 0)
+        .collect()
+}
+
+/// The row id of the message that `message` replies to, in the same chat.
+pub(super) fn reply_of(message: &tdlib_rs::types::Message) -> Option<String> {
+    match message.reply_to.as_ref()? {
+        tdlib_rs::enums::MessageReplyTo::Message(reply) if reply.chat_id == message.chat_id => {
+            Some(super::inbox::message_id(reply.chat_id, reply.message_id))
+        }
+        _ => None,
+    }
+}
+
 /// The parts of a video, an animation, or a video note.
 struct Clip<'a> {
     label: &'static str,

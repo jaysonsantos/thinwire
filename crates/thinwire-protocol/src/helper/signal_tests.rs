@@ -60,6 +60,7 @@ const fn caps(protocol: ProtocolId) -> ProtocolCapabilities {
         sends_text: true,
         pages_history: true,
         sends_media: true,
+        message_actions: crate::MessageActions::NONE,
     }
 }
 
@@ -253,6 +254,8 @@ impl ProtocolAdapter for FakeClient {
                         photo: None,
                         audio: None,
                         video: None,
+                        reactions: Vec::new(),
+                        reply_to: None,
                     },
                 );
                 emit_send_accepted(events, protocol, conversation_id, request);
@@ -422,6 +425,7 @@ async fn a_signal_link_crosses_the_pipe_both_ways() {
         conversation_id: CHAT.into(),
         body: "hello".into(),
         request: 9,
+        reply_to: None,
     });
     probe
         .until("SendAccepted", |event| {

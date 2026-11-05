@@ -162,6 +162,31 @@ pub enum Intent {
         message_id: String,
         file_id: i32,
     },
+    /// The next send of the open chat replies to this message. Only a
+    /// protocol with `MessageActions::reply`.
+    ReplyTo {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+    },
+    /// The next send is a plain message again.
+    CancelReply,
+    /// Delete one message of the open chat. `for_everyone` removes an own
+    /// message for every member, where the protocol allows it.
+    DeleteMessage {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        for_everyone: bool,
+    },
+    /// Add or remove the reaction `emoji` of this account on one message.
+    React {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        add: bool,
+    },
     /// Telegram login and account actions.
     Telegram(TelegramIntent),
     /// Experimental WhatsApp pairing. Only a `whatsapp-web` build acts on it.
