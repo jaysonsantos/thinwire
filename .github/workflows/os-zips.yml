@@ -78,9 +78,12 @@ jobs:
             libegl1-mesa-dev \
             libc++-dev \
             libc++abi-dev \
+            libasound2-dev \
             patchelf
           # libc++-dev pulls libunwind-18-dev. Do not also install libunwind-dev;
           # those packages conflict.
+          # libasound2-dev supplies alsa.pc. Voice notes link ALSA through
+          # rodio, and alsa-sys finds that file with pkg-config.
 
       - name: Install Rust toolchain
         run: rustup show
