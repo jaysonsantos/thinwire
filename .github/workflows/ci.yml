@@ -23,6 +23,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # rustc and cargo come from the nix shell, not from the runner.
+          cmd-format: nix develop --command {0}
+          # Only main saves the cache. A pull request reads the cache of main
+          # and cannot change it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: "false"
       - name: Lint
         run: nix develop --command scripts/lint.sh
 
@@ -35,6 +43,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # rustc and cargo come from the nix shell, not from the runner.
+          cmd-format: nix develop --command {0}
+          # Only main saves the cache. A pull request reads the cache of main
+          # and cannot change it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: "false"
       - name: Test
         run: nix develop --command scripts/test.sh
 
@@ -47,6 +63,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # rustc and cargo come from the nix shell, not from the runner.
+          cmd-format: nix develop --command {0}
+          # Only main saves the cache. A pull request reads the cache of main
+          # and cannot change it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: "false"
       - name: Build
         run: nix develop --command cargo build --workspace
 
@@ -76,6 +100,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # rustc and cargo come from the nix shell, not from the runner.
+          cmd-format: nix develop --command {0}
+          # Only main saves the cache. A pull request reads the cache of main
+          # and cannot change it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: "false"
       - name: Build and test the release protocol features and the helpers
         run: nix develop --command scripts/test-release-features.sh
 
@@ -88,6 +120,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # rustc and cargo come from the nix shell, not from the runner.
+          cmd-format: nix develop --command {0}
+          # Only main saves the cache. A pull request reads the cache of main
+          # and cannot change it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: "false"
       - name: Snapshot tests
         run: nix develop --command cargo test -p thinwire --features ui-snapshots ui_snapshots -- --test-threads=1
       - name: Upload snapshot images
