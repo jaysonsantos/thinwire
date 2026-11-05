@@ -24,7 +24,14 @@ default = []
 # messenger. `sqlite-storage` (not `sqlite-storage-bundled`) so the lock can
 # use libsqlite3-sys 0.36. The 0.38 pin cannot share the graph with the
 # Signal sqlite store. The bundled build is the direct dependency below.
-whatsapp-web = ["dep:whatsapp-rust", "dep:libsqlite3-sys"]
+whatsapp-web = [
+  "dep:whatsapp-rust",
+  "dep:libsqlite3-sys",
+  "dep:diesel",
+  "dep:rusqlite",
+  "dep:thinwire-core",
+  "thinwire-protocol/session-cipher",
+]
 
 [dependencies]
 # The command line of the helper program.
@@ -32,21 +39,30 @@ clap.workspace = true
 dirs.workspace = true
 thinwire-protocol.workspace = true
 # `io-std`: the helper talks over its stdin and stdout.
-tokio = { workspace = true, features = ["io-std"] }
+tokio = { workspace = true, features = ["fs", "io-std"] }
 tracing.workspace = true
 # The log of the helper program. The tests also read log lines with it (#238).
 tracing-subscriber.workspace = true
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "0d1373a8f06e0dfa72f3ea1c4c33abae9fd21d61", optional = true, default-features = false, features = [
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "e634d245f71d66e2ae55f79ef714c4ca01615ed8", optional = true, default-features = false, features = [
   "sqlite-storage",
   "tokio-transport",
   "tokio-runtime",
   "ureq-client",
   "tokio-native",
 ] }
-# Same 0.36 line as the Signal sqlite store. `bundled` keeps WhatsApp off the system libsqlite.
+# Same SQLCipher build as the Signal helper. Vendored OpenSSL keeps the
+# helper off the system libssl. The key lives in the OS keychain.
 libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
-  "bundled",
+  "bundled-sqlcipher-vendored-openssl",
 ] }
+# The connection hook sets the raw key. `sqlite` does not bundle a second SQLite.
+diesel = { version = "2.3.14", optional = true, default-features = false, features = [
+  "sqlite",
+] }
+rusqlite = { version = "0.38", optional = true, default-features = false, features = [
+  "bundled-sqlcipher-vendored-openssl",
+] }
+thinwire-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The adapter contract kit (ADR 0010) for the tests.

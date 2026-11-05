@@ -15,7 +15,7 @@ use twilight_model::id::Id;
 
 use super::api::{
     ApiFuture, ChannelKind, ChannelSummary, DiscordApi, DiscordApiError, GuildSummary,
-    MessageSummary, Overwrite, OverwriteTarget,
+    MessageSummary, Overwrite, OverwriteTarget, UploadFile,
 };
 
 /// Used when a 429 body has no usable `retry_after`.
@@ -228,6 +228,38 @@ impl DiscordApi for TwilightApi {
                 .await
                 .map_err(|_| DiscordApiError::Transport)?;
             Ok(messages.into_iter().map(message_summary).collect())
+        })
+    }
+
+    fn send_files(
+        &self,
+        channel_id: u64,
+        body: String,
+        files: Vec<UploadFile>,
+    ) -> ApiFuture<'_, MessageSummary> {
+        Box::pin(async move {
+            let attachments: Vec<twilight_model::http::attachment::Attachment> = files
+                .into_iter()
+                .zip(0_u64..)
+                .map(|(file, index)| {
+                    twilight_model::http::attachment::Attachment::from_bytes(
+                        file.name, file.bytes, index,
+                    )
+                })
+                .collect();
+            let mut request = self
+                .client
+                .create_message(id(channel_id)?)
+                .attachments(&attachments);
+            if !body.trim().is_empty() {
+                request = request.content(&body);
+            }
+            let response = request.await.map_err(|e| map_error(&e))?;
+            let message = response
+                .model()
+                .await
+                .map_err(|_| DiscordApiError::Transport)?;
+            Ok(message_summary(message))
         })
     }
 

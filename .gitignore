@@ -26,3 +26,6 @@ device.sqlite-*
 /thinwire-helpers-*-source.tar.gz
 /thinwire-*.tar.gz
 /dist/
+
+# Before / after UI comparison. Built by scripts/ui-compare.sh.
+docs/ui-revamp/

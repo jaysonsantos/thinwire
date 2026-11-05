@@ -12,6 +12,8 @@ mod path;
 mod session;
 
 #[cfg(feature = "whatsapp-web")]
+mod cipher;
+#[cfg(feature = "whatsapp-web")]
 mod live;
 
 pub use path::{SessionLock, SessionLockError, lock_session, set_session_dir};
@@ -42,6 +44,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: cfg!(feature = "whatsapp-web"),
     // The session history pages from memory (LoadOlderMessages).
     pages_history: cfg!(feature = "whatsapp-web"),
+    sends_media: cfg!(feature = "whatsapp-web"),
 };
 
 /// Longest wait at shutdown for the sends in flight, before the client
@@ -94,6 +97,13 @@ pub struct WhatsAppAdapter {
     /// waits for them, up to [`SEND_DRAIN`].
     sends: SendsInFlight,
 }
+
+/// Library tests keep this off, so an acknowledgement does not open the
+/// user's WhatsApp store. The helper process tests use their own session
+/// folder.
+#[cfg(all(test, feature = "whatsapp-web"))]
+static RESUME_ON_ACKNOWLEDGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The send tasks that still run: a task id and the conversation id of
 /// each. Never the text.
@@ -205,7 +215,27 @@ impl WhatsAppAdapter {
             AdapterStatus::Stubbed,
             "WhatsApp ban gate accepted. No linked-device session has started.",
         );
+        self.resume_saved_session(events);
         Ok(())
+    }
+
+    /// The app sends the gate again at start when the user accepted it
+    /// before. A saved, paired store then opens with no QR code. A new link
+    /// still waits for `WhatsAppBeginLink`.
+    fn resume_saved_session(&mut self, events: &EventTx) {
+        #[cfg(feature = "whatsapp-web")]
+        {
+            #[cfg(test)]
+            if !RESUME_ON_ACKNOWLEDGE.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let link = self.link.get_or_insert_with(|| {
+                link::LinkHandle::spawn(live::LiveBackend, self.session.clone(), events.clone())
+            });
+            link.resume();
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        let _ = (self, events);
     }
 
     /// `pairing` is the shell's id for this pairing. Every QR code and pair
@@ -238,6 +268,26 @@ impl WhatsAppAdapter {
             AdapterStatus::Connecting,
             "Experimental WhatsApp pairing was queued on the worker. This is not a supported messenger.",
         );
+        Ok(())
+    }
+
+    /// Read the session key again and open the saved session. This is not a
+    /// new link and does not delete the store. A wrong key tries the
+    /// move-aside again. The row shows Connecting until the open ends.
+    fn retry_store_key(&mut self, events: &EventTx) -> Result<(), AdapterError> {
+        let Some(link) = &self.link else {
+            return Err(AdapterError::Unavailable {
+                protocol: ProtocolId::WhatsApp,
+                reason: "WhatsApp is not reading a session key",
+            });
+        };
+        emit_status(
+            events,
+            ProtocolId::WhatsApp,
+            AdapterStatus::Connecting,
+            "Opening the saved session.",
+        );
+        link.retry();
         Ok(())
     }
 
@@ -348,9 +398,11 @@ impl WhatsAppAdapter {
             .session
             .with_inbox(|inbox| inbox.open_chat(jid))
             .ok_or_else(|| unavailable(UNKNOWN_CHAT))?;
-        for event in opened {
-            let _ = events.send(event);
+        for event in &opened {
+            let _ = events.send(event.clone());
         }
+        // The rows go first. A sticker image comes later with its row.
+        self.session.fetch_media(&opened, events);
         Ok(())
     }
 
@@ -380,6 +432,58 @@ impl WhatsAppAdapter {
             retry: false,
         };
         self.spawn_send(sender, jid, pending, body, answer, events);
+    }
+
+    /// Photos and videos go out one message each. The caption goes with
+    /// the first. One pending row stands for the whole send.
+    fn send_media(
+        &self,
+        conversation_id: &str,
+        files: Vec<thinwire_protocol::OutgoingFile>,
+        caption: &str,
+        request: u64,
+        events: &EventTx,
+    ) {
+        let label = media_label(&files, caption);
+        let prepared = self.prepare_send(conversation_id, &label);
+        let Ok((jid, label, sender)) = prepared.and_then(|ready| {
+            if files.is_empty() {
+                Err(unavailable(EMPTY_BODY))
+            } else {
+                Ok(ready)
+            }
+        }) else {
+            emit_send_rejected(events, ProtocolId::WhatsApp, conversation_id, request);
+            return;
+        };
+        let (pending, shown, upsert) = self.session.with_inbox(|inbox| {
+            let begun = inbox.begin_send(&jid, &label, unix_now());
+            inbox.mark_media_send(&jid, &begun.0);
+            begun
+        });
+        let _ = events.send(shown);
+        if let Some(upsert) = upsert {
+            let _ = events.send(upsert);
+        }
+        let answer = session::SendRequest {
+            conversation_id: conversation_id.to_string(),
+            request,
+            retry: false,
+        };
+        let (generation, sender) = sender;
+        let session = self.session.clone();
+        let events = events.clone();
+        let owner = self.link.as_ref().map(|link| link.callbacks(generation));
+        let running = self.sends.begin(&answer.conversation_id);
+        let caption = caption.trim().to_string();
+        tokio::spawn(async move {
+            let result = send_files(sender.as_ref(), &jid, &files, &caption).await;
+            let revoked = session.finish_send(generation, &jid, &pending, result, &answer, &events);
+            running.finish();
+            if revoked && let Some(owner) = owner {
+                owner.send(session::LinkEvent::LoggedOut);
+            }
+        });
     }
 
     fn prepare_send(
@@ -418,9 +522,10 @@ impl WhatsAppAdapter {
                 .with_inbox(|inbox| inbox.older_page(jid, before, inbox::OPEN_CHAT_MESSAGES)),
             None => (Vec::new(), false),
         };
-        for event in page {
-            let _ = events.send(event);
+        for event in &page {
+            let _ = events.send(event.clone());
         }
+        self.session.fetch_media(&page, events);
         emit_older_history_loaded(
             events,
             ProtocolId::WhatsApp,
@@ -486,6 +591,44 @@ impl WhatsAppAdapter {
             }
         });
     }
+}
+
+/// The row of a media send: the caption, or what the files are.
+fn media_label(files: &[thinwire_protocol::OutgoingFile], caption: &str) -> String {
+    let caption = caption.trim();
+    if !caption.is_empty() {
+        return caption.to_string();
+    }
+    match files {
+        [one] if one.kind == thinwire_protocol::MediaKind::Photo => "[photo]".into(),
+        [_] => "[video]".into(),
+        many => format!("[{} files]", many.len()),
+    }
+}
+
+/// Send each file as its own message. The send is the first message: its
+/// failure fails the send. A later file that fails is logged.
+async fn send_files(
+    sender: &dyn session::WhatsAppSender,
+    jid: &str,
+    files: &[thinwire_protocol::OutgoingFile],
+    caption: &str,
+) -> Result<String, session::SendFailure> {
+    let mut first = None;
+    for (index, file) in files.iter().enumerate() {
+        let caption = if index == 0 { caption } else { "" };
+        match sender.send_media(jid, file, caption).await {
+            Ok(id) => {
+                first.get_or_insert(id);
+            }
+            Err(failure) if first.is_none() => return Err(failure),
+            Err(_) => {
+                tracing::warn!("whatsapp: a later photo or video did not send");
+                break;
+            }
+        }
+    }
+    first.ok_or(session::SendFailure::Rejected)
 }
 
 /// Chat JID inside a WhatsApp conversation id. The placeholder row returns `None`.
@@ -621,6 +764,17 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 self.send_text(&conversation_id, &body, request, events);
                 Ok(())
             }
+            AdapterCommand::SendMedia {
+                protocol: ProtocolId::WhatsApp,
+                conversation_id,
+                files,
+                caption,
+                request,
+                ..
+            } => {
+                self.send_media(&conversation_id, files, &caption, request, events);
+                Ok(())
+            }
             AdapterCommand::LoadOlderMessages {
                 protocol: ProtocolId::WhatsApp,
                 conversation_id,
@@ -644,6 +798,9 @@ impl ProtocolAdapter for WhatsAppAdapter {
             | AdapterCommand::WhatsAppCancelLink => self.cancel_link(events),
             AdapterCommand::WhatsAppAcknowledgeRisk => self.acknowledge(events),
             AdapterCommand::WhatsAppBeginLink { generation } => self.begin_link(generation, events),
+            AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::WhatsApp,
+            } => self.retry_store_key(events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::WhatsApp,
                 reason: "command is not handled by the WhatsApp adapter",
@@ -2505,6 +2662,7 @@ mod tests {
             .with_capabilities(ProtocolCapabilities {
                 sends_text: true,
                 pages_history: true,
+                sends_media: true,
                 ..CAPABILITIES
             });
         let events = kit.events();

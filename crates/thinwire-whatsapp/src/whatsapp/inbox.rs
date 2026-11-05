@@ -5,9 +5,15 @@
 //! message batches into these records on the worker. Default builds test the
 //! same rules with fakes.
 
-use std::collections::{HashMap, HashSet};
+use std::any::Any;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::sync::Arc;
 
-use thinwire_protocol::{AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ProtocolId};
+use thinwire_protocol::{
+    AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ImageBytes, MessagePhoto,
+    PhotoSize, ProtocolId,
+};
 
 /// Prefix on every WhatsApp conversation id. The rest is the chat JID.
 pub(super) const CONVERSATION_PREFIX: &str = "whatsapp:";
@@ -33,6 +39,116 @@ const STATUS_BROADCAST: &str = "status@broadcast";
 const BROADCAST_SERVER: &str = "@broadcast";
 const NEWSLETTER_SERVER: &str = "@newsletter";
 
+/// Downloaded sticker images kept in memory. Past this, the oldest goes.
+/// A chat that opens again downloads a dropped image again.
+const MEDIA_CACHE: usize = 200;
+
+/// The largest sticker image the helper keeps. It must fit in one wire
+/// line: it is `thinwire_ipc::WirePhoto::MAX_BYTES` (a test checks it).
+pub(super) const MEDIA_MAX_BYTES: usize = 512 * 1024;
+
+/// The longest side of a sticker in the thread, in points. The image keeps
+/// its own pixels, so it stays sharp on a high-density screen.
+const STICKER_SIDE: u32 = 160;
+
+/// The download reference of one media file. Only the live client can read
+/// it: it holds the whatsapp-rust message. `Debug` shows no key or path.
+#[derive(Clone)]
+pub(super) struct MediaRef(Arc<dyn Any + Send + Sync>);
+
+impl MediaRef {
+    #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
+    pub(super) fn new(value: impl Any + Send + Sync) -> Self {
+        Self(Arc::new(value))
+    }
+
+    #[cfg_attr(not(feature = "whatsapp-web"), allow(dead_code))]
+    pub(super) fn get<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
+
+impl fmt::Debug for MediaRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MediaRef")
+    }
+}
+
+impl PartialEq for MediaRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for MediaRef {}
+
+/// A sticker on a message. The image downloads after the row shows. Until
+/// then, and when the download fails, the row shows "[sticker]".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Sticker {
+    /// Pixel size from the message. Zero when the message has none.
+    pub width: u32,
+    pub height: u32,
+    pub media: MediaRef,
+}
+
+impl Sticker {
+    fn photo(&self, bytes: &ImageBytes) -> MessagePhoto {
+        let (width, height) = sticker_side(self.width, self.height);
+        MessagePhoto {
+            width,
+            height,
+            mini: None,
+            sizes: vec![PhotoSize {
+                width,
+                height,
+                file_id: None,
+                path: None,
+                bytes: Some(bytes.clone()),
+            }],
+            has_spoiler: false,
+            is_secret: false,
+            failed: false,
+        }
+    }
+}
+
+/// The display size of a sticker: the longest side is [`STICKER_SIDE`]. A
+/// sticker with no size is a square.
+fn sticker_side(width: u32, height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (STICKER_SIDE, STICKER_SIDE);
+    }
+    let long = width.max(height);
+    let scale = |side: u32| {
+        u32::try_from(u64::from(side) * u64::from(STICKER_SIDE) / u64::from(long))
+            .unwrap_or(STICKER_SIDE)
+            .max(1)
+    };
+    (scale(width), scale(height))
+}
+
+/// One media download the session must start. `Debug` shows no JID.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct MediaRequest {
+    pub chat_jid: String,
+    pub id: String,
+    pub media: MediaRef,
+}
+
+impl fmt::Debug for MediaRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MediaRequest(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MediaState {
+    Requested,
+    Ready(ImageBytes),
+    Failed,
+}
+
 /// One text-like message from history sync or live traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WaMessage {
@@ -47,6 +163,8 @@ pub(super) struct WaMessage {
     pub body: String,
     /// Unix seconds.
     pub timestamp: i64,
+    /// The sticker of a sticker message. `body` is then "[sticker]".
+    pub sticker: Option<Sticker>,
 }
 
 /// One conversation from a history-sync chunk.
@@ -137,6 +255,9 @@ struct ChatRecord {
     messages: Vec<WaMessage>,
     /// Local `pending:` ids whose send failed. The user can resend them.
     failed: HashSet<String>,
+    /// Local ids of photo and video sends. Their files are not kept, so a
+    /// failed one cannot be sent again.
+    media_sends: HashSet<String>,
     /// The user saw this chat up to this message time (Unix seconds). A later
     /// history chunk carries the phone's older unread count, so a chat read
     /// here changes its count only by new messages (#98). A message older
@@ -267,6 +388,10 @@ pub(super) struct Inbox {
     next_pending: u64,
     /// Chats sent by the chat-list pages so far (newest first).
     listed: usize,
+    /// Sticker images by chat JID and message id.
+    media: HashMap<(String, String), MediaState>,
+    /// Ready images, oldest first, for the [`MEDIA_CACHE`] limit.
+    media_ready: VecDeque<(String, String)>,
 }
 
 impl Inbox {
@@ -281,6 +406,80 @@ impl Inbox {
             .collect();
         *self = Self::default();
         removed
+    }
+
+    /// The sticker downloads for the rows in `events`. Each sticker asks
+    /// one time: a later row of the same message asks again only after its
+    /// image left the cache.
+    pub(super) fn media_requests(&mut self, events: &[AdapterEvent]) -> Vec<MediaRequest> {
+        let mut out = Vec::new();
+        for event in events {
+            let message = match event {
+                AdapterEvent::MessageReceived { message }
+                | AdapterEvent::MessageReplaced { message, .. } => message,
+                _ => continue,
+            };
+            let Some(jid) = parse_conversation_id(&message.conversation_id) else {
+                continue;
+            };
+            let Some(sticker) = self
+                .chats
+                .get(jid)
+                .and_then(|record| record.messages.iter().find(|row| row.id == message.id))
+                .and_then(|row| row.sticker.as_ref())
+            else {
+                continue;
+            };
+            let key = (jid.to_string(), message.id.clone());
+            if self.media.contains_key(&key) {
+                continue;
+            }
+            out.push(MediaRequest {
+                chat_jid: key.0.clone(),
+                id: key.1.clone(),
+                media: sticker.media.clone(),
+            });
+            self.media.insert(key, MediaState::Requested);
+        }
+        out
+    }
+
+    /// A sticker download ended. With an image, the row comes again with
+    /// it, when the message is still in the cache. A failed download keeps
+    /// the "[sticker]" row and does not ask again.
+    pub(super) fn finish_media(
+        &mut self,
+        jid: &str,
+        id: &str,
+        bytes: Option<Vec<u8>>,
+    ) -> Option<AdapterEvent> {
+        let key = (jid.to_string(), id.to_string());
+        if self.media.get(&key) != Some(&MediaState::Requested) {
+            // A reset dropped the request. The row is gone or new.
+            return None;
+        }
+        let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty() && bytes.len() <= MEDIA_MAX_BYTES)
+        else {
+            self.media.insert(key, MediaState::Failed);
+            return None;
+        };
+        self.media
+            .insert(key.clone(), MediaState::Ready(ImageBytes::new(bytes)));
+        self.media_ready.push_back(key);
+        while self.media_ready.len() > MEDIA_CACHE {
+            if let Some(old) = self.media_ready.pop_front() {
+                self.media.remove(&old);
+            }
+        }
+        let message = self
+            .chats
+            .get(jid)?
+            .messages
+            .iter()
+            .find(|row| row.id == id)?;
+        Some(AdapterEvent::MessageReceived {
+            message: self.chat_message(message, Arrival::History),
+        })
     }
 
     /// Merge one history-sync chunk. Returns upserts for the chats it touched.
@@ -522,6 +721,7 @@ impl Inbox {
             sender_jid: None,
             body: body.to_string(),
             timestamp: now,
+            sticker: None,
         };
         let record = self.chats.entry(jid.to_string()).or_default();
         record.timestamp = record.timestamp.max(now);
@@ -533,6 +733,13 @@ impl Inbox {
             },
             self.upsert_event(jid),
         )
+    }
+
+    /// The pending row `pending` is a send of photos or videos.
+    pub(super) fn mark_media_send(&mut self, jid: &str, pending: &str) {
+        if let Some(record) = self.chats.get_mut(jid) {
+            record.media_sends.insert(pending.to_string());
+        }
     }
 
     pub(super) fn confirm_send(
@@ -626,6 +833,9 @@ impl Inbox {
     /// delivery event, or `None` when the row is not a failed send.
     pub(super) fn retry_send(&mut self, jid: &str, id: &str) -> Option<(String, AdapterEvent)> {
         let record = self.chats.get_mut(jid)?;
+        if record.media_sends.contains(id) {
+            return None;
+        }
         if !record.failed.remove(id) {
             return None;
         }
@@ -760,19 +970,34 @@ impl Inbox {
         } else {
             Delivery::Sent
         };
+        // A sticker with its image shows the image and no label.
+        let photo = message.sticker.as_ref().and_then(|sticker| {
+            match self
+                .media
+                .get(&(message.chat_jid.clone(), message.id.clone()))
+            {
+                Some(MediaState::Ready(bytes)) => Some(sticker.photo(bytes)),
+                _ => None,
+            }
+        });
+        let body = if photo.is_some() {
+            String::new()
+        } else {
+            message.body.clone()
+        };
         ChatMessage {
             protocol: ProtocolId::WhatsApp,
             conversation_id: conversation_id(&message.chat_jid),
             id: message.id.clone(),
             sender,
-            body: message.body.clone(),
+            body,
             outbound: message.from_me,
             delivery,
             sent_at: message.timestamp,
             arrival,
             topic: None,
             links: Vec::new(),
-            photo: None,
+            photo,
         }
     }
 }
@@ -883,7 +1108,106 @@ pub(super) mod tests {
             sender_jid: Some(chat.into()),
             body: body.into(),
             timestamp: ts,
+            sticker: None,
         }
+    }
+
+    pub(in crate::whatsapp) fn sticker_message(chat: &str, id: &str, ts: i64) -> WaMessage {
+        WaMessage {
+            sticker: Some(Sticker {
+                width: 512,
+                height: 256,
+                media: MediaRef::new(id.to_string()),
+            }),
+            ..message(chat, id, "[sticker]", ts)
+        }
+    }
+
+    fn received_id(events: &[AdapterEvent], id: &str) -> Option<ChatMessage> {
+        events.iter().find_map(|event| match event {
+            AdapterEvent::MessageReceived { message } if message.id == id => Some(message.clone()),
+            _ => None,
+        })
+    }
+
+    /// A sticker row shows "[sticker]" first and asks for its image one
+    /// time. With the image, the row comes again with the photo and no label.
+    /// The chat list keeps "[sticker]" as the preview.
+    #[test]
+    fn a_sticker_shows_its_image_after_the_download() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let events = inbox.apply_messages(vec![sticker_message(chat, "s1", 1)]);
+        let row = received_id(&events, "s1").expect("sticker row");
+        assert_eq!(row.body, "[sticker]");
+        assert!(row.photo.is_none());
+        let requests = inbox.media_requests(&events);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "s1");
+        assert!(
+            inbox.media_requests(&events).is_empty(),
+            "a running download does not ask again"
+        );
+
+        let event = inbox
+            .finish_media(chat, "s1", Some(vec![1, 2, 3]))
+            .expect("the row again");
+        let AdapterEvent::MessageReceived { message } = event else {
+            panic!("not a message row: {event:?}");
+        };
+        assert_eq!(message.body, "");
+        assert_eq!(message.arrival, Arrival::History);
+        let photo = message.photo.expect("photo");
+        assert_eq!((photo.width, photo.height), (160, 80));
+        assert_eq!(
+            photo.sizes[0].bytes.as_ref().map(ImageBytes::as_slice),
+            Some([1, 2, 3].as_slice())
+        );
+        // An open of the chat sends the image with the row.
+        let opened = inbox.open_chat(chat).expect("open");
+        assert!(received_id(&opened, "s1").expect("row").photo.is_some());
+        assert!(inbox.media_requests(&opened).is_empty());
+        let preview = upserts(&opened)[0].preview.clone();
+        assert_eq!(preview, "[sticker]");
+    }
+
+    /// A failed or too large download keeps the label and does not ask again.
+    /// A text message never asks.
+    #[test]
+    fn a_failed_sticker_download_keeps_the_label() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let events = inbox.apply_messages(vec![
+            sticker_message(chat, "s1", 1),
+            sticker_message(chat, "s2", 2),
+            message(chat, "t1", "hi", 3),
+        ]);
+        let requests = inbox.media_requests(&events);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(inbox.finish_media(chat, "s1", None), None);
+        assert_eq!(
+            inbox.finish_media(chat, "s2", Some(vec![0; MEDIA_MAX_BYTES + 1])),
+            None
+        );
+        let opened = inbox.open_chat(chat).expect("open");
+        assert_eq!(received_id(&opened, "s1").expect("row").body, "[sticker]");
+        assert!(inbox.media_requests(&opened).is_empty());
+        // A result after a reset is dropped.
+        inbox.clear();
+        assert_eq!(inbox.finish_media(chat, "s1", Some(vec![1])), None);
+    }
+
+    #[test]
+    fn the_sticker_limit_is_the_wire_limit() {
+        assert_eq!(MEDIA_MAX_BYTES, thinwire_ipc::WirePhoto::MAX_BYTES);
+    }
+
+    #[test]
+    fn a_sticker_keeps_its_shape_at_the_thread_size() {
+        assert_eq!(sticker_side(512, 512), (160, 160));
+        assert_eq!(sticker_side(256, 512), (80, 160));
+        assert_eq!(sticker_side(0, 0), (160, 160));
+        assert_eq!(sticker_side(1, 4000), (1, 160));
     }
 
     fn upserts(events: &[AdapterEvent]) -> Vec<&Conversation> {

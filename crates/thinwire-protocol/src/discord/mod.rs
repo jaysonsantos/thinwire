@@ -26,7 +26,8 @@ use std::sync::Arc;
 
 use super::adapter::{
     AccountState, AdapterCommand, AdapterError, AdapterStatus, DiscordAuthMode, EventTx,
-    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_account, emit_status,
+    ProtocolAdapter, ProtocolCapabilities, ProtocolId, SupportClass, emit_account,
+    emit_send_rejected, emit_status,
 };
 use token::authorization_token;
 
@@ -72,6 +73,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     allows_user_account_automation: false,
     sends_text: cfg!(feature = "discord-bot"),
     pages_history: false,
+    sends_media: cfg!(feature = "discord-bot"),
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.
@@ -409,6 +411,31 @@ impl DiscordAdapter {
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
+    fn send_media(
+        &mut self,
+        conversation_id: String,
+        body: String,
+        files: Vec<crate::media::OutgoingFile>,
+        request: u64,
+        events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        self.session_mut()?
+            .send_media(conversation_id, body, files, request, events)
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn send_media(
+        &mut self,
+        _conversation_id: String,
+        _body: String,
+        _files: Vec<crate::media::OutgoingFile>,
+        _request: u64,
+        _events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        Err(not_ready())
+    }
+
+    #[cfg(any(test, feature = "discord-bot"))]
     fn resend(
         &mut self,
         conversation_id: String,
@@ -554,6 +581,9 @@ impl ProtocolAdapter for DiscordAdapter {
             AdapterCommand::SendText {
                 protocol: ProtocolId::Discord,
                 ..
+            } | AdapterCommand::SendMedia {
+                protocol: ProtocolId::Discord,
+                ..
             } | AdapterCommand::ResendMessage {
                 protocol: ProtocolId::Discord,
                 ..
@@ -629,6 +659,22 @@ impl ProtocolAdapter for DiscordAdapter {
                 body,
                 request,
             } => self.send_text(conversation_id, body, request, events),
+            AdapterCommand::SendMedia {
+                protocol: ProtocolId::Discord,
+                conversation_id,
+                caption,
+                files,
+                request,
+                ..
+            } => {
+                let result =
+                    self.send_media(conversation_id.clone(), caption, files, request, events);
+                // A refusal before the owner took the send still names it.
+                if result.is_err() {
+                    emit_send_rejected(events, ProtocolId::Discord, conversation_id, request);
+                }
+                result
+            }
             AdapterCommand::ResendMessage {
                 protocol: ProtocolId::Discord,
                 conversation_id,
@@ -1778,6 +1824,54 @@ mod tests {
             api.state().sent,
             vec![(GENERAL, "hi from thinwire".to_string())]
         );
+    }
+
+    /// Twelve photos go out as two messages of 10 and 2 files. The text goes
+    /// with the first message. One answer names the request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn photos_go_out_ten_in_one_message() {
+        let folder =
+            std::env::temp_dir().join(format!("thinwire-discord-media-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("folder");
+        let files: Vec<crate::media::OutgoingFile> = (0..12)
+            .map(|n| {
+                let path = folder.join(format!("{n}.png"));
+                std::fs::write(&path, [n as u8; 4]).expect("file");
+                crate::media::OutgoingFile::new(path).expect("photo")
+            })
+            .collect();
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendMedia {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    topic: None,
+                    files,
+                    caption: "trip".into(),
+                    request: 3,
+                },
+                &tx,
+            )
+            .expect("send");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReplaced { .. })
+        })
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::SendAccepted { request: 3, .. }))
+        );
+        let sent = api.state().sent_files.clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].1, "trip");
+        assert_eq!(sent[0].2.len(), 10);
+        assert_eq!(sent[1].1, "");
+        assert_eq!(sent[1].2, vec!["10.png".to_string(), "11.png".to_string()]);
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[tokio::test]

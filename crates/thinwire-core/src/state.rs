@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, ChatTopic,
-    Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, MessageTopic,
-    ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthError, TelegramAuthPhase,
-    TelegramAuthStep, TelegramCodeVia, TelegramSecretVault, catalog, ordered_topics,
-    telegram_api_available, topic_mute_id, with_outbox_read,
+    Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, MAX_ATTACHMENTS,
+    MessageTopic, OutgoingFile, ProtocolCapabilities, ProtocolId, StoreAccessReason,
+    TelegramApiSource, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia,
+    TelegramSecretVault, catalog, ordered_topics, telegram_api_available, topic_mute_id,
+    with_outbox_read,
 };
 
 use crate::mutes::{ChatMute, ChatMutes};
@@ -38,59 +39,6 @@ pub fn stub_banner(snapshot: &Snapshot) -> Option<&'static str> {
         Some(TELEGRAM_STUB_UNTIL_READY)
     } else {
         Some(TDLIB_UNAVAILABLE_BANNER)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InboxFilter {
-    Telegram,
-    #[cfg(feature = "slack-oauth")]
-    Slack,
-}
-
-impl InboxFilter {
-    /// Top-bar filters for this build. There is no All filter: the middle
-    /// column is one account. Spike tabs stay out until their feature is on.
-    #[must_use]
-    pub fn chrome_filters() -> &'static [Self] {
-        #[cfg(feature = "slack-oauth")]
-        {
-            const FILTERS: &[InboxFilter] = &[InboxFilter::Telegram, InboxFilter::Slack];
-            FILTERS
-        }
-        #[cfg(not(feature = "slack-oauth"))]
-        {
-            const FILTERS: &[InboxFilter] = &[InboxFilter::Telegram];
-            FILTERS
-        }
-    }
-
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Telegram => "Telegram",
-            #[cfg(feature = "slack-oauth")]
-            Self::Slack => "Slack",
-        }
-    }
-
-    #[must_use]
-    pub const fn matches(self, protocol: ProtocolId) -> bool {
-        match self {
-            Self::Telegram => matches!(protocol, ProtocolId::Telegram),
-            #[cfg(feature = "slack-oauth")]
-            Self::Slack => matches!(protocol, ProtocolId::Slack),
-        }
-    }
-
-    /// The protocol this pill selects.
-    #[must_use]
-    pub const fn protocol(self) -> ProtocolId {
-        match self {
-            Self::Telegram => ProtocolId::Telegram,
-            #[cfg(feature = "slack-oauth")]
-            Self::Slack => ProtocolId::Slack,
-        }
     }
 }
 
@@ -386,8 +334,8 @@ pub struct AccountRow {
     pub caps: ProtocolCapabilities,
     pub status: AdapterStatus,
     pub detail: String,
-    /// Link state. Only `AdapterEvent::Account` (and the Telegram login,
-    /// which maps onto it) changes it. A `Status` never does.
+    /// Link state. `AdapterEvent::Account` changes it. A wrong key also
+    /// leaves Linked. A `Status` never does.
     pub state: AccountState,
     /// State of the protocol's helper process (ADR 0013). `None` for a
     /// protocol that runs in the app, and before its helper reports.
@@ -396,6 +344,10 @@ pub struct AccountRow {
     /// account of every protocol, including the linked Signal number.
     /// The number is a slot, not an account id.
     pub signal_retained: Option<u32>,
+    /// The session key could not be used. `None` after the next status.
+    /// A denied read shows Retry. A failed move shows Retry and stays
+    /// linked. A wrong key shows Link and leaves Linked.
+    pub store_access: Option<StoreAccessReason>,
     /// Read state of a previous Signal store.
     /// The core sets [`RetainedRead::Unreadable`] when it handles the
     /// unreadable line. A later chat upsert clears it.
@@ -462,6 +414,26 @@ pub struct HelperNotice<'a> {
     pub error: Option<&'a UserError>,
 }
 
+/// The tray note when a dropped or pasted file is not a photo or a video.
+pub const ATTACH_ONLY_MEDIA: &str = "Only photos and videos can be attached.";
+/// The tray note when the tray is full.
+pub const ATTACH_TOO_MANY: &str = "30 files at most in one send.";
+/// The tray note when this account cannot send files.
+pub const ATTACH_NOT_HERE: &str = "This account cannot send photos or videos.";
+
+/// Identity of the WhatsApp ban gate copy: its README risk bullets. The
+/// settings file keeps it when the user accepts the gate. A saved value of
+/// another copy does not count, so a new copy shows the gate again.
+pub const WHATSAPP_GATE_VERSION: u64 =
+    crate::signal_notice::notice_version(&thinwire_protocol::CRITIC_RISK_BULLETS);
+
+/// Status line after the user starts a WhatsApp pairing.
+pub const WHATSAPP_PAIRING_REQUESTED: &str = "WhatsApp pairing requested.";
+/// Status line after the user accepts the WhatsApp ban gate.
+pub const WHATSAPP_GATE_ACCEPTED: &str = "WhatsApp ban gate accepted. Pairing has not started.";
+/// Status line after WhatsApp links. It replaces the pairing lines.
+pub const WHATSAPP_LINKED: &str = "WhatsApp is linked.";
+
 /// Account row line while the helper starts or does not answer in time.
 pub const HELPER_BUSY: &str = "Helper is busy…";
 /// Account row line while the core waits to start the helper again.
@@ -470,6 +442,45 @@ pub const HELPER_RESTARTING: &str = "Helper stopped. Restarting…";
 pub const HELPER_STOPPED: &str = "Helper stopped.";
 /// Account row line when the helper program is not installed.
 pub const HELPER_MISSING: &str = "Helper missing";
+
+/// The sentence under the chip for a session-key problem.
+///
+/// A saved account (`linked`) that cannot read the key gets the retry
+/// sentence. A first link gets the "did not link" sentence.
+fn store_access_detail(
+    protocol: ProtocolId,
+    reason: StoreAccessReason,
+    linked: bool,
+) -> &'static str {
+    match reason {
+        StoreAccessReason::KeychainDenied if linked => thinwire_protocol::KEYCHAIN_ACCESS_DENIED,
+        StoreAccessReason::KeychainDenied if protocol == ProtocolId::WhatsApp => {
+            thinwire_protocol::whatsapp_keychain_unavailable()
+        }
+        StoreAccessReason::KeychainDenied => thinwire_protocol::signal_keychain_unavailable(),
+        StoreAccessReason::WrongKey if protocol == ProtocolId::WhatsApp => {
+            thinwire_protocol::whatsapp_session_kept()
+        }
+        StoreAccessReason::WrongKey => thinwire_protocol::signal_session_kept(),
+        StoreAccessReason::MoveFailed if protocol == ProtocolId::WhatsApp => {
+            thinwire_protocol::whatsapp_key_wrong_kept()
+        }
+        StoreAccessReason::MoveFailed => thinwire_protocol::signal_key_wrong_kept(),
+    }
+}
+
+/// The move-aside failed. The files stayed, so a saved account stays linked.
+fn stores_left_in_place(detail: &str) -> bool {
+    detail == thinwire_protocol::signal_key_wrong_kept()
+        || detail == thinwire_protocol::whatsapp_key_wrong_kept()
+}
+
+/// Drop a trailing "did not link" sentence. A saved account does not use it.
+fn without_did_not_link(detail: &str) -> String {
+    detail
+        .replace(" Signal did not link.", "")
+        .replace(" WhatsApp did not link.", "")
+}
 
 /// Shown in the open chat when the phone removed this Signal device.
 /// Sending does not go out. The history stays.
@@ -516,7 +527,6 @@ pub struct Snapshot {
     pub selected_topic: Option<MessageTopic>,
     /// Keyboard highlight. Arrows move this. Enter and a click open the chat.
     pub focused_row: Option<String>,
-    pub filter: InboxFilter,
     /// Read-only notice opened from Unofficial or Ban risk. It does not
     /// start a link and it does not cancel one.
     notice_review: Option<ProtocolId>,
@@ -567,6 +577,13 @@ pub struct Snapshot {
     keychain_failed: bool,
     /// The user asked to read the keychain again. The app runs it off the UI thread.
     keychain_retry: bool,
+    /// A saved account could not read its session key while the app
+    /// keychain was not settled yet. One later pump sends `RetryStoreKey`
+    /// when that read succeeds. A denial after the keychain is ready does
+    /// not set this. The user clicks Retry for that one.
+    store_key_retry_due: bool,
+    /// The app keychain could be read at the start of this pump.
+    app_keychain_ready: bool,
     /// Protocols whose chat list is loading.
     chat_list_loading: HashSet<ProtocolId>,
     /// Chats whose history is loading, per protocol.
@@ -625,6 +642,11 @@ pub struct Snapshot {
     /// Unsent compose text per chat and topic. `compose` holds the open
     /// thread's draft. A chat with no topics uses `None`.
     drafts: HashMap<(ProtocolId, String, Option<MessageTopic>), String>,
+    /// Photos and videos attached to a thread and not sent yet, in order.
+    attachments: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<OutgoingFile>>,
+    /// Why the last attach skipped files. The tray shows it until the next
+    /// change of the tray.
+    attachment_note: Option<&'static str>,
     /// Body of a send or retry the adapter rejected, until that protocol's
     /// session ends. An unlink keeps one only when nothing newer replaced it.
     /// A Telegram session end drops them.
@@ -739,7 +761,6 @@ impl std::fmt::Debug for Snapshot {
         let mut out = f.debug_struct("Snapshot");
         out.field("accounts", &accounts)
             .field("selected_protocol", &self.selected_protocol)
-            .field("filter", &self.filter)
             .field("notice_review", &self.notice_review)
             .field("auth", &self.auth)
             .field("auth_busy", &self.auth_busy)
@@ -848,6 +869,7 @@ impl Snapshot {
                 state: AccountState::Unlinked,
                 helper: None,
                 signal_retained: None,
+                store_access: None,
                 retained_read: RetainedRead::Readable,
             })
             .collect();
@@ -860,7 +882,6 @@ impl Snapshot {
             selected_conversation: None,
             selected_topic: None,
             focused_row: None,
-            filter: InboxFilter::Telegram,
             notice_review: None,
             search: String::new(),
             auth: AuthScreen::Idle,
@@ -886,6 +907,8 @@ impl Snapshot {
             keychain_wait_started: None,
             keychain_failed: false,
             keychain_retry: false,
+            store_key_retry_due: false,
+            app_keychain_ready: false,
             chat_list_loading: HashSet::new(),
             history_loading: HashSet::new(),
             older_loading: HashSet::new(),
@@ -908,6 +931,8 @@ impl Snapshot {
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
+            attachments: HashMap::new(),
+            attachment_note: None,
             rejected_bodies: HashMap::new(),
             focus_compose: false,
             stopped: HashSet::new(),
@@ -990,12 +1015,13 @@ impl Snapshot {
                 status,
                 detail,
             } => {
-                // A different Signal number is linked. Drop the live chats of
-                // the previous number. The retained rows already hold them.
-                // This line is not a status of the live account.
+                // A retained-history line is not a status of the live account.
+                // It does not change the link state or the session key.
                 if protocol == ProtocolId::Signal
                     && detail == thinwire_protocol::SIGNAL_PREVIOUS_ACCOUNT
                 {
+                    // A different Signal number is linked. Drop the live chats of
+                    // the previous number. The retained rows already hold them.
                     self.retire_live_signal_chats();
                 } else if protocol == ProtocolId::Signal
                     && detail == thinwire_protocol::SIGNAL_RETAINED_RESET
@@ -1018,11 +1044,28 @@ impl Snapshot {
                     // slot sends nothing here, so settle still drops that row.
                     self.keep_unreadable_retained_slot(slot);
                 } else {
-                    // The status line only. It never changes the link state: a
-                    // recoverable error must not hide the inbox (shell plan 1, 11).
+                    // A saved account never hears "did not link". That sentence is
+                    // for a first link only.
+                    let saved = self.has_session(protocol);
+                    let detail = if saved && detail.contains("did not link") {
+                        without_did_not_link(&detail)
+                    } else {
+                        detail
+                    };
+                    // The status line does not end a session. A failed move of a
+                    // saved account puts the live row back to Linked: the files
+                    // stayed. A previous Signal number is a separate row.
                     if let Some(row) = self.live_account_mut(protocol) {
                         row.status = status;
                         row.detail = detail.clone();
+                        // A new status replaces the key sentence and hides Retry.
+                        // A failed move is the exception: the files stayed, so
+                        // the row stays linked and Retry tries the move again.
+                        row.store_access = None;
+                        if saved && stores_left_in_place(&detail) {
+                            row.state = AccountState::Linked;
+                            row.store_access = Some(StoreAccessReason::MoveFailed);
+                        }
                     }
                     #[cfg(feature = "signal-local")]
                     if protocol == ProtocolId::Signal {
@@ -1340,6 +1383,52 @@ impl Snapshot {
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
                     let _ = (code, generation);
+                }
+            }
+            AdapterEvent::StoreAccess { protocol, reason } => {
+                // A saved account keeps its session on a denied read. A wrong
+                // key moved the store files aside, so the row leaves Linked.
+                // A first link that cannot read the key is not a saved account.
+                let saved = self.has_session(protocol);
+                let detail = store_access_detail(protocol, reason, saved);
+                let leave = match reason {
+                    StoreAccessReason::WrongKey => {
+                        saved
+                            || self.accounts.iter().any(|row| {
+                                row.caps.id == protocol && row.state != AccountState::Unlinked
+                            })
+                    }
+                    StoreAccessReason::KeychainDenied => !saved,
+                    StoreAccessReason::MoveFailed => false,
+                };
+                if leave {
+                    self.set_account(protocol, AccountState::Unlinked);
+                } else if saved
+                    && matches!(
+                        reason,
+                        StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed
+                    )
+                {
+                    // A helper may have marked a saved account Linking while
+                    // it read the key. The account is still linked.
+                    // A previous Signal number does not take this update.
+                    if let Some(row) = self.live_account_mut(protocol) {
+                        row.state = AccountState::Linked;
+                    }
+                }
+                if let Some(row) = self.live_account_mut(protocol) {
+                    row.status = AdapterStatus::Error;
+                    row.detail = detail.to_string();
+                    row.store_access = Some(reason);
+                }
+                // A saved account, and the app keychain was not settled yet.
+                // One later pump sends RetryStoreKey when that read succeeds.
+                // A denial after the keychain is ready waits for the user's
+                // Retry click. A first link has no session, so it does not
+                // resume itself.
+                if saved && reason == StoreAccessReason::KeychainDenied && !self.app_keychain_ready
+                {
+                    self.store_key_retry_due = true;
                 }
             }
             AdapterEvent::SignalQr { code, generation } => {
@@ -1703,6 +1792,109 @@ impl Snapshot {
         }
     }
 
+    /// Add photos and videos to the tray of one thread. Another file is
+    /// skipped, and the tray says why. A file already in the tray is not
+    /// added again. The tray holds [`MAX_ATTACHMENTS`] files at most.
+    pub fn add_attachments(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        paths: Vec<std::path::PathBuf>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        if !self.sends_media(protocol) {
+            self.attachment_note = Some(ATTACH_NOT_HERE);
+            return;
+        }
+        let key = (protocol, chat.to_owned(), topic);
+        let tray = self.attachments.entry(key).or_default();
+        let mut note = None;
+        for path in paths {
+            let Some(file) = OutgoingFile::new(path) else {
+                note = Some(ATTACH_ONLY_MEDIA);
+                continue;
+            };
+            if tray.contains(&file) {
+                continue;
+            }
+            if tray.len() >= MAX_ATTACHMENTS {
+                note = Some(ATTACH_TOO_MANY);
+                break;
+            }
+            tray.push(file);
+        }
+        self.attachment_note = note;
+    }
+
+    /// Take one file out of the tray of a thread.
+    pub fn remove_attachment(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        index: usize,
+    ) {
+        let key = (protocol, chat.to_owned(), topic);
+        if let Some(tray) = self.attachments.get_mut(&key)
+            && index < tray.len()
+        {
+            tray.remove(index);
+            if tray.is_empty() {
+                self.attachments.remove(&key);
+            }
+        }
+        self.attachment_note = None;
+    }
+
+    /// The tray of the open thread.
+    #[must_use]
+    pub fn compose_attachments(&self) -> &[OutgoingFile] {
+        let Some(chat) = self.selected_conversation.clone() else {
+            return &[];
+        };
+        self.attachments
+            .get(&(self.selected_protocol, chat, self.selected_topic))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Why the last attach skipped files, if it did.
+    #[must_use]
+    pub const fn attachment_note(&self) -> Option<&'static str> {
+        self.attachment_note
+    }
+
+    /// The linked account of `protocol` can send photos and videos.
+    #[must_use]
+    pub fn sends_media(&self, protocol: ProtocolId) -> bool {
+        self.accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.linked() && row.caps.sends_media)
+    }
+
+    /// An accepted send took these files: drop them from the tray, when the
+    /// tray still holds them.
+    fn clear_sent_files(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        files: &[OutgoingFile],
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let key = (protocol, chat.to_owned(), topic);
+        if let Some(tray) = self.attachments.get_mut(&key) {
+            tray.retain(|file| !files.contains(file));
+            if tray.is_empty() {
+                self.attachments.remove(&key);
+            }
+        }
+    }
+
     /// True when this chat and topic are the open thread.
     #[must_use]
     pub fn is_selected_thread(
@@ -1795,10 +1987,12 @@ impl Snapshot {
             .selected_conversation
             .as_deref()
             .is_some_and(|id| thinwire_protocol::signal_retained_slot(id).is_some());
+        let has_files = !self.compose_attachments().is_empty();
         sends_text
             && !retained
             && topic_open
-            && !self.compose.trim().is_empty()
+            && (!self.compose.trim().is_empty() || has_files)
+            && (!has_files || self.sends_media(protocol))
             && self
                 .selected_conversation_row()
                 .is_some_and(|row| row.writable && !self.sends.in_flight(protocol, &row.id))
@@ -1863,19 +2057,6 @@ impl Snapshot {
         });
     }
 
-    pub fn set_filter(&mut self, filter: InboxFilter) {
-        let changed = self.filter != filter;
-        self.filter = filter;
-        let protocol = filter.protocol();
-        if !filter.matches(self.selected_protocol) && self.account_surface_visible(protocol) {
-            self.select_protocol(protocol);
-            return;
-        }
-        if changed {
-            self.sync_focused_row(FocusFollow::List);
-        }
-    }
-
     /// New inbox search. A highlight that the query hides is cleared.
     pub fn set_search(&mut self, text: String) {
         if self.search == text {
@@ -1913,7 +2094,7 @@ impl Snapshot {
         }
     }
 
-    /// The account rail lists every account this build shows. A filter pill
+    /// The account sidebar lists every account this build shows. Picking one
     /// does not hide the others. The middle column is still only the
     /// selected account ([`Self::visible_conversations`]).
     #[must_use]
@@ -2561,9 +2742,12 @@ impl Snapshot {
     fn note_send_accepted(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
         match self.sends.settle(protocol, chat, request) {
             // An accepted retry needs nothing more: its delivery events move the row.
-            Some(Pending::Send { body, topic, .. }) => {
+            Some(Pending::Send {
+                body, topic, files, ..
+            }) => {
                 self.drop_rejected_body(protocol, chat);
                 self.clear_sent_text(protocol, chat, topic, &body);
+                self.clear_sent_files(protocol, chat, topic, &files);
                 self.hold_telegram_send_line(protocol, chat, request, false);
             }
             Some(Pending::Retry { .. }) => {
@@ -2585,7 +2769,12 @@ impl Snapshot {
         let retry = matches!(pending, Pending::Retry { .. });
         self.drop_rejected_body(protocol, chat);
         match pending {
-            Pending::Send { body, topic, .. } => self.clear_sent_text(protocol, chat, topic, &body),
+            Pending::Send {
+                body, topic, files, ..
+            } => {
+                self.clear_sent_text(protocol, chat, topic, &body);
+                self.clear_sent_files(protocol, chat, topic, &files);
+            }
             Pending::Retry { message_id, .. } => {
                 self.set_delivery(protocol, chat, &message_id, Delivery::Sent);
                 // A new retry of the same row must not fail it again.
@@ -3022,17 +3211,30 @@ impl Snapshot {
         let body = self.compose.trim().to_string();
         // Keep the text until the adapter accepts the send; see note_send_accepted.
         let protocol = self.selected_protocol;
-        let Some(request) = self.sends.begin_send(
+        let files = self.compose_attachments().to_vec();
+        let Some(request) = self.sends.begin_send_files(
             protocol,
             &conversation_id,
             &body,
             self.selected_topic,
+            files.clone(),
             Instant::now(),
         ) else {
             return;
         };
         self.error = None;
-        if let Some(topic) = self.selected_topic {
+        self.attachment_note = None;
+        if !files.is_empty() {
+            // The files stay in the tray until the adapter accepts them.
+            self.pending.push(AdapterCommand::SendMedia {
+                protocol,
+                conversation_id,
+                topic: self.selected_topic,
+                files,
+                caption: body,
+                request,
+            });
+        } else if let Some(topic) = self.selected_topic {
             self.pending.push(AdapterCommand::SendTopicText {
                 protocol,
                 conversation_id,
@@ -3899,6 +4101,54 @@ impl Snapshot {
             .push(AdapterCommand::RestartHelper { protocol });
     }
 
+    /// The user clicked Retry on a keychain denial or a failed move.
+    ///
+    /// The command asks the helper to read the key again and open the saved
+    /// session. A wrong key tries the move-aside again. It is not a new link
+    /// and it does not delete a store. A wrong key that already moved does
+    /// not take this path.
+    pub fn retry_store_key(&mut self, protocol: ProtocolId) {
+        let Some(row) = self.live_account_mut(protocol) else {
+            return;
+        };
+        if !matches!(
+            row.store_access,
+            Some(StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed)
+        ) {
+            return;
+        }
+        row.store_access = None;
+        row.status = AdapterStatus::Connecting;
+        row.detail = "Opening the saved session.".into();
+        self.pending
+            .push(AdapterCommand::RetryStoreKey { protocol });
+    }
+
+    /// Read the session key again for every saved account that was denied.
+    /// This is not a new link.
+    pub(crate) fn retry_denied_store_keys(&mut self) {
+        let protocols: Vec<ProtocolId> = self
+            .accounts
+            .iter()
+            .filter(|row| row.store_access == Some(StoreAccessReason::KeychainDenied))
+            .map(|row| row.caps.id)
+            .collect();
+        for protocol in protocols {
+            self.retry_store_key(protocol);
+        }
+    }
+
+    /// One saved key denial is waiting for a keychain that can be read.
+    pub(crate) fn take_store_key_retry_due(&mut self) -> bool {
+        std::mem::take(&mut self.store_key_retry_due)
+    }
+
+    /// The app keychain state at the start of this pump. A saved-key denial
+    /// arms an automatic retry only when this is false.
+    pub(crate) fn note_app_keychain_ready(&mut self, ready: bool) {
+        self.app_keychain_ready = ready;
+    }
+
     /// The helper program of this protocol is not installed.
     #[must_use]
     pub fn helper_missing(&self, protocol: ProtocolId) -> bool {
@@ -4185,6 +4435,7 @@ impl Snapshot {
             state: AccountState::Unlinked,
             helper: None,
             signal_retained: Some(slot),
+            store_access: None,
             retained_read: RetainedRead::Readable,
         };
         // The highest slot is the most recent previous account. It sits
@@ -4302,6 +4553,9 @@ impl Snapshot {
         self.rejected_bodies
             .retain(|(owner, _), _| *owner != protocol);
         self.drafts.retain(|(owner, _, _), _| *owner != protocol);
+        // The files of an ended session do not go to a new one.
+        self.attachments
+            .retain(|(owner, _, _), _| *owner != protocol);
         for (chat, topic, body) in keep {
             self.drafts.insert((protocol, chat, topic), body);
         }
@@ -5056,6 +5310,30 @@ impl Snapshot {
         phone.clear();
     }
 
+    /// The user accepted the ban gate of this pairing.
+    #[must_use]
+    pub const fn whatsapp_gate_accepted(&self) -> bool {
+        #[cfg(feature = "whatsapp-web")]
+        {
+            self.whatsapp_risk_acknowledged
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        {
+            false
+        }
+    }
+
+    /// The app starts with a saved acceptance of the current ban gate. The
+    /// helper starts and opens a saved, paired session. No screen opens, and
+    /// a new link still shows the gate.
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn restore_whatsapp_gate(&mut self) {
+        if self.helper_missing(ProtocolId::WhatsApp) {
+            return;
+        }
+        self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
+    }
+
     #[cfg(feature = "whatsapp-web")]
     pub fn acknowledge_whatsapp_risk(&mut self) {
         // The ban gate must be on screen: a frontend cannot skip it.
@@ -5066,7 +5344,7 @@ impl Snapshot {
         self.whatsapp_risk_acknowledged = true;
         self.whatsapp_screen = WhatsAppScreen::Pair;
         self.error = None;
-        self.status_text = "WhatsApp ban gate accepted. Pairing has not started.".into();
+        self.status_text = WHATSAPP_GATE_ACCEPTED.into();
         self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
     }
 
@@ -5115,7 +5393,7 @@ impl Snapshot {
         self.whatsapp_pair_code = None;
         self.whatsapp_started = true;
         self.error = None;
-        self.status_text = "WhatsApp pairing requested.".into();
+        self.status_text = WHATSAPP_PAIRING_REQUESTED.into();
         let generation = self.next_pairing_generation;
         self.next_pairing_generation += 1;
         self.pairing_generation
@@ -5163,12 +5441,23 @@ impl Snapshot {
     /// must not close a risk gate the user just opened.
     #[cfg(feature = "whatsapp-web")]
     fn finish_whatsapp_link(&mut self) {
-        if !self.whatsapp_started || self.whatsapp_screen != WhatsAppScreen::Pair {
+        // A line about the pairing is not true after the link. This also
+        // applies when the pair screen closed before the phone linked.
+        if [WHATSAPP_PAIRING_REQUESTED, WHATSAPP_GATE_ACCEPTED].contains(&self.status_text.as_str())
+        {
+            self.status_text = WHATSAPP_LINKED.into();
+        }
+        // The pair screen closes on any link: the pairing the user started,
+        // or the saved session that opened after the gate. A Cancel on a
+        // pair screen that stays open would end that session. A reconnect
+        // does not close the risk gate: that is another screen.
+        if self.whatsapp_screen != WhatsAppScreen::Pair {
             return;
         }
         self.whatsapp_screen = WhatsAppScreen::Hidden;
         self.end_pairing();
         self.whatsapp_phone.clear();
+        self.status_text = WHATSAPP_LINKED.into();
     }
 
     /// The pairing stopped. Drop its QR and its pair code.
@@ -5267,11 +5556,36 @@ impl Snapshot {
         self.pending.push(AdapterCommand::SignalAcknowledgeNotice);
     }
 
-    /// The user opened the notice. While the account is not linked, this
-    /// drops the saved acceptance. While it is linked, the screen opens and
-    /// the acceptance stays.
+    /// The saved notice hash still matches. Link must not show the notice
+    /// again. This does not send a command and does not clear the hash.
+    #[cfg(feature = "signal-local")]
+    pub(crate) fn keep_saved_signal_notice(&mut self) {
+        self.signal_notice_acknowledged = true;
+    }
+
+    /// The user opened the notice.
+    ///
+    /// A linked account shows the notice and keeps the saved acceptance.
+    /// A remembered acceptance that is not already on screen also keeps
+    /// that acceptance. Link then opens the link screen. The account is
+    /// not linked yet after a keychain failure, and after a helper crash
+    /// that has not reported `Linked` again. That Link click must not drop
+    /// the saved hash. Cancel drops it. A re-show from the link screen
+    /// drops it too.
     #[cfg(feature = "signal-local")]
     pub fn open_signal_notice(&mut self) {
+        if self.signal_notice_acknowledged && self.signal_screen == SignalScreen::Hidden {
+            if !self.signal_linking_available() || self.helper_missing(ProtocolId::Signal) {
+                return;
+            }
+            self.signal_qr = None;
+            self.signal_screen = if self.protocol_linked(ProtocolId::Signal) {
+                SignalScreen::Notice
+            } else {
+                SignalScreen::Link
+            };
+            return;
+        }
         self.reveal_signal_notice(true);
     }
 
@@ -5351,7 +5665,14 @@ impl Snapshot {
     /// With no acceptance yet, it opens the notice first.
     #[cfg(feature = "signal-local")]
     pub fn relink_removed_signal(&mut self) {
-        if !self.signal_removed
+        // The same path after the phone removed the device and after a wrong
+        // key moved the store files aside. Neither path deletes those files.
+        let wrong_key = self.accounts.iter().any(|row| {
+            row.caps.id == ProtocolId::Signal
+                && row.store_access == Some(StoreAccessReason::WrongKey)
+                && !row.linked()
+        });
+        if (!self.signal_removed && !wrong_key)
             || !self.signal_linking_available()
             || self.helper_missing(ProtocolId::Signal)
         {
@@ -5596,6 +5917,325 @@ mod tests {
     /// feature).
     fn settle_resume(snapshot: &mut Snapshot) {
         snapshot.poll_resume(&SecretStore::memory());
+    }
+
+    /// A start with no Signal or WhatsApp account does not read a session key.
+    #[test]
+    fn startup_with_no_signal_or_whatsapp_account_does_not_read_a_session_key() {
+        let mut snapshot = Snapshot::new();
+        snapshot.poll_resume(&SecretStore::memory());
+        assert!(!snapshot.has_session(ProtocolId::Signal));
+        assert!(!snapshot.has_session(ProtocolId::WhatsApp));
+        let commands = snapshot.take_commands();
+        assert!(
+            commands
+                .iter()
+                .all(|command| !thinwire_protocol::command_reads_session_key(command)),
+            "a start with no such account must not read the key: {commands:?}"
+        );
+    }
+
+    fn signal_chat() -> Conversation {
+        let mut chat = telegram_chat(1, "Ada", 1);
+        chat.protocol = ProtocolId::Signal;
+        chat.id = "signal:ada".into();
+        chat
+    }
+
+    fn link_signal(snapshot: &mut Snapshot) {
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: signal_chat(),
+        });
+        snapshot.take_commands();
+    }
+
+    /// A saved account hears the retry sentence. A first link hears
+    /// "did not link". Retry reads the key again on both, and does not
+    /// start a link.
+    #[test]
+    fn a_denied_key_says_did_not_link_only_on_a_first_link() {
+        let mut saved = Snapshot::new();
+        link_signal(&mut saved);
+        saved.apply(AdapterEvent::StoreAccess {
+            protocol: ProtocolId::Signal,
+            reason: StoreAccessReason::KeychainDenied,
+        });
+        let row = saved
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert_eq!(row.state, AccountState::Linked);
+        assert_eq!(row.detail, thinwire_protocol::KEYCHAIN_ACCESS_DENIED);
+        assert!(
+            !row.detail.contains("did not link"),
+            "a saved account does not hear that the link failed"
+        );
+        assert_eq!(row.store_access, Some(StoreAccessReason::KeychainDenied));
+        saved.retry_store_key(ProtocolId::Signal);
+        assert_eq!(
+            saved.take_commands(),
+            vec![AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::Signal,
+            }]
+        );
+
+        let mut first = Snapshot::new();
+        first.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linking,
+        });
+        first.take_commands();
+        first.apply(AdapterEvent::StoreAccess {
+            protocol: ProtocolId::Signal,
+            reason: StoreAccessReason::KeychainDenied,
+        });
+        let row = first
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert_ne!(row.state, AccountState::Linked);
+        assert_eq!(row.detail, thinwire_protocol::signal_keychain_unavailable());
+        assert!(row.detail.contains("did not link"));
+        assert_eq!(row.store_access, Some(StoreAccessReason::KeychainDenied));
+        first.retry_store_key(ProtocolId::Signal);
+        assert_eq!(
+            first.take_commands(),
+            vec![AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::Signal,
+            }]
+        );
+
+        let mut saved_status = Snapshot::new();
+        link_signal(&mut saved_status);
+        saved_status.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: thinwire_protocol::signal_key_not_saved().into(),
+        });
+        let row = saved_status
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert!(
+            !row.detail.contains("did not link"),
+            "a saved account keeps the reason without the first-link sentence"
+        );
+        let mut first_status = Snapshot::new();
+        first_status.apply(AdapterEvent::Status {
+            protocol: ProtocolId::Signal,
+            status: AdapterStatus::Error,
+            detail: thinwire_protocol::signal_key_not_saved().into(),
+        });
+        let row = first_status
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert!(row.detail.contains("did not link"));
+    }
+
+    /// Keychain Deny keeps the row, the chats, and the exact sentence.
+    /// Retry asks for the key again and does not start a link.
+    #[test]
+    fn a_denied_keychain_read_keeps_the_row_and_retry_reads_the_key() {
+        let mut snapshot = Snapshot::new();
+        link_signal(&mut snapshot);
+        snapshot.apply(AdapterEvent::StoreAccess {
+            protocol: ProtocolId::Signal,
+            reason: StoreAccessReason::KeychainDenied,
+        });
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert_eq!(row.state, AccountState::Linked);
+        assert_eq!(row.status, AdapterStatus::Error);
+        assert_eq!(row.detail, thinwire_protocol::KEYCHAIN_ACCESS_DENIED);
+        assert_eq!(row.store_access, Some(StoreAccessReason::KeychainDenied));
+        assert!(
+            snapshot.error.is_none(),
+            "a denied read is not a link failure"
+        );
+        assert_eq!(
+            snapshot
+                .conversations
+                .get(&ProtocolId::Signal)
+                .map(Vec::len),
+            Some(1),
+            "the account is not emptied"
+        );
+        snapshot.retry_store_key(ProtocolId::Signal);
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![AdapterCommand::RetryStoreKey {
+                protocol: ProtocolId::Signal,
+            }]
+        );
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == ProtocolId::Signal)
+            .expect("signal row");
+        assert_eq!(row.status, AdapterStatus::Connecting);
+        assert!(row.store_access.is_none());
+        assert_eq!(row.state, AccountState::Linked);
+    }
+
+    /// A wrong key leaves Linked. The sentence ends with Link again.
+    /// Retry does nothing. Link starts the same QR flow as a removed device.
+    #[test]
+    fn a_wrong_key_leaves_linked_and_link_starts_the_relink() {
+        for (protocol, sentence) in [
+            (ProtocolId::Signal, thinwire_protocol::signal_session_kept()),
+            (
+                ProtocolId::WhatsApp,
+                thinwire_protocol::whatsapp_session_kept(),
+            ),
+        ] {
+            let mut snapshot = Snapshot::new();
+            snapshot.apply(AdapterEvent::Account {
+                protocol,
+                state: AccountState::Linked,
+            });
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: {
+                    let mut chat = telegram_chat(1, "Ada", 1);
+                    chat.protocol = protocol;
+                    chat.id = format!("{protocol:?}:ada");
+                    chat
+                },
+            });
+            snapshot.take_commands();
+            assert!(snapshot.has_session(protocol));
+            snapshot.apply(AdapterEvent::StoreAccess {
+                protocol,
+                reason: StoreAccessReason::WrongKey,
+            });
+            let row = snapshot
+                .accounts
+                .iter()
+                .find(|row| row.caps.id == protocol)
+                .expect("row");
+            assert_eq!(row.state, AccountState::Unlinked);
+            assert!(!snapshot.has_session(protocol));
+            assert_eq!(row.detail, sentence);
+            assert!(row.detail.ends_with("Link again"), "{}", row.detail);
+            assert_eq!(row.store_access, Some(StoreAccessReason::WrongKey));
+            snapshot.retry_store_key(protocol);
+            assert!(
+                snapshot.take_commands().is_empty(),
+                "a wrong key does not retry the key read"
+            );
+            #[cfg(feature = "signal-local")]
+            if protocol == ProtocolId::Signal {
+                snapshot.signal_notice_acknowledged = true;
+                snapshot.relink_removed_signal();
+                let commands = snapshot.take_commands();
+                assert!(
+                    commands
+                        .iter()
+                        .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+                    "Link starts the QR flow: {commands:?}"
+                );
+                assert!(
+                    commands
+                        .iter()
+                        .all(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+                    "Link does not delete the saved store: {commands:?}"
+                );
+            }
+            #[cfg(feature = "whatsapp-web")]
+            if protocol == ProtocolId::WhatsApp {
+                snapshot.open_whatsapp_risk_gate();
+                assert!(matches!(snapshot.whatsapp_screen, WhatsAppScreen::RiskGate));
+                assert!(
+                    snapshot.take_commands().is_empty(),
+                    "the risk gate does not delete the saved store"
+                );
+            }
+        }
+    }
+
+    /// A failed move is not a wrong key. The files stayed, the row stays
+    /// linked, and Retry asks for the move again. It does not link.
+    #[test]
+    fn a_failed_move_keeps_the_linked_row_and_retries_the_move() {
+        for (protocol, sentence) in [
+            (
+                ProtocolId::Signal,
+                thinwire_protocol::signal_key_wrong_kept(),
+            ),
+            (
+                ProtocolId::WhatsApp,
+                thinwire_protocol::whatsapp_key_wrong_kept(),
+            ),
+        ] {
+            let mut snapshot = Snapshot::new();
+            snapshot.apply(AdapterEvent::Account {
+                protocol,
+                state: AccountState::Linked,
+            });
+            snapshot.apply(AdapterEvent::ConversationUpsert {
+                conversation: {
+                    let mut chat = telegram_chat(1, "Ada", 1);
+                    chat.protocol = protocol;
+                    chat.id = format!("{protocol:?}:ada");
+                    chat
+                },
+            });
+            snapshot.take_commands();
+            snapshot.apply(AdapterEvent::Account {
+                protocol,
+                state: AccountState::Linking,
+            });
+            snapshot.apply(AdapterEvent::Status {
+                protocol,
+                status: AdapterStatus::Error,
+                detail: sentence.into(),
+            });
+            let row = snapshot
+                .accounts
+                .iter()
+                .find(|row| row.caps.id == protocol)
+                .expect("row");
+            assert_eq!(row.state, AccountState::Linked);
+            assert!(snapshot.has_session(protocol));
+            assert_eq!(row.store_access, Some(StoreAccessReason::MoveFailed));
+            assert_eq!(row.detail, sentence);
+            assert!(row.detail.contains("left in place"), "{}", row.detail);
+            assert!(
+                row.detail.contains("Nothing was deleted."),
+                "{}",
+                row.detail
+            );
+            assert!(!row.detail.contains("Link again"), "{}", row.detail);
+            assert_eq!(
+                snapshot.conversations.get(&protocol).map(Vec::len),
+                Some(1),
+                "the account is not emptied"
+            );
+            snapshot.retry_store_key(protocol);
+            let commands = snapshot.take_commands();
+            assert_eq!(
+                commands,
+                vec![AdapterCommand::RetryStoreKey { protocol }],
+                "Retry reads the key and tries the move again"
+            );
+            assert!(
+                commands
+                    .iter()
+                    .all(|command| matches!(command, AdapterCommand::RetryStoreKey { .. })),
+                "Retry does not start a link: {commands:?}"
+            );
+        }
     }
 
     // region: helper process (ADR 0013)
@@ -5861,6 +6501,31 @@ mod tests {
         );
     }
 
+    /// Link after a remembered notice must not drop that acceptance.
+    /// The account is not linked yet. A keychain failure leaves it there.
+    /// A re-show from the link screen still drops the acceptance.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn link_after_a_remembered_notice_keeps_the_acceptance() {
+        let mut snapshot = Snapshot::new();
+        snapshot.restore_signal_notice();
+        let _ = snapshot.take_commands();
+        snapshot.open_signal_notice();
+        assert!(snapshot.signal_notice_acknowledged());
+        assert!(
+            !snapshot.take_signal_notice_forget(),
+            "Link does not ask to clear the saved hash"
+        );
+        assert_eq!(snapshot.signal_screen, SignalScreen::Link);
+
+        snapshot.open_signal_notice();
+        assert!(!snapshot.signal_notice_acknowledged());
+        assert!(
+            snapshot.take_signal_notice_forget(),
+            "a re-show from the link screen still clears the saved hash"
+        );
+    }
+
     /// #248: with no Signal helper program the notice does not open. When
     /// the helper goes away while the link screen is open, a link start
     /// does nothing, and Start does not stay disabled with no answer. When
@@ -6013,6 +6678,56 @@ mod tests {
         assert!(snapshot.whatsapp_started, "the WhatsApp pairing stays");
         snapshot.apply(whatsapp_qr(pairing));
         assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("qr-one"));
+    }
+
+    /// A link replaces the pairing line of the status strip. The strip
+    /// does not say "pairing requested" for a linked account.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_whatsapp_link_replaces_the_pairing_status() {
+        let phone = thinwire_protocol::WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.begin_whatsapp_link(&phone);
+        assert_eq!(snapshot.status_line(), WHATSAPP_PAIRING_REQUESTED);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.status_line(), WHATSAPP_LINKED);
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+
+        // The pair screen closed first. The link still replaces the line.
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.begin_whatsapp_link(&phone);
+        snapshot.whatsapp_screen = WhatsAppScreen::Hidden;
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.status_line(), WHATSAPP_LINKED);
+    }
+
+    /// The saved session opens after the gate, with no pairing. The pair
+    /// screen then closes, so its Cancel cannot end that session.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_saved_session_that_opens_after_the_gate_closes_the_pair_screen() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        assert!(!snapshot.whatsapp_started);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        assert_eq!(snapshot.status_line(), WHATSAPP_LINKED);
+        assert!(whatsapp_row(&snapshot).linked());
     }
 
     /// ADR 0013 decision 6: a missing helper keeps the account row, with
@@ -7136,7 +7851,7 @@ mod tests {
     }
 
     /// The middle column lists the selected account. Another account's chats
-    /// stay off that list. Both accounts stay on the rail.
+    /// stay off that list. Both accounts stay in the sidebar.
     #[test]
     fn the_middle_column_lists_only_the_selected_account() {
         let mut snapshot = Snapshot::new();
@@ -7155,11 +7870,6 @@ mod tests {
         assert_eq!(visible_ids(&snapshot), ["general"]);
         assert!(snapshot.shows_in_switcher(ProtocolId::Telegram));
         assert!(snapshot.shows_in_switcher(ProtocolId::Slack));
-        assert!(
-            !InboxFilter::chrome_filters()
-                .iter()
-                .any(|filter| filter.label() == "All")
-        );
     }
 
     /// Loading while the account syncs. "No chats yet." only after the link,
@@ -7549,6 +8259,106 @@ mod tests {
             snapshot.account_display_unread(ProtocolId::Telegram, &mutes),
             2
         );
+    }
+
+    /// Photos and videos go out in one media send with the text as the
+    /// caption. The tray keeps them until the adapter accepts the send.
+    #[test]
+    fn attached_files_go_out_with_the_text_and_leave_the_tray_on_accept() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        snapshot.add_attachments(
+            ProtocolId::Telegram,
+            "telegram:1",
+            None,
+            vec![
+                "/home/a/cat.png".into(),
+                "/home/a/notes.pdf".into(),
+                "/home/a/clip.mp4".into(),
+                "/home/a/cat.png".into(),
+            ],
+        );
+        assert_eq!(snapshot.compose_attachments().len(), 2, "no pdf, no repeat");
+        assert_eq!(snapshot.attachment_note(), Some(ATTACH_ONLY_MEDIA));
+        assert!(snapshot.can_send(), "files with no text can go");
+        snapshot.send_compose();
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::SendMedia {
+            files,
+            caption,
+            request,
+            topic,
+            ..
+        }) = commands.last()
+        else {
+            panic!("no media send: {commands:?}");
+        };
+        assert_eq!(files.len(), 2);
+        assert_eq!(caption, "");
+        assert_eq!(*topic, None);
+        assert_eq!(
+            snapshot.compose_attachments().len(),
+            2,
+            "the tray stays until the adapter accepts"
+        );
+        assert!(!snapshot.can_send(), "one send at a time");
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request: *request,
+        });
+        assert!(snapshot.compose_attachments().is_empty());
+
+        // A rejection keeps the tray. Remove takes one file out.
+        snapshot.add_attachments(
+            ProtocolId::Telegram,
+            "telegram:1",
+            None,
+            vec!["/a/1.jpg".into(), "/a/2.jpg".into()],
+        );
+        snapshot.compose = "look".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendMedia {
+                    request, caption, ..
+                } if caption == "look" => Some(request),
+                _ => None,
+            })
+            .expect("media send");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(snapshot.compose_attachments().len(), 2);
+        snapshot.remove_attachment(ProtocolId::Telegram, "telegram:1", None, 0);
+        assert_eq!(snapshot.compose_attachments().len(), 1);
+        assert_eq!(
+            snapshot.compose_attachments()[0].path,
+            std::path::PathBuf::from("/a/2.jpg")
+        );
+    }
+
+    /// The tray of one chat does not show in another chat, and it holds 30
+    /// files at most.
+    #[test]
+    fn the_tray_belongs_to_its_chat_and_is_capped() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.select_conversation("telegram:1".into());
+        let many = (0..40).map(|n| format!("/a/{n}.png").into()).collect();
+        snapshot.add_attachments(ProtocolId::Telegram, "telegram:1", None, many);
+        assert_eq!(snapshot.compose_attachments().len(), MAX_ATTACHMENTS);
+        assert_eq!(snapshot.attachment_note(), Some(ATTACH_TOO_MANY));
+        snapshot.select_conversation("telegram:2".into());
+        assert!(snapshot.compose_attachments().is_empty());
+        snapshot.select_conversation("telegram:1".into());
+        assert_eq!(snapshot.compose_attachments().len(), MAX_ATTACHMENTS);
     }
 
     /// An accept for topic A clears A's draft. Topic B keeps the same text.
@@ -9346,21 +10156,6 @@ mod tests {
         assert_eq!(
             protocol_chrome_enabled(ProtocolId::Signal),
             cfg!(feature = "signal-local")
-        );
-        let filters = InboxFilter::chrome_filters();
-        assert!(
-            !filters.iter().any(|filter| filter.label() == "All"),
-            "there is no combined inbox"
-        );
-        assert!(filters.contains(&InboxFilter::Telegram));
-        #[cfg(feature = "slack-oauth")]
-        assert!(filters.contains(&InboxFilter::Slack));
-        #[cfg(not(feature = "slack-oauth"))]
-        assert_eq!(filters.len(), 1);
-        assert!(
-            !filters
-                .iter()
-                .any(|filter| filter.label() == "Experimental")
         );
         let snapshot = Snapshot::new();
         assert!(snapshot.shows_in_switcher(ProtocolId::Telegram));
@@ -11458,21 +12253,6 @@ mod tests {
         assert_eq!(snapshot.status_text, "telegram api_id must be a number");
     }
 
-    #[test]
-    fn filter_matches_supported_protocols_without_an_experimental_tab() {
-        assert!(InboxFilter::Telegram.matches(ProtocolId::Telegram));
-        assert!(!InboxFilter::Telegram.matches(ProtocolId::Slack));
-        assert!(!InboxFilter::Telegram.matches(ProtocolId::WhatsApp));
-        assert!(!InboxFilter::Telegram.matches(ProtocolId::Discord));
-        #[cfg(feature = "slack-oauth")]
-        assert!(InboxFilter::Slack.matches(ProtocolId::Slack));
-        assert!(
-            !InboxFilter::chrome_filters()
-                .iter()
-                .any(|filter| filter.label() == "All" || filter.label() == "Experimental")
-        );
-    }
-
     fn discord_guild_placeholder() -> Conversation {
         Conversation {
             protocol: ProtocolId::Discord,
@@ -11618,37 +12398,25 @@ mod tests {
     }
 
     #[test]
-    fn the_account_rail_lists_every_account_and_has_no_all_filter() {
-        assert!(
-            !InboxFilter::chrome_filters()
-                .iter()
-                .any(|filter| filter.label() == "All")
+    fn the_account_sidebar_lists_every_account_of_this_build() {
+        let view = Snapshot::new();
+        assert_eq!(
+            view.shows_in_switcher(ProtocolId::WhatsApp),
+            cfg!(feature = "whatsapp-web")
         );
-        for filter in InboxFilter::chrome_filters() {
-            let mut view = Snapshot::new();
-            view.set_filter(*filter);
-            assert_eq!(
-                view.shows_in_switcher(ProtocolId::WhatsApp),
-                cfg!(feature = "whatsapp-web"),
-                "a pill does not hide other accounts"
-            );
-            assert_eq!(
-                view.shows_in_switcher(ProtocolId::Discord),
-                DiscordAdapter::bot_inbox_compiled()
-            );
-            assert_eq!(
-                view.shows_in_switcher(ProtocolId::Slack),
-                cfg!(feature = "slack-oauth")
-            );
-            assert_eq!(
-                view.shows_in_switcher(ProtocolId::Signal),
-                cfg!(feature = "signal-local")
-            );
-            assert!(view.shows_in_switcher(ProtocolId::Telegram));
-        }
-        assert!(!InboxFilter::Telegram.matches(ProtocolId::Slack));
-        #[cfg(feature = "slack-oauth")]
-        assert!(!InboxFilter::Slack.matches(ProtocolId::Telegram));
+        assert_eq!(
+            view.shows_in_switcher(ProtocolId::Discord),
+            DiscordAdapter::bot_inbox_compiled()
+        );
+        assert_eq!(
+            view.shows_in_switcher(ProtocolId::Slack),
+            cfg!(feature = "slack-oauth")
+        );
+        assert_eq!(
+            view.shows_in_switcher(ProtocolId::Signal),
+            cfg!(feature = "signal-local")
+        );
+        assert!(view.shows_in_switcher(ProtocolId::Telegram));
     }
 
     #[test]

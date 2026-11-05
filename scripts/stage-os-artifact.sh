@@ -74,6 +74,9 @@ copy_app_notice third_party/widestring/LICENSE-MIT widestring-LICENSE-MIT.txt
 copy_app_notice third_party/widestring/LICENSE-APACHE widestring-LICENSE-APACHE.txt
 copy_app_notice third_party/webbrowser/LICENSE-MIT webbrowser-LICENSE-MIT.txt
 copy_app_notice third_party/webbrowser/LICENSE-APACHE webbrowser-LICENSE-APACHE.txt
+# SQLCipher and OpenSSL are linked into the release helpers (issue #291).
+copy_app_notice third_party/sqlcipher/LICENSE sqlcipher-LICENSE.txt
+copy_app_notice third_party/openssl/LICENSE-APACHE openssl-LICENSE-APACHE.txt
 
 copy_llvm_notice() {
   local lib="$1"
@@ -716,6 +719,15 @@ EOF
       exit 1
     fi
   done
+  for notice in \
+    sqlcipher-LICENSE.txt \
+    openssl-LICENSE-APACHE.txt
+  do
+    if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${notice}" ]]; then
+      echo "::error::Thinwire.app Resources are missing the cipher notice ${notice}."
+      exit 1
+    fi
+  done
   for helper_name in "${helper_names[@]}"; do
     if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${helper_name}-AGPL-3.0.txt" || ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${helper_name}-SOURCE.md" ]]; then
       echo "::error::Thinwire.app Resources are missing the AGPL text or the source offer of ${helper_name}."
@@ -874,6 +886,8 @@ with tarfile.open(archive, "r:gz") as tf:
         "widestring-LICENSE-APACHE.txt",
         "webbrowser-LICENSE-MIT.txt",
         "webbrowser-LICENSE-APACHE.txt",
+        "sqlcipher-LICENSE.txt",
+        "openssl-LICENSE-APACHE.txt",
     ):
         if not any(name.endswith(f"THIRD_PARTY_NOTICES/{notice}") for name in names):
             raise SystemExit(f"{archive} is missing the notice {notice}")

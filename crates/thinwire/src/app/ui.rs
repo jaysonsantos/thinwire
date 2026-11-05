@@ -1,31 +1,32 @@
-//! Shell: account rail, the selected account's chat list, then the open chat.
+//! Shell: the account sidebar, the selected account's chat list, then the open
+//! chat. A status banner sits above all three when there is something to say.
 
 use std::time::Instant;
 
-use eframe::egui::{self, RichText};
+use eframe::egui::{self, AtomExt, RichText};
 use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
 use thinwire_protocol::{
-    AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic, ProtocolId,
-    SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, SIGNAL_PREVIOUS_ACCOUNT, topic_mute_id,
+    AccountState, AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic,
+    ProtocolId, SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, StoreAccessReason, topic_mute_id,
 };
 
 use super::auth;
+use super::icons;
 use super::motion;
 use super::theme::{self, radius, size, space};
 use super::theme_mode::ThemeModeEgui;
 use super::thread_layout::{RowLayout, list_time, thread_rows};
-#[cfg(feature = "signal-local")]
-use thinwire_core::SignalIntent;
 #[cfg(feature = "slack-oauth")]
 use thinwire_core::SlackIntent;
 use thinwire_core::secrets::Persistence;
 use thinwire_core::state::{
-    AccountRow, AuthKey, AuthScreen, CenterView, InboxFilter, InboxState, KEYCHAIN_READ_FAILED,
+    AccountRow, AuthKey, AuthScreen, CenterView, InboxState, KEYCHAIN_READ_FAILED,
     LOADING_CHATS_STATUS, OlderState, RESUME_CONNECTING, Snapshot, ThreadState, notice_label,
     unofficial_notice,
 };
 use thinwire_core::{Intent, TelegramIntent, ThemeMode, View};
+use thinwire_core::{SignalIntent, WhatsAppIntent};
 
 /// Shown while the OS keychain is not available. Secrets stay in memory.
 pub(crate) const KEYCHAIN_UNAVAILABLE_NOTICE: &str =
@@ -46,19 +47,55 @@ pub(crate) fn keychain_notice(persistence: Persistence) -> Option<&'static str> 
     }
 }
 
+/// Width the account sidebar opens at, and when the window is narrow.
+const RAIL_WIDTH: f32 = 216.0;
+const RAIL_WIDTH_NARROW: f32 = 188.0;
+/// Width the chat list opens at, and when the window is narrow.
+const LIST_WIDTH: f32 = 312.0;
+const LIST_WIDTH_NARROW: f32 = 256.0;
+/// Below this window width the two side columns open narrower, so the thread
+/// keeps room for a readable line.
+const NARROW_WINDOW: f32 = 960.0;
+
+/// The window is narrow: the side columns open at their smaller width.
+fn narrow_window(ui: &egui::Ui) -> bool {
+    ui.ctx().content_rect().width() < NARROW_WINDOW
+}
+/// Gap between two rows of a list.
+const ROW_GAP: f32 = 2.0;
+const TILE: f32 = theme::TILE_SIDE;
+/// Side of the icon on a sidebar button.
+const RAIL_ICON: f32 = 16.0;
+/// Painter for one of the icons in [`icons`].
+type Icon = fn(&egui::Painter, egui::Pos2, f32, egui::Color32);
+
 const COMPOSE_MAX_ROWS: usize = 5;
-/// Send is at least this tall. The field grows with the line count.
+/// Diameter of the round Send button, and the least height of the compose
+/// row. The field grows with the line count.
 const SEND_MIN_HEIGHT: f32 = 40.0;
 /// Focused field border. Unfocused is 1px. The reserve keeps the thicker ring.
 const FIELD_STROKE_MAX: f32 = 2.0;
 /// A message bubble uses at most this share of the thread width.
-const BUBBLE_WIDTH: f32 = 0.75;
+const BUBBLE_WIDTH: f32 = 0.78;
 /// Cap so a wide window does not make a line too long to read.
-const BUBBLE_MAX: f32 = 560.0;
+const BUBBLE_MAX: f32 = 540.0;
 /// Gap between bubbles in one sender run.
-const SAME_RUN_GAP: f32 = 2.0;
+const SAME_RUN_GAP: f32 = 3.0;
+/// Font size of a message that is only emoji. It has no bubble.
+const EMOJI_SIZE: f32 = 38.0;
+/// Height of the soft edge where the messages scroll under the header or
+/// the compose bar.
+const SCROLL_FADE: f32 = 18.0;
+/// Side of an icon button, and of the icon inside it.
+const ICON_BUTTON: f32 = 36.0;
+const ICON_BUTTON_ICON: f32 = 18.0;
+/// Padding inside a bubble, left and right, then top and bottom.
+const BUBBLE_PAD_X: i8 = 14;
+const BUBBLE_PAD_Y: i8 = 9;
 /// Gap before the first bubble of the next sender run.
-const NEXT_RUN_GAP: f32 = 10.0;
+const NEXT_RUN_GAP: f32 = 12.0;
+/// Space left and right of the messages and the compose bar.
+const THREAD_INSET: f32 = space::XL;
 
 /// One-shot hints from the core. A hint counts as used only where its widget
 /// draws, so a hidden widget does not lose it (qa L1).
@@ -145,7 +182,6 @@ pub(crate) fn draw(
         super::signal_gate::draw(ui, snapshot, out);
         return;
     }
-    top_bar(ui, snapshot, out);
     status_strip(ui, snapshot, out);
     account_rail(ui, snapshot, out);
     chat_column(ui, snapshot, hints, out);
@@ -166,67 +202,7 @@ pub(crate) fn edited(
     changed.then_some(text)
 }
 
-fn top_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
-    egui::Panel::top("top")
-        .frame(theme::chrome_panel(ui.style()))
-        .show(ui, |ui| {
-            let palette = theme::palette(ui);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("thinwire")
-                        .text_style(egui::TextStyle::Heading)
-                        .color(palette.text),
-                );
-                ui.add_space(space::S);
-                for filter in InboxFilter::chrome_filters() {
-                    let selected = filter.matches(snapshot.selected_protocol);
-                    if filter_pill(ui, filter.label(), selected).clicked() {
-                        out.push(Intent::SetFilter(*filter));
-                    }
-                }
-                if let Some(text) = search_field(ui, &snapshot.search) {
-                    out.push(Intent::SetSearch(text.into()));
-                }
-                if snapshot.can_add_account() && ui.button("Add account").clicked() {
-                    out.push(Intent::Telegram(TelegramIntent::AddAccount));
-                }
-                add_slack_workspace(ui, snapshot, out);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    more_menu(ui, |ui| {
-                        if ui.button("Refresh").clicked() {
-                            out.push(Intent::Refresh);
-                            ui.close();
-                        }
-                        if snapshot.can_add_account() && ui.button("Advanced").clicked() {
-                            out.push(Intent::Telegram(TelegramIntent::OpenApiOverride));
-                            ui.close();
-                        }
-                        ui.separator();
-                        theme_control(ui, snapshot.theme(), out);
-                        ui.separator();
-                        notification_control(ui, snapshot, out);
-                    });
-                    busy_indicator(ui, busy_line(snapshot).as_deref());
-                });
-            });
-        });
-}
-
-/// The settings menu button. Its three dots are painted: U+22EF is in
-/// neither Inter nor egui's fallback fonts, so a text glyph draws as a box.
-fn more_menu(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let icon = egui::Atom::custom(egui::IdSalt::new("more-icon"), egui::vec2(16.0, 16.0));
-    let response = ui.menu_button(icon, add_contents).response;
-    let ink = ui.style().interact(&response).fg_stroke.color;
-    let center = response.rect.center();
-    for dx in [-5.0, 0.0, 5.0] {
-        ui.painter()
-            .circle_filled(center + egui::vec2(dx, 0.0), 1.75, ink);
-    }
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Menu"));
-}
-
-/// Side of the busy spinner in the top bar.
+/// Side of the busy spinner in the chat list header.
 const BUSY_SPINNER: f32 = 14.0;
 
 /// A running load or send, left of the menu. It takes no row of its own, so
@@ -284,66 +260,134 @@ fn busy_indicator(ui: &mut egui::Ui, line: Option<&str>) {
     });
 }
 
-fn filter_pill(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let palette = theme::palette(ui);
-    let on = motion::toggle(
-        ui.ctx(),
-        ui.scope_id().with(("filter-pill", label)),
-        selected,
-        motion::STATE,
-    );
-    let fill = motion::mix(egui::Color32::TRANSPARENT, palette.selected_row, on);
-    let color = motion::mix(palette.text2, palette.text, on);
-    ui.add(
-        egui::Button::new(RichText::new(label).color(color))
-            .fill(fill)
-            .corner_radius(egui::CornerRadius::same(radius::PILL))
-            .min_size(egui::vec2(0.0, 32.0)),
-    )
-}
-
-/// Glass drawn in the search field, to the right of [`theme::search_field_margin`].
-const SEARCH_ICON: f32 = 12.0;
+/// Glass drawn in the search field, inside [`theme::search_field_margin`].
+const SEARCH_ICON: f32 = 14.0;
 
 fn search_field(ui: &mut egui::Ui, search: &str) -> Option<String> {
     let palette = theme::palette(ui);
+    let id = ui.make_persistent_id("chat-search");
+    let focused = ui.memory(|memory| memory.has_focus(id));
+    let ring = motion::toggle(ui.ctx(), id.with("ring"), focused, motion::STATE);
+    let margin = theme::search_field_margin();
+    let frame = theme::field_frame(palette, ring, margin);
+    let width = ui.available_width();
     let mut text = search.to_owned();
     let output = egui::TextEdit::singleline(&mut text)
-        .desired_width(200.0)
-        .min_size(egui::vec2(0.0, theme::MIN_TARGET))
-        .margin(theme::search_field_margin())
-        .hint_text(RichText::new("title / participant").color(palette.text3))
+        .id(id)
+        .frame(frame)
+        .desired_width(width)
+        .min_size(egui::vec2(0.0, theme::SEARCH_HEIGHT))
+        .hint_text(RichText::new("Search chats").color(palette.text3))
         .prefix(egui::Atom::custom(
             egui::IdSalt::new("search-icon"),
             egui::vec2(SEARCH_ICON, SEARCH_ICON),
         ))
         .show(ui);
     let rect = output.response.rect;
-    let center = egui::pos2(rect.min.x + space::S + SEARCH_ICON * 0.5, rect.center().y)
-        - egui::vec2(1.0, 1.0);
-    let stroke = egui::Stroke::new(1.5, palette.text3);
-    ui.painter().circle_stroke(center, 4.5, stroke);
-    ui.painter().line_segment(
-        [center + egui::vec2(3.2, 3.2), center + egui::vec2(6.0, 6.0)],
-        stroke,
+    let center = egui::pos2(
+        rect.min.x + f32::from(margin.left) + SEARCH_ICON * 0.5,
+        rect.center().y,
     );
+    icons::search(ui.painter(), center, SEARCH_ICON, palette.text3);
     output.response.changed().then_some(text)
 }
 
-fn theme_control(ui: &mut egui::Ui, current: ThemeMode, out: &mut Vec<Intent>) {
-    ui.label("Theme");
-    let mut preference = current.to_egui();
-    preference.buttons(ui);
-    let chosen = ThemeMode::from_egui(preference);
-    if chosen != current {
-        out.push(Intent::SetTheme(chosen));
-        super::theme_mode::apply(ui.ctx(), chosen);
+/// A quiet full-width button for the foot of the sidebar: a painted icon, then
+/// the label at the left. It has no fill until the pointer is on it.
+fn rail_button(ui: &mut egui::Ui, label: &str, icon: Icon) -> egui::Response {
+    let palette = theme::palette(ui);
+    let icon_id = egui::IdSalt::new(("rail-icon", label));
+    let button = egui::Button::new((
+        egui::Atom::custom(icon_id, egui::vec2(RAIL_ICON, RAIL_ICON)),
+        RichText::new(label)
+            .color(palette.text2)
+            .atom_grow(true)
+            .atom_align(egui::Align2::LEFT_CENTER),
+    ))
+    .frame_when_inactive(false)
+    .corner_radius(egui::CornerRadius::same(radius::ROW))
+    .min_size(egui::vec2(ui.available_width(), theme::MIN_TARGET + 4.0));
+    let shown = button.atom_ui(ui);
+    if let Some(rect) = shown.rect(icon_id) {
+        icon(ui.painter(), rect.center(), RAIL_ICON, palette.text2);
     }
+    shown.response
+}
+
+/// The foot of the sidebar: Add account, a Slack workspace, and Settings.
+fn rail_footer(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    egui::Panel::bottom("accounts-footer")
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(egui::Frame::new().inner_margin(egui::Margin {
+            top: space::S as i8,
+            ..egui::Margin::ZERO
+        }))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = ROW_GAP;
+            if snapshot.can_add_account() && rail_button(ui, "Add account", icons::plus).clicked() {
+                out.push(Intent::Telegram(TelegramIntent::AddAccount));
+            }
+            add_slack_workspace(ui, snapshot, out);
+            let settings = rail_button(ui, "Settings", icons::gear);
+            egui::Popup::menu(&settings)
+                .align(egui::RectAlign::TOP_START)
+                .gap(space::XS)
+                .show(|ui| settings_menu(ui, snapshot, out));
+        });
+}
+
+/// What the Settings button opens.
+fn settings_menu(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    ui.set_min_width(232.0);
+    ui.spacing_mut().button_padding = egui::vec2(space::S, 6.0);
+    ui.spacing_mut().item_spacing.y = 4.0;
+    if ui.button("Refresh").clicked() {
+        out.push(Intent::Refresh);
+        ui.close();
+    }
+    if snapshot.can_add_account() && ui.button("Advanced").clicked() {
+        out.push(Intent::Telegram(TelegramIntent::OpenApiOverride));
+        ui.close();
+    }
+    ui.separator();
+    theme_control(ui, snapshot.theme(), out);
+    ui.separator();
+    notification_control(ui, snapshot, out);
+}
+
+/// One caption over a group of settings.
+fn menu_caption(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(space::XS);
+    ui.label(
+        RichText::new(text)
+            .small()
+            .family(theme::semibold())
+            .color(theme::palette(ui).text3),
+    );
+}
+
+fn theme_control(ui: &mut egui::Ui, current: ThemeMode, out: &mut Vec<Intent>) {
+    menu_caption(ui, "Theme");
+    ui.horizontal(|ui| {
+        for (preference, label) in [
+            (egui::ThemePreference::System, "System"),
+            (egui::ThemePreference::Light, "Light"),
+            (egui::ThemePreference::Dark, "Dark"),
+        ] {
+            let selected = current.to_egui() == preference;
+            if ui.selectable_label(selected, label).clicked() && !selected {
+                let chosen = ThemeMode::from_egui(preference);
+                out.push(Intent::SetTheme(chosen));
+                super::theme_mode::apply(ui.ctx(), chosen);
+            }
+        }
+    });
 }
 
 /// Settings switches for desktop notifications (#32).
 fn notification_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
-    ui.label("Notifications");
+    menu_caption(ui, "Notifications");
     let mut on = snapshot.notifications();
     if ui.checkbox(&mut on, "Show notifications").changed() {
         out.push(Intent::SetNotifications(on));
@@ -369,16 +413,53 @@ fn status_strip(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         ui.data(|data| data.get_temp::<StripContent>(last))
             .unwrap_or_default()
     };
+    let palette = theme::palette(ui);
+    let fill = motion::mix(palette.bg, shown.tone().ink(palette), 0.10);
     let mut open = visible;
     let mut dismiss = false;
     // Idle chrome with no notice and no error draws no panel, so the strip is 0 px.
     egui::Panel::top("status")
         .resizable(false)
-        .frame(theme::chrome_panel(ui.style()))
+        .show_separator_line(false)
+        .frame(
+            egui::Frame::new()
+                .fill(fill)
+                .inner_margin(egui::Margin::symmetric(space::L as i8, space::S as i8)),
+        )
         .show_collapsible(ui, &mut open, |ui| shown.draw(ui, &mut dismiss));
     if dismiss && visible {
         out.push(Intent::DismissError);
     }
+}
+
+/// How serious the strip is. It picks the tint of the banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Info,
+    Warn,
+    Error,
+}
+
+impl Tone {
+    fn ink(self, palette: &theme::Palette) -> egui::Color32 {
+        match self {
+            Self::Info => palette.accent,
+            Self::Warn => palette.warn,
+            Self::Error => palette.error,
+        }
+    }
+}
+
+/// One line of the strip: a colored dot for the tone, then the text.
+fn banner_line(ui: &mut egui::Ui, tone: Tone, text: &str, color: egui::Color32) {
+    let palette = theme::palette(ui);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = space::S;
+        let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 14.0), egui::Sense::hover());
+        ui.painter()
+            .circle_filled(dot.center(), 3.5, tone.ink(palette));
+        ui.label(RichText::new(text).color(color));
+    });
 }
 
 /// What the status strip draws. Owned, so the strip can draw it again while
@@ -416,21 +497,28 @@ impl StripContent {
         self.line.is_none() && self.notice.is_none() && self.note.is_none() && self.error.is_none()
     }
 
+    /// The most serious thing on the strip.
+    fn tone(&self) -> Tone {
+        if self.error.is_some() || self.line.as_ref().is_some_and(|(_, failed)| *failed) {
+            Tone::Error
+        } else if self.notice.is_some() {
+            Tone::Warn
+        } else {
+            Tone::Info
+        }
+    }
+
     fn draw(&self, ui: &mut egui::Ui, dismiss: &mut bool) {
         let palette = theme::palette(ui);
         if let Some((text, failed)) = &self.line {
-            let color = if *failed {
-                palette.error
-            } else {
-                palette.text2
-            };
-            ui.label(RichText::new(text).color(color));
+            let tone = if *failed { Tone::Error } else { Tone::Info };
+            banner_line(ui, tone, text, palette.text);
         }
         if let Some(notice) = self.notice {
-            ui.colored_label(palette.warn, notice);
+            banner_line(ui, Tone::Warn, notice, palette.text);
         }
         if let Some(note) = &self.note {
-            ui.label(RichText::new(note).color(palette.text2));
+            banner_line(ui, Tone::Info, note, palette.text);
         }
         if let Some(error) = &self.error {
             error_block(ui, error, dismiss);
@@ -438,43 +526,26 @@ impl StripContent {
     }
 }
 
-/// Width of the error accent bar.
-const ERROR_BAR: f32 = 3.0;
-
 fn error_block(ui: &mut egui::Ui, error: &thinwire_core::state::UserError, dismiss: &mut bool) {
     let palette = theme::palette(ui);
-    egui::Frame::new()
-        .fill(palette.surface)
-        .inner_margin(egui::Margin::symmetric(space::S as i8, space::S as i8))
-        .show(ui, |ui| {
-            let row = ui.horizontal(|ui| {
-                let (bar, _) =
-                    ui.allocate_exact_size(egui::vec2(ERROR_BAR, 0.0), egui::Sense::hover());
-                ui.add_space(space::S);
-                let text = ui
-                    .vertical(|ui| {
-                        ui.label(
-                            RichText::new(format!("What happened: {}", error.happened))
-                                .color(palette.error),
-                        );
-                        ui.label(RichText::new(format!("Why: {}", error.why)).color(palette.text2));
-                        ui.label(
-                            RichText::new(format!("What to do: {}", error.next))
-                                .color(palette.text2),
-                        );
-                        if ui.button("Dismiss").clicked() {
-                            *dismiss = true;
-                        }
-                    })
-                    .response
-                    .rect;
-                (bar.left(), text)
-            });
-            // The bar runs the full height of the text, however many lines wrap.
-            let (left, text) = row.inner;
-            let bar = egui::Rect::from_x_y_ranges(left..=left + ERROR_BAR, text.y_range());
-            ui.painter().rect_filled(bar, 0.0, palette.error);
-        });
+    ui.spacing_mut().item_spacing.y = 2.0;
+    egui::Sides::new().shrink_left().show(
+        ui,
+        |ui| {
+            ui.label(
+                RichText::new(format!("What happened: {}", error.happened))
+                    .family(theme::semibold())
+                    .color(palette.error),
+            );
+        },
+        |ui| {
+            if ui.button("Dismiss").clicked() {
+                *dismiss = true;
+            }
+        },
+    );
+    ui.label(RichText::new(format!("Why: {}", error.why)).color(palette.text2));
+    ui.label(RichText::new(format!("What to do: {}", error.next)).color(palette.text2));
 }
 
 /// A line the strip may show.
@@ -533,8 +604,8 @@ fn shown_status<'a>(snapshot: &Snapshot, line: &'a str) -> Option<&'a str> {
     public_status(line).filter(|text| !is_idle_status(text))
 }
 
-/// A running load, a send, or a refresh. The top bar shows it beside the
-/// menu. A failed load is not busy: it stays on the strip.
+/// A running load, a send, or a refresh. The chat list header shows it beside
+/// the title. A failed load is not busy: it stays on the strip.
 fn is_busy_status(snapshot: &Snapshot, line: &str, text: &str) -> bool {
     load_failure_text(line).is_none() && (snapshot.status_line_loads() || text == "Refreshing…")
 }
@@ -558,78 +629,141 @@ pub(super) fn status_strip_visible(snapshot: &Snapshot, notice: Option<&'static 
     !StripContent::of(snapshot, notice).is_empty()
 }
 
-/// Narrow left column. One row per account. The chat list is the next column.
+/// Left sidebar: the mark, one row per account, then the foot with Add
+/// account and Settings. The chat list is the next column.
 fn account_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    let palette = theme::palette(ui);
     egui::Panel::left("accounts")
         .resizable(true)
-        .default_size(168.0)
-        .size_range(120.0..=220.0)
-        .frame(theme::chrome_panel(ui.style()))
+        .default_size(if narrow_window(ui) {
+            RAIL_WIDTH_NARROW
+        } else {
+            RAIL_WIDTH
+        })
+        .size_range(RAIL_WIDTH_NARROW..=256.0)
+        .show_separator_line(false)
+        .frame(theme::rail_frame(palette))
         .show(ui, |ui| {
-            section_header(ui, "Accounts");
-
-            let mut clicked: Option<ProtocolId> = None;
-            for account in snapshot.accounts.iter() {
-                if !snapshot.shows_in_switcher(account.caps.id) {
-                    continue;
-                }
-                let unread = snapshot.account_row_unread(account);
-                if account_chip(
-                    ui,
-                    snapshot,
-                    account,
-                    snapshot.account_row_selected(account),
-                    unread,
-                    out,
-                ) {
-                    if let Some(slot) = account.signal_retained {
-                        out.push(Intent::SelectRetainedSignal(slot));
-                    } else {
-                        clicked = Some(account.caps.id);
-                    }
-                }
-                helper_actions(ui, account, out);
-                removed_signal_link(ui, snapshot, account, out);
-                ui.add_space(4.0);
-            }
-            if let Some(protocol) = clicked {
-                out.push(Intent::SelectProtocol(protocol));
-            }
+            rail_footer(ui, snapshot, out);
+            brand(ui);
+            egui::ScrollArea::vertical()
+                .id_salt("accounts-scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = ROW_GAP;
+                    account_rows(ui, snapshot, out);
+                });
         });
 }
 
-/// Middle column: the selected account's chats, at the full height under the top bar.
+/// The mark and the name at the top of the sidebar.
+fn brand(ui: &mut egui::Ui) {
+    let palette = theme::palette(ui);
+    ui.horizontal(|ui| {
+        ui.add_space(theme::ROW_INSET.x);
+        let (mark, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(mark, egui::CornerRadius::same(8), palette.accent);
+        ui.painter().text(
+            mark.center(),
+            egui::Align2::CENTER_CENTER,
+            "t",
+            egui::FontId::new(size::BODY, theme::semibold()),
+            palette.on_accent,
+        );
+        ui.add_space(space::XS);
+        ui.label(
+            RichText::new("thinwire")
+                .text_style(egui::TextStyle::Heading)
+                .color(palette.text),
+        );
+    });
+    ui.add_space(space::S);
+}
+
+fn account_rows(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    let mut clicked: Option<ProtocolId> = None;
+    for account in snapshot.accounts.iter() {
+        if !snapshot.shows_in_switcher(account.caps.id) {
+            continue;
+        }
+        let unread = snapshot.account_row_unread(account);
+        if account_chip(
+            ui,
+            snapshot,
+            account,
+            snapshot.account_row_selected(account),
+            unread,
+            out,
+        ) {
+            if let Some(slot) = account.signal_retained {
+                out.push(Intent::SelectRetainedSignal(slot));
+            } else {
+                clicked = Some(account.caps.id);
+            }
+        }
+        store_protection_line(ui, account, out);
+        helper_actions(ui, account, out);
+        removed_signal_link(ui, snapshot, account, out);
+    }
+    if let Some(protocol) = clicked {
+        out.push(Intent::SelectProtocol(protocol));
+    }
+}
+
+/// Middle column: the selected account's chats, at the full height of the window.
 fn chat_column(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
+    let palette = theme::palette(ui);
     egui::Panel::left("chats")
         .resizable(true)
-        .default_size(300.0)
-        .size_range(240.0..=480.0)
-        .frame(theme::chrome_panel(ui.style()))
+        .default_size(if narrow_window(ui) {
+            LIST_WIDTH_NARROW
+        } else {
+            LIST_WIDTH
+        })
+        .size_range(LIST_WIDTH_NARROW..=480.0)
+        .frame(theme::list_frame(palette))
         .show(ui, |ui| {
             account_info(ui, snapshot, out);
-            section_header(ui, "Chats");
             link_offer(ui, snapshot, out);
             let inbox_list_id = ui.make_persistent_id("inbox");
             inbox_scroll(ui, snapshot, hints, inbox_list_id, out);
         });
 }
 
-/// Selected account. Ban risk opens the same README text as Unofficial.
+/// Header of the chat list: the account name, its risk notice, the busy
+/// state, and the search field. Ban risk opens the same README text as Unofficial.
 fn account_info(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let protocol = snapshot.selected_protocol;
     let palette = theme::palette(ui);
     ui.horizontal(|ui| {
+        ui.add_space(theme::ROW_INSET.x);
         ui.label(
             RichText::new(protocol.display_name())
-                .text_style(theme::row_title())
+                .text_style(egui::TextStyle::Heading)
                 .color(palette.text),
         );
         if let Some(label) = notice_label(protocol)
-            && ui.button(label).clicked()
+            && ui
+                .add(
+                    egui::Button::new(RichText::new(label).small().color(palette.text2))
+                        .corner_radius(egui::CornerRadius::same(radius::PILL))
+                        .min_size(egui::vec2(0.0, 24.0)),
+                )
+                .clicked()
         {
             out.push(Intent::ShowNotice(protocol));
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(theme::ROW_INSET.x);
+            busy_indicator(ui, busy_line(snapshot).as_deref());
+        });
     });
+    ui.add_space(space::XS);
+    if let Some(text) = search_field(ui, &snapshot.search) {
+        out.push(Intent::SetSearch(text.into()));
+    }
+    ui.add_space(space::S);
 }
 
 /// Link starts here for an unlinked unofficial account. The notice is the next step.
@@ -669,6 +803,8 @@ fn notice_review(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
         });
 }
 
+/// One account of the sidebar: the protocol tile with its status dot, the
+/// name, one status line, and the unread count. Returns true on a click.
 fn account_chip(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
@@ -680,28 +816,29 @@ fn account_chip(
     let caps = account.caps;
     let palette = theme::palette(ui);
     let width = ui.available_width();
-    let detail = rail_detail(snapshot, account);
+    let label = chip_label(snapshot, account);
     let unofficial = account.linked() && unofficial_notice(caps.id).is_some();
     // A store that could not be read stays in the list and takes no click.
     let enabled = !account.history_unreadable();
-    // One line is the name. A helper line or Unofficial needs a second line.
-    // The removed-device line wraps, so that row is taller.
-    // One previous Signal number, and a store that could not be read, use a
-    // sentence that wraps further.
-    // [`theme::ROW_INSET`] adds 8 px above and below.
-    let lines =
-        if account.history_unreadable() || detail.as_deref() == Some(SIGNAL_PREVIOUS_ACCOUNT) {
-            68.0
-        } else if detail.as_deref() == Some(SIGNAL_DEVICE_REMOVED)
-            || unofficial
-            || account.signal_retained.is_some()
-        {
-            52.0
-        } else {
-            36.0
-        };
+    let badge = badge_text(unread);
+    let badge_room = badge
+        .as_deref()
+        .map_or(0.0, |text| unread_badge_width(ui, text) + space::S);
+    // The column keeps the name and the status off the tile and the badge.
+    let text_width = (width - theme::ROW_INSET.x * 2.0 - TILE - space::M - badge_room).max(48.0);
+    // A long sentence (a removed Signal device, a stopped helper, a previous
+    // Signal number, or a store that could not be read) wraps, so the row is
+    // as tall as that wrapped text.
+    let status = ui.painter().layout(
+        label.clone(),
+        egui::FontId::new(size::CAPTION, egui::FontFamily::Proportional),
+        palette.text3,
+        text_width,
+    );
+    let name_height = ui.text_style_height(&theme::row_title());
+    let content = TILE.max(name_height + 2.0 + status.size().y);
     let (rect, hover) = ui.allocate_exact_size(
-        egui::vec2(width, lines + space::S * 2.0),
+        egui::vec2(width, content + theme::ROW_INSET.y * 2.0),
         egui::Sense::hover(),
     );
     let chip_id = ui
@@ -709,16 +846,16 @@ fn account_chip(
         .with(("account-chip", caps.id, account.signal_retained));
     // The row click is under the Unofficial button, so that button takes its own click.
     // A store that could not be read takes no click.
-    let response = ui.interact(
-        rect,
-        chip_id,
-        if enabled {
-            egui::Sense::click()
-        } else {
-            egui::Sense::hover()
-        },
-    );
-    row_backdrop(ui, chip_id, rect, selected, hover.hovered());
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let mut response = ui.interact(rect, chip_id, sense);
+    if enabled {
+        response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    let fill = row_backdrop(ui, chip_id, rect, palette.rail, selected, hover.hovered());
     let inner = theme::row_content_rect(rect, 0.0);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -726,52 +863,85 @@ fn account_chip(
             .layout(egui::Layout::left_to_right(egui::Align::Center))
             .id_salt(("account-chip", caps.id, account.signal_retained)),
     );
-    let (dot, dot_response) =
-        child.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-    // The dot is painted, so tests need a label to read its left edge.
+    child.spacing_mut().item_spacing.x = space::M;
+    // A selectable label takes the click, so only the tile selected the
+    // account. Plain labels let the click go to the row.
+    child.style_mut().interaction.selectable_labels = false;
+    let (tile, tile_response) =
+        child.allocate_exact_size(egui::vec2(TILE, TILE), egui::Sense::hover());
+    // The tile is painted, so tests need a label to read its left edge.
     #[cfg(test)]
-    dot_response
+    tile_response
         .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, "account status"));
     #[cfg(not(test))]
-    let _ = dot_response;
-    child.painter().circle_filled(
-        dot.center(),
-        4.0,
-        if account.status == AdapterStatus::Ready {
-            palette.ok
-        } else {
-            palette.text3
-        },
-    );
-    child.add_space(space::S);
+    let _ = tile_response;
+    let dot = if account.status == AdapterStatus::Ready {
+        palette.ok
+    } else {
+        palette.text3
+    };
+    paint_protocol_tile(&child, tile, caps.id, Some((fill, dot)));
+    // The name keeps its full width. The Unofficial pill goes next to the
+    // name only when both fit. Else it goes on the status line.
+    let pill_on_name = unofficial && {
+        let name_font = theme::row_title().resolve(child.style());
+        let name = child
+            .painter()
+            .layout_no_wrap(caps.id.display_name().to_owned(), name_font, palette.text)
+            .size()
+            .x;
+        name + space::S + unofficial_pill_width(&child) <= text_width
+    };
     let mut unofficial_hit = false;
-    child.vertical(|ui| {
-        ui.label(
-            RichText::new(caps.id.display_name())
-                .text_style(theme::row_title())
-                .color(palette.text),
+    let mut pill = |ui: &mut egui::Ui| {
+        ui.spacing_mut().button_padding = egui::vec2(space::S, 1.0);
+        let button = ui.add(
+            egui::Button::new(RichText::new("Unofficial").small().color(palette.text2))
+                .corner_radius(egui::CornerRadius::same(radius::PILL)),
         );
-        if unofficial {
-            let button = ui.small_button("Unofficial");
-            let pointer = ui.input(|input| input.pointer.interact_pos());
-            unofficial_hit = button.clicked()
-                || response.clicked() && pointer.is_some_and(|pos| button.rect.contains(pos));
-            if unofficial_hit {
-                out.push(Intent::ShowNotice(caps.id));
-            }
+        let pointer = ui.input(|input| input.pointer.interact_pos());
+        unofficial_hit = button.clicked()
+            || response.clicked() && pointer.is_some_and(|pos| button.rect.contains(pos));
+        if unofficial_hit {
+            out.push(Intent::ShowNotice(caps.id));
         }
-        if let Some(label) = detail {
-            let color = if account.status == AdapterStatus::Ready {
-                palette.ok
-            } else {
-                palette.text3
-            };
+    };
+    child.vertical(|ui| {
+        ui.set_max_width(text_width);
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = space::S;
+            ui.add(
+                egui::Label::new(
+                    RichText::new(caps.id.display_name())
+                        .text_style(theme::row_title())
+                        .color(palette.text),
+                )
+                .truncate(),
+            );
+            if pill_on_name {
+                pill(ui);
+            }
+        });
+        let color = match account.status {
+            AdapterStatus::Ready => palette.ok,
+            AdapterStatus::Error | AdapterStatus::Refused => palette.warn,
+            _ => palette.text3,
+        };
+        if unofficial && !pill_on_name {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::S;
+                ui.label(RichText::new(label).small().color(color));
+                pill(ui);
+            });
+        } else {
             ui.label(RichText::new(label).small().color(color));
         }
     });
-    if let Some(text) = badge_text(unread) {
+    if let Some(text) = &badge {
         child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            unread_badge(ui, &text, false);
+            unread_badge(ui, text, false);
         });
     }
     response.widget_info(|| {
@@ -788,24 +958,49 @@ fn account_chip(
     enabled && response.clicked() && !unofficial_hit
 }
 
-/// Extra line on the rail. The normal row is only the name, the status dot,
-/// and the unread badge. A previous Signal account, a helper fault, and a
-/// removed Signal device stay, because the row is where Restart and Link are.
-fn rail_detail(snapshot: &Snapshot, account: &AccountRow) -> Option<String> {
-    if account.signal_retained.is_some()
-        || account.helper_label().is_some()
-        || (account.caps.id == ProtocolId::Signal
-            && (snapshot.signal_link_checking() || snapshot.signal_device_removed()))
-    {
-        Some(chip_label(snapshot, account))
-    } else {
-        None
+/// Width of the Unofficial pill of an account row, with its padding.
+fn unofficial_pill_width(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    ui.painter()
+        .layout_no_wrap("Unofficial".to_owned(), font, egui::Color32::PLACEHOLDER)
+        .size()
+        .x
+        + space::S * 2.0
+}
+
+/// The protocol tile: a tinted square with the first letter. `dot` is the
+/// row fill and the account state: the dot is cut out of the corner in the
+/// row's own fill.
+pub(super) fn paint_protocol_tile(
+    ui: &egui::Ui,
+    tile: egui::Rect,
+    protocol: ProtocolId,
+    dot: Option<(egui::Color32, egui::Color32)>,
+) {
+    let ink = theme::avatar_ink(theme::protocol_tile(protocol), ui.visuals().dark_mode);
+    let corner = (tile.width() * 0.28).round().clamp(4.0, 24.0) as u8;
+    ui.painter()
+        .rect_filled(tile, egui::CornerRadius::same(corner), ink.fill);
+    let initial: String = protocol
+        .display_name()
+        .chars()
+        .take(1)
+        .flat_map(char::to_uppercase)
+        .collect();
+    ui.painter().text(
+        tile.center(),
+        egui::Align2::CENTER_CENTER,
+        initial,
+        egui::FontId::new(tile.width() * 0.46, theme::semibold()),
+        ink.text,
+    );
+    if let Some((fill, color)) = dot {
+        let at = tile.right_bottom() - egui::vec2(3.0, 3.0);
+        ui.painter().circle_filled(at, 6.5, fill);
+        ui.painter().circle_filled(at, 4.5, color);
     }
 }
 
-/// Under the chip of a protocol that runs in a helper process (ADR 0013).
-/// A stopped helper gets Restart: with the chip line it reads "Helper
-/// stopped. Restart". A missing helper gets the full reason.
 /// Link again after the phone removed this Signal device. The button opens
 /// the normal QR link flow. The line above it is the only copy on the row.
 #[cfg(feature = "signal-local")]
@@ -838,6 +1033,78 @@ fn removed_signal_link(
 ) {
 }
 
+/// The keychain or encryption sentence, under the account row. The status
+/// line of the row stays short.
+///
+/// A denied keychain read shows Retry. Retry reads the key again
+/// (`RetryStoreKey`). A failed move shows Retry too. That Retry opens the
+/// saved session and, on a wrong key, tries the move again. Nothing is
+/// deleted. A wrong key that already moved shows Link. Link starts the same
+/// flow as a removed Signal device, and the WhatsApp risk gate.
+fn store_protection_line(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
+    if account.status != AdapterStatus::Error && account.store_access.is_none() {
+        return;
+    }
+    if !thinwire_protocol::is_store_protection_detail(&account.detail) {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(theme::ROW_INSET.x);
+        ui.label(
+            RichText::new(&account.detail)
+                .small()
+                .color(theme::palette(ui).warn),
+        );
+        if let Some(intent) = store_row_intent(account)
+            && ui
+                .small_button(store_row_button(account))
+                .on_hover_text(store_row_hover(account))
+                .clicked()
+        {
+            out.push(intent);
+        }
+    });
+}
+
+/// Retry reads the key again. A failed move uses the same command to try
+/// the move again. Link starts the existing link flow.
+fn store_row_intent(account: &AccountRow) -> Option<Intent> {
+    match account.store_access {
+        Some(StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed) => {
+            Some(Intent::RetryStoreKey(account.caps.id))
+        }
+        Some(StoreAccessReason::WrongKey) if account.caps.id == ProtocolId::Signal => {
+            Some(Intent::Signal(SignalIntent::Relink))
+        }
+        Some(StoreAccessReason::WrongKey) if account.caps.id == ProtocolId::WhatsApp => {
+            Some(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate))
+        }
+        Some(StoreAccessReason::WrongKey) | None => None,
+    }
+}
+
+fn store_row_button(account: &AccountRow) -> &'static str {
+    match account.store_access {
+        Some(StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed) => "Retry",
+        Some(StoreAccessReason::WrongKey) => "Link",
+        None => "",
+    }
+}
+
+fn store_row_hover(account: &AccountRow) -> &'static str {
+    match account.store_access {
+        Some(StoreAccessReason::KeychainDenied) => "Read the session key from Keychain again",
+        Some(StoreAccessReason::MoveFailed) => {
+            "Tries to move the saved session aside again. Nothing is deleted."
+        }
+        Some(StoreAccessReason::WrongKey) => "Link again. The old data stays.",
+        None => "",
+    }
+}
+
+/// Under the row of a protocol that runs in a helper process (ADR 0013). A
+/// stopped helper gets Restart: with the status line it reads "Helper
+/// stopped. Restart". A missing helper gets the full reason.
 fn helper_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
     let protocol = account.caps.id;
     if account.helper_stopped() {
@@ -861,33 +1128,6 @@ fn helper_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>
             );
         });
     }
-}
-
-/// "Accounts" and "Inbox": caption, uppercase, `text3`.
-///
-/// `space::S` above, the label centered in a 24 px row and indented to
-/// [`theme::ROW_INSET`], then the separator. Callers share this for both
-/// headers.
-fn section_header(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(space::S);
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, space::XL), egui::Sense::hover());
-    let inner = egui::Rect::from_min_max(
-        egui::pos2(theme::sidebar_content_x(rect.min.x), rect.min.y),
-        rect.max,
-    );
-    let mut child = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(inner)
-            .layout(egui::Layout::left_to_right(egui::Align::Center))
-            .id_salt(("section", title)),
-    );
-    child.label(
-        RichText::new(title.to_uppercase())
-            .small()
-            .color(theme::palette(ui).text3),
-    );
-    ui.separator();
 }
 
 /// The chat-list time of `at`, in the zone of the view's clock (#120).
@@ -936,7 +1176,7 @@ fn anchored_inbox_offset(previous: &InboxAnchor, ids: &[String]) -> Option<f32> 
 }
 
 fn inbox_row_stride(ui: &egui::Ui) -> f32 {
-    inbox_row_height(ui) + ui.spacing().item_spacing.y
+    inbox_row_height(ui) + ROW_GAP
 }
 
 /// The inbox list. A reorder anchors the scroll offset before the rows draw.
@@ -990,6 +1230,7 @@ fn inbox(
     inbox_list_id: egui::Id,
     out: &mut Vec<Intent>,
 ) -> DrawnInbox {
+    ui.spacing_mut().item_spacing.y = ROW_GAP;
     let stride = inbox_row_stride(ui);
     let now = snapshot.now();
     let rows: Vec<InboxRow> = snapshot
@@ -1010,9 +1251,11 @@ fn inbox(
     match snapshot.inbox_state() {
         InboxState::Rows => {}
         InboxState::Loading => {
+            ui.add_space(space::L);
             ui.horizontal(|ui| {
+                ui.add_space(theme::ROW_INSET.x);
                 motion::spinner(ui);
-                ui.label(RichText::new(LOADING_CHATS_STATUS).weak());
+                ui.label(RichText::new(LOADING_CHATS_STATUS).color(theme::palette(ui).text3));
             });
             return DrawnInbox {
                 anchor: None,
@@ -1021,7 +1264,7 @@ fn inbox(
         }
         InboxState::Empty => {
             if let Some(text) = snapshot.inbox_placeholder() {
-                ui.label(RichText::new(text).italics().weak());
+                empty_note(ui, text);
             }
             return DrawnInbox {
                 anchor: None,
@@ -1030,11 +1273,7 @@ fn inbox(
         }
         InboxState::NoMatch => {
             let query = snapshot.search.trim();
-            ui.label(
-                RichText::new(format!("No chats match '{query}'."))
-                    .italics()
-                    .weak(),
-            );
+            empty_note(ui, &format!("No chats match '{query}'."));
             return DrawnInbox {
                 anchor: None,
                 stride,
@@ -1100,14 +1339,27 @@ fn inbox(
         } else {
             response.context_menu(add_menu);
         }
-        if focused {
+        // The open chat already has its fill. The ring marks only a row the
+        // arrow keys moved to, so a click does not leave an outline behind.
+        if focused && !selected {
             ui.painter().rect_stroke(
                 response.rect,
-                egui::CornerRadius::same(radius::CONTROL),
+                egui::CornerRadius::same(radius::ROW),
                 egui::Stroke::new(2.0, theme::palette(ui).text),
                 egui::StrokeKind::Inside,
             );
         }
+        // The arrow keys move the highlight (`inbox_keys`). Tell egui, so its
+        // own focus walk does not also move the widget focus a second time.
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    vertical_arrows: true,
+                    ..egui::EventFilter::default()
+                },
+            );
+        });
         // AccessKit `selected` is the open chat. The highlight is keyboard focus.
         response.widget_info(|| {
             let label = if mute.is_muted() {
@@ -1206,11 +1458,11 @@ fn protocol_mute_button(ui: &mut egui::Ui, title: &str) -> egui::Response {
     response
 }
 
-/// The mute button of a chat (#153): Mute, Unmute, or a disabled "Muted in
-/// <protocol>" when the protocol mutes it. A protocol mute wins, so only
-/// the protocol can unmute it. `what` follows the verb: "chat" in the row
-/// menu, empty in the thread header. The row menu puts the reason beside
-/// the disabled item. Returns the intent of a click.
+/// The mute item of a row menu (#153): Mute, Unmute, or a disabled "Muted
+/// in <protocol>" when the protocol mutes it. A protocol mute wins, so only
+/// the protocol can unmute it. `what` follows the verb: "chat" or "topic". The
+/// menu puts the reason beside the disabled item. Returns the intent of a
+/// click. The thread header has its own icon button: [`header_mute`].
 fn mute_control(
     ui: &mut egui::Ui,
     protocol: ProtocolId,
@@ -1224,10 +1476,8 @@ fn mute_control(
         ChatMute::Protocol => {
             let name = protocol.display_name();
             let title = format!("Muted in {name}");
-            let response = if what.is_empty() {
-                protocol_mute_button(ui, &title)
-            } else {
-                ui.horizontal(|ui| {
+            let response = ui
+                .horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = space::S;
                     let response = protocol_mute_button(ui, &title);
                     let ink = theme::protocol_mute_ink(theme::palette(ui));
@@ -1238,22 +1488,93 @@ fn mute_control(
                     );
                     response
                 })
-                .inner
-            };
+                .inner;
             response.on_disabled_hover_text(format!("Unmute it in {name}."));
             return None;
         }
     };
-    let text = if what.is_empty() {
-        verb.to_owned()
-    } else {
-        format!("{verb} {what}")
-    };
-    ui.button(text).clicked().then(|| Intent::SetChatMute {
+    ui.button(format!("{verb} {what}"))
+        .clicked()
+        .then(|| Intent::SetChatMute {
+            protocol,
+            conversation_id: id.to_owned(),
+            muted,
+        })
+}
+
+/// A quiet round button with a painted icon, 36 px, with no fill until the
+/// pointer is on it. `label` is its name for a screen reader.
+fn icon_button(ui: &mut egui::Ui, label: &str, icon: Icon, ink: egui::Color32) -> egui::Response {
+    let icon_id = egui::IdSalt::new(("icon-button", label));
+    let enabled = ui.is_enabled();
+    let shown = egui::Button::new(egui::Atom::custom(
+        icon_id,
+        egui::vec2(ICON_BUTTON_ICON, ICON_BUTTON_ICON),
+    ))
+    .frame_when_inactive(false)
+    .corner_radius(egui::CornerRadius::same(radius::PILL))
+    .min_size(egui::vec2(ICON_BUTTON, ICON_BUTTON))
+    .atom_ui(ui);
+    if let Some(rect) = shown.rect(icon_id) {
+        icon(ui.painter(), rect.center(), ICON_BUTTON_ICON, ink);
+    }
+    let response = shown.response;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+    response
+}
+
+/// The mute button of the thread header: a bell, or a slashed bell once the
+/// chat is muted. The name for a screen reader is the verb, or "Muted in
+/// <protocol>" when the protocol mutes it. Then nothing here can unmute it.
+fn header_mute(
+    ui: &mut egui::Ui,
+    protocol: ProtocolId,
+    id: &str,
+    mute: ChatMute,
+    topic: bool,
+) -> Option<Intent> {
+    let palette = theme::palette(ui);
+    let what = if topic { "topic" } else { "chat" };
+    let intent = |muted| Intent::SetChatMute {
         protocol,
         conversation_id: id.to_owned(),
         muted,
-    })
+    };
+    match mute {
+        ChatMute::None => {
+            let label = if topic { "Mute topic" } else { "Mute" };
+            icon_button(ui, label, icons::bell, palette.text2)
+                .on_hover_text(format!("Mute {what}"))
+                .clicked()
+                .then(|| intent(true))
+        }
+        ChatMute::Here => {
+            let label = if topic { "Unmute topic" } else { "Unmute" };
+            icon_button(ui, label, icons::bell_off, palette.text)
+                .on_hover_text(format!("Unmute {what}"))
+                .clicked()
+                .then(|| intent(false))
+        }
+        ChatMute::Protocol => {
+            let name = protocol.display_name();
+            let ink = theme::protocol_mute_ink(palette);
+            // No 0.5 fade: it would drop the icon under 3:1 (see
+            // `protocol_mute_button`).
+            let previous = ui.style().visuals.disabled_alpha;
+            ui.style_mut().visuals.disabled_alpha = 1.0;
+            let response = ui
+                .add_enabled_ui(false, |ui| {
+                    icon_button(ui, &format!("Muted in {name}"), icons::bell_off, ink.title)
+                })
+                .inner;
+            ui.style_mut().visuals.disabled_alpha = previous;
+            response.on_disabled_hover_text(format!(
+                "{}. Unmute it in {name}.",
+                protocol_mute_reason(name)
+            ));
+            None
+        }
+    }
 }
 
 /// The highlight scroll wins when both requests exist. It is the Enter target.
@@ -1354,19 +1675,25 @@ fn row_ends(
     });
 }
 
-/// Title line, preview line, and the padding around them.
-///
-/// Each line sits in a horizontal row, and that row is at least
-/// [`theme::MIN_TARGET`] tall (`interact_size`). The preview line is also
-/// at least as tall as the unread badge, which adds [`space::XS`] around
-/// the caption.
+/// Avatar, or the title and preview lines when those are taller, plus the
+/// padding around them. The unread badge adds [`space::XS`] around its caption.
 fn inbox_row_height(ui: &egui::Ui) -> f32 {
-    let line = ui.spacing().interact_size.y;
-    let title = line.max(ui.text_style_height(&theme::row_title()));
+    let title = ui.text_style_height(&theme::row_title());
     let caption = ui.text_style_height(&egui::TextStyle::Small);
-    let preview = line.max(ui.text_style_height(&theme::secondary()));
+    let preview = ui.text_style_height(&theme::secondary());
     let badge = caption + space::XS;
-    space::S + title + space::XS + preview.max(badge) + space::S
+    let lines = title + 2.0 + preview.max(badge);
+    super::photos::AVATAR_SIDE.max(lines) + theme::ROW_INSET.y * 2.0
+}
+
+/// A quiet line in an empty list, in line with the row content.
+fn empty_note(ui: &mut egui::Ui, text: &str) {
+    let palette = theme::palette(ui);
+    ui.add_space(space::L);
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(theme::ROW_INSET.x);
+        ui.label(RichText::new(text).color(palette.text3));
+    });
 }
 
 /// One inbox row. The whole rect is the click target, including the preview.
@@ -1391,7 +1718,7 @@ fn inbox_row(
         egui::Sense::hover(),
     );
     let row_id = ui.scope_id().with(("inbox-row", id));
-    row_backdrop(ui, row_id, rect, selected, hover.hovered());
+    row_backdrop(ui, row_id, rect, palette.sidebar, selected, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
     let mut child = ui.new_child(
@@ -1400,7 +1727,7 @@ fn inbox_row(
             .layout(egui::Layout::left_to_right(egui::Align::Center))
             .id_salt(("inbox-row", id)),
     );
-    child.spacing_mut().item_spacing.x = space::S;
+    child.spacing_mut().item_spacing.x = space::M;
     let (avatar_rect, avatar_response) = child.allocate_exact_size(
         egui::vec2(super::photos::AVATAR_SIDE, super::photos::AVATAR_SIDE),
         egui::Sense::hover(),
@@ -1411,12 +1738,16 @@ fn inbox_row(
     super::photos::paint_avatar(ui, avatar_rect, protocol, id, title, avatar, out);
     child.vertical(|ui| {
         ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = space::XS;
-        inbox_row_lines(ui, title, preview, time, unread, muted, palette);
+        ui.spacing_mut().item_spacing.y = 2.0;
+        // A line is as tall as its text. The row, not the line, is the target.
+        ui.spacing_mut().interact_size.y = 0.0;
+        inbox_row_lines(ui, title, preview, time, unread, muted, selected, palette);
     });
     ui.interact(rect, row_id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inbox_row_lines(
     ui: &mut egui::Ui,
     title: &str,
@@ -1424,6 +1755,7 @@ fn inbox_row_lines(
     time: &str,
     unread: u32,
     muted: bool,
+    selected: bool,
     palette: &theme::Palette,
 ) {
     let title_font = if unread > 0 {
@@ -1446,7 +1778,14 @@ fn inbox_row_lines(
             );
         },
         |ui| {
-            ui.label(RichText::new(time).small().color(palette.text3));
+            // An unread chat shows its time in the accent. The open chat keeps
+            // the quiet ink: the accent is under 4.5:1 on its fill.
+            let time_ink = if unread > 0 && !muted && !selected {
+                palette.accent
+            } else {
+                palette.text3
+            };
+            ui.label(RichText::new(time).small().color(time_ink));
             // A word, not a glyph: every font has it, and a screen reader
             // reads it (#153).
             if muted {
@@ -1454,6 +1793,11 @@ fn inbox_row_lines(
             }
         },
     );
+    let preview_ink = if unread > 0 {
+        palette.text
+    } else {
+        palette.text2
+    };
     row_ends(
         ui,
         |ui| {
@@ -1461,7 +1805,7 @@ fn inbox_row_lines(
                 egui::Label::new(
                     RichText::new(preview)
                         .text_style(theme::secondary())
-                        .color(palette.text2),
+                        .color(preview_ink),
                 )
                 .truncate()
                 .halign(egui::Align::LEFT),
@@ -1475,20 +1819,27 @@ fn inbox_row_lines(
     );
 }
 
-/// Highlight behind an inbox row or an account chip. Hover and selection
-/// fade, so a pointer sweep over the list or a chat switch does not flash.
-fn row_backdrop(ui: &egui::Ui, id: egui::Id, rect: egui::Rect, selected: bool, hovered: bool) {
+/// Highlight behind a list row or an account row. Hover and selection fade,
+/// so a pointer sweep over the list or a chat switch does not flash. `base`
+/// is the panel under the row. Returns the fill it painted.
+fn row_backdrop(
+    ui: &egui::Ui,
+    id: egui::Id,
+    rect: egui::Rect,
+    base: egui::Color32,
+    selected: bool,
+    hovered: bool,
+) -> egui::Color32 {
     let hovered = motion::toggle(ui.ctx(), id.with("hover"), hovered, motion::HOVER);
     let selected = motion::toggle(ui.ctx(), id.with("selected"), selected, motion::STATE);
+    let fill = theme::row_fill(base, theme::palette(ui), selected, hovered);
     if hovered > 0.0 || selected > 0.0 {
-        let fill = theme::inbox_row_fill(theme::palette(ui), selected, hovered);
         ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(radius::CONTROL), fill);
+            .rect_filled(rect, egui::CornerRadius::same(radius::ROW), fill);
     }
+    fill
 }
 
-/// Unread pill. `text` comes from [`badge_text`]. A muted chat gets an
-/// outline in the row title color, not the accent fill (#153, #206).
 fn unread_badge(ui: &mut egui::Ui, text: &str, muted: bool) {
     let palette = theme::palette(ui);
     let ink = if muted {
@@ -1496,9 +1847,8 @@ fn unread_badge(ui: &mut egui::Ui, text: &str, muted: bool) {
     } else {
         palette.on_badge
     };
-    let font = egui::FontId::new(size::CAPTION, theme::medium());
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, ink);
-    let width = (galley.size().x + space::XS * 2.0).max(20.0);
+    let galley = badge_galley(ui, text, ink);
+    let width = badge_width(galley.size().x);
     let height = galley.size().y + space::XS;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     response.widget_info(|| {
@@ -1520,6 +1870,21 @@ fn unread_badge(ui: &mut egui::Ui, text: &str, muted: bool) {
         rect.center().y - galley.size().y * 0.5,
     );
     ui.painter().galley(pos, galley, ink);
+}
+
+fn badge_galley(ui: &egui::Ui, text: &str, ink: egui::Color32) -> std::sync::Arc<egui::Galley> {
+    let font = egui::FontId::new(size::CAPTION, theme::semibold());
+    ui.painter().layout_no_wrap(text.to_owned(), font, ink)
+}
+
+/// Pill width for a text of `text_width`: a circle for one digit.
+fn badge_width(text_width: f32) -> f32 {
+    (text_width + space::S).max(20.0)
+}
+
+/// Width [`unread_badge`] takes for `text`.
+fn unread_badge_width(ui: &egui::Ui, text: &str) -> f32 {
+    badge_width(badge_galley(ui, text, egui::Color32::PLACEHOLDER).size().x)
 }
 
 /// Pill text for an unread count. `None` when there is nothing to show.
@@ -1547,8 +1912,8 @@ fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
     }
 }
 
-/// Chip text. A compiled client reports Connecting at launch. That is
-/// "Not signed in" until a login or a resume starts.
+/// The status line of an account row. A compiled client reports Connecting
+/// at launch. That is "Not signed in" until a login or a resume starts.
 ///
 /// One previous Signal account uses the reason sentence. Two or more use
 /// "Previous account N". N is the slot. It is not a phone number.
@@ -1568,6 +1933,20 @@ fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> String {
     // The helper state wins: with no helper, the adapter status is old.
     if let Some(label) = account.helper_label() {
         return label.to_owned();
+    }
+    // A denied read or a wrong key has its own sentence under the chip.
+    if account.store_access.is_some() {
+        return "Connection problem".to_owned();
+    }
+    // A store migration runs while the account is Linking. The row stays
+    // on Connecting until that work finishes.
+    if account.state == AccountState::Linking
+        && !matches!(
+            account.status,
+            AdapterStatus::Error | AdapterStatus::Refused | AdapterStatus::Ready
+        )
+    {
+        return "Connecting…".to_owned();
     }
     let session_moving = snapshot.auth != AuthScreen::Idle
         || matches!(snapshot.center_view(), CenterView::Resuming { .. });
@@ -1590,7 +1969,7 @@ fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> String {
     }
 }
 
-/// Short account state for the chip. The raw status stays on the hover text.
+/// Short account state for the status line of an account row.
 #[must_use]
 fn account_label(status: AdapterStatus) -> &'static str {
     match status {
@@ -1602,9 +1981,11 @@ fn account_label(status: AdapterStatus) -> &'static str {
 
 fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
     let fill = theme::palette(ui).bg;
+    // The thread runs edge to edge: its header and compose bar own their
+    // padding. The other views sit in a padded frame below.
     let frame = egui::Frame::central_panel(ui.style())
         .fill(fill)
-        .inner_margin(space::M);
+        .inner_margin(0.0);
     egui::CentralPanel::default().frame(frame).show(ui, |ui| {
         // Keys first, before a text field can take Enter. One press, one action.
         let (enter, escape) = ui.input(|input| {
@@ -1634,61 +2015,98 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: 
             )),
             motion::FADE,
         ));
-        match view {
-            CenterView::Auth => auth::draw(ui, snapshot, out),
-            CenterView::Resuming { connecting } => resuming(ui, snapshot, connecting),
-            CenterView::FirstRun => first_run(ui, snapshot, out),
-            CenterView::KeychainFailed => keychain_failed(ui, out),
-            CenterView::Thread => thread(ui, snapshot, hints, out),
+        if view == CenterView::Thread {
+            thread(ui, snapshot, hints, out);
+            return;
         }
+        // A card can be taller than a short window: a long error, or a notice
+        // that wraps. It scrolls then, so Cancel and Change number stay in
+        // reach. `room` is the height that is on screen. Inside a scroll area
+        // `available_height` is not, so each view gets it from here to center
+        // itself, and a card that does not fit starts at the top.
+        let room = (ui.available_height() - space::L * 2.0).max(0.0);
+        egui::ScrollArea::vertical()
+            .id_salt("center-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(space::L as i8))
+                    .show(ui, |ui| match view {
+                        CenterView::Auth => auth::draw(ui, snapshot, room, out),
+                        CenterView::Resuming { connecting } => {
+                            resuming(ui, snapshot, room, connecting);
+                        }
+                        CenterView::FirstRun => first_run(ui, snapshot, room, out),
+                        CenterView::KeychainFailed => keychain_failed(ui, room, out),
+                        CenterView::Thread => {}
+                    });
+            });
     });
 }
 
-fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, connecting: bool) {
-    let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
+fn resuming(ui: &mut egui::Ui, snapshot: &Snapshot, room: f32, connecting: bool) {
+    let palette = theme::palette(ui);
+    let top = (room * 0.30).clamp(24.0, 160.0);
     ui.add_space(top);
     ui.vertical_centered(|ui| {
         motion::spinner(ui);
-        ui.add_space(8.0);
-        if connecting {
-            ui.label(RESUME_CONNECTING);
+        ui.add_space(space::M);
+        let text = if connecting {
+            RESUME_CONNECTING
         } else {
-            ui.label(snapshot.keychain_wait_text(Instant::now()));
-        }
+            snapshot.keychain_wait_text(Instant::now())
+        };
+        ui.label(RichText::new(text).color(palette.text2));
     });
 }
 
-fn keychain_failed(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
-    let top = (ui.available_height() * 0.18).clamp(24.0, 96.0);
+fn keychain_failed(ui: &mut egui::Ui, room: f32, out: &mut Vec<Intent>) {
+    let top = (room * 0.25).clamp(24.0, 140.0);
     ui.add_space(top);
     ui.vertical_centered(|ui| {
-        ui.colored_label(theme::palette(ui).warn, KEYCHAIN_READ_FAILED);
-        ui.add_space(12.0);
+        ui.set_max_width(theme::LOGIN_CARD_WIDTH);
+        note_box(ui, theme::palette(ui).warn, KEYCHAIN_READ_FAILED);
+        ui.add_space(space::M);
         if ui.button("Try again").clicked() {
             out.push(Intent::RetryKeychain);
         }
     });
 }
 
-fn first_run(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+/// A short message in a rounded box tinted with `ink`. The text stays in the
+/// primary color, so the tint never has to carry 4.5:1 contrast on its own.
+pub(super) fn note_box(ui: &mut egui::Ui, ink: egui::Color32, text: &str) {
+    let palette = theme::palette(ui);
+    let fill = motion::mix(palette.bg, ink, 0.12);
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(radius::ROW))
+        .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(text).color(palette.text));
+        });
+}
+
+fn first_run(ui: &mut egui::Ui, snapshot: &View<'_>, room: f32, out: &mut Vec<Intent>) {
     let id = ui.scope_id().with("first-run-card-height");
     let known = ui.data(|data| data.get_temp::<f32>(id).unwrap_or(0.0));
-    let spare = (ui.available_height() - known).max(0.0);
+    let spare = (room - known).max(0.0);
     ui.add_space(spare / 2.0);
     let response = ui
         .scope(|ui| {
             theme::show_centered_card(ui, |ui| {
                 let palette = theme::palette(ui);
+                let (tile, _) =
+                    ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
+                paint_protocol_tile(ui, tile, ProtocolId::Telegram, None);
+                ui.add_space(space::M);
                 ui.label(
                     RichText::new("Start with Telegram")
                         .text_style(theme::display())
                         .color(palette.text),
                 );
-                ui.add_space(space::M);
-                if let Some(banner) = super::auth::stub_banner(snapshot) {
-                    ui.colored_label(palette.warn, banner);
-                    ui.add_space(space::S);
-                }
+                ui.add_space(space::S);
                 if snapshot.has_api_credentials() {
                     ui.label(
                         RichText::new(
@@ -1706,12 +2124,17 @@ fn first_run(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                         .color(palette.text2),
                     );
                 }
-                ui.add_space(space::M);
+                if let Some(banner) = super::auth::stub_banner(snapshot) {
+                    ui.add_space(space::M);
+                    note_box(ui, palette.warn, banner);
+                }
+                ui.add_space(space::L);
                 if ui
                     .add(
                         egui::Button::new(RichText::new("Add Telegram").color(palette.on_accent))
                             .fill(palette.accent)
-                            .min_size(egui::vec2(ui.available_width(), 40.0)),
+                            .corner_radius(egui::CornerRadius::same(radius::ROW))
+                            .min_size(egui::vec2(ui.available_width(), 44.0)),
                     )
                     .clicked()
                 {
@@ -1754,22 +2177,38 @@ fn add_slack_workspace(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Int
 fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<Intent>) {}
 
 fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
+    if snapshot.selected_conversation_row().is_none() {
+        empty_thread(ui, snapshot);
+        return;
+    }
     thread_header(ui, snapshot, out);
-    if let Some(reason) = snapshot.signal_read_only_reason() {
-        let palette = theme::palette(ui);
-        ui.label(RichText::new(reason).color(palette.warn));
-        // The README risk line. The previous number stays read-only.
-        ui.label(
-            RichText::new("Signal: no supported third-party API, expect breakage.")
-                .color(palette.text2),
-        );
-    } else if snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal {
-        let palette = theme::palette(ui);
-        ui.label(RichText::new(SIGNAL_DEVICE_REMOVED).color(palette.warn));
-        ui.label(RichText::new(thinwire_core::state::SIGNAL_SENDING_OFF).color(palette.text2));
+    let palette = theme::palette(ui);
+    let signal_removed =
+        snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal;
+    if snapshot.signal_read_only_reason().is_some() || signal_removed {
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::S as i8))
+            .show(ui, |ui| {
+                if let Some(reason) = snapshot.signal_read_only_reason() {
+                    note_box(ui, palette.warn, reason);
+                    // The README risk line. The previous number stays read-only.
+                    ui.label(
+                        RichText::new("Signal: no supported third-party API, expect breakage.")
+                            .color(palette.text2),
+                    );
+                } else {
+                    note_box(ui, palette.warn, SIGNAL_DEVICE_REMOVED);
+                    ui.label(
+                        RichText::new(thinwire_core::state::SIGNAL_SENDING_OFF)
+                            .color(palette.text2),
+                    );
+                }
+            });
     }
     if snapshot.showing_topic_list() {
-        topic_list(ui, snapshot, out);
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(space::S as i8, space::S as i8))
+            .show(ui, |ui| topic_list(ui, snapshot, out));
         return;
     }
 
@@ -1810,6 +2249,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
         0.0
     } else {
         compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y)
+            + super::attach::tray_height(ui, snapshot)
     };
 
     let state = snapshot.thread_state();
@@ -1846,44 +2286,50 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     }
     let output = area.show(ui, |ui| {
         ui.multiply_opacity(fade);
-        match older {
-            OlderState::Loading => {
-                ui.horizontal(|ui| {
-                    motion::spinner(ui);
-                    ui.label(RichText::new("Loading older messages…").weak());
-                });
-            }
-            OlderState::StartOfChat if state == ThreadState::Rows => {
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Start of chat").small().weak());
-                });
-            }
-            OlderState::StartOfChat | OlderState::Idle => {}
-        }
-        if older != OlderState::Loading
-            && let Some(note) = snapshot.older_note()
-        {
-            // A failed older page: a note for this chat, not an error block.
-            // The next successful page clears it (#57).
-            ui.label(RichText::new(note).small().color(theme::palette(ui).warn));
-        }
-        match state {
-            ThreadState::Loading => {
-                ui.horizontal(|ui| {
-                    motion::spinner(ui);
-                    ui.label(RichText::new("Loading messages…").weak());
-                });
-            }
-            ThreadState::Empty => {
-                ui.label(RichText::new("No messages in this chat.").italics().weak());
-            }
-            ThreadState::NoSelection | ThreadState::Rows => {}
-        }
-        let mut gap_before = None;
-        for message in &messages {
-            bubble(ui, message, &mut retry, gap_before, out);
-            gap_before = Some(message.layout.run_end);
-        }
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, 0))
+            .show(ui, |ui| {
+                ui.add_space(space::M);
+                match older {
+                    OlderState::Loading => {
+                        ui.horizontal(|ui| {
+                            motion::spinner(ui);
+                            ui.label(RichText::new("Loading older messages…").color(palette.text3));
+                        });
+                    }
+                    OlderState::StartOfChat if state == ThreadState::Rows => {
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("Start of chat").small().color(palette.text3));
+                        });
+                    }
+                    OlderState::StartOfChat | OlderState::Idle => {}
+                }
+                if older != OlderState::Loading
+                    && let Some(note) = snapshot.older_note()
+                {
+                    // A failed older page: a note for this chat, not an error block.
+                    // The next successful page clears it (#57).
+                    ui.label(RichText::new(note).small().color(theme::palette(ui).warn));
+                }
+                match state {
+                    ThreadState::Loading => {
+                        ui.horizontal(|ui| {
+                            motion::spinner(ui);
+                            ui.label(RichText::new("Loading messages…").color(palette.text3));
+                        });
+                    }
+                    ThreadState::Empty => {
+                        ui.label(RichText::new("No messages in this chat.").color(palette.text3));
+                    }
+                    ThreadState::NoSelection | ThreadState::Rows => {}
+                }
+                let mut gap_before = None;
+                for message in &messages {
+                    bubble(ui, message, &mut retry, gap_before, out);
+                    gap_before = Some(message.layout.run_end);
+                }
+                ui.add_space(space::M);
+            });
         if scroll.jump {
             ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
         }
@@ -1895,6 +2341,12 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     }
     let below =
         output.content_size.y - output.inner_rect.height() - output.state.clamped_offset().y;
+    scroll_fades(
+        ui,
+        output.inner_rect,
+        output.state.clamped_offset().y,
+        below,
+    );
     let jump = jump_to_latest(
         ui,
         output.inner_rect,
@@ -1964,7 +2416,42 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
 
     if !hide_compose {
         compose(ui, snapshot, hints, compose_height, out);
+        if snapshot.sends_media(snapshot.selected_protocol) {
+            super::attach::drop_hint(ui, ui.max_rect());
+        }
     }
+}
+
+/// A soft edge where messages scroll under the header or the compose bar.
+/// `above` and `below` are the points of content past each edge: a fade is
+/// only as tall as that, so a chat at its top or bottom edge has none.
+fn scroll_fades(ui: &egui::Ui, view: egui::Rect, above: f32, below: f32) {
+    let ground = theme::palette(ui).bg;
+    let top = above.clamp(0.0, SCROLL_FADE);
+    let bottom = below.clamp(0.0, SCROLL_FADE);
+    if top > 0.5 {
+        let band = egui::Rect::from_min_size(view.min, egui::vec2(view.width(), top));
+        fade_band(ui, band, ground, egui::Color32::TRANSPARENT);
+    }
+    if bottom > 0.5 {
+        let band = egui::Rect::from_min_size(
+            egui::pos2(view.left(), view.bottom() - bottom),
+            egui::vec2(view.width(), bottom),
+        );
+        fade_band(ui, band, egui::Color32::TRANSPARENT, ground);
+    }
+}
+
+/// A vertical gradient from `from` at the top of `band` to `to` at the bottom.
+fn fade_band(ui: &egui::Ui, band: egui::Rect, from: egui::Color32, to: egui::Color32) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(band.left_top(), from);
+    mesh.colored_vertex(band.right_top(), from);
+    mesh.colored_vertex(band.right_bottom(), to);
+    mesh.colored_vertex(band.left_bottom(), to);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
 }
 
 /// What the thread remembers between frames for its scroll motion.
@@ -2109,6 +2596,54 @@ fn older_step(
     }
 }
 
+/// Colors of the time and the delivery marks. They depend on what is behind
+/// them: the bubble fill, or the plain thread for a message of only emoji.
+struct MetaInk {
+    time: egui::Color32,
+    /// The "read" ticks.
+    read: egui::Color32,
+    /// "Not sent."
+    error: egui::Color32,
+    /// Retry.
+    action: egui::Color32,
+}
+
+/// A message of one to three emoji and nothing else. It draws large, with no
+/// bubble. A photo or a link keeps its bubble.
+fn is_emoji_only(message: &Bubble<'_>) -> bool {
+    message.photo.is_none() && message.links.is_empty() && only_emoji(message.body)
+}
+
+/// One to three emoji, with the joiners, skin tones, and spaces between them.
+/// A joined sequence, such as a family, counts as one.
+fn only_emoji(text: &str) -> bool {
+    let is_emoji = |ch: char| {
+        matches!(ch,
+            '\u{1F000}'..='\u{1FAFF}' | '\u{2600}'..='\u{27BF}' | '\u{2B00}'..='\u{2BFF}'
+            | '\u{2300}'..='\u{23FF}')
+    };
+    let mut units = 0;
+    let mut joined = false;
+    for ch in text.chars() {
+        match ch {
+            _ if ch.is_whitespace() => {}
+            '\u{200D}' => {
+                joined = true;
+                continue;
+            }
+            '\u{FE0F}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}' => {}
+            _ if is_emoji(ch) => {
+                if !joined {
+                    units += 1;
+                }
+            }
+            _ => return false,
+        }
+        joined = false;
+    }
+    (1..=3).contains(&units)
+}
+
 /// One message row, ready to draw. The photo stays a reference so a frame
 /// does not copy the image bytes.
 struct Bubble<'a> {
@@ -2168,14 +2703,15 @@ fn topic_list(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     if let Some(offset) = forced {
         area = area.vertical_scroll_offset(offset);
     }
-    let stride = inbox_row_stride(ui);
+    let stride = topic_row_height(ui) + ROW_GAP;
     let mut drawn = DrawnInbox {
         anchor: None,
         stride,
     };
     let output = area.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = ROW_GAP;
         if topics.is_empty() {
-            ui.label(RichText::new("No topics.").italics().weak());
+            empty_note(ui, "No topics.");
             return;
         }
         let now = snapshot.now();
@@ -2231,6 +2767,15 @@ fn topic_list(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     });
 }
 
+/// Side of the tile at the start of a topic row.
+const TOPIC_TILE: f32 = 32.0;
+
+/// Height of a topic row: one line beside its tile.
+fn topic_row_height(ui: &egui::Ui) -> f32 {
+    let title = ui.text_style_height(&theme::row_title());
+    TOPIC_TILE.max(title) + theme::ROW_INSET.y * 2.0
+}
+
 /// One topic row. A closed topic shows a lock beside the name.
 #[allow(clippy::too_many_arguments)]
 fn topic_row(
@@ -2245,20 +2790,40 @@ fn topic_row(
     let palette = theme::palette(ui);
     let width = laid_out_width(ui, "topic-row-width");
     let (rect, hover) = ui.allocate_exact_size(
-        egui::vec2(width, inbox_row_height(ui)),
+        egui::vec2(width, topic_row_height(ui)),
         egui::Sense::hover(),
     );
     let row_id = ui.scope_id().with(("topic-row", id));
-    row_backdrop(ui, row_id, rect, false, hover.hovered());
+    row_backdrop(ui, row_id, rect, palette.bg, false, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
+    // A topic has no photo and no preview: one line, after a small tile.
+    // The tile and the line are both centered on the row.
+    let tile = egui::Rect::from_center_size(
+        egui::pos2(inner.left() + TOPIC_TILE * 0.5, inner.center().y),
+        egui::vec2(TOPIC_TILE, TOPIC_TILE),
+    );
+    ui.painter()
+        .rect_filled(tile, egui::CornerRadius::same(8), palette.sidebar);
+    icons::hash(ui.painter(), tile.center(), 16.0, palette.text2);
+    let line_height = ui.text_style_height(&theme::row_title());
+    let line = egui::Rect::from_min_max(
+        egui::pos2(
+            tile.right() + space::M,
+            inner.center().y - line_height * 0.5,
+        ),
+        egui::pos2(inner.right(), inner.center().y + line_height * 0.5),
+    );
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(inner)
-            .layout(egui::Layout::top_down(egui::Align::Min))
+            .max_rect(line)
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
             .id_salt(("topic-row", id)),
     );
-    child.spacing_mut().item_spacing.y = space::XS;
+    // A nested row starts as tall as this. Zero would put its top on the
+    // center line, and the text would sit under the tile center.
+    child.spacing_mut().interact_size.y = line_height;
+    child.style_mut().interaction.selectable_labels = false;
     let title_font = if unread > 0 {
         theme::semibold()
     } else {
@@ -2277,7 +2842,7 @@ fn topic_row(
                         RichText::new(name)
                             .text_style(theme::row_title())
                             .family(title_font)
-                            .color(palette.text),
+                            .color(if closed { palette.text2 } else { palette.text }),
                     )
                     .truncate()
                     .halign(egui::Align::LEFT),
@@ -2285,33 +2850,19 @@ fn topic_row(
             });
         },
         |ui| {
+            ui.spacing_mut().item_spacing.x = space::S;
+            if let Some(text) = badge_text(unread) {
+                unread_badge(ui, &text, muted);
+            }
             ui.label(RichText::new(time).small().color(palette.text3));
             if muted {
                 ui.label(RichText::new("muted").small().color(palette.text3));
             }
         },
     );
-    row_ends(
-        &mut child,
-        |ui| {
-            let note = if closed { "Closed" } else { "" };
-            ui.add(
-                egui::Label::new(
-                    RichText::new(note)
-                        .text_style(theme::secondary())
-                        .color(palette.text2),
-                )
-                .truncate()
-                .halign(egui::Align::LEFT),
-            );
-        },
-        |ui| {
-            if let Some(text) = badge_text(unread) {
-                unread_badge(ui, &text, muted);
-            }
-        },
-    );
-    let response = ui.interact(rect, row_id, egui::Sense::click());
+    let response = ui
+        .interact(rect, row_id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     let access = if closed {
         format!("{name}, closed")
     } else {
@@ -2350,61 +2901,138 @@ fn lock_icon(ui: &mut egui::Ui, color: egui::Color32) {
     ));
 }
 
-/// Title, optional "group" line, and a bottom border.
+/// Avatar, title, a line that says what the chat is, and the mute button,
+/// over a hairline.
 fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     let palette = theme::palette(ui);
     egui::Frame::new()
-        .inner_margin(egui::Margin::same(space::M as i8))
-        .show(ui, |ui| match snapshot.selected_conversation_row() {
-            Some(conversation) => {
-                let mute = snapshot.chat_mute(conversation.protocol, &conversation.id);
-                // One row: the button sits right, and the title takes the
-                // rest and truncates.
-                let open = snapshot.open_topic();
-                let title = match open {
-                    Some(topic) => format!("{} › {}", conversation.title, topic.name),
-                    None => conversation.title.clone(),
-                };
-                let (mute_id, mute) = match open {
-                    Some(topic) => (
-                        topic_mute_id(&conversation.id, topic.topic),
-                        snapshot.topic_mute(topic),
-                    ),
-                    None => (conversation.id.clone(), mute),
-                };
-                egui::Sides::new().shrink_left().truncate().show(
-                    ui,
-                    |ui| {
-                        if open.is_some_and(|topic| topic.closed) {
-                            lock_icon(ui, palette.text2);
-                            ui.add_space(space::XS);
-                        }
-                        ui.add(
-                            egui::Label::new(RichText::new(title).heading().color(palette.text))
+        .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::M as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let Some(conversation) = snapshot.selected_conversation_row() else {
+                return;
+            };
+            let mute = snapshot.chat_mute(conversation.protocol, &conversation.id);
+            // One row: the button sits right, and the title takes the rest
+            // and truncates.
+            let open = snapshot.open_topic();
+            let (mute_id, mute) = match open {
+                Some(topic) => (
+                    topic_mute_id(&conversation.id, topic.topic),
+                    snapshot.topic_mute(topic),
+                ),
+                None => (conversation.id.clone(), mute),
+            };
+            let kind = if conversation.is_group {
+                format!("Group · {}", conversation.protocol.display_name())
+            } else {
+                conversation.protocol.display_name().to_owned()
+            };
+            // The left side pushes here: the right side holds `out`.
+            let mut avatar_out = Vec::new();
+            egui::Sides::new().shrink_left().truncate().show(
+                ui,
+                |ui| {
+                    // An open topic shows Back. It goes to the topic list.
+                    if open.is_some()
+                        && icon_button(ui, "Back to topics", icons::chevron_left, palette.text2)
+                            .on_hover_text("All topics")
+                            .clicked()
+                    {
+                        avatar_out.push(Intent::CloseTopic {
+                            conversation_id: conversation.id.clone(),
+                        });
+                    }
+                    let side = super::photos::HEADER_AVATAR_SIDE;
+                    let (avatar, _) =
+                        ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+                    super::photos::paint_avatar(
+                        ui,
+                        avatar,
+                        conversation.protocol,
+                        &conversation.id,
+                        &conversation.title,
+                        &conversation.avatar,
+                        &mut avatar_out,
+                    );
+                    ui.add_space(space::XS);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = space::XS;
+                            let Some(topic) = open else {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&conversation.title)
+                                            .heading()
+                                            .color(palette.text),
+                                    )
+                                    .truncate(),
+                                );
+                                return;
+                            };
+                            // The breadcrumb: the chat name is a link to its
+                            // topic list.
+                            // A long chat name takes half the row at most,
+                            // so the topic name stays in view.
+                            let room = ui.available_width() * 0.5;
+                            let crumb = ui
+                                .scope(|ui| {
+                                    ui.set_max_width(room);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&conversation.title)
+                                                .heading()
+                                                .color(palette.text2),
+                                        )
+                                        .selectable(false)
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
+                                    )
+                                })
+                                .inner
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("All topics");
+                            if crumb.hovered() {
+                                let rect = crumb.rect;
+                                ui.painter().hline(
+                                    rect.x_range(),
+                                    rect.bottom() - 1.0,
+                                    egui::Stroke::new(1.0, palette.text2),
+                                );
+                            }
+                            if crumb.clicked() {
+                                avatar_out.push(Intent::CloseTopic {
+                                    conversation_id: conversation.id.clone(),
+                                });
+                            }
+                            ui.label(RichText::new("›").heading().color(palette.text3));
+                            if topic.closed {
+                                lock_icon(ui, palette.text2);
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&topic.name).heading().color(palette.text),
+                                )
                                 .truncate(),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(kind)
+                                .text_style(theme::secondary())
+                                .color(palette.text3),
                         );
-                    },
-                    |ui| {
-                        let what = if open.is_some() { "topic" } else { "" };
-                        if let Some(intent) =
-                            mute_control(ui, conversation.protocol, &mute_id, mute, what)
-                        {
-                            out.push(intent);
-                        }
-                    },
-                );
-                if conversation.is_group {
-                    ui.label(RichText::new("group").small().color(palette.text3));
-                }
-            }
-            None => {
-                ui.label(RichText::new("Thread").heading().color(palette.text));
-                ui.label(
-                    RichText::new("Select a conversation in the inbox.")
-                        .small()
-                        .color(palette.text3),
-                );
-            }
+                    });
+                },
+                |ui| {
+                    if let Some(intent) =
+                        header_mute(ui, conversation.protocol, &mute_id, mute, open.is_some())
+                    {
+                        out.push(intent);
+                    }
+                },
+            );
+            out.append(&mut avatar_out);
         });
     let y = ui.cursor().min.y;
     ui.painter().hline(
@@ -2412,6 +3040,36 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
         y,
         egui::Stroke::new(1.0, palette.border),
     );
+}
+
+/// The thread column when no chat is open: what to do, and a picture.
+fn empty_thread(ui: &mut egui::Ui, snapshot: &View<'_>) {
+    let palette = theme::palette(ui);
+    let (title, hint) = match snapshot.inbox_state() {
+        InboxState::Loading => ("Hang tight", "Your conversations show up here soon."),
+        InboxState::Empty => ("Nothing here yet", "New conversations show up here."),
+        InboxState::Rows | InboxState::NoMatch => (
+            "Select a chat",
+            "Pick a conversation from the list to read and reply.",
+        ),
+    };
+    let top = (ui.available_height() * 0.5 - 90.0).max(24.0);
+    ui.add_space(top);
+    ui.vertical_centered(|ui| {
+        let (art, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+        icons::chat_bubble(ui.painter(), art.center(), 56.0, palette.text3);
+        ui.add_space(space::M);
+        ui.label(
+            RichText::new(title)
+                .text_style(egui::TextStyle::Heading)
+                .color(palette.text),
+        );
+        ui.label(
+            RichText::new(hint)
+                .text_style(theme::secondary())
+                .color(palette.text2),
+        );
+    });
 }
 
 /// Own messages sit on the right on `out`. Others sit on the left on `surface`.
@@ -2442,19 +3100,44 @@ fn bubble(
         ui.add_space(if ended { NEXT_RUN_GAP } else { SAME_RUN_GAP });
     }
     let max_width = bubble_cap(laid_out_width(ui, "thread-width"));
-    let (align, fill, body, meta) = if message.outbound {
+    let emoji = is_emoji_only(message);
+    let align = if message.outbound {
+        egui::Align::Max
+    } else {
+        egui::Align::Min
+    };
+    let (fill, body, ink) = if emoji {
         (
-            egui::Align::Max,
+            egui::Color32::TRANSPARENT,
+            palette.text,
+            MetaInk {
+                time: palette.text3,
+                read: palette.accent,
+                error: palette.error,
+                action: palette.accent,
+            },
+        )
+    } else if message.outbound {
+        (
             palette.out,
             palette.on_out,
-            palette.out_meta,
+            MetaInk {
+                time: palette.out_meta,
+                read: palette.on_out,
+                error: palette.out_error,
+                action: palette.on_out,
+            },
         )
     } else {
         (
-            egui::Align::Min,
             palette.surface,
             palette.text,
-            palette.text3,
+            MetaInk {
+                time: palette.text3,
+                read: palette.text3,
+                error: palette.error,
+                action: palette.accent,
+            },
         )
     };
     let mut body_galley = None;
@@ -2462,15 +3145,20 @@ fn bubble(
         let frame = egui::Frame::new()
             .fill(fill)
             .corner_radius(bubble_radius(message.outbound, message.layout.run_end))
-            .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
+            .inner_margin(egui::Margin::symmetric(BUBBLE_PAD_X, BUBBLE_PAD_Y))
             .show(ui, |ui| {
                 ui.set_max_width(max_width);
                 let meta_width =
                     meta_column_width(ui, &message.layout.time, message.delivery, message.outbound);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                     if message.layout.show_sender {
-                        let response =
-                            ui.label(RichText::new(message.sender).small().color(palette.text));
+                        let ink = theme::sender_ink(message.sender, ui.visuals().dark_mode);
+                        let response = ui.label(
+                            RichText::new(message.sender)
+                                .small()
+                                .family(theme::semibold())
+                                .color(ink),
+                        );
                         // The pane name already includes the sender.
                         hide_from_accesskit(ui, response.id);
                     }
@@ -2486,9 +3174,7 @@ fn bubble(
                     }
                     let caption = !message.body.is_empty() || message.photo.is_none();
                     if !caption {
-                        if !message.layout.time.is_empty() {
-                            ui.label(RichText::new(&message.layout.time).small().color(meta));
-                        }
+                        meta_line(ui, message, &ink, false);
                         return;
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
@@ -2498,14 +3184,22 @@ fn bubble(
                             .vertical(|ui| {
                                 ui.set_max_width(text_width);
                                 let text = if message.links.is_empty() {
-                                    egui::WidgetText::from(RichText::new(message.body).color(body))
+                                    let mut text = RichText::new(message.body).color(body);
+                                    if emoji {
+                                        text = text.size(EMOJI_SIZE);
+                                    }
+                                    egui::WidgetText::from(text)
                                 } else {
                                     let font = egui::TextStyle::Body.resolve(ui.style());
                                     egui::WidgetText::from(super::links::layout_job(
                                         message.body,
                                         message.links,
                                         body,
-                                        palette.link,
+                                        if message.outbound {
+                                            palette.out_link
+                                        } else {
+                                            palette.link
+                                        },
                                         font,
                                     ))
                                 };
@@ -2530,17 +3224,19 @@ fn bubble(
                             .rect;
                         let line = ui.text_style_height(&egui::TextStyle::Small);
                         let has_time = !message.layout.time.is_empty();
+                        let inline_mark = delivery_inline(message.delivery, message.outbound);
                         let extra = delivery_rows(message.delivery, message.outbound);
-                        if has_time || extra > 0 {
+                        if has_time || inline_mark || extra > 0 {
                             let gap_y = ui.spacing().item_spacing.y;
-                            let time_h = if has_time { line } else { 0.0 };
-                            // The time shares the last body line. Status rows continue below it.
+                            let time_h = if has_time || inline_mark { line } else { 0.0 };
+                            // The time shares the last body line. A failed send
+                            // continues on a row below it.
                             let extra_h = if extra == 0 {
                                 0.0
                             } else {
                                 gap_y + line * extra as f32 + gap_y * (extra - 1) as f32
                             };
-                            let meta_top = if has_time {
+                            let meta_top = if has_time || inline_mark {
                                 body_rect.bottom() - time_h
                             } else {
                                 body_rect.bottom() + gap_y
@@ -2554,52 +3250,9 @@ fn bubble(
                                     .max_rect(meta_rect)
                                     .layout(egui::Layout::top_down(egui::Align::Min)),
                                 |ui| {
-                                    if !message.layout.time.is_empty() {
-                                        let response = ui.label(
-                                            RichText::new(&message.layout.time).small().color(meta),
-                                        );
-                                        if message.group {
-                                            // The pane name already includes the time.
-                                            hide_from_accesskit(ui, response.id);
-                                        }
-                                    }
-                                    if message.outbound {
-                                        match message.delivery {
-                                            Delivery::Pending => {
-                                                ui.label(
-                                                    RichText::new(SENDING_MARK).small().color(meta),
-                                                );
-                                            }
-                                            Delivery::Sent => {
-                                                delivery_mark(ui, SENT_MARK, "Sent", meta);
-                                            }
-                                            Delivery::Read => {
-                                                delivery_mark(
-                                                    ui,
-                                                    READ_MARK,
-                                                    "Read",
-                                                    palette.accent,
-                                                );
-                                            }
-                                            Delivery::Failed => {
-                                                ui.colored_label(
-                                                    palette.out_error,
-                                                    RichText::new(FAILED_MARK).small(),
-                                                );
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            RichText::new("Retry")
-                                                                .color(palette.accent),
-                                                        )
-                                                        .frame(false),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    *retry = Some(message.id.to_owned());
-                                                }
-                                            }
-                                        }
+                                    meta_line(ui, message, &ink, message.group);
+                                    if message.outbound && message.delivery == Delivery::Failed {
+                                        failed_line(ui, message, &ink, retry);
                                     }
                                 },
                             );
@@ -2662,24 +3315,75 @@ fn delivery_mark(ui: &mut egui::Ui, glyph: &str, access: &str, color: egui::Colo
     });
 }
 
-/// "Sending…" under an outgoing row that the server has not accepted.
+/// "Sending…" beside the time of an outgoing message that the server has not
+/// accepted.
 const SENDING_MARK: &str = "Sending…";
-/// One check. The server has the message. Small and gray. No animation.
+/// One check. The server has the message. Small, in the muted bubble ink. No
+/// animation.
 const SENT_MARK: &str = "✓";
-/// Two checks. The other party has read the message. Accent color.
+/// Two checks. The other party has read the message. They use the bright
+/// bubble text color: the accent is the bubble fill, so it cannot be the mark.
 const READ_MARK: &str = "✓✓";
 /// The server did not accept the message.
 const FAILED_MARK: &str = "Not sent.";
 
-/// Extra lines under the time for an outgoing delivery mark.
+/// Extra rows under the time line. A failed send adds one: the message and Retry.
 fn delivery_rows(delivery: Delivery, outbound: bool) -> i32 {
-    if !outbound {
-        return 0;
-    }
-    match delivery {
-        Delivery::Pending | Delivery::Sent | Delivery::Read => 1,
-        Delivery::Failed => 2,
-    }
+    i32::from(outbound && delivery == Delivery::Failed)
+}
+
+/// The delivery mark sits on the time line for every state but a failure.
+fn delivery_inline(delivery: Delivery, outbound: bool) -> bool {
+    outbound && delivery != Delivery::Failed
+}
+
+/// The time, then the delivery mark on the same line.
+fn meta_line(ui: &mut egui::Ui, message: &Bubble<'_>, ink: &MetaInk, hide_time: bool) {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = space::XS;
+            if !message.layout.time.is_empty() {
+                let response =
+                    ui.label(RichText::new(&message.layout.time).small().color(ink.time));
+                if hide_time {
+                    // The pane name already includes the time.
+                    hide_from_accesskit(ui, response.id);
+                }
+            }
+            if !delivery_inline(message.delivery, message.outbound) {
+                return;
+            }
+            match message.delivery {
+                Delivery::Pending => {
+                    ui.label(RichText::new(SENDING_MARK).small().color(ink.time));
+                }
+                Delivery::Sent => delivery_mark(ui, SENT_MARK, "Sent", ink.time),
+                Delivery::Read => delivery_mark(ui, READ_MARK, "Read", ink.read),
+                Delivery::Failed => {}
+            }
+        });
+    });
+}
+
+/// "Not sent." and Retry, on the row under the time of a failed send.
+fn failed_line(ui: &mut egui::Ui, message: &Bubble<'_>, ink: &MetaInk, retry: &mut Option<String>) {
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = space::S;
+            ui.label(RichText::new(FAILED_MARK).small().color(ink.error));
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Retry").small().underline().color(ink.action))
+                        .frame(false),
+                )
+                .clicked()
+            {
+                *retry = Some(message.id.to_owned());
+            }
+        });
+    });
 }
 
 /// Width of the time and delivery column. Empty when the row has neither.
@@ -2695,20 +3399,26 @@ fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery, outbound: bo
                 .x
         }
     };
-    let mut width = text_width(time);
-    if outbound {
-        match delivery {
-            Delivery::Pending => width = width.max(text_width(SENDING_MARK)),
-            Delivery::Sent => width = width.max(text_width(SENT_MARK)),
-            Delivery::Read => width = width.max(text_width(READ_MARK)),
-            Delivery::Failed => {
-                width = width.max(text_width(FAILED_MARK));
-                let pad = ui.spacing().button_padding.x * 2.0;
-                width = width.max(text_width("Retry") + pad);
-            }
+    let gap = space::XS;
+    let time_width = text_width(time);
+    if !outbound {
+        return time_width;
+    }
+    let after_time = |mark: &str| {
+        if time_width > 0.0 {
+            time_width + gap + text_width(mark)
+        } else {
+            text_width(mark)
+        }
+    };
+    match delivery {
+        Delivery::Pending => after_time(SENDING_MARK),
+        Delivery::Sent => after_time(SENT_MARK),
+        Delivery::Read => after_time(READ_MARK),
+        Delivery::Failed => {
+            time_width.max(text_width(FAILED_MARK) + space::S + text_width("Retry"))
         }
     }
-    width
 }
 
 /// AccessKit name of a bubble. A screen reader reads this once.
@@ -2731,7 +3441,8 @@ fn bubble_access_label(message: &Bubble<'_>) -> String {
     }
 }
 
-/// 12 on every corner. The last bubble of a run uses 4 on the sender side.
+/// [`radius::BUBBLE`] on every corner. The last bubble of a run uses
+/// [`radius::BUBBLE_TAIL`] on the sender side.
 fn bubble_radius(outbound: bool, run_end: bool) -> egui::CornerRadius {
     let round = radius::BUBBLE;
     let tail = if run_end { radius::BUBBLE_TAIL } else { round };
@@ -2752,16 +3463,17 @@ fn bubble_radius(outbound: bool, run_end: bool) -> egui::CornerRadius {
     }
 }
 
-/// Height of the field row: text, field padding, focus ring, at least Send.
-///
-/// `ui.horizontal` only offers `interact_size` of height, and a vertical
-/// scroll area otherwise stays at its 64px minimum. Compose uses this as
-/// both `min_scrolled_height` and `max_height`, so the bar tracks the text.
 /// Rows in the draft. `str::lines` drops a trailing blank row from Shift+Enter.
 fn compose_line_count(text: &str) -> usize {
     text.split('\n').count()
 }
 
+/// Height of the field row: text, field padding, focus ring, at least the
+/// round Send button.
+///
+/// `ui.horizontal` only offers `interact_size` of height, and a vertical
+/// scroll area otherwise stays at its 64px minimum. Compose uses this as
+/// both `min_scrolled_height` and `max_height`, so the bar tracks the text.
 fn compose_row_height(row_height: f32, rows: usize) -> f32 {
     let rows = rows.clamp(1, COMPOSE_MAX_ROWS) as f32;
     let pad = space::M * 2.0;
@@ -2801,6 +3513,15 @@ fn compose(
     let sending_off = snapshot.selected_protocol == ProtocolId::Signal
         && (snapshot.signal_device_removed() || snapshot.signal_read_only_reason().is_some());
     let compose_open = !closed && !sending_off;
+    // Dropped and pasted photos and videos go to the tray of this thread.
+    // This runs before the field, so a paste of files adds no text.
+    if compose_open
+        && snapshot.sends_media(snapshot.selected_protocol)
+        && let Some(thread) = chat.as_ref()
+    {
+        let focused = ui.memory(|memory| memory.has_focus(compose_id));
+        super::attach::take_input(ui, thread, focused, out);
+    }
     if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
     }
@@ -2834,7 +3555,10 @@ fn compose(
     );
     if closed {
         ui.add_space(space::S);
-        ui.label(RichText::new("This topic is closed.").color(palette.text2));
+        ui.horizontal(|ui| {
+            ui.add_space(THREAD_INSET);
+            ui.label(RichText::new("This topic is closed.").color(palette.text2));
+        });
     }
     let focused = ui.memory(|memory| memory.has_focus(compose_id));
     let ring = motion::toggle(ui.ctx(), compose_id.with("ring"), focused, motion::STATE);
@@ -2845,14 +3569,16 @@ fn compose(
             motion::mix(palette.border_strong, palette.accent, ring),
         ))
         .corner_radius(radius::FIELD)
-        .inner_margin(egui::Margin::symmetric(space::M as i8, space::M as i8));
+        .inner_margin(egui::Margin::symmetric(space::L as i8, space::M as i8));
     egui::Frame::new()
-        .fill(palette.sidebar)
-        .inner_margin(egui::Margin::same(space::M as i8))
+        .fill(palette.bg)
+        .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::M as i8))
         .show(ui, |ui| {
+            if let Some(thread) = chat.as_ref() {
+                super::attach::tray(ui, snapshot, thread, out);
+            }
             ui.horizontal(|ui| {
-                let send_width = 72.0;
-                let width = (ui.available_width() - send_width - space::S).max(0.0);
+                let width = (ui.available_width() - SEND_MIN_HEIGHT - space::S).max(0.0);
                 let visible = compose_row_height(
                     ui.text_style_height(&egui::TextStyle::Body),
                     compose_line_count(&snapshot.compose),
@@ -2892,11 +3618,8 @@ fn compose(
                     motion::mix(send_label(false, palette), send_label(true, palette), ready);
                 let fill = motion::mix(send_fill(false, palette), send_fill(true, palette), ready);
                 if ui
-                    .add_enabled(snapshot.can_send(), {
-                        egui::Button::new(RichText::new("Send").color(label))
-                            .fill(fill)
-                            .min_size(egui::vec2(send_width, SEND_MIN_HEIGHT))
-                    })
+                    .add_enabled_ui(snapshot.can_send(), |ui| send_button(ui, fill, label))
+                    .inner
                     .clicked()
                     && let Some((protocol, conversation_id, topic)) = chat.clone()
                 {
@@ -2908,6 +3631,24 @@ fn compose(
                 }
             });
         });
+}
+
+/// The round Send button: an arrow on `fill`. Its name for a screen reader is
+/// "Send". A disabled button does not answer clicks (the caller disables it).
+fn send_button(ui: &mut egui::Ui, fill: egui::Color32, ink: egui::Color32) -> egui::Response {
+    let icon_id = egui::IdSalt::new("send-icon");
+    let enabled = ui.is_enabled();
+    let shown = egui::Button::new(egui::Atom::custom(icon_id, egui::vec2(18.0, 18.0)))
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(radius::PILL))
+        .min_size(egui::vec2(SEND_MIN_HEIGHT, SEND_MIN_HEIGHT))
+        .atom_ui(ui);
+    if let Some(rect) = shown.rect(icon_id) {
+        icons::arrow_up(ui.painter(), rect.center(), 18.0, ink);
+    }
+    let response = shown.response;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, "Send"));
+    response
 }
 
 /// Fill of the Send button. Disabled uses `surface`, not a faded accent.
@@ -2931,6 +3672,27 @@ fn send_label(can_send: bool, palette: &theme::Palette) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::{InboxAnchor, account_label, anchored_inbox_offset, badge_text, row_scrolls};
+
+    #[test]
+    fn only_one_to_three_emoji_lose_their_bubble() {
+        use super::only_emoji;
+
+        assert!(only_emoji("👍"));
+        assert!(only_emoji("👍 🎉"));
+        assert!(only_emoji("👍👍👍"));
+        assert!(only_emoji("❤️"));
+        assert!(only_emoji("👋🏽"), "a skin tone belongs to its emoji");
+        assert!(
+            only_emoji("👨\u{200D}👩\u{200D}👧"),
+            "a family is one emoji"
+        );
+        assert!(!only_emoji("👍👍👍👍"), "four is a line of text");
+        assert!(!only_emoji("ok 👍"));
+        assert!(!only_emoji("…"));
+        assert!(!only_emoji("1"));
+        assert!(!only_emoji(""));
+        assert!(!only_emoji("   "));
+    }
 
     #[test]
     fn both_scroll_requests_scroll_the_highlight() {
@@ -3439,6 +4201,191 @@ mod tests {
         assert_eq!(chip_label(&snapshot, account), "Connecting…");
     }
 
+    /// A store migration keeps the row on Connecting. A denied keychain
+    /// read is its own chip, even before the account is linked.
+    #[test]
+    fn chip_shows_connecting_during_migration_and_the_denied_key() {
+        use super::chip_label;
+        use thinwire_core::state::Snapshot;
+        use thinwire_protocol::{AccountState, ProtocolId, StoreAccessReason};
+
+        let mut snapshot = Snapshot::new();
+        snapshot.poll_resume(&thinwire_core::secrets::SecretStore::memory());
+        {
+            let account = snapshot
+                .accounts
+                .iter_mut()
+                .find(|account| account.caps.id == ProtocolId::WhatsApp)
+                .expect("whatsapp");
+            account.state = AccountState::Linking;
+            account.status = AdapterStatus::Stubbed;
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.caps.id == ProtocolId::WhatsApp)
+            .expect("whatsapp");
+        assert_eq!(chip_label(&snapshot, account), "Connecting…");
+
+        {
+            let account = snapshot
+                .accounts
+                .iter_mut()
+                .find(|account| account.caps.id == ProtocolId::Signal)
+                .expect("signal");
+            account.state = AccountState::Linking;
+            account.status = AdapterStatus::Error;
+            account.detail = thinwire_protocol::KEYCHAIN_ACCESS_DENIED.into();
+            account.store_access = Some(StoreAccessReason::KeychainDenied);
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.caps.id == ProtocolId::Signal)
+            .expect("signal");
+        assert_eq!(chip_label(&snapshot, account), "Connection problem");
+        assert_eq!(account.detail, thinwire_protocol::KEYCHAIN_ACCESS_DENIED);
+
+        {
+            let account = snapshot
+                .accounts
+                .iter_mut()
+                .find(|account| account.caps.id == ProtocolId::Signal)
+                .expect("signal");
+            account.state = AccountState::Linked;
+            account.status = AdapterStatus::Connecting;
+            account.store_access = None;
+            account.detail = "Opening the saved session.".into();
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|account| account.caps.id == ProtocolId::Signal)
+            .expect("signal");
+        assert_eq!(chip_label(&snapshot, account), "Connecting…");
+    }
+
+    /// Retry restarts the key read. Link on a wrong key is the removed-device
+    /// relink (`SignalIntent::Relink`), which starts the QR flow.
+    #[test]
+    fn a_wrong_key_link_button_starts_the_relink() {
+        use super::{store_row_button, store_row_hover, store_row_intent};
+        use thinwire_core::state::{AccountRow, RetainedRead};
+        use thinwire_core::{Intent, SignalIntent, WhatsAppIntent};
+        use thinwire_protocol::{
+            AccountState, AdapterStatus, ProtocolId, StoreAccessReason, catalog,
+        };
+
+        let signal = catalog()
+            .into_iter()
+            .find(|caps| caps.id == ProtocolId::Signal)
+            .expect("signal");
+        let whatsapp = catalog()
+            .into_iter()
+            .find(|caps| caps.id == ProtocolId::WhatsApp)
+            .expect("whatsapp");
+        let mut account = AccountRow {
+            caps: signal,
+            status: AdapterStatus::Error,
+            detail: thinwire_protocol::signal_session_kept().into(),
+            state: AccountState::Unlinked,
+            helper: None,
+            signal_retained: None,
+            store_access: Some(StoreAccessReason::WrongKey),
+            retained_read: RetainedRead::Readable,
+        };
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::Signal(SignalIntent::Relink))
+        );
+        assert_eq!(store_row_button(&account), "Link");
+        account.store_access = Some(StoreAccessReason::KeychainDenied);
+        account.state = AccountState::Linked;
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::RetryStoreKey(ProtocolId::Signal))
+        );
+        assert_eq!(store_row_button(&account), "Retry");
+        account.caps = whatsapp;
+        account.store_access = Some(StoreAccessReason::WrongKey);
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate))
+        );
+        account.store_access = Some(StoreAccessReason::MoveFailed);
+        account.state = AccountState::Linked;
+        account.detail = thinwire_protocol::whatsapp_key_wrong_kept().into();
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::RetryStoreKey(ProtocolId::WhatsApp))
+        );
+        assert_eq!(store_row_button(&account), "Retry");
+        assert_eq!(
+            store_row_hover(&account),
+            "Tries to move the saved session aside again. Nothing is deleted."
+        );
+        account.caps = signal;
+        account.detail = thinwire_protocol::signal_key_wrong_kept().into();
+        assert_eq!(
+            store_row_intent(&account),
+            Some(Intent::RetryStoreKey(ProtocolId::Signal))
+        );
+    }
+
+    /// The failed-move row draws Retry. The click sends `RetryStoreKey`.
+    #[test]
+    fn a_failed_move_row_draws_retry() {
+        use eframe::egui::accesskit::Role;
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use thinwire_core::Intent;
+        use thinwire_core::state::{AccountRow, RetainedRead};
+        use thinwire_protocol::{
+            AccountState, AdapterStatus, ProtocolId, StoreAccessReason, catalog,
+        };
+
+        use super::{store_protection_line, store_row_hover};
+        use crate::app::theme;
+
+        let signal = catalog()
+            .into_iter()
+            .find(|caps| caps.id == ProtocolId::Signal)
+            .expect("signal");
+        let account = AccountRow {
+            caps: signal,
+            status: AdapterStatus::Error,
+            detail: thinwire_protocol::signal_key_wrong_kept().into(),
+            state: AccountState::Linked,
+            helper: None,
+            signal_retained: None,
+            store_access: Some(StoreAccessReason::MoveFailed),
+            retained_read: RetainedRead::Readable,
+        };
+        assert_eq!(
+            store_row_hover(&account),
+            "Tries to move the saved session aside again. Nothing is deleted."
+        );
+        let intents = Rc::new(RefCell::new(Vec::new()));
+        let intents_ui = Rc::clone(&intents);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(520.0, 96.0))
+            .build_ui(move |ui| {
+                theme::install(ui.ctx());
+                let mut out = Vec::new();
+                store_protection_line(ui, &account, &mut out);
+                intents_ui.borrow_mut().extend(out);
+            });
+        harness.run_steps(3);
+        harness.get_by_role_and_label(Role::Button, "Retry").click();
+        harness.run_steps(2);
+        assert_eq!(
+            intents.borrow().as_slice(),
+            [Intent::RetryStoreKey(ProtocolId::Signal)]
+        );
+    }
+
     /// Shell plan 11: a linked account with an error is not "Not signed in".
     #[test]
     fn chip_keeps_a_linked_account_signed_in_on_an_error() {
@@ -3491,13 +4438,12 @@ mod tests {
 
     #[test]
     fn add_account_hides_when_telegram_is_linked() {
-        use thinwire_core::state::{InboxFilter, Snapshot};
+        use thinwire_core::state::Snapshot;
 
         let mut snapshot = Snapshot::new();
         assert!(snapshot.can_add_account());
         snapshot.telegram_authorized = true;
         assert!(!snapshot.can_add_account());
-        assert!(InboxFilter::chrome_filters().len() + 2 <= 6);
     }
 
     #[test]

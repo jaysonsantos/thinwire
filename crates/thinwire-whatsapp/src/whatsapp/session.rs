@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use super::inbox::{self, HistoryChat, Inbox, Mute, WaMessage};
+use super::inbox::{self, HistoryChat, Inbox, MediaRef, MediaRequest, Mute, WaMessage};
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret,
     emit_status,
@@ -63,7 +63,31 @@ impl SendFailure {
 /// Outgoing text transport. The live client wraps whatsapp-rust. Tests use a fake.
 pub(super) trait WhatsAppSender: Send + Sync {
     fn send_text<'a>(&'a self, chat_jid: &'a str, body: &'a str) -> SendFuture<'a>;
+
+    /// Upload one photo or video and send it, with `caption` when it is not
+    /// empty. Resolves to the server message id. A sender with no client
+    /// refuses.
+    fn send_media<'a>(
+        &'a self,
+        _chat_jid: &'a str,
+        _file: &'a thinwire_protocol::OutgoingFile,
+        _caption: &'a str,
+    ) -> SendFuture<'a> {
+        Box::pin(async { Err(SendFailure::Rejected) })
+    }
+
+    /// Download and decrypt one media file. A sender with no client has
+    /// nothing to download.
+    fn download<'a>(&'a self, _media: &'a MediaRef) -> DownloadFuture<'a> {
+        Box::pin(async { Err(()) })
+    }
 }
+
+/// Boxed media download. Resolves to the plain bytes. The error has no text.
+pub(super) type DownloadFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, ()>> + Send + 'a>>;
+
+/// Sticker downloads that run at one time.
+const MEDIA_DOWNLOADS: usize = 4;
 
 /// What the linked-device client reports to the adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +145,8 @@ struct State {
     /// The adapter shut down. A send result that comes later is dropped, so
     /// no `SendAccepted`, `SendRejected` or row follows `Stopped` (#238).
     closed: bool,
+    /// Limits the sticker downloads that run at one time.
+    media_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// The timer for the next timed mute end (#168 item 13).
@@ -312,6 +338,70 @@ impl Session {
         action(&mut self.lock().inbox)
     }
 
+    /// Start the sticker downloads for the rows in `rows`. Each result sends
+    /// its row again, with the image.
+    pub(super) fn fetch_media(&self, rows: &[AdapterEvent], events: &EventTx) {
+        let mut state = self.lock();
+        self.spawn_media(&mut state, rows, events);
+    }
+
+    /// Nothing starts while the link is offline, closed, or not yet shown:
+    /// the rows ask again when the chat opens.
+    fn spawn_media(&self, state: &mut State, rows: &[AdapterEvent], events: &EventTx) {
+        if state.closed || !state.connected || !state.announced {
+            return;
+        }
+        let Some(sender) = state.sender.clone() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let requests = state.inbox.media_requests(rows);
+        if requests.is_empty() {
+            return;
+        }
+        let gate = state
+            .media_gate
+            .get_or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MEDIA_DOWNLOADS)))
+            .clone();
+        let generation = state.generation;
+        for request in requests {
+            let session = self.clone();
+            let sender = sender.clone();
+            let events = events.clone();
+            let gate = gate.clone();
+            runtime.spawn(async move {
+                let _permit = gate.acquire_owned().await.ok();
+                let bytes = sender.download(&request.media).await.ok();
+                session.finish_media(generation, &request, bytes, &events);
+            });
+        }
+    }
+
+    /// One download ended. A result of an old or a closed link is dropped.
+    fn finish_media(
+        &self,
+        generation: u64,
+        request: &MediaRequest,
+        bytes: Option<Vec<u8>>,
+        events: &EventTx,
+    ) {
+        let mut state = self.lock();
+        if state.closed || state.generation != generation {
+            return;
+        }
+        if bytes.is_none() {
+            tracing::debug!("whatsapp sticker download failed");
+        }
+        if let Some(row) = state
+            .inbox
+            .finish_media(&request.chat_jid, &request.id, bytes)
+        {
+            let _ = events.send(row);
+        }
+    }
+
     /// Apply one client event of link `generation` and push the UI events.
     ///
     /// The generation check, the state change, and the event sends happen
@@ -402,6 +492,7 @@ impl Session {
             }
         };
         let mut out = out;
+        self.spawn_media(&mut state, &out, events);
         if let Some(detail) = stop {
             state.connected = false;
             state.stopped = Some(detail);
@@ -583,13 +674,16 @@ fn status(events: &EventTx, status: AdapterStatus, detail: &str) {
 pub(super) mod fake {
     use std::sync::Mutex;
 
-    use super::{SendFailure, SendFuture, WhatsAppSender};
+    use super::{DownloadFuture, MediaRef, SendFailure, SendFuture, WhatsAppSender};
 
-    /// Records sends. Returns `SRV<n>` ids, or the failure in `fail`.
+    /// Records sends. Returns `SRV<n>` ids, or the failure in `fail`. A
+    /// download returns `media` when set, else it fails.
     #[derive(Default)]
     pub(in crate::whatsapp) struct FakeSender {
         pub sent: Mutex<Vec<(String, String)>>,
         pub fail: Option<SendFailure>,
+        pub media: Option<Vec<u8>>,
+        pub downloads: Mutex<u32>,
     }
 
     impl WhatsAppSender for FakeSender {
@@ -602,6 +696,13 @@ pub(super) mod fake {
                 } else {
                     Ok(format!("SRV{}", sent.len()))
                 }
+            })
+        }
+
+        fn download<'a>(&'a self, _media: &'a MediaRef) -> DownloadFuture<'a> {
+            Box::pin(async move {
+                *self.downloads.lock().expect("fake lock") += 1;
+                self.media.clone().ok_or(())
             })
         }
     }
@@ -653,6 +754,44 @@ mod tests {
 
     fn armed_end(session: &Session) -> Option<i64> {
         session.lock().mute_timer.as_ref().map(|timer| timer.end)
+    }
+
+    /// A live sticker shows "[sticker]", then the row comes again with its
+    /// image. The download runs one time.
+    #[tokio::test]
+    async fn a_live_sticker_row_comes_again_with_its_image() {
+        let (session, tx, mut rx) = linked();
+        let sender = Arc::new(fake::FakeSender {
+            media: Some(vec![9, 9, 9]),
+            ..Default::default()
+        });
+        assert!(session.attach_sender(1, sender.clone()));
+        let sticker = crate::whatsapp::inbox::tests::sticker_message(CHAT, "s1", 5);
+        session.apply(LinkEvent::Messages(vec![sticker]), 1, &tx);
+        let mut rows = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while rows.len() < 2 && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(AdapterEvent::MessageReceived { message })) if message.id == "s1" => {
+                    rows.push(message);
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+        assert_eq!(rows.len(), 2, "the row and the row with its image");
+        assert_eq!(rows[0].body, "[sticker]");
+        assert!(rows[0].photo.is_none());
+        assert_eq!(rows[1].body, "");
+        assert!(rows[1].photo.is_some());
+        assert_eq!(*sender.downloads.lock().expect("lock"), 1);
+
+        // A close drops a download that ends later.
+        session.close();
+        let late = crate::whatsapp::inbox::tests::sticker_message(CHAT, "s2", 6);
+        session.apply(LinkEvent::Messages(vec![late]), 1, &tx);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*sender.downloads.lock().expect("lock"), 1);
     }
 
     /// #168 item 12: the session tells the inbox about each connection. A

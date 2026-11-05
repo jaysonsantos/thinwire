@@ -100,10 +100,14 @@ pub struct ProtocolCapabilities {
     /// The adapter answers `LoadOlderMessages`. The shell asks for older
     /// messages on scroll up only for such a protocol.
     pub pages_history: bool,
+    /// The adapter answers `SendMedia`. The compose field takes photos and
+    /// videos only for such a protocol.
+    pub sends_media: bool,
 }
 
-/// Link state of the account of one protocol. Only
-/// [`AdapterEvent::Account`] changes it; a `Status` never does.
+/// Link state of the account of one protocol.
+/// [`AdapterEvent::Account`] changes it. A wrong key also leaves `Linked`.
+/// A `Status` never does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccountState {
     /// No account, or the account ended. The shell shows no rows for it.
@@ -376,6 +380,18 @@ pub enum AdapterCommand {
         body: String,
         request: u64,
     },
+    /// Send photos and videos, with the text as the caption. The caption can
+    /// be empty. `topic` is the open topic, if any. A protocol that takes
+    /// fewer files in one message sends more than one message. The adapter
+    /// answers one `SendAccepted` or `SendRejected` with `request`.
+    SendMedia {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        files: Vec<crate::media::OutgoingFile>,
+        caption: String,
+        request: u64,
+    },
     /// Send plain text in one topic. The body is the user's message.
     SendTopicText {
         protocol: ProtocolId,
@@ -412,6 +428,12 @@ pub enum AdapterCommand {
     RestartHelper {
         protocol: ProtocolId,
     },
+    /// Read the session key again and open the saved session. This does not
+    /// start a link and it does not delete a store. A wrong key tries the
+    /// move-aside again.
+    RetryStoreKey {
+        protocol: ProtocolId,
+    },
     /// Download one Telegram photo file. `secret` means the file is deleted
     /// after the bytes are read, and the UI does not open the full view.
     /// The file id is not a secret.
@@ -436,10 +458,12 @@ impl AdapterCommand {
             | Self::LoadOlderTopic { protocol, .. }
             | Self::SendText { protocol, .. }
             | Self::SendTopicText { protocol, .. }
+            | Self::SendMedia { protocol, .. }
             | Self::ResendMessage { protocol, .. }
             | Self::ViewChat { protocol, .. }
             | Self::ViewTopic { protocol, .. }
             | Self::RestartHelper { protocol }
+            | Self::RetryStoreKey { protocol }
             | Self::DownloadFile { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
@@ -453,6 +477,30 @@ impl AdapterCommand {
     }
 }
 
+/// Why the helper could not use the session key. The account stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreAccessReason {
+    /// The keychain refused the read. The store was not moved.
+    KeychainDenied,
+    /// The encrypted store did not open. The folder was moved aside.
+    WrongKey,
+    /// The store files could not be moved aside. They stay. Nothing was deleted.
+    MoveFailed,
+}
+
+/// `true` when this command makes a helper read the session key.
+///
+/// A start with no Signal or WhatsApp account does not send one of these.
+#[must_use]
+pub const fn command_reads_session_key(command: &AdapterCommand) -> bool {
+    matches!(
+        command,
+        AdapterCommand::SignalBeginLink { .. }
+            | AdapterCommand::WhatsAppBeginLink { .. }
+            | AdapterCommand::RetryStoreKey { .. }
+    )
+}
+
 /// Events a worker may push. The UI is the only consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterEvent {
@@ -460,6 +508,11 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         status: AdapterStatus,
         detail: String,
+    },
+    /// The session key could not be used. This does not end the account.
+    StoreAccess {
+        protocol: ProtocolId,
+        reason: StoreAccessReason,
     },
     ConversationUpsert {
         conversation: Conversation,

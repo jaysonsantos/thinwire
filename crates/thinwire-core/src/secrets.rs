@@ -949,13 +949,13 @@ impl fmt::Debug for SecretStore {
     }
 }
 
-fn memory_requested() -> bool {
+pub(crate) fn memory_requested() -> bool {
     std::env::var_os(KEYRING_ENV).is_some_and(|value| value == KEYRING_MEMORY)
 }
 
 /// Why no OS store settled.
 #[derive(Debug)]
-enum AttachError {
+pub(crate) enum AttachError {
     /// No usable OS store: memory-only for this session.
     Absent(SecretError),
     /// A store is present but failed (locked, prompt dismissed, timeout, D-Bus
@@ -1026,7 +1026,7 @@ fn no_bus_at_connect(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-fn probe_os() -> Result<OsBackend, AttachError> {
+pub(crate) fn probe_os() -> Result<OsBackend, AttachError> {
     if keyring_core::get_default_store().is_none() {
         let backend = install_platform_store()?;
         let _ = OS_BACKEND.set(backend);
@@ -1096,7 +1096,13 @@ fn try_linux_store(backend: OsBackend) -> Result<(), keyring_core::Error> {
 #[cfg(not(target_os = "linux"))]
 fn install_platform_store() -> Result<OsBackend, AttachError> {
     let store = {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "keychain-security-cli"))]
+        {
+            tracing::info!("Keychain access goes through the security command (local build)");
+            crate::security_cli::Store::new()
+                .map_err(|error| AttachError::Absent(map_keyring_error(error)))?
+        }
+        #[cfg(all(target_os = "macos", not(feature = "keychain-security-cli")))]
         {
             apple_native_keyring_store::keychain::Store::new()
                 .map_err(|error| AttachError::Absent(map_keyring_error(error)))?
@@ -1253,7 +1259,7 @@ impl SecretStore {
     }
 }
 
-fn map_keyring_error(error: keyring_core::Error) -> SecretError {
+pub(crate) fn map_keyring_error(error: keyring_core::Error) -> SecretError {
     let kind = match error {
         keyring_core::Error::NoEntry => "not found",
         keyring_core::Error::NoStorageAccess(_) => "no storage access",

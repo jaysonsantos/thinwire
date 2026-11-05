@@ -8,7 +8,7 @@
 use crate::notify::NotifyKey;
 use thinwire_protocol::{MessageTopic, ProtocolId};
 
-use crate::state::{AuthKey, InboxFilter};
+use crate::state::AuthKey;
 use crate::{SecretText, ThemeMode};
 
 /// One user action. Frontends map clicks and keys to these values.
@@ -28,14 +28,15 @@ pub enum Intent {
         conversation_id: String,
         topic: MessageTopic,
     },
+    /// Leave the open topic of this chat and show its topic list. Dropped
+    /// when another chat is open.
+    CloseTopic { conversation_id: String },
     /// Move the inbox highlight by `delta` rows. Down is positive.
     /// This does not open the chat and does not focus the compose field.
     MoveInbox { delta: i32 },
     /// Move the inbox highlight to the row that has keyboard focus.
     /// This does not open the chat.
     FocusInbox { id: String },
-    /// Select the account of one top-bar pill. There is no combined inbox.
-    SetFilter(InboxFilter),
     /// Inbox search text. Matches chat title and participant only.
     /// `SecretText` keeps the typed text out of `Debug`.
     SetSearch(SecretText),
@@ -60,6 +61,22 @@ pub enum Intent {
         protocol: ProtocolId,
         conversation_id: String,
         topic: Option<MessageTopic>,
+    },
+    /// Attach photos and videos to the tray of this thread: dropped files,
+    /// pasted files, or a pasted image that the frontend saved as a file.
+    /// Another file is skipped, and the tray says why.
+    AddAttachments {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        paths: Vec<std::path::PathBuf>,
+    },
+    /// Take the file at `index` out of the tray of this thread.
+    RemoveAttachment {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        index: usize,
     },
     /// Send a failed outgoing message again.
     Retry { message_id: String },
@@ -96,6 +113,9 @@ pub enum Intent {
     /// Start the helper process of this protocol again (ADR 0013). It acts
     /// only while the account row shows "Helper stopped."
     RestartHelper(ProtocolId),
+    /// Read the session key again after the keychain refused the read.
+    /// This does not start a link and does not move the store.
+    RetryStoreKey(ProtocolId),
     /// Open the README risk text for an unofficial account. This does not
     /// start or cancel a link.
     ShowNotice(ProtocolId),

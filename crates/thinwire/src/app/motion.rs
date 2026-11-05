@@ -36,7 +36,7 @@ pub(crate) fn spinner(ui: &mut egui::Ui) {
     paint_spinner(ui, None);
 }
 
-/// The top-bar spinner: a fixed size and color, or [`WORKING`] when motion
+/// The spinner in the chat list header: a fixed size and color, or [`WORKING`] when motion
 /// is off.
 pub(crate) fn busy_spinner(ui: &mut egui::Ui, size: f32, color: Color32) {
     paint_spinner(ui, Some((size, color)));

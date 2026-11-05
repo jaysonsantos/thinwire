@@ -15,16 +15,17 @@ use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::store::error::StoreError;
 use whatsapp_rust::types::events::{Event, EventKind};
 use whatsapp_rust::wacore::proto_helpers::{MessageBuilderExt, MessageExt};
+use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::{Client, ClientError, Jid, RunCompletionReason};
 
-use super::inbox::{HistoryChat, Mute, WaMessage};
+use super::inbox::{HistoryChat, MEDIA_MAX_BYTES, MediaRef, Mute, Sticker, WaMessage};
 use super::link::{Callbacks, LinkBackend, StartError, Started};
 use super::path::{
     prepare_session_dir, remove_device_store, restrict_store_file, revoked_marker,
     whatsapp_device_store_path,
 };
-use super::session::{LinkEvent, SendFailure, SendFuture, WhatsAppSender};
+use super::session::{DownloadFuture, LinkEvent, SendFailure, SendFuture, WhatsAppSender};
 use thinwire_protocol::RedactedPairingSecret;
 
 /// whatsapp-rust client work for the link owner. No state of its own.
@@ -39,8 +40,13 @@ impl LinkBackend for LiveBackend {
         _generation: u64,
         phone: Option<String>,
         callbacks: Callbacks,
+        resume: bool,
     ) -> Result<Started<BotHandle>, StartError> {
         let path = whatsapp_device_store_path().map_err(|()| StartError::DataDir)?;
+        // A resume never makes a store or a key: no file, no session.
+        if resume && !path.is_file() {
+            return Err(StartError::NotPaired);
+        }
         let parent = path
             .parent()
             .map(std::path::Path::to_path_buf)
@@ -50,9 +56,43 @@ impl LinkBackend for LiveBackend {
             .ok()
             .and_then(Result::ok)
             .ok_or(StartError::Store)?;
+        let store_path = path.clone();
+        let protected =
+            tokio::task::spawn_blocking(move || super::cipher::protect_store(&store_path))
+                .await
+                .map_err(|_| StartError::Store)?;
+        protected.map_err(|fail| match fail {
+            super::cipher::ProtectFail::KeychainDenied => StartError::KeychainDenied {
+                saved: path.is_file(),
+            },
+            super::cipher::ProtectFail::WrongKey => StartError::WrongKey,
+            super::cipher::ProtectFail::NotMoved => StartError::MoveFailed,
+            super::cipher::ProtectFail::NotSaved => {
+                StartError::Reported(thinwire_protocol::whatsapp_key_not_saved().to_string())
+            }
+            super::cipher::ProtectFail::EncryptFailed => {
+                StartError::Reported(thinwire_protocol::whatsapp_encrypt_failed().to_string())
+            }
+        })?;
         let db = path.to_str().ok_or(StartError::Store)?;
-        let backend = SqliteStore::open(db).await.map_err(|_| StartError::Store)?;
+        let backend = super::cipher::open_store(db)
+            .await
+            .map_err(|()| StartError::Store)?;
         let _ = restrict_store_file(&path);
+        // A store from a pairing that did not end has no phone number. A
+        // resume of it would ask for a new QR code: stop before the client.
+        if resume {
+            use whatsapp_rust::store::DeviceStore as _;
+            let paired = backend
+                .load()
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|device| device.pn.is_some());
+            if !paired {
+                return Err(StartError::NotPaired);
+            }
+        }
         let bot = build_bot(backend, digits_only(phone), callbacks)
             .await
             .map_err(|()| StartError::Build)?;
@@ -82,6 +122,15 @@ impl LinkBackend for LiveBackend {
             .await
             .map_err(|_| ())?
             .map_err(|_| ())
+    }
+
+    async fn has_store(&self) -> bool {
+        let Ok(path) = whatsapp_device_store_path() else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || path.is_file())
+            .await
+            .unwrap_or(false)
     }
 
     async fn is_revoked(&self) -> bool {
@@ -126,17 +175,17 @@ async fn build_bot(
     phone_number: Option<String>,
     callbacks: Callbacks,
 ) -> Result<Bot, ()> {
-    let mut builder =
-        Bot::builder()
-            .with_backend(backend)
-            .on_event_for(INBOX_EVENTS, move |event, _client| {
-                let callbacks = callbacks.clone();
-                async move {
-                    if let Some(link_event) = map_event(&event) {
-                        callbacks.send(link_event);
-                    }
+    let mut builder = Bot::builder()
+        .with_backend(backend)
+        .with_device_props(device_props())
+        .on_event_for(INBOX_EVENTS, move |event, _client| {
+            let callbacks = callbacks.clone();
+            async move {
+                if let Some(link_event) = map_event(&event) {
+                    callbacks.send(link_event);
                 }
-            });
+            }
+        });
     if let Some(phone_number) = phone_number {
         builder = builder.with_pair_code(PairCodeOptions {
             phone_number,
@@ -144,6 +193,15 @@ async fn build_bot(
         });
     }
     builder.build().await.map_err(|_| ())
+}
+
+/// The name on the phone's Linked devices list. The library default is
+/// "rust". WhatsApp reads it only when the device pairs, so a device that
+/// linked before keeps the old name until it links again.
+pub(crate) const DEVICE_NAME: &str = "thinwire";
+
+fn device_props() -> DevicePropsOverride {
+    DevicePropsOverride::new().with_os(DEVICE_NAME)
 }
 
 fn map_event(event: &Event) -> Option<LinkEvent> {
@@ -184,6 +242,7 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
                         sender_jid: Some(info.source.sender.to_non_ad().to_string()),
                         body: body_of(&inbound.message)?,
                         timestamp: info.timestamp.timestamp(),
+                        sticker: sticker_of(&inbound.message),
                     })
                 })
                 .collect(),
@@ -248,6 +307,32 @@ fn map_history_message(chat_jid: &str, info: &wa::WebMessageInfo) -> Option<WaMe
             .message_timestamp
             .and_then(|ts| i64::try_from(ts).ok())
             .unwrap_or(0),
+        sticker: info.message.as_option().and_then(sticker_of),
+    })
+}
+
+/// The sticker of a sticker message, when the app can draw it: a WebP or a
+/// PNG image of [`MEDIA_MAX_BYTES`] or less. A Lottie sticker is not an
+/// image, so its row keeps "[sticker]".
+fn sticker_of(message: &wa::Message) -> Option<Sticker> {
+    let sticker = message.get_base_message().sticker_message.as_option()?;
+    if sticker.is_lottie == Some(true) {
+        return None;
+    }
+    let drawable = sticker
+        .mimetype
+        .as_deref()
+        .is_none_or(|mime| mime == "image/webp" || mime == "image/png");
+    let fits = sticker
+        .file_length
+        .is_none_or(|length| usize::try_from(length).is_ok_and(|length| length <= MEDIA_MAX_BYTES));
+    if !drawable || !fits {
+        return None;
+    }
+    Some(Sticker {
+        width: sticker.width.unwrap_or(0),
+        height: sticker.height.unwrap_or(0),
+        media: MediaRef::new(sticker.clone()),
     })
 }
 
@@ -368,6 +453,92 @@ impl WhatsAppSender for LiveSender {
                 .map_err(|error| classify_send_error(&error))
         })
     }
+
+    fn send_media<'a>(
+        &'a self,
+        chat_jid: &'a str,
+        file: &'a thinwire_protocol::OutgoingFile,
+        caption: &'a str,
+    ) -> SendFuture<'a> {
+        Box::pin(async move {
+            use whatsapp_rust::download::MediaType;
+            use whatsapp_rust::waproto::buffa::MessageField;
+            let jid: Jid = chat_jid.parse().map_err(|_| SendFailure::Rejected)?;
+            // An error can hold the path. It stays out of the log.
+            let size = tokio::fs::metadata(&file.path)
+                .await
+                .map_err(|_| SendFailure::Rejected)?
+                .len();
+            if size > thinwire_protocol::MAX_ATTACHMENT_BYTES {
+                return Err(SendFailure::Rejected);
+            }
+            let data = tokio::fs::read(&file.path)
+                .await
+                .map_err(|_| SendFailure::Rejected)?;
+            let kind = match file.kind {
+                thinwire_protocol::MediaKind::Photo => MediaType::Image,
+                thinwire_protocol::MediaKind::Video => MediaType::Video,
+            };
+            let upload = self
+                .client
+                .upload(data, kind, whatsapp_rust::UploadOptions::new())
+                .await
+                .map_err(|_| SendFailure::Network)?;
+            let caption = (!caption.is_empty()).then(|| caption.to_string());
+            let mut message = wa::Message::default();
+            // The proto structs are non-exhaustive: set the fields one by one.
+            match file.kind {
+                thinwire_protocol::MediaKind::Photo => {
+                    let mut image = wa::message::ImageMessage::default();
+                    image.url = Some(upload.url);
+                    image.mimetype = Some(file.mime().to_string());
+                    image.caption = caption;
+                    image.file_sha256 = Some(upload.file_sha256.to_vec());
+                    image.file_length = Some(upload.file_length);
+                    image.media_key = Some(upload.media_key.to_vec());
+                    image.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
+                    image.direct_path = Some(upload.direct_path);
+                    image.media_key_timestamp = Some(upload.media_key_timestamp);
+                    message.image_message = MessageField::some(image);
+                }
+                thinwire_protocol::MediaKind::Video => {
+                    let mut video = wa::message::VideoMessage::default();
+                    video.url = Some(upload.url);
+                    video.mimetype = Some(file.mime().to_string());
+                    video.caption = caption;
+                    video.file_sha256 = Some(upload.file_sha256.to_vec());
+                    video.file_length = Some(upload.file_length);
+                    video.media_key = Some(upload.media_key.to_vec());
+                    video.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
+                    video.direct_path = Some(upload.direct_path);
+                    video.media_key_timestamp = Some(upload.media_key_timestamp);
+                    video.streaming_sidecar = upload.streaming_sidecar;
+                    message.video_message = MessageField::some(video);
+                }
+            }
+            self.client
+                .send_message(jid, message)
+                .await
+                .map(|sent| sent.message_id.to_string())
+                .map_err(|error| classify_send_error(&error))
+        })
+    }
+
+    fn download<'a>(&'a self, media: &'a MediaRef) -> DownloadFuture<'a> {
+        Box::pin(async move {
+            let sticker = media.get::<wa::message::StickerMessage>().ok_or(())?;
+            // The error can name a host or a path. It stays out of the log.
+            let bytes = self
+                .client
+                .download(sticker, Default::default())
+                .await
+                .map_err(|_| ())?;
+            if bytes.len() > MEDIA_MAX_BYTES {
+                return Err(());
+            }
+            Ok(bytes)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +623,42 @@ mod tests {
         );
         let debug = format!("{:?}", SendFailure::Rejected);
         assert!(!debug.contains("111"));
+    }
+
+    /// The phone lists this device as "thinwire", not as the library
+    /// default "rust".
+    #[test]
+    fn the_linked_device_is_named_thinwire() {
+        assert_eq!(device_props().os.as_deref(), Some("thinwire"));
+    }
+
+    /// A WebP sticker can be drawn. A Lottie sticker and a large file
+    /// cannot: their rows keep "[sticker]".
+    #[test]
+    fn only_a_small_image_sticker_downloads() {
+        let with = |edit: fn(&mut wa::message::StickerMessage)| {
+            let mut sticker = wa::message::StickerMessage::default();
+            sticker.mimetype = Some("image/webp".into());
+            sticker.width = Some(512);
+            sticker.height = Some(512);
+            sticker.file_length = Some(40_000);
+            edit(&mut sticker);
+            let mut message = wa::Message::default();
+            message.sticker_message = whatsapp_rust::waproto::buffa::MessageField::some(sticker);
+            message
+        };
+        let webp = sticker_of(&with(|_| {})).expect("a webp sticker");
+        assert_eq!((webp.width, webp.height), (512, 512));
+        assert_eq!(body_of(&with(|_| {})).as_deref(), Some("[sticker]"));
+        assert!(sticker_of(&with(|sticker| sticker.is_lottie = Some(true))).is_none());
+        assert!(sticker_of(&with(|sticker| sticker.file_length = Some(10_000_000))).is_none());
+        assert!(
+            sticker_of(&with(
+                |sticker| sticker.mimetype = Some("application/was".into())
+            ))
+            .is_none()
+        );
+        assert!(sticker_of(&wa::Message::text("hi")).is_none());
     }
 
     #[test]

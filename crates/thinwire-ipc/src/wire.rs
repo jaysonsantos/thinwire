@@ -12,7 +12,11 @@ use crate::SecretText;
 
 /// Version of the wire protocol. The app refuses a helper with another
 /// version.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 adds [`WireCommand::RetryStoreKey`] and
+/// [`WireEvent::StoreAccess`]. Version 3 adds [`WireCommand::SendMedia`]
+/// and [`WireMessage::photo`]. An older peer cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A protocol that a helper carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -101,6 +105,14 @@ pub enum WireCommand {
         message_id: String,
         request: u64,
     },
+    /// Send photos and videos with the text as the caption. The helper reads
+    /// each file from its path: the bytes do not cross the pipe.
+    SendMedia {
+        conversation_id: String,
+        files: Vec<WireFile>,
+        caption: String,
+        request: u64,
+    },
     /// The chat the user now looks at. `None`: the user left every chat.
     ViewChat {
         conversation_id: Option<String>,
@@ -115,6 +127,9 @@ pub enum WireCommand {
     },
     /// Stop a pairing that is not complete.
     CancelLink,
+    /// Read the session key again. This is not a new link and it does not
+    /// move the store.
+    RetryStoreKey,
 }
 
 impl WireCommand {
@@ -129,11 +144,30 @@ impl WireCommand {
             Self::LoadOlderMessages { .. } => "load_older_messages",
             Self::SendText { .. } => "send_text",
             Self::ResendMessage { .. } => "resend_message",
+            Self::SendMedia { .. } => "send_media",
             Self::ViewChat { .. } => "view_chat",
             Self::AcknowledgeGate => "acknowledge_gate",
             Self::BeginLink { .. } => "begin_link",
             Self::CancelLink => "cancel_link",
+            Self::RetryStoreKey => "retry_store_key",
         }
+    }
+
+    /// `true` when this command makes the helper read the session key.
+    ///
+    /// `Connect` and the gate do not. A start with no Signal or WhatsApp
+    /// account sends neither of the commands that read the key.
+    #[must_use]
+    pub const fn reads_session_key(&self) -> bool {
+        matches!(self, Self::BeginLink { .. } | Self::RetryStoreKey)
+    }
+
+    /// `true` when this command starts the helper process.
+    ///
+    /// [`Self::RetryStoreKey`] does not. A retry must not start a new link.
+    #[must_use]
+    pub const fn wakes_helper(&self) -> bool {
+        matches!(self, Self::AcknowledgeGate | Self::BeginLink { .. })
     }
 }
 
@@ -141,6 +175,28 @@ impl fmt::Debug for WireCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "WireCommand({})", self.kind())
     }
+}
+
+/// One file of a media send: a local path and its kind.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireFile {
+    pub path: String,
+    pub kind: WireMediaKind,
+}
+
+impl fmt::Debug for WireFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WireFile({:?})", self.kind)
+    }
+}
+
+/// The kind of a file of a media send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireMediaKind {
+    Photo,
+    Video,
 }
 
 /// Live adapter state. A wire copy of `AdapterStatus`.
@@ -217,6 +273,59 @@ pub struct WireMessage {
     /// Unix seconds when the message was sent. Zero when unknown.
     pub sent_at: i64,
     pub arrival: WireArrival,
+    /// An image of the message, for example a sticker. `None` when the
+    /// message has no image, or when the helper did not download it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<WirePhoto>,
+}
+
+/// An image of a message, as encoded bytes (WebP, PNG, or JPEG).
+///
+/// The bytes cross as base64. A line holds 1 MiB at most, so the helper
+/// sends only an image of [`WirePhoto::MAX_BYTES`] or less.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirePhoto {
+    pub width: u32,
+    pub height: u32,
+    #[serde(with = "base64_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+impl WirePhoto {
+    /// The largest image that fits in one line, with room for the rest of
+    /// the message. Base64 makes the bytes 4/3 as long.
+    pub const MAX_BYTES: usize = 512 * 1024;
+}
+
+impl fmt::Debug for WirePhoto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "WirePhoto({}x{}, {} bytes)",
+            self.width,
+            self.height,
+            self.bytes.len()
+        )
+    }
+}
+
+/// Bytes as one base64 string, not as a JSON array of numbers.
+mod base64_bytes {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
 }
 
 impl fmt::Debug for WireMessage {
@@ -302,6 +411,21 @@ pub enum WireEvent {
         code: SecretText,
         generation: u64,
     },
+    /// The session key could not be used. This is not an account end.
+    /// `KeychainDenied` did not move the store. `WrongKey` did.
+    StoreAccess {
+        reason: WireStoreAccess,
+    },
+}
+
+/// Why the helper could not use the session key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireStoreAccess {
+    /// The keychain refused the read. The store stays where it is.
+    KeychainDenied,
+    /// The encrypted store did not open. The folder was moved aside.
+    WrongKey,
 }
 
 impl WireEvent {
@@ -328,6 +452,7 @@ impl WireEvent {
             Self::OlderHistoryLoaded { .. } => "older_history_loaded",
             Self::Qr { .. } => "qr",
             Self::PairCode { .. } => "pair_code",
+            Self::StoreAccess { .. } => "store_access",
         }
     }
 }
@@ -358,7 +483,37 @@ mod tests {
             delivery: WireDelivery::Sent,
             sent_at: 1_790_000_000,
             arrival: WireArrival::Live,
+            photo: None,
         }
+    }
+
+    /// A photo crosses as one base64 string. A message with no photo has no
+    /// `photo` key, and a line with no key still reads.
+    #[test]
+    fn a_photo_crosses_as_base64() {
+        let mut with_photo = message();
+        with_photo.photo = Some(WirePhoto {
+            width: 512,
+            height: 512,
+            bytes: vec![0x52, 0x49, 0x46, 0x46],
+        });
+        let line = HelperLine::Event {
+            protocol: WireProtocol::WhatsApp,
+            event: WireEvent::MessageReceived {
+                message: with_photo.clone(),
+            },
+        };
+        let text = encode(&line).expect("encode");
+        assert!(text.contains("\"bytes\":\"UklGRg==\""), "{text}");
+        assert_eq!(decode::<HelperLine>(text.trim_end()).expect("decode"), line);
+        let plain = encode(&HelperLine::Event {
+            protocol: WireProtocol::WhatsApp,
+            event: WireEvent::MessageReceived { message: message() },
+        })
+        .expect("encode");
+        assert!(!plain.contains("photo"), "{plain}");
+        let debug = format!("{:?}", with_photo.photo);
+        assert!(!debug.contains("82"), "{debug}");
     }
 
     #[test]
@@ -409,6 +564,11 @@ mod tests {
                     request: 900_001,
                 },
             },
+            AppLine::Request {
+                id: 4,
+                protocol: WireProtocol::Signal,
+                command: WireCommand::RetryStoreKey,
+            },
             AppLine::Shutdown,
         ];
         for line in app {
@@ -442,6 +602,18 @@ mod tests {
             HelperLine::Event {
                 protocol: WireProtocol::WhatsApp,
                 event: WireEvent::ChatListLoaded,
+            },
+            HelperLine::Event {
+                protocol: WireProtocol::Signal,
+                event: WireEvent::StoreAccess {
+                    reason: WireStoreAccess::KeychainDenied,
+                },
+            },
+            HelperLine::Event {
+                protocol: WireProtocol::WhatsApp,
+                event: WireEvent::StoreAccess {
+                    reason: WireStoreAccess::WrongKey,
+                },
             },
             HelperLine::Stopped {
                 protocol: WireProtocol::WhatsApp,
@@ -513,5 +685,28 @@ mod tests {
                 assert!(!shown.contains(secret), "{shown}");
             }
         }
+    }
+
+    #[test]
+    fn the_session_key_is_read_only_for_an_account_command() {
+        let begin = WireCommand::BeginLink {
+            generation: 1,
+            phone: None,
+        };
+        assert!(begin.reads_session_key());
+        assert!(begin.wakes_helper());
+        assert!(WireCommand::RetryStoreKey.reads_session_key());
+        assert!(!WireCommand::RetryStoreKey.wakes_helper());
+        for command in [
+            WireCommand::Connect,
+            WireCommand::Disconnect,
+            WireCommand::AcknowledgeGate,
+            WireCommand::CancelLink,
+            WireCommand::LoadChats,
+        ] {
+            assert!(!command.reads_session_key(), "{}", command.kind());
+        }
+        assert!(WireCommand::AcknowledgeGate.wakes_helper());
+        assert!(!WireCommand::Connect.wakes_helper());
     }
 }
