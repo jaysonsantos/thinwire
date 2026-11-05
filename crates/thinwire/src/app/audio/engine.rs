@@ -23,18 +23,27 @@ const OPUS_RATE: u32 = 48_000;
 const END_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) enum Cmd {
-    Play(AudioPath),
+    Play { path: AudioPath, generation: u64 },
     Stop,
 }
 
+/// End of one play. `generation` is the [`Cmd::Play`] that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Done {
-    Finished,
-    Rejected,
+    Finished { generation: u64 },
+    Rejected { generation: u64 },
+}
+
+impl Done {
+    pub(super) fn generation(self) -> u64 {
+        match self {
+            Self::Finished { generation } | Self::Rejected { generation } => generation,
+        }
+    }
 }
 
 enum Wire {
-    Play(AudioPath),
+    Play { path: AudioPath, generation: u64 },
     Stop,
     Shutdown,
 }
@@ -68,7 +77,7 @@ impl Backend for Engine {
             return;
         };
         let wire = match cmd {
-            Cmd::Play(path) => Wire::Play(path),
+            Cmd::Play { path, generation } => Wire::Play { path, generation },
             Cmd::Stop => Wire::Stop,
         };
         let _ = tx.send(wire);
@@ -113,20 +122,25 @@ impl Engine {
     }
 }
 
+/// The sink stays open across notes. `playing` is the generation that still
+/// owes the UI an end event. Stop and a new play clear it before the old
+/// player is dropped, so the end of a replaced note is not reported. A
+/// completion already sitting in the channel keeps the generation of the
+/// play that emitted it.
 struct Output {
     player: Option<Sink>,
     sink: Option<rodio::MixerDeviceSink>,
-    owes_end: bool,
+    playing: Option<u64>,
 }
 
 fn worker(rx: Receiver<Wire>, done: Sender<Done>) {
     let mut output = Output {
         player: None,
         sink: None,
-        owes_end: false,
+        playing: None,
     };
     loop {
-        let incoming = if output.owes_end {
+        let incoming = if output.playing.is_some() {
             match rx.recv_timeout(END_POLL) {
                 Ok(cmd) => Some(cmd),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -140,31 +154,33 @@ fn worker(rx: Receiver<Wire>, done: Sender<Done>) {
         };
         if let Some(cmd) = incoming {
             match cmd {
-                Wire::Play(path) => play(&mut output, &path, &done),
+                Wire::Play { path, generation } => play(&mut output, &path, generation, &done),
                 Wire::Stop => stop(&mut output),
                 Wire::Shutdown => break,
             }
         }
-        if output.owes_end && output.player.as_ref().is_some_and(Sink::empty) {
-            output.owes_end = false;
+        if let Some(generation) = output.playing
+            && output.player.as_ref().is_some_and(Sink::empty)
+        {
+            output.playing = None;
             output.player = None;
-            let _ = done.send(Done::Finished);
+            let _ = done.send(Done::Finished { generation });
         }
     }
 }
 
-fn play(output: &mut Output, path: &AudioPath, done: &Sender<Done>) {
+fn play(output: &mut Output, path: &AudioPath, generation: u64, done: &Sender<Done>) {
     stop(output);
     let buffer = match read_voice(path) {
         Ok(buffer) => buffer,
         Err(()) => {
-            let _ = done.send(Done::Rejected);
+            let _ = done.send(Done::Rejected { generation });
             return;
         }
     };
     if ensure_sink(output).is_err() {
         tracing::warn!("voice output is unavailable");
-        let _ = done.send(Done::Rejected);
+        let _ = done.send(Done::Rejected { generation });
         return;
     }
     let player = {
@@ -173,11 +189,11 @@ fn play(output: &mut Output, path: &AudioPath, done: &Sender<Done>) {
     };
     player.append(buffer);
     output.player = Some(player);
-    output.owes_end = true;
+    output.playing = Some(generation);
 }
 
 fn stop(output: &mut Output) {
-    output.owes_end = false;
+    output.playing = None;
     output.player = None;
 }
 

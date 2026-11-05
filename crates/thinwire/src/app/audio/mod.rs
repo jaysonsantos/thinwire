@@ -231,6 +231,8 @@ fn clock(total_secs: u32) -> String {
 
 pub(crate) struct Player<B: Backend = engine::Engine> {
     session: Session,
+    /// Latest play sent to the device. Any other completion is ignored.
+    generation: u64,
     engine: B,
 }
 
@@ -239,6 +241,7 @@ impl Player<engine::Engine> {
     pub(crate) fn new() -> Self {
         Self {
             session: Session::Idle,
+            generation: 0,
             engine: engine::Engine::new(),
         }
     }
@@ -258,10 +261,15 @@ impl<B: Backend> Player<B> {
 
     /// The open thread, after the core has applied this frame's events.
     pub(crate) fn sync(&mut self, messages: &[ChatMessage]) {
-        if let Some(done) = self.engine.take_done() {
+        // A completion can already be queued when a newer play replaces it.
+        // The worker stamps the play that produced it. Applying an older one
+        // would stop or clear the note that is current now.
+        if let Some(done) = self.engine.take_done()
+            && done.generation() == self.generation
+        {
             let input = match done {
-                engine::Done::Finished => Input::Ended,
-                engine::Done::Rejected => Input::Rejected,
+                engine::Done::Finished { .. } => Input::Ended,
+                engine::Done::Rejected { .. } => Input::Rejected,
             };
             self.commit(step(&self.session, input));
         }
@@ -344,7 +352,13 @@ impl<B: Backend> Player<B> {
             match effect {
                 Effect::None => {}
                 Effect::Download { file_id } => download = Some(file_id),
-                Effect::Start(path) => self.engine.send(engine::Cmd::Play(path)),
+                Effect::Start(path) => {
+                    self.generation += 1;
+                    self.engine.send(engine::Cmd::Play {
+                        path,
+                        generation: self.generation,
+                    });
+                }
                 Effect::StopSink => self.engine.send(engine::Cmd::Stop),
             }
         }
@@ -426,8 +440,16 @@ mod tests {
     fn test_player() -> Player<Fake> {
         Player {
             session: Session::Idle,
+            generation: 0,
             engine: Fake::default(),
         }
+    }
+
+    fn play_generation(cmd: &Cmd) -> u64 {
+        let Cmd::Play { generation, .. } = cmd else {
+            panic!("expected play");
+        };
+        *generation
     }
 
     fn key(message_id: &str) -> VoiceKey {
@@ -748,12 +770,12 @@ mod tests {
         let mut out = Vec::new();
         player.press(ProtocolId::Telegram, "telegram:1", "m", &audio, &mut out);
         assert!(out.is_empty());
-        assert!(matches!(player.engine.cmds.as_slice(), [Cmd::Play(_)]));
+        assert!(matches!(player.engine.cmds.as_slice(), [Cmd::Play { .. }]));
         player.press(ProtocolId::Telegram, "telegram:1", "m", &audio, &mut out);
         assert!(out.is_empty());
         assert!(matches!(
             player.engine.cmds.as_slice(),
-            [Cmd::Play(_), Cmd::Stop]
+            [Cmd::Play { .. }, Cmd::Stop]
         ));
         assert!(matches!(player.session, Session::Idle));
     }
@@ -769,12 +791,12 @@ mod tests {
         ready.set_file(path());
         player.sync(std::slice::from_ref(&voice("m", Some(ready))));
         assert!(matches!(player.session, Session::Playing(_)));
-        assert!(matches!(player.engine.cmds.as_slice(), [Cmd::Play(_)]));
+        assert!(matches!(player.engine.cmds.as_slice(), [Cmd::Play { .. }]));
         player.sync(&[]);
         assert!(matches!(player.session, Session::Idle));
         assert!(matches!(
             player.engine.cmds.as_slice(),
-            [Cmd::Play(_), Cmd::Stop]
+            [Cmd::Play { .. }, Cmd::Stop]
         ));
     }
 
@@ -789,7 +811,90 @@ mod tests {
         assert!(matches!(player.session, Session::Idle));
         assert!(matches!(
             player.engine.cmds.as_slice(),
-            [Cmd::Play(_), Cmd::Stop]
+            [Cmd::Play { .. }, Cmd::Stop]
+        ));
+    }
+
+    #[test]
+    fn a_done_from_a_superseded_play_does_not_stop_or_clear_the_current_note() {
+        let first = MessageAudio::telegram(3, 7, Some(path())).expect("note");
+        let second = MessageAudio::telegram(4, 8, Some(path())).expect("note");
+        let mut player = test_player();
+        let mut out = Vec::new();
+        player.press(ProtocolId::Telegram, "telegram:1", "a", &first, &mut out);
+        let older = play_generation(&player.engine.cmds[0]);
+        // The end of note A is already queued when the user starts note B.
+        player
+            .engine
+            .done
+            .push_back(Done::Finished { generation: older });
+        player.press(ProtocolId::Telegram, "telegram:1", "b", &second, &mut out);
+        let current = play_generation(&player.engine.cmds[1]);
+        assert_ne!(older, current);
+
+        let open = [voice("a", Some(first)), voice("b", Some(second))];
+        player.sync(&open);
+        assert!(matches!(
+            &player.session,
+            Session::Playing(key) if key.message_id == "b"
+        ));
+        assert!(matches!(
+            player.engine.cmds.as_slice(),
+            [Cmd::Play { .. }, Cmd::Play { .. }]
+        ));
+
+        // Note A was still decoding and rejects after B is the current play.
+        player
+            .engine
+            .done
+            .push_back(Done::Rejected { generation: older });
+        player.sync(&open);
+        assert!(matches!(
+            &player.session,
+            Session::Playing(key) if key.message_id == "b"
+        ));
+        assert!(matches!(
+            player.engine.cmds.as_slice(),
+            [Cmd::Play { .. }, Cmd::Play { .. }]
+        ));
+
+        player.sync(&[]);
+        assert!(matches!(player.session, Session::Idle));
+        assert!(matches!(
+            player.engine.cmds.as_slice(),
+            [Cmd::Play { .. }, Cmd::Play { .. }, Cmd::Stop]
+        ));
+    }
+
+    #[test]
+    fn a_finished_event_of_the_current_play_clears_the_session() {
+        let note = MessageAudio::telegram(3, 7, Some(path())).expect("note");
+        let mut player = test_player();
+        let mut out = Vec::new();
+        player.press(ProtocolId::Telegram, "telegram:1", "a", &note, &mut out);
+        let generation = play_generation(&player.engine.cmds[0]);
+        player.engine.done.push_back(Done::Finished { generation });
+        player.sync(std::slice::from_ref(&voice("a", Some(note))));
+        assert!(matches!(player.session, Session::Idle));
+        assert!(matches!(player.engine.cmds.as_slice(), [Cmd::Play { .. }]));
+    }
+
+    #[test]
+    fn a_rejected_event_of_the_current_play_stops_it() {
+        let note = MessageAudio::telegram(3, 7, Some(path())).expect("note");
+        let mut player = test_player();
+        let mut out = Vec::new();
+        player.press(ProtocolId::Telegram, "telegram:1", "a", &note, &mut out);
+        let generation = play_generation(&player.engine.cmds[0]);
+        player.engine.done.push_back(Done::Rejected { generation });
+        player.sync(std::slice::from_ref(&voice("a", Some(note))));
+        assert!(matches!(
+            &player.session,
+            Session::Failed(key) if key.message_id == "a"
+        ));
+        assert!(matches!(
+            player.engine.cmds.as_slice(),
+            [Cmd::Play { .. }, Cmd::Stop]
         ));
     }
 
