@@ -10,6 +10,7 @@ cd "$(dirname "$script_dir")"
 # System libraries for building and running the egui/eframe (winit + glow) GUI.
 # The Rust toolchain, cmake and pkg-config already ship in the base image; these
 # X11/Wayland/OpenGL libraries are the ones the desktop shell links and dlopens.
+# libasound2-dev supplies alsa.pc. Voice notes link ALSA through rodio.
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
@@ -27,7 +28,8 @@ sudo apt-get install -y --no-install-recommends \
   libgl1 \
   libglx-mesa0 \
   libgl1-mesa-dri \
-  libegl1
+  libegl1 \
+  libasound2-dev
 
 # Warm the workspace build so the first agent command is fast and setup is
 # verified end to end. Matches the canonical dev command from the README.

@@ -114,6 +114,8 @@ nix develop --command scripts/lint.sh
 nix develop --command scripts/test.sh
 ```
 
+On Linux, a build outside the Nix shell needs `libasound2-dev`. Voice-note playback links ALSA, and `alsa-sys` finds it with `pkg-config` (`alsa.pc`). The Nix dev shell supplies `alsa-lib`.
+
 UI snapshots (Linux, lavapipe). The default `cargo test` does not run them. CI job `ui-snapshots` does. Rewrite the images in `crates/thinwire/tests/snapshots/` with:
 
 ```bash
@@ -139,6 +141,7 @@ The Linux dev shell adds the items that a live run needs:
 - `llvmPackages.libcxx`. The static TDLib links and loads `libc++` and `libc++abi`. You do not need the distro `libc++-dev` packages in this shell.
 - nixpkgs `mesa` for OpenGL. The shell sets `LD_LIBRARY_PATH`, `__EGL_VENDOR_LIBRARY_DIRS`, and `LIBGL_DRIVERS_PATH` to that mesa. On non-NixOS Linux, the Nix `libglvnd` does not find the host GL drivers without these variables.
 - nixpkgs `vulkan-loader` and mesa lavapipe (`VK_DRIVER_FILES`) for the UI snapshot tests.
+- `alsa-lib` for voice-note playback. The shell puts it on `PKG_CONFIG_PATH` and `LD_LIBRARY_PATH`. Outside this shell, install `libasound2-dev`.
 
 GPU notes:
 
