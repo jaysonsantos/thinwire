@@ -1,6 +1,7 @@
 //! eframe application: draws the core view and sends user intents to the core.
 
 mod attach;
+mod audio;
 mod auth;
 mod dock;
 mod icons;
@@ -385,6 +386,7 @@ pub struct ThinwireApp {
     /// The close gate's deadline; it bounds the runtime shutdown at exit.
     exit_deadline: Option<Instant>,
     intents: Vec<Intent>,
+    player: audio::Player,
     last_os_theme: Option<egui::Theme>,
     close_gate: CloseGate,
     /// The exit watchdog runs. Started once, on the first close.
@@ -419,6 +421,7 @@ impl ThinwireApp {
             runtime: Some(runtime),
             exit_deadline: None,
             intents: Vec::new(),
+            player: audio::Player::new(),
             last_os_theme: None,
             close_gate: CloseGate::Open,
             watchdog: false,
@@ -631,8 +634,9 @@ impl eframe::App for ThinwireApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let view = self.core.view();
+        self.player.sync(view.selected_messages());
         let mut hints = ui::Hints::from_view(&view);
-        ui::draw(ui, &view, &mut hints, &mut self.intents);
+        ui::draw(ui, &view, &mut hints, &mut self.player, &mut self.intents);
         // Clear a hint only after its widget used it (qa L1).
         if hints.used_focus_compose() {
             self.core.take_focus_compose();
@@ -669,6 +673,7 @@ impl ThinwireApp {
     /// Last step at exit: try the keychain flush first, then stop the runtime
     /// within the close deadline instead of waiting for every blocking task.
     fn finish_exit(&mut self) {
+        self.player.shutdown();
         // Each send with no answer yet is named in the log (protocol and
         // chat id, never the text), so none ends without a trace.
         self.core.log_unfinished_sends();
@@ -752,6 +757,22 @@ mod tests {
             raise_fn.contains("confirm the show"),
             "the residual shown-then-drop race stays documented"
         );
+    }
+
+    #[test]
+    fn voice_playback_starts_after_pump_and_stops_on_exit() {
+        let app = include_str!("mod.rs");
+        let logic = &app[app.find("fn logic(").expect("logic")..];
+        let logic = &logic[..logic.find("\n    }\n").expect("end")];
+        assert!(logic.contains("self.core.pump()"));
+        let ui = &app[app.find("fn ui(&mut self").expect("ui")..];
+        let ui = &ui[..ui.find("\n    fn on_exit(").expect("on_exit")];
+        let sync = ui.find("self.player.sync(").expect("sync");
+        let draw = ui.find("ui::draw(").expect("draw");
+        assert!(sync < draw, "a finished download can start before paint");
+        let finish = &app[app.find("fn finish_exit(").expect("finish")..];
+        let finish = &finish[..finish.find("impl Drop").expect("drop")];
+        assert!(finish.contains("self.player.shutdown()"));
     }
 
     #[test]

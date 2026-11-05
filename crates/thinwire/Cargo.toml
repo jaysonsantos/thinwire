@@ -55,6 +55,15 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ] }
+# Voice notes. `playback` is the output device. rodio 0.23's symphonia
+# features decode Vorbis, not Opus, and Telegram voice notes are Opus in
+# Ogg, so `ogg` and `opus` decode that file in `app/audio/engine.rs`.
+rodio = { version = "0.23", default-features = false, features = [
+  "playback",
+  "vorbis",
+] }
+ogg = "0.9"
+opus = "0.4"
 # `hardened` rejects every scheme except http and https (webbrowser 1.2).
 webbrowser = { version = "1.2", features = ["hardened"] }
 # Host display for the link confirm dialog. `host_str` is the punycode form.

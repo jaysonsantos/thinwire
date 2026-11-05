@@ -11,6 +11,7 @@ use thinwire_protocol::{
     ProtocolId, SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, StoreAccessReason, topic_mute_id,
 };
 
+use super::audio::Player;
 use super::auth;
 use super::icons;
 use super::motion;
@@ -169,6 +170,7 @@ pub(crate) fn draw(
     ui: &mut egui::Ui,
     snapshot: &View<'_>,
     hints: &mut Hints,
+    player: &mut Player,
     out: &mut Vec<Intent>,
 ) {
     super::theme_mode::apply(ui.ctx(), snapshot.theme());
@@ -185,7 +187,7 @@ pub(crate) fn draw(
     status_strip(ui, snapshot, out);
     account_rail(ui, snapshot, out);
     chat_column(ui, snapshot, hints, out);
-    center_panel(ui, snapshot, hints, out);
+    center_panel(ui, snapshot, hints, player, out);
     notice_review(ui, snapshot, out);
     super::links::confirm(ui);
     super::photos::overlay(ui, snapshot.selected_messages());
@@ -968,7 +970,7 @@ fn unofficial_pill_width(ui: &egui::Ui) -> f32 {
         + space::S * 2.0
 }
 
-/// The protocol tile: a tinted square with the first letter. `dot` is the
+/// The protocol tile: a tinted square with the protocol mark. `dot` is the
 /// row fill and the account state: the dot is cut out of the corner in the
 /// row's own fill.
 pub(super) fn paint_protocol_tile(
@@ -981,17 +983,11 @@ pub(super) fn paint_protocol_tile(
     let corner = (tile.width() * 0.28).round().clamp(4.0, 24.0) as u8;
     ui.painter()
         .rect_filled(tile, egui::CornerRadius::same(corner), ink.fill);
-    let initial: String = protocol
-        .display_name()
-        .chars()
-        .take(1)
-        .flat_map(char::to_uppercase)
-        .collect();
-    ui.painter().text(
+    super::icons::protocol(
+        ui.painter(),
         tile.center(),
-        egui::Align2::CENTER_CENTER,
-        initial,
-        egui::FontId::new(tile.width() * 0.46, theme::semibold()),
+        tile.width() * 0.58,
+        protocol,
         ink.text,
     );
     if let Some((fill, color)) = dot {
@@ -1718,7 +1714,7 @@ fn inbox_row(
         egui::Sense::hover(),
     );
     let row_id = ui.scope_id().with(("inbox-row", id));
-    row_backdrop(ui, row_id, rect, palette.sidebar, selected, hover.hovered());
+    let row_fill = row_backdrop(ui, row_id, rect, palette.sidebar, selected, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
     let mut child = ui.new_child(
@@ -1735,7 +1731,7 @@ fn inbox_row(
     avatar_response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::Role::Label, true, format!("avatar {title}"))
     });
-    super::photos::paint_avatar(ui, avatar_rect, protocol, id, title, avatar, out);
+    super::photos::paint_avatar(ui, avatar_rect, protocol, id, title, avatar, row_fill, out);
     child.vertical(|ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 2.0;
@@ -1979,7 +1975,13 @@ fn account_label(status: AdapterStatus) -> &'static str {
     }
 }
 
-fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
+fn center_panel(
+    ui: &mut egui::Ui,
+    snapshot: &View<'_>,
+    hints: &mut Hints,
+    player: &mut Player,
+    out: &mut Vec<Intent>,
+) {
     let fill = theme::palette(ui).bg;
     // The thread runs edge to edge: its header and compose bar own their
     // padding. The other views sit in a padded frame below.
@@ -2016,7 +2018,7 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: 
             motion::FADE,
         ));
         if view == CenterView::Thread {
-            thread(ui, snapshot, hints, out);
+            thread(ui, snapshot, hints, player, out);
             return;
         }
         // A card can be taller than a short window: a long error, or a notice
@@ -2176,7 +2178,13 @@ fn add_slack_workspace(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Int
 #[cfg(not(feature = "slack-oauth"))]
 fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<Intent>) {}
 
-fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
+fn thread(
+    ui: &mut egui::Ui,
+    snapshot: &View<'_>,
+    hints: &mut Hints,
+    player: &mut Player,
+    out: &mut Vec<Intent>,
+) {
     if snapshot.selected_conversation_row().is_none() {
         empty_thread(ui, snapshot);
         return;
@@ -2232,6 +2240,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
             body: &message.body,
             links: &message.links,
             photo: message.photo.as_ref(),
+            audio: message.audio.as_ref(),
             delivery: message.delivery,
             group: is_group,
             layout,
@@ -2340,7 +2349,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
                     }) {
                         unreadable_run_label(ui, run.skipped);
                     }
-                    bubble(ui, message, &mut retry, gap_before, out);
+                    bubble(ui, message, &mut retry, gap_before, player, out);
                     gap_before = Some(message.layout.run_end);
                 }
                 for run in runs.iter().filter(|run| run.before_id.is_none()) {
@@ -2638,9 +2647,12 @@ struct MetaInk {
 }
 
 /// A message of one to three emoji and nothing else. It draws large, with no
-/// bubble. A photo or a link keeps its bubble.
+/// bubble. A photo, a voice note, or a link keeps its bubble.
 fn is_emoji_only(message: &Bubble<'_>) -> bool {
-    message.photo.is_none() && message.links.is_empty() && only_emoji(message.body)
+    message.photo.is_none()
+        && message.audio.is_none()
+        && message.links.is_empty()
+        && only_emoji(message.body)
 }
 
 /// One to three emoji, with the joiners, skin tones, and spaces between them.
@@ -2684,6 +2696,7 @@ struct Bubble<'a> {
     body: &'a str,
     links: &'a [MessageLink],
     photo: Option<&'a MessagePhoto>,
+    audio: Option<&'a thinwire_protocol::MessageAudio>,
     delivery: Delivery,
     /// Group chat. The AccessKit name keeps the sender on every row.
     group: bool,
@@ -2982,6 +2995,7 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
                         &conversation.id,
                         &conversation.title,
                         &conversation.avatar,
+                        palette.bg,
                         &mut avatar_out,
                     );
                     ui.add_space(space::XS);
@@ -3110,6 +3124,7 @@ fn bubble(
     message: &Bubble<'_>,
     retry: &mut Option<String>,
     previous_run_ended: Option<bool>,
+    player: &mut Player,
     out: &mut Vec<Intent>,
 ) {
     let palette = theme::palette(ui);
@@ -3201,6 +3216,14 @@ fn bubble(
                             out,
                         );
                     }
+                    player.show(
+                        ui,
+                        message.protocol,
+                        message.conversation_id,
+                        message.id,
+                        message.audio,
+                        out,
+                    );
                     let caption = !message.body.is_empty() || message.photo.is_none();
                     if !caption {
                         meta_line(ui, message, &ink, false);
@@ -4756,7 +4779,8 @@ mod tests {
             let view = View::from_parts(snapshot, store, settings);
             let mut hints = Hints::default();
             let mut out = Vec::new();
-            draw(ui, &view, &mut hints, &mut out);
+            let mut player = crate::app::audio::Player::new();
+            draw(ui, &view, &mut hints, &mut player, &mut out);
         }
 
         assert_still(
@@ -4815,7 +4839,8 @@ mod tests {
             let view = core.view();
             let mut hints = Hints::default();
             let mut out = Vec::new();
-            draw(ui, &view, &mut hints, &mut out);
+            let mut player = crate::app::audio::Player::new();
+            draw(ui, &view, &mut hints, &mut player, &mut out);
         });
         drop(core);
         drop(runtime);
@@ -4875,7 +4900,8 @@ mod tests {
                 let view = View::from_parts(&snapshot, &store, &settings);
                 let mut hints = Hints::default();
                 let mut out = Vec::new();
-                draw(ui, &view, &mut hints, &mut out);
+                let mut player = crate::app::audio::Player::new();
+                draw(ui, &view, &mut hints, &mut player, &mut out);
             });
         harness.run_steps(4);
         let copies = harness
@@ -5002,7 +5028,8 @@ mod tests {
                 let view = View::from_parts(&snapshot, &store, &settings);
                 let mut hints = Hints::default();
                 let mut out = Vec::new();
-                draw(ui, &view, &mut hints, &mut out);
+                let mut player = crate::app::audio::Player::new();
+                draw(ui, &view, &mut hints, &mut player, &mut out);
             });
         harness.run_steps(4);
         for label in [
@@ -5087,7 +5114,8 @@ mod tests {
                 let view = View::from_parts(&snapshot, &store, &settings);
                 let mut hints = Hints::default();
                 let mut out = Vec::new();
-                draw(ui, &view, &mut hints, &mut out);
+                let mut player = crate::app::audio::Player::new();
+                draw(ui, &view, &mut hints, &mut player, &mut out);
             });
         harness.run_steps(4);
         assert!(

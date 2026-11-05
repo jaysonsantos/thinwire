@@ -93,7 +93,8 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
         if state.apply_hints {
             state.hints = Hints::from_view(&view);
         }
-        ui::draw(ui, &view, &mut state.hints, &mut out);
+        let mut player = super::audio::Player::new();
+        ui::draw(ui, &view, &mut state.hints, &mut player, &mut out);
     }
     for intent in out {
         match intent {
@@ -875,6 +876,7 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         topic: None,
         links: Vec::new(),
         photo: None,
+        audio: None,
     }
 }
 

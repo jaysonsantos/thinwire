@@ -248,6 +248,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "alsa"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "812947049edcd670a82cd5c73c3661d2e58468577ba8489de58e1a73c04cbd5d"
+dependencies = [
+ "alsa-sys",
+ "bitflags 2.13.2",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
+name = "alsa-sys"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad7569085a265dd3f607ebecce7458eaab2132a84393534c95b18dcbc3f31e04"
+dependencies = [
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -350,9 +372,9 @@ dependencies = [
 
 [[package]]
 name = "arboard"
-version = "3.6.1"
+version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0348a1c054491f4bfe6ab86a7b6ab1e44e45d899005de92f58b3df180b36ddaf"
+checksum = "aeb9553e62312c8756a5979254fc6d7da8bbeb5986a1e17037fab932f7037917"
 dependencies = [
  "clipboard-win",
  "image",
@@ -1138,6 +1160,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1301,6 +1332,56 @@ dependencies = [
  "hax-lib",
  "pastey",
  "rand 0.10.3",
+]
+
+[[package]]
+name = "core_detect"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
+
+[[package]]
+name = "coreaudio-rs"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d5d7dca3ebcf65a035582c9ad4385371a9d9ee6537474d2a278f4e1e475bb58"
+dependencies = [
+ "bitflags 2.13.2",
+ "libc",
+ "objc2-audio-toolbox",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+]
+
+[[package]]
+name = "cpal"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f02e8d0327b42d3e2e4ab2119af397344eb9fc54a34bf0ddeaa1277af8681f1"
+dependencies = [
+ "alsa",
+ "block2 0.6.2",
+ "coreaudio-rs",
+ "dasp_sample",
+ "jni",
+ "js-sys",
+ "libc",
+ "mach2",
+ "ndk",
+ "ndk-context",
+ "num-derive",
+ "num-traits",
+ "objc2 0.6.5",
+ "objc2-audio-toolbox",
+ "objc2-avf-audio",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "web-sys",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
@@ -1562,6 +1643,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dasp_sample"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
+
+[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1584,7 +1671,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1669,8 +1756,7 @@ dependencies = [
 [[package]]
 name = "diesel"
 version = "2.3.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebe9f7eaef33febd60290c5a9f3b0571d03c4c04a24739cd64808ce30e65a5d3"
+source = "git+https://github.com/jaysonsantos/thinwire?rev=5a4894173e84e772927fe2274222db688bec03d3#5a4894173e84e772927fe2274222db688bec03d3"
 dependencies = [
  "diesel_derives",
  "downcast-rs 2.0.2",
@@ -1777,7 +1863,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2067,6 +2153,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89253175e704ab869b04f9db224d38630e0211a53841a79181deae0889e169f5"
+dependencies = [
+ "cfg-if",
+ "core_detect",
+ "multiversion_no_op",
+ "rustversion",
+ "scopeguard",
+ "simdutf8",
+]
+
+[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2158,7 +2258,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3794,13 +3894,14 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.36.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95b4103cffefa72eb8428cb6b47d6627161e51c2739fc5e3b734584157bc642a"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "openssl-sys",
  "pkg-config",
+ "sqlcipher-src",
  "vcpkg",
 ]
 
@@ -3933,6 +4034,12 @@ dependencies = [
  "objc2-user-notifications 0.3.2",
  "thiserror 2.0.20",
 ]
+
+[[package]]
+name = "mach2"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
 name = "matchers"
@@ -4068,6 +4175,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
+name = "multiversion_no_op"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
 name = "naga"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4192,7 +4305,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4233,6 +4346,17 @@ name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
+
+[[package]]
+name = "num-derive"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "num-integer"
@@ -4352,6 +4476,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-audio-toolbox"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6948501a91121d6399b79abaa33a8aa4ea7857fe019f341b8c23ad6e81b79b08"
+dependencies = [
+ "bitflags 2.13.2",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
+name = "objc2-avf-audio"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
 name = "objc2-cloud-kit"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4373,6 +4523,29 @@ dependencies = [
  "block2 0.5.1",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-core-audio"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1eebcea8b0dbff5f7c8504f3107c68fc061a3eb44932051c8cf8a68d969c3b2"
+dependencies = [
+ "dispatch2",
+ "objc2 0.6.5",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
+name = "objc2-core-audio-types"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a89f2ec274a0cf4a32642b2991e8b351a404d290da87bb6a9a9d8632490bd1c"
+dependencies = [
+ "bitflags 2.13.2",
+ "objc2 0.6.5",
 ]
 
 [[package]]
@@ -4634,6 +4807,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ogg"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdab8dcd8d4052eaacaf8fb07a3ccd9a6e26efadb42878a413c68fc4af1dee2b"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4702,6 +4884,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "opus"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33718946cc77d4032911d4efe03a66dbcbfbd2bb16c3da06aaeadcc637c32216"
+dependencies = [
+ "opusic-sys",
+]
+
+[[package]]
+name = "opusic-sys"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "986d749e9dc12035f11bf3ecc83a2a696ff7534d4143be9469a4a0faa25b9fd1"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4746,7 +4946,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5175,7 +5375,7 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/whisperfish/presage?rev=291c7ee10d2fd3ae04cea48e586ad55bdb89cd23#291c7ee10d2fd3ae04cea48e586ad55bdb89cd23"
+source = "git+https://github.com/jaysonsantos/thinwire?rev=5a4894173e84e772927fe2274222db688bec03d3#5a4894173e84e772927fe2274222db688bec03d3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5724,6 +5924,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rodio"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36e3ee0a5ca418bac59a15d5506e498ab138359edbb67257a6b8a3b93d411f39"
+dependencies = [
+ "cpal",
+ "dasp_sample",
+ "num-rational",
+ "symphonia",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "rsb_derive"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5746,16 +5959,15 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.38.0"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1c93dd1c9683b438c392c492109cb702b8090b2bfc8fed6f6e4eb4523f17af3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.2",
  "fallible-iterator",
  "fallible-streaming-iterator",
  "libsqlite3-sys",
  "smallvec",
- "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -5802,7 +6014,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5859,7 +6071,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6487,6 +6699,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlcipher-src"
+version = "419.0.6+sqlcipher-4.19.0-sqlite-3.53.4-libtomcrypt-1.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab732d48ebf2a1449e94d071b26544f99845834c75c3c210e927ace097b49aa4"
+
+[[package]]
 name = "sqlite-wasm-rs"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6651,8 +6869,7 @@ dependencies = [
 [[package]]
 name = "sqlx-sqlite"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
+source = "git+https://github.com/jaysonsantos/thinwire?rev=5a4894173e84e772927fe2274222db688bec03d3#5a4894173e84e772927fe2274222db688bec03d3"
 dependencies = [
  "atoi",
  "flume",
@@ -6736,6 +6953,77 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symphonia"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5773a4c030a19d9bfaa090f49746ff35c75dfddfa700df7a5939d5e076a57039"
+dependencies = [
+ "lazy_static",
+ "symphonia-codec-vorbis",
+ "symphonia-core",
+ "symphonia-format-ogg",
+ "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-codec-vorbis"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f025837c309cd69ffef572750b4a2257b59552c5399a5e49707cc5b1b85d1c73"
+dependencies = [
+ "log",
+ "symphonia-core",
+ "symphonia-utils-xiph",
+]
+
+[[package]]
+name = "symphonia-core"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea00cc4f79b7f6bb7ff87eddc065a1066f3a43fe1875979056672c9ef948c2af"
+dependencies = [
+ "arrayvec",
+ "bitflags 1.3.2",
+ "bytemuck",
+ "lazy_static",
+ "log",
+]
+
+[[package]]
+name = "symphonia-format-ogg"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b4955c67c1ed3aa8ae8428d04ca8397fbef6a19b2b051e73b5da8b1435639cb"
+dependencies = [
+ "log",
+ "symphonia-core",
+ "symphonia-metadata",
+ "symphonia-utils-xiph",
+]
+
+[[package]]
+name = "symphonia-metadata"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36306ff42b9ffe6e5afc99d49e121e0bd62fe79b9db7b9681d48e29fa19e6b16"
+dependencies = [
+ "encoding_rs",
+ "lazy_static",
+ "log",
+ "symphonia-core",
+]
+
+[[package]]
+name = "symphonia-utils-xiph"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee27c85ab799a338446b68eec77abf42e1a6f1bb490656e121c6e27bfbab9f16"
+dependencies = [
+ "symphonia-core",
+ "symphonia-metadata",
+]
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6802,7 +7090,7 @@ dependencies = [
 [[package]]
 name = "tdlib-rs"
 version = "1.4.0"
-source = "git+https://github.com/jaysonsantos/thinwire?branch=cursor%2Ftdlib-rs-zip-9-bed5#63582844ec64e072013ae6c7b7569b6b8648e4cc"
+source = "git+https://github.com/jaysonsantos/thinwire?rev=63582844ec64e072013ae6c7b7569b6b8648e4cc#63582844ec64e072013ae6c7b7569b6b8648e4cc"
 dependencies = [
  "dirs 6.0.0",
  "futures-channel",
@@ -6820,7 +7108,7 @@ dependencies = [
 [[package]]
 name = "tdlib-rs-gen"
 version = "1.4.0"
-source = "git+https://github.com/jaysonsantos/thinwire?branch=cursor%2Ftdlib-rs-zip-9-bed5#63582844ec64e072013ae6c7b7569b6b8648e4cc"
+source = "git+https://github.com/jaysonsantos/thinwire?rev=63582844ec64e072013ae6c7b7569b6b8648e4cc#63582844ec64e072013ae6c7b7569b6b8648e4cc"
 dependencies = [
  "tdlib-rs-parser",
 ]
@@ -6828,7 +7116,7 @@ dependencies = [
 [[package]]
 name = "tdlib-rs-parser"
 version = "1.4.0"
-source = "git+https://github.com/jaysonsantos/thinwire?branch=cursor%2Ftdlib-rs-zip-9-bed5#63582844ec64e072013ae6c7b7569b6b8648e4cc"
+source = "git+https://github.com/jaysonsantos/thinwire?rev=63582844ec64e072013ae6c7b7569b6b8648e4cc#63582844ec64e072013ae6c7b7569b6b8648e4cc"
 
 [[package]]
 name = "tempfile"
@@ -6837,10 +7125,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6867,7 +7155,10 @@ dependencies = [
  "image",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
+ "ogg",
+ "opus",
  "qrcode",
+ "rodio",
  "thinwire-core",
  "thinwire-notify",
  "thinwire-protocol",
@@ -7791,7 +8082,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wacore"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "aes 0.9.2",
  "anyhow",
@@ -7839,7 +8130,7 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "anyhow",
  "buffa",
@@ -7861,7 +8152,7 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "bytes",
  "compact_str",
@@ -7880,7 +8171,7 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7890,9 +8181,11 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "aes 0.9.2",
+ "aes-gcm",
+ "arrayvec",
  "async-lock",
  "async-trait",
  "buffa",
@@ -7901,28 +8194,27 @@ dependencies = [
  "chrono",
  "ctr 0.10.1",
  "curve25519-dalek",
- "ghash",
  "hex",
  "hkdf",
  "hmac",
+ "itoa",
  "log",
  "portable-atomic",
  "rand 0.10.3",
  "serde",
- "sha1 0.11.0",
  "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.20",
  "wacore-binary",
  "wacore-derive",
  "waproto",
- "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
 name = "wacore-noise"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "anyhow",
  "buffa",
@@ -7959,7 +8251,7 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "buffa",
  "buffa-build",
@@ -8411,7 +8703,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -8453,7 +8745,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "async-trait",
  "buffa",
@@ -8475,7 +8767,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -8495,7 +8787,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
-source = "git+https://github.com/oxidezap/whatsapp-rust?rev=e634d245f71d66e2ae55f79ef714c4ca01615ed8#e634d245f71d66e2ae55f79ef714c4ca01615ed8"
+source = "git+https://github.com/oxidezap/whatsapp-rust?rev=52fb6643ba3a97c7271ce6ffe5814c32d47070d8#52fb6643ba3a97c7271ce6ffe5814c32d47070d8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8534,7 +8826,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

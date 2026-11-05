@@ -3,7 +3,8 @@
 //! A frontend (egui, a TUI, a headless test) sends [`Intent`] values and
 //! redraws when the [`ChangeSignal`] fires. The core owns the state, the
 //! secret store, the settings, and the adapter host. Protocol work stays on
-//! the tokio worker. This crate never depends on egui, eframe, or winit.
+//! the tokio worker. This crate never depends on egui, eframe, winit, or an
+//! audio playback crate.
 
 // Local macOS builds only. See `security_cli.rs`, `build.rs` and
 // `scripts/check-local-only-features.sh`: it never reaches CI or a release.
@@ -60,7 +61,7 @@ mod tests {
         let deps = manifest
             .split_once("[dependencies]")
             .map_or("", |(_, rest)| rest);
-        for name in ["egui", "eframe", "winit"] {
+        for name in ["egui", "eframe", "winit", "rodio", "cpal", "symphonia"] {
             assert!(
                 !deps.lines().any(|line| line.trim_start().starts_with(name)),
                 "thinwire-core must not depend on {name}"
@@ -69,7 +70,7 @@ mod tests {
     }
 
     /// The dependency check runs in public CI, so it must not turn on
-    /// `telegram-tdlib` (TDLib download). It keeps the GUI assertion.
+    /// `telegram-tdlib` (TDLib download). It keeps the GUI and playback bans.
     #[test]
     fn dependency_check_stays_on_default_features() {
         let script = include_str!("../../../scripts/check-core-deps.sh");
@@ -80,8 +81,12 @@ mod tests {
         assert!(!command.contains("--all-features"));
         assert!(!command.contains("--features"));
         assert!(!command.contains("telegram-tdlib"));
-        for name in ["egui", "eframe", "winit"] {
+        for name in ["egui", "eframe", "winit", "rodio", "cpal", "symphonia"] {
             assert!(script.contains(name), "the check still rejects {name}");
         }
+        assert!(
+            script.contains("crates/thinwire/src/app/audio/engine.rs"),
+            "playback imports stay in the desktop engine"
+        );
     }
 }

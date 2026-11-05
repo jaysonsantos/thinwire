@@ -445,6 +445,12 @@ pub enum AdapterCommand {
         file_id: i32,
         secret: bool,
     },
+    /// Download one Telegram voice file. The file stays on disk. The worker
+    /// reports a path and never reads the bytes into this process.
+    DownloadVoice {
+        protocol: ProtocolId,
+        file_id: i32,
+    },
 }
 
 impl AdapterCommand {
@@ -467,7 +473,8 @@ impl AdapterCommand {
             | Self::ViewTopic { protocol, .. }
             | Self::RestartHelper { protocol }
             | Self::RetryStoreKey { protocol }
-            | Self::DownloadFile { protocol, .. } => protocol,
+            | Self::DownloadFile { protocol, .. }
+            | Self::DownloadVoice { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
             Self::WhatsAppAcknowledgeRisk
@@ -586,8 +593,8 @@ pub enum AdapterEvent {
         message_id: String,
         body: String,
     },
-    /// Replace the caption, the links, and the photo of a message. A text
-    /// edit sets `photo` to `None`.
+    /// Replace the caption, the links, the photo, and the voice note.
+    /// A text edit sets `photo` and `audio` to `None`.
     MessageMedia {
         protocol: ProtocolId,
         conversation_id: String,
@@ -595,6 +602,7 @@ pub enum AdapterEvent {
         body: String,
         links: Vec<crate::media::MessageLink>,
         photo: Option<crate::media::MessagePhoto>,
+        audio: Option<crate::media::MessageAudio>,
     },
     /// Links found after the message was shown. Does not change the body.
     MessageLinks {
@@ -613,6 +621,15 @@ pub enum AdapterEvent {
     },
     /// A photo file did not download.
     PhotoFailed {
+        protocol: ProtocolId,
+        file_id: i32,
+    },
+    VoiceReady {
+        protocol: ProtocolId,
+        file_id: i32,
+        path: crate::media::AudioPath,
+    },
+    VoiceFailed {
         protocol: ProtocolId,
         file_id: i32,
     },
@@ -754,6 +771,8 @@ impl AdapterEvent {
             | Self::MessageLinks { protocol, .. }
             | Self::PhotoReady { protocol, .. }
             | Self::PhotoFailed { protocol, .. }
+            | Self::VoiceReady { protocol, .. }
+            | Self::VoiceFailed { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }
@@ -1014,6 +1033,7 @@ pub struct ChatMessage {
     pub links: Vec<crate::media::MessageLink>,
     /// A photo. [`Self::body`] is the caption, and it can be empty.
     pub photo: Option<crate::media::MessagePhoto>,
+    pub audio: Option<crate::media::MessageAudio>,
 }
 
 /// How a message reached the app.
@@ -1178,6 +1198,7 @@ pub(crate) fn emit_message_body(
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_message_media(
     events: &EventTx,
     protocol: ProtocolId,
@@ -1186,6 +1207,7 @@ pub(crate) fn emit_message_media(
     body: impl Into<String>,
     links: Vec<crate::media::MessageLink>,
     photo: Option<crate::media::MessagePhoto>,
+    audio: Option<crate::media::MessageAudio>,
 ) {
     let _ = events.send(AdapterEvent::MessageMedia {
         protocol,
@@ -1194,6 +1216,7 @@ pub(crate) fn emit_message_media(
         body: body.into(),
         links,
         photo,
+        audio,
     });
 }
 

@@ -158,6 +158,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         };
         let commands = [
             AdapterCommand::Connect { protocol },

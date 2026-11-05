@@ -103,6 +103,7 @@ impl ProtocolAdapter for FakeAdapter {
                         topic: None,
                         links: Vec::new(),
                         photo: None,
+                        audio: None,
                     },
                 );
                 Ok(())
