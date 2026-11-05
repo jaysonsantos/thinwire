@@ -849,6 +849,8 @@ mod tests {
     /// The audio of a message crosses as its handle and its duration: no
     /// path and no bytes. A download command and both answers cross too.
     /// A path that is not absolute is a failed download in the app.
+    /// The ready path is absolute on this platform. A Unix `/tmp` string
+    /// is not absolute on Windows.
     #[test]
     fn audio_crosses_as_a_handle_and_a_relative_path_fails() {
         let mut voice = message(ProtocolId::Signal);
@@ -878,12 +880,14 @@ mod tests {
         let (back, _) = command_from_wire(ProtocolId::Signal, wire).expect("back");
         assert_eq!(back, command);
 
+        let absolute = std::env::temp_dir().join("9.audio");
+        assert!(absolute.is_absolute());
         let ready = event_to_wire(
             ProtocolId::Signal,
             AdapterEvent::VoiceReady {
                 protocol: ProtocolId::Signal,
                 file_id: 9,
-                path: AudioPath::new("/tmp/9.audio".to_string()).expect("path"),
+                path: AudioPath::new(absolute.to_string_lossy()).expect("path"),
             },
         )
         .expect("crosses");
