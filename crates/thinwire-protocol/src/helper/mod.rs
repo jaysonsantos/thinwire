@@ -12,6 +12,7 @@
 //! Both sides are MIT. This module names no AGPL crate.
 
 mod convert;
+mod fds;
 mod launch;
 mod serve;
 #[cfg(test)]

@@ -28,6 +28,9 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS names (jid TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);
 ";
 
+/// Write one chat row, or replace it.
+const UPSERT_CHAT: &str = "INSERT INTO chats (jid, data) VALUES (?1, ?2) ON CONFLICT(jid) DO UPDATE SET data = excluded.data";
+
 /// The chat cache of one session folder.
 pub(super) struct DiskCache {
     path: PathBuf,
@@ -109,12 +112,8 @@ impl InboxStore for DiskCache {
         let tx = conn.transaction().map_err(|_| ())?;
         for (jid, _, chat) in &changes.chats {
             let data = serde_json::to_string(chat).map_err(|_| ())?;
-            tx.execute(
-                "INSERT INTO chats (jid, data) VALUES (?1, ?2)
-                 ON CONFLICT(jid) DO UPDATE SET data = excluded.data",
-                params![jid, data],
-            )
-            .map_err(|_| ())?;
+            tx.execute(UPSERT_CHAT, params![jid, data])
+                .map_err(|_| ())?;
         }
         for jid in &changes.removed {
             tx.execute("DELETE FROM chats WHERE jid = ?1", params![jid])
