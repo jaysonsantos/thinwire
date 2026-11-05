@@ -5,6 +5,13 @@
 //! secret store, the settings, and the adapter host. Protocol work stays on
 //! the tokio worker. This crate never depends on egui, eframe, or winit.
 
+// Local macOS builds only. See `security_cli.rs`, `build.rs` and
+// `scripts/check-local-only-features.sh`: it never reaches CI or a release.
+#[cfg(all(feature = "keychain-security-cli", not(target_os = "macos")))]
+compile_error!(
+    "feature `keychain-security-cli` is for macOS local builds: it runs /usr/bin/security"
+);
+
 mod clock;
 mod core;
 pub mod demo;
@@ -14,12 +21,15 @@ pub mod mutes;
 pub mod notify;
 mod secret_text;
 pub mod secrets;
+#[cfg(all(feature = "keychain-security-cli", target_os = "macos"))]
+mod security_cli;
 mod sends;
 pub mod settings;
 mod show;
 mod signal;
 pub mod signal_notice;
 pub mod state;
+mod store_key;
 mod theme;
 mod view;
 
@@ -30,7 +40,12 @@ pub use intent::{
 };
 pub use secret_text::SecretText;
 pub use signal::{ChangeNotifier, ChangeSignal, change_channel};
-pub use state::{AuthKey, InboxFilter};
+pub use state::AuthKey;
+pub use store_key::{
+    CreateStoreKeyError, LoadStoreKey, SIGNAL_STORE_KEY_ACCOUNT, StoreKey, StoreKeyAction,
+    StoreKeyPolicy, WHATSAPP_STORE_KEY_ACCOUNT, create_store_key, load_store_key, store_key_action,
+    store_key_policy,
+};
 pub use theme::ThemeMode;
 pub use view::View;
 // Frontends name protocols through the core, not through a second dependency.

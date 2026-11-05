@@ -8,8 +8,9 @@
 //!
 //! Lifetime of the helper:
 //!
-//! - It starts when the user accepts the protocol's gate. Before that, the
-//!   supervisor answers every command itself, like the feature-off stub.
+//! - It starts when the user accepts the protocol's gate, or when the app
+//!   starts with a saved acceptance. Before that, the supervisor answers
+//!   every command itself, like the feature-off stub.
 //! - It stops when the app closes (`Shutdown`).
 //! - If it ends by itself, the supervisor starts it again after a wait
 //!   (ADR 0012 "Failure") and sends the gate and the pairing again, so the
@@ -569,6 +570,11 @@ impl Supervisor {
             request,
             ..
         }
+        | WireCommand::SendMedia {
+            conversation_id,
+            request,
+            ..
+        }
         | WireCommand::ResendMessage {
             conversation_id,
             request,
@@ -678,6 +684,11 @@ impl Supervisor {
                 request,
                 ..
             }
+            | WireCommand::SendMedia {
+                conversation_id,
+                request,
+                ..
+            }
             | WireCommand::ResendMessage {
                 conversation_id,
                 request,
@@ -704,6 +715,16 @@ impl Supervisor {
             WireCommand::ViewChat { .. } => {}
             // A start that failed: `launch` reported it.
             WireCommand::AcknowledgeGate | WireCommand::BeginLink { .. } => {}
+            // The helper is not running. Do not start it: a start would
+            // replay the link. A running helper receives `RetryStoreKey`
+            // and opens the saved session. A wrong key then tries the move
+            // again. This arm only covers a helper that is already down.
+            WireCommand::RetryStoreKey => {
+                let _ = self.events.send(AdapterEvent::StoreAccess {
+                    protocol,
+                    reason: crate::StoreAccessReason::KeychainDenied,
+                });
+            }
         }
     }
 
@@ -955,11 +976,15 @@ impl Supervisor {
             return;
         }
         if self.account != AccountState::Unlinked {
-            // A session that was up reconnects when the next helper gets its
-            // pairing again. The shell keeps its rows, ends its loads, and
-            // asks again after `Linked` (#163). With no pairing to send, no
-            // helper links this account again: it is unlinked.
-            let relinks = self.replay.link.is_some() || self.wake_link.is_some();
+            // A session that was up reconnects when the next helper starts.
+            // The shell keeps its rows, ends its loads, and asks again after
+            // `Linked` (#163). A resumed Signal account has the accepted gate
+            // and no `BeginLink`. The store links again. That is a reconnect.
+            // An unlink here drops the chats and the in-memory notice
+            // acceptance, and the Link button can then clear the saved hash.
+            let relinks = self.replay.link.is_some()
+                || self.wake_link.is_some()
+                || (self.linked_once && self.replay.acknowledged);
             self.account = if relinks {
                 AccountState::Linking
             } else {

@@ -31,6 +31,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     // Only the client in the helper process can send or page history.
     sends_text: false,
     pages_history: false,
+    sends_media: false,
 };
 
 /// File name of the WhatsApp helper program, without `.exe`.
@@ -51,6 +52,7 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     allows_user_account_automation: false,
     sends_text: true,
     pages_history: true,
+    sends_media: true,
 };
 
 /// The WhatsApp adapter of a `whatsapp-web` build: it runs the AGPL client

@@ -90,3 +90,10 @@ apple-native-keyring-store = { version = "1", default-features = false, features
 ] }
 # No `search` (default) — sheds regex; Entry get/set/delete does not need it.
 windows-native-keyring-store = { version = "1", default-features = false }
+
+# crates.io tdlib-rs 1.4.0 requires zip 8. The branch below is that crate
+# with zip 9.0.5, the first release that closes the critical zip extract
+# advisory. Remove this patch when a crates.io release allows zip 9.0.5.
+# The branch history is tdlib-rs. Do not merge it into thinwire main.
+[patch.crates-io]
+tdlib-rs = { git = "https://github.com/jaysonsantos/thinwire", branch = "cursor/tdlib-rs-zip-9-bed5" }

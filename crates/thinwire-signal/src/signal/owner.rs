@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! One task owns a Signal link attempt.
 //!
-//! Begin, Resume, Cancel, Shutdown, and worker results are messages. The task
-//! handles them one at a time. A new Begin runs only after the previous
-//! cleanup finished, so a late shutdown cannot clear the next attempt.
+//! Begin, Resume, RetryKey, Cancel, Shutdown, and worker results are messages.
+//! The task handles them one at a time. A new Begin runs only after the
+//! previous cleanup finished, so a late shutdown cannot clear the next attempt.
 
 use std::sync::Arc;
 
@@ -25,6 +25,10 @@ enum Msg {
         events: EventTx,
     },
     Cancel {
+        events: EventTx,
+    },
+    /// Read the session key again. This is not a new link.
+    RetryKey {
         events: EventTx,
     },
     Shutdown {
@@ -82,6 +86,13 @@ impl Handle {
         });
     }
 
+    /// Read the session key again. Does not assign a new pairing id.
+    pub(super) fn retry_key(&self, events: &EventTx) {
+        let _ = self.tx.send(Msg::RetryKey {
+            events: events.clone(),
+        });
+    }
+
     pub(super) fn shutdown(&self, events: &EventTx) {
         let (done, _wait) = oneshot::channel();
         let _ = self.tx.send(Msg::Shutdown {
@@ -117,6 +128,7 @@ impl Owner {
             match msg {
                 Msg::Begin { pairing, events } => self.begin(pairing, &events).await,
                 Msg::Resume { events } => self.resume(&events).await,
+                Msg::RetryKey { events } => self.retry_key(&events).await,
                 Msg::Cancel { events } => self.cancel(&events).await,
                 Msg::Shutdown { events, done } => {
                     self.shutdown(&events).await;
@@ -141,27 +153,42 @@ impl Owner {
         // A link the user starts can provision. A resume must not leak into it.
         self.session.set_resume_only(false);
         self.session.set_pairing(pairing);
-        self.worker = (self.start)(&self.session, events);
-        self.generation = self.session.generation();
-        if self.worker.is_none() {
-            self.session.shutdown();
-            // The link failure dialog is created only while `signal_started`
-            // is set. Unlinked clears that flag, so the error has to land first.
-            emit_status(
-                events,
-                ProtocolId::Signal,
-                AdapterStatus::Error,
-                "Signal worker could not start. No session was opened.",
-            );
-            emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
-            return;
+        self.launch(events, true);
+    }
+
+    /// Open again with the pairing id that is already set.
+    /// This does not start a new link, and a failed start does not end the account.
+    /// The new open reads the key. A wrong key tries the move-aside again.
+    async fn retry_key(&mut self, events: &EventTx) {
+        if self.worker.is_some() {
+            self.cleanup().await;
         }
+        self.launch(events, false);
+    }
+
+    fn launch(&mut self, events: &EventTx, end_account_on_failure: bool) {
+        // Connecting goes out before the worker thread runs, so the row
+        // shows it while the store migration blocks.
         emit_status(
             events,
             ProtocolId::Signal,
             AdapterStatus::Connecting,
             "Signal linking was queued on the worker.",
         );
+        self.worker = (self.start)(&self.session, events);
+        self.generation = self.session.generation();
+        if self.worker.is_none() {
+            self.session.shutdown();
+            emit_status(
+                events,
+                ProtocolId::Signal,
+                AdapterStatus::Error,
+                "Signal worker could not start. No session was opened.",
+            );
+            if end_account_on_failure {
+                emit_account(events, ProtocolId::Signal, AccountState::Unlinked);
+            }
+        }
     }
 
     /// Load the registration when one exists. A missing store stays idle:
@@ -343,9 +370,100 @@ mod tests {
         }
         assert_eq!(
             order,
-            ["error", "unlinked"],
-            "Unlinked clears signal_started before the link failure dialog is created"
+            ["connecting", "error", "unlinked"],
+            "Connecting shows while the worker starts, then the error, then Unlinked"
         );
+    }
+
+    /// The row shows Connecting before the worker closure runs, so a store
+    /// migration on that thread cannot hide the row on the old status.
+    #[tokio::test]
+    async fn connecting_is_queued_before_the_worker_starts() {
+        let session = Arc::new(Session::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let rx_for_start = Arc::clone(&rx);
+        let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_for_start = Arc::clone(&saw);
+        let handle = Handle::spawn(Arc::clone(&session), {
+            Box::new(move |session, _events| {
+                let mut guard = rx_for_start.lock().expect("events");
+                while let Ok(event) = guard.try_recv() {
+                    if matches!(
+                        event,
+                        AdapterEvent::Status {
+                            status: AdapterStatus::Connecting,
+                            ..
+                        }
+                    ) {
+                        saw_for_start.store(true, Ordering::SeqCst);
+                    }
+                }
+                drop(guard);
+                let (_token, _wake) = session.begin_attempt();
+                let thread = std::thread::spawn(|| {});
+                let abort = tokio::spawn(async {}).abort_handle();
+                Some(SignalWorker { thread, abort })
+            })
+        });
+        handle.begin(9, &tx);
+        handle.flush().await;
+        assert!(
+            saw.load(Ordering::SeqCst),
+            "Connecting is queued before the worker starts"
+        );
+        assert_eq!(session.pairing(), 9);
+        handle.retry_key(&tx);
+        handle.flush().await;
+        assert_eq!(
+            session.pairing(),
+            9,
+            "a key retry keeps the pairing id and does not start a new link"
+        );
+    }
+
+    /// The worker has ended after a failed move. Retry starts it again.
+    /// That start is the open, and a wrong key there tries the move again.
+    #[tokio::test]
+    async fn a_retry_after_the_worker_ends_opens_again() {
+        let session = Arc::new(Session::new());
+        let starts = Arc::new(AtomicUsize::new(0));
+        let starts_for_start = Arc::clone(&starts);
+        let handle = Handle::spawn(Arc::clone(&session), {
+            Box::new(move |session, _events| {
+                let (_token, _wake) = session.begin_attempt();
+                session.mark_active();
+                starts_for_start.fetch_add(1, Ordering::SeqCst);
+                let thread = std::thread::spawn(|| {});
+                let abort = tokio::spawn(async {}).abort_handle();
+                Some(SignalWorker { thread, abort })
+            })
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle.begin(4, &tx);
+        handle.flush().await;
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        while rx.try_recv().is_ok() {}
+        handle.retry_key(&tx);
+        handle.flush().await;
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "retry opens the saved session again"
+        );
+        assert_eq!(session.pairing(), 4, "retry does not start a new link");
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    AdapterEvent::Account {
+                        state: AccountState::Unlinked,
+                        ..
+                    }
+                ),
+                "retry does not drop the saved account: {event:?}"
+            );
+        }
     }
 
     /// A remembered notice asks the worker to load a registration. A failed

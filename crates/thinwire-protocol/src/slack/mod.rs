@@ -90,6 +90,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     allows_user_account_automation: false,
     sends_text: true,
     pages_history: false,
+    sends_media: false,
 };
 
 /// Official Slack path. Workspace install UI is out of scope for this spike.

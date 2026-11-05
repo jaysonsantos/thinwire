@@ -280,7 +280,18 @@ impl Core {
             held_topic_notices: Vec::new(),
         };
         core.restore_signal_notice();
+        core.restore_whatsapp_gate();
         core
+    }
+
+    /// A saved acceptance of the current WhatsApp ban gate starts the helper,
+    /// and the helper opens the saved session. Another saved copy, or none,
+    /// starts nothing: the user opens the gate on the next link.
+    fn restore_whatsapp_gate(&mut self) {
+        #[cfg(feature = "whatsapp-web")]
+        if self.settings.whatsapp_gate_version() == crate::state::WHATSAPP_GATE_VERSION {
+            self.state.restore_whatsapp_gate();
+        }
     }
 
     /// A saved acceptance of the current Signal notice starts the helper.
@@ -371,6 +382,10 @@ impl Core {
     pub fn pump(&mut self) -> bool {
         // Expire first, then apply the queued events. A late answer then meets
         // an expired send, whatever the frontend's timing (PR #81 review).
+        // Record the keychain before those events. A denial in this pump
+        // then knows if the app keychain was already ready.
+        let keychain_ready = self.secrets.attach_settled() && !self.secrets.read_failed();
+        self.state.note_app_keychain_ready(keychain_ready);
         let expired = self.state.expire_sends();
         let mut applied = false;
         while let Ok(event) = self.events.try_recv() {
@@ -413,6 +428,7 @@ impl Core {
             self.state.status_text = text;
         }
         self.state.poll_resume(&self.secrets);
+        self.resume_denied_store_keys();
         self.state.sync_viewed();
         self.state.sync_timeout_hint();
         self.sync_notifications();
@@ -618,9 +634,13 @@ impl Core {
             } => {
                 let _ = self.state.select_topic(conversation_id, topic);
             }
+            Intent::CloseTopic { conversation_id } => {
+                if self.state.selected_conversation.as_deref() == Some(conversation_id.as_str()) {
+                    self.state.close_open_topic();
+                }
+            }
             Intent::MoveInbox { delta } => self.state.move_inbox_selection(delta),
             Intent::FocusInbox { id } => self.state.focus_inbox_row(id),
-            Intent::SetFilter(filter) => self.state.set_filter(filter),
             Intent::SetSearch(text) => self.state.set_search(text.into_inner()),
             Intent::Refresh => self.state.refresh_visible(),
             Intent::DismissError => self.state.error = None,
@@ -633,6 +653,22 @@ impl Core {
             } => self
                 .state
                 .set_draft(protocol, &conversation_id, topic, text.into_inner()),
+            Intent::AddAttachments {
+                protocol,
+                conversation_id,
+                topic,
+                paths,
+            } => self
+                .state
+                .add_attachments(protocol, &conversation_id, topic, paths),
+            Intent::RemoveAttachment {
+                protocol,
+                conversation_id,
+                topic,
+                index,
+            } => self
+                .state
+                .remove_attachment(protocol, &conversation_id, topic, index),
             Intent::SendDraft {
                 protocol,
                 conversation_id,
@@ -715,6 +751,7 @@ impl Core {
                 }
             }
             Intent::RestartHelper(protocol) => self.state.restart_helper(protocol),
+            Intent::RetryStoreKey(protocol) => self.state.retry_store_key(protocol),
             Intent::ShowNotice(protocol) => self.state.open_notice_review(protocol),
             Intent::CloseNotice => self.state.close_notice_review(),
             Intent::LoadPhoto {
@@ -908,14 +945,30 @@ impl Core {
         let phone: &PhoneVault = &self.whatsapp_phone;
         match intent {
             WhatsAppIntent::OpenRiskGate => self.state.open_whatsapp_risk_gate(),
-            WhatsAppIntent::CloseGate => self.state.close_whatsapp_gate(phone),
-            WhatsAppIntent::AcknowledgeRisk => self.state.acknowledge_whatsapp_risk(),
+            WhatsAppIntent::CloseGate => {
+                // A close after the acceptance is Cancel: forget the saved gate.
+                let accepted = self.state.whatsapp_gate_accepted();
+                self.state.close_whatsapp_gate(phone);
+                if accepted && !self.state.whatsapp_gate_accepted() {
+                    self.settings.set_whatsapp_gate_version(0);
+                }
+            }
+            WhatsAppIntent::AcknowledgeRisk => {
+                self.state.acknowledge_whatsapp_risk();
+                if self.state.whatsapp_gate_accepted() {
+                    self.settings
+                        .set_whatsapp_gate_version(crate::state::WHATSAPP_GATE_VERSION);
+                }
+            }
             WhatsAppIntent::SetPhone(value) => {
                 self.state.set_whatsapp_phone(value.expose().to_owned());
             }
             WhatsAppIntent::BeginLink => self.state.begin_whatsapp_link(phone),
             WhatsAppIntent::LinkWithPhone => self.state.open_whatsapp_phone_link(phone),
-            WhatsAppIntent::CancelLink => self.state.cancel_whatsapp_link(phone),
+            WhatsAppIntent::CancelLink => {
+                self.state.cancel_whatsapp_link(phone);
+                self.settings.set_whatsapp_gate_version(0);
+            }
         }
     }
 
@@ -929,7 +982,15 @@ impl Core {
     #[cfg(feature = "signal-local")]
     fn signal_gate(&mut self, intent: SignalIntent) {
         match intent {
-            SignalIntent::OpenNotice => self.state.open_signal_notice(),
+            SignalIntent::OpenNotice => {
+                // A saved acceptance of this notice copy. Link does not
+                // show the notice again. Only the first link shows it.
+                let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+                if self.settings.signal_notice_version() == current {
+                    self.state.keep_saved_signal_notice();
+                }
+                self.state.open_signal_notice();
+            }
             SignalIntent::CloseGate => self.state.close_signal_gate(),
             SignalIntent::AcknowledgeNotice => self.state.acknowledge_signal_notice(),
             SignalIntent::BeginLink => self.state.begin_signal_link(),
@@ -942,6 +1003,22 @@ impl Core {
     #[cfg(not(feature = "signal-local"))]
     fn signal_gate(&mut self, intent: SignalIntent) {
         let _ = intent;
+    }
+
+    /// A saved account denied the session key while the app keychain was
+    /// not settled. When that read succeeds, send `RetryStoreKey` once.
+    /// The flag is cleared by that send. A denial after the keychain is
+    /// ready does not arm it. The user clicks Retry for that denial.
+    /// This does not send `BeginLink`.
+    fn resume_denied_store_keys(&mut self) {
+        let ready = self.secrets.attach_settled() && !self.secrets.read_failed();
+        if !ready {
+            return;
+        }
+        if !self.state.take_store_key_retry_due() {
+            return;
+        }
+        self.state.retry_denied_store_keys();
     }
 
     fn flush(&mut self) {
@@ -1640,6 +1717,73 @@ mod tests {
         assert_eq!(core.settings.signal_notice_version(), current);
     }
 
+    /// A saved acceptance of the WhatsApp ban gate starts the helper at app
+    /// start, so the saved session opens with no click. No screen opens. A
+    /// different saved copy starts nothing. Accept saves the gate, and
+    /// Cancel clears it.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_whatsapp_gate_resumes_the_session_at_start() {
+        use crate::WhatsAppIntent;
+        use crate::state::{WHATSAPP_GATE_VERSION, WhatsAppScreen};
+
+        let start = |label: &str, version: u64| {
+            let path = std::env::temp_dir()
+                .join("thinwire-core-tests")
+                .join(format!(
+                    "whatsapp-gate-{}-{:?}-{label}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ))
+                .join("settings.toml");
+            let mut settings = Settings::load_from(path.clone());
+            settings.set_whatsapp_gate_version(version);
+            if let Some(job) = settings.take_persist_job() {
+                job.run();
+            }
+            let mut core = Core::new(
+                &Handle::current(),
+                CoreConfig::new(Settings::load_from(path)).with_memory_secrets(),
+            );
+            let (probe, sent) = unbounded_channel();
+            core.commands = HostSender::for_test(probe);
+            let (_events_tx, events) = unbounded_channel();
+            core.events = events;
+            core.pump();
+            (core, sent, _events_tx)
+        };
+
+        let (core, mut sent, _keep) = start("saved", WHATSAPP_GATE_VERSION);
+        assert_eq!(
+            std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>(),
+            vec![AdapterCommand::WhatsAppAcknowledgeRisk],
+            "the helper starts and opens the saved session"
+        );
+        assert_eq!(core.view().whatsapp_screen, WhatsAppScreen::Hidden);
+        assert!(
+            !core.view().whatsapp_gate_accepted(),
+            "a new link still shows the gate"
+        );
+
+        let (mut core, mut sent, _keep) = start("other", WHATSAPP_GATE_VERSION.wrapping_add(1));
+        assert!(sent.try_recv().is_err(), "another gate copy starts nothing");
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::AcknowledgeRisk));
+        assert_eq!(core.settings.whatsapp_gate_version(), WHATSAPP_GATE_VERSION);
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::CancelLink));
+        assert_eq!(core.settings.whatsapp_gate_version(), 0, "cancel clears it");
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::AcknowledgeRisk));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::CloseGate));
+        assert_eq!(
+            core.settings.whatsapp_gate_version(),
+            0,
+            "a close after the acceptance is Cancel"
+        );
+        let (_core, mut sent, _keep) = start("none", 0);
+        assert!(sent.try_recv().is_err(), "no saved gate starts nothing");
+    }
+
     /// A network reconnect and a helper restart keep the saved notice hash.
     /// Those events do not end the acceptance.
     #[cfg(feature = "signal-local")]
@@ -1678,6 +1822,345 @@ mod tests {
             "a reconnect leaves the in-memory acceptance"
         );
         assert_eq!(core.settings.signal_notice_version(), current);
+    }
+
+    /// A keychain denial, Retry, and a helper restart keep the saved notice.
+    /// The denial can arrive before the account is linked. Link on that row
+    /// must not clear the hash. Cancel still does.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_access_failure_keeps_the_saved_signal_notice() {
+        use crate::state::SignalScreen;
+        use thinwire_protocol::{AccountState, AdapterEvent, HelperState, StoreAccessReason};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let mut core = core_with_signal_notice(current);
+        let (probe, _sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        assert!(core.view().signal_notice_acknowledged());
+
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("keychain");
+        core.pump();
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert!(
+            core.view().signal_notice_acknowledged(),
+            "a keychain denial before Linked keeps the acceptance"
+        );
+
+        core.dispatch(Intent::Signal(SignalIntent::OpenNotice));
+        assert_eq!(core.view().signal_screen, SignalScreen::Link);
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert!(core.view().signal_notice_acknowledged());
+
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linked,
+            })
+            .expect("linked");
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("keychain while linked");
+        events_tx
+            .send(AdapterEvent::Helper {
+                protocol: ProtocolId::Signal,
+                state: HelperState::Restarting,
+            })
+            .expect("helper restart");
+        core.pump();
+        core.dispatch(Intent::RetryStoreKey(ProtocolId::Signal));
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert!(
+            core.view().signal_notice_acknowledged(),
+            "Retry and a helper restart keep the acceptance"
+        );
+    }
+
+    /// The app keychain is already settled. A saved-account denial does not
+    /// send `RetryStoreKey` by itself. The user's Retry click does. A second
+    /// denial still waits for that click. Link does not show the notice
+    /// again. Cancel still clears the saved hash.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_saved_signal_key_waits_for_the_retry_click() {
+        use crate::state::SignalScreen;
+        use thinwire_protocol::{AccountState, AdapterEvent, StoreAccessReason};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let mut core = core_with_signal_notice(current);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        while sent.try_recv().is_ok() {}
+
+        let deny = || {
+            events_tx
+                .send(AdapterEvent::Account {
+                    protocol: ProtocolId::Signal,
+                    state: AccountState::Linked,
+                })
+                .expect("linked");
+            events_tx
+                .send(AdapterEvent::StoreAccess {
+                    protocol: ProtocolId::Signal,
+                    reason: StoreAccessReason::KeychainDenied,
+                })
+                .expect("denied");
+        };
+        let pumps =
+            |core: &mut Core, sent: &mut tokio::sync::mpsc::UnboundedReceiver<AdapterCommand>| {
+                let mut commands = Vec::new();
+                for _ in 0..5 {
+                    core.pump();
+                    commands.extend(std::iter::from_fn(|| sent.try_recv().ok()));
+                }
+                commands
+            };
+
+        deny();
+        let idle = pumps(&mut core, &mut sent);
+        assert!(
+            !idle.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "a settled keychain does not retry on its own: {idle:?}"
+        );
+        assert!(
+            core.view()
+                .accounts
+                .iter()
+                .any(|row| row.caps.id == ProtocolId::Signal && row.linked()),
+            "a saved account stays linked"
+        );
+        assert_ne!(core.view().signal_screen, SignalScreen::Notice);
+        assert_eq!(core.settings.signal_notice_version(), current);
+
+        core.dispatch(Intent::RetryStoreKey(ProtocolId::Signal));
+        let clicked: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert_eq!(
+            clicked
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    AdapterCommand::RetryStoreKey {
+                        protocol: ProtocolId::Signal
+                    }
+                ))
+                .count(),
+            1,
+            "the Retry click sends one read: {clicked:?}"
+        );
+        assert!(
+            !clicked
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+            "Retry is not a new link: {clicked:?}"
+        );
+
+        deny();
+        let again = pumps(&mut core, &mut sent);
+        assert!(
+            !again.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "a second denial waits for another click: {again:?}"
+        );
+        core.dispatch(Intent::RetryStoreKey(ProtocolId::Signal));
+        let second: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert_eq!(
+            second
+                .iter()
+                .filter(|command| matches!(command, AdapterCommand::RetryStoreKey { .. }))
+                .count(),
+            1,
+            "the next Retry click still sends one read: {second:?}"
+        );
+
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Unlinked,
+            })
+            .expect("unlinked");
+        core.pump();
+        assert!(!core.view().signal_notice_acknowledged());
+        assert_eq!(core.settings.signal_notice_version(), current);
+        core.dispatch(Intent::Signal(SignalIntent::OpenNotice));
+        assert_ne!(
+            core.view().signal_screen,
+            SignalScreen::Notice,
+            "a saved acceptance does not show the notice again"
+        );
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert!(core.view().signal_notice_acknowledged());
+        core.dispatch(Intent::Signal(SignalIntent::CancelLink));
+        assert!(!core.view().signal_notice_acknowledged());
+        assert_eq!(
+            core.settings.signal_notice_version(),
+            0,
+            "Cancel still clears the saved hash"
+        );
+    }
+
+    /// A first link has no saved session. A key denial does not resume it
+    /// and does not mark it linked.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_link_key_denial_does_not_resume_the_session() {
+        use thinwire_protocol::{AdapterEvent, StoreAccessReason};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let mut core = core_with_signal_notice(current);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        while sent.try_recv().is_ok() {}
+
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("denied");
+        core.pump();
+        let commands: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert!(
+            !commands.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "a first link does not resume: {commands:?}"
+        );
+        assert!(
+            !core
+                .view()
+                .accounts
+                .iter()
+                .any(|row| row.caps.id == ProtocolId::Signal && row.linked())
+        );
+    }
+
+    /// The keychain is still denied when the helper reports the failure.
+    /// After the keychain can be read, the saved session is opened again.
+    /// The command is `RetryStoreKey`, not `BeginLink`.
+    #[cfg(feature = "signal-local")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_key_denial_waits_until_the_keychain_can_be_read() {
+        use thinwire_protocol::{AccountState, AdapterEvent, StoreAccessReason};
+
+        let current = crate::signal_notice::SIGNAL_NOTICE_VERSION;
+        let path = notice_settings_path("defer-key");
+        let mut settings = Settings::load_from(path.clone());
+        settings.set_signal_notice_version(current);
+        if let Some(job) = settings.take_persist_job() {
+            job.run();
+        }
+        let secrets = SecretStore::detached_for_test();
+        let mut core = Core::with_store(
+            &Handle::current(),
+            CoreConfig::new(Settings::load_from(path)),
+            std::sync::Arc::clone(&secrets),
+            std::sync::Arc::new(WhatsAppPhoneVault::new()),
+            Vec::new(),
+        );
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        let (events_tx, events) = unbounded_channel();
+        core.events = events;
+        core.pump();
+        while sent.try_recv().is_ok() {}
+
+        events_tx
+            .send(AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linked,
+            })
+            .expect("linked");
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("denied");
+        core.pump();
+        let early: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert!(
+            !early.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "no resume while the keychain cannot be read: {early:?}"
+        );
+
+        secrets.complete_ready_attach_for_test(&[]);
+        core.pump();
+        let commands: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey {
+                    protocol: ProtocolId::Signal
+                }
+            )),
+            "Allow opens the saved session: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::SignalBeginLink { .. })),
+            "Allow does not start a new link: {commands:?}"
+        );
+        assert_eq!(core.settings.signal_notice_version(), current);
+        assert_ne!(
+            core.view().signal_screen,
+            crate::state::SignalScreen::Notice
+        );
+
+        events_tx
+            .send(AdapterEvent::StoreAccess {
+                protocol: ProtocolId::Signal,
+                reason: StoreAccessReason::KeychainDenied,
+            })
+            .expect("second denial");
+        let mut later = Vec::new();
+        for _ in 0..5 {
+            core.pump();
+            later.extend(std::iter::from_fn(|| sent.try_recv().ok()));
+        }
+        assert!(
+            !later.iter().any(|command| matches!(
+                command,
+                AdapterCommand::RetryStoreKey { .. } | AdapterCommand::SignalBeginLink { .. }
+            )),
+            "a denial after the keychain is ready waits for Retry: {later:?}"
+        );
+        core.dispatch(Intent::RetryStoreKey(ProtocolId::Signal));
+        let clicked: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert_eq!(
+            clicked
+                .iter()
+                .filter(|command| matches!(command, AdapterCommand::RetryStoreKey { .. }))
+                .count(),
+            1,
+            "the Retry click still sends one read: {clicked:?}"
+        );
     }
 
     /// An unlink and a device removal clear no saved hash. The next launch
@@ -2742,6 +3225,21 @@ mod tests {
         });
         assert_eq!(core.view().compose, "bring water");
         assert_eq!(core.view().selected_topic, Some(trail));
+
+        // The breadcrumb goes back to the topic list too. A close for
+        // another chat does nothing.
+        core.dispatch(Intent::CloseTopic {
+            conversation_id: "telegram:1".into(),
+        });
+        assert_eq!(core.view().selected_topic, Some(trail));
+        core.dispatch(Intent::CloseTopic {
+            conversation_id: "telegram:9".into(),
+        });
+        assert!(core.view().showing_topic_list());
+        assert_eq!(
+            core.view().selected_conversation.as_deref(),
+            Some("telegram:9")
+        );
     }
 
     /// A notification for a topic opens the forum when that forum's topics

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use thinwire_protocol::{MessageTopic, ProtocolId};
+use thinwire_protocol::{MessageTopic, OutgoingFile, ProtocolId};
 
 /// What is in flight for one chat.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,9 @@ pub(crate) enum Pending {
         /// The topic the text was typed in. `None` is a chat with no topic.
         /// An accept clears only this thread's compose or draft.
         topic: Option<MessageTopic>,
+        /// The photos and videos of the send. An accept clears the tray of
+        /// the thread only when it still holds these files.
+        files: Vec<OutgoingFile>,
     },
     /// A failed message sent again.
     Retry { request: u64, message_id: String },
@@ -89,6 +92,7 @@ impl SendTracker {
     }
 
     /// Start a send. `None` while this chat already has a send or a retry.
+    #[cfg(test)]
     pub(crate) fn begin_send(
         &mut self,
         protocol: ProtocolId,
@@ -97,10 +101,24 @@ impl SendTracker {
         topic: Option<MessageTopic>,
         now: Instant,
     ) -> Option<u64> {
+        self.begin_send_files(protocol, chat, body, topic, Vec::new(), now)
+    }
+
+    /// Start a send of photos and videos. `body` is the caption.
+    pub(crate) fn begin_send_files(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        body: &str,
+        topic: Option<MessageTopic>,
+        files: Vec<OutgoingFile>,
+        now: Instant,
+    ) -> Option<u64> {
         self.begin(protocol, chat, now, |request| Pending::Send {
             request,
             body: body.to_owned(),
             topic,
+            files,
         })
     }
 
@@ -357,6 +375,7 @@ mod tests {
                 request,
                 body: "hi".into(),
                 topic: None,
+                files: Vec::new(),
             })
         );
         assert!(!sends.in_flight(ProtocolId::Telegram, "telegram:1"));
@@ -437,6 +456,7 @@ mod tests {
                 request,
                 body: "hi".into(),
                 topic: None,
+                files: Vec::new(),
             })
         );
         assert_eq!(

@@ -6,7 +6,7 @@
 //! protocol from both sides with no AGPL code and no child process.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -59,6 +59,7 @@ const fn caps(protocol: ProtocolId) -> ProtocolCapabilities {
         allows_user_account_automation: false,
         sends_text: true,
         pages_history: true,
+        sends_media: true,
     }
 }
 
@@ -70,6 +71,8 @@ struct Site {
     launches: AtomicU32,
     /// Ends the helper that runs, like a crash.
     crash: Notify,
+    /// `AcknowledgeGate` links an existing session. No `BeginLink`.
+    resume_on_ack: AtomicBool,
 }
 
 impl Site {
@@ -78,6 +81,7 @@ impl Site {
             protocol,
             launches: AtomicU32::new(0),
             crash: Notify::new(),
+            resume_on_ack: AtomicBool::new(false),
         })
     }
 
@@ -100,11 +104,13 @@ impl HelperLauncher for SiteLauncher {
         let (helper_out, stdout) = tokio::io::duplex(PIPE_BYTES);
         let (exited_tx, exited) = oneshot::channel();
         let (kill, killed) = oneshot::channel::<()>();
+        let resume_on_ack = site.resume_on_ack.load(Ordering::SeqCst);
         tokio::spawn(async move {
             let client = FakeClient {
                 protocol: site.protocol,
                 acknowledged: false,
                 linked: false,
+                resume_on_ack,
             };
             let config = ServeConfig {
                 helper_version: "fake",
@@ -134,6 +140,9 @@ struct FakeClient {
     protocol: ProtocolId,
     acknowledged: bool,
     linked: bool,
+    /// An accepted gate opens a saved session. The real Signal helper does
+    /// this on `SignalAcknowledgeNotice` when a registration is on disk.
+    resume_on_ack: bool,
 }
 
 impl FakeClient {
@@ -205,6 +214,11 @@ impl ProtocolAdapter for FakeClient {
         match command {
             AdapterCommand::SignalAcknowledgeNotice | AdapterCommand::WhatsAppAcknowledgeRisk => {
                 self.acknowledged = true;
+                if self.resume_on_ack {
+                    self.linked = true;
+                    emit_account(events, protocol, AccountState::Linked);
+                    emit_status(events, protocol, AdapterStatus::Ready, "linked");
+                }
             }
             AdapterCommand::SignalBeginLink { generation }
             | AdapterCommand::WhatsAppBeginLink { generation } => {
@@ -497,4 +511,40 @@ async fn a_stopped_signal_helper_leaves_the_whatsapp_helper_running() {
     assert_eq!(whatsapp.site.launches(), 1);
     signal.shut_down().await;
     whatsapp.shut_down().await;
+}
+
+/// A remembered Signal notice links from the store. There is no `BeginLink`.
+/// A crash of that helper is a reconnect. It must not report `Unlinked`.
+/// `Unlinked` drops the chats and the in-memory notice acceptance.
+#[tokio::test]
+async fn a_resumed_signal_session_reconnects_when_the_helper_crashes() {
+    let mut probe = Probe::start(ProtocolId::Signal);
+    probe.site.resume_on_ack.store(true, Ordering::SeqCst);
+    probe.send(AdapterCommand::SignalAcknowledgeNotice);
+    probe.until_account(AccountState::Linked).await;
+    probe.drain();
+
+    probe.site.crash.notify_one();
+    probe.until_helper(HelperState::Restarting).await;
+    probe.until_account(AccountState::Linked).await;
+    assert!(
+        probe.saw(|event| *event
+            == AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Linking,
+            }),
+        "a crash of a resumed session reconnects"
+    );
+    assert!(
+        !probe.saw(|event| *event
+            == AdapterEvent::Account {
+                protocol: ProtocolId::Signal,
+                state: AccountState::Unlinked,
+            }),
+        "a crash must not unlink a resumed session"
+    );
+    assert!(
+        !probe.saw(|event| matches!(event, AdapterEvent::SignalQr { .. })),
+        "a restart of a resumed session does not start a new link"
+    );
 }

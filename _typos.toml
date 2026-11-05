@@ -14,3 +14,5 @@ zizmor = "zizmor"
 prek = "prek"
 # Signal service identifier (ACI), not ACPI.
 Aci = "Aci"
+# whatsapp-rust field of the device phone number (`Device::pn`).
+pn = "pn"

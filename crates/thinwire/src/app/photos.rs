@@ -13,9 +13,14 @@ use thinwire_protocol::{ChatAvatar, MessagePhoto, PhotoSize, ProtocolId};
 use super::motion;
 
 /// Diameter of an inbox avatar, in points.
-pub(crate) const AVATAR_SIDE: f32 = 36.0;
-/// Corner radius that turns the 36 px square into a circle.
-const AVATAR_RADIUS: u8 = 18;
+pub(crate) const AVATAR_SIDE: f32 = 44.0;
+/// Diameter of the avatar in the thread header, in points.
+pub(crate) const HEADER_AVATAR_SIDE: f32 = 40.0;
+
+/// Corner radius that turns a square of `side` into a circle.
+fn circle_radius(side: f32) -> u8 {
+    (side * 0.5).round().clamp(0.0, 255.0) as u8
+}
 
 /// Longest side of a chat photo, in points.
 const MAX_SIDE: f32 = 360.0;
@@ -205,7 +210,8 @@ pub(crate) fn take_escape(ctx: &egui::Context) -> bool {
     closed
 }
 
-/// One inbox avatar. A ready photo uses the chat-photo loader and cache.
+/// One round avatar, in an inbox row or in the thread header. A ready photo
+/// uses the chat-photo loader and cache.
 /// With no photo, or while the file is still loading, the circle shows initials.
 pub(crate) fn paint_avatar(
     ui: &mut egui::Ui,
@@ -220,7 +226,7 @@ pub(crate) fn paint_avatar(
     let ink = super::theme::avatar_ink(avatar.accent, ui.visuals().dark_mode);
     // Opaque circle, so the row selection fill does not show through.
     ui.painter()
-        .circle_filled(rect.center(), AVATAR_SIDE * 0.5, ink.fill);
+        .circle_filled(rect.center(), rect.width() * 0.5, ink.fill);
     let shown = avatar_image(ui, protocol, conversation_id, avatar);
     if let Some(shown) = &shown {
         paint_circle(ui, &avatar_base(protocol, conversation_id), shown, rect);
@@ -299,13 +305,14 @@ fn paint_circle(ui: &mut egui::Ui, base: &str, shown: &Shown, rect: egui::Rect) 
     // Default image tint is white, which leaves the photo untinted.
     egui::Image::from_uri(&shown.uri)
         .fit_to_exact_size(rect.size())
-        .corner_radius(egui::CornerRadius::same(AVATAR_RADIUS))
+        .corner_radius(egui::CornerRadius::same(circle_radius(rect.width())))
         .show_loading_spinner(false)
         .paint_at(ui, rect);
 }
 
 fn paint_initials(ui: &egui::Ui, rect: egui::Rect, title: &str, color: Color32) {
-    let font = egui::FontId::new(super::theme::size::BUTTON, super::theme::semibold());
+    let size = (rect.width() * 0.36).clamp(super::theme::size::CAPTION, 20.0);
+    let font = egui::FontId::new(size, super::theme::semibold());
     let galley = ui.painter().layout_no_wrap(initials(title), font, color);
     let pos = egui::pos2(
         rect.center().x - galley.size().x * 0.5,

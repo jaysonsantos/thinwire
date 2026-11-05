@@ -26,6 +26,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: true,
     // The Signal adapter answers LoadOlderMessages (ADR 0010 rule 10).
     pages_history: true,
+    sends_media: true,
 };
 
 /// File name of the Signal helper program, without `.exe`.
@@ -117,6 +118,7 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     allows_user_account_automation: false,
     sends_text: true,
     pages_history: true,
+    sends_media: true,
 };
 
 /// The Signal adapter of a `signal-local` build: it runs the AGPL client in
