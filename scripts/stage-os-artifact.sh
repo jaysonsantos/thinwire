@@ -771,6 +771,7 @@ EOF
   # Mach-O files are signed from the inside out, then the bundle. --deep
   # is only used on the verify inside sign_macos_app.
   sign_macos_app "$app"
+  "${script_dir}/notarize-macos-app.sh" staple "$app"
 fi
 
 if [[ -f dist/thinwire.exe ]]; then
@@ -921,6 +922,10 @@ with tarfile.open(archive, "r:gz") as tf:
 
 print(f"archive ok: {norm(binary.name)} mode {oct(mode)}")
 PY
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  "${script_dir}/notarize-macos-app.sh" validate-archive "$archive"
+fi
 
 echo "Staged payload:"
 find dist -print | sort

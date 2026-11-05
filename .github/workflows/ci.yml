@@ -126,7 +126,7 @@ jobs:
             exit 0
           fi
           shared='Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$'
-          notify="^(crates/thinwire-notify/|scripts/stage-os-artifact\.sh$|scripts/stage-helper\.sh$|scripts/install-protoc\.sh$|${shared})"
+          notify="^(crates/thinwire-notify/|scripts/stage-os-artifact\.sh$|scripts/notarize-macos-app\.sh$|scripts/stage-helper\.sh$|scripts/install-protoc\.sh$|${shared})"
           # The helper adapter is in thinwire-protocol: its manifest (tokio
           # process support), the adapter contract, and the helper module.
           helpers="^(crates/thinwire-ipc/|crates/thinwire-whatsapp/|crates/thinwire-signal/|crates/thinwire-protocol/Cargo\.toml$|crates/thinwire-protocol/src/(helper/|adapter\.rs$|lib\.rs$|whatsapp\.rs$|signal\.rs$)|scripts/stage-helper\.sh$|scripts/install-protoc\.sh$|${shared})"

@@ -457,6 +457,44 @@ mod tests {
                 .contains("MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}")
         );
         assert!(os_zips.contains("MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}"));
+        for secret in [
+            "MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}",
+            "MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}",
+            "MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}",
+        ] {
+            assert_eq!(
+                os_zips.matches(secret).count(),
+                1,
+                "the notary secret belongs only on the macOS stage step: {secret}"
+            );
+        }
+        let macos_stage = os_zips
+            .split("Stage, sign, and archive the macOS app")
+            .nth(1)
+            .expect("macOS stage step");
+        let macos_stage = macos_stage
+            .split("\n      - ")
+            .next()
+            .expect("macOS stage step body");
+        assert!(macos_stage.contains("MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}"));
+        assert!(macos_stage.contains("MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}"));
+        assert!(macos_stage.contains("MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}"));
+        let sign_at = stage
+            .find("sign_macos_app \"$app\"")
+            .expect("sign_macos_app");
+        let staple_at = stage
+            .find("notarize-macos-app.sh\" staple")
+            .expect("staple");
+        assert!(sign_at < staple_at, "staple the app after sign_macos_app");
+        let tar_at = stage.find("tar -czf").expect("tar");
+        let validate_at = stage
+            .find("notarize-macos-app.sh\" validate-archive")
+            .expect("validate-archive");
+        assert!(tar_at < validate_at, "validate the archive after tar -czf");
+        assert!(
+            ci.contains(r"scripts/notarize-macos-app\.sh$"),
+            "notify-os runs when the notarize script changes"
+        );
         for (name, src) in [
             ("ci.yml", ci),
             ("release-tag.yml", release),
@@ -466,6 +504,10 @@ mod tests {
             assert!(
                 !src.contains("MACOS_SIGNING"),
                 "{name} must not read the macOS signing secrets"
+            );
+            assert!(
+                !src.contains("MACOS_NOTARY"),
+                "{name} must not read the notary secrets"
             );
         }
         for line in os_zips.lines() {
