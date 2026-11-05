@@ -343,7 +343,45 @@ mod tests {
         );
         assert!(stage.contains("-T /usr/bin/codesign"));
         assert!(stage.contains("--options runtime"));
-        assert!(stage.contains("--timestamp=none"));
+        assert!(
+            stage.contains("args+=(--options runtime --timestamp)"),
+            "Developer ID signs with a secure timestamp"
+        );
+        assert!(
+            stage.contains("args+=(--timestamp=none)"),
+            "other identities stay offline"
+        );
+        assert!(stage.contains("codesign timestamp: secure (Developer ID Application)"));
+        assert!(stage.contains("codesign timestamp: none"));
+        assert!(
+            stage.contains("::error::Developer ID builds must be notarized. Missing"),
+            "a Developer ID signature stops before codesign when a notary variable is empty"
+        );
+        assert!(stage.contains("MACOS_NOTARY_KEY"));
+        assert!(stage.contains("MACOS_NOTARY_KEY_ID"));
+        assert!(stage.contains("MACOS_NOTARY_ISSUER"));
+        assert!(
+            !stage.contains("echo \"$MACOS_NOTARY_KEY\""),
+            "the stage script must not print the notary key"
+        );
+        assert!(
+            !stage.contains("unset MACOS_NOTARY_KEY"),
+            "the signing shell only checks that the notary variables are non-empty"
+        );
+        assert!(
+            !stage.contains("notarytool"),
+            "the stage script does not submit to the notary service"
+        );
+        assert!(
+            stage.contains(
+                "::error::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
+            ),
+            "an unmatched MACOS_SIGNING_IDENTITY fails the job"
+        );
+        assert!(
+            !stage.contains("::warning::MACOS_SIGNING_IDENTITY did not match"),
+            "an unmatched MACOS_SIGNING_IDENTITY must not warn and continue"
+        );
         assert!(
             stage.contains(r#"codesign "${args[@]}" "$target" || status=$?"#),
             "sign_with_identity must keep the codesign status"

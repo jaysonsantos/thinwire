@@ -539,14 +539,18 @@ import_macos_signing_identity() {
       sign_use_hardened_runtime=1
     fi
   else
-    echo "::warning::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
+    # The string is not a hash or a name in this keychain. Signing it
+    # would write a signature the job cannot name.
+    echo "::error::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
     log_parsed_identities
-    kind="unmatched identity"
+    exit 1
   fi
   if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
     echo "codesign hardened runtime: on (Developer ID Application)"
+    echo "codesign timestamp: secure (Developer ID Application)"
   else
     echo "codesign hardened runtime: off (${kind})"
+    echo "codesign timestamp: none (${kind})"
   fi
   if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
     echo "codesign sign argument: ${MACOS_SIGNING_IDENTITY}"
@@ -568,17 +572,40 @@ macho_file() {
 # Hardened runtime checks the Team ID of every library. A self-signed
 # identity has no Team ID, so dlopen of a bundled libtdjson fails.
 # --options runtime is only for Developer ID Application.
+# That identity also needs a secure timestamp. Notarization rejects
+# Timestamp=none, and a timestamp-server failure must not fall back.
 sign_with_identity() {
   local target="$1"
   local entitlements_from="${2:-$1}"
-  local entitlements status
+  local entitlements status missing
   local -a args
+  if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
+    # An unstapled Developer ID app still needs Open Anyway. Stop before
+    # codesign writes those bytes. Emptiness only. The .p8 stays in the
+    # notarize process.
+    missing=""
+    if [[ -z "${MACOS_NOTARY_KEY:-}" ]]; then
+      missing+=" MACOS_NOTARY_KEY"
+    fi
+    if [[ -z "${MACOS_NOTARY_KEY_ID:-}" ]]; then
+      missing+=" MACOS_NOTARY_KEY_ID"
+    fi
+    if [[ -z "${MACOS_NOTARY_ISSUER:-}" ]]; then
+      missing+=" MACOS_NOTARY_ISSUER"
+    fi
+    if [[ -n "$missing" ]]; then
+      echo "::error::Developer ID builds must be notarized. Missing${missing}."
+      exit 1
+    fi
+  fi
   entitlements="$(mktemp)"
   args=(--force)
   if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
-    args+=(--options runtime)
+    args+=(--options runtime --timestamp)
+  else
+    args+=(--timestamp=none)
   fi
-  args+=(--timestamp=none --sign "$sign_identity")
+  args+=(--sign "$sign_identity")
   if codesign -d --entitlements :- "$entitlements_from" >"$entitlements" 2>/dev/null \
     && grep -q '<plist' "$entitlements"; then
     args+=(--entitlements "$entitlements")
