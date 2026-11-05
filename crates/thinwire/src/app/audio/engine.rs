@@ -21,6 +21,10 @@ use super::Backend;
 const OPUS_MAX_FRAME: usize = 5760;
 const OPUS_RATE: u32 = 48_000;
 const END_POLL: Duration = Duration::from_millis(50);
+/// PCM kept for one note. 48 kHz `f32` mono is 11.52 MB a minute, so half an
+/// hour is about 346 MB. A decode past this is refused.
+const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
+const MAX_DECODED_SAMPLES: usize = MAX_DECODED_BYTES / std::mem::size_of::<f32>();
 
 pub(crate) enum Cmd {
     Play { path: AudioPath, generation: u64 },
@@ -218,8 +222,13 @@ fn read_voice(path: &AudioPath) -> Result<SamplesBuffer, ()> {
             return Err(());
         }
     };
-    if let VoiceDecode::Opus(buffer) = voice_buffer(file) {
-        return Ok(buffer);
+    match voice_buffer(file) {
+        VoiceDecode::Opus(buffer) => return Ok(buffer),
+        VoiceDecode::Rejected => {
+            tracing::warn!("voice note is too large to play");
+            return Err(());
+        }
+        VoiceDecode::TryVorbis => {}
     }
     let file = match File::open(path.as_path()) {
         Ok(file) => file,
@@ -246,7 +255,13 @@ where
 {
     let channels = decoder.channels();
     let rate = decoder.sample_rate();
-    let data: Vec<rodio::Sample> = decoder.collect();
+    let mut data = Vec::new();
+    for sample in decoder {
+        if data.len() >= MAX_DECODED_SAMPLES {
+            return Err(());
+        }
+        data.push(sample);
+    }
     if data.is_empty() || !data.len().is_multiple_of(channels.get() as usize) {
         return Err(());
     }
@@ -256,6 +271,7 @@ where
 enum VoiceDecode {
     Opus(SamplesBuffer),
     TryVorbis,
+    Rejected,
 }
 
 struct OpusHead {
@@ -264,38 +280,56 @@ struct OpusHead {
 }
 
 fn voice_buffer(reader: impl Read + Seek) -> VoiceDecode {
-    opus_samples(reader).map_or(VoiceDecode::TryVorbis, VoiceDecode::Opus)
+    decode_opus(reader, MAX_DECODED_SAMPLES)
 }
 
-fn opus_samples(reader: impl Read + Seek) -> Result<SamplesBuffer, ()> {
+fn decode_opus(reader: impl Read + Seek, max_samples: usize) -> VoiceDecode {
     let mut reader = ogg::PacketReader::new(reader);
-    let head = reader.read_packet().map_err(|_| ())?.ok_or(())?;
-    let OpusHead { channels, pre_skip } = opus_head(&head.data)?;
-    let mut packets = Vec::new();
-    if let Some(second) = reader.read_packet().map_err(|_| ())?
-        && !second.data.starts_with(b"OpusTags")
-    {
-        packets.push(second.data);
-    }
-    while let Some(packet) = reader.read_packet().map_err(|_| ())? {
-        packets.push(packet.data);
-    }
+    let head = match reader.read_packet() {
+        Ok(Some(packet)) => packet,
+        Ok(None) | Err(_) => return VoiceDecode::TryVorbis,
+    };
+    let OpusHead { channels, pre_skip } = match opus_head(&head.data) {
+        Ok(head) => head,
+        Err(()) => return VoiceDecode::TryVorbis,
+    };
     let channel_count = match channels {
         1 => opus::Channels::Mono,
         2 => opus::Channels::Stereo,
-        _ => return Err(()),
+        _ => return VoiceDecode::TryVorbis,
     };
-    let mut decoder = opus::Decoder::new(OPUS_RATE, channel_count).map_err(|_| ())?;
+    let mut decoder = match opus::Decoder::new(OPUS_RATE, channel_count) {
+        Ok(decoder) => decoder,
+        Err(_) => return VoiceDecode::TryVorbis,
+    };
     let mut pcm = Vec::new();
     let mut frame = vec![0.0f32; OPUS_MAX_FRAME * channels as usize];
     let mut skip = pre_skip as usize;
-    for packet in &packets {
-        let decoded = decoder
-            .decode_float(packet, &mut frame, false)
-            .map_err(|_| ())?;
+    let mut produced = 0usize;
+    let mut checked_tags = false;
+    loop {
+        let packet = match reader.read_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(_) => return VoiceDecode::TryVorbis,
+        };
+        if !checked_tags {
+            checked_tags = true;
+            if packet.data.starts_with(b"OpusTags") {
+                continue;
+            }
+        }
+        let decoded = match decoder.decode_float(&packet.data, &mut frame, false) {
+            Ok(decoded) => decoded,
+            Err(_) => return VoiceDecode::TryVorbis,
+        };
         let samples = decoded.saturating_mul(channels as usize);
         if samples > frame.len() {
-            return Err(());
+            return VoiceDecode::TryVorbis;
+        }
+        produced = produced.saturating_add(samples);
+        if produced > max_samples {
+            return VoiceDecode::Rejected;
         }
         let taken = &frame[..samples];
         if skip == 0 {
@@ -308,11 +342,15 @@ fn opus_samples(reader: impl Read + Seek) -> Result<SamplesBuffer, ()> {
         pcm.extend_from_slice(&taken[drop_samples..]);
     }
     if pcm.is_empty() {
-        return Err(());
+        return VoiceDecode::TryVorbis;
     }
-    let channels = NonZero::new(u16::from(channels)).ok_or(())?;
-    let rate = NonZero::new(OPUS_RATE).ok_or(())?;
-    Ok(SamplesBuffer::new(channels, rate, pcm))
+    let Some(channels) = NonZero::new(u16::from(channels)) else {
+        return VoiceDecode::TryVorbis;
+    };
+    let Some(rate) = NonZero::new(OPUS_RATE) else {
+        return VoiceDecode::TryVorbis;
+    };
+    VoiceDecode::Opus(SamplesBuffer::new(channels, rate, pcm))
 }
 
 fn opus_head(data: &[u8]) -> Result<OpusHead, ()> {
@@ -333,7 +371,7 @@ mod tests {
 
     use rodio::source::Source;
 
-    use super::{VoiceDecode, voice_buffer};
+    use super::{MAX_DECODED_SAMPLES, VoiceDecode, decode_opus, voice_buffer};
 
     #[test]
     fn bytes_that_are_not_ogg_opus_are_refused() {
@@ -343,10 +381,38 @@ mod tests {
 
     #[test]
     fn an_ogg_opus_page_decodes_without_opening_a_device() {
+        let VoiceDecode::Opus(buffer) = voice_buffer(Cursor::new(ogg_opus(1))) else {
+            panic!("opus");
+        };
+        assert_eq!(buffer.channels().get(), 1);
+        assert_eq!(buffer.sample_rate().get(), 48_000);
+        assert!(buffer.into_iter().next().is_some());
+    }
+
+    #[test]
+    fn a_note_past_the_decode_cap_is_refused() {
+        let bytes = ogg_opus(4);
+        let VoiceDecode::Opus(buffer) = decode_opus(Cursor::new(bytes.clone()), usize::MAX) else {
+            panic!("opus");
+        };
+        let count = buffer.into_iter().count();
+        assert!(count > 1);
+        assert!(matches!(
+            decode_opus(Cursor::new(bytes), count - 1),
+            VoiceDecode::Rejected
+        ));
+    }
+
+    #[test]
+    fn thirty_minutes_of_mono_pcm_is_over_the_decode_cap() {
+        let samples = 48_000usize * 30 * 60;
+        assert!(samples > MAX_DECODED_SAMPLES);
+    }
+
+    fn ogg_opus(frames: usize) -> Vec<u8> {
         let mut encoder =
             opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Audio)
                 .expect("encoder");
-        let packet = encoder.encode_vec(&[0i16; 960], 4_000).expect("frame");
         let mut bytes = Vec::new();
         {
             let mut writer = ogg::PacketWriter::new(&mut bytes);
@@ -356,16 +422,19 @@ mod tests {
             writer
                 .write_packet(opus_tags(), 1, ogg::PacketWriteEndInfo::EndPage, 0)
                 .expect("tags");
-            writer
-                .write_packet(packet, 1, ogg::PacketWriteEndInfo::EndStream, 960)
-                .expect("audio");
+            for index in 0..frames {
+                let packet = encoder.encode_vec(&[0i16; 960], 4_000).expect("frame");
+                let end = if index + 1 == frames {
+                    ogg::PacketWriteEndInfo::EndStream
+                } else {
+                    ogg::PacketWriteEndInfo::EndPage
+                };
+                writer
+                    .write_packet(packet, 1, end, (index as u64 + 1) * 960)
+                    .expect("audio");
+            }
         }
-        let VoiceDecode::Opus(buffer) = voice_buffer(Cursor::new(bytes)) else {
-            panic!("opus");
-        };
-        assert_eq!(buffer.channels().get(), 1);
-        assert_eq!(buffer.sample_rate().get(), 48_000);
-        assert!(buffer.into_iter().next().is_some());
+        bytes
     }
 
     fn opus_head_bytes() -> Vec<u8> {
