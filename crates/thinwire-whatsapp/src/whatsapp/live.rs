@@ -15,6 +15,7 @@ use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::store::error::StoreError;
 use whatsapp_rust::types::events::{Event, EventKind};
 use whatsapp_rust::wacore::proto_helpers::{MessageBuilderExt, MessageExt};
+use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::{Client, ClientError, Jid, RunCompletionReason};
 
@@ -146,17 +147,17 @@ async fn build_bot(
     phone_number: Option<String>,
     callbacks: Callbacks,
 ) -> Result<Bot, ()> {
-    let mut builder =
-        Bot::builder()
-            .with_backend(backend)
-            .on_event_for(INBOX_EVENTS, move |event, _client| {
-                let callbacks = callbacks.clone();
-                async move {
-                    if let Some(link_event) = map_event(&event) {
-                        callbacks.send(link_event);
-                    }
+    let mut builder = Bot::builder()
+        .with_backend(backend)
+        .with_device_props(device_props())
+        .on_event_for(INBOX_EVENTS, move |event, _client| {
+            let callbacks = callbacks.clone();
+            async move {
+                if let Some(link_event) = map_event(&event) {
+                    callbacks.send(link_event);
                 }
-            });
+            }
+        });
     if let Some(phone_number) = phone_number {
         builder = builder.with_pair_code(PairCodeOptions {
             phone_number,
@@ -164,6 +165,15 @@ async fn build_bot(
         });
     }
     builder.build().await.map_err(|_| ())
+}
+
+/// The name on the phone's Linked devices list. The library default is
+/// "rust". WhatsApp reads it only when the device pairs, so a device that
+/// linked before keeps the old name until it links again.
+pub(crate) const DEVICE_NAME: &str = "thinwire";
+
+fn device_props() -> DevicePropsOverride {
+    DevicePropsOverride::new().with_os(DEVICE_NAME)
 }
 
 fn map_event(event: &Event) -> Option<LinkEvent> {
@@ -472,6 +482,13 @@ mod tests {
         );
         let debug = format!("{:?}", SendFailure::Rejected);
         assert!(!debug.contains("111"));
+    }
+
+    /// The phone lists this device as "thinwire", not as the library
+    /// default "rust".
+    #[test]
+    fn the_linked_device_is_named_thinwire() {
+        assert_eq!(device_props().os.as_deref(), Some("thinwire"));
     }
 
     #[test]

@@ -65,6 +65,41 @@ pub(crate) fn arrow_up(painter: &egui::Painter, center: Pos2, size: f32, color: 
     );
 }
 
+/// A chevron that points left: back to the list above.
+pub(crate) fn chevron_left(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let stroke = Stroke::new(2.0, color);
+    let unit = size / 16.0;
+    painter.line_segment(
+        [at(center, unit, 2.5, -6.0), at(center, unit, -3.5, 0.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [at(center, unit, -3.5, 0.0), at(center, unit, 2.5, 6.0)],
+        stroke,
+    );
+}
+
+/// A hash sign: one topic of a forum.
+pub(crate) fn hash(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let stroke = Stroke::new(1.6, color);
+    let unit = size / 16.0;
+    for x in [-2.0, 2.5] {
+        painter.line_segment(
+            [
+                at(center, unit, x + 1.0, -6.0),
+                at(center, unit, x - 1.0, 6.0),
+            ],
+            stroke,
+        );
+    }
+    for y in [-2.5, 2.5] {
+        painter.line_segment(
+            [at(center, unit, -6.0, y), at(center, unit, 6.0, y)],
+            stroke,
+        );
+    }
+}
+
 /// A speech bubble with two text lines: the empty chat state.
 pub(crate) fn chat_bubble(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     let stroke = Stroke::new(2.0, color);

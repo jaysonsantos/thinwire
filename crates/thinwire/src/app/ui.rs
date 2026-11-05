@@ -867,6 +867,9 @@ fn account_chip(
             .id_salt(("account-chip", caps.id, account.signal_retained)),
     );
     child.spacing_mut().item_spacing.x = space::M;
+    // A selectable label takes the click, so only the tile selected the
+    // account. Plain labels let the click go to the row.
+    child.style_mut().interaction.selectable_labels = false;
     let (tile, tile_response) =
         child.allocate_exact_size(egui::vec2(TILE, TILE), egui::Sense::hover());
     // The tile is painted, so tests need a label to read its left edge.
@@ -881,40 +884,47 @@ fn account_chip(
         palette.text3
     };
     paint_protocol_tile(&child, tile, caps.id, Some((fill, dot)));
+    // The name keeps its full width. The Unofficial pill goes next to the
+    // name only when both fit. Else it goes on the status line.
+    let pill_on_name = unofficial && {
+        let name_font = theme::row_title().resolve(child.style());
+        let name = child
+            .painter()
+            .layout_no_wrap(caps.id.display_name().to_owned(), name_font, palette.text)
+            .size()
+            .x;
+        name + space::S + unofficial_pill_width(&child) <= text_width
+    };
     let mut unofficial_hit = false;
+    let mut pill = |ui: &mut egui::Ui| {
+        ui.spacing_mut().button_padding = egui::vec2(space::S, 1.0);
+        let button = ui.add(
+            egui::Button::new(RichText::new("Unofficial").small().color(palette.text2))
+                .corner_radius(egui::CornerRadius::same(radius::PILL)),
+        );
+        let pointer = ui.input(|input| input.pointer.interact_pos());
+        unofficial_hit = button.clicked()
+            || response.clicked() && pointer.is_some_and(|pos| button.rect.contains(pos));
+        if unofficial_hit {
+            out.push(Intent::ShowNotice(caps.id));
+        }
+    };
     child.vertical(|ui| {
         ui.set_max_width(text_width);
         ui.spacing_mut().item_spacing.y = 2.0;
         ui.spacing_mut().interact_size.y = 0.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = space::S;
-            ui.scope(|ui| {
-                ui.set_max_width(if unofficial {
-                    (text_width - 76.0).max(24.0)
-                } else {
-                    text_width
-                });
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(caps.id.display_name())
-                            .text_style(theme::row_title())
-                            .color(palette.text),
-                    )
-                    .truncate(),
-                );
-            });
-            if unofficial {
-                ui.spacing_mut().button_padding = egui::vec2(space::S, 1.0);
-                let button = ui.add(
-                    egui::Button::new(RichText::new("Unofficial").small().color(palette.text2))
-                        .corner_radius(egui::CornerRadius::same(radius::PILL)),
-                );
-                let pointer = ui.input(|input| input.pointer.interact_pos());
-                unofficial_hit = button.clicked()
-                    || response.clicked() && pointer.is_some_and(|pos| button.rect.contains(pos));
-                if unofficial_hit {
-                    out.push(Intent::ShowNotice(caps.id));
-                }
+            ui.add(
+                egui::Label::new(
+                    RichText::new(caps.id.display_name())
+                        .text_style(theme::row_title())
+                        .color(palette.text),
+                )
+                .truncate(),
+            );
+            if pill_on_name {
+                pill(ui);
             }
         });
         let color = match account.status {
@@ -922,7 +932,15 @@ fn account_chip(
             AdapterStatus::Error | AdapterStatus::Refused => palette.warn,
             _ => palette.text3,
         };
-        ui.label(RichText::new(label).small().color(color));
+        if unofficial && !pill_on_name {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::S;
+                ui.label(RichText::new(label).small().color(color));
+                pill(ui);
+            });
+        } else {
+            ui.label(RichText::new(label).small().color(color));
+        }
     });
     if let Some(text) = &badge {
         child.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -936,6 +954,16 @@ fn account_chip(
         ui.label(RichText::new(note).small().weak());
     }
     response.clicked() && !unofficial_hit
+}
+
+/// Width of the Unofficial pill of an account row, with its padding.
+fn unofficial_pill_width(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    ui.painter()
+        .layout_no_wrap("Unofficial".to_owned(), font, egui::Color32::PLACEHOLDER)
+        .size()
+        .x
+        + space::S * 2.0
 }
 
 /// The protocol tile: a tinted square with the first letter. `dot` is the
@@ -2661,7 +2689,7 @@ fn topic_list(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     if let Some(offset) = forced {
         area = area.vertical_scroll_offset(offset);
     }
-    let stride = inbox_row_stride(ui);
+    let stride = topic_row_height(ui) + ROW_GAP;
     let mut drawn = DrawnInbox {
         anchor: None,
         stride,
@@ -2725,6 +2753,15 @@ fn topic_list(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     });
 }
 
+/// Side of the tile at the start of a topic row.
+const TOPIC_TILE: f32 = 32.0;
+
+/// Height of a topic row: one line beside its tile.
+fn topic_row_height(ui: &egui::Ui) -> f32 {
+    let title = ui.text_style_height(&theme::row_title());
+    TOPIC_TILE.max(title) + theme::ROW_INSET.y * 2.0
+}
+
 /// One topic row. A closed topic shows a lock beside the name.
 #[allow(clippy::too_many_arguments)]
 fn topic_row(
@@ -2739,21 +2776,40 @@ fn topic_row(
     let palette = theme::palette(ui);
     let width = laid_out_width(ui, "topic-row-width");
     let (rect, hover) = ui.allocate_exact_size(
-        egui::vec2(width, inbox_row_height(ui)),
+        egui::vec2(width, topic_row_height(ui)),
         egui::Sense::hover(),
     );
     let row_id = ui.scope_id().with(("topic-row", id));
     row_backdrop(ui, row_id, rect, palette.bg, false, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
+    // A topic has no photo and no preview: one line, after a small tile.
+    // The tile and the line are both centered on the row.
+    let tile = egui::Rect::from_center_size(
+        egui::pos2(inner.left() + TOPIC_TILE * 0.5, inner.center().y),
+        egui::vec2(TOPIC_TILE, TOPIC_TILE),
+    );
+    ui.painter()
+        .rect_filled(tile, egui::CornerRadius::same(8), palette.sidebar);
+    icons::hash(ui.painter(), tile.center(), 16.0, palette.text2);
+    let line_height = ui.text_style_height(&theme::row_title());
+    let line = egui::Rect::from_min_max(
+        egui::pos2(
+            tile.right() + space::M,
+            inner.center().y - line_height * 0.5,
+        ),
+        egui::pos2(inner.right(), inner.center().y + line_height * 0.5),
+    );
     let mut child = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(inner)
-            .layout(egui::Layout::top_down(egui::Align::Min))
+            .max_rect(line)
+            .layout(egui::Layout::left_to_right(egui::Align::Center))
             .id_salt(("topic-row", id)),
     );
-    child.spacing_mut().item_spacing.y = 2.0;
-    child.spacing_mut().interact_size.y = 0.0;
+    // A nested row starts as tall as this. Zero would put its top on the
+    // center line, and the text would sit under the tile center.
+    child.spacing_mut().interact_size.y = line_height;
+    child.style_mut().interaction.selectable_labels = false;
     let title_font = if unread > 0 {
         theme::semibold()
     } else {
@@ -2772,7 +2828,7 @@ fn topic_row(
                         RichText::new(name)
                             .text_style(theme::row_title())
                             .family(title_font)
-                            .color(palette.text),
+                            .color(if closed { palette.text2 } else { palette.text }),
                     )
                     .truncate()
                     .halign(egui::Align::LEFT),
@@ -2780,29 +2836,13 @@ fn topic_row(
             });
         },
         |ui| {
+            ui.spacing_mut().item_spacing.x = space::S;
+            if let Some(text) = badge_text(unread) {
+                unread_badge(ui, &text, muted);
+            }
             ui.label(RichText::new(time).small().color(palette.text3));
             if muted {
                 ui.label(RichText::new("muted").small().color(palette.text3));
-            }
-        },
-    );
-    row_ends(
-        &mut child,
-        |ui| {
-            let note = if closed { "Closed" } else { "" };
-            ui.add(
-                egui::Label::new(
-                    RichText::new(note)
-                        .text_style(theme::secondary())
-                        .color(palette.text2),
-                )
-                .truncate()
-                .halign(egui::Align::LEFT),
-            );
-        },
-        |ui| {
-            if let Some(text) = badge_text(unread) {
-                unread_badge(ui, &text, muted);
             }
         },
     );
@@ -2862,10 +2902,6 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
             // One row: the button sits right, and the title takes the rest
             // and truncates.
             let open = snapshot.open_topic();
-            let title = match open {
-                Some(topic) => format!("{} › {}", conversation.title, topic.name),
-                None => conversation.title.clone(),
-            };
             let (mute_id, mute) = match open {
                 Some(topic) => (
                     topic_mute_id(&conversation.id, topic.topic),
@@ -2878,10 +2914,21 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
             } else {
                 conversation.protocol.display_name().to_owned()
             };
+            // The left side pushes here: the right side holds `out`.
             let mut avatar_out = Vec::new();
             egui::Sides::new().shrink_left().truncate().show(
                 ui,
                 |ui| {
+                    // An open topic shows Back. It goes to the topic list.
+                    if open.is_some()
+                        && icon_button(ui, "Back to topics", icons::chevron_left, palette.text2)
+                            .on_hover_text("All topics")
+                            .clicked()
+                    {
+                        avatar_out.push(Intent::CloseTopic {
+                            conversation_id: conversation.id.clone(),
+                        });
+                    }
                     let side = super::photos::HEADER_AVATAR_SIDE;
                     let (avatar, _) =
                         ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
@@ -2899,12 +2946,59 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = space::XS;
-                            if open.is_some_and(|topic| topic.closed) {
+                            let Some(topic) = open else {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&conversation.title)
+                                            .heading()
+                                            .color(palette.text),
+                                    )
+                                    .truncate(),
+                                );
+                                return;
+                            };
+                            // The breadcrumb: the chat name is a link to its
+                            // topic list.
+                            // A long chat name takes half the row at most,
+                            // so the topic name stays in view.
+                            let room = ui.available_width() * 0.5;
+                            let crumb = ui
+                                .scope(|ui| {
+                                    ui.set_max_width(room);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&conversation.title)
+                                                .heading()
+                                                .color(palette.text2),
+                                        )
+                                        .selectable(false)
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
+                                    )
+                                })
+                                .inner
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("All topics");
+                            if crumb.hovered() {
+                                let rect = crumb.rect;
+                                ui.painter().hline(
+                                    rect.x_range(),
+                                    rect.bottom() - 1.0,
+                                    egui::Stroke::new(1.0, palette.text2),
+                                );
+                            }
+                            if crumb.clicked() {
+                                avatar_out.push(Intent::CloseTopic {
+                                    conversation_id: conversation.id.clone(),
+                                });
+                            }
+                            ui.label(RichText::new("›").heading().color(palette.text3));
+                            if topic.closed {
                                 lock_icon(ui, palette.text2);
                             }
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(title).heading().color(palette.text),
+                                    RichText::new(&topic.name).heading().color(palette.text),
                                 )
                                 .truncate(),
                             );

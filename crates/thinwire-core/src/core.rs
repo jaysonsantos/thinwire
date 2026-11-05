@@ -623,6 +623,11 @@ impl Core {
             } => {
                 let _ = self.state.select_topic(conversation_id, topic);
             }
+            Intent::CloseTopic { conversation_id } => {
+                if self.state.selected_conversation.as_deref() == Some(conversation_id.as_str()) {
+                    self.state.close_open_topic();
+                }
+            }
             Intent::MoveInbox { delta } => self.state.move_inbox_selection(delta),
             Intent::FocusInbox { id } => self.state.focus_inbox_row(id),
             Intent::SetSearch(text) => self.state.set_search(text.into_inner()),
@@ -3110,6 +3115,21 @@ mod tests {
         });
         assert_eq!(core.view().compose, "bring water");
         assert_eq!(core.view().selected_topic, Some(trail));
+
+        // The breadcrumb goes back to the topic list too. A close for
+        // another chat does nothing.
+        core.dispatch(Intent::CloseTopic {
+            conversation_id: "telegram:1".into(),
+        });
+        assert_eq!(core.view().selected_topic, Some(trail));
+        core.dispatch(Intent::CloseTopic {
+            conversation_id: "telegram:9".into(),
+        });
+        assert!(core.view().showing_topic_list());
+        assert_eq!(
+            core.view().selected_conversation.as_deref(),
+            Some("telegram:9")
+        );
     }
 
     /// A notification for a topic opens the forum when that forum's topics

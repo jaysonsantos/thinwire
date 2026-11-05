@@ -392,6 +392,13 @@ pub struct HelperNotice<'a> {
     pub error: Option<&'a UserError>,
 }
 
+/// Status line after the user starts a WhatsApp pairing.
+pub const WHATSAPP_PAIRING_REQUESTED: &str = "WhatsApp pairing requested.";
+/// Status line after the user accepts the WhatsApp ban gate.
+pub const WHATSAPP_GATE_ACCEPTED: &str = "WhatsApp ban gate accepted. Pairing has not started.";
+/// Status line after WhatsApp links. It replaces the pairing lines.
+pub const WHATSAPP_LINKED: &str = "WhatsApp is linked.";
+
 /// Account row line while the helper starts or does not answer in time.
 pub const HELPER_BUSY: &str = "Helper is busy…";
 /// Account row line while the core waits to start the helper again.
@@ -4953,7 +4960,7 @@ impl Snapshot {
         self.whatsapp_risk_acknowledged = true;
         self.whatsapp_screen = WhatsAppScreen::Pair;
         self.error = None;
-        self.status_text = "WhatsApp ban gate accepted. Pairing has not started.".into();
+        self.status_text = WHATSAPP_GATE_ACCEPTED.into();
         self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
     }
 
@@ -5002,7 +5009,7 @@ impl Snapshot {
         self.whatsapp_pair_code = None;
         self.whatsapp_started = true;
         self.error = None;
-        self.status_text = "WhatsApp pairing requested.".into();
+        self.status_text = WHATSAPP_PAIRING_REQUESTED.into();
         let generation = self.next_pairing_generation;
         self.next_pairing_generation += 1;
         self.pairing_generation
@@ -5050,12 +5057,19 @@ impl Snapshot {
     /// must not close a risk gate the user just opened.
     #[cfg(feature = "whatsapp-web")]
     fn finish_whatsapp_link(&mut self) {
+        // A line about the pairing is not true after the link. This also
+        // applies when the pair screen closed before the phone linked.
+        if [WHATSAPP_PAIRING_REQUESTED, WHATSAPP_GATE_ACCEPTED].contains(&self.status_text.as_str())
+        {
+            self.status_text = WHATSAPP_LINKED.into();
+        }
         if !self.whatsapp_started || self.whatsapp_screen != WhatsAppScreen::Pair {
             return;
         }
         self.whatsapp_screen = WhatsAppScreen::Hidden;
         self.end_pairing();
         self.whatsapp_phone.clear();
+        self.status_text = WHATSAPP_LINKED.into();
     }
 
     /// The pairing stopped. Drop its QR and its pair code.
@@ -6276,6 +6290,37 @@ mod tests {
         assert!(snapshot.whatsapp_started, "the WhatsApp pairing stays");
         snapshot.apply(whatsapp_qr(pairing));
         assert_eq!(snapshot.whatsapp_qr.as_deref(), Some("qr-one"));
+    }
+
+    /// A link replaces the pairing line of the status strip. The strip
+    /// does not say "pairing requested" for a linked account.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_whatsapp_link_replaces_the_pairing_status() {
+        let phone = thinwire_protocol::WhatsAppPhoneVault::new();
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.begin_whatsapp_link(&phone);
+        assert_eq!(snapshot.status_line(), WHATSAPP_PAIRING_REQUESTED);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.status_line(), WHATSAPP_LINKED);
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+
+        // The pair screen closed first. The link still replaces the line.
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        snapshot.begin_whatsapp_link(&phone);
+        snapshot.whatsapp_screen = WhatsAppScreen::Hidden;
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.status_line(), WHATSAPP_LINKED);
     }
 
     /// ADR 0013 decision 6: a missing helper keeps the account row, with

@@ -28,6 +28,9 @@ pub enum Intent {
         conversation_id: String,
         topic: MessageTopic,
     },
+    /// Leave the open topic of this chat and show its topic list. Dropped
+    /// when another chat is open.
+    CloseTopic { conversation_id: String },
     /// Move the inbox highlight by `delta` rows. Down is positive.
     /// This does not open the chat and does not focus the compose field.
     MoveInbox { delta: i32 },

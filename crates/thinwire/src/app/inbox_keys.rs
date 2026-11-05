@@ -102,6 +102,12 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             }
             Intent::RestartHelper(protocol) => state.restarts.push(protocol),
             Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
+            Intent::CloseTopic { conversation_id } => {
+                if state.snapshot.selected_conversation.as_deref() == Some(conversation_id.as_str())
+                {
+                    state.snapshot.close_open_topic();
+                }
+            }
             Intent::ShowNotice(protocol) => state.snapshot.open_notice_review(protocol),
             Intent::CloseNotice => state.snapshot.close_notice_review(),
             Intent::Retry { message_id } => state.snapshot.retry_send(&message_id),
@@ -275,6 +281,138 @@ fn unofficial_opens_the_notice() {
         .click();
     harness.run();
     assert!(harness.state().snapshot.notice_review().is_none());
+}
+
+/// A pointer click on the name or the status text of an account row selects
+/// that account. Before, only the tile took the click: the labels were
+/// selectable and kept it.
+#[test]
+fn a_click_on_the_account_name_selects_the_account() {
+    let mut state = InboxUi::ready();
+    show_protocol(&mut state.snapshot, ProtocolId::WhatsApp);
+    state.snapshot.apply(AdapterEvent::Account {
+        protocol: ProtocolId::WhatsApp,
+        state: AccountState::Linked,
+    });
+    state.snapshot.select_protocol(ProtocolId::Telegram);
+    let mut harness = harness(state);
+    // The WhatsApp chat list loads, so its spinner keeps repainting.
+    harness.run_steps(3);
+    let name = harness
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Label)
+                .label("WhatsApp"),
+        )
+        .map(|node| node.rect())
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("the name label of the WhatsApp row");
+    let at = egui::pos2(name.center().x, name.center().y);
+    click_at(&mut harness, at);
+    assert_eq!(
+        harness.state().snapshot.selected_protocol,
+        ProtocolId::WhatsApp
+    );
+    let telegram = harness
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Label)
+                .label("Telegram"),
+        )
+        .map(|node| node.rect())
+        .min_by(|a, b| a.left().total_cmp(&b.left()))
+        .expect("the name label of the Telegram row");
+    click_at(
+        &mut harness,
+        egui::pos2(telegram.center().x, telegram.center().y),
+    );
+    assert_eq!(
+        harness.state().snapshot.selected_protocol,
+        ProtocolId::Telegram
+    );
+}
+
+/// An open topic shows Back, and the chat name in the header is a link.
+/// Both go back to the topic list of that chat.
+#[test]
+fn back_and_the_breadcrumb_open_the_topic_list() {
+    use thinwire_protocol::{ChatTopic, MessageTopic};
+
+    let mut state = InboxUi::ready();
+    let mut forum = telegram_chat(9, "Camp forum", 30);
+    forum.has_topics = true;
+    state.snapshot.apply(AdapterEvent::ConversationUpsert {
+        conversation: forum,
+    });
+    let trail = MessageTopic::Forum(2);
+    state.snapshot.apply(AdapterEvent::TopicUpsert {
+        topic: ChatTopic {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:9".into(),
+            topic: trail,
+            name: "Trail".into(),
+            unread: 0,
+            last_at: 1,
+            general: false,
+            hidden: false,
+            closed: false,
+            muted: false,
+        },
+    });
+    state.snapshot.select_conversation("telegram:9".into());
+    assert!(state.snapshot.select_topic("telegram:9".into(), trail));
+    let mut harness = harness(state);
+    // The topic history loads, so its spinner keeps repainting.
+    harness.run_steps(3);
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Back to topics")
+        .click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().snapshot.selected_topic, None);
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:9")
+    );
+    assert!(
+        harness.query_by_label("Back to topics").is_none(),
+        "the topic list has no Back"
+    );
+
+    // The chat name of the breadcrumb is the rightmost "Camp forum" label.
+    assert!(
+        harness
+            .state_mut()
+            .snapshot
+            .select_topic("telegram:9".into(), trail)
+    );
+    harness.run_steps(3);
+    let crumb = harness
+        .query_all(
+            By::new()
+                .role(egui::accesskit::Role::Label)
+                .label("Camp forum"),
+        )
+        .max_by(|a, b| a.rect().left().total_cmp(&b.rect().left()))
+        .expect("the breadcrumb");
+    crumb.click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().snapshot.selected_topic, None);
+}
+
+/// A press and a release of the main button at one point. The new account
+/// can show a spinner, so this runs a fixed number of frames.
+fn click_at(harness: &mut Harness<'static, InboxUi>, pos: egui::Pos2) {
+    harness.hover_at(pos);
+    harness.run_steps(2);
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    harness.run_steps(2);
 }
 
 /// The account info view keeps Ban risk. It opens the same README text.
