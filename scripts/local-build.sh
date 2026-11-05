@@ -89,8 +89,61 @@ profile="debug"
 for arg in "$@"; do
   [[ "$arg" == "--release" ]] && profile="release"
 done
+run="target/${profile}/thinwire"
+
+# macOS: a bare binary has no bundle, so the notification center refuses
+# it and a notification cannot open its chat. A small Thinwire.app with
+# the bundle id of a release fixes that. The Keychain store reads through
+# `security`, so the new path asks for no permission.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  out="target/${profile}"
+  app="${out}/Thinwire.app"
+  rm -rf "$app"
+  mkdir -p "$app/Contents/MacOS"
+  for program in thinwire thinwire-whatsapp-helper thinwire-signal-helper; do
+    # `/bin/cp -c` clones the file on APFS: no second copy of the bytes.
+    # The `cp` of the Nix shell is GNU cp, which has no `-c`.
+    /bin/cp -c "${out}/${program}" "$app/Contents/MacOS/${program}" 2>/dev/null \
+      || cp "${out}/${program}" "$app/Contents/MacOS/${program}"
+  done
+  version="$(sed -nE '/^\[workspace.package\]/,/^\[/s/^version = "([^"]+)"/\1/p' Cargo.toml)"
+  cat >"$app/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>thinwire</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.jaysonsantos.thinwire</string>
+  <key>CFBundleName</key>
+  <string>Thinwire</string>
+  <key>CFBundleDisplayName</key>
+  <string>Thinwire</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${version:-0.0.0}</string>
+  <key>CFBundleVersion</key>
+  <string>${version:-0.0.0}</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+EOF
+  # Ad-hoc signatures: the helpers first, then the app around them.
+  codesign --force --sign - "$app/Contents/MacOS/thinwire-whatsapp-helper"
+  codesign --force --sign - "$app/Contents/MacOS/thinwire-signal-helper"
+  codesign --force --sign - "$app"
+  run="${app}/Contents/MacOS/thinwire"
+fi
+
 echo
 echo "Built with every protocol and $store."
-echo "Run it with: target/${profile}/thinwire"
+echo "Run it with: ${run}"
 echo "The helpers are beside it, where the app looks for them."
 echo "(A custom --profile builds into target/<profile>/.)"
