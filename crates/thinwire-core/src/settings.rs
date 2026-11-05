@@ -119,6 +119,9 @@ pub struct Settings {
     /// Accepted Signal notice copy. `0` means the user has not accepted the
     /// current notice. Any other value is the version they accepted.
     signal_notice_version: u64,
+    /// Accepted WhatsApp ban gate copy. `0` means the user has not accepted
+    /// the current gate. Any other value is the version they accepted.
+    whatsapp_gate_version: u64,
 }
 
 /// Settings key of the WhatsApp helper path.
@@ -127,6 +130,8 @@ const WHATSAPP_HELPER_KEY: &str = "whatsapp_helper";
 const SIGNAL_HELPER_KEY: &str = "signal_helper";
 /// Settings key of the accepted Signal notice copy.
 const SIGNAL_NOTICE_VERSION_KEY: &str = "signal_notice_version";
+/// Settings key of the accepted WhatsApp ban gate copy.
+const WHATSAPP_GATE_VERSION_KEY: &str = "whatsapp_gate_version";
 
 impl Settings {
     /// Load from the platform config dir, and the muted chats from the
@@ -150,6 +155,7 @@ impl Settings {
         let whatsapp_helper = read_path(&path, WHATSAPP_HELPER_KEY);
         let signal_helper = read_path(&path, SIGNAL_HELPER_KEY);
         let signal_notice_version = read_u64(&path, SIGNAL_NOTICE_VERSION_KEY).unwrap_or(0);
+        let whatsapp_gate_version = read_u64(&path, WHATSAPP_GATE_VERSION_KEY).unwrap_or(0);
         Self {
             theme,
             notifications: read_bool(&path, "notifications").unwrap_or(true),
@@ -164,6 +170,7 @@ impl Settings {
             whatsapp_helper,
             signal_helper,
             signal_notice_version,
+            whatsapp_gate_version,
         }
     }
 
@@ -185,6 +192,7 @@ impl Settings {
             whatsapp_helper: None,
             signal_helper: None,
             signal_notice_version: 0,
+            whatsapp_gate_version: 0,
         }
     }
 
@@ -199,6 +207,21 @@ impl Settings {
     pub fn set_signal_notice_version(&mut self, version: u64) {
         if self.signal_notice_version != version {
             self.signal_notice_version = version;
+            self.persist_pending = true;
+        }
+    }
+
+    /// The WhatsApp ban gate copy the user accepted. `0` means none.
+    #[must_use]
+    pub const fn whatsapp_gate_version(&self) -> u64 {
+        self.whatsapp_gate_version
+    }
+
+    /// Remember which WhatsApp ban gate copy the user accepted. `0` clears
+    /// it. Disk persist is queued.
+    pub fn set_whatsapp_gate_version(&mut self, version: u64) {
+        if self.whatsapp_gate_version != version {
+            self.whatsapp_gate_version = version;
             self.persist_pending = true;
         }
     }
@@ -326,6 +349,12 @@ impl Settings {
             text.push_str(&format!(
                 "{SIGNAL_NOTICE_VERSION_KEY} = {}\n",
                 self.signal_notice_version
+            ));
+        }
+        if self.whatsapp_gate_version != 0 {
+            text.push_str(&format!(
+                "{WHATSAPP_GATE_VERSION_KEY} = {}\n",
+                self.whatsapp_gate_version
             ));
         }
         // Keep the helper paths of the user when another setting changes.
@@ -562,6 +591,28 @@ mod tests {
             "the helper path still reads"
         );
         assert_eq!(Settings::in_memory().signal_notice_version(), 0);
+    }
+
+    #[test]
+    fn the_whatsapp_gate_version_persists_and_defaults_to_none() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.whatsapp_gate_version(), 0);
+        settings.set_whatsapp_gate_version(7);
+        settings.set_signal_notice_version(42);
+        settings.persist_now().expect("save");
+        let loaded = Settings::load_from(path.clone());
+        assert_eq!(loaded.whatsapp_gate_version(), 7);
+        assert_eq!(loaded.signal_notice_version(), 42, "both versions read");
+        settings.set_whatsapp_gate_version(0);
+        settings.persist_now().expect("clear");
+        assert_eq!(Settings::load_from(path.clone()).whatsapp_gate_version(), 0);
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.contains("whatsapp_gate_version"),
+            "a cleared acceptance leaves no version key"
+        );
+        assert_eq!(Settings::in_memory().whatsapp_gate_version(), 0);
     }
 
     #[test]

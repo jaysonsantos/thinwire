@@ -98,6 +98,13 @@ pub struct WhatsAppAdapter {
     sends: SendsInFlight,
 }
 
+/// Library tests keep this off, so an acknowledgement does not open the
+/// user's WhatsApp store. The helper process tests use their own session
+/// folder.
+#[cfg(all(test, feature = "whatsapp-web"))]
+static RESUME_ON_ACKNOWLEDGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The send tasks that still run: a task id and the conversation id of
 /// each. Never the text.
 #[derive(Clone, Default)]
@@ -208,7 +215,27 @@ impl WhatsAppAdapter {
             AdapterStatus::Stubbed,
             "WhatsApp ban gate accepted. No linked-device session has started.",
         );
+        self.resume_saved_session(events);
         Ok(())
+    }
+
+    /// The app sends the gate again at start when the user accepted it
+    /// before. A saved, paired store then opens with no QR code. A new link
+    /// still waits for `WhatsAppBeginLink`.
+    fn resume_saved_session(&mut self, events: &EventTx) {
+        #[cfg(feature = "whatsapp-web")]
+        {
+            #[cfg(test)]
+            if !RESUME_ON_ACKNOWLEDGE.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let link = self.link.get_or_insert_with(|| {
+                link::LinkHandle::spawn(live::LiveBackend, self.session.clone(), events.clone())
+            });
+            link.resume();
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        let _ = (self, events);
     }
 
     /// `pairing` is the shell's id for this pairing. Every QR code and pair

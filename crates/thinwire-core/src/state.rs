@@ -400,6 +400,12 @@ pub const ATTACH_TOO_MANY: &str = "30 files at most in one send.";
 /// The tray note when this account cannot send files.
 pub const ATTACH_NOT_HERE: &str = "This account cannot send photos or videos.";
 
+/// Identity of the WhatsApp ban gate copy: its README risk bullets. The
+/// settings file keeps it when the user accepts the gate. A saved value of
+/// another copy does not count, so a new copy shows the gate again.
+pub const WHATSAPP_GATE_VERSION: u64 =
+    crate::signal_notice::notice_version(&thinwire_protocol::CRITIC_RISK_BULLETS);
+
 /// Status line after the user starts a WhatsApp pairing.
 pub const WHATSAPP_PAIRING_REQUESTED: &str = "WhatsApp pairing requested.";
 /// Status line after the user accepts the WhatsApp ban gate.
@@ -5094,6 +5100,30 @@ impl Snapshot {
         phone.clear();
     }
 
+    /// The user accepted the ban gate of this pairing.
+    #[must_use]
+    pub const fn whatsapp_gate_accepted(&self) -> bool {
+        #[cfg(feature = "whatsapp-web")]
+        {
+            self.whatsapp_risk_acknowledged
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        {
+            false
+        }
+    }
+
+    /// The app starts with a saved acceptance of the current ban gate. The
+    /// helper starts and opens a saved, paired session. No screen opens, and
+    /// a new link still shows the gate.
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn restore_whatsapp_gate(&mut self) {
+        if self.helper_missing(ProtocolId::WhatsApp) {
+            return;
+        }
+        self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
+    }
+
     #[cfg(feature = "whatsapp-web")]
     pub fn acknowledge_whatsapp_risk(&mut self) {
         // The ban gate must be on screen: a frontend cannot skip it.
@@ -5207,7 +5237,11 @@ impl Snapshot {
         {
             self.status_text = WHATSAPP_LINKED.into();
         }
-        if !self.whatsapp_started || self.whatsapp_screen != WhatsAppScreen::Pair {
+        // The pair screen closes on any link: the pairing the user started,
+        // or the saved session that opened after the gate. A Cancel on a
+        // pair screen that stays open would end that session. A reconnect
+        // does not close the risk gate: that is another screen.
+        if self.whatsapp_screen != WhatsAppScreen::Pair {
             return;
         }
         self.whatsapp_screen = WhatsAppScreen::Hidden;
@@ -6465,6 +6499,25 @@ mod tests {
             state: AccountState::Linked,
         });
         assert_eq!(snapshot.status_line(), WHATSAPP_LINKED);
+    }
+
+    /// The saved session opens after the gate, with no pairing. The pair
+    /// screen then closes, so its Cancel cannot end that session.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_saved_session_that_opens_after_the_gate_closes_the_pair_screen() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        assert!(!snapshot.whatsapp_started);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        assert_eq!(snapshot.status_line(), WHATSAPP_LINKED);
+        assert!(whatsapp_row(&snapshot).linked());
     }
 
     /// ADR 0013 decision 6: a missing helper keeps the account row, with

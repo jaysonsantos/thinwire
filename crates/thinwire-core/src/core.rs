@@ -280,7 +280,18 @@ impl Core {
             held_topic_notices: Vec::new(),
         };
         core.restore_signal_notice();
+        core.restore_whatsapp_gate();
         core
+    }
+
+    /// A saved acceptance of the current WhatsApp ban gate starts the helper,
+    /// and the helper opens the saved session. Another saved copy, or none,
+    /// starts nothing: the user opens the gate on the next link.
+    fn restore_whatsapp_gate(&mut self) {
+        #[cfg(feature = "whatsapp-web")]
+        if self.settings.whatsapp_gate_version() == crate::state::WHATSAPP_GATE_VERSION {
+            self.state.restore_whatsapp_gate();
+        }
     }
 
     /// A saved acceptance of the current Signal notice starts the helper.
@@ -934,14 +945,30 @@ impl Core {
         let phone: &PhoneVault = &self.whatsapp_phone;
         match intent {
             WhatsAppIntent::OpenRiskGate => self.state.open_whatsapp_risk_gate(),
-            WhatsAppIntent::CloseGate => self.state.close_whatsapp_gate(phone),
-            WhatsAppIntent::AcknowledgeRisk => self.state.acknowledge_whatsapp_risk(),
+            WhatsAppIntent::CloseGate => {
+                // A close after the acceptance is Cancel: forget the saved gate.
+                let accepted = self.state.whatsapp_gate_accepted();
+                self.state.close_whatsapp_gate(phone);
+                if accepted && !self.state.whatsapp_gate_accepted() {
+                    self.settings.set_whatsapp_gate_version(0);
+                }
+            }
+            WhatsAppIntent::AcknowledgeRisk => {
+                self.state.acknowledge_whatsapp_risk();
+                if self.state.whatsapp_gate_accepted() {
+                    self.settings
+                        .set_whatsapp_gate_version(crate::state::WHATSAPP_GATE_VERSION);
+                }
+            }
             WhatsAppIntent::SetPhone(value) => {
                 self.state.set_whatsapp_phone(value.expose().to_owned());
             }
             WhatsAppIntent::BeginLink => self.state.begin_whatsapp_link(phone),
             WhatsAppIntent::LinkWithPhone => self.state.open_whatsapp_phone_link(phone),
-            WhatsAppIntent::CancelLink => self.state.cancel_whatsapp_link(phone),
+            WhatsAppIntent::CancelLink => {
+                self.state.cancel_whatsapp_link(phone);
+                self.settings.set_whatsapp_gate_version(0);
+            }
         }
     }
 
@@ -1688,6 +1715,73 @@ mod tests {
 
         core.dispatch(Intent::Signal(SignalIntent::AcknowledgeNotice));
         assert_eq!(core.settings.signal_notice_version(), current);
+    }
+
+    /// A saved acceptance of the WhatsApp ban gate starts the helper at app
+    /// start, so the saved session opens with no click. No screen opens. A
+    /// different saved copy starts nothing. Accept saves the gate, and
+    /// Cancel clears it.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_whatsapp_gate_resumes_the_session_at_start() {
+        use crate::WhatsAppIntent;
+        use crate::state::{WHATSAPP_GATE_VERSION, WhatsAppScreen};
+
+        let start = |label: &str, version: u64| {
+            let path = std::env::temp_dir()
+                .join("thinwire-core-tests")
+                .join(format!(
+                    "whatsapp-gate-{}-{:?}-{label}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ))
+                .join("settings.toml");
+            let mut settings = Settings::load_from(path.clone());
+            settings.set_whatsapp_gate_version(version);
+            if let Some(job) = settings.take_persist_job() {
+                job.run();
+            }
+            let mut core = Core::new(
+                &Handle::current(),
+                CoreConfig::new(Settings::load_from(path)).with_memory_secrets(),
+            );
+            let (probe, sent) = unbounded_channel();
+            core.commands = HostSender::for_test(probe);
+            let (_events_tx, events) = unbounded_channel();
+            core.events = events;
+            core.pump();
+            (core, sent, _events_tx)
+        };
+
+        let (core, mut sent, _keep) = start("saved", WHATSAPP_GATE_VERSION);
+        assert_eq!(
+            std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>(),
+            vec![AdapterCommand::WhatsAppAcknowledgeRisk],
+            "the helper starts and opens the saved session"
+        );
+        assert_eq!(core.view().whatsapp_screen, WhatsAppScreen::Hidden);
+        assert!(
+            !core.view().whatsapp_gate_accepted(),
+            "a new link still shows the gate"
+        );
+
+        let (mut core, mut sent, _keep) = start("other", WHATSAPP_GATE_VERSION.wrapping_add(1));
+        assert!(sent.try_recv().is_err(), "another gate copy starts nothing");
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::AcknowledgeRisk));
+        assert_eq!(core.settings.whatsapp_gate_version(), WHATSAPP_GATE_VERSION);
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::CancelLink));
+        assert_eq!(core.settings.whatsapp_gate_version(), 0, "cancel clears it");
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::AcknowledgeRisk));
+        core.dispatch(Intent::WhatsApp(WhatsAppIntent::CloseGate));
+        assert_eq!(
+            core.settings.whatsapp_gate_version(),
+            0,
+            "a close after the acceptance is Cancel"
+        );
+        let (_core, mut sent, _keep) = start("none", 0);
+        assert!(sent.try_recv().is_err(), "no saved gate starts nothing");
     }
 
     /// A network reconnect and a helper restart keep the saved notice hash.
