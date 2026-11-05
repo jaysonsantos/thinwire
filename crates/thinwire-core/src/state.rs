@@ -11681,6 +11681,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -11818,6 +11819,7 @@ mod tests {
                     topic: None,
                     links: Vec::new(),
                     photo: None,
+                    audio: None,
                 },
             });
             snapshot.apply(AdapterEvent::Status {
@@ -11931,6 +11933,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -12108,6 +12111,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.select_retained_signal(1);
