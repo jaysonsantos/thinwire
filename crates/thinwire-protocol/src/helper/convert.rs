@@ -131,7 +131,8 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::SendTopicText { .. }
         | AdapterCommand::SendMedia { topic: Some(_), .. }
         | AdapterCommand::ViewTopic { .. }
-        | AdapterCommand::DownloadFile { .. } => return None,
+        | AdapterCommand::DownloadFile { .. }
+        | AdapterCommand::DownloadVoice { .. } => return None,
     })
 }
 
@@ -742,6 +743,7 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
         topic: None,
         links: Vec::new(),
         photo: message.photo.and_then(photo_from_wire),
+        audio: None,
     }
 }
 
@@ -772,6 +774,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         }
     }
 
@@ -1048,6 +1051,15 @@ mod tests {
                 protocol: ProtocolId::Telegram,
             },
             AdapterCommand::SignalBeginLink { generation: 1 },
+            AdapterCommand::DownloadVoice {
+                protocol,
+                file_id: 42,
+            },
+            AdapterCommand::DownloadFile {
+                protocol,
+                file_id: 7,
+                secret: false,
+            },
         ] {
             assert_eq!(command_to_wire(protocol, &command, || None), None);
         }

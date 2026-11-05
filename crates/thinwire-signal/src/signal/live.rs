@@ -3337,6 +3337,7 @@ fn row_and_message(
         topic: None,
         links: Vec::new(),
         photo: None,
+        audio: None,
     };
     let conversation = Conversation {
         protocol: ProtocolId::Signal,
@@ -3427,6 +3428,7 @@ async fn send_text(
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         },
     );
     // A media row keeps no files, so it cannot be sent again.

@@ -30,6 +30,8 @@
           ];
           # Static TDLib (`telegram-tdlib`) links and loads the LLVM C++ runtime.
           cxxLibs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.llvmPackages.libcxx ];
+          # rodio's output device (cpal) links ALSA for in-app voice notes.
+          audioLibs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
           # Nix libglvnd does not see host GL drivers on non-NixOS Linux.
           # Point it at nixpkgs mesa (AMD / Intel). NVIDIA hosts need nixGL.
           glDrivers = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.mesa ];
@@ -63,11 +65,11 @@
                 pkgs.editorconfig-checker
               ]
               ++ guiLibs;
-              buildInputs = cxxLibs;
+              buildInputs = cxxLibs ++ audioLibs;
 
               RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
               RUST_LOG = "info";
-              LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (guiLibs ++ cxxLibs ++ glDrivers);
+              LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (guiLibs ++ cxxLibs ++ glDrivers ++ audioLibs);
             }
             // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
               __EGL_VENDOR_LIBRARY_DIRS = "${pkgs.mesa}/share/glvnd/egl_vendor.d";

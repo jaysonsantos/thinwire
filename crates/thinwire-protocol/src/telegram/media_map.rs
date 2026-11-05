@@ -1,8 +1,10 @@
-//! Turn a TDLib message into a caption, links, and a photo.
+//! Turn a TDLib message into a caption, links, a photo, and a voice note.
 //!
 //! Offsets from TDLib are UTF-16. [`crate::links_in`] stores UTF-8 indexes.
 
-use crate::media::{MessageLink, MessagePhoto, PhotoSize, TextKind, TextSpan, links_in};
+use crate::media::{
+    AudioPath, MessageAudio, MessageLink, MessagePhoto, PhotoSize, TextKind, TextSpan, links_in,
+};
 use crate::{ImageBytes, ImagePath};
 
 pub(super) struct Mapped {
@@ -10,6 +12,7 @@ pub(super) struct Mapped {
     pub preview: String,
     pub links: Vec<MessageLink>,
     pub photo: Option<MessagePhoto>,
+    pub audio: Option<MessageAudio>,
     /// Plain text with no entities: the worker asks `getTextEntities`.
     pub scan: bool,
 }
@@ -23,6 +26,7 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 text: body,
                 links,
                 photo: None,
+                audio: None,
                 scan,
             }
         }
@@ -39,13 +43,16 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 preview,
                 links,
                 photo: Some(mapped),
+                audio: None,
                 scan,
             }
         }
         tdlib_rs::enums::MessageContent::MessageSticker(_) => label("Sticker"),
         tdlib_rs::enums::MessageContent::MessageVideo(_) => label("Video"),
         tdlib_rs::enums::MessageContent::MessageAnimation(_) => label("Animation"),
-        tdlib_rs::enums::MessageContent::MessageVoiceNote(_) => label("Voice message"),
+        // This TDLib build has no `is_secret` on a voice note. An expired
+        // voice note is `MessageExpiredVoiceNote` and stays on the label arm.
+        tdlib_rs::enums::MessageContent::MessageVoiceNote(note) => map_voice(note),
         tdlib_rs::enums::MessageContent::MessageDocument(_) => label("File"),
         _ => label("Message"),
     }
@@ -57,8 +64,23 @@ fn label(text: &str) -> Mapped {
         preview: text.to_string(),
         links: Vec::new(),
         photo: None,
+        audio: None,
         scan: false,
     }
+}
+
+fn map_voice(note: &tdlib_rs::types::MessageVoiceNote) -> Mapped {
+    let mut mapped = label("Voice message");
+    let local = note
+        .voice_note
+        .voice
+        .local
+        .is_downloading_completed
+        .then(|| AudioPath::new(note.voice_note.voice.local.path.clone()))
+        .flatten();
+    mapped.audio =
+        MessageAudio::telegram(note.voice_note.duration, note.voice_note.voice.id, local);
+    mapped
 }
 
 fn from_formatted(text: &tdlib_rs::types::FormattedText) -> (String, Vec<MessageLink>, bool) {
@@ -137,7 +159,7 @@ fn local_path(file: &tdlib_rs::types::File, secret: bool) -> Option<ImagePath> {
 
 #[cfg(test)]
 mod tests {
-    use super::thumbnail_bytes;
+    use super::{map_content, thumbnail_bytes};
 
     #[test]
     fn a_minithumbnail_is_base64_jpeg_bytes() {
@@ -145,5 +167,89 @@ mod tests {
         assert_eq!(bytes, vec![0xff, 0xd8, 0xff]);
         assert!(thumbnail_bytes("").is_none());
         assert!(thumbnail_bytes("!!!!").is_none());
+    }
+
+    fn voice(
+        file_id: i32,
+        duration: i32,
+        completed: bool,
+        path: &str,
+    ) -> tdlib_rs::enums::MessageContent {
+        let mut note = tdlib_rs::types::MessageVoiceNote::default();
+        note.voice_note.duration = duration;
+        note.voice_note.voice.id = file_id;
+        note.voice_note.voice.local.is_downloading_completed = completed;
+        note.voice_note.voice.local.path = path.to_string();
+        tdlib_rs::enums::MessageContent::MessageVoiceNote(note)
+    }
+
+    #[test]
+    fn a_voice_note_is_playable_and_other_audio_stays_a_label() {
+        let mapped = map_content(&voice(42, 15, false, ""));
+        assert_eq!(mapped.text, "Voice message");
+        assert_eq!(mapped.preview, "Voice message");
+        let audio = mapped.audio.expect("voice note");
+        assert_eq!(audio.file_id(), 42);
+        assert_eq!(audio.duration_secs(), 15);
+        assert!(audio.file().is_none());
+        assert!(mapped.photo.is_none());
+
+        let ready = map_content(&voice(42, 15, true, "/tmp/hidden-voice.ogg"));
+        let audio = ready.audio.expect("ready");
+        assert_eq!(
+            audio.file().expect("path").as_path(),
+            std::path::Path::new("/tmp/hidden-voice.ogg")
+        );
+        assert!(!format!("{audio:?}").contains("hidden-voice"));
+
+        let missing = map_content(&voice(0, 15, false, ""));
+        assert!(missing.audio.is_none());
+        assert_eq!(missing.preview, "Voice message");
+
+        let music = tdlib_rs::enums::MessageContent::MessageAudio(tdlib_rs::types::MessageAudio {
+            audio: tdlib_rs::types::Audio {
+                duration: 20,
+                title: "Song".into(),
+                performer: String::new(),
+                file_name: "song.mp3".into(),
+                mime_type: "audio/mpeg".into(),
+                album_cover_minithumbnail: None,
+                album_cover_thumbnail: None,
+                external_album_covers: Vec::new(),
+                audio: tdlib_rs::types::File {
+                    id: 9,
+                    ..tdlib_rs::types::File::default()
+                },
+            },
+            caption: tdlib_rs::types::FormattedText::default(),
+        });
+        let music = map_content(&music);
+        assert!(music.audio.is_none());
+        assert_eq!(music.preview, "Message");
+
+        let note =
+            tdlib_rs::enums::MessageContent::MessageVideoNote(tdlib_rs::types::MessageVideoNote {
+                video_note: tdlib_rs::types::VideoNote {
+                    duration: 3,
+                    waveform: String::new(),
+                    length: 240,
+                    minithumbnail: None,
+                    thumbnail: None,
+                    speech_recognition_result: None,
+                    video: tdlib_rs::types::File {
+                        id: 8,
+                        ..tdlib_rs::types::File::default()
+                    },
+                },
+                is_viewed: false,
+                is_secret: true,
+            });
+        let note = map_content(&note);
+        assert!(note.audio.is_none());
+        assert_eq!(note.preview, "Message");
+
+        let expired = map_content(&tdlib_rs::enums::MessageContent::MessageExpiredVoiceNote);
+        assert!(expired.audio.is_none());
+        assert_eq!(expired.preview, "Message");
     }
 }

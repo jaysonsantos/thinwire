@@ -740,6 +740,7 @@ fn message(chat: &str, index: usize, sender: &str, body: &str, sent_at: i64) -> 
         topic: None,
         links: Vec::new(),
         photo: None,
+        audio: None,
     }
 }
 

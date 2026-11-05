@@ -364,6 +364,7 @@ impl GatedFake {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         }
     }
 

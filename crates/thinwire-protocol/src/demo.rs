@@ -376,6 +376,7 @@ impl DemoAdapter {
                     topic,
                     links: Vec::new(),
                     photo: None,
+                    audio: None,
                 },
             },
         );
@@ -578,6 +579,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         }
     }
 
