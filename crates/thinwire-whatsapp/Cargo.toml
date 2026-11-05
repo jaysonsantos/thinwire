@@ -40,7 +40,8 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
-thinwire-protocol.workspace = true
+# `photo-resize`: a WhatsApp photo crosses the pipe as a smaller image.
+thinwire-protocol = { workspace = true, features = ["photo-resize"] }
 # `io-std`: the helper talks over its stdin and stdout.
 tokio = { workspace = true, features = ["fs", "io-std"] }
 tracing.workspace = true

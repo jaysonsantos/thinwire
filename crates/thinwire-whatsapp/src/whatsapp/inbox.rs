@@ -47,6 +47,9 @@ const MEDIA_CACHE: usize = 200;
 /// line: it is `thinwire_ipc::WirePhoto::MAX_BYTES` (a test checks it).
 pub(super) const MEDIA_MAX_BYTES: usize = 512 * 1024;
 
+/// The body of a photo message with no caption.
+pub(super) const PHOTO_LABEL: &str = "[photo]";
+
 /// The longest side of a sticker in the thread, in points. The image keeps
 /// its own pixels, so it stays sharp on a high-density screen.
 const STICKER_SIDE: u32 = 160;
@@ -90,10 +93,20 @@ pub(super) struct Sticker {
     pub width: u32,
     pub height: u32,
     pub media: MediaRef,
+    /// A photo message, not a sticker. Its download is made smaller to fit
+    /// the pipe, and it shows at its own size, with its caption.
+    pub photo: bool,
 }
 
 impl Sticker {
     fn photo(&self, bytes: &ImageBytes) -> MessagePhoto {
+        // A photo shows at the size of its image. The bytes are a JPEG, PNG,
+        // or WebP that fits the pipe, so only the header is read.
+        if self.photo
+            && let Some(photo) = thinwire_protocol::photo_resize::photo_from_bytes(bytes.as_slice())
+        {
+            return photo;
+        }
         let (width, height) = sticker_side(self.width, self.height);
         MessagePhoto {
             width,
@@ -638,7 +651,15 @@ impl Inbox {
     /// The sticker downloads for the rows in `events`. Each sticker asks
     /// one time: a later row of the same message asks again only after its
     /// image left the cache.
-    pub(super) fn media_requests(&mut self, events: &[AdapterEvent]) -> Vec<MediaRequest> {
+    ///
+    /// A photo of a history row asks only when `history_photos` is set: the
+    /// chat is open, or the user loads an older page. A history sync at a
+    /// pairing does not download every photo.
+    pub(super) fn media_requests(
+        &mut self,
+        events: &[AdapterEvent],
+        history_photos: bool,
+    ) -> Vec<MediaRequest> {
         let mut out = Vec::new();
         for event in events {
             let message = match event {
@@ -657,6 +678,9 @@ impl Inbox {
             else {
                 continue;
             };
+            if sticker.photo && message.arrival == Arrival::History && !history_photos {
+                continue;
+            }
             let key = (jid.to_string(), message.id.clone());
             if self.media.contains_key(&key) {
                 continue;
@@ -1198,7 +1222,8 @@ impl Inbox {
         } else {
             Delivery::Sent
         };
-        // A sticker with its image shows the image and no label.
+        // A sticker with its image shows the image and no label. A photo
+        // keeps its caption as the body.
         let photo = message.sticker.as_ref().and_then(|sticker| {
             match self
                 .media
@@ -1208,7 +1233,11 @@ impl Inbox {
                 _ => None,
             }
         });
-        let body = if photo.is_some() {
+        let caption = message
+            .sticker
+            .as_ref()
+            .is_some_and(|sticker| sticker.photo && message.body != PHOTO_LABEL);
+        let body = if photo.is_some() && !caption {
             String::new()
         } else {
             message.body.clone()
@@ -1354,6 +1383,7 @@ pub(super) mod tests {
                 width: 512,
                 height: 256,
                 media: MediaRef::new(id.to_string()),
+                photo: false,
             }),
             ..message(chat, id, "[sticker]", ts)
         }
@@ -1364,6 +1394,52 @@ pub(super) mod tests {
             AdapterEvent::MessageReceived { message } if message.id == id => Some(message.clone()),
             _ => None,
         })
+    }
+
+    /// A 1x1 PNG.
+    const PIXEL_PNG: [u8; 67] = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn photo_message(chat: &str, id: &str, body: &str) -> WaMessage {
+        WaMessage {
+            sticker: Some(Sticker {
+                width: 0,
+                height: 0,
+                media: MediaRef::new(id.to_string()),
+                photo: true,
+            }),
+            ..message(chat, id, body, 1)
+        }
+    }
+
+    /// A photo row shows its label or its caption first. With its image, a
+    /// caption stays the body, the label goes, and the photo has the size of
+    /// its image.
+    #[test]
+    fn a_photo_keeps_its_caption_and_drops_its_label() {
+        let chat = "15550111@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        let events = inbox.apply_messages(vec![
+            photo_message(chat, "p1", "[photo]"),
+            photo_message(chat, "p2", "at the lake"),
+        ]);
+        assert_eq!(inbox.media_requests(&events, true).len(), 2);
+        for (id, body) in [("p1", ""), ("p2", "at the lake")] {
+            let event = inbox
+                .finish_media(chat, id, Some(PIXEL_PNG.to_vec()))
+                .expect("the row again");
+            let AdapterEvent::MessageReceived { message } = event else {
+                panic!("not a message row: {event:?}");
+            };
+            assert_eq!(message.body, body, "{id}");
+            let photo = message.photo.expect("photo");
+            assert_eq!((photo.width, photo.height), (1, 1), "{id}");
+        }
     }
 
     /// A sticker row shows "[sticker]" first and asks for its image one
@@ -1377,11 +1453,11 @@ pub(super) mod tests {
         let row = received_id(&events, "s1").expect("sticker row");
         assert_eq!(row.body, "[sticker]");
         assert!(row.photo.is_none());
-        let requests = inbox.media_requests(&events);
+        let requests = inbox.media_requests(&events, true);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].id, "s1");
         assert!(
-            inbox.media_requests(&events).is_empty(),
+            inbox.media_requests(&events, true).is_empty(),
             "a running download does not ask again"
         );
 
@@ -1402,7 +1478,7 @@ pub(super) mod tests {
         // An open of the chat sends the image with the row.
         let opened = inbox.open_chat(chat).expect("open");
         assert!(received_id(&opened, "s1").expect("row").photo.is_some());
-        assert!(inbox.media_requests(&opened).is_empty());
+        assert!(inbox.media_requests(&opened, true).is_empty());
         let preview = upserts(&opened)[0].preview.clone();
         assert_eq!(preview, "[sticker]");
     }
@@ -1418,7 +1494,7 @@ pub(super) mod tests {
             sticker_message(chat, "s2", 2),
             message(chat, "t1", "hi", 3),
         ]);
-        let requests = inbox.media_requests(&events);
+        let requests = inbox.media_requests(&events, true);
         assert_eq!(requests.len(), 2);
         assert_eq!(inbox.finish_media(chat, "s1", None), None);
         assert_eq!(
@@ -1427,7 +1503,7 @@ pub(super) mod tests {
         );
         let opened = inbox.open_chat(chat).expect("open");
         assert_eq!(received_id(&opened, "s1").expect("row").body, "[sticker]");
-        assert!(inbox.media_requests(&opened).is_empty());
+        assert!(inbox.media_requests(&opened, true).is_empty());
         // A result after a reset is dropped.
         inbox.clear();
         assert_eq!(inbox.finish_media(chat, "s1", Some(vec![1])), None);

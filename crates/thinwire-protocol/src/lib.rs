@@ -10,6 +10,8 @@ pub mod helper;
 mod host;
 mod log_id;
 mod media;
+#[cfg(any(test, feature = "photo-resize"))]
+pub mod photo_resize;
 mod risk;
 mod secrets;
 #[cfg(feature = "session-cipher")]

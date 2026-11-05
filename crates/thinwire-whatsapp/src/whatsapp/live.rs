@@ -19,7 +19,9 @@ use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::{Client, ClientError, Jid, RunCompletionReason};
 
-use super::inbox::{HistoryChat, MEDIA_MAX_BYTES, MediaRef, Mute, Sticker, Voice, WaMessage};
+use super::inbox::{
+    HistoryChat, MEDIA_MAX_BYTES, MediaRef, Mute, PHOTO_LABEL, Sticker, Voice, WaMessage,
+};
 use super::link::{Callbacks, LinkBackend, StartError, Started};
 use super::path::{
     prepare_session_dir, remove_device_store, restrict_store_file, revoked_marker,
@@ -269,7 +271,7 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
                         sender_jid: Some(info.source.sender.to_non_ad().to_string()),
                         body: body_of(&inbound.message)?,
                         timestamp: info.timestamp.timestamp(),
-                        sticker: sticker_of(&inbound.message),
+                        sticker: picture_of(&inbound.message),
                         voice: voice_of(&inbound.message),
                     })
                 })
@@ -335,7 +337,7 @@ fn map_history_message(chat_jid: &str, info: &wa::WebMessageInfo) -> Option<WaMe
             .message_timestamp
             .and_then(|ts| i64::try_from(ts).ok())
             .unwrap_or(0),
-        sticker: info.message.as_option().and_then(sticker_of),
+        sticker: info.message.as_option().and_then(picture_of),
         voice: info.message.as_option().and_then(voice_of),
     })
 }
@@ -362,6 +364,31 @@ fn sticker_of(message: &wa::Message) -> Option<Sticker> {
         width: sticker.width.unwrap_or(0),
         height: sticker.height.unwrap_or(0),
         media: MediaRef::new(sticker.clone()),
+        photo: false,
+    })
+}
+
+/// The sticker or the photo of a message, when the app can draw it.
+fn picture_of(message: &wa::Message) -> Option<Sticker> {
+    sticker_of(message).or_else(|| photo_of(message))
+}
+
+/// The photo of a photo message, when it is not larger than the helper
+/// downloads.
+fn photo_of(message: &wa::Message) -> Option<Sticker> {
+    let image = message.get_base_message().image_message.as_option()?;
+    let fits = image.file_length.is_none_or(|length| {
+        usize::try_from(length)
+            .is_ok_and(|length| length <= thinwire_protocol::photo_resize::PHOTO_DOWNLOAD_MAX)
+    });
+    if !fits {
+        return None;
+    }
+    Some(Sticker {
+        width: image.width.unwrap_or(0),
+        height: image.height.unwrap_or(0),
+        media: MediaRef::new(image.clone()),
+        photo: true,
     })
 }
 
@@ -390,7 +417,7 @@ fn body_of(message: &wa::Message) -> Option<String> {
         return non_empty(text);
     }
     let label = if base.image_message.is_set() {
-        "[photo]"
+        PHOTO_LABEL
     } else if base.video_message.is_set() {
         "[video]"
     } else if base
@@ -586,6 +613,26 @@ impl WhatsAppSender for LiveSender {
                     .await
                     .map_err(|_| ())?;
                 return (bytes.len() <= MEDIA_MAX_BYTES).then_some(bytes).ok_or(());
+            }
+            if let Some(image) = media.get::<wa::message::ImageMessage>() {
+                let bytes = self
+                    .client
+                    .download(image, Default::default())
+                    .await
+                    .map_err(|_| ())?;
+                // A photo crosses the pipe as an image that fits one line.
+                let photo = tokio::task::spawn_blocking(move || {
+                    thinwire_protocol::photo_resize::photo_from_bytes(&bytes)
+                })
+                .await
+                .map_err(|_| ())?
+                .ok_or(())?;
+                return photo
+                    .sizes
+                    .into_iter()
+                    .find_map(|size| size.bytes)
+                    .map(|bytes| bytes.as_slice().to_vec())
+                    .ok_or(());
             }
             let audio = media.get::<wa::message::AudioMessage>().ok_or(())?;
             let bytes = self

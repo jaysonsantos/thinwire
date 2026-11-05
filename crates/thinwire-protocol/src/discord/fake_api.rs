@@ -107,6 +107,7 @@ fn message(id: u64, author_id: u64, author: &str, content: &str) -> MessageSumma
         embeds: 0,
         stickers: 0,
         audio: None,
+        image: None,
     }
 }
 

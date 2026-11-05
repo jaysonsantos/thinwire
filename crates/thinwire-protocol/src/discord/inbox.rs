@@ -201,6 +201,9 @@ impl PreviewPause {
     }
 }
 
+/// The body of a message that has only an image.
+pub(crate) const IMAGE_LABEL: &str = "[image]";
+
 /// Visible text. Discord's REST `content` is kept as returned (the Message
 /// Content intent fills it for other people). A message with no content is
 /// labeled from what it does carry.
@@ -211,7 +214,7 @@ pub(crate) fn message_body(message: &MessageSummary) -> String {
     }
     let mut labels = Vec::new();
     if message.images > 0 {
-        labels.push("[image]");
+        labels.push(IMAGE_LABEL);
     }
     if let Some(audio) = &message.audio {
         labels.push(if audio.voice {
@@ -306,6 +309,7 @@ mod tests {
                 embeds: 0,
                 stickers: 0,
                 audio: None,
+                image: None,
             },
         );
         assert_eq!(row.sent_at, 1_700_000_000);
@@ -338,6 +342,7 @@ mod tests {
             embeds: 0,
             stickers: 0,
             audio: None,
+            image: None,
         };
         assert_eq!(message_body(&row), "hello");
         row.content.clear();

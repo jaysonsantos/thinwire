@@ -31,6 +31,7 @@ slack-oauth = [
 # Bot/OAuth guild inbox spike via twilight. Default CI stays feature-off.
 # No user-token client. Never put a Discord token in CI or the MIT tree.
 discord-bot = [
+  "photo-resize",
   "dep:twilight-http",
   "dep:twilight-model",
   "dep:rustls",
@@ -48,8 +49,16 @@ contract-kit = []
 # the bundled SQLCipher and the vendored OpenSSL, so it does not need those
 # libraries on the system.
 session-cipher = ["dep:rusqlite"]
+# Make a downloaded photo small enough for the wire (`photo_resize`). The
+# helpers and the Discord adapter turn it on.
+photo-resize = ["dep:image"]
 
 [dependencies]
+image = { version = "0.25", optional = true, default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+] }
 # TDLib sends a minithumbnail as base64. Only the live client decodes it.
 base64 = { version = "0.23", optional = true }
 tdlib-rs = { version = "1.4", optional = true, default-features = false, features = [
@@ -97,6 +106,12 @@ tokio = { workspace = true, features = ["fs", "io-util", "net", "process"] }
 tracing.workspace = true
 
 [dev-dependencies]
+# The Discord tests run without `discord-bot`, and they use `photo_resize`.
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+] }
 serde_json = "1"
 # Reads the log lines in the tests of what is logged at close (#238).
 tracing-subscriber.workspace = true

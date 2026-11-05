@@ -1087,6 +1087,7 @@ mod tests {
                 embeds: 0,
                 stickers: 0,
                 audio: None,
+                image: None,
             }],
         );
         // A 500 is `Rejected`, not Forbidden or NotFound.
@@ -1429,6 +1430,79 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AdapterEvent::VoiceFailed { .. }))
         );
+    }
+
+    /// A history row with an image shows "[image]" first. Its row then
+    /// comes again with the photo, and the label goes. A reopen shows the
+    /// photo at once and does not download it again.
+    #[tokio::test]
+    async fn an_image_row_comes_again_with_its_photo() {
+        const URL: &str = "https://cdn.discordapp.com/attachments/1/2/lake.png";
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(6, 3, image::Rgb([10, 20, 30]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("png");
+        let fake = FakeDiscordApi::guild_fixture();
+        {
+            let mut state = fake.state();
+            let history = state.history.get_mut(&GENERAL).expect("general");
+            let row = history
+                .iter_mut()
+                .find(|message| message.id == 2)
+                .expect("the empty message");
+            row.images = 1;
+            row.image = Some(super::api::ImageSummary { url: URL.into() });
+            state.downloads.insert(URL.into(), png.into_inner());
+        }
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        let open = |adapter: &mut DiscordAdapter| {
+            adapter
+                .handle(
+                    AdapterCommand::OpenChat {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: id.clone(),
+                    },
+                    &tx,
+                )
+                .expect("open");
+        };
+        open(&mut adapter);
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::MessageReceived { message } if message.photo.is_some()
+            )
+        })
+        .await;
+        let rows = messages(&events);
+        let first = rows
+            .iter()
+            .find(|row| row.id.ends_with(":2") && row.photo.is_none())
+            .expect("the row before its photo");
+        assert_eq!(first.body, "[image]");
+        let shown = rows
+            .iter()
+            .find(|row| row.photo.is_some())
+            .expect("the row with its photo");
+        assert_eq!(shown.body, "");
+        let photo = shown.photo.as_ref().expect("photo");
+        assert_eq!((photo.width, photo.height), (6, 3));
+
+        open(&mut adapter);
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+            )
+        })
+        .await;
+        let again = messages(&events);
+        let row = again
+            .iter()
+            .find(|row| row.id.ends_with(":2"))
+            .expect("the row");
+        assert!(row.photo.is_some(), "the cache shows it at once");
     }
 
     #[tokio::test]

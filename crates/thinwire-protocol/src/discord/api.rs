@@ -74,6 +74,20 @@ pub(crate) struct MessageSummary {
     pub stickers: usize,
     /// The first audio attachment: a voice message or an audio file.
     pub audio: Option<AudioSummary>,
+    /// The CDN address of the first image attachment. The row shows it.
+    pub image: Option<ImageSummary>,
+}
+
+/// An image attachment of a message. `Debug` shows no URL.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ImageSummary {
+    pub url: String,
+}
+
+impl std::fmt::Debug for ImageSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ImageSummary(..)")
+    }
 }
 
 /// An audio attachment of a message. `Debug` shows no URL.

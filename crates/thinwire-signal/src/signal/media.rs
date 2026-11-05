@@ -8,31 +8,16 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io::Cursor;
 
 use presage::proto::AttachmentPointer;
-use thinwire_protocol::{ChatMessage, ImageBytes, MessageAudio, MessagePhoto, PhotoSize};
-
-/// The largest image that crosses the pipe. It is
-/// `thinwire_ipc::WirePhoto::MAX_BYTES` (a test checks it).
-pub(super) const PHOTO_MAX_BYTES: usize = 512 * 1024;
+use thinwire_protocol::{ChatMessage, MessageAudio, MessagePhoto};
 
 /// The largest photo the helper downloads.
 const PHOTO_DOWNLOAD_MAX: u32 = 25 * 1024 * 1024;
 
-/// The longest side of a photo after it is made smaller, in pixels. The
-/// second value is for a photo that is still too large after the first.
-const PHOTO_SIDES: [u32; 2] = [1280, 800];
-
-/// The JPEG quality for each side of [`PHOTO_SIDES`].
-const PHOTO_QUALITY: [u8; 2] = [82, 70];
-
 /// Photos that the helper keeps in memory. Past this, the oldest goes. A
 /// chat that opens again downloads a dropped photo again.
 const PHOTO_CACHE: usize = 200;
-
-/// The largest image that the decoder accepts, in pixels for each side.
-const DECODE_MAX_SIDE: u32 = 12_000;
 
 /// The flag of a voice note in [`AttachmentPointer::flags`].
 const VOICE_MESSAGE_FLAG: u32 = 1;
@@ -225,69 +210,9 @@ fn trim(book: &mut Book) {
     }
 }
 
-/// The photo that crosses the pipe, from the downloaded file. A JPEG, PNG,
-/// or WebP file that fits stays as it is. Any other image is made smaller
-/// and becomes a JPEG. `None` when the bytes are not an image, or when the
-/// image does not fit at the smallest size.
+/// The photo that crosses the pipe, from the downloaded file.
 pub(super) fn photo_from_bytes(bytes: &[u8]) -> Option<MessagePhoto> {
-    let reader = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?;
-    let format = reader.format()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(DECODE_MAX_SIDE);
-    limits.max_image_height = Some(DECODE_MAX_SIDE);
-    let keep = bytes.len() <= PHOTO_MAX_BYTES
-        && matches!(
-            format,
-            image::ImageFormat::Jpeg | image::ImageFormat::Png | image::ImageFormat::WebP
-        );
-    if keep {
-        let mut sized = image::ImageReader::new(Cursor::new(bytes))
-            .with_guessed_format()
-            .ok()?;
-        sized.limits(limits);
-        let (width, height) = sized.into_dimensions().ok()?;
-        return Some(photo(width, height, bytes.to_vec()));
-    }
-    let mut decoder = reader;
-    decoder.limits(limits);
-    let image = decoder.decode().ok()?;
-    for (side, quality) in PHOTO_SIDES.into_iter().zip(PHOTO_QUALITY) {
-        let small = if image.width().max(image.height()) > side {
-            image.resize(side, side, image::imageops::FilterType::Triangle)
-        } else {
-            image.clone()
-        };
-        let rgb = small.to_rgb8();
-        let mut out = Vec::new();
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
-        if rgb.write_with_encoder(encoder).is_err() {
-            return None;
-        }
-        if out.len() <= PHOTO_MAX_BYTES {
-            return Some(photo(rgb.width(), rgb.height(), out));
-        }
-    }
-    None
-}
-
-fn photo(width: u32, height: u32, bytes: Vec<u8>) -> MessagePhoto {
-    MessagePhoto {
-        width,
-        height,
-        mini: None,
-        sizes: vec![PhotoSize {
-            width,
-            height,
-            file_id: None,
-            path: None,
-            bytes: Some(ImageBytes::new(bytes)),
-        }],
-        has_spoiler: false,
-        is_secret: false,
-        failed: false,
-    }
+    thinwire_protocol::photo_resize::photo_from_bytes(bytes)
 }
 
 #[cfg(test)]
@@ -322,20 +247,6 @@ mod tests {
         }
     }
 
-    fn png(width: u32, height: u32) -> Vec<u8> {
-        let image = image::RgbImage::from_pixel(width, height, image::Rgb([200, 40, 40]));
-        let mut out = Cursor::new(Vec::new());
-        image
-            .write_to(&mut out, image::ImageFormat::Png)
-            .expect("png");
-        out.into_inner()
-    }
-
-    #[test]
-    fn the_wire_limit_is_the_limit_of_the_pipe() {
-        assert_eq!(PHOTO_MAX_BYTES, thinwire_ipc::WirePhoto::MAX_BYTES);
-    }
-
     #[test]
     fn an_attachment_has_a_kind_and_a_label() {
         assert_eq!(kind(&pointer("image/jpeg", 0)), Kind::Photo);
@@ -360,8 +271,7 @@ mod tests {
         let jobs = book.take_jobs("signal:chat");
         assert_eq!(jobs.len(), 1);
         assert!(book.take_jobs("signal:chat").is_empty(), "each job once");
-        let photo = photo_from_bytes(&png(4, 2)).expect("an image");
-        assert_eq!((photo.width, photo.height), (4, 2));
+        let photo = thinwire_protocol::photo_resize::photo(4, 2, vec![1, 2, 3]);
         let shown = book
             .finish(jobs[0].clone(), Some(photo))
             .expect("the row comes back");
@@ -400,30 +310,5 @@ mod tests {
         assert_eq!(audio.duration_secs(), 0);
         assert!(book.voice(audio.file_id()).is_some());
         assert!(book.voice(audio.file_id().wrapping_add(1).max(1)).is_none());
-    }
-
-    /// A large photo becomes a JPEG that fits the pipe, with its long side
-    /// at most the first size.
-    #[test]
-    fn a_large_photo_is_made_smaller() {
-        // Noise does not compress, so this PNG is larger than the pipe.
-        let mut seed = 7_u32;
-        let image = image::RgbImage::from_fn(1600, 1200, |_, _| {
-            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            let [a, b, c, _] = seed.to_le_bytes();
-            image::Rgb([a, b, c])
-        });
-        let mut out = Cursor::new(Vec::new());
-        image
-            .write_to(&mut out, image::ImageFormat::Png)
-            .expect("png");
-        let bytes = out.into_inner();
-        assert!(bytes.len() > PHOTO_MAX_BYTES);
-        let photo = photo_from_bytes(&bytes).expect("a smaller photo");
-        assert!(photo.width.max(photo.height) <= PHOTO_SIDES[0]);
-        let shown = photo.sizes[0].bytes.as_ref().expect("bytes");
-        assert!(shown.as_slice().len() <= PHOTO_MAX_BYTES);
-        assert!(shown.as_slice().starts_with(&[0xFF, 0xD8]), "a JPEG");
-        assert!(photo_from_bytes(b"not an image").is_none());
     }
 }

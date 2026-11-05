@@ -28,8 +28,8 @@ signal-local = [
   "dep:sqlx",
   "dep:rusqlite",
   "dep:thinwire-core",
-  "dep:image",
   "thinwire-protocol/session-cipher",
+  "thinwire-protocol/photo-resize",
 ]
 
 [dependencies]
@@ -56,12 +56,6 @@ rusqlite = { version = "0.41", optional = true, default-features = false, featur
   "bundled-sqlcipher-vendored-openssl",
 ] }
 thinwire-core = { workspace = true, optional = true }
-# Signal photos cross the pipe as bytes: a large one becomes a smaller JPEG.
-image = { version = "0.25", optional = true, default-features = false, features = [
-  "jpeg",
-  "png",
-  "webp",
-] }
 futures = { version = "0.3", optional = true, default-features = false, features = [
   "std",
 ] }

@@ -348,12 +348,18 @@ impl Session {
     /// its row again, with the image.
     pub(super) fn fetch_media(&self, rows: &[AdapterEvent], events: &EventTx) {
         let mut state = self.lock();
-        self.spawn_media(&mut state, rows, events);
+        self.spawn_media(&mut state, rows, true, events);
     }
 
     /// Nothing starts while the link is offline, closed, or not yet shown:
     /// the rows ask again when the chat opens.
-    fn spawn_media(&self, state: &mut State, rows: &[AdapterEvent], events: &EventTx) {
+    fn spawn_media(
+        &self,
+        state: &mut State,
+        rows: &[AdapterEvent],
+        history_photos: bool,
+        events: &EventTx,
+    ) {
         if state.closed || !state.connected || !state.announced {
             return;
         }
@@ -363,7 +369,7 @@ impl Session {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let requests = state.inbox.media_requests(rows);
+        let requests = state.inbox.media_requests(rows, history_photos);
         if requests.is_empty() {
             return;
         }
@@ -553,7 +559,9 @@ impl Session {
             }
         };
         let mut out = out;
-        self.spawn_media(&mut state, &out, events);
+        // A history sync does not download its photos: the chat asks when
+        // it opens.
+        self.spawn_media(&mut state, &out, false, events);
         if let Some(detail) = stop {
             state.connected = false;
             state.stopped = Some(detail);

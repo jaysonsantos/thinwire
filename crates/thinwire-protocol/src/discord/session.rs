@@ -36,8 +36,8 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use super::api::{DiscordApi, DiscordApiError, MessageSummary, UploadFile};
 use super::inbox::{
-    HISTORY_LIMIT, InboxChannel, PREVIEW_FETCH_CONCURRENCY, PreviewPause, channel_preview,
-    chat_message, load_channels,
+    HISTORY_LIMIT, IMAGE_LABEL, InboxChannel, PREVIEW_FETCH_CONCURRENCY, PreviewPause,
+    channel_preview, chat_message, load_channels,
 };
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
 use crate::adapter::{
@@ -299,6 +299,12 @@ enum Msg {
     Voice {
         file_id: i32,
     },
+    /// A photo download of a history row ended.
+    ImageDone {
+        message_id: u64,
+        row: Box<ChatMessage>,
+        photo: Option<crate::MessagePhoto>,
+    },
     ReloadDone {
         ticket: u64,
         result: Result<(u64, Vec<InboxChannel>), DiscordApiError>,
@@ -476,6 +482,9 @@ impl Session {
             pending_end: None,
             settle_armed: false,
             voices: HashMap::new(),
+            images: HashMap::new(),
+            image_order: std::collections::VecDeque::new(),
+            image_gate: Arc::new(Semaphore::new(IMAGE_DOWNLOADS)),
         };
         let _ = tx.send(Msg::Reload);
         tokio::spawn(owner.run(rx, handoff));
@@ -792,9 +801,103 @@ struct Owner {
     settle_armed: bool,
     /// The CDN address of each audio handle of a history row.
     voices: HashMap<i32, String>,
+    /// The photo of each message with an image, by message id.
+    images: HashMap<u64, ImageState>,
+    /// The message ids of `images`, oldest first. Past [`IMAGE_CACHE`] the
+    /// oldest goes, and its chat downloads it again when it opens.
+    image_order: std::collections::VecDeque<u64>,
+    /// Photo downloads that run at one time.
+    image_gate: Arc<Semaphore>,
 }
 
+/// The photo of one message.
+enum ImageState {
+    Requested,
+    Ready(crate::MessagePhoto),
+    Failed,
+}
+
+/// Photos that the owner keeps in memory.
+const IMAGE_CACHE: usize = 200;
+
+/// Photo downloads that run at one time.
+const IMAGE_DOWNLOADS: usize = 4;
+
 impl Owner {
+    /// Show the photo of a history row from the cache, or start its
+    /// download. The row keeps its label until the photo is here.
+    fn dress_image(&mut self, message: &MessageSummary, row: &mut ChatMessage) {
+        let Some(image) = &message.image else {
+            return;
+        };
+        match self.images.get(&message.id) {
+            Some(ImageState::Ready(photo)) => {
+                row.photo = Some(photo.clone());
+                if message.content.is_empty() && row.body == IMAGE_LABEL {
+                    row.body.clear();
+                }
+                return;
+            }
+            Some(ImageState::Requested | ImageState::Failed) => return,
+            None => {}
+        }
+        self.images.insert(message.id, ImageState::Requested);
+        self.image_order.push_back(message.id);
+        while self.image_order.len() > IMAGE_CACHE {
+            if let Some(old) = self.image_order.pop_front() {
+                self.images.remove(&old);
+            }
+        }
+        let api = Arc::clone(&self.api);
+        let gate = Arc::clone(&self.image_gate);
+        let url = image.url.clone();
+        let message_id = message.id;
+        let row = Box::new(row.clone());
+        self.spawn(async move {
+            let _permit = gate.acquire_owned().await.ok();
+            let photo = match api.download(url).await {
+                Ok(bytes) => tokio::task::spawn_blocking(move || {
+                    crate::photo_resize::photo_from_bytes(&bytes)
+                })
+                .await
+                .ok()
+                .flatten(),
+                Err(_) => None,
+            };
+            Msg::ImageDone {
+                message_id,
+                row,
+                photo,
+            }
+        });
+    }
+
+    /// A photo download ended. With a photo, its row comes again. A failed
+    /// photo keeps the label and does not ask again.
+    fn image_done(
+        &mut self,
+        message_id: u64,
+        mut row: ChatMessage,
+        photo: Option<crate::MessagePhoto>,
+    ) {
+        if !matches!(self.images.get(&message_id), Some(ImageState::Requested)) {
+            // The cache dropped the request. The row asks again later.
+            return;
+        }
+        let Some(photo) = photo else {
+            tracing::debug!("a discord photo did not download");
+            self.images.insert(message_id, ImageState::Failed);
+            return;
+        };
+        self.images
+            .insert(message_id, ImageState::Ready(photo.clone()));
+        row.photo = Some(photo);
+        if row.body == IMAGE_LABEL {
+            row.body.clear();
+        }
+        emit_message(&self.events, row);
+    }
+
     /// Download the audio `file_id` into the voice folder. The answer is
     /// `VoiceReady`, or `VoiceFailed` when no history row has the handle,
     /// or when the download or the write failed.
@@ -891,6 +994,11 @@ impl Owner {
                 }
             }
             Msg::Voice { file_id } => self.download_voice(file_id),
+            Msg::ImageDone {
+                message_id,
+                row,
+                photo,
+            } => self.image_done(message_id, *row, photo),
             Msg::ReloadDone { ticket, result } => self.reload_done(ticket, result),
             Msg::PreviewCheck {
                 ticket,
@@ -1406,11 +1514,14 @@ impl Owner {
                             .insert(super::inbox::voice_file_id(message.id), audio.url.clone());
                     }
                 }
-                let rows: Vec<ChatMessage> = messages
+                let mut rows: Vec<ChatMessage> = messages
                     .iter()
                     .rev()
                     .map(|message| chat_message(&conversation_id, bot_id, message))
                     .collect();
+                for (message, row) in messages.iter().rev().zip(rows.iter_mut()) {
+                    self.dress_image(message, row);
+                }
                 let new_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
                 let gone = {
                     let mut history = self.carried.history();

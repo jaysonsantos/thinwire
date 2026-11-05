@@ -157,6 +157,20 @@ fn message_summary(message: Message) -> MessageSummary {
             duration_secs: whole_seconds(attachment.duration_secs),
             voice,
         });
+    let image = message
+        .attachments
+        .iter()
+        .find(|attachment| {
+            attachment
+                .content_type
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("image/"))
+                && usize::try_from(attachment.size)
+                    .is_ok_and(|size| size <= crate::photo_resize::PHOTO_DOWNLOAD_MAX)
+        })
+        .map(|attachment| super::api::ImageSummary {
+            url: attachment.url.clone(),
+        });
     for attachment in &message.attachments {
         if attachment
             .content_type
@@ -178,6 +192,7 @@ fn message_summary(message: Message) -> MessageSummary {
         embeds: message.embeds.len(),
         stickers: message.sticker_items.len(),
         audio,
+        image,
     }
 }
 
