@@ -66,7 +66,7 @@ It holds:
   crates/thinwire-whatsapp and crates/thinwire-signal.
 - Every dependency in vendor/, from cargo vendor. This includes whatsapp-rust,
   wacore-libsignal, presage, and libsignal. vendor/ also holds the SQLCipher
-  amalgamation (libsqlite3-sys) and the OpenSSL source (openssl-src). The
+  amalgamation (sqlcipher-src) and the OpenSSL source (openssl-src). The
   helpers link both.
 - .cargo/config.toml, which points cargo at vendor/.
 
@@ -121,11 +121,15 @@ for needed in \
     exit 1
   fi
 done
-if ! grep -qE "^${name}/vendor/libsqlite3-sys-[^/]+/sqlcipher/sqlite3.c$" <<<"$listing"; then
+if ! grep -qE "^${name}/vendor/sqlcipher-src-[^/]+/Cargo\.toml$" <<<"$listing"; then
+  echo "the source tarball is missing the vendored sqlcipher-src crate" >&2
+  exit 1
+fi
+if ! grep -qE "^${name}/vendor/sqlcipher-src-[^/]+/sqlcipher/sqlcipher.c$" <<<"$listing"; then
   echo "the source tarball is missing the SQLCipher amalgamation" >&2
   exit 1
 fi
-if ! grep -qE "^${name}/vendor/libsqlite3-sys-[^/]+/sqlcipher/LICENSE$" <<<"$listing"; then
+if ! grep -qE "^${name}/vendor/sqlcipher-src-[^/]+/sqlcipher/LICENSE-sqlcipher$" <<<"$listing"; then
   echo "the source tarball is missing the SQLCipher license" >&2
   exit 1
 fi
