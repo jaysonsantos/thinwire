@@ -5203,7 +5203,6 @@ impl Snapshot {
         }
     }
 
-    // One argument per `MessageMedia` field. A wrapper struct would only rename the call.
     #[allow(clippy::too_many_arguments)]
     fn patch_message_media(
         &mut self,
@@ -5307,8 +5306,6 @@ impl Snapshot {
         });
     }
 
-    /// Download the voice file on the open message. A repeat queues again.
-    /// A path, another file, or a message that is not on screen does nothing.
     pub(crate) fn play_audio(
         &mut self,
         protocol: ProtocolId,

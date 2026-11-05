@@ -1,5 +1,3 @@
-//! The output device. The UI thread never calls into rodio.
-//!
 //! rodio 0.23's symphonia features decode Vorbis, not Opus. Telegram voice
 //! notes are Opus inside Ogg, so this module reads those packets itself.
 
@@ -20,7 +18,6 @@ use super::Backend;
 /// At most one Opus frame, in samples per channel.
 const OPUS_MAX_FRAME: usize = 5760;
 const OPUS_RATE: u32 = 48_000;
-/// How often the worker looks for the end of the buffer while a note plays.
 const END_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) enum Cmd {
@@ -114,23 +111,20 @@ impl Engine {
     }
 }
 
-/// The sink stays open across notes. `playing` means this buffer still owes
-/// the UI an end event. Stop and a new play clear it before the old player
-/// is dropped, so the end of a replaced note is not reported.
 struct Output {
     player: Option<Sink>,
     sink: Option<rodio::MixerDeviceSink>,
-    playing: bool,
+    owes_end: bool,
 }
 
 fn worker(rx: Receiver<Wire>, done: Sender<Done>) {
     let mut output = Output {
         player: None,
         sink: None,
-        playing: false,
+        owes_end: false,
     };
     loop {
-        let incoming = if output.playing {
+        let incoming = if output.owes_end {
             match rx.recv_timeout(END_POLL) {
                 Ok(cmd) => Some(cmd),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -149,8 +143,8 @@ fn worker(rx: Receiver<Wire>, done: Sender<Done>) {
                 Wire::Shutdown => break,
             }
         }
-        if output.playing && output.player.as_ref().is_some_and(Sink::empty) {
-            output.playing = false;
+        if output.owes_end && output.player.as_ref().is_some_and(Sink::empty) {
+            output.owes_end = false;
             output.player = None;
             let _ = done.send(Done::Finished);
         }
@@ -177,11 +171,11 @@ fn play(output: &mut Output, path: &AudioPath, done: &Sender<Done>) {
     };
     player.append(buffer);
     output.player = Some(player);
-    output.playing = true;
+    output.owes_end = true;
 }
 
 fn stop(output: &mut Output) {
-    output.playing = false;
+    output.owes_end = false;
     output.player = None;
 }
 
@@ -206,7 +200,7 @@ fn read_voice(path: &AudioPath) -> Result<SamplesBuffer, ()> {
             return Err(());
         }
     };
-    if let Ok(buffer) = voice_buffer(file) {
+    if let VoiceDecode::Opus(buffer) = voice_buffer(file) {
         return Ok(buffer);
     }
     let file = match File::open(path.as_path()) {
@@ -241,12 +235,24 @@ where
     Ok(SamplesBuffer::new(channels, rate, data))
 }
 
-/// Opus packets in an Ogg page. `Err` when the file is not that, so the
-/// caller can try rodio's Vorbis decoder on the same path.
-fn voice_buffer(reader: impl Read + Seek) -> Result<SamplesBuffer, ()> {
+enum VoiceDecode {
+    Opus(SamplesBuffer),
+    TryVorbis,
+}
+
+struct OpusHead {
+    channels: u8,
+    pre_skip: u16,
+}
+
+fn voice_buffer(reader: impl Read + Seek) -> VoiceDecode {
+    opus_samples(reader).map_or(VoiceDecode::TryVorbis, VoiceDecode::Opus)
+}
+
+fn opus_samples(reader: impl Read + Seek) -> Result<SamplesBuffer, ()> {
     let mut reader = ogg::PacketReader::new(reader);
     let head = reader.read_packet().map_err(|_| ())?.ok_or(())?;
-    let (channels, pre_skip) = opus_head(&head.data)?;
+    let OpusHead { channels, pre_skip } = opus_head(&head.data)?;
     let mut packets = Vec::new();
     if let Some(second) = reader.read_packet().map_err(|_| ())?
         && !second.data.starts_with(b"OpusTags")
@@ -291,8 +297,7 @@ fn voice_buffer(reader: impl Read + Seek) -> Result<SamplesBuffer, ()> {
     Ok(SamplesBuffer::new(channels, rate, pcm))
 }
 
-/// `Ok((channels, pre_skip))` for an OpusHead packet.
-fn opus_head(data: &[u8]) -> Result<(u8, u16), ()> {
+fn opus_head(data: &[u8]) -> Result<OpusHead, ()> {
     if data.len() < 19 || &data[..8] != b"OpusHead" || data[8] > 15 {
         return Err(());
     }
@@ -301,7 +306,7 @@ fn opus_head(data: &[u8]) -> Result<(u8, u16), ()> {
         return Err(());
     }
     let pre_skip = u16::from_le_bytes([data[10], data[11]]);
-    Ok((channels, pre_skip))
+    Ok(OpusHead { channels, pre_skip })
 }
 
 #[cfg(test)]
@@ -310,12 +315,12 @@ mod tests {
 
     use rodio::source::Source;
 
-    use super::voice_buffer;
+    use super::{VoiceDecode, voice_buffer};
 
     #[test]
     fn bytes_that_are_not_ogg_opus_are_refused() {
         let junk = Cursor::new(b"not a voice note".to_vec());
-        assert!(voice_buffer(junk).is_err());
+        assert!(matches!(voice_buffer(junk), VoiceDecode::TryVorbis));
     }
 
     #[test]
@@ -337,7 +342,9 @@ mod tests {
                 .write_packet(packet, 1, ogg::PacketWriteEndInfo::EndStream, 960)
                 .expect("audio");
         }
-        let buffer = voice_buffer(Cursor::new(bytes)).expect("opus");
+        let VoiceDecode::Opus(buffer) = voice_buffer(Cursor::new(bytes)) else {
+            panic!("opus");
+        };
         assert_eq!(buffer.channels().get(), 1);
         assert_eq!(buffer.sample_rate().get(), 48_000);
         assert!(buffer.into_iter().next().is_some());
