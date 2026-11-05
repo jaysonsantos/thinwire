@@ -59,6 +59,7 @@ const fn caps(protocol: ProtocolId) -> ProtocolCapabilities {
         allows_user_account_automation: false,
         sends_text: true,
         pages_history: true,
+        sends_media: true,
     }
 }
 

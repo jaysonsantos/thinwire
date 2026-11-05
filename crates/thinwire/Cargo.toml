@@ -59,6 +59,10 @@ image = { version = "0.25", default-features = false, features = [
 webbrowser = { version = "1.2", features = ["hardened"] }
 # Host display for the link confirm dialog. `host_str` is the punycode form.
 url = "2"
+# The file list of a paste from a file manager. egui-winit already links it.
+arboard = "3.6"
+# The cache folder for pasted images.
+dirs.workspace = true
 thinwire-core.workspace = true
 thinwire-notify.workspace = true
 thinwire-protocol.workspace = true

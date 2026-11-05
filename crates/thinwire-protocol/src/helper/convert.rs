@@ -6,8 +6,11 @@
 
 use thinwire_ipc::{
     SecretText, WireAccountState, WireArrival, WireCommand, WireConversation, WireDelivery,
-    WireEvent, WireMessage, WireProtocol, WireStatus, WireStoreAccess,
+    WireEvent, WireFile, WireMediaKind, WireMessage, WirePhoto, WireProtocol, WireStatus,
+    WireStoreAccess,
 };
+
+use crate::media::{ImageBytes, MediaKind, MessagePhoto, OutgoingFile, PhotoSize};
 
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, Arrival, ChatMessage, Conversation,
@@ -65,6 +68,28 @@ pub(crate) fn command_to_wire(
             body: body.clone(),
             request: *request,
         },
+        AdapterCommand::SendMedia {
+            conversation_id,
+            files,
+            caption,
+            request,
+            topic: None,
+            ..
+        } => WireCommand::SendMedia {
+            conversation_id: conversation_id.clone(),
+            files: files
+                .iter()
+                .map(|file| WireFile {
+                    path: file.path.to_string_lossy().into_owned(),
+                    kind: match file.kind {
+                        MediaKind::Photo => WireMediaKind::Photo,
+                        MediaKind::Video => WireMediaKind::Video,
+                    },
+                })
+                .collect(),
+            caption: caption.clone(),
+            request: *request,
+        },
         AdapterCommand::ResendMessage {
             conversation_id,
             message_id,
@@ -101,6 +126,7 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::OpenTopic { .. }
         | AdapterCommand::LoadOlderTopic { .. }
         | AdapterCommand::SendTopicText { .. }
+        | AdapterCommand::SendMedia { topic: Some(_), .. }
         | AdapterCommand::ViewTopic { .. }
         | AdapterCommand::DownloadFile { .. } => return None,
     })
@@ -136,6 +162,28 @@ pub(crate) fn command_from_wire(
             protocol,
             conversation_id,
             body,
+            request,
+        },
+        WireCommand::SendMedia {
+            conversation_id,
+            files,
+            caption,
+            request,
+        } => AdapterCommand::SendMedia {
+            protocol,
+            conversation_id,
+            topic: None,
+            files: files
+                .into_iter()
+                .map(|file| OutgoingFile {
+                    path: file.path.into(),
+                    kind: match file.kind {
+                        WireMediaKind::Photo => MediaKind::Photo,
+                        WireMediaKind::Video => MediaKind::Video,
+                    },
+                })
+                .collect(),
+            caption,
             request,
         },
         WireCommand::ResendMessage {
@@ -572,7 +620,44 @@ fn message_to_wire(message: ChatMessage) -> WireMessage {
         delivery: delivery_to_wire(message.delivery),
         sent_at: message.sent_at,
         arrival: arrival_to_wire(message.arrival),
+        photo: message.photo.as_ref().and_then(photo_to_wire),
     }
+}
+
+/// The first size that holds its bytes. A photo with no bytes, or with too
+/// many for one line, does not cross: the row shows the body.
+fn photo_to_wire(photo: &MessagePhoto) -> Option<WirePhoto> {
+    let size = photo.sizes.iter().find(|size| size.bytes.is_some())?;
+    let bytes = size.bytes.as_ref()?.as_slice();
+    if bytes.is_empty() || bytes.len() > WirePhoto::MAX_BYTES {
+        return None;
+    }
+    Some(WirePhoto {
+        width: size.width,
+        height: size.height,
+        bytes: bytes.to_vec(),
+    })
+}
+
+fn photo_from_wire(photo: WirePhoto) -> Option<MessagePhoto> {
+    if photo.bytes.is_empty() {
+        return None;
+    }
+    Some(MessagePhoto {
+        width: photo.width,
+        height: photo.height,
+        mini: None,
+        sizes: vec![PhotoSize {
+            width: photo.width,
+            height: photo.height,
+            file_id: None,
+            path: None,
+            bytes: Some(ImageBytes::new(photo.bytes)),
+        }],
+        has_spoiler: false,
+        is_secret: false,
+        failed: false,
+    })
 }
 
 fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage {
@@ -588,7 +673,7 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
         arrival: arrival_from_wire(message.arrival),
         topic: None,
         links: Vec::new(),
-        photo: None,
+        photo: message.photo.and_then(photo_from_wire),
     }
 }
 
@@ -639,6 +724,32 @@ mod tests {
             has_topics: false,
             avatar: Default::default(),
         }
+    }
+
+    /// A sticker image crosses the pipe with its size and its bytes. An
+    /// image that is too large for one line does not cross.
+    #[test]
+    fn a_message_photo_survives_the_wire() {
+        let mut sticker = message(ProtocolId::WhatsApp);
+        sticker.body = String::new();
+        sticker.photo = photo_from_wire(WirePhoto {
+            width: 512,
+            height: 400,
+            bytes: vec![1, 2, 3],
+        });
+        let event = AdapterEvent::MessageReceived {
+            message: sticker.clone(),
+        };
+        let wire = event_to_wire(ProtocolId::WhatsApp, event.clone()).expect("wire");
+        assert_eq!(event_from_wire(ProtocolId::WhatsApp, wire), Some(event));
+
+        let mut large = sticker;
+        large.photo = photo_from_wire(WirePhoto {
+            width: 512,
+            height: 512,
+            bytes: vec![0; WirePhoto::MAX_BYTES + 1],
+        });
+        assert_eq!(message_to_wire(large).photo, None);
     }
 
     /// Every WhatsApp event that the helper can send comes back unchanged.

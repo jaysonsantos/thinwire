@@ -57,6 +57,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     allows_user_account_automation: false,
     sends_text: true,
     pages_history: true,
+    sends_media: true,
 };
 
 /// Official Telegram path. Default builds report TDLib unavailable.
@@ -490,6 +491,42 @@ impl ProtocolAdapter for TelegramAdapter {
                 file_id,
                 secret,
             } => self.dispatch_live(events, LiveCall::DownloadFile { file_id, secret }),
+            AdapterCommand::SendMedia {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                topic,
+                files,
+                caption,
+                request,
+            } => {
+                let rejected = if files.is_empty() {
+                    Some("no photo or video to send")
+                } else if parse_telegram_chat_id(&conversation_id).is_none() {
+                    Some("chat id is not a Telegram chat")
+                } else {
+                    None
+                };
+                let result = match rejected {
+                    Some(reason) => Err(AdapterError::Unavailable {
+                        protocol: ProtocolId::Telegram,
+                        reason,
+                    }),
+                    None => self.dispatch_live(
+                        events,
+                        LiveCall::SendMedia {
+                            conversation_id: conversation_id.clone(),
+                            topic,
+                            files,
+                            caption,
+                            request,
+                        },
+                    ),
+                };
+                if result.is_err() {
+                    emit_send_rejected(events, ProtocolId::Telegram, conversation_id, request);
+                }
+                result
+            }
             other => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Telegram,
                 reason: command_mismatch(other),
@@ -563,6 +600,13 @@ enum LiveCall {
     DownloadFile {
         file_id: i32,
         secret: bool,
+    },
+    SendMedia {
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        files: Vec<crate::media::OutgoingFile>,
+        caption: String,
+        request: u64,
     },
 }
 
@@ -652,6 +696,24 @@ impl TelegramAdapter {
                 LiveCall::DownloadFile { file_id, secret } => {
                     self.tdlib
                         .download_file(file_id, secret, secrets, source, events);
+                }
+                LiveCall::SendMedia {
+                    conversation_id,
+                    topic,
+                    files,
+                    caption,
+                    request,
+                } => {
+                    self.tdlib.send_media(
+                        conversation_id,
+                        topic,
+                        files,
+                        caption,
+                        request,
+                        secrets,
+                        source,
+                        events,
+                    );
                 }
             }
             Ok(())

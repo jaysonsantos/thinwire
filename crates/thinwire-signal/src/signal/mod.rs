@@ -54,6 +54,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: true,
     // The Signal adapter answers LoadOlderMessages (ADR 0010 rule 10).
     pages_history: true,
+    sends_media: cfg!(feature = "signal-local"),
 };
 
 const NOTICE_REQUIRED: &str =
@@ -390,6 +391,7 @@ impl SignalAdapter {
                     conversation_id: conversation_id.to_string(),
                     body: body.to_string(),
                     request,
+                    files: Vec::new(),
                 });
                 if !queued {
                     thinwire_protocol::emit_send_rejected(
@@ -402,6 +404,42 @@ impl SignalAdapter {
                 Ok(())
             }
         }
+    }
+
+    /// Photos and videos go out in one Signal message, with the text. Only
+    /// the live client sends them.
+    fn send_media(
+        &mut self,
+        conversation_id: &str,
+        caption: &str,
+        files: Vec<thinwire_protocol::OutgoingFile>,
+        request: u64,
+        events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        let queued = match &mut self.engine {
+            Engine::Sync(_) => false,
+            #[cfg(feature = "signal-local")]
+            Engine::Live(session) => {
+                !files.is_empty()
+                    && session.submit(live::Outbound {
+                        conversation_id: conversation_id.to_string(),
+                        body: caption.to_string(),
+                        request,
+                        files,
+                    })
+            }
+        };
+        if !queued {
+            #[cfg(not(feature = "signal-local"))]
+            let _ = (caption, files);
+            thinwire_protocol::emit_send_rejected(
+                events,
+                ProtocolId::Signal,
+                conversation_id,
+                request,
+            );
+        }
+        Ok(())
     }
 
     fn resend(
@@ -452,6 +490,7 @@ impl SignalAdapter {
                         conversation_id: conversation_id.clone(),
                         body,
                         request,
+                        files: Vec::new(),
                     });
                     if !queued {
                         thinwire_protocol::emit_send_rejected(
@@ -650,6 +689,14 @@ impl ProtocolAdapter for SignalAdapter {
                 body,
                 request,
             } => self.send_text(&conversation_id, &body, request, events),
+            AdapterCommand::SendMedia {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+                caption,
+                files,
+                request,
+                ..
+            } => self.send_media(&conversation_id, &caption, files, request, events),
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Signal,
                 reason: "command is not handled by the Signal adapter",

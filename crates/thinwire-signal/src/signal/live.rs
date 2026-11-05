@@ -89,7 +89,12 @@ pub(super) struct Outbound {
     pub(super) conversation_id: String,
     pub(super) body: String,
     pub(super) request: u64,
+    /// Photos and videos of the message. `body` is then the caption.
+    pub(super) files: Vec<thinwire_protocol::OutgoingFile>,
 }
+
+/// Attachments in one Signal message at most.
+const SIGNAL_ATTACHMENTS: usize = 32;
 
 /// One page of stored history. The same size as the Telegram older page.
 const HISTORY_PAGE: usize = 50;
@@ -3143,9 +3148,12 @@ async fn send_text(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ())?
         .as_millis() as u64;
+    let attachments = upload_files(manager, &outbound.files).await?;
+    let caption = outbound.body.trim();
     let data_message = DataMessage {
-        body: Some(outbound.body.clone()),
+        body: (!caption.is_empty() || attachments.is_empty()).then(|| outbound.body.clone()),
         timestamp: Some(timestamp),
+        attachments,
         ..Default::default()
     };
     if super::group::is_group_id(&outbound.conversation_id) {
@@ -3172,6 +3180,7 @@ async fn send_text(
     );
     let sent_at = super::time::sent_at_secs(timestamp);
     let id = signal_message_id(timestamp, "me");
+    let shown = shown_body(outbound);
     let conversation = sent_conversation(outbound, sent_at, names, group_titles);
     unread.insert(conversation.id.clone(), 0);
     remember_row(rows, &conversation);
@@ -3183,7 +3192,7 @@ async fn send_text(
             conversation_id: outbound.conversation_id.clone(),
             id: id.clone(),
             sender: "me".into(),
-            body: outbound.body.clone(),
+            body: shown,
             outbound: true,
             delivery: Delivery::Sent,
             sent_at,
@@ -3193,8 +3202,68 @@ async fn send_text(
             photo: None,
         },
     );
-    session.remember(&id, &outbound.body).await;
+    // A media row keeps no files, so it cannot be sent again.
+    if outbound.files.is_empty() {
+        session.remember(&id, &outbound.body).await;
+    }
     Ok(())
+}
+
+/// The row of a sent message: the text, or what the files are.
+fn shown_body(outbound: &Outbound) -> String {
+    let caption = outbound.body.trim();
+    if !caption.is_empty() || outbound.files.is_empty() {
+        return outbound.body.clone();
+    }
+    match outbound.files.as_slice() {
+        [one] if one.kind == thinwire_protocol::MediaKind::Photo => "[photo]".into(),
+        [_] => "[video]".into(),
+        many => format!("[{} files]", many.len()),
+    }
+}
+
+/// Read and upload the files of a send. Any failure fails the send: no
+/// message goes out with a part of its files.
+async fn upload_files(
+    manager: &Manager<SqliteStore, Registered>,
+    files: &[thinwire_protocol::OutgoingFile],
+) -> Result<Vec<presage::proto::AttachmentPointer>, ()> {
+    use presage::libsignal_service::sender::AttachmentSpec;
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    if files.len() > SIGNAL_ATTACHMENTS {
+        return Err(());
+    }
+    let mut specs = Vec::with_capacity(files.len());
+    for file in files {
+        // An error can hold the path. It stays out of the log.
+        let size = tokio::fs::metadata(&file.path).await.map_err(|_| ())?.len();
+        if size > thinwire_protocol::MAX_ATTACHMENT_BYTES {
+            return Err(());
+        }
+        let data = tokio::fs::read(&file.path).await.map_err(|_| ())?;
+        specs.push((
+            AttachmentSpec {
+                content_type: file.mime().to_string(),
+                length: data.len(),
+                file_name: Some(file.file_name()),
+                preview: None,
+                voice_note: None,
+                borderless: None,
+                width: None,
+                height: None,
+                caption: None,
+                blur_hash: None,
+            },
+            data,
+        ));
+    }
+    let uploaded = manager.upload_attachments(specs).await.map_err(|_| ())?;
+    uploaded
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ())
 }
 
 fn sent_conversation(
@@ -6989,6 +7058,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             conversation_id: id.clone(),
             body: "sent line".into(),
             request: 7,
+            files: Vec::new(),
         };
         let mut names = HashMap::new();
         names.insert(id.clone(), "Ada".into());

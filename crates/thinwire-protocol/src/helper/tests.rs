@@ -50,6 +50,7 @@ const CAPS: ProtocolCapabilities = ProtocolCapabilities {
     allows_user_account_automation: false,
     sends_text: true,
     pages_history: true,
+    sends_media: true,
 };
 
 /// Short waits, so a restart test takes milliseconds.

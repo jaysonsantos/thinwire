@@ -44,6 +44,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: cfg!(feature = "whatsapp-web"),
     // The session history pages from memory (LoadOlderMessages).
     pages_history: cfg!(feature = "whatsapp-web"),
+    sends_media: cfg!(feature = "whatsapp-web"),
 };
 
 /// Longest wait at shutdown for the sends in flight, before the client
@@ -370,9 +371,11 @@ impl WhatsAppAdapter {
             .session
             .with_inbox(|inbox| inbox.open_chat(jid))
             .ok_or_else(|| unavailable(UNKNOWN_CHAT))?;
-        for event in opened {
-            let _ = events.send(event);
+        for event in &opened {
+            let _ = events.send(event.clone());
         }
+        // The rows go first. A sticker image comes later with its row.
+        self.session.fetch_media(&opened, events);
         Ok(())
     }
 
@@ -402,6 +405,58 @@ impl WhatsAppAdapter {
             retry: false,
         };
         self.spawn_send(sender, jid, pending, body, answer, events);
+    }
+
+    /// Photos and videos go out one message each. The caption goes with
+    /// the first. One pending row stands for the whole send.
+    fn send_media(
+        &self,
+        conversation_id: &str,
+        files: Vec<thinwire_protocol::OutgoingFile>,
+        caption: &str,
+        request: u64,
+        events: &EventTx,
+    ) {
+        let label = media_label(&files, caption);
+        let prepared = self.prepare_send(conversation_id, &label);
+        let Ok((jid, label, sender)) = prepared.and_then(|ready| {
+            if files.is_empty() {
+                Err(unavailable(EMPTY_BODY))
+            } else {
+                Ok(ready)
+            }
+        }) else {
+            emit_send_rejected(events, ProtocolId::WhatsApp, conversation_id, request);
+            return;
+        };
+        let (pending, shown, upsert) = self.session.with_inbox(|inbox| {
+            let begun = inbox.begin_send(&jid, &label, unix_now());
+            inbox.mark_media_send(&jid, &begun.0);
+            begun
+        });
+        let _ = events.send(shown);
+        if let Some(upsert) = upsert {
+            let _ = events.send(upsert);
+        }
+        let answer = session::SendRequest {
+            conversation_id: conversation_id.to_string(),
+            request,
+            retry: false,
+        };
+        let (generation, sender) = sender;
+        let session = self.session.clone();
+        let events = events.clone();
+        let owner = self.link.as_ref().map(|link| link.callbacks(generation));
+        let running = self.sends.begin(&answer.conversation_id);
+        let caption = caption.trim().to_string();
+        tokio::spawn(async move {
+            let result = send_files(sender.as_ref(), &jid, &files, &caption).await;
+            let revoked = session.finish_send(generation, &jid, &pending, result, &answer, &events);
+            running.finish();
+            if revoked && let Some(owner) = owner {
+                owner.send(session::LinkEvent::LoggedOut);
+            }
+        });
     }
 
     fn prepare_send(
@@ -440,9 +495,10 @@ impl WhatsAppAdapter {
                 .with_inbox(|inbox| inbox.older_page(jid, before, inbox::OPEN_CHAT_MESSAGES)),
             None => (Vec::new(), false),
         };
-        for event in page {
-            let _ = events.send(event);
+        for event in &page {
+            let _ = events.send(event.clone());
         }
+        self.session.fetch_media(&page, events);
         emit_older_history_loaded(
             events,
             ProtocolId::WhatsApp,
@@ -508,6 +564,44 @@ impl WhatsAppAdapter {
             }
         });
     }
+}
+
+/// The row of a media send: the caption, or what the files are.
+fn media_label(files: &[thinwire_protocol::OutgoingFile], caption: &str) -> String {
+    let caption = caption.trim();
+    if !caption.is_empty() {
+        return caption.to_string();
+    }
+    match files {
+        [one] if one.kind == thinwire_protocol::MediaKind::Photo => "[photo]".into(),
+        [_] => "[video]".into(),
+        many => format!("[{} files]", many.len()),
+    }
+}
+
+/// Send each file as its own message. The send is the first message: its
+/// failure fails the send. A later file that fails is logged.
+async fn send_files(
+    sender: &dyn session::WhatsAppSender,
+    jid: &str,
+    files: &[thinwire_protocol::OutgoingFile],
+    caption: &str,
+) -> Result<String, session::SendFailure> {
+    let mut first = None;
+    for (index, file) in files.iter().enumerate() {
+        let caption = if index == 0 { caption } else { "" };
+        match sender.send_media(jid, file, caption).await {
+            Ok(id) => {
+                first.get_or_insert(id);
+            }
+            Err(failure) if first.is_none() => return Err(failure),
+            Err(_) => {
+                tracing::warn!("whatsapp: a later photo or video did not send");
+                break;
+            }
+        }
+    }
+    first.ok_or(session::SendFailure::Rejected)
 }
 
 /// Chat JID inside a WhatsApp conversation id. The placeholder row returns `None`.
@@ -641,6 +735,17 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 request,
             } => {
                 self.send_text(&conversation_id, &body, request, events);
+                Ok(())
+            }
+            AdapterCommand::SendMedia {
+                protocol: ProtocolId::WhatsApp,
+                conversation_id,
+                files,
+                caption,
+                request,
+                ..
+            } => {
+                self.send_media(&conversation_id, files, &caption, request, events);
                 Ok(())
             }
             AdapterCommand::LoadOlderMessages {
@@ -2530,6 +2635,7 @@ mod tests {
             .with_capabilities(ProtocolCapabilities {
                 sends_text: true,
                 pages_history: true,
+                sends_media: true,
                 ..CAPABILITIES
             });
         let events = kit.events();

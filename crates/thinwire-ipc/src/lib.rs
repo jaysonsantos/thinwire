@@ -22,6 +22,6 @@ pub use frame::{FrameError, FrameReader, MAX_LINE_BYTES, decode, encode, write_l
 pub use secret::SecretText;
 pub use wire::{
     AppLine, HelperLine, HelperRefusal, PROTOCOL_VERSION, WireAccountState, WireArrival,
-    WireCommand, WireConversation, WireDelivery, WireEvent, WireMessage, WireProtocol, WireStatus,
-    WireStoreAccess,
+    WireCommand, WireConversation, WireDelivery, WireEvent, WireFile, WireMediaKind, WireMessage,
+    WirePhoto, WireProtocol, WireStatus, WireStoreAccess,
 };

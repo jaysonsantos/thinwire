@@ -114,6 +114,19 @@ impl fmt::Display for DiscordApiError {
     }
 }
 
+/// One file of a send: its name and its bytes. `Debug` shows the length only.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct UploadFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+impl fmt::Debug for UploadFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "UploadFile({} bytes)", self.bytes.len())
+    }
+}
+
 /// Bot-token HTTP calls the guild inbox needs. No user-account endpoints.
 pub(crate) trait DiscordApi: Send + Sync {
     /// Id of the bot user that owns the token.
@@ -128,6 +141,13 @@ pub(crate) trait DiscordApi: Send + Sync {
     fn history(&self, channel_id: u64, limit: u16) -> ApiFuture<'_, Vec<MessageSummary>>;
     /// Send plain text as the bot.
     fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary>;
+    /// Send files as the bot, with `body` as the text. `body` can be empty.
+    fn send_files(
+        &self,
+        channel_id: u64,
+        body: String,
+        files: Vec<UploadFile>,
+    ) -> ApiFuture<'_, MessageSummary>;
 
     /// Set by tests. The live client leaves this empty.
     ///

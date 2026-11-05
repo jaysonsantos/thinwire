@@ -6,6 +6,7 @@
 //! `Debug` prints no URL, path, or image bytes.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// A link inside a message body.
 #[derive(Clone, PartialEq, Eq)]
@@ -624,5 +625,117 @@ mod tests {
         assert!(!photo_debug.contains("jpeg"));
         assert!(photo_debug.contains("is_secret"));
         assert!(photo_debug.contains("ImageBytes"));
+    }
+}
+
+/// The kind of a file that the user attaches to a message. Only photos and
+/// videos go out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaKind {
+    Photo,
+    Video,
+}
+
+/// Files that one send takes at most. A protocol that takes fewer in one
+/// message sends more than one message.
+pub const MAX_ATTACHMENTS: usize = 30;
+
+/// Files in one Telegram album or one Discord message.
+pub const FILES_PER_MESSAGE: usize = 10;
+
+/// The largest file that a send takes, in bytes.
+pub const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
+
+impl MediaKind {
+    /// The kind of a file from its extension. `None` for another file.
+    #[must_use]
+    pub fn of_path(path: &Path) -> Option<Self> {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        match extension.as_str() {
+            "jpg" | "jpeg" | "png" | "webp" | "gif" | "heic" | "heif" | "bmp" => Some(Self::Photo),
+            "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" | "3gp" => Some(Self::Video),
+            _ => None,
+        }
+    }
+}
+
+/// One file that the user attached to a message. `Debug` shows the kind
+/// only: a path can hold a user name or a file name.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct OutgoingFile {
+    pub path: PathBuf,
+    pub kind: MediaKind,
+}
+
+impl OutgoingFile {
+    /// `None` when the file is not a photo or a video.
+    #[must_use]
+    pub fn new(path: PathBuf) -> Option<Self> {
+        let kind = MediaKind::of_path(&path)?;
+        Some(Self { path, kind })
+    }
+
+    /// The file name, for the upload and for the tray of the compose field.
+    #[must_use]
+    pub fn file_name(&self) -> String {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(|| "file".to_owned(), str::to_owned)
+    }
+
+    /// The MIME type from the extension.
+    #[must_use]
+    pub fn mime(&self) -> &'static str {
+        let extension = self
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match extension.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "heic" => "image/heic",
+            "heif" => "image/heif",
+            "bmp" => "image/bmp",
+            "mp4" | "m4v" => "video/mp4",
+            "mov" => "video/quicktime",
+            "webm" => "video/webm",
+            "mkv" => "video/x-matroska",
+            "avi" => "video/x-msvideo",
+            "3gp" => "video/3gpp",
+            _ => "application/octet-stream",
+        }
+    }
+}
+
+impl fmt::Debug for OutgoingFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OutgoingFile({:?})", self.kind)
+    }
+}
+
+#[cfg(test)]
+mod outgoing_tests {
+    use super::*;
+
+    #[test]
+    fn only_photos_and_videos_attach() {
+        assert_eq!(
+            OutgoingFile::new("/home/a/IMG_1.JPG".into()).map(|file| file.kind),
+            Some(MediaKind::Photo)
+        );
+        assert_eq!(
+            OutgoingFile::new("clip.mov".into()).map(|file| file.mime()),
+            Some("video/quicktime")
+        );
+        assert!(OutgoingFile::new("notes.pdf".into()).is_none());
+        assert!(OutgoingFile::new("no-extension".into()).is_none());
+        let file = OutgoingFile::new("/home/secret-user/cat.png".into()).expect("photo");
+        assert_eq!(file.file_name(), "cat.png");
+        assert!(!format!("{file:?}").contains("secret-user"));
     }
 }

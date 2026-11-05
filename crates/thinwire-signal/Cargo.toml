@@ -38,7 +38,7 @@ dirs.workspace = true
 sha2 = "0.11.0"
 thinwire-protocol.workspace = true
 # `io-std`: the helper talks over its stdin and stdout.
-tokio = { workspace = true, features = ["io-std"] }
+tokio = { workspace = true, features = ["fs", "io-std"] }
 tracing.workspace = true
 # The log of the helper program.
 tracing-subscriber.workspace = true

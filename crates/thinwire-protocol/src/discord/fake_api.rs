@@ -28,6 +28,8 @@ pub(crate) struct FakeState {
     pub channels: HashMap<u64, Vec<ChannelSummary>>,
     pub history: HashMap<u64, Vec<MessageSummary>>,
     pub sent: Vec<(u64, String)>,
+    /// Each file send: the channel, the text, and the file names.
+    pub sent_files: Vec<(u64, String, Vec<String>)>,
     /// Every call returns 401 until this is cleared. A revoked bot token.
     pub unauthorized: bool,
     pub send_error: Option<DiscordApiError>,
@@ -345,6 +347,26 @@ impl DiscordApi for FakeDiscordApi {
                 body.as_str()
             };
             Ok(message(id, BOT_ID, "thinwire-bot", content))
+        })
+    }
+
+    fn send_files(
+        &self,
+        channel_id: u64,
+        body: String,
+        files: Vec<super::api::UploadFile>,
+    ) -> ApiFuture<'_, MessageSummary> {
+        Box::pin(async move {
+            self.check_token()?;
+            let mut state = self.state();
+            if let Some(error) = state.send_error {
+                return Err(error);
+            }
+            state.next_id += 1;
+            let id = state.next_id;
+            let names = files.into_iter().map(|file| file.name).collect();
+            state.sent_files.push((channel_id, body.clone(), names));
+            Ok(message(id, BOT_ID, "thinwire-bot", &body))
         })
     }
 }

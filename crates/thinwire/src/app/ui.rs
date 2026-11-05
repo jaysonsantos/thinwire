@@ -2241,7 +2241,8 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     let row_height = ui.text_style_height(&egui::TextStyle::Body);
     let compose_rows = compose_line_count(&snapshot.compose);
     let compose_height = compose_row_height(row_height, COMPOSE_MAX_ROWS);
-    let reserve = compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y);
+    let reserve = compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y)
+        + super::attach::tray_height(ui, snapshot);
 
     let state = snapshot.thread_state();
     let older = snapshot.older_state();
@@ -2406,6 +2407,9 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
     }
 
     compose(ui, snapshot, hints, compose_height, out);
+    if snapshot.sends_media(snapshot.selected_protocol) {
+        super::attach::drop_hint(ui, ui.max_rect());
+    }
 }
 
 /// A soft edge where messages scroll under the header or the compose bar.
@@ -3499,6 +3503,15 @@ fn compose(
     let sending_off = snapshot.selected_protocol == ProtocolId::Signal
         && (snapshot.signal_device_removed() || snapshot.signal_read_only_reason().is_some());
     let compose_open = !closed && !sending_off;
+    // Dropped and pasted photos and videos go to the tray of this thread.
+    // This runs before the field, so a paste of files adds no text.
+    if compose_open
+        && snapshot.sends_media(snapshot.selected_protocol)
+        && let Some(thread) = chat.as_ref()
+    {
+        let focused = ui.memory(|memory| memory.has_focus(compose_id));
+        super::attach::take_input(ui, thread, focused, out);
+    }
     if hints.take_focus_compose() {
         ui.memory_mut(|memory| memory.request_focus(compose_id));
     }
@@ -3551,6 +3564,9 @@ fn compose(
         .fill(palette.bg)
         .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::M as i8))
         .show(ui, |ui| {
+            if let Some(thread) = chat.as_ref() {
+                super::attach::tray(ui, snapshot, thread, out);
+            }
             ui.horizontal(|ui| {
                 let width = (ui.available_width() - SEND_MIN_HEIGHT - space::S).max(0.0);
                 let visible = compose_row_height(

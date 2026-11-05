@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use super::api::{DiscordApi, DiscordApiError, MessageSummary};
+use super::api::{DiscordApi, DiscordApiError, MessageSummary, UploadFile};
 use super::inbox::{
     HISTORY_LIMIT, InboxChannel, PREVIEW_FETCH_CONCURRENCY, PreviewPause, channel_preview,
     chat_message, load_channels,
@@ -212,9 +212,74 @@ enum AccountEnd {
     Disconnect { detail: &'static str, attempt: u64 },
 }
 
+/// "[photo]", "[video]", or "[3 files]": the row of a media send with no text.
+fn media_label(files: &[crate::media::OutgoingFile]) -> String {
+    match files {
+        [one] if one.kind == crate::media::MediaKind::Photo => "[photo]".into(),
+        [_] => "[video]".into(),
+        many => format!("[{} files]", many.len()),
+    }
+}
+
+/// Read the files and post them, [`crate::media::FILES_PER_MESSAGE`] in one
+/// message. The text goes with the first message, and the result of that
+/// message is the result of the send. A later message that fails is logged.
+async fn send_files(
+    api: &dyn DiscordApi,
+    channel_id: u64,
+    body: String,
+    files: &[crate::media::OutgoingFile],
+) -> Result<MessageSummary, DiscordApiError> {
+    let mut first = None;
+    let mut body = Some(body);
+    for batch in files.chunks(crate::media::FILES_PER_MESSAGE) {
+        let mut upload = Vec::with_capacity(batch.len());
+        for file in batch {
+            let fits = tokio::fs::metadata(&file.path)
+                .await
+                .is_ok_and(|meta| meta.len() <= crate::media::MAX_ATTACHMENT_BYTES);
+            // The error can hold the path. It stays out of the result.
+            let bytes = if fits {
+                tokio::fs::read(&file.path)
+                    .await
+                    .map_err(|_| DiscordApiError::Rejected)?
+            } else {
+                return first.unwrap_or(Err(DiscordApiError::Rejected));
+            };
+            upload.push(UploadFile {
+                name: file.file_name(),
+                bytes,
+            });
+        }
+        let result = api
+            .send_files(channel_id, body.take().unwrap_or_default(), upload)
+            .await;
+        if first.is_none() {
+            let failed = result.is_err();
+            first = Some(result);
+            if failed {
+                break;
+            }
+        } else if let Err(error) = result {
+            tracing::warn!(
+                error = error.reason(),
+                "discord: a later file message failed"
+            );
+            break;
+        }
+    }
+    first.unwrap_or(Err(DiscordApiError::Rejected))
+}
+
 enum Outgoing {
     New(String),
     Retry(String),
+    /// Photos and videos, with the text. A media row cannot be sent again:
+    /// its files are not kept.
+    Media {
+        body: String,
+        files: Vec<crate::media::OutgoingFile>,
+    },
 }
 
 enum Msg {
@@ -449,6 +514,23 @@ impl Session {
         events: &EventTx,
     ) -> Result<(), AdapterError> {
         self.send_outgoing(conversation_id, request, Outgoing::New(body), events)
+    }
+
+    /// Posts photos and videos with the text. The text can be empty.
+    pub(crate) fn send_media(
+        &self,
+        conversation_id: String,
+        body: String,
+        files: Vec<crate::media::OutgoingFile>,
+        request: u64,
+        events: &EventTx,
+    ) -> Result<(), AdapterError> {
+        self.send_outgoing(
+            conversation_id,
+            request,
+            Outgoing::Media { body, files },
+            events,
+        )
     }
 
     /// Posts a failed outgoing row again. The shell names that row and a new request.
@@ -943,9 +1025,12 @@ impl Owner {
                 request,
             );
         };
-        if let Outgoing::New(body) = &outgoing
-            && body.trim().is_empty()
-        {
+        let empty = match &outgoing {
+            Outgoing::New(body) => body.trim().is_empty(),
+            Outgoing::Media { files, .. } => files.is_empty(),
+            Outgoing::Retry(_) => false,
+        };
+        if empty {
             reject(self);
             emit_notice(&self.events, ProtocolId::Discord, EMPTY_SEND_REFUSAL);
             return;
@@ -983,6 +1068,10 @@ impl Owner {
             pause.arrived.notify_one();
             tokio::task::block_in_place(|| pause.wait());
         }
+        let files = match &outgoing {
+            Outgoing::Media { files, .. } => Some(files.clone()),
+            Outgoing::New(_) | Outgoing::Retry(_) => None,
+        };
         let Some(body) = self.register_send(conversation_id, request, outgoing, bot_id) else {
             reject(self);
             return;
@@ -990,7 +1079,10 @@ impl Owner {
         self.send_tasks += 1;
         let api = Arc::clone(&self.api);
         tokio::spawn(async move {
-            let result = api.send(access.channel_id, body).await;
+            let result = match files {
+                Some(files) => send_files(api.as_ref(), access.channel_id, body, &files).await,
+                None => api.send(access.channel_id, body).await,
+            };
             let _ = tx.send(Msg::SendDone { request, result });
             // The result is with the owner now. A test can run a 401 here.
             if let Some(pause) = api.send_result_pause() {
@@ -1049,6 +1141,35 @@ impl Owner {
                     .cloned()
                     .filter(|text| !text.trim().is_empty())?;
                 (body, message_id, SendRow::Retry)
+            }
+            Outgoing::Media { body, files } => {
+                self.next_pending += 1;
+                let message_id = format!("discord:pending:{}:{}", self.id, self.next_pending);
+                // The row shows the text, or what the files are. No body is
+                // kept, so Retry of a failed media row is refused.
+                let shown = if body.trim().is_empty() {
+                    media_label(&files)
+                } else {
+                    body.clone()
+                };
+                emit_message(
+                    &events,
+                    ChatMessage {
+                        protocol: ProtocolId::Discord,
+                        conversation_id: conversation_id.clone(),
+                        id: message_id.clone(),
+                        sender: "bot".into(),
+                        body: shown,
+                        outbound: true,
+                        delivery: Delivery::Pending,
+                        sent_at: local_unix_seconds(),
+                        arrival: Arrival::History,
+                        topic: None,
+                        links: Vec::new(),
+                        photo: None,
+                    },
+                );
+                (body, message_id, SendRow::Pending)
             }
         };
         let tracked = Inflight {

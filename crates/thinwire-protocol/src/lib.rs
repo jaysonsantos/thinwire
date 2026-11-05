@@ -39,8 +39,9 @@ pub use helper::{HelperAdapter, HelperLauncher, HelperSpec, ProcessLauncher};
 pub use host::{AdapterHost, HostSender};
 pub use log_id::LogChatId;
 pub use media::{
-    ChatAvatar, ImageBytes, ImagePath, MessageLink, MessagePhoto, PhotoFile, PhotoSize, TextKind,
-    TextSpan, links_in, openable_url, utf16_range, with_scheme,
+    ChatAvatar, FILES_PER_MESSAGE, ImageBytes, ImagePath, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS,
+    MediaKind, MessageLink, MessagePhoto, OutgoingFile, PhotoFile, PhotoSize, TextKind, TextSpan,
+    links_in, openable_url, utf16_range, with_scheme,
 };
 pub use risk::{
     CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3, CRITIC_RISK_BULLETS, critic_bullets_for,

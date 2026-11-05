@@ -102,6 +102,22 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             }
             Intent::RestartHelper(protocol) => state.restarts.push(protocol),
             Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
+            Intent::AddAttachments {
+                protocol,
+                conversation_id,
+                topic,
+                paths,
+            } => state
+                .snapshot
+                .add_attachments(protocol, &conversation_id, topic, paths),
+            Intent::RemoveAttachment {
+                protocol,
+                conversation_id,
+                topic,
+                index,
+            } => state
+                .snapshot
+                .remove_attachment(protocol, &conversation_id, topic, index),
             Intent::CloseTopic { conversation_id } => {
                 if state.snapshot.selected_conversation.as_deref() == Some(conversation_id.as_str())
                 {
@@ -413,6 +429,57 @@ fn click_at(harness: &mut Harness<'static, InboxUi>, pos: egui::Pos2) {
         });
     }
     harness.run_steps(2);
+}
+
+/// Dropped photos and videos show in the tray above the field. A file of
+/// another kind is skipped with a note. Remove takes one file out.
+#[test]
+fn dropped_files_show_in_the_tray_and_remove_takes_one_out() {
+    let mut state = InboxUi::ready();
+    state.snapshot.select_conversation("telegram:1".into());
+    let mut harness = harness(state);
+    harness.run_steps(3);
+    harness.input_mut().dropped_files =
+        ["/home/a/cat.png", "/home/a/notes.pdf", "/home/a/clip.mp4"]
+            .into_iter()
+            .map(|path| std::sync::Arc::new(Dropped(path.into())) as egui::DroppedFileHandle)
+            .collect();
+    harness.run_steps(3);
+    assert_eq!(harness.state().snapshot.compose_attachments().len(), 2);
+    harness.get_by_label("Only photos and videos can be attached.");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Remove cat.png")
+        .click();
+    harness.run_steps(3);
+    let left: Vec<String> = harness
+        .state()
+        .snapshot
+        .compose_attachments()
+        .iter()
+        .map(thinwire_protocol::OutgoingFile::file_name)
+        .collect();
+    assert_eq!(left, ["clip.mp4"]);
+    assert!(
+        !harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Send")
+            .accesskit_node()
+            .is_disabled(),
+        "a file with no text can go"
+    );
+}
+
+/// A file dropped on the window, for a test. It has a path and no bytes.
+#[derive(Debug)]
+struct Dropped(std::path::PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        Err("a test file has no bytes".into())
+    }
 }
 
 /// The account info view keeps Ban risk. It opens the same README text.

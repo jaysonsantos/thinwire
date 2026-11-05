@@ -642,6 +642,22 @@ impl Core {
             } => self
                 .state
                 .set_draft(protocol, &conversation_id, topic, text.into_inner()),
+            Intent::AddAttachments {
+                protocol,
+                conversation_id,
+                topic,
+                paths,
+            } => self
+                .state
+                .add_attachments(protocol, &conversation_id, topic, paths),
+            Intent::RemoveAttachment {
+                protocol,
+                conversation_id,
+                topic,
+                index,
+            } => self
+                .state
+                .remove_attachment(protocol, &conversation_id, topic, index),
             Intent::SendDraft {
                 protocol,
                 conversation_id,

@@ -68,7 +68,7 @@ rusqlite = { version = "0.38", optional = true, default-features = false, featur
 # The wire lines to a helper process (ADR 0013). MIT, no AGPL code.
 thinwire-ipc.workspace = true
 # `process`: the app starts a helper process as a child.
-tokio = { workspace = true, features = ["io-util", "net", "process"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "process"] }
 tracing.workspace = true
 
 [dev-dependencies]

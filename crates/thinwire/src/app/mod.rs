@@ -1,5 +1,6 @@
 //! eframe application: draws the core view and sends user intents to the core.
 
+mod attach;
 mod auth;
 mod dock;
 mod icons;

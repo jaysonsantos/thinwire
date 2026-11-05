@@ -100,6 +100,9 @@ pub struct ProtocolCapabilities {
     /// The adapter answers `LoadOlderMessages`. The shell asks for older
     /// messages on scroll up only for such a protocol.
     pub pages_history: bool,
+    /// The adapter answers `SendMedia`. The compose field takes photos and
+    /// videos only for such a protocol.
+    pub sends_media: bool,
 }
 
 /// Link state of the account of one protocol.
@@ -377,6 +380,18 @@ pub enum AdapterCommand {
         body: String,
         request: u64,
     },
+    /// Send photos and videos, with the text as the caption. The caption can
+    /// be empty. `topic` is the open topic, if any. A protocol that takes
+    /// fewer files in one message sends more than one message. The adapter
+    /// answers one `SendAccepted` or `SendRejected` with `request`.
+    SendMedia {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        files: Vec<crate::media::OutgoingFile>,
+        caption: String,
+        request: u64,
+    },
     /// Send plain text in one topic. The body is the user's message.
     SendTopicText {
         protocol: ProtocolId,
@@ -443,6 +458,7 @@ impl AdapterCommand {
             | Self::LoadOlderTopic { protocol, .. }
             | Self::SendText { protocol, .. }
             | Self::SendTopicText { protocol, .. }
+            | Self::SendMedia { protocol, .. }
             | Self::ResendMessage { protocol, .. }
             | Self::ViewChat { protocol, .. }
             | Self::ViewTopic { protocol, .. }

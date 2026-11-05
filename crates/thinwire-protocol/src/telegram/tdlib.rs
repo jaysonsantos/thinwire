@@ -97,6 +97,14 @@ enum TdlibCommand {
         file_id: i32,
         secret: bool,
     },
+    /// Send photos and videos, with the caption on the first file.
+    SendMedia {
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        files: Vec<crate::media::OutgoingFile>,
+        caption: String,
+        request: u64,
+    },
 }
 
 /// How often a waiter checks that closing workers have exited.
@@ -430,6 +438,32 @@ impl TdlibRuntime {
     ) {
         self.enqueue(
             TdlibCommand::DownloadFile { file_id, secret },
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_media(
+        &mut self,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        files: Vec<crate::media::OutgoingFile>,
+        caption: String,
+        request: u64,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::SendMedia {
+                conversation_id,
+                topic,
+                files,
+                caption,
+                request,
+            },
             secrets,
             source,
             events,
@@ -795,6 +829,25 @@ fn spawn_tdlib_worker(
                                 live.open_chat = live.viewed.get();
                                 live.open_topic = live.viewed.get_topic();
                             }
+                        }
+                        TdlibCommand::SendMedia {
+                            conversation_id,
+                            topic,
+                            files,
+                            caption,
+                            request,
+                        } => {
+                            send_media(
+                                client_id,
+                                &conversation_id,
+                                topic,
+                                &files,
+                                &caption,
+                                request,
+                                &live,
+                                &events,
+                            )
+                            .await;
                         }
                         TdlibCommand::SendText {
                             conversation_id,
@@ -2550,6 +2603,154 @@ async fn fetch_older_page(
     let raw_len = messages.len();
     let older = inbox::older_than(messages, before, |message| message.id);
     Ok((inbox::page_outcome(raw_len, older.len()), older))
+}
+
+/// One photo or video for TDLib. TDLib reads the local file and finds the
+/// size itself. The caption goes on the first file of a message.
+fn media_content(
+    file: &crate::media::OutgoingFile,
+    caption: Option<&str>,
+) -> tdlib_rs::enums::InputMessageContent {
+    use tdlib_rs::enums::{InputFile, InputMessageContent};
+    use tdlib_rs::types::{FormattedText, InputFileLocal, InputMessagePhoto, InputMessageVideo};
+    let input = InputFile::Local(InputFileLocal {
+        path: file.path.to_string_lossy().into_owned(),
+    });
+    let caption = caption
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| FormattedText {
+            text: text.to_owned(),
+            entities: Vec::new(),
+        });
+    match file.kind {
+        crate::media::MediaKind::Photo => {
+            InputMessageContent::InputMessagePhoto(InputMessagePhoto {
+                photo: input,
+                thumbnail: None,
+                added_sticker_file_ids: Vec::new(),
+                width: 0,
+                height: 0,
+                caption,
+                show_caption_above_media: false,
+                self_destruct_type: None,
+                has_spoiler: false,
+            })
+        }
+        crate::media::MediaKind::Video => {
+            InputMessageContent::InputMessageVideo(InputMessageVideo {
+                video: input,
+                thumbnail: None,
+                cover: None,
+                start_timestamp: 0,
+                added_sticker_file_ids: Vec::new(),
+                duration: 0,
+                width: 0,
+                height: 0,
+                supports_streaming: true,
+                caption,
+                show_caption_above_media: false,
+                self_destruct_type: None,
+                has_spoiler: false,
+            })
+        }
+    }
+}
+
+/// Send photos and videos: one message for one file, albums of up to
+/// [`crate::media::FILES_PER_MESSAGE`] files for more. The caption goes with
+/// the first file. The send is accepted when the first message is out. A
+/// later album that fails shows its own error.
+#[allow(clippy::too_many_arguments)]
+async fn send_media(
+    client_id: i32,
+    conversation_id: &str,
+    topic: Option<MessageTopic>,
+    files: &[crate::media::OutgoingFile],
+    caption: &str,
+    request: u64,
+    live: &LiveInbox,
+    events: &EventTx,
+) {
+    let rejected = || {
+        emit_send_rejected(events, ProtocolId::Telegram, conversation_id, request);
+    };
+    if !live.linked() || files.is_empty() {
+        rejected();
+        return;
+    }
+    let Some(chat_id) = inbox::parse_telegram_chat_id(conversation_id) else {
+        rejected();
+        return;
+    };
+    let mut accepted = false;
+    for (index, batch) in files.chunks(crate::media::FILES_PER_MESSAGE).enumerate() {
+        let contents: Vec<_> = batch
+            .iter()
+            .enumerate()
+            .map(|(at, file)| media_content(file, (index == 0 && at == 0).then_some(caption)))
+            .collect();
+        let sent: Result<Vec<tdlib_rs::types::Message>, tdlib_rs::types::Error> =
+            if let [content] = contents.as_slice() {
+                tdlib_rs::functions::send_message(
+                    chat_id,
+                    topic.and_then(td_topic),
+                    None,
+                    None,
+                    content.clone(),
+                    client_id,
+                )
+                .await
+                .map(|tdlib_rs::enums::Message::Message(message)| vec![message])
+            } else {
+                tdlib_rs::functions::send_message_album(
+                    chat_id,
+                    topic.and_then(td_topic),
+                    None,
+                    None,
+                    contents,
+                    client_id,
+                )
+                .await
+                .map(|tdlib_rs::enums::Messages::Messages(list)| {
+                    list.messages.into_iter().flatten().collect()
+                })
+            };
+        match sent {
+            Ok(messages) => {
+                for message in &messages {
+                    emit_mapped_message(
+                        client_id,
+                        events,
+                        message,
+                        live,
+                        None,
+                        OutgoingUpdate::Listed,
+                    );
+                }
+                if !accepted {
+                    emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request);
+                    accepted = true;
+                }
+            }
+            Err(error) => {
+                log_tdlib_error("sendMessageAlbum", &error);
+                if !accepted {
+                    rejected();
+                }
+                emit_status(
+                    events,
+                    ProtocolId::Telegram,
+                    AdapterStatus::Error,
+                    format!(
+                        "Telegram did not send the photos or videos (TDLib {}).",
+                        error.code
+                    ),
+                );
+                return;
+            }
+        }
+    }
 }
 
 async fn send_text(

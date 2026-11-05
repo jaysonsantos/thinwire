@@ -62,6 +62,22 @@ pub enum Intent {
         conversation_id: String,
         topic: Option<MessageTopic>,
     },
+    /// Attach photos and videos to the tray of this thread: dropped files,
+    /// pasted files, or a pasted image that the frontend saved as a file.
+    /// Another file is skipped, and the tray says why.
+    AddAttachments {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        paths: Vec<std::path::PathBuf>,
+    },
+    /// Take the file at `index` out of the tray of this thread.
+    RemoveAttachment {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        index: usize,
+    },
     /// Send a failed outgoing message again.
     Retry { message_id: String },
     /// The thread of this chat reached the top: load the page before its

@@ -6844,8 +6844,10 @@ dependencies = [
 name = "thinwire"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "chrono",
  "chrono-tz",
+ "dirs 7.0.0",
  "eframe",
  "egui",
  "egui_extras",
@@ -6892,6 +6894,7 @@ dependencies = [
 name = "thinwire-ipc"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "serde",
  "serde_json",
  "tokio",

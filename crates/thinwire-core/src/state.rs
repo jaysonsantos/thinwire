@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, ChatTopic,
-    Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, MessageTopic,
-    ProtocolCapabilities, ProtocolId, StoreAccessReason, TelegramApiSource, TelegramAuthError,
-    TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia, TelegramSecretVault, catalog,
-    ordered_topics, telegram_api_available, topic_mute_id, with_outbox_read,
+    Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, MAX_ATTACHMENTS,
+    MessageTopic, OutgoingFile, ProtocolCapabilities, ProtocolId, StoreAccessReason,
+    TelegramApiSource, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia,
+    TelegramSecretVault, catalog, ordered_topics, telegram_api_available, topic_mute_id,
+    with_outbox_read,
 };
 
 use crate::mutes::{ChatMute, ChatMutes};
@@ -392,6 +393,13 @@ pub struct HelperNotice<'a> {
     pub error: Option<&'a UserError>,
 }
 
+/// The tray note when a dropped or pasted file is not a photo or a video.
+pub const ATTACH_ONLY_MEDIA: &str = "Only photos and videos can be attached.";
+/// The tray note when the tray is full.
+pub const ATTACH_TOO_MANY: &str = "30 files at most in one send.";
+/// The tray note when this account cannot send files.
+pub const ATTACH_NOT_HERE: &str = "This account cannot send photos or videos.";
+
 /// Status line after the user starts a WhatsApp pairing.
 pub const WHATSAPP_PAIRING_REQUESTED: &str = "WhatsApp pairing requested.";
 /// Status line after the user accepts the WhatsApp ban gate.
@@ -607,6 +615,11 @@ pub struct Snapshot {
     /// Unsent compose text per chat and topic. `compose` holds the open
     /// thread's draft. A chat with no topics uses `None`.
     drafts: HashMap<(ProtocolId, String, Option<MessageTopic>), String>,
+    /// Photos and videos attached to a thread and not sent yet, in order.
+    attachments: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<OutgoingFile>>,
+    /// Why the last attach skipped files. The tray shows it until the next
+    /// change of the tray.
+    attachment_note: Option<&'static str>,
     /// Body of a send or retry the adapter rejected, until that protocol's
     /// session ends. An unlink keeps one only when nothing newer replaced it.
     /// A Telegram session end drops them.
@@ -887,6 +900,8 @@ impl Snapshot {
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
+            attachments: HashMap::new(),
+            attachment_note: None,
             rejected_bodies: HashMap::new(),
             focus_compose: false,
             stopped: HashSet::new(),
@@ -1722,6 +1737,109 @@ impl Snapshot {
         }
     }
 
+    /// Add photos and videos to the tray of one thread. Another file is
+    /// skipped, and the tray says why. A file already in the tray is not
+    /// added again. The tray holds [`MAX_ATTACHMENTS`] files at most.
+    pub fn add_attachments(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        paths: Vec<std::path::PathBuf>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        if !self.sends_media(protocol) {
+            self.attachment_note = Some(ATTACH_NOT_HERE);
+            return;
+        }
+        let key = (protocol, chat.to_owned(), topic);
+        let tray = self.attachments.entry(key).or_default();
+        let mut note = None;
+        for path in paths {
+            let Some(file) = OutgoingFile::new(path) else {
+                note = Some(ATTACH_ONLY_MEDIA);
+                continue;
+            };
+            if tray.contains(&file) {
+                continue;
+            }
+            if tray.len() >= MAX_ATTACHMENTS {
+                note = Some(ATTACH_TOO_MANY);
+                break;
+            }
+            tray.push(file);
+        }
+        self.attachment_note = note;
+    }
+
+    /// Take one file out of the tray of a thread.
+    pub fn remove_attachment(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        index: usize,
+    ) {
+        let key = (protocol, chat.to_owned(), topic);
+        if let Some(tray) = self.attachments.get_mut(&key)
+            && index < tray.len()
+        {
+            tray.remove(index);
+            if tray.is_empty() {
+                self.attachments.remove(&key);
+            }
+        }
+        self.attachment_note = None;
+    }
+
+    /// The tray of the open thread.
+    #[must_use]
+    pub fn compose_attachments(&self) -> &[OutgoingFile] {
+        let Some(chat) = self.selected_conversation.clone() else {
+            return &[];
+        };
+        self.attachments
+            .get(&(self.selected_protocol, chat, self.selected_topic))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Why the last attach skipped files, if it did.
+    #[must_use]
+    pub const fn attachment_note(&self) -> Option<&'static str> {
+        self.attachment_note
+    }
+
+    /// The linked account of `protocol` can send photos and videos.
+    #[must_use]
+    pub fn sends_media(&self, protocol: ProtocolId) -> bool {
+        self.accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.linked() && row.caps.sends_media)
+    }
+
+    /// An accepted send took these files: drop them from the tray, when the
+    /// tray still holds them.
+    fn clear_sent_files(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        files: &[OutgoingFile],
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let key = (protocol, chat.to_owned(), topic);
+        if let Some(tray) = self.attachments.get_mut(&key) {
+            tray.retain(|file| !files.contains(file));
+            if tray.is_empty() {
+                self.attachments.remove(&key);
+            }
+        }
+    }
+
     /// True when this chat and topic are the open thread.
     #[must_use]
     pub fn is_selected_thread(
@@ -1814,10 +1932,12 @@ impl Snapshot {
             .selected_conversation
             .as_deref()
             .is_some_and(|id| thinwire_protocol::signal_retained_slot(id).is_some());
+        let has_files = !self.compose_attachments().is_empty();
         sends_text
             && !retained
             && topic_open
-            && !self.compose.trim().is_empty()
+            && (!self.compose.trim().is_empty() || has_files)
+            && (!has_files || self.sends_media(protocol))
             && self
                 .selected_conversation_row()
                 .is_some_and(|row| row.writable && !self.sends.in_flight(protocol, &row.id))
@@ -2558,9 +2678,12 @@ impl Snapshot {
     fn note_send_accepted(&mut self, protocol: ProtocolId, chat: &str, request: u64) {
         match self.sends.settle(protocol, chat, request) {
             // An accepted retry needs nothing more: its delivery events move the row.
-            Some(Pending::Send { body, topic, .. }) => {
+            Some(Pending::Send {
+                body, topic, files, ..
+            }) => {
                 self.drop_rejected_body(protocol, chat);
                 self.clear_sent_text(protocol, chat, topic, &body);
+                self.clear_sent_files(protocol, chat, topic, &files);
                 self.hold_telegram_send_line(protocol, chat, request, false);
             }
             Some(Pending::Retry { .. }) => {
@@ -2582,7 +2705,12 @@ impl Snapshot {
         let retry = matches!(pending, Pending::Retry { .. });
         self.drop_rejected_body(protocol, chat);
         match pending {
-            Pending::Send { body, topic, .. } => self.clear_sent_text(protocol, chat, topic, &body),
+            Pending::Send {
+                body, topic, files, ..
+            } => {
+                self.clear_sent_text(protocol, chat, topic, &body);
+                self.clear_sent_files(protocol, chat, topic, &files);
+            }
             Pending::Retry { message_id, .. } => {
                 self.set_delivery(protocol, chat, &message_id, Delivery::Sent);
                 // A new retry of the same row must not fail it again.
@@ -2993,17 +3121,30 @@ impl Snapshot {
         let body = self.compose.trim().to_string();
         // Keep the text until the adapter accepts the send; see note_send_accepted.
         let protocol = self.selected_protocol;
-        let Some(request) = self.sends.begin_send(
+        let files = self.compose_attachments().to_vec();
+        let Some(request) = self.sends.begin_send_files(
             protocol,
             &conversation_id,
             &body,
             self.selected_topic,
+            files.clone(),
             Instant::now(),
         ) else {
             return;
         };
         self.error = None;
-        if let Some(topic) = self.selected_topic {
+        self.attachment_note = None;
+        if !files.is_empty() {
+            // The files stay in the tray until the adapter accepts them.
+            self.pending.push(AdapterCommand::SendMedia {
+                protocol,
+                conversation_id,
+                topic: self.selected_topic,
+                files,
+                caption: body,
+                request,
+            });
+        } else if let Some(topic) = self.selected_topic {
             self.pending.push(AdapterCommand::SendTopicText {
                 protocol,
                 conversation_id,
@@ -4206,6 +4347,9 @@ impl Snapshot {
         self.rejected_bodies
             .retain(|(owner, _), _| *owner != protocol);
         self.drafts.retain(|(owner, _, _), _| *owner != protocol);
+        // The files of an ended session do not go to a new one.
+        self.attachments
+            .retain(|(owner, _, _), _| *owner != protocol);
         for (chat, topic, body) in keep {
             self.drafts.insert((protocol, chat, topic), body);
         }
@@ -7852,6 +7996,106 @@ mod tests {
             snapshot.account_display_unread(ProtocolId::Telegram, &mutes),
             2
         );
+    }
+
+    /// Photos and videos go out in one media send with the text as the
+    /// caption. The tray keeps them until the adapter accepts the send.
+    #[test]
+    fn attached_files_go_out_with_the_text_and_leave_the_tray_on_accept() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        snapshot.add_attachments(
+            ProtocolId::Telegram,
+            "telegram:1",
+            None,
+            vec![
+                "/home/a/cat.png".into(),
+                "/home/a/notes.pdf".into(),
+                "/home/a/clip.mp4".into(),
+                "/home/a/cat.png".into(),
+            ],
+        );
+        assert_eq!(snapshot.compose_attachments().len(), 2, "no pdf, no repeat");
+        assert_eq!(snapshot.attachment_note(), Some(ATTACH_ONLY_MEDIA));
+        assert!(snapshot.can_send(), "files with no text can go");
+        snapshot.send_compose();
+        let commands = snapshot.take_commands();
+        let Some(AdapterCommand::SendMedia {
+            files,
+            caption,
+            request,
+            topic,
+            ..
+        }) = commands.last()
+        else {
+            panic!("no media send: {commands:?}");
+        };
+        assert_eq!(files.len(), 2);
+        assert_eq!(caption, "");
+        assert_eq!(*topic, None);
+        assert_eq!(
+            snapshot.compose_attachments().len(),
+            2,
+            "the tray stays until the adapter accepts"
+        );
+        assert!(!snapshot.can_send(), "one send at a time");
+        snapshot.apply(AdapterEvent::SendAccepted {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request: *request,
+        });
+        assert!(snapshot.compose_attachments().is_empty());
+
+        // A rejection keeps the tray. Remove takes one file out.
+        snapshot.add_attachments(
+            ProtocolId::Telegram,
+            "telegram:1",
+            None,
+            vec!["/a/1.jpg".into(), "/a/2.jpg".into()],
+        );
+        snapshot.compose = "look".into();
+        snapshot.send_compose();
+        let request = snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::SendMedia {
+                    request, caption, ..
+                } if caption == "look" => Some(request),
+                _ => None,
+            })
+            .expect("media send");
+        snapshot.apply(AdapterEvent::SendRejected {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            request,
+        });
+        assert_eq!(snapshot.compose_attachments().len(), 2);
+        snapshot.remove_attachment(ProtocolId::Telegram, "telegram:1", None, 0);
+        assert_eq!(snapshot.compose_attachments().len(), 1);
+        assert_eq!(
+            snapshot.compose_attachments()[0].path,
+            std::path::PathBuf::from("/a/2.jpg")
+        );
+    }
+
+    /// The tray of one chat does not show in another chat, and it holds 30
+    /// files at most.
+    #[test]
+    fn the_tray_belongs_to_its_chat_and_is_capped() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        snapshot.select_conversation("telegram:1".into());
+        let many = (0..40).map(|n| format!("/a/{n}.png").into()).collect();
+        snapshot.add_attachments(ProtocolId::Telegram, "telegram:1", None, many);
+        assert_eq!(snapshot.compose_attachments().len(), MAX_ATTACHMENTS);
+        assert_eq!(snapshot.attachment_note(), Some(ATTACH_TOO_MANY));
+        snapshot.select_conversation("telegram:2".into());
+        assert!(snapshot.compose_attachments().is_empty());
+        snapshot.select_conversation("telegram:1".into());
+        assert_eq!(snapshot.compose_attachments().len(), MAX_ATTACHMENTS);
     }
 
     /// An accept for topic A clears A's draft. Topic B keeps the same text.

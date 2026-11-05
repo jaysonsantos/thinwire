@@ -14,8 +14,9 @@ use crate::SecretText;
 /// version.
 ///
 /// Version 2 adds [`WireCommand::RetryStoreKey`] and
-/// [`WireEvent::StoreAccess`]. An older peer cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// [`WireEvent::StoreAccess`]. Version 3 adds [`WireCommand::SendMedia`]
+/// and [`WireMessage::photo`]. An older peer cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A protocol that a helper carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -104,6 +105,14 @@ pub enum WireCommand {
         message_id: String,
         request: u64,
     },
+    /// Send photos and videos with the text as the caption. The helper reads
+    /// each file from its path: the bytes do not cross the pipe.
+    SendMedia {
+        conversation_id: String,
+        files: Vec<WireFile>,
+        caption: String,
+        request: u64,
+    },
     /// The chat the user now looks at. `None`: the user left every chat.
     ViewChat {
         conversation_id: Option<String>,
@@ -135,6 +144,7 @@ impl WireCommand {
             Self::LoadOlderMessages { .. } => "load_older_messages",
             Self::SendText { .. } => "send_text",
             Self::ResendMessage { .. } => "resend_message",
+            Self::SendMedia { .. } => "send_media",
             Self::ViewChat { .. } => "view_chat",
             Self::AcknowledgeGate => "acknowledge_gate",
             Self::BeginLink { .. } => "begin_link",
@@ -165,6 +175,28 @@ impl fmt::Debug for WireCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "WireCommand({})", self.kind())
     }
+}
+
+/// One file of a media send: a local path and its kind.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireFile {
+    pub path: String,
+    pub kind: WireMediaKind,
+}
+
+impl fmt::Debug for WireFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WireFile({:?})", self.kind)
+    }
+}
+
+/// The kind of a file of a media send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireMediaKind {
+    Photo,
+    Video,
 }
 
 /// Live adapter state. A wire copy of `AdapterStatus`.
@@ -241,6 +273,59 @@ pub struct WireMessage {
     /// Unix seconds when the message was sent. Zero when unknown.
     pub sent_at: i64,
     pub arrival: WireArrival,
+    /// An image of the message, for example a sticker. `None` when the
+    /// message has no image, or when the helper did not download it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photo: Option<WirePhoto>,
+}
+
+/// An image of a message, as encoded bytes (WebP, PNG, or JPEG).
+///
+/// The bytes cross as base64. A line holds 1 MiB at most, so the helper
+/// sends only an image of [`WirePhoto::MAX_BYTES`] or less.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WirePhoto {
+    pub width: u32,
+    pub height: u32,
+    #[serde(with = "base64_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+impl WirePhoto {
+    /// The largest image that fits in one line, with room for the rest of
+    /// the message. Base64 makes the bytes 4/3 as long.
+    pub const MAX_BYTES: usize = 512 * 1024;
+}
+
+impl fmt::Debug for WirePhoto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "WirePhoto({}x{}, {} bytes)",
+            self.width,
+            self.height,
+            self.bytes.len()
+        )
+    }
+}
+
+/// Bytes as one base64 string, not as a JSON array of numbers.
+mod base64_bytes {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
 }
 
 impl fmt::Debug for WireMessage {
@@ -398,7 +483,37 @@ mod tests {
             delivery: WireDelivery::Sent,
             sent_at: 1_790_000_000,
             arrival: WireArrival::Live,
+            photo: None,
         }
+    }
+
+    /// A photo crosses as one base64 string. A message with no photo has no
+    /// `photo` key, and a line with no key still reads.
+    #[test]
+    fn a_photo_crosses_as_base64() {
+        let mut with_photo = message();
+        with_photo.photo = Some(WirePhoto {
+            width: 512,
+            height: 512,
+            bytes: vec![0x52, 0x49, 0x46, 0x46],
+        });
+        let line = HelperLine::Event {
+            protocol: WireProtocol::WhatsApp,
+            event: WireEvent::MessageReceived {
+                message: with_photo.clone(),
+            },
+        };
+        let text = encode(&line).expect("encode");
+        assert!(text.contains("\"bytes\":\"UklGRg==\""), "{text}");
+        assert_eq!(decode::<HelperLine>(text.trim_end()).expect("decode"), line);
+        let plain = encode(&HelperLine::Event {
+            protocol: WireProtocol::WhatsApp,
+            event: WireEvent::MessageReceived { message: message() },
+        })
+        .expect("encode");
+        assert!(!plain.contains("photo"), "{plain}");
+        let debug = format!("{:?}", with_photo.photo);
+        assert!(!debug.contains("82"), "{debug}");
     }
 
     #[test]

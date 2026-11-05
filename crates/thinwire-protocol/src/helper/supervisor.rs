@@ -569,6 +569,11 @@ impl Supervisor {
             request,
             ..
         }
+        | WireCommand::SendMedia {
+            conversation_id,
+            request,
+            ..
+        }
         | WireCommand::ResendMessage {
             conversation_id,
             request,
@@ -673,6 +678,11 @@ impl Supervisor {
                 None,
             ),
             WireCommand::SendText {
+                conversation_id,
+                request,
+                ..
+            }
+            | WireCommand::SendMedia {
                 conversation_id,
                 request,
                 ..
