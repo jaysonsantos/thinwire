@@ -362,6 +362,11 @@ fn opens_with_key(path: &Path, key: &[u8; 32]) -> bool {
 }
 
 fn apply_key(conn: &Connection, key: &[u8; 32]) -> Result<(), ()> {
+    // The key is the only cipher setting. The previous bundle was SQLCipher
+    // 4.10.0, and 4.19.0 keeps those defaults: 256000 PBKDF2-HMAC-SHA512
+    // iterations, HMAC-SHA512, and 4096-byte pages. `cipher_compatibility`
+    // and `kdf_iter` stay unset. A different value would make a saved store
+    // look like the wrong key.
     let mut sql = format!("PRAGMA key = {};", raw_key_literal(key));
     let result = conn.execute_batch(&sql);
     wipe(&mut sql);
@@ -582,6 +587,41 @@ CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
         }
         names.sort();
         names
+    }
+
+    /// Read one SQLCipher pragma. Numbers and text both come back as text.
+    fn pragma_text(conn: &Connection, name: &str) -> String {
+        conn.query_row(&format!("PRAGMA {name}"), [], |row| {
+            row.get::<_, String>(0)
+                .or_else(|_| row.get::<_, i64>(0).map(|value| value.to_string()))
+        })
+        .unwrap_or_else(|err| panic!("{name}: {err}"))
+    }
+
+    #[test]
+    fn a_keyed_store_keeps_the_sqlcipher_4_defaults() {
+        let dir = temp_dir("defaults");
+        let path = dir.join("session.sqlite");
+        seed(&path, 1);
+        prepare_file(&path, &KEY, MigrateOptions::default()).expect("copy");
+        let conn = open_keyed(&path, &KEY).expect("open");
+        // These are the SQLCipher 4 defaults. 4.10.0 wrote them, and 4.19.0
+        // still reports them when the open sets only `PRAGMA key`.
+        assert_eq!(pragma_text(&conn, "kdf_iter"), "256000");
+        assert_eq!(pragma_text(&conn, "cipher_page_size"), "4096");
+        assert_eq!(pragma_text(&conn, "cipher_use_hmac"), "1");
+        assert_eq!(pragma_text(&conn, "cipher_plaintext_header_size"), "0");
+        assert_eq!(pragma_text(&conn, "cipher_hmac_algorithm"), "HMAC_SHA512");
+        assert_eq!(
+            pragma_text(&conn, "cipher_kdf_algorithm"),
+            "PBKDF2_HMAC_SHA512"
+        );
+        let version = pragma_text(&conn, "cipher_version");
+        assert!(
+            version.starts_with("4."),
+            "saved stores were written by SQLCipher 4: {version}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
