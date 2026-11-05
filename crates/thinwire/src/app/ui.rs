@@ -968,7 +968,7 @@ fn unofficial_pill_width(ui: &egui::Ui) -> f32 {
         + space::S * 2.0
 }
 
-/// The protocol tile: a tinted square with the first letter. `dot` is the
+/// The protocol tile: a tinted square with the protocol mark. `dot` is the
 /// row fill and the account state: the dot is cut out of the corner in the
 /// row's own fill.
 pub(super) fn paint_protocol_tile(
@@ -981,17 +981,11 @@ pub(super) fn paint_protocol_tile(
     let corner = (tile.width() * 0.28).round().clamp(4.0, 24.0) as u8;
     ui.painter()
         .rect_filled(tile, egui::CornerRadius::same(corner), ink.fill);
-    let initial: String = protocol
-        .display_name()
-        .chars()
-        .take(1)
-        .flat_map(char::to_uppercase)
-        .collect();
-    ui.painter().text(
+    super::icons::protocol(
+        ui.painter(),
         tile.center(),
-        egui::Align2::CENTER_CENTER,
-        initial,
-        egui::FontId::new(tile.width() * 0.46, theme::semibold()),
+        tile.width() * 0.58,
+        protocol,
         ink.text,
     );
     if let Some((fill, color)) = dot {
@@ -1718,7 +1712,7 @@ fn inbox_row(
         egui::Sense::hover(),
     );
     let row_id = ui.scope_id().with(("inbox-row", id));
-    row_backdrop(ui, row_id, rect, palette.sidebar, selected, hover.hovered());
+    let row_fill = row_backdrop(ui, row_id, rect, palette.sidebar, selected, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
     let mut child = ui.new_child(
@@ -1735,7 +1729,7 @@ fn inbox_row(
     avatar_response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::Role::Label, true, format!("avatar {title}"))
     });
-    super::photos::paint_avatar(ui, avatar_rect, protocol, id, title, avatar, out);
+    super::photos::paint_avatar(ui, avatar_rect, protocol, id, title, avatar, row_fill, out);
     child.vertical(|ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 2.0;
@@ -2991,6 +2985,7 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
                         &conversation.id,
                         &conversation.title,
                         &conversation.avatar,
+                        palette.bg,
                         &mut avatar_out,
                     );
                     ui.add_space(space::XS);
