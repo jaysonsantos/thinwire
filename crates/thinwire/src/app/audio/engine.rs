@@ -124,25 +124,20 @@ impl Engine {
     }
 }
 
-/// The sink stays open across notes. `playing` is the generation that still
-/// owes the UI an end event. Stop and a new play clear it before the old
-/// player is dropped, so the end of a replaced note is not reported. A
-/// completion already sitting in the channel keeps the generation of the
-/// play that emitted it.
 struct Output {
     player: Option<Sink>,
     sink: Option<rodio::MixerDeviceSink>,
-    playing: Option<u64>,
+    owes_end: Option<u64>,
 }
 
 fn worker(rx: Receiver<Wire>, done: Sender<Done>) {
     let mut output = Output {
         player: None,
         sink: None,
-        playing: None,
+        owes_end: None,
     };
     loop {
-        let incoming = if output.playing.is_some() {
+        let incoming = if output.owes_end.is_some() {
             match rx.recv_timeout(END_POLL) {
                 Ok(cmd) => Some(cmd),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -161,10 +156,10 @@ fn worker(rx: Receiver<Wire>, done: Sender<Done>) {
                 Wire::Shutdown => break,
             }
         }
-        if let Some(generation) = output.playing
+        if let Some(generation) = output.owes_end
             && output.player.as_ref().is_some_and(Sink::empty)
         {
-            output.playing = None;
+            output.owes_end = None;
             output.player = None;
             let _ = done.send(Done::Finished { generation });
         }
@@ -191,11 +186,11 @@ fn play(output: &mut Output, path: &AudioPath, generation: u64, done: &Sender<Do
     };
     player.append(buffer);
     output.player = Some(player);
-    output.playing = Some(generation);
+    output.owes_end = Some(generation);
 }
 
 fn stop(output: &mut Output) {
-    output.playing = None;
+    output.owes_end = None;
     output.player = None;
 }
 
