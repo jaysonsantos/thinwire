@@ -372,6 +372,22 @@ mod tests {
             !stage.contains("notarytool"),
             "the stage script does not submit to the notary service"
         );
+        let notarize = include_str!("../../../../scripts/notarize-macos-app.sh");
+        assert!(
+            notarize.contains("${MACOS_NOTARY_KEY:-}"),
+            "the notarize script is the reader of the notary key"
+        );
+        assert!(
+            !notarize.contains("echo \"$MACOS_NOTARY_KEY\""),
+            "the notarize script must not print the notary key"
+        );
+        assert!(!notarize.contains("apple-id"));
+        assert!(!notarize.contains("store-credentials"));
+        assert_eq!(
+            notarize.matches("notarytool submit").count(),
+            1,
+            "notarytool submit has one call site"
+        );
         assert!(
             stage.contains(
                 "::error::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
@@ -515,6 +531,25 @@ mod tests {
         assert!(
             output.status.success(),
             "identity kind bash test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Developer ID without a notary key exits before notarytool.
+    /// An ad-hoc signature skips.
+    #[cfg(unix)]
+    #[test]
+    fn notarize_macos_app_gates_on_the_credential_and_the_signature() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test-notarize-macos-app.sh");
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .output()
+            .expect("run the notarize bash test");
+        assert!(
+            output.status.success(),
+            "notarize bash test failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
