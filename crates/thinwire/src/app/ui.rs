@@ -1710,7 +1710,7 @@ fn inbox_row(
         egui::Sense::hover(),
     );
     let row_id = ui.scope_id().with(("inbox-row", id));
-    row_backdrop(ui, row_id, rect, palette.sidebar, selected, hover.hovered());
+    let row_fill = row_backdrop(ui, row_id, rect, palette.sidebar, selected, hover.hovered());
     let gutter = ui.spacing().scroll.bar_width;
     let inner = theme::row_content_rect(rect, gutter);
     let mut child = ui.new_child(
@@ -1727,7 +1727,7 @@ fn inbox_row(
     avatar_response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::Role::Label, true, format!("avatar {title}"))
     });
-    super::photos::paint_avatar(ui, avatar_rect, protocol, id, title, avatar, out);
+    super::photos::paint_avatar(ui, avatar_rect, protocol, id, title, avatar, row_fill, out);
     child.vertical(|ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 2.0;
@@ -2937,6 +2937,7 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
                         &conversation.id,
                         &conversation.title,
                         &conversation.avatar,
+                        palette.bg,
                         &mut avatar_out,
                     );
                     ui.add_space(space::XS);

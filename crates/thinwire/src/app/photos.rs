@@ -213,6 +213,9 @@ pub(crate) fn take_escape(ctx: &egui::Context) -> bool {
 /// One round avatar, in an inbox row or in the thread header. A ready photo
 /// uses the chat-photo loader and cache.
 /// With no photo, or while the file is still loading, the circle shows initials.
+/// `ring` is the row or panel fill behind the badge, so hover and selection do
+/// not leave a white or sidebar halo.
+#[allow(clippy::too_many_arguments)] // ring has to travel with the avatar paint
 pub(crate) fn paint_avatar(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -220,6 +223,7 @@ pub(crate) fn paint_avatar(
     conversation_id: &str,
     title: &str,
     avatar: &ChatAvatar,
+    ring: Color32,
     out: &mut Vec<Intent>,
 ) {
     prune_loads(ui.ctx());
@@ -233,7 +237,7 @@ pub(crate) fn paint_avatar(
     } else {
         paint_initials(ui, rect, title, ink.text);
     }
-    paint_protocol_badge(ui, rect, protocol);
+    paint_protocol_badge(ui, rect, protocol, ring);
     // One ask per file. A repeat each frame would dispatch each frame, and
     // each dispatch asks for a repaint. The core sets `requested` when it
     // queues the download.
@@ -254,33 +258,16 @@ pub(crate) fn paint_avatar(
 }
 
 /// Small protocol mark on the lower-right of a chat avatar.
-fn paint_protocol_badge(ui: &egui::Ui, avatar: egui::Rect, protocol: ProtocolId) {
-    let side = (avatar.width() * 0.32).clamp(11.0, 14.0);
-    let center = avatar.right_bottom() - egui::vec2(side * 0.22, side * 0.22);
-    let (fill, mark) = protocol_badge_ink(protocol);
-    let ring = if ui.visuals().dark_mode {
-        super::theme::palette(ui).sidebar
-    } else {
-        Color32::WHITE
-    };
+fn paint_protocol_badge(ui: &egui::Ui, avatar: egui::Rect, protocol: ProtocolId, ring: Color32) {
+    let side = (avatar.width() * 0.30).clamp(11.0, 13.0);
+    let ring_r = side * 0.55;
+    // Keep the ring inside the avatar so the chat list does not clip it.
+    let center = avatar.right_bottom() - egui::vec2(ring_r, ring_r);
+    let (fill, mark) = super::theme::protocol_badge_ink(protocol);
     let painter = ui.painter();
-    painter.circle_filled(center, side * 0.62, ring);
-    painter.circle_filled(center, side * 0.5, fill);
-    super::icons::protocol(painter, center, side * 0.62, protocol, mark);
-}
-
-/// Fill and mark for the avatar badge. Approximate brand hues, not the
-/// official assets.
-fn protocol_badge_ink(protocol: ProtocolId) -> (Color32, Color32) {
-    let mark = Color32::from_rgb(255, 255, 255);
-    let fill = match protocol {
-        ProtocolId::Telegram => Color32::from_rgb(0x2A, 0xAB, 0xEE),
-        ProtocolId::WhatsApp => Color32::from_rgb(0x25, 0xD3, 0x66),
-        ProtocolId::Signal => Color32::from_rgb(0x3A, 0x76, 0xF0),
-        ProtocolId::Discord => Color32::from_rgb(0x58, 0x65, 0xF2),
-        ProtocolId::Slack => Color32::from_rgb(0xE0, 0x1E, 0x5A),
-    };
-    (fill, mark)
+    painter.circle_filled(center, ring_r, ring);
+    painter.circle_filled(center, side * 0.45, fill);
+    super::icons::protocol(painter, center, side * 0.58, protocol, mark);
 }
 
 /// Up to two initials from `title`. A title with no letters is "?".
@@ -1220,7 +1207,16 @@ mod tests {
                     ui.cursor().min,
                     egui::vec2(AVATAR_SIDE, AVATAR_SIDE),
                 );
-                paint_avatar(ui, rect, protocol, conversation_id, "Ada", avatar, out);
+                paint_avatar(
+                    ui,
+                    rect,
+                    protocol,
+                    conversation_id,
+                    "Ada",
+                    avatar,
+                    Color32::from_gray(40),
+                    out,
+                );
             });
         });
         output.textures_delta.clear();
