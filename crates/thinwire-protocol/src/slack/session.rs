@@ -31,8 +31,8 @@ use crate::adapter::{
     EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, emit_account,
     emit_chat_list_loaded, emit_command_failed, emit_conversation, emit_conversation_removed,
     emit_flush_secrets, emit_history_loaded, emit_message, emit_message_body,
-    emit_messages_removed, emit_notice, emit_send_accepted, emit_send_rejected, emit_status,
-    emit_stopped,
+    emit_messages_removed, emit_notice, emit_older_history_loaded, emit_send_accepted,
+    emit_send_rejected, emit_status, emit_stopped,
 };
 
 /// Messages loaded when a channel opens. Also the cap on the per-channel
@@ -391,6 +391,12 @@ where
                 protocol: ProtocolId::Slack,
                 conversation_id,
             } => self.open_channel(&conversation_id).await,
+            AdapterCommand::LoadOlderMessages {
+                protocol: ProtocolId::Slack,
+                conversation_id,
+                before_message_id,
+                ..
+            } => self.load_older(&conversation_id, &before_message_id).await,
             AdapterCommand::SendText {
                 protocol: ProtocolId::Slack,
                 conversation_id,
@@ -902,7 +908,12 @@ where
         };
         let token = live.token.clone();
         self.recheck_posting(&token, &channel).await;
-        let page = match self.deps.api.history(&token, &channel, HISTORY_LIMIT).await {
+        let page = match self
+            .deps
+            .api
+            .history(&token, &channel, HISTORY_LIMIT, None)
+            .await
+        {
             Ok(page) => page,
             Err(error) => {
                 self.api_failed(&error).await;
@@ -941,6 +952,64 @@ where
         }
         self.mark_channel_read(&channel);
         emit_history_loaded(&self.events, ProtocolId::Slack, conversation);
+    }
+
+    /// The page older than the row `before`: its posts show above the open
+    /// rows. Every request ends with one `OlderHistoryLoaded`.
+    async fn load_older(&mut self, conversation: &str, before: &str) {
+        let end = |owner: &Self, more: bool| {
+            emit_older_history_loaded(
+                &owner.events,
+                ProtocolId::Slack,
+                conversation,
+                before,
+                more,
+                None,
+                None,
+            );
+        };
+        let (Some(channel), Some(live)) = (
+            channel_id(conversation).map(str::to_string),
+            self.live.as_ref(),
+        ) else {
+            end(self, false);
+            return;
+        };
+        let token = live.token.clone();
+        // The exact `ts` of the row, or the same value from its rank.
+        let latest = self
+            .shown
+            .get(&channel)
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| message_id_of(&channel, &row.ts) == before)
+                    .map(|row| row.ts.clone())
+            })
+            .or_else(|| ts_of_message_id(&channel, before));
+        let Some(latest) = latest else {
+            end(self, false);
+            return;
+        };
+        let page = match self
+            .deps
+            .api
+            .history(&token, &channel, HISTORY_LIMIT, Some(&latest))
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                self.api_failed(&error).await;
+                end(self, false);
+                return;
+            }
+        };
+        let more = page.has_more;
+        for post in page.posts.into_iter().rev() {
+            if let Some(message) = self.chat_message(&token, post, true).await {
+                emit_message(&self.events, message);
+            }
+        }
+        end(self, more);
     }
 
     fn set_view(&mut self, conversation_id: Option<String>) {
@@ -1666,6 +1735,18 @@ fn conversation_id(channel: &str) -> String {
 /// `slack:<channel>:<rank>`. The shell parses the last segment as `i64`.
 fn message_id_of(channel: &str, ts: &str) -> String {
     format!("{SLACK_CONVERSATION_PREFIX}{channel}:{}", ts_rank(ts))
+}
+
+/// The `ts` of a row id of `channel`, from its rank: seconds, a dot, and
+/// six digits of microseconds.
+fn ts_of_message_id(channel: &str, message_id: &str) -> Option<String> {
+    let rank: i64 = message_id
+        .strip_prefix(SLACK_CONVERSATION_PREFIX)?
+        .strip_prefix(channel)?
+        .strip_prefix(':')?
+        .parse()
+        .ok()?;
+    (rank > 0).then(|| format!("{}.{:06}", rank / 1_000_000, rank % 1_000_000))
 }
 
 fn channel_id(conversation: &str) -> Option<&str> {

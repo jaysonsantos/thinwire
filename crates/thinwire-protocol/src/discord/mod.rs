@@ -89,7 +89,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     official_api: true,
     allows_user_account_automation: false,
     sends_text: cfg!(feature = "discord-bot"),
-    pages_history: false,
+    pages_history: true,
     sends_media: cfg!(feature = "discord-bot"),
 };
 
@@ -415,6 +415,18 @@ impl DiscordAdapter {
         self.session_mut()?.open(conversation_id)
     }
 
+    /// `false` when no session can load an older page.
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn load_older(&mut self, conversation_id: String, before_message_id: String) -> bool {
+        self.session_mut()
+            .is_ok_and(|session| session.older(conversation_id, before_message_id))
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn load_older(&mut self, _conversation_id: String, _before_message_id: String) -> bool {
+        false
+    }
+
     /// `false` when no session can download.
     #[cfg(any(test, feature = "discord-bot"))]
     fn download_voice(&mut self, file_id: i32) -> bool {
@@ -687,6 +699,25 @@ impl ProtocolAdapter for DiscordAdapter {
                 protocol: ProtocolId::Discord,
                 conversation_id,
             } => self.open_chat(conversation_id, events),
+            AdapterCommand::LoadOlderMessages {
+                protocol: ProtocolId::Discord,
+                conversation_id,
+                before_message_id,
+                ..
+            } => {
+                if !self.load_older(conversation_id.clone(), before_message_id.clone()) {
+                    crate::adapter::emit_older_history_loaded(
+                        events,
+                        ProtocolId::Discord,
+                        conversation_id,
+                        before_message_id,
+                        false,
+                        None,
+                        None,
+                    );
+                }
+                Ok(())
+            }
             AdapterCommand::SendText {
                 protocol: ProtocolId::Discord,
                 conversation_id,
@@ -1503,6 +1534,55 @@ mod tests {
             .find(|row| row.id.ends_with(":2"))
             .expect("the row");
         assert!(row.photo.is_some(), "the cache shows it at once");
+    }
+
+    /// The top of the thread asks for the page older than its oldest row.
+    /// The rows come, and a short page says that no more come.
+    #[tokio::test]
+    async fn an_older_page_loads_above_the_oldest_row() {
+        let (mut adapter, tx, mut rx, _) =
+            connected(Arc::new(FakeDiscordApi::guild_fixture())).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    before_message_id: "discord:2".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("older");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::OlderHistoryLoaded { .. })
+        })
+        .await;
+        let rows = messages(&events);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, vec!["discord:1"]);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::OlderHistoryLoaded { conversation_id, before_message_id, more: false, .. }
+                if conversation_id == &id && before_message_id == "discord:2"
+        )));
+        // A row id that is not a Discord message ends the load at once.
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    before_message_id: "telegram:1:2".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("older");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::OlderHistoryLoaded { .. })
+        })
+        .await;
+        assert!(messages(&events).is_empty());
     }
 
     #[tokio::test]

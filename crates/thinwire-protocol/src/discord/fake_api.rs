@@ -374,6 +374,24 @@ impl DiscordApi for FakeDiscordApi {
         })
     }
 
+    fn history_before(
+        &self,
+        channel_id: u64,
+        before: u64,
+        limit: u16,
+    ) -> ApiFuture<'_, Vec<MessageSummary>> {
+        Box::pin(async move {
+            self.check_token()?;
+            let state = self.state();
+            let rows = state.history.get(&channel_id).cloned().unwrap_or_default();
+            Ok(rows
+                .into_iter()
+                .filter(|message| message.id < before)
+                .take(usize::from(limit))
+                .collect())
+        })
+    }
+
     fn download(&self, url: String) -> ApiFuture<'_, Vec<u8>> {
         Box::pin(async move {
             self.check_token()?;

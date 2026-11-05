@@ -89,7 +89,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     official_api: true,
     allows_user_account_automation: false,
     sends_text: true,
-    pages_history: false,
+    pages_history: true,
     sends_media: false,
 };
 

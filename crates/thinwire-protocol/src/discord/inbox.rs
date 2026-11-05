@@ -267,6 +267,12 @@ pub(crate) fn chat_message(
     }
 }
 
+/// The snowflake of a Discord row id.
+#[must_use]
+pub(crate) fn message_snowflake(message_id: &str) -> Option<u64> {
+    message_id.strip_prefix(CONVERSATION_PREFIX)?.parse().ok()
+}
+
 /// The handle of the audio of one message for `DownloadVoice`. The same
 /// message has the same handle in every run. Always positive.
 #[must_use]

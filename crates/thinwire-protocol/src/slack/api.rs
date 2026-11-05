@@ -153,6 +153,8 @@ pub struct SlackHistoryPage {
     /// `posts` is the latest displayable window. Slack had no older rows,
     /// or this page already held `limit` displayable posts.
     pub authoritative: bool,
+    /// Slack has rows older than this page.
+    pub has_more: bool,
 }
 
 impl Default for SlackHistoryPage {
@@ -161,6 +163,7 @@ impl Default for SlackHistoryPage {
             posts: Vec::new(),
             oldest_raw_ts: None,
             authoritative: true,
+            has_more: false,
         }
     }
 }
@@ -174,6 +177,7 @@ impl SlackHistoryPage {
             posts,
             oldest_raw_ts,
             authoritative: true,
+            has_more: false,
         }
     }
 }
@@ -266,11 +270,15 @@ pub trait SlackWebApi: Send + Sync + 'static {
     /// Newest-first displayable posts from `conversations.history`.
     ///
     /// `limit` is the raw page size. Ignored subtypes count toward it.
+    ///
+    /// `latest` asks for the posts older than that `ts` only. `None` asks for
+    /// the newest page.
     fn history(
         &self,
         token: &SlackBotToken,
         channel: &str,
         limit: u16,
+        latest: Option<&str>,
     ) -> impl Future<Output = Result<SlackHistoryPage, SlackApiError>> + Send;
 
     fn post_message(

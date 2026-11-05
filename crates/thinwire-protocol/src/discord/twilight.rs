@@ -310,6 +310,28 @@ impl DiscordApi for TwilightApi {
         })
     }
 
+    fn history_before(
+        &self,
+        channel_id: u64,
+        before: u64,
+        limit: u16,
+    ) -> ApiFuture<'_, Vec<MessageSummary>> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .channel_messages(id(channel_id)?)
+                .before(id(before)?)
+                .limit(limit)
+                .await
+                .map_err(|e| map_error(&e))?;
+            let messages = response
+                .models()
+                .await
+                .map_err(|_| DiscordApiError::Transport)?;
+            Ok(messages.into_iter().map(message_summary).collect())
+        })
+    }
+
     fn download(&self, url: String) -> ApiFuture<'_, Vec<u8>> {
         Box::pin(async move { super::download::fetch(&url).await })
     }

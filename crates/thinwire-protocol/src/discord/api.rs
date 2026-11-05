@@ -175,6 +175,13 @@ pub(crate) trait DiscordApi: Send + Sync {
     fn channels(&self, guild_id: u64) -> ApiFuture<'_, Vec<ChannelSummary>>;
     /// Recent messages, newest first (Discord order).
     fn history(&self, channel_id: u64, limit: u16) -> ApiFuture<'_, Vec<MessageSummary>>;
+    /// The messages older than `before`, newest first (Discord order).
+    fn history_before(
+        &self,
+        channel_id: u64,
+        before: u64,
+        limit: u16,
+    ) -> ApiFuture<'_, Vec<MessageSummary>>;
     /// Send plain text as the bot.
     fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary>;
     /// Send files as the bot, with `body` as the text. `body` can be empty.

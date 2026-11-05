@@ -196,15 +196,27 @@ impl SlackWebApi for FakeApi {
         token: &SlackBotToken,
         channel: &str,
         limit: u16,
+        latest: Option<&str>,
     ) -> Result<SlackHistoryPage, SlackApiError> {
         Self::check_token(token);
         assert!(limit > 0);
         self.with(|state| {
-            state.calls.push(format!("conversations.history {channel}"));
+            state.calls.push(match latest {
+                Some(latest) => format!("conversations.history {channel} before {latest}"),
+                None => format!("conversations.history {channel}"),
+            });
             if let Some(error) = state.history_error.clone() {
                 return Err(error);
             }
-            Ok(state.history.get(channel).cloned().unwrap_or_default())
+            let mut page = state.history.get(channel).cloned().unwrap_or_default();
+            if let Some(latest) = latest {
+                let older = |ts: &str| {
+                    ts.parse::<f64>().unwrap_or(0.0) < latest.parse::<f64>().unwrap_or(0.0)
+                };
+                page.posts.retain(|post| older(&post.ts));
+                page.has_more = false;
+            }
+            Ok(page)
         })
     }
 
@@ -891,6 +903,7 @@ async fn history_keeps_a_cached_post_behind_ignored_subtypes() {
                 posts: Vec::new(),
                 oldest_raw_ts: Some("1700000003.000100".into()),
                 authoritative: false,
+                has_more: true,
             },
         );
     });
@@ -960,6 +973,7 @@ async fn an_empty_diluted_page_clears_the_preview_when_nothing_remains() {
                 posts: Vec::new(),
                 oldest_raw_ts: Some("1600000000.000100".into()),
                 authoritative: false,
+                has_more: true,
             },
         );
     });
@@ -1638,6 +1652,50 @@ async fn history_is_oldest_first_with_names_and_the_app_as_outbound() {
         )
     })
     .await;
+}
+
+/// The top of the thread asks for the posts older than its oldest row.
+/// Slack gets that `ts` as `latest`, and the older post comes with one
+/// `OlderHistoryLoaded`.
+#[tokio::test]
+async fn an_older_page_asks_for_posts_before_the_oldest_row() {
+    let mut h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    h.until("history loaded", |event| {
+        matches!(
+            event,
+            AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == "slack:C1"
+        )
+    })
+    .await;
+    h.send(AdapterCommand::LoadOlderMessages {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+        before_message_id: "slack:C1:1700000002000200".into(),
+        store_cursor: None,
+    });
+    let older = h.message("first").await;
+    assert_eq!(older.id, "slack:C1:1700000001000100");
+    h.until("older loaded", |event| {
+        matches!(
+            event,
+            AdapterEvent::OlderHistoryLoaded { conversation_id, before_message_id, more: false, .. }
+                if conversation_id == "slack:C1"
+                    && before_message_id == "slack:C1:1700000002000200"
+        )
+    })
+    .await;
+    assert!(h.api.with(|state| {
+        state
+            .calls
+            .iter()
+            .any(|call| call == "conversations.history C1 before 1700000002.000200")
+    }));
 }
 
 #[tokio::test]

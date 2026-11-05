@@ -304,11 +304,18 @@ impl SlackWebApi for MorphismWebApi {
         token: &SlackBotToken,
         channel: &str,
         limit: u16,
+        latest: Option<&str>,
     ) -> Result<SlackHistoryPage, SlackApiError> {
         let token = self.bot_session_token(token.reveal());
-        let request = SlackApiConversationsHistoryRequest::new()
+        let mut request = SlackApiConversationsHistoryRequest::new()
             .with_channel(SlackChannelId::new(channel.into()))
             .with_limit(limit);
+        if let Some(latest) = latest {
+            // An older page: the posts before the oldest one on screen.
+            request = request
+                .with_latest(SlackTs::new(latest.into()))
+                .with_inclusive(false);
+        }
         let response = self
             .client
             .open_session(&token)
@@ -345,6 +352,7 @@ impl SlackWebApi for MorphismWebApi {
             posts,
             oldest_raw_ts,
             authoritative,
+            has_more,
         })
     }
 

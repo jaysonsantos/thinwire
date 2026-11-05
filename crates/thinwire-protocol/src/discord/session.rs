@@ -44,8 +44,8 @@ use crate::adapter::{
     AccountState, AdapterError, AdapterEvent, AdapterStatus, Arrival, ChatMessage, Conversation,
     Delivery, EventTx, ProtocolId, emit_account, emit_chat_list_loaded, emit_command_failed,
     emit_conversation, emit_conversation_removed, emit_history_loaded, emit_message,
-    emit_message_delivery, emit_message_replaced, emit_notice, emit_send_accepted,
-    emit_send_rejected, emit_status, emit_stopped,
+    emit_message_delivery, emit_message_replaced, emit_notice, emit_older_history_loaded,
+    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
 };
 
 const READ_ONLY_REFUSAL: &str = "The bot does not have Send Messages in that channel.";
@@ -298,6 +298,17 @@ enum Msg {
     /// Download the audio of this handle for the player.
     Voice {
         file_id: i32,
+    },
+    /// The page of `conversation_id` older than the message `before`.
+    Older {
+        conversation_id: String,
+        before_message_id: String,
+        before: u64,
+    },
+    OlderDone {
+        conversation_id: String,
+        before_message_id: String,
+        result: Result<Vec<MessageSummary>, DiscordApiError>,
     },
     /// A photo download of a history row ended.
     ImageDone {
@@ -604,6 +615,22 @@ impl Session {
         self.tx.send(Msg::Voice { file_id }).is_ok()
     }
 
+    /// Load the page older than the row `before_message_id`. The answer is
+    /// the rows and one `OlderHistoryLoaded`. `false`: the row id is not a
+    /// Discord message, or the owner is gone.
+    pub(crate) fn older(&self, conversation_id: String, before_message_id: String) -> bool {
+        let Some(before) = super::inbox::message_snowflake(&before_message_id) else {
+            return false;
+        };
+        self.tx
+            .send(Msg::Older {
+                conversation_id,
+                before_message_id,
+                before,
+            })
+            .is_ok()
+    }
+
     fn check_ready(&self) -> Result<(), AdapterError> {
         if self.flags.ready.load(Ordering::SeqCst) {
             Ok(())
@@ -824,6 +851,96 @@ const IMAGE_CACHE: usize = 200;
 const IMAGE_DOWNLOADS: usize = 4;
 
 impl Owner {
+    /// The rows of one page, oldest first. Each row gets its audio handle
+    /// and its photo.
+    fn page_rows(
+        &mut self,
+        conversation_id: &str,
+        messages: &[MessageSummary],
+    ) -> Vec<ChatMessage> {
+        let bot_id = self.bot_id.unwrap_or_default();
+        for message in messages {
+            if let Some(audio) = &message.audio {
+                self.voices
+                    .insert(super::inbox::voice_file_id(message.id), audio.url.clone());
+            }
+        }
+        let mut rows: Vec<ChatMessage> = messages
+            .iter()
+            .rev()
+            .map(|message| chat_message(conversation_id, bot_id, message))
+            .collect();
+        for (message, row) in messages.iter().rev().zip(rows.iter_mut()) {
+            self.dress_image(message, row);
+        }
+        rows
+    }
+
+    /// Ask Discord for the page older than `before`. A channel that is not
+    /// in the list, or a session that ends, answers with no more rows.
+    fn older(&mut self, conversation_id: String, before_message_id: String, before: u64) {
+        let open = !self.replaced()
+            && !self.unlinked()
+            && self.ending_error().is_none()
+            && self.bot_id.is_some();
+        let access = self.carried.channels.get(&conversation_id).copied();
+        let (true, Some(access)) = (open, access) else {
+            emit_older_history_loaded(
+                &self.events,
+                ProtocolId::Discord,
+                conversation_id,
+                before_message_id,
+                false,
+                None,
+                None,
+            );
+            return;
+        };
+        let api = Arc::clone(&self.api);
+        self.spawn(async move {
+            let result = api
+                .history_before(access.channel_id, before, HISTORY_LIMIT)
+                .await;
+            Msg::OlderDone {
+                conversation_id,
+                before_message_id,
+                result,
+            }
+        });
+    }
+
+    /// An older page came. Its rows show above the open rows. A full page
+    /// says that more may come.
+    fn older_done(
+        &mut self,
+        conversation_id: String,
+        before_message_id: String,
+        result: Result<Vec<MessageSummary>, DiscordApiError>,
+    ) {
+        if self.replaced() || self.unlinked() {
+            return;
+        }
+        let (more, note) = match result {
+            Ok(messages) => {
+                let more = messages.len() >= usize::from(HISTORY_LIMIT);
+                for row in self.page_rows(&conversation_id, &messages) {
+                    emit_message(&self.events, row);
+                }
+                (more, None)
+            }
+            Err(error) => (false, Some(error.reason().to_string())),
+        };
+        emit_older_history_loaded(
+            &self.events,
+            ProtocolId::Discord,
+            conversation_id,
+            before_message_id,
+            more,
+            note,
+            None,
+        );
+    }
+
     /// Show the photo of a history row from the cache, or start its
     /// download. The row keeps its label until the photo is here.
     fn dress_image(&mut self, message: &MessageSummary, row: &mut ChatMessage) {
@@ -994,6 +1111,16 @@ impl Owner {
                 }
             }
             Msg::Voice { file_id } => self.download_voice(file_id),
+            Msg::Older {
+                conversation_id,
+                before_message_id,
+                before,
+            } => self.older(conversation_id, before_message_id, before),
+            Msg::OlderDone {
+                conversation_id,
+                before_message_id,
+                result,
+            } => self.older_done(conversation_id, before_message_id, result),
             Msg::ImageDone {
                 message_id,
                 row,
@@ -1509,21 +1636,7 @@ impl Owner {
         }
         match result {
             Ok(messages) => {
-                let bot_id = self.bot_id.unwrap_or_default();
-                for message in &messages {
-                    if let Some(audio) = &message.audio {
-                        self.voices
-                            .insert(super::inbox::voice_file_id(message.id), audio.url.clone());
-                    }
-                }
-                let mut rows: Vec<ChatMessage> = messages
-                    .iter()
-                    .rev()
-                    .map(|message| chat_message(&conversation_id, bot_id, message))
-                    .collect();
-                for (message, row) in messages.iter().rev().zip(rows.iter_mut()) {
-                    self.dress_image(message, row);
-                }
+                let rows = self.page_rows(&conversation_id, &messages);
                 let new_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
                 let gone = {
                     let mut history = self.carried.history();
