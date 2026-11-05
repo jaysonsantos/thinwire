@@ -109,8 +109,8 @@ pub trait TelegramSecretVault: Send + Sync {
     /// Name of the TDLib data folder for this store. A store that loses its
     /// keys (keyutils at a restart) uses its own folder, so its lost-key
     /// recovery never moves another store's session.
-    fn tdlib_folder_name(&self) -> &'static str {
-        TDLIB_FOLDER
+    fn tdlib_folder_name(&self) -> std::borrow::Cow<'static, str> {
+        TDLIB_FOLDER.into()
     }
 
     /// `false` when values live in memory only and are lost at exit. The

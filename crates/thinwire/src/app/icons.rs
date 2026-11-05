@@ -7,7 +7,7 @@
 //! They are not the brand assets.
 
 use eframe::egui::{self, Color32, Pos2, Shape, Stroke, Vec2};
-use thinwire_protocol::ProtocolId;
+use thinwire_protocol::{ProtocolId, ProtocolKind};
 
 fn at(center: Pos2, unit: f32, x: f32, y: f32) -> Pos2 {
     center + Vec2::new(x, y) * unit
@@ -190,12 +190,13 @@ pub(crate) fn protocol(
     protocol: ProtocolId,
     color: Color32,
 ) {
-    match protocol {
-        ProtocolId::Telegram => telegram(painter, center, size, color),
-        ProtocolId::WhatsApp => whatsapp(painter, center, size, color),
-        ProtocolId::Signal => signal(painter, center, size, color),
-        ProtocolId::Discord => discord(painter, center, size, color),
-        ProtocolId::Slack => slack(painter, center, size, color),
+    // Every account of a protocol has the same mark (ADR 0014).
+    match protocol.kind() {
+        ProtocolKind::Telegram => telegram(painter, center, size, color),
+        ProtocolKind::WhatsApp => whatsapp(painter, center, size, color),
+        ProtocolKind::Signal => signal(painter, center, size, color),
+        ProtocolKind::Discord => discord(painter, center, size, color),
+        ProtocolKind::Slack => slack(painter, center, size, color),
     }
 }
 

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+use thinwire_protocol::ProtocolKind;
 
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault;
@@ -47,10 +48,10 @@ pub fn stub_banner(snapshot: &Snapshot) -> Option<&'static str> {
 /// that only describes the screen.
 #[must_use]
 pub fn unofficial_notice(protocol: ProtocolId) -> Option<&'static [&'static str]> {
-    match protocol {
-        ProtocolId::WhatsApp => Some(thinwire_protocol::CRITIC_RISK_BULLETS.as_slice()),
-        ProtocolId::Signal => Some(crate::signal_notice::SIGNAL_NOTICE_REVIEW.as_slice()),
-        ProtocolId::Telegram | ProtocolId::Discord | ProtocolId::Slack => None,
+    match protocol.kind() {
+        ProtocolKind::WhatsApp => Some(thinwire_protocol::CRITIC_RISK_BULLETS.as_slice()),
+        ProtocolKind::Signal => Some(crate::signal_notice::SIGNAL_NOTICE_REVIEW.as_slice()),
+        ProtocolKind::Telegram | ProtocolKind::Discord | ProtocolKind::Slack => None,
     }
 }
 
@@ -58,22 +59,22 @@ pub fn unofficial_notice(protocol: ProtocolId) -> Option<&'static [&'static str]
 /// WhatsApp is "Ban risk". Signal is "Risk".
 #[must_use]
 pub const fn notice_label(protocol: ProtocolId) -> Option<&'static str> {
-    match protocol {
-        ProtocolId::WhatsApp => Some("Ban risk"),
-        ProtocolId::Signal => Some("Risk"),
-        ProtocolId::Telegram | ProtocolId::Discord | ProtocolId::Slack => None,
+    match protocol.kind() {
+        ProtocolKind::WhatsApp => Some("Ban risk"),
+        ProtocolKind::Signal => Some("Risk"),
+        ProtocolKind::Telegram | ProtocolKind::Discord | ProtocolKind::Slack => None,
     }
 }
 
 /// Compile-time chrome gate: spikes stay invisible when their feature is off.
 #[must_use]
 pub const fn protocol_chrome_enabled(protocol: ProtocolId) -> bool {
-    match protocol {
-        ProtocolId::Telegram => true,
-        ProtocolId::Slack => cfg!(feature = "slack-oauth"),
-        ProtocolId::WhatsApp => cfg!(feature = "whatsapp-web"),
-        ProtocolId::Discord => cfg!(feature = "discord-bot"),
-        ProtocolId::Signal => cfg!(feature = "signal-local"),
+    match protocol.kind() {
+        ProtocolKind::Telegram => true,
+        ProtocolKind::Slack => cfg!(feature = "slack-oauth"),
+        ProtocolKind::WhatsApp => cfg!(feature = "whatsapp-web"),
+        ProtocolKind::Discord => cfg!(feature = "discord-bot"),
+        ProtocolKind::Signal => cfg!(feature = "signal-local"),
     }
 }
 
@@ -479,6 +480,9 @@ pub const ATTACH_NOT_HERE: &str = "This account cannot send photos or videos.";
 pub const WHATSAPP_GATE_VERSION: u64 =
     crate::signal_notice::notice_version(&thinwire_protocol::CRITIC_RISK_BULLETS);
 
+/// Row line of an account after account 0 whose saved session ended.
+pub const ACCOUNT_SIGN_IN_AGAIN: &str = "Signed out. Click Link to sign in again.";
+
 /// Status line after the user starts a WhatsApp pairing.
 pub const WHATSAPP_PAIRING_REQUESTED: &str = "WhatsApp pairing requested.";
 /// Status line after the user accepts the WhatsApp ban gate.
@@ -506,19 +510,31 @@ fn store_access_detail(
 ) -> &'static str {
     match reason {
         StoreAccessReason::KeychainDenied if linked => thinwire_protocol::KEYCHAIN_ACCESS_DENIED,
-        StoreAccessReason::KeychainDenied if protocol == ProtocolId::WhatsApp => {
+        StoreAccessReason::KeychainDenied if protocol.is(ProtocolKind::WhatsApp) => {
             thinwire_protocol::whatsapp_keychain_unavailable()
         }
         StoreAccessReason::KeychainDenied => thinwire_protocol::signal_keychain_unavailable(),
-        StoreAccessReason::WrongKey if protocol == ProtocolId::WhatsApp => {
+        StoreAccessReason::WrongKey if protocol.is(ProtocolKind::WhatsApp) => {
             thinwire_protocol::whatsapp_session_kept()
         }
         StoreAccessReason::WrongKey => thinwire_protocol::signal_session_kept(),
-        StoreAccessReason::MoveFailed if protocol == ProtocolId::WhatsApp => {
+        StoreAccessReason::MoveFailed if protocol.is(ProtocolKind::WhatsApp) => {
             thinwire_protocol::whatsapp_key_wrong_kept()
         }
         StoreAccessReason::MoveFailed => thinwire_protocol::signal_key_wrong_kept(),
     }
+}
+
+/// A status line about the retained Signal history, not about the live
+/// account.
+fn is_signal_retained_line(detail: &str) -> bool {
+    [
+        thinwire_protocol::SIGNAL_PREVIOUS_ACCOUNT,
+        thinwire_protocol::SIGNAL_RETAINED_RESET,
+        thinwire_protocol::SIGNAL_RETAINED_SETTLED,
+    ]
+    .contains(&detail)
+        || thinwire_protocol::signal_retained_unreadable_slot(detail).is_some()
 }
 
 /// The move-aside failed. The files stayed, so a saved account stays linked.
@@ -734,6 +750,13 @@ pub struct Snapshot {
     /// Telegram photo downloads in flight, keyed by protocol and file id.
     photo_downloads: HashSet<(ProtocolId, i32)>,
     pending: Vec<AdapterCommand>,
+    /// The Telegram account that the login screens are for (ADR 0014).
+    /// Login steps go to it, and only its login events change the screens.
+    telegram_login_account: ProtocolId,
+    /// The WhatsApp account that the gate and the pair screen are for.
+    whatsapp_link_account: ProtocolId,
+    /// The Signal account that the notice and the link screen are for.
+    signal_link_account: ProtocolId,
     keychain_flush: bool,
     /// Accounts that ended for good in this pump: a Telegram session that
     /// another device or Telegram ended, or `AccountEnded` (a WhatsApp
@@ -1009,6 +1032,9 @@ impl Snapshot {
             data_reset: None,
             api_source: TelegramApiSource::from_build(),
             pending: Vec::new(),
+            telegram_login_account: ProtocolId::Telegram,
+            whatsapp_link_account: ProtocolId::WhatsApp,
+            signal_link_account: ProtocolId::Signal,
             photo_downloads: HashSet::new(),
             keychain_flush: false,
             ended_accounts: Vec::new(),
@@ -1064,6 +1090,19 @@ impl Snapshot {
     }
 
     pub fn apply(&mut self, event: AdapterEvent) {
+        match event {
+            AdapterEvent::FromAccount { account, event } => {
+                self.apply_from_account(account, *event);
+            }
+            // An event with no protocol field is from account 0.
+            event => match self.event_flow_account(&event) {
+                Some(target) => self.apply_from_account(target.first_account(), event),
+                None => self.apply_unchecked(event),
+            },
+        }
+    }
+
+    fn apply_unchecked(&mut self, event: AdapterEvent) {
         // Inbox events come only while the account is linked. One that
         // arrives while it is not is from a cancelled or ended client, for
         // example queued before Cancel: drop it (PR #49 review). Adapters
@@ -1082,13 +1121,19 @@ impl Snapshot {
             } => {
                 // A retained-history line is not a status of the live account.
                 // It does not change the link state or the session key.
-                if protocol == ProtocolId::Signal
+                if protocol.is(ProtocolKind::Signal)
+                    && protocol.slot() != 0
+                    && is_signal_retained_line(&detail)
+                {
+                    // The retained history of another Signal account is not
+                    // shown (ADR 0014).
+                } else if protocol == ProtocolId::Signal
                     && detail == thinwire_protocol::SIGNAL_PREVIOUS_ACCOUNT
                 {
                     // A different Signal number is linked. Drop the live chats of
                     // the previous number. The retained rows already hold them.
                     self.retire_live_signal_chats();
-                } else if protocol == ProtocolId::Signal
+                } else if protocol.is(ProtocolKind::Signal)
                     && detail == thinwire_protocol::SIGNAL_RETAINED_RESET
                 {
                     // Keep the rows. Each store sends its chats when that
@@ -1133,7 +1178,7 @@ impl Snapshot {
                         }
                     }
                     #[cfg(feature = "signal-local")]
-                    if protocol == ProtocolId::Signal {
+                    if self.signal_screen_of(protocol) {
                         if status == AdapterStatus::Ready {
                             self.signal_inbox_open = true;
                         }
@@ -1142,7 +1187,7 @@ impl Snapshot {
                         self.signal_checking = detail == thinwire_protocol::SIGNAL_LINK_CHECK;
                     }
                     #[cfg(feature = "whatsapp-web")]
-                    if protocol == ProtocolId::WhatsApp
+                    if self.whatsapp_screen_of(protocol)
                         && status == AdapterStatus::Error
                         && detail == thinwire_protocol::WHATSAPP_QR_EXHAUSTED
                         && self.whatsapp_started
@@ -1156,18 +1201,18 @@ impl Snapshot {
                         // A failed load does not send its end event. Stop the spinners.
                         self.stop_spinners(protocol, None);
                         #[cfg(feature = "signal-local")]
-                        if protocol == ProtocolId::Signal
+                        if self.signal_screen_of(protocol)
                             && detail == thinwire_protocol::SIGNAL_DEVICE_REMOVED
                         {
                             // The row and the open chat show this line. No popup.
                             self.signal_removed = true;
-                        } else if protocol == ProtocolId::Signal && self.signal_started {
+                        } else if self.signal_screen_of(protocol) && self.signal_started {
                             self.note_signal_failure(&detail);
                         }
                     }
                     // Crate / feature jargon stays on the account row and in logs.
                     // Chrome surfaces Telegram errors and Ready operational copy only.
-                    if protocol == ProtocolId::Telegram
+                    if protocol.is(ProtocolKind::Telegram)
                         && matches!(
                             status,
                             AdapterStatus::Error | AdapterStatus::Refused | AdapterStatus::Ready
@@ -1189,8 +1234,17 @@ impl Snapshot {
                     }
                 }
             }
+            AdapterEvent::ConversationUpsert { conversation }
+                if conversation.protocol.is(ProtocolKind::Signal)
+                    && conversation.protocol.slot() != 0
+                    && thinwire_protocol::signal_retained_slot(&conversation.id).is_some() =>
+            {
+                // The retained history of another Signal account is not
+                // shown (ADR 0014).
+                tracing::debug!(account = %conversation.protocol, "a retained Signal chat was dropped");
+            }
             AdapterEvent::ConversationUpsert { mut conversation } => {
-                if conversation.protocol == ProtocolId::Signal
+                if conversation.protocol.is(ProtocolKind::Signal)
                     && let Some(slot) = thinwire_protocol::signal_retained_slot(&conversation.id)
                 {
                     // The previous number cannot send. The helper says so,
@@ -1241,7 +1295,7 @@ impl Snapshot {
                 delivery,
             } => {
                 self.set_delivery(protocol, &conversation_id, &message_id, delivery);
-                if protocol == ProtocolId::Telegram
+                if protocol.is(ProtocolKind::Telegram)
                     && matches!(delivery, Delivery::Sent | Delivery::Read | Delivery::Failed)
                 {
                     self.release_telegram_for_message(&message_id);
@@ -1277,6 +1331,10 @@ impl Snapshot {
             }
             // Internal: the host unwraps stamped login events in poll_events.
             AdapterEvent::Login { .. } => {}
+            // `apply` unwraps it.
+            AdapterEvent::FromAccount { account, event } => {
+                self.apply_from_account(account, *event);
+            }
             AdapterEvent::OlderHistoryLoaded {
                 protocol,
                 conversation_id,
@@ -1462,7 +1520,7 @@ impl Snapshot {
                     self.retained_publish = None;
                 }
                 #[cfg(feature = "signal-local")]
-                if protocol == ProtocolId::Signal {
+                if self.signal_screen_of(protocol) {
                     self.signal_removed = true;
                     self.signal_checking = false;
                     // The row and the open chat show the removal. The strip
@@ -1562,11 +1620,402 @@ impl Snapshot {
 
     /// Queue one command for the worker. The core sends it on the next flush.
     pub(crate) fn queue(&mut self, command: AdapterCommand) {
-        self.pending.push(command);
+        self.push(command);
     }
 
     pub fn take_commands(&mut self) -> Vec<AdapterCommand> {
         std::mem::take(&mut self.pending)
+    }
+
+    // region: accounts
+
+    /// Add the row of `account` after the other accounts of its protocol
+    /// (ADR 0014). It copies the capabilities of account 0. `false` for
+    /// account 0, for a known account, and for a protocol with no row.
+    pub fn add_account_row(&mut self, account: ProtocolId) -> bool {
+        if account.slot() == 0 || self.accounts.iter().any(|row| row.caps.id == account) {
+            return false;
+        }
+        let Some(first) = self
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == account.first_account() && row.signal_retained.is_none())
+        else {
+            return false;
+        };
+        let mut caps = first.caps;
+        caps.id = account;
+        let row = AccountRow {
+            caps,
+            status: AdapterStatus::Stubbed,
+            detail: caps.detail.to_string(),
+            state: AccountState::Unlinked,
+            helper: None,
+            signal_retained: None,
+            retained_read: RetainedRead::Readable,
+            store_access: None,
+        };
+        let at = self
+            .accounts
+            .iter()
+            .rposition(|row| row.caps.id.same_protocol(account))
+            .map_or(self.accounts.len(), |at| at + 1);
+        self.accounts.insert(at, row);
+        true
+    }
+
+    /// Remove the row of `account` and its chats. Account 0 stays. The
+    /// keychain values and the files of the account stay too.
+    pub fn remove_account_row(&mut self, account: ProtocolId) {
+        if account.slot() == 0 {
+            return;
+        }
+        self.end_session(account);
+        self.accounts.retain(|row| row.caps.id != account);
+        self.stopped.remove(&account);
+        if self.selected_protocol == account {
+            self.selected_protocol = account.first_account();
+            self.set_selected_conversation(None);
+        }
+    }
+
+    /// The lowest free account number of `kind` after account 0. `None`
+    /// when every number up to [`thinwire_protocol::MAX_ACCOUNT_SLOT`] is in
+    /// use.
+    #[must_use]
+    pub fn next_account(&self, kind: ProtocolKind) -> Option<ProtocolId> {
+        (1..=thinwire_protocol::MAX_ACCOUNT_SLOT).find_map(|slot| {
+            let account = ProtocolId::account(kind, slot)?;
+            (!self.accounts.iter().any(|row| row.caps.id == account)).then_some(account)
+        })
+    }
+
+    /// The accounts of this build, account 0 of each protocol first.
+    #[must_use]
+    pub fn account_ids(&self) -> Vec<ProtocolId> {
+        self.accounts
+            .iter()
+            .filter(|row| row.signal_retained.is_none())
+            .map(|row| row.caps.id)
+            .collect()
+    }
+
+    /// The Telegram account of the login screens.
+    #[must_use]
+    pub const fn telegram_login_account(&self) -> ProtocolId {
+        self.telegram_login_account
+    }
+
+    /// The WhatsApp account of the gate and the pair screen.
+    #[must_use]
+    pub const fn whatsapp_link_account(&self) -> ProtocolId {
+        self.whatsapp_link_account
+    }
+
+    /// The Signal account of the notice and the link screen.
+    #[must_use]
+    pub const fn signal_link_account(&self) -> ProtocolId {
+        self.signal_link_account
+    }
+
+    /// The WhatsApp gate and pair screen are for `protocol`.
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_screen_of(&self, protocol: ProtocolId) -> bool {
+        protocol == self.whatsapp_link_account
+    }
+
+    /// The Signal notice and link screen are for `protocol`.
+    #[cfg(feature = "signal-local")]
+    fn signal_screen_of(&self, protocol: ProtocolId) -> bool {
+        protocol == self.signal_link_account
+    }
+
+    /// The account is linked.
+    #[must_use]
+    pub fn protocol_is_linked(&self, account: ProtocolId) -> bool {
+        self.protocol_linked(account)
+    }
+
+    /// The account can take a new login: it is not linked and no login
+    /// screen is open for its protocol.
+    #[must_use]
+    pub fn account_free(&self, account: ProtocolId) -> bool {
+        if self.protocol_linked(account) || !self.account_surface_visible(account.first_account()) {
+            return false;
+        }
+        !self.login_open(account.kind())
+            && !(account == ProtocolId::Telegram && self.telegram_authorized)
+    }
+
+    /// A login screen of `kind` is open, for any account.
+    #[must_use]
+    pub fn login_open(&self, kind: ProtocolKind) -> bool {
+        match kind {
+            ProtocolKind::Telegram => self.auth != AuthScreen::Idle,
+            #[cfg(feature = "whatsapp-web")]
+            ProtocolKind::WhatsApp => self.whatsapp_gate_open(),
+            #[cfg(feature = "signal-local")]
+            ProtocolKind::Signal => self.signal_gate_open(),
+            _ => false,
+        }
+    }
+
+    /// Open the login screen of `account` (ADR 0014). A login of the same
+    /// protocol that is open already stays.
+    pub fn open_login(&mut self, account: ProtocolId, store: &SecretStore) {
+        match account.kind() {
+            // The login screens fill the center. Ready selects the account.
+            ProtocolKind::Telegram => {
+                self.begin_telegram_login(account, store);
+                return;
+            }
+            ProtocolKind::WhatsApp => {
+                #[cfg(feature = "whatsapp-web")]
+                {
+                    if self.whatsapp_gate_open() {
+                        self.status_text = "Finish or cancel the open WhatsApp link first.".into();
+                    } else {
+                        self.whatsapp_link_account = account;
+                        self.open_whatsapp_risk_gate();
+                    }
+                }
+            }
+            ProtocolKind::Signal => {
+                #[cfg(feature = "signal-local")]
+                {
+                    if self.signal_gate_open() {
+                        self.status_text = "Finish or cancel the open Signal link first.".into();
+                    } else if account.slot() == 0 {
+                        self.open_signal_notice();
+                    } else {
+                        // Another account shows the notice: its helper needs
+                        // the acceptance. The saved acceptance of account 0
+                        // stays.
+                        self.signal_link_account = account;
+                        self.reveal_signal_notice(false);
+                    }
+                }
+            }
+            ProtocolKind::Discord => {
+                self.status_text = format!(
+                    "Put the bot token of {} in the keychain as {}, then restart thinwire.",
+                    account.label(),
+                    account.scoped(thinwire_protocol::DISCORD_SECRET_BOT_TOKEN)
+                );
+            }
+            ProtocolKind::Slack => {
+                self.status_text = format!(
+                    "Install the Slack app in the workspace of {} with Add Slack workspace.",
+                    account.label()
+                );
+            }
+        }
+        self.select_protocol(account);
+    }
+
+    /// The Telegram login screens for `account`. Account 0 is Add account.
+    /// Another account parks the login state of account 0 and gets it back
+    /// when its login ends.
+    fn begin_telegram_login(&mut self, account: ProtocolId, store: &SecretStore) {
+        if account.slot() == 0 {
+            if self.telegram_login_account.slot() == 0 {
+                self.open_add_account(store);
+            }
+            return;
+        }
+        if self.auth != AuthScreen::Idle && self.telegram_login_account != account {
+            self.status_text = "Finish or cancel the open Telegram sign-in first.".into();
+            return;
+        }
+        // Until the keychain read of this account ends, nothing is parked:
+        // `open_telegram` shows the reason and opens no screen.
+        if store.read_failed() || !store.attach_settled() {
+            self.open_telegram(store);
+            return;
+        }
+        self.telegram_login_account = account;
+        self.telegram_authorized = false;
+        self.resume = Resume::Settled;
+        self.open_telegram(store);
+    }
+
+    /// The login of another Telegram account ended: the screens are for
+    /// account 0 again.
+    fn restore_telegram_login(&mut self) {
+        if self.telegram_login_account.slot() == 0 {
+            return;
+        }
+        self.telegram_login_account = ProtocolId::Telegram;
+        self.telegram_authorized = self.protocol_linked(ProtocolId::Telegram);
+        self.resume = Resume::Settled;
+    }
+
+    /// No login screen is for `account` any more. Its protocol's screens
+    /// close when they were for it.
+    pub fn end_login_of(&mut self, account: ProtocolId) {
+        if self.telegram_login_account == account {
+            self.auth = AuthScreen::Idle;
+            self.auth_busy = false;
+            self.restore_telegram_login();
+        }
+        #[cfg(feature = "whatsapp-web")]
+        if self.whatsapp_link_account == account {
+            if self.whatsapp_gate_open() {
+                self.whatsapp_screen = WhatsAppScreen::Hidden;
+            }
+            self.whatsapp_link_account = ProtocolId::WhatsApp;
+        }
+        #[cfg(feature = "signal-local")]
+        if self.signal_link_account == account {
+            if self.signal_gate_open() {
+                self.signal_screen = SignalScreen::Hidden;
+            }
+            self.signal_link_account = ProtocolId::Signal;
+        }
+    }
+
+    /// Resume the saved session of an account after account 0, with no
+    /// screen. Only Telegram needs it: the other protocols connect when
+    /// their adapter starts or when their token loads.
+    pub fn resume_account(&mut self, account: ProtocolId, store: &SecretStore) {
+        if !account.is(ProtocolKind::Telegram) || account.slot() == 0 || !tdlib_compiled() {
+            return;
+        }
+        let saved = store.get(SecretKey::Session).ok().flatten().is_some();
+        if !saved || !self.has_api_credentials(store) {
+            return;
+        }
+        self.pending.push(
+            AdapterCommand::TelegramAuth {
+                step: TelegramAuthStep::ApiCredentials,
+                epoch: 0,
+            }
+            .for_account(account),
+        );
+    }
+
+    /// Start the helper of a saved WhatsApp or Signal account after account
+    /// 0 with the accepted gate. No screen opens.
+    pub(crate) fn resume_helper_account(&mut self, account: ProtocolId) {
+        if account.slot() == 0 || self.helper_missing(account) {
+            return;
+        }
+        let gate = match account.kind() {
+            ProtocolKind::WhatsApp => AdapterCommand::WhatsAppAcknowledgeRisk,
+            ProtocolKind::Signal => AdapterCommand::SignalAcknowledgeNotice,
+            _ => return,
+        };
+        self.pending.push(gate.for_account(account));
+    }
+
+    // endregion: accounts
+
+    /// Queue a command. A login step or a pairing command has no protocol
+    /// field: it goes to the account of its screen (ADR 0014).
+    fn push(&mut self, command: AdapterCommand) {
+        let command = match self.flow_account(&command) {
+            Some(account) => command.for_account(account),
+            None => command,
+        };
+        self.pending.push(command);
+    }
+
+    /// The account of the screen that a login or pairing command belongs to.
+    /// `None` for a command with a protocol field.
+    fn flow_account(&self, command: &AdapterCommand) -> Option<ProtocolId> {
+        match command {
+            AdapterCommand::TelegramAuth { .. } => Some(self.telegram_login_account),
+            AdapterCommand::WhatsAppAcknowledgeRisk
+            | AdapterCommand::WhatsAppBeginLink { .. }
+            | AdapterCommand::WhatsAppCancelLink => Some(self.whatsapp_link_account),
+            AdapterCommand::SignalAcknowledgeNotice
+            | AdapterCommand::SignalBeginLink { .. }
+            | AdapterCommand::SignalCancelLink => Some(self.signal_link_account),
+            _ => None,
+        }
+    }
+
+    /// The account of the screen that a login or pairing event belongs to.
+    /// `None` for an event with a protocol field, and for an event of a
+    /// whole account (a secret flush).
+    fn event_flow_account(&self, event: &AdapterEvent) -> Option<ProtocolId> {
+        match event {
+            AdapterEvent::TelegramAuth { .. }
+            | AdapterEvent::TelegramAuthRejected { .. }
+            | AdapterEvent::TelegramDataReset { .. }
+            | AdapterEvent::TelegramSessionEnded
+            | AdapterEvent::TelegramCodeSent { .. } => Some(self.telegram_login_account),
+            AdapterEvent::WhatsAppQr { .. } | AdapterEvent::WhatsAppPairCode { .. } => {
+                Some(self.whatsapp_link_account)
+            }
+            AdapterEvent::SignalQr { .. } => Some(self.signal_link_account),
+            _ => None,
+        }
+    }
+
+    /// An event of the adapter of `account`, with no protocol field. Only
+    /// the account of the screen changes the screen. A secret flush counts
+    /// for every account.
+    fn apply_from_account(&mut self, account: ProtocolId, event: AdapterEvent) {
+        match self.event_flow_account(&event) {
+            Some(target) if target == account => self.apply_unchecked(event),
+            // A Telegram account that is not on the login screens: its login
+            // phases link or unlink its row only.
+            Some(_) if account.is(ProtocolKind::Telegram) => {
+                self.apply_background_telegram(account, event);
+            }
+            Some(_) => tracing::debug!(%account, "a login event of another account was dropped"),
+            None => self.apply_unchecked(event),
+        }
+    }
+
+    /// A login phase of a Telegram account that is not on the login
+    /// screens, for example the resume of a saved session at start. Ready
+    /// links its row and loads its chats. A request for a phone, a code, or
+    /// a password means the session ended: the row unlinks and shows Link.
+    fn apply_background_telegram(&mut self, account: ProtocolId, event: AdapterEvent) {
+        let phase = match event {
+            AdapterEvent::TelegramAuth { phase } => Some(phase),
+            AdapterEvent::TelegramSessionEnded => None,
+            _ => return,
+        };
+        match phase {
+            Some(TelegramAuthPhase::Ready) => {
+                if let Some(row) = self.live_account_mut(account) {
+                    row.state = AccountState::Linked;
+                    row.status = AdapterStatus::Ready;
+                }
+                if self.sessions.insert(account) {
+                    self.chat_list_loading.insert(account);
+                }
+            }
+            // The client did not start. A linked row stays linked.
+            Some(TelegramAuthPhase::Failed | TelegramAuthPhase::Unavailable) => {
+                if let Some(row) = self.live_account_mut(account) {
+                    row.status = AdapterStatus::Error;
+                }
+            }
+            // The saved session is gone.
+            Some(
+                TelegramAuthPhase::NeedPhone
+                | TelegramAuthPhase::NeedCode
+                | TelegramAuthPhase::NeedTwoFactor,
+            )
+            | None => {
+                if self.has_session(account) {
+                    self.end_session(account);
+                }
+                if let Some(row) = self.live_account_mut(account) {
+                    row.state = AccountState::Unlinked;
+                    row.status = AdapterStatus::Stubbed;
+                    row.detail = ACCOUNT_SIGN_IN_AGAIN.into();
+                }
+                // The client must not wait for a phone number on no screen.
+                if phase.is_some() {
+                    self.push(AdapterCommand::Disconnect { protocol: account });
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -1698,7 +2147,7 @@ impl Snapshot {
         let known = self
             .accounts
             .iter()
-            .any(|row| row.caps.id == ProtocolId::Signal && row.signal_retained == Some(slot));
+            .any(|row| row.caps.id.is(ProtocolKind::Signal) && row.signal_retained == Some(slot));
         if !known || !self.account_surface_visible(ProtocolId::Signal) {
             return;
         }
@@ -1715,7 +2164,7 @@ impl Snapshot {
         if self.selected_protocol != account.caps.id {
             return false;
         }
-        if account.caps.id != ProtocolId::Signal {
+        if !account.caps.id.is(ProtocolKind::Signal) {
             return true;
         }
         self.selected_signal_retained == account.signal_retained
@@ -1774,7 +2223,7 @@ impl Snapshot {
         let count = self
             .accounts
             .iter()
-            .filter(|row| row.caps.id == ProtocolId::Signal && row.signal_retained.is_some())
+            .filter(|row| row.caps.id.is(ProtocolKind::Signal) && row.signal_retained.is_some())
             .count();
         if count >= 2 {
             format!("Previous account {slot}")
@@ -2078,6 +2527,11 @@ impl Snapshot {
     /// Every adapter answered `Shutdown` with `Stopped`: no session of any
     /// protocol (TDLib, the WhatsApp bot and its SQLite session) still runs.
     #[must_use]
+    #[cfg(test)]
+    pub(crate) fn stopped_contains(&self, account: ProtocolId) -> bool {
+        self.stopped.contains(&account)
+    }
+
     pub fn all_stopped(&self) -> bool {
         self.accounts
             .iter()
@@ -2173,7 +2627,7 @@ impl Snapshot {
             self.compose.clear();
         }
         self.error = None;
-        self.pending.push(AdapterCommand::ResendMessage {
+        self.push(AdapterCommand::ResendMessage {
             protocol,
             conversation_id,
             message_id: message_id.to_string(),
@@ -2212,9 +2666,10 @@ impl Snapshot {
         if self.extra_visible.contains(&protocol) {
             return true;
         }
-        match protocol {
-            ProtocolId::Discord => self.discord_inbox_visible(),
-            other => protocol_chrome_enabled(other),
+        if protocol.is(ProtocolKind::Discord) {
+            self.discord_inbox_visible()
+        } else {
+            protocol_chrome_enabled(protocol)
         }
     }
 
@@ -2297,7 +2752,7 @@ impl Snapshot {
             .map(|rows| {
                 rows.iter()
                     .filter(|row| {
-                        account.caps.id != ProtocolId::Signal
+                        !account.caps.id.is(ProtocolKind::Signal)
                             || thinwire_protocol::signal_retained_slot(&row.id)
                                 == account.signal_retained
                     })
@@ -2431,7 +2886,7 @@ impl Snapshot {
             // (protocol, chat, topic).
             Some(LOADING_OLDER_STATUS)
         } else if self.sends.compose_in_flight(protocol)
-            || (protocol == ProtocolId::Telegram
+            || (protocol.is(ProtocolKind::Telegram)
                 && self
                     .telegram_send_unconfirmed
                     .iter()
@@ -2551,14 +3006,14 @@ impl Snapshot {
         let store_cursor = self.take_resume_cursor(protocol, &id, topic);
         self.older_loading.insert(older_key(protocol, &id, topic));
         if let Some(topic) = topic {
-            self.pending.push(AdapterCommand::LoadOlderTopic {
+            self.push(AdapterCommand::LoadOlderTopic {
                 protocol,
                 conversation_id: id,
                 topic,
                 before_message_id: oldest,
             });
         } else {
-            self.pending.push(AdapterCommand::LoadOlderMessages {
+            self.push(AdapterCommand::LoadOlderMessages {
                 protocol,
                 conversation_id: id,
                 before_message_id: oldest,
@@ -2939,11 +3394,11 @@ impl Snapshot {
         for protocol in protocols {
             if self.protocol_linked(protocol) {
                 self.chat_list_loading.insert(protocol);
-                self.pending.push(AdapterCommand::LoadChats { protocol });
-            } else if protocol != ProtocolId::Slack {
+                self.push(AdapterCommand::LoadChats { protocol });
+            } else if !protocol.is(ProtocolKind::Slack) {
                 // Slack Connect with no token opens the browser. Only the
                 // Add Slack workspace button starts that install.
-                self.pending.push(AdapterCommand::Connect { protocol });
+                self.push(AdapterCommand::Connect { protocol });
             }
         }
         self.status_text = "Refreshing…".into();
@@ -2959,8 +3414,8 @@ impl Snapshot {
         self.telegram_authorized
     }
 
-    /// Add account is offered only while Telegram is not signed in: this
-    /// build supports one Telegram account (ux F8).
+    /// A new login of Telegram account 0 is offered only while it is not
+    /// signed in (ux F8). A second account has its own login (ADR 0014).
     #[must_use]
     pub fn can_add_account(&self) -> bool {
         !self.telegram_authorized
@@ -2987,9 +3442,10 @@ impl Snapshot {
             return;
         }
         self.status_text = "Account linking cancelled.".into();
-        self.pending.push(AdapterCommand::Disconnect {
-            protocol: ProtocolId::Telegram,
+        self.push(AdapterCommand::Disconnect {
+            protocol: self.telegram_login_account,
         });
+        self.restore_telegram_login();
     }
 
     pub fn advance_telegram(&mut self, store: &SecretStore) {
@@ -3023,8 +3479,8 @@ impl Snapshot {
             AuthScreen::TelegramConnecting => {
                 // Try again after a failed start: close the old client, then
                 // start a new one. The new one waits for the old one to close.
-                self.pending.push(AdapterCommand::Disconnect {
-                    protocol: ProtocolId::Telegram,
+                self.push(AdapterCommand::Disconnect {
+                    protocol: self.telegram_login_account,
                 });
                 self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
                 self.mark_auth_busy(CONNECTING_STATUS);
@@ -3468,7 +3924,7 @@ impl Snapshot {
         &self,
         protocol: ProtocolId,
     ) -> Vec<(String, Option<MessageTopic>, String)> {
-        if protocol == ProtocolId::Telegram {
+        if protocol.is(ProtocolKind::Telegram) {
             return Vec::new();
         }
         let mut keep: Vec<(String, Option<MessageTopic>, String)> = self
@@ -3587,7 +4043,7 @@ impl Snapshot {
         self.attachment_note = None;
         if !files.is_empty() {
             // The files stay in the tray until the adapter accepts them.
-            self.pending.push(AdapterCommand::SendMedia {
+            self.push(AdapterCommand::SendMedia {
                 protocol,
                 conversation_id,
                 topic: self.selected_topic,
@@ -3596,7 +4052,7 @@ impl Snapshot {
                 request,
             });
         } else if let Some(topic) = self.selected_topic {
-            self.pending.push(AdapterCommand::SendTopicText {
+            self.push(AdapterCommand::SendTopicText {
                 protocol,
                 conversation_id,
                 topic,
@@ -3604,7 +4060,7 @@ impl Snapshot {
                 request,
             });
         } else {
-            self.pending.push(AdapterCommand::SendText {
+            self.push(AdapterCommand::SendText {
                 protocol,
                 conversation_id,
                 body,
@@ -3621,7 +4077,7 @@ impl Snapshot {
         request: u64,
         retry: bool,
     ) {
-        if protocol != ProtocolId::Telegram {
+        if !protocol.is(ProtocolKind::Telegram) {
             return;
         }
         let message_id = self
@@ -3718,7 +4174,7 @@ impl Snapshot {
     /// Bind a pending Telegram row to its send, or release that send when the
     /// row is sent or failed. `replaced` is the pending id a new id took over.
     fn observe_telegram_message(&mut self, message: &ChatMessage, replaced: Option<&str>) {
-        if message.protocol != ProtocolId::Telegram || !message.outbound {
+        if !message.protocol.is(ProtocolKind::Telegram) || !message.outbound {
             return;
         }
         match message.delivery {
@@ -3744,7 +4200,7 @@ impl Snapshot {
     /// delivery, the 30 s timeout, or the end of the session. A release names
     /// the request. It does not drop a different send.
     fn end_telegram_send(&mut self, protocol: ProtocolId, end: TelegramSendEnd) {
-        if protocol != ProtocolId::Telegram {
+        if !protocol.is(ProtocolKind::Telegram) {
             return;
         }
         match end {
@@ -3838,7 +4294,7 @@ impl Snapshot {
                 self.auth_notice = Some(notice);
                 // The saved session is gone with the old data folder: the
                 // next login can be another account (#201 review).
-                self.ended_accounts.push(ProtocolId::Telegram);
+                self.ended_accounts.push(self.telegram_login_account);
             }
             TelegramAuthPhase::NeedPhone if resuming => {
                 // The worker drops the stale session marker on this path.
@@ -3847,7 +4303,7 @@ impl Snapshot {
                 self.status_text = SESSION_ENDED_NOTICE.into();
                 // The saved session ended while the app was closed: drop its
                 // mutes, as a live session end does (#201 review).
-                self.ended_accounts.push(ProtocolId::Telegram);
+                self.ended_accounts.push(self.telegram_login_account);
             }
             TelegramAuthPhase::NeedPhone => {
                 self.auth = AuthScreen::TelegramPhone;
@@ -3875,8 +4331,8 @@ impl Snapshot {
                     // client, and let Add Telegram start a fresh one.
                     self.auth = AuthScreen::Idle;
                     self.clear_secrets();
-                    self.pending.push(AdapterCommand::Disconnect {
-                        protocol: ProtocolId::Telegram,
+                    self.push(AdapterCommand::Disconnect {
+                        protocol: self.telegram_login_account,
                     });
                 }
             }
@@ -3888,24 +4344,27 @@ impl Snapshot {
         if let Some(row) = self
             .accounts
             .iter_mut()
-            .find(|row| row.caps.id == ProtocolId::Telegram)
+            .find(|row| row.caps.id == self.telegram_login_account)
         {
             row.state = AccountState::Linked;
         }
-        self.sessions.insert(ProtocolId::Telegram);
+        let account = self.telegram_login_account;
+        self.sessions.insert(account);
         self.telegram_authorized = true;
         // The worker loads the main list right after Ready.
-        self.chat_list_loading.insert(ProtocolId::Telegram);
+        self.chat_list_loading.insert(account);
         // Keep a selection the user made in another linked protocol (#70).
-        let keep = self.selected_protocol != ProtocolId::Telegram
+        let keep = !self.selected_protocol.is(ProtocolKind::Telegram)
             && self.has_session(self.selected_protocol);
         if !keep {
-            self.select_protocol(ProtocolId::Telegram);
+            self.select_protocol(account);
         }
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
         self.error = None;
         self.status_text = "Telegram is ready. Loading the chat list.".into();
+        // Another account linked: the screens are for account 0 again.
+        self.restore_telegram_login();
     }
 
     /// The live session ended elsewhere. Drop the old inbox, then start a new
@@ -3915,10 +4374,10 @@ impl Snapshot {
             return;
         }
         self.telegram_authorized = false;
-        self.end_session(ProtocolId::Telegram);
+        self.end_session(self.telegram_login_account);
         // The next account on this machine must not get this account's
         // mutes, as it does not get its drafts (#153 review).
-        self.ended_accounts.push(ProtocolId::Telegram);
+        self.ended_accounts.push(self.telegram_login_account);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
         self.error = None;
@@ -3933,11 +4392,11 @@ impl Snapshot {
         if let Some(row) = self
             .accounts
             .iter_mut()
-            .find(|row| row.caps.id == ProtocolId::Telegram)
+            .find(|row| row.caps.id == self.telegram_login_account)
         {
             row.state = AccountState::Unlinked;
         }
-        self.sessions.remove(&ProtocolId::Telegram);
+        self.sessions.remove(&self.telegram_login_account);
         self.auth = AuthScreen::Idle;
         self.auth_busy = false;
         self.telegram_authorized = false;
@@ -3958,8 +4417,7 @@ impl Snapshot {
 
     fn queue_telegram_step(&mut self, step: TelegramAuthStep) {
         // The host replaces `epoch` with the login client this step belongs to.
-        self.pending
-            .push(AdapterCommand::TelegramAuth { step, epoch: 0 });
+        self.push(AdapterCommand::TelegramAuth { step, epoch: 0 });
     }
 
     fn mark_auth_busy(&mut self, status: &str) {
@@ -4012,7 +4470,7 @@ impl Snapshot {
             rows.iter()
                 .find(|row| {
                     !row.placeholder
-                        && (protocol != ProtocolId::Signal
+                        && (!protocol.is(ProtocolKind::Signal)
                             || thinwire_protocol::signal_retained_slot(&row.id) == retained)
                 })
                 .map(|row| row.id.clone())
@@ -4073,13 +4531,13 @@ impl Snapshot {
         }
         self.history_loading.insert((protocol, id.clone()));
         if let Some(topic) = topic {
-            self.pending.push(AdapterCommand::OpenTopic {
+            self.push(AdapterCommand::OpenTopic {
                 protocol,
                 conversation_id: id,
                 topic,
             });
         } else {
-            self.pending.push(AdapterCommand::OpenChat {
+            self.push(AdapterCommand::OpenChat {
                 protocol,
                 conversation_id: id,
             });
@@ -4104,21 +4562,21 @@ impl Snapshot {
             (None, _) => None,
         };
         if let Some(protocol) = left_protocol {
-            self.pending.push(AdapterCommand::ViewChat {
+            self.push(AdapterCommand::ViewChat {
                 protocol,
                 conversation_id: None,
             });
         }
         match now {
             Some((protocol, id, Some(topic))) => {
-                self.pending.push(AdapterCommand::ViewTopic {
+                self.push(AdapterCommand::ViewTopic {
                     protocol,
                     conversation_id: id,
                     topic,
                 });
             }
             Some((protocol, id, None)) => {
-                self.pending.push(AdapterCommand::ViewChat {
+                self.push(AdapterCommand::ViewChat {
                     protocol,
                     conversation_id: Some(id),
                 });
@@ -4274,14 +4732,14 @@ impl Snapshot {
                 // (#163).
                 if self.list_on_link.remove(&protocol) {
                     self.chat_list_loading.insert(protocol);
-                    self.pending.push(AdapterCommand::LoadChats { protocol });
+                    self.push(AdapterCommand::LoadChats { protocol });
                 }
                 #[cfg(feature = "whatsapp-web")]
-                if protocol == ProtocolId::WhatsApp {
+                if self.whatsapp_screen_of(protocol) {
                     self.finish_whatsapp_link();
                 }
                 #[cfg(feature = "signal-local")]
-                if protocol == ProtocolId::Signal {
+                if self.signal_screen_of(protocol) {
                     self.signal_removed = false;
                     self.signal_checking = false;
                     self.finish_signal_link();
@@ -4300,7 +4758,7 @@ impl Snapshot {
             AccountState::Unlinked =>
             {
                 #[cfg(feature = "signal-local")]
-                if protocol == ProtocolId::Signal && self.signal_started {
+                if self.signal_screen_of(protocol) && self.signal_started {
                     self.signal_started = false;
                     self.signal_inbox_open = false;
                     self.signal_qr = None;
@@ -4345,11 +4803,11 @@ impl Snapshot {
             self.stop_spinners(protocol, None);
         }
         #[cfg(feature = "whatsapp-web")]
-        if protocol == ProtocolId::WhatsApp {
+        if self.whatsapp_screen_of(protocol) {
             self.note_whatsapp_helper(state);
         }
         #[cfg(feature = "signal-local")]
-        if protocol == ProtocolId::Signal {
+        if self.signal_screen_of(protocol) {
             self.note_signal_helper(state);
         }
         if let HelperState::Stopped(fault) = state {
@@ -4458,8 +4916,7 @@ impl Snapshot {
             return;
         }
         self.error = None;
-        self.pending
-            .push(AdapterCommand::RestartHelper { protocol });
+        self.push(AdapterCommand::RestartHelper { protocol });
     }
 
     /// The user clicked Retry on a keychain denial or a failed move.
@@ -4481,8 +4938,7 @@ impl Snapshot {
         row.store_access = None;
         row.status = AdapterStatus::Connecting;
         row.detail = "Opening the saved session.".into();
-        self.pending
-            .push(AdapterCommand::RetryStoreKey { protocol });
+        self.push(AdapterCommand::RetryStoreKey { protocol });
     }
 
     /// Read the session key again for every saved account that was denied.
@@ -4596,7 +5052,7 @@ impl Snapshot {
 
     /// `true` when `id` belongs to the account row that is open.
     fn chat_in_open_account(&self, id: &str) -> bool {
-        if self.selected_protocol != ProtocolId::Signal {
+        if !self.selected_protocol.is(ProtocolKind::Signal) {
             return true;
         }
         thinwire_protocol::signal_retained_slot(id) == self.selected_signal_retained
@@ -4660,10 +5116,9 @@ impl Snapshot {
     /// A selected previous account that this link did not publish is closed.
     fn settle_retained_signal_selection(&mut self) {
         if let Some(slot) = self.selected_signal_retained {
-            let exists = self
-                .accounts
-                .iter()
-                .any(|row| row.caps.id == ProtocolId::Signal && row.signal_retained == Some(slot));
+            let exists = self.accounts.iter().any(|row| {
+                row.caps.id.is(ProtocolKind::Signal) && row.signal_retained == Some(slot)
+            });
             if !exists {
                 self.selected_signal_retained = None;
                 self.selected_conversation = None;
@@ -4777,14 +5232,14 @@ impl Snapshot {
         if self
             .accounts
             .iter()
-            .any(|row| row.caps.id == ProtocolId::Signal && row.signal_retained == Some(slot))
+            .any(|row| row.caps.id.is(ProtocolKind::Signal) && row.signal_retained == Some(slot))
         {
             return;
         }
         let Some(caps) = self
             .accounts
             .iter()
-            .find(|row| row.caps.id == ProtocolId::Signal && row.signal_retained.is_none())
+            .find(|row| row.caps.id.is(ProtocolKind::Signal) && row.signal_retained.is_none())
             .map(|row| row.caps)
         else {
             return;
@@ -4805,13 +5260,13 @@ impl Snapshot {
             .accounts
             .iter()
             .position(|row| {
-                row.caps.id == ProtocolId::Signal
+                row.caps.id.is(ProtocolKind::Signal)
                     && row.signal_retained.is_some_and(|existing| existing < slot)
             })
             .unwrap_or_else(|| {
                 self.accounts
                     .iter()
-                    .rposition(|row| row.caps.id == ProtocolId::Signal)
+                    .rposition(|row| row.caps.id.is(ProtocolKind::Signal))
                     .map_or(self.accounts.len(), |index| index + 1)
             });
         self.accounts.insert(at, row);
@@ -4953,14 +5408,14 @@ impl Snapshot {
         self.forget_older_protocol(protocol);
         self.end_telegram_send(protocol, TelegramSendEnd::All);
         #[cfg(feature = "whatsapp-web")]
-        if protocol == ProtocolId::WhatsApp {
+        if self.whatsapp_screen_of(protocol) {
             // The adapter ended the pairing itself (a pair code that
             // failed, or a ban). QR codes that ran out keep the expired
             // screen: `Unlinked` follows that status.
             self.stop_whatsapp_pairing();
         }
         #[cfg(feature = "signal-local")]
-        if protocol == ProtocolId::Signal {
+        if self.signal_screen_of(protocol) {
             self.signal_started = false;
             self.signal_inbox_open = false;
             self.signal_checking = false;
@@ -5238,7 +5693,7 @@ impl Snapshot {
                 }
             }
         }
-        if protocol == ProtocolId::Telegram {
+        if protocol.is(ProtocolKind::Telegram) {
             for id in read {
                 self.release_telegram_for_message(&id);
             }
@@ -5735,11 +6190,11 @@ impl Snapshot {
     pub fn open_whatsapp_risk_gate(&mut self) {
         // With no helper program, no pairing can start: the entry is
         // disabled, and a frontend cannot open the gate another way.
-        if !self.whatsapp_pairing_available() || self.helper_missing(ProtocolId::WhatsApp) {
+        if !self.whatsapp_pairing_available() || self.helper_missing(self.whatsapp_link_account) {
             return;
         }
         if self.whatsapp_started {
-            self.pending.push(AdapterCommand::WhatsAppCancelLink);
+            self.push(AdapterCommand::WhatsAppCancelLink);
         }
         self.whatsapp_screen = WhatsAppScreen::RiskGate;
         self.end_pairing();
@@ -5788,7 +6243,7 @@ impl Snapshot {
         if self.helper_missing(ProtocolId::WhatsApp) {
             return;
         }
-        self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
+        self.push(AdapterCommand::WhatsAppAcknowledgeRisk);
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -5802,7 +6257,7 @@ impl Snapshot {
         self.whatsapp_screen = WhatsAppScreen::Pair;
         self.error = None;
         self.status_text = WHATSAPP_GATE_ACCEPTED.into();
-        self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
+        self.push(AdapterCommand::WhatsAppAcknowledgeRisk);
     }
 
     /// New text in the phone field of the pair screen.
@@ -5828,7 +6283,7 @@ impl Snapshot {
         // The helper program can go away while the pair screen is open. No
         // helper can take the pairing then, and no answer would end it: do
         // not start. The pair screen shows the reason.
-        if self.helper_missing(ProtocolId::WhatsApp) {
+        if self.helper_missing(self.whatsapp_link_account) {
             return;
         }
         // A phone number has 15 digits at most. A longer text is not one,
@@ -5854,9 +6309,8 @@ impl Snapshot {
         let generation = self.next_pairing_generation;
         self.next_pairing_generation += 1;
         self.pairing_generation
-            .insert(ProtocolId::WhatsApp, generation);
-        self.pending
-            .push(AdapterCommand::WhatsAppBeginLink { generation });
+            .insert(self.whatsapp_link_account, generation);
+        self.push(AdapterCommand::WhatsAppBeginLink { generation });
     }
 
     /// Leave the QR and open the phone pair-code field.
@@ -5869,11 +6323,11 @@ impl Snapshot {
             tracing::warn!("whatsapp phone link dropped: the risk gate was not accepted");
             return;
         }
-        if self.helper_missing(ProtocolId::WhatsApp) {
+        if self.helper_missing(self.whatsapp_link_account) {
             return;
         }
         if self.whatsapp_started {
-            self.pending.push(AdapterCommand::WhatsAppCancelLink);
+            self.push(AdapterCommand::WhatsAppCancelLink);
         }
         phone.clear();
         self.end_pairing();
@@ -5888,7 +6342,7 @@ impl Snapshot {
     #[must_use]
     pub fn whatsapp_pairing_generation(&self) -> u64 {
         self.pairing_generation
-            .get(&ProtocolId::WhatsApp)
+            .get(&self.whatsapp_link_account)
             .copied()
             .unwrap_or(0)
     }
@@ -5915,6 +6369,8 @@ impl Snapshot {
         self.end_pairing();
         self.whatsapp_phone.clear();
         self.status_text = WHATSAPP_LINKED.into();
+        // Another account linked: the screens are for account 0 again.
+        self.whatsapp_link_account = ProtocolId::WhatsApp;
     }
 
     /// The pairing stopped. Drop its QR and its pair code.
@@ -5938,7 +6394,7 @@ impl Snapshot {
     /// later payload of the old pairing.
     #[cfg(feature = "whatsapp-web")]
     fn end_pairing(&mut self) {
-        self.pairing_generation.remove(&ProtocolId::WhatsApp);
+        self.pairing_generation.remove(&self.whatsapp_link_account);
         self.whatsapp_qr = None;
         self.whatsapp_pair_code = None;
         self.whatsapp_qr_exhausted = false;
@@ -5964,7 +6420,8 @@ impl Snapshot {
         self.whatsapp_risk_acknowledged = false;
         self.whatsapp_screen = WhatsAppScreen::Hidden;
         self.status_text = "WhatsApp pairing cancelled.".into();
-        self.pending.push(AdapterCommand::WhatsAppCancelLink);
+        self.push(AdapterCommand::WhatsAppCancelLink);
+        self.whatsapp_link_account = ProtocolId::WhatsApp;
     }
 
     /// Signal linking chrome when feature `signal-local` is compiled.
@@ -5987,7 +6444,7 @@ impl Snapshot {
     /// payload of the old link.
     #[cfg(feature = "signal-local")]
     fn end_signal_pairing(&mut self) {
-        self.pairing_generation.remove(&ProtocolId::Signal);
+        self.pairing_generation.remove(&self.signal_link_account);
         self.signal_qr = None;
     }
 
@@ -6010,7 +6467,7 @@ impl Snapshot {
     #[cfg(feature = "signal-local")]
     pub(crate) fn restore_signal_notice(&mut self) {
         self.signal_notice_acknowledged = true;
-        self.pending.push(AdapterCommand::SignalAcknowledgeNotice);
+        self.push(AdapterCommand::SignalAcknowledgeNotice);
     }
 
     /// The saved notice hash still matches. Link must not show the notice
@@ -6032,11 +6489,11 @@ impl Snapshot {
     #[cfg(feature = "signal-local")]
     pub fn open_signal_notice(&mut self) {
         if self.signal_notice_acknowledged && self.signal_screen == SignalScreen::Hidden {
-            if !self.signal_linking_available() || self.helper_missing(ProtocolId::Signal) {
+            if !self.signal_linking_available() || self.helper_missing(self.signal_link_account) {
                 return;
             }
             self.signal_qr = None;
-            self.signal_screen = if self.protocol_linked(ProtocolId::Signal) {
+            self.signal_screen = if self.protocol_linked(self.signal_link_account) {
                 SignalScreen::Notice
             } else {
                 SignalScreen::Link
@@ -6057,16 +6514,16 @@ impl Snapshot {
     fn reveal_signal_notice(&mut self, forget: bool) {
         // With no helper program the entry is disabled (ADR 0013 decision
         // 6), and a frontend cannot open the notice another way.
-        if !self.signal_linking_available() || self.helper_missing(ProtocolId::Signal) {
+        if !self.signal_linking_available() || self.helper_missing(self.signal_link_account) {
             return;
         }
-        if self.protocol_linked(ProtocolId::Signal) {
+        if self.protocol_linked(self.signal_link_account) {
             self.signal_screen = SignalScreen::Notice;
             self.signal_qr = None;
             return;
         }
         if self.signal_started {
-            self.pending.push(AdapterCommand::SignalCancelLink);
+            self.push(AdapterCommand::SignalCancelLink);
         }
         self.signal_screen = SignalScreen::Notice;
         self.signal_qr = None;
@@ -6083,7 +6540,7 @@ impl Snapshot {
     /// this is Cancel: linking stops and the acknowledgement resets. From
     /// the notice alone it only hides the screen.
     pub fn close_signal_gate(&mut self) {
-        if self.protocol_linked(ProtocolId::Signal) {
+        if self.protocol_linked(self.signal_link_account) {
             self.signal_screen = SignalScreen::Hidden;
             self.signal_qr = None;
             return;
@@ -6105,7 +6562,7 @@ impl Snapshot {
             tracing::warn!("signal notice acknowledgement dropped: the notice is not shown");
             return;
         }
-        if self.protocol_linked(ProtocolId::Signal) {
+        if self.protocol_linked(self.signal_link_account) {
             self.signal_screen = SignalScreen::Hidden;
             self.signal_qr = None;
             return;
@@ -6114,7 +6571,7 @@ impl Snapshot {
         self.signal_screen = SignalScreen::Link;
         self.error = None;
         self.status_text = "Signal notice accepted. Linking has not started.".into();
-        self.pending.push(AdapterCommand::SignalAcknowledgeNotice);
+        self.push(AdapterCommand::SignalAcknowledgeNotice);
     }
 
     /// The Link button after the phone removed this device. The notice was
@@ -6125,13 +6582,13 @@ impl Snapshot {
         // The same path after the phone removed the device and after a wrong
         // key moved the store files aside. Neither path deletes those files.
         let wrong_key = self.accounts.iter().any(|row| {
-            row.caps.id == ProtocolId::Signal
+            row.caps.id.is(ProtocolKind::Signal)
                 && row.store_access == Some(StoreAccessReason::WrongKey)
                 && !row.linked()
         });
         if (!self.signal_removed && !wrong_key)
             || !self.signal_linking_available()
-            || self.helper_missing(ProtocolId::Signal)
+            || self.helper_missing(self.signal_link_account)
         {
             return;
         }
@@ -6158,7 +6615,7 @@ impl Snapshot {
         // The helper program can go away while the link screen is open. No
         // helper can take the link then, and no answer would end it: do not
         // start. The link screen shows the reason.
-        if self.helper_missing(ProtocolId::Signal) {
+        if self.helper_missing(self.signal_link_account) {
             return;
         }
         self.signal_started = true;
@@ -6168,9 +6625,8 @@ impl Snapshot {
         let generation = self.next_pairing_generation;
         self.next_pairing_generation += 1;
         self.pairing_generation
-            .insert(ProtocolId::Signal, generation);
-        self.pending
-            .push(AdapterCommand::SignalBeginLink { generation });
+            .insert(self.signal_link_account, generation);
+        self.push(AdapterCommand::SignalBeginLink { generation });
     }
 
     /// The shell id of the Signal link that runs now. `0` when none runs.
@@ -6179,7 +6635,7 @@ impl Snapshot {
     #[must_use]
     pub fn signal_pairing_generation(&self) -> u64 {
         self.pairing_generation
-            .get(&ProtocolId::Signal)
+            .get(&self.signal_link_account)
             .copied()
             .unwrap_or(0)
     }
@@ -6194,7 +6650,9 @@ impl Snapshot {
         self.signal_screen = SignalScreen::Hidden;
         self.end_signal_pairing();
         self.status_text = "Signal is linked.".into();
-        self.select_protocol(ProtocolId::Signal);
+        self.select_protocol(self.signal_link_account);
+        // Another account linked: the screens are for account 0 again.
+        self.signal_link_account = ProtocolId::Signal;
     }
 
     #[cfg(feature = "signal-local")]
@@ -6203,10 +6661,13 @@ impl Snapshot {
         self.signal_started = false;
         self.signal_inbox_open = false;
         self.signal_notice_acknowledged = false;
-        self.signal_notice_forget = true;
+        // A cancel for another account keeps the saved acceptance of
+        // account 0 (ADR 0014).
+        self.signal_notice_forget |= self.signal_link_account.slot() == 0;
         self.signal_screen = SignalScreen::Hidden;
         self.status_text = "Signal linking cancelled.".into();
-        self.pending.push(AdapterCommand::SignalCancelLink);
+        self.push(AdapterCommand::SignalCancelLink);
+        self.signal_link_account = ProtocolId::Signal;
     }
 }
 
@@ -6308,7 +6769,7 @@ pub mod test_support {
         if let Some(row) = snapshot
             .accounts
             .iter_mut()
-            .find(|row| row.caps.id == ProtocolId::Telegram)
+            .find(|row| row.caps.id.is(ProtocolKind::Telegram))
         {
             row.state = AccountState::Linked;
         }
@@ -17418,4 +17879,327 @@ mod tests {
     }
 
     // endregion: #135
+}
+
+#[cfg(test)]
+mod account_flow_tests {
+    use super::test_support::{ready_with_chats, seed_override};
+    use super::*;
+
+    fn telegram(slot: u8) -> ProtocolId {
+        ProtocolId::account(ProtocolKind::Telegram, slot).expect("slot")
+    }
+
+    /// The row of a second account sits after the first. It removes again,
+    /// and the next number is the lowest free one.
+    #[test]
+    fn a_second_account_has_its_own_row() {
+        let mut snapshot = Snapshot::new();
+        assert_eq!(
+            snapshot.next_account(ProtocolKind::Telegram),
+            Some(telegram(1))
+        );
+        assert!(snapshot.add_account_row(telegram(1)));
+        assert!(
+            !snapshot.add_account_row(telegram(1)),
+            "one row per account"
+        );
+        assert!(
+            !snapshot.add_account_row(ProtocolId::Telegram),
+            "account 0 has its row"
+        );
+        let ids = snapshot.account_ids();
+        let first = ids
+            .iter()
+            .position(|id| *id == ProtocolId::Telegram)
+            .expect("first");
+        assert_eq!(ids[first + 1], telegram(1));
+        assert_eq!(
+            snapshot.next_account(ProtocolKind::Telegram),
+            Some(telegram(2))
+        );
+        snapshot.remove_account_row(telegram(1));
+        assert!(!snapshot.account_ids().contains(&telegram(1)));
+        snapshot.remove_account_row(ProtocolId::Telegram);
+        assert!(snapshot.account_ids().contains(&ProtocolId::Telegram));
+    }
+
+    /// A login of a second Telegram account, while account 0 is linked: its
+    /// steps go to that account, and its Ready links its row. The login
+    /// screens are then for account 0 again, which stays linked.
+    #[test]
+    fn a_second_telegram_account_signs_in_beside_the_first() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        assert!(snapshot.telegram_ready());
+        let second = telegram(1);
+        let second_store = SecretStore::memory_for_account(1);
+        seed_override(&second_store);
+        assert!(snapshot.add_account_row(second));
+        snapshot.open_login(second, &second_store);
+        assert_eq!(snapshot.telegram_login_account(), second);
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
+        let commands = snapshot.take_commands();
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                AdapterCommand::ToAccount { account, command }
+                    if *account == second && matches!(**command, AdapterCommand::TelegramAuth { .. })
+            )),
+            "the login step goes to the second account: {commands:?}"
+        );
+        // A phase of account 0 does not change the screens of the second.
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramConnecting);
+        assert!(snapshot.protocol_is_linked(ProtocolId::Telegram));
+        snapshot.apply(AdapterEvent::FromAccount {
+            account: second,
+            event: Box::new(AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::NeedPhone,
+            }),
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        snapshot.apply(AdapterEvent::FromAccount {
+            account: second,
+            event: Box::new(AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::Ready,
+            }),
+        });
+        assert!(snapshot.protocol_is_linked(second));
+        assert!(snapshot.has_session(second));
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert_eq!(snapshot.telegram_login_account(), ProtocolId::Telegram);
+        assert!(
+            snapshot.protocol_is_linked(ProtocolId::Telegram),
+            "account 0 stays"
+        );
+        assert!(snapshot.telegram_ready());
+        // The chats of each account stay apart.
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: second,
+                ..test_support::telegram_chat(1, "Second Ada", 3)
+            },
+        });
+        snapshot.select_protocol(second);
+        assert_eq!(snapshot.visible_conversations().len(), 1);
+        assert_eq!(snapshot.visible_conversations()[0].title, "Second Ada");
+        snapshot.select_protocol(ProtocolId::Telegram);
+        assert!(
+            snapshot
+                .visible_conversations()
+                .iter()
+                .all(|row| row.title != "Second Ada")
+        );
+    }
+
+    /// A saved session of a second account resumes with no screen. A lost
+    /// session unlinks only that row and stops its client.
+    #[test]
+    fn a_second_account_resumes_and_ends_in_the_background() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let second = telegram(1);
+        assert!(snapshot.add_account_row(second));
+        snapshot.apply(AdapterEvent::FromAccount {
+            account: second,
+            event: Box::new(AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::Ready,
+            }),
+        });
+        assert!(snapshot.protocol_is_linked(second));
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert!(snapshot.telegram_ready(), "account 0 is not touched");
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::FromAccount {
+            account: second,
+            event: Box::new(AdapterEvent::TelegramAuth {
+                phase: TelegramAuthPhase::NeedPhone,
+            }),
+        });
+        assert!(!snapshot.protocol_is_linked(second));
+        assert_eq!(snapshot.auth, AuthScreen::Idle, "no phone screen opens");
+        assert!(snapshot.protocol_is_linked(ProtocolId::Telegram));
+        let commands = snapshot.take_commands();
+        assert!(commands.contains(&AdapterCommand::Disconnect { protocol: second }));
+        let row = snapshot
+            .accounts
+            .iter()
+            .find(|row| row.caps.id == second)
+            .expect("row");
+        assert_eq!(row.detail, ACCOUNT_SIGN_IN_AGAIN);
+    }
+
+    /// A failed start of a linked background account keeps it linked and
+    /// sends no Disconnect.
+    #[test]
+    fn a_failed_background_start_keeps_the_link() {
+        let store = SecretStore::memory();
+        let mut snapshot = ready_with_chats(&store);
+        let second = telegram(1);
+        assert!(snapshot.add_account_row(second));
+        for phase in [TelegramAuthPhase::Ready, TelegramAuthPhase::Failed] {
+            snapshot.apply(AdapterEvent::FromAccount {
+                account: second,
+                event: Box::new(AdapterEvent::TelegramAuth { phase }),
+            });
+        }
+        assert!(snapshot.protocol_is_linked(second));
+        assert!(
+            !snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::Disconnect { .. }))
+        );
+    }
+
+    /// A resume of a second account sends its first login step there.
+    #[test]
+    fn a_saved_second_account_resumes_with_its_own_store() {
+        let mut snapshot = Snapshot::new();
+        let second = telegram(1);
+        let store = SecretStore::memory_for_account(1);
+        seed_override(&store);
+        store.set(SecretKey::Session, "1").expect("session");
+        snapshot.resume_account(second, &store);
+        let commands = snapshot.take_commands();
+        if tdlib_compiled() {
+            assert!(matches!(
+                commands.as_slice(),
+                [AdapterCommand::ToAccount { account, .. }] if *account == second
+            ));
+        } else {
+            assert!(commands.is_empty(), "no TDLib, no resume");
+        }
+        let empty = SecretStore::memory_for_account(1);
+        seed_override(&empty);
+        snapshot.resume_account(second, &empty);
+        assert!(snapshot.take_commands().is_empty(), "no saved session");
+    }
+}
+
+#[cfg(test)]
+#[cfg(any(feature = "whatsapp-web", feature = "signal-local"))]
+mod helper_account_tests {
+    use super::*;
+
+    fn second(kind: ProtocolKind) -> ProtocolId {
+        ProtocolId::account(kind, 1).expect("slot")
+    }
+
+    fn routed(commands: &[AdapterCommand], account: ProtocolId) -> bool {
+        commands.iter().any(|command| {
+            matches!(command, AdapterCommand::ToAccount { account: to, .. } if *to == account)
+        })
+    }
+
+    /// The gate of a second WhatsApp account: its acceptance goes to that
+    /// account. Its link closes the pair screen, and the screens are for
+    /// account 0 again. Account 0 stays linked.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_second_whatsapp_account_links_with_its_own_gate() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        let account = second(ProtocolKind::WhatsApp);
+        assert!(snapshot.add_account_row(account));
+        snapshot.take_commands();
+        snapshot.open_login(account, &store);
+        assert_eq!(snapshot.whatsapp_link_account(), account);
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::RiskGate);
+        snapshot.acknowledge_whatsapp_risk();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        let commands = snapshot.take_commands();
+        assert!(routed(&commands, account), "{commands:?}");
+        // A link of account 0 in the background does not close this screen.
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: account,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        assert_eq!(snapshot.whatsapp_link_account(), ProtocolId::WhatsApp);
+        assert!(snapshot.protocol_is_linked(account));
+        assert!(snapshot.protocol_is_linked(ProtocolId::WhatsApp));
+    }
+
+    /// A background link of a second WhatsApp account does not close the
+    /// pair screen of account 0.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_background_whatsapp_account_leaves_the_screen_of_account_0() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        let account = second(ProtocolKind::WhatsApp);
+        assert!(snapshot.add_account_row(account));
+        snapshot.open_login(ProtocolId::WhatsApp, &store);
+        snapshot.acknowledge_whatsapp_risk();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: account,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        assert!(snapshot.protocol_is_linked(account));
+        assert!(!snapshot.protocol_is_linked(ProtocolId::WhatsApp));
+    }
+
+    /// A saved helper account starts its helper at start with no screen.
+    #[test]
+    fn a_saved_helper_account_resumes_with_no_screen() {
+        let mut snapshot = Snapshot::new();
+        for kind in [ProtocolKind::WhatsApp, ProtocolKind::Signal] {
+            let account = second(kind);
+            assert!(snapshot.add_account_row(account));
+            snapshot.resume_helper_account(account);
+            let commands = snapshot.take_commands();
+            assert!(routed(&commands, account), "{kind:?}: {commands:?}");
+        }
+        snapshot.resume_helper_account(ProtocolId::WhatsApp);
+        assert!(
+            snapshot.take_commands().is_empty(),
+            "account 0 has its own resume"
+        );
+    }
+
+    /// A second Signal account shows the notice even when account 0
+    /// accepted it: its own helper needs the acceptance. Its cancel keeps
+    /// the saved acceptance of account 0.
+    #[cfg(feature = "signal-local")]
+    #[test]
+    fn a_second_signal_account_shows_the_notice_and_keeps_the_saved_one() {
+        let store = SecretStore::memory();
+        let mut snapshot = Snapshot::new();
+        snapshot.restore_signal_notice();
+        snapshot.take_commands();
+        let account = second(ProtocolKind::Signal);
+        assert!(snapshot.add_account_row(account));
+        snapshot.open_login(account, &store);
+        assert_eq!(snapshot.signal_link_account(), account);
+        assert_eq!(snapshot.signal_screen, SignalScreen::Notice);
+        snapshot.acknowledge_signal_notice();
+        assert_eq!(snapshot.signal_screen, SignalScreen::Link);
+        let commands = snapshot.take_commands();
+        assert!(routed(&commands, account), "{commands:?}");
+        snapshot.cancel_signal_link();
+        assert!(
+            !snapshot.take_signal_notice_forget(),
+            "account 0 keeps its acceptance"
+        );
+        assert_eq!(snapshot.signal_link_account(), ProtocolId::Signal);
+        assert!(snapshot
+            .take_commands()
+            .iter()
+            .any(|command| matches!(command, AdapterCommand::ToAccount { account: to, .. } if *to == account)));
+    }
 }

@@ -1,6 +1,7 @@
 //! Critic risk copy. Keep these strings verbatim wherever the gate appears.
 
 use super::ProtocolId;
+use crate::ProtocolKind;
 
 /// Critic bullet 1. Do not soften.
 pub const CRITIC_BULLET_1: &str = "WhatsApp (unofficial Web/linked-device) and Discord (user-account / self-bot) can get the user’s personal account banned or terminated. License-clean crates do not grant Meta or Discord permission.";
@@ -17,15 +18,18 @@ pub const CRITIC_RISK_BULLETS: [&str; 3] = [CRITIC_BULLET_1, CRITIC_BULLET_2, CR
 /// WhatsApp and Discord must show a risk gate before any credential or QR step.
 #[must_use]
 pub const fn requires_experimental_gate(protocol: ProtocolId) -> bool {
-    matches!(protocol, ProtocolId::WhatsApp | ProtocolId::Discord)
+    matches!(
+        protocol.kind(),
+        ProtocolKind::WhatsApp | ProtocolKind::Discord
+    )
 }
 
 /// Critic bullets that apply to one protocol’s experimental / constrained gate.
 #[must_use]
 pub const fn critic_bullets_for(protocol: ProtocolId) -> &'static [&'static str] {
-    match protocol {
-        ProtocolId::WhatsApp | ProtocolId::Discord => CRITIC_RISK_BULLETS.as_slice(),
-        ProtocolId::Telegram | ProtocolId::Slack | ProtocolId::Signal => &[],
+    match protocol.kind() {
+        ProtocolKind::WhatsApp | ProtocolKind::Discord => CRITIC_RISK_BULLETS.as_slice(),
+        ProtocolKind::Telegram | ProtocolKind::Slack | ProtocolKind::Signal => &[],
     }
 }
 

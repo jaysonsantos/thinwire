@@ -8,9 +8,32 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::adapter::LoginEpoch;
 use super::{
-    AdapterCommand, AdapterEvent, DiscordSecretVault, ProtocolAdapter, ProtocolId,
-    SlackSecretVault, TelegramSecretVault, WhatsAppPhoneVault, registry,
+    AdapterCommand, AdapterEvent, DiscordSecretVault, EventTx, ProtocolAdapter, ProtocolId,
+    ProtocolKind, SlackSecretVault, TelegramSecretVault, WhatsAppPhoneVault, registry,
 };
+
+/// What the host needs to start the adapter of an account other than 0
+/// (ADR 0014): the secret vault of that account for a protocol that runs in
+/// the app, or a ready adapter (a helper adapter with its own session
+/// folder).
+pub enum AccountAdapter {
+    Telegram(Arc<dyn TelegramSecretVault>),
+    Discord(Arc<dyn DiscordSecretVault>),
+    Slack(Arc<dyn SlackSecretVault>),
+    Ready(Box<dyn ProtocolAdapter>),
+}
+
+/// Makes the adapter of an account other than 0. `None`: this build has no
+/// such account.
+pub type AccountFactory = Arc<dyn Fn(ProtocolId) -> Option<AccountAdapter> + Send + Sync>;
+
+/// One account and its adapter. Events of an account other than 0 go
+/// through a forwarder that tags them with the account.
+struct Instance {
+    account: ProtocolId,
+    adapter: Box<dyn ProtocolAdapter>,
+    events: EventTx,
+}
 
 /// Bridge between the UI thread and protocol workers.
 pub struct AdapterHost {
@@ -31,18 +54,53 @@ impl AdapterHost {
         whatsapp_phone: Arc<WhatsAppPhoneVault>,
         replacements: Vec<Box<dyn ProtocolAdapter>>,
     ) -> Self {
+        Self::spawn_with_accounts(
+            handle,
+            secrets,
+            discord,
+            slack,
+            whatsapp_phone,
+            replacements,
+            None,
+        )
+    }
+
+    /// [`Self::spawn`] with a factory for the adapters of more accounts.
+    /// [`AdapterCommand::AddAccount`] calls it.
+    #[must_use]
+    pub fn spawn_with_accounts(
+        handle: &Handle,
+        secrets: Arc<dyn TelegramSecretVault>,
+        discord: Arc<dyn DiscordSecretVault>,
+        slack: Arc<dyn SlackSecretVault>,
+        whatsapp_phone: Arc<WhatsAppPhoneVault>,
+        replacements: Vec<Box<dyn ProtocolAdapter>>,
+        accounts: Option<AccountFactory>,
+    ) -> Self {
         let login_epoch: LoginEpoch = Arc::new(AtomicU64::new(0));
         let adapter_epoch = Arc::clone(&login_epoch);
-        Self::spawn_inner(handle, login_epoch, move || {
-            registry(
-                secrets,
-                discord,
-                slack,
-                whatsapp_phone,
-                adapter_epoch,
-                replacements,
-            )
-        })
+        let build_epoch = Arc::clone(&login_epoch);
+        let build = accounts.map(|factory| {
+            Box::new(move |account: ProtocolId| {
+                let parts = factory(account)?;
+                Some(build_account_adapter(parts, &build_epoch))
+            }) as Builder
+        });
+        Self::spawn_inner(
+            handle,
+            login_epoch,
+            move || {
+                registry(
+                    secrets,
+                    discord,
+                    slack,
+                    whatsapp_phone,
+                    adapter_epoch,
+                    replacements,
+                )
+            },
+            build,
+        )
     }
 
     /// Spawn the worker with these adapters in place of the app's registry.
@@ -50,25 +108,61 @@ impl AdapterHost {
     /// and the error handling are the same as in [`Self::spawn`].
     #[must_use]
     pub fn spawn_adapters(handle: &Handle, adapters: Vec<Box<dyn ProtocolAdapter>>) -> Self {
-        Self::spawn_inner(handle, Arc::new(AtomicU64::new(0)), move || adapters)
+        Self::spawn_inner(handle, Arc::new(AtomicU64::new(0)), move || adapters, None)
+    }
+
+    /// [`Self::spawn_adapters`] with a builder for the adapters of more
+    /// accounts. For tests of the account routing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn spawn_adapters_with_accounts(
+        handle: &Handle,
+        adapters: Vec<Box<dyn ProtocolAdapter>>,
+        accounts: impl Fn(ProtocolId) -> Option<Box<dyn ProtocolAdapter>> + Send + 'static,
+    ) -> Self {
+        Self::spawn_inner(
+            handle,
+            Arc::new(AtomicU64::new(0)),
+            move || adapters,
+            Some(Box::new(accounts)),
+        )
     }
 
     fn spawn_inner(
         handle: &Handle,
         login_epoch: LoginEpoch,
         adapters: impl FnOnce() -> Vec<Box<dyn ProtocolAdapter>> + Send + 'static,
+        build: Option<Builder>,
     ) -> Self {
         let (event_tx, event_rx) = unbounded_channel();
-        let (command_tx, mut command_rx) = unbounded_channel();
+        let (command_tx, mut command_rx) = unbounded_channel::<AdapterCommand>();
 
         handle.spawn(async move {
-            let mut adapters = adapters();
-            for adapter in &mut adapters {
-                adapter.start(event_tx.clone());
+            let mut instances: Vec<Instance> = adapters()
+                .into_iter()
+                .map(|adapter| Instance {
+                    account: adapter.id(),
+                    adapter,
+                    events: event_tx.clone(),
+                })
+                .collect();
+            for instance in &mut instances {
+                instance.adapter.start(instance.events.clone());
             }
 
             while let Some(command) = command_rx.recv().await {
-                let _ = dispatch(&mut adapters, command, &event_tx);
+                let (account, command) = command.route();
+                match command {
+                    AdapterCommand::AddAccount { .. } => {
+                        add_account(&mut instances, account, build.as_ref(), &event_tx);
+                    }
+                    AdapterCommand::RemoveAccount { .. } => {
+                        remove_account(&mut instances, account);
+                    }
+                    command => {
+                        let _ = dispatch(&mut instances, account, command, &event_tx);
+                    }
+                }
             }
         });
 
@@ -190,44 +284,153 @@ fn stamp_login_failure(auth_epoch: Option<u64>, status: AdapterEvent) -> Adapter
 
 /// Record the login epoch a Telegram step was sent under.
 fn stamp_auth_epoch(command: &mut AdapterCommand, epoch: u64) {
-    if let AdapterCommand::TelegramAuth { epoch: slot, .. } = command {
-        *slot = epoch;
+    match command {
+        AdapterCommand::TelegramAuth { epoch: slot, .. } => *slot = epoch,
+        // The login step of another Telegram account (ADR 0014).
+        AdapterCommand::ToAccount { command, .. } => stamp_auth_epoch(command, epoch),
+        _ => {}
     }
 }
 
-/// Commands that end the current Telegram client's login flow.
+/// Commands that end the login flow of a Telegram client. Every Telegram
+/// account shares the login epoch.
 fn ends_telegram_login(command: &AdapterCommand) -> bool {
     matches!(
         command,
-        AdapterCommand::Disconnect {
-            protocol: ProtocolId::Telegram
-        } | AdapterCommand::Shutdown {
-            protocol: ProtocolId::Telegram
-        }
+        AdapterCommand::Disconnect { protocol } | AdapterCommand::Shutdown { protocol }
+            if protocol.is(ProtocolKind::Telegram)
     )
 }
 
 /// Unwrap a stamped login event if its epoch is current; drop a stale one.
-/// Other events pass unchanged.
+/// An event of another account keeps its account. Other events pass
+/// unchanged.
 fn deliver(event: AdapterEvent, current_epoch: u64) -> Option<AdapterEvent> {
     match event {
         AdapterEvent::Login { epoch, event } => (epoch == current_epoch).then_some(*event),
+        AdapterEvent::FromAccount { account, event } => {
+            deliver(*event, current_epoch).map(|inner| inner.for_account(account))
+        }
         other => Some(other),
     }
 }
 
-/// Route one command to its adapter. Returns true when the adapter failed
-/// it in `handle`; the host then sends that failure as a `Status` event.
-pub(crate) fn dispatch(
+/// Builds the adapter of one more account.
+type Builder = Box<dyn Fn(ProtocolId) -> Option<Box<dyn ProtocolAdapter>> + Send>;
+
+/// The adapter of an account other than 0, from its parts.
+fn build_account_adapter(parts: AccountAdapter, epoch: &LoginEpoch) -> Box<dyn ProtocolAdapter> {
+    match parts {
+        AccountAdapter::Telegram(vault) => Box::new(super::TelegramAdapter::with_login_epoch(
+            vault,
+            super::telegram::TelegramApiSource::from_build(),
+            Arc::clone(epoch),
+        )),
+        AccountAdapter::Discord(vault) => Box::new(super::DiscordAdapter::new(vault)),
+        AccountAdapter::Slack(vault) => super::slack::registry_adapter(vault),
+        AccountAdapter::Ready(adapter) => adapter,
+    }
+}
+
+/// Start the adapter of `account`. Account 0, an account that runs, and a
+/// build with no factory start nothing.
+fn add_account(
+    instances: &mut Vec<Instance>,
+    account: ProtocolId,
+    build: Option<&Builder>,
+    main: &EventTx,
+) {
+    if account.slot() == 0 || instances.iter().any(|instance| instance.account == account) {
+        return;
+    }
+    let Some(mut adapter) = build.and_then(|build| build(account)) else {
+        tracing::warn!(%account, "this build cannot start another account");
+        return;
+    };
+    let events = forwarder(account, main.clone());
+    adapter.start(events.clone());
+    instances.push(Instance {
+        account,
+        adapter,
+        events,
+    });
+}
+
+/// Shut the adapter of `account` down and drop it. Account 0 stays.
+fn remove_account(instances: &mut Vec<Instance>, account: ProtocolId) {
+    if account.slot() == 0 {
+        return;
+    }
+    if let Some(at) = instances
+        .iter()
+        .position(|instance| instance.account == account)
+    {
+        let mut instance = instances.remove(at);
+        instance.adapter.shutdown(&instance.events);
+    }
+}
+
+/// A sender for the adapter of `account`: each event gets the account
+/// before it goes to `main`. The order of the events stays.
+fn forwarder(account: ProtocolId, main: EventTx) -> EventTx {
+    let (tx, mut rx) = unbounded_channel::<AdapterEvent>();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if main.send(event.for_account(account)).is_err() {
+                break;
+            }
+        }
+    });
+    tx
+}
+
+/// Route one command to the adapter of `account`. Returns true when the
+/// adapter failed it in `handle`; the host then sends that failure as a
+/// `Status` event.
+fn dispatch(
+    instances: &mut [Instance],
+    account: ProtocolId,
+    command: AdapterCommand,
+    main: &EventTx,
+) -> bool {
+    let Some(instance) = instances
+        .iter_mut()
+        .find(|instance| instance.account == account)
+    else {
+        // An account with no adapter, for example a helper that this build
+        // cannot start: it is stopped already, so the close does not wait.
+        if matches!(command, AdapterCommand::Shutdown { .. }) {
+            let _ = main.send(AdapterEvent::Stopped { protocol: account });
+        }
+        tracing::warn!(%account, "no adapter registered");
+        return false;
+    };
+    dispatch_to(&mut instance.adapter, command, &instance.events)
+}
+
+/// [`dispatch`] over a plain list of account-0 adapters, for the contract
+/// kit and the tests.
+#[cfg(any(test, feature = "contract-kit"))]
+pub(crate) fn dispatch_adapters(
     adapters: &mut [Box<dyn ProtocolAdapter>],
     command: AdapterCommand,
-    events: &super::EventTx,
+    events: &EventTx,
 ) -> bool {
-    let protocol = command.protocol();
+    let (account, command) = command.route();
+    let protocol = account.first_account();
     let Some(adapter) = adapters.iter_mut().find(|adapter| adapter.id() == protocol) else {
         tracing::warn!(%protocol, "no adapter registered");
         return false;
     };
+    dispatch_to(adapter, command, events)
+}
+
+/// Hand one command, as its adapter sees it, to `adapter`.
+fn dispatch_to(
+    adapter: &mut Box<dyn ProtocolAdapter>,
+    command: AdapterCommand,
+    events: &EventTx,
+) -> bool {
     // Every adapter answers Shutdown, so the app can wait for all of them.
     if matches!(command, AdapterCommand::Shutdown { .. }) {
         adapter.shutdown(events);
@@ -416,13 +619,79 @@ mod tests {
         ));
     }
 
+    /// `AddAccount` starts a second adapter. Its events carry its account,
+    /// and a command for that account reaches it as account 0. Account 0
+    /// keeps its own adapter. `RemoveAccount` shuts it down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_account_has_its_own_adapter_and_tagged_events() {
+        let second = ProtocolId::account(crate::ProtocolKind::Telegram, 1).expect("slot");
+        let mut host = AdapterHost::spawn_adapters_with_accounts(
+            &Handle::current(),
+            vec![Box::new(crate::FakeAdapter::default())],
+            |account| {
+                (account.slot() == 1)
+                    .then(|| Box::new(crate::FakeAdapter::default()) as Box<dyn ProtocolAdapter>)
+            },
+        );
+        host.send(AdapterCommand::AddAccount { protocol: second });
+        host.send(AdapterCommand::Connect { protocol: second });
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !seen.iter().any(|event| {
+                matches!(event, AdapterEvent::ConversationUpsert { conversation } if conversation.protocol == second)
+            })
+        {
+            seen.extend(host.poll_events());
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            AdapterEvent::Account { protocol, state: crate::AccountState::Linked } if *protocol == second
+        )), "the second adapter started: {seen:?}");
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                AdapterEvent::Account {
+                    protocol: ProtocolId::Telegram,
+                    ..
+                }
+            )),
+            "account 0 has its own adapter: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation } if conversation.protocol == second
+            )),
+            "the Connect of the second account reached its adapter: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|event| matches!(
+                event,
+                AdapterEvent::ConversationUpsert { conversation } if conversation.protocol == ProtocolId::Telegram
+            )),
+            "the Connect did not reach account 0: {seen:?}"
+        );
+        host.send(AdapterCommand::RemoveAccount { protocol: second });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut stopped = false;
+        while std::time::Instant::now() < deadline && !stopped {
+            stopped = host.poll_events().iter().any(
+                |event| matches!(event, AdapterEvent::Stopped { protocol } if *protocol == second),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(stopped, "the second adapter stopped");
+    }
+
     #[test]
     fn view_chat_reaches_the_default_method_and_emits_nothing() {
         let mut adapters: Vec<Box<dyn ProtocolAdapter>> =
             vec![Box::new(crate::FakeAdapter::default())];
         let (tx, mut rx) = unbounded_channel();
         for conversation_id in [Some("telegram:1".to_owned()), None] {
-            dispatch(
+            dispatch_adapters(
                 &mut adapters,
                 AdapterCommand::ViewChat {
                     protocol: ProtocolId::Telegram,

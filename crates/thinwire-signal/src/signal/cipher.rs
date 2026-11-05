@@ -115,7 +115,7 @@ fn remember_key() -> Result<[u8; 32], ()> {
 
 #[cfg(not(test))]
 fn remember_key() -> Result<[u8; 32], ()> {
-    match load_store_key(SIGNAL_STORE_KEY_ACCOUNT) {
+    match load_store_key(&super::path::account_key_name(SIGNAL_STORE_KEY_ACCOUNT)) {
         LoadStoreKey::Found(key) => {
             let bytes = key.bytes();
             let _ = SESSION_KEY.set(bytes);
@@ -137,7 +137,7 @@ fn test_key() -> [u8; 32] {
 
 #[cfg(not(test))]
 fn resolve_key(encrypted_present: bool, dir: &Path) -> Result<[u8; 32], ProtectFail> {
-    let loaded = load_store_key(SIGNAL_STORE_KEY_ACCOUNT);
+    let loaded = load_store_key(&super::path::account_key_name(SIGNAL_STORE_KEY_ACCOUNT));
     match store_key_action(&loaded, encrypted_present) {
         StoreKeyAction::Open => match loaded {
             LoadStoreKey::Found(key) => Ok(key.bytes()),
@@ -148,11 +148,13 @@ fn resolve_key(encrypted_present: bool, dir: &Path) -> Result<[u8; 32], ProtectF
         StoreKeyAction::Denied => Err(ProtectFail::KeychainDenied),
         StoreKeyAction::NotSaved => Err(ProtectFail::NotSaved),
         StoreKeyAction::MoveAside => Err(move_aside(dir)),
-        StoreKeyAction::Create => match create_store_key(SIGNAL_STORE_KEY_ACCOUNT) {
-            Ok(key) => Ok(key.bytes()),
-            Err(CreateStoreKeyError::NotSaved) => Err(ProtectFail::NotSaved),
-            Err(CreateStoreKeyError::Unavailable) => Err(ProtectFail::KeychainDenied),
-        },
+        StoreKeyAction::Create => {
+            match create_store_key(&super::path::account_key_name(SIGNAL_STORE_KEY_ACCOUNT)) {
+                Ok(key) => Ok(key.bytes()),
+                Err(CreateStoreKeyError::NotSaved) => Err(ProtectFail::NotSaved),
+                Err(CreateStoreKeyError::Unavailable) => Err(ProtectFail::KeychainDenied),
+            }
+        }
     }
 }
 

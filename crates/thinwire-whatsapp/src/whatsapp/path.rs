@@ -18,6 +18,45 @@ const SESSION_LOCK_FILE: &str = "helper.lock";
 /// place of the folder under the platform app-data folder.
 static SESSION_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// The account number of this helper (ADR 0014). 0 is the first account.
+/// Account `n` keeps its store in its own folder and its key under its own
+/// keychain name.
+static ACCOUNT: OnceLock<u8> = OnceLock::new();
+
+/// Run as account `slot`. Call it one time, before the adapter starts.
+///
+/// # Errors
+///
+/// Returns `slot` when an account is already set.
+pub fn set_account(slot: u8) -> Result<(), u8> {
+    ACCOUNT.set(slot)
+}
+
+/// The account number of this helper. 0 when none was set.
+#[must_use]
+pub(crate) fn account() -> u8 {
+    ACCOUNT.get().copied().unwrap_or(0)
+}
+
+/// `base` for account 0, `base-n` for account `n`: the session folder.
+fn account_folder(base: &str) -> String {
+    match account() {
+        0 => base.to_owned(),
+        slot => format!("{base}-{slot}"),
+    }
+}
+
+/// `name` for account 0, `name#n` for account `n`: the keychain name.
+#[must_use]
+// The keychain code that calls it is off in a test build.
+#[cfg_attr(any(test, not(feature = "whatsapp-web")), allow(dead_code))]
+pub(crate) fn account_key_name(name: &str) -> String {
+    match account() {
+        0 => name.to_owned(),
+        slot => format!("{name}#{slot}"),
+    }
+}
+
 /// Keep the session store in `dir`, not under the platform app-data folder.
 /// Call it one time, before the adapter starts. The tests of the helper
 /// process use it, so they never touch the session of the user.
@@ -33,7 +72,7 @@ pub fn set_session_dir(dir: PathBuf) -> Result<(), PathBuf> {
 pub(crate) fn device_store_file(data_dir: &Path) -> PathBuf {
     data_dir
         .join("thinwire")
-        .join("whatsapp")
+        .join(account_folder("whatsapp"))
         .join(DEVICE_STORE_FILE)
 }
 

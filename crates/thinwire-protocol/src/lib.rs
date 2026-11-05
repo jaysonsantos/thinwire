@@ -23,13 +23,13 @@ mod whatsapp;
 pub use adapter::{
     APP_CLOSE_LIMIT, AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus,
     Arrival, ChatMessage, ChatTopic, Conversation, Delivery, DiscordAuthMode, EventTx, HelperFault,
-    HelperState, HistorySkipRun, HistoryStoreCursor, MAX_HISTORY_CURSOR_RUNS, MessageTopic,
-    OutgoingUpdate, ProtocolAdapter, ProtocolCapabilities, ProtocolId, RedactedPairingSecret,
-    StoreAccessReason, SupportClass, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
-    TelegramCodeVia, command_reads_session_key, emit_account, emit_chat_list_loaded,
-    emit_conversation, emit_history_loaded, emit_message, emit_older_history_loaded,
-    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped, ordered_topics,
-    outgoing_delivery, topic_mute_id, with_outbox_read,
+    HelperState, HistorySkipRun, HistoryStoreCursor, MAX_ACCOUNT_SLOT, MAX_HISTORY_CURSOR_RUNS,
+    MessageTopic, OutgoingUpdate, ProtocolAdapter, ProtocolCapabilities, ProtocolId, ProtocolKind,
+    RedactedPairingSecret, StoreAccessReason, SupportClass, TelegramAuthError, TelegramAuthPhase,
+    TelegramAuthStep, TelegramCodeVia, command_reads_session_key, emit_account,
+    emit_chat_list_loaded, emit_conversation, emit_history_loaded, emit_message,
+    emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
+    ordered_topics, outgoing_delivery, topic_mute_id, with_outbox_read,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -37,7 +37,7 @@ pub use discord::{
 };
 pub use fake::FakeAdapter;
 pub use helper::{HelperAdapter, HelperLauncher, HelperSpec, ProcessLauncher};
-pub use host::{AdapterHost, HostSender};
+pub use host::{AccountAdapter, AccountFactory, AdapterHost, HostSender};
 pub use log_id::LogChatId;
 pub use media::{
     AudioPath, ChatAvatar, FILES_PER_MESSAGE, ImageBytes, ImagePath, MAX_ATTACHMENT_BYTES,
@@ -62,8 +62,9 @@ pub use session_cipher::{
 pub use signal::{
     SIGNAL_DEVICE_REMOVED, SIGNAL_HELPER_PROGRAM, SIGNAL_LINK_CHECK, SIGNAL_PREVIOUS_ACCOUNT,
     SIGNAL_RETAINED_RESET, SIGNAL_RETAINED_SETTLED, SIGNAL_RETAINED_UNREADABLE, SignalAdapter,
-    signal_helper_adapter, signal_retained_chat, signal_retained_chat_id, signal_retained_slot,
-    signal_retained_unreadable_detail, signal_retained_unreadable_slot,
+    signal_helper_adapter, signal_helper_adapter_for, signal_retained_chat,
+    signal_retained_chat_id, signal_retained_slot, signal_retained_unreadable_detail,
+    signal_retained_unreadable_slot,
 };
 pub use slack::{
     DEDUP_FRESH_SECS, MemorySlackVault, SLACK_CONVERSATION_PREFIX, SLACK_OAUTH_CALLBACK_PATH,
@@ -89,7 +90,7 @@ pub use telegram::{
 };
 pub use whatsapp::{
     WHATSAPP_HELPER_PROGRAM, WHATSAPP_QR_EXHAUSTED, WhatsAppAdapter, WhatsAppPhoneVault,
-    whatsapp_helper_adapter,
+    whatsapp_helper_adapter, whatsapp_helper_adapter_for,
 };
 
 /// Shell protocols in display order. Signal is hidden unless `signal-local` is on.

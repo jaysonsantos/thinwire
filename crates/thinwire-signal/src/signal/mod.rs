@@ -11,7 +11,7 @@ mod device;
 mod group;
 mod message;
 mod path;
-pub use path::{SessionLock, SessionLockError, lock_session, set_session_dir};
+pub use path::{SessionLock, SessionLockError, lock_session, set_account, set_session_dir};
 mod reconnect;
 mod time;
 mod wake;

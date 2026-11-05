@@ -65,14 +65,28 @@ pub fn whatsapp_helper_adapter(
     phone: Arc<WhatsAppPhoneVault>,
     configured: Option<PathBuf>,
 ) -> crate::helper::HelperAdapter {
+    whatsapp_helper_adapter_for(phone, configured, 0)
+}
+
+/// The helper adapter of WhatsApp account `slot` (ADR 0014). Account `n`
+/// starts its own helper with `--account n`: its own session folder, lock,
+/// and keychain name. Every account shares the phone vault: one pairing
+/// runs at a time.
+#[must_use]
+pub fn whatsapp_helper_adapter_for(
+    phone: Arc<WhatsAppPhoneVault>,
+    configured: Option<PathBuf>,
+    slot: u8,
+) -> crate::helper::HelperAdapter {
     crate::helper::HelperAdapter::new(
         crate::helper::HelperSpec {
             protocol: ProtocolId::WhatsApp,
             capabilities: HELPER_CAPABILITIES,
         },
-        Arc::new(crate::helper::ProcessLauncher::new(
+        Arc::new(crate::helper::account_launcher(
             WHATSAPP_HELPER_PROGRAM,
             configured,
+            slot,
         )),
         Some(phone),
     )

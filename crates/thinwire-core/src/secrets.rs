@@ -144,11 +144,22 @@ struct Inner {
 /// Memory-first store. OS keychain attach/flush is worker-only.
 pub struct SecretStore {
     inner: Mutex<Inner>,
+    /// The account number of this store (ADR 0014). 0 is the first account
+    /// and uses the names it always had. Account `n` adds `#n` to the
+    /// keychain name of each value of the account, and `-n` to the TDLib
+    /// folder. The names of the app (the Telegram API id and hash, the Slack
+    /// app keys) stay shared.
+    scope: u8,
 }
 
 impl SecretStore {
     fn blank(phase: AttachPhase) -> Self {
+        Self::scoped_blank(phase, 0)
+    }
+
+    fn scoped_blank(phase: AttachPhase, scope: u8) -> Self {
         Self {
+            scope,
             inner: Mutex::new(Inner {
                 values: HashMap::new(),
                 dirty: HashSet::new(),
@@ -218,6 +229,30 @@ impl SecretStore {
         let store = Arc::new(Self::blank(AttachPhase::Detached));
         store.spawn_os_attach(handle);
         store
+    }
+
+    /// The store of account `slot` of a protocol (ADR 0014). It reads and
+    /// writes its own keychain names. Account 0 is [`Self::for_ui`].
+    #[must_use]
+    pub fn for_account(handle: &Handle, slot: u8) -> Arc<Self> {
+        if memory_requested() {
+            return Arc::new(Self::scoped_blank(AttachPhase::MemoryOnly, slot));
+        }
+        let store = Arc::new(Self::scoped_blank(AttachPhase::Detached, slot));
+        store.spawn_os_attach(handle);
+        store
+    }
+
+    /// A memory store of account `slot`, for tests.
+    #[must_use]
+    pub fn memory_for_account(slot: u8) -> Self {
+        Self::scoped_blank(AttachPhase::MemoryOnly, slot)
+    }
+
+    /// The account number of this store. 0 is the first account.
+    #[must_use]
+    pub const fn scope(&self) -> u8 {
+        self.scope
     }
 
     /// Blocking attach used by tests. The app calls [`Self::for_ui`] instead.
@@ -458,9 +493,9 @@ impl SecretStore {
             Ok(backend) => {
                 self.store_probed_secrets(
                     backend,
-                    read_os_snapshot(),
-                    read_discord_os_token(),
-                    read_slack_os(),
+                    read_os_snapshot(self.scope),
+                    read_discord_os_token(self.scope),
+                    read_slack_os(self.scope),
                 );
             }
             Err(error) => {
@@ -605,8 +640,8 @@ impl SecretStore {
         }
         for (key, value) in snapshot {
             match value {
-                Some(value) => os_set(*key, value)?,
-                None => os_delete(*key)?,
+                Some(value) => os_set(self.scope, *key, value)?,
+                None => os_delete(self.scope, *key)?,
             }
         }
         self.flush_discord_token()?;
@@ -623,8 +658,8 @@ impl SecretStore {
             inner.discord_bot_token.clone()
         };
         let write = match snapshot {
-            Some(value) => discord_os_set(&value),
-            None => discord_os_delete(),
+            Some(value) => discord_os_set(self.scope, &value),
+            None => discord_os_delete(self.scope),
         };
         if let Err(error) = write {
             if let Ok(mut inner) = self.lock() {
@@ -765,8 +800,8 @@ impl SecretStore {
         };
         for (index, (key, value)) in snapshot.iter().enumerate() {
             let write = match value {
-                Some(value) => slack_os_set(*key, value),
-                None => slack_os_delete(*key),
+                Some(value) => slack_os_set(self.scope, *key, value),
+                None => slack_os_delete(self.scope, *key),
             };
             if let Err(error) = write {
                 if let Ok(mut inner) = self.lock() {
@@ -902,14 +937,19 @@ impl TelegramSecretVault for SecretStore {
         self.persistence() != Persistence::ThisSession
     }
 
-    fn tdlib_folder_name(&self) -> &'static str {
+    fn tdlib_folder_name(&self) -> std::borrow::Cow<'static, str> {
         let keyutils = self
             .lock()
             .is_ok_and(|inner| inner.os_backend == Some(OsBackend::KernelKeyring));
-        if keyutils {
+        let base = if keyutils {
             TDLIB_KEYUTILS_FOLDER
         } else {
             TDLIB_FOLDER
+        };
+        if self.scope == 0 {
+            base.into()
+        } else {
+            format!("{base}-{}", self.scope).into()
         }
     }
 }
@@ -926,10 +966,10 @@ enum FlushAction {
 /// `Ok(None)` omits the key. That is a confirmed missing entry. `Err` drops
 /// keys already read and returns the error, so a later key failure cannot be
 /// applied as a partial `Ready` snapshot.
-fn read_os_snapshot() -> Result<HashMap<SecretKey, String>, SecretError> {
+fn read_os_snapshot(scope: u8) -> Result<HashMap<SecretKey, String>, SecretError> {
     let mut os_values = HashMap::new();
     for key in SecretKey::PERSISTENT {
-        match os_get(key) {
+        match os_get(scope, key) {
             Ok(Some(value)) => {
                 os_values.insert(key, value);
             }
@@ -1127,51 +1167,71 @@ fn install_platform_store() -> Result<OsBackend, AttachError> {
     Ok(OsBackend::Native)
 }
 
-fn os_entry(key: SecretKey) -> Result<Entry, SecretError> {
-    ensure_default_store()?;
-    Entry::new(TELEGRAM_SECRET_SERVICE, key.account()).map_err(map_keyring_error)
+/// The keychain name of a value of account `scope`: `name` for account 0
+/// and for a value of the app, `name#n` for account `n` (ADR 0014).
+fn scoped_name(scope: u8, name: &str, shared: bool) -> String {
+    if scope == 0 || shared {
+        name.to_owned()
+    } else {
+        format!("{name}#{scope}")
+    }
 }
 
-fn os_set(key: SecretKey, value: &str) -> Result<(), SecretError> {
-    os_entry(key)?
+fn os_entry(scope: u8, key: SecretKey) -> Result<Entry, SecretError> {
+    ensure_default_store()?;
+    // The API id and hash name the app, not the account.
+    let shared = matches!(key, SecretKey::ApiId | SecretKey::ApiHash);
+    let name = scoped_name(scope, key.account(), shared);
+    Entry::new(TELEGRAM_SECRET_SERVICE, &name).map_err(map_keyring_error)
+}
+
+fn os_set(scope: u8, key: SecretKey, value: &str) -> Result<(), SecretError> {
+    os_entry(scope, key)?
         .set_password(value)
         .map_err(map_keyring_error)
 }
 
-fn os_get(key: SecretKey) -> Result<Option<String>, SecretError> {
-    match os_entry(key)?.get_password() {
+fn os_get(scope: u8, key: SecretKey) -> Result<Option<String>, SecretError> {
+    match os_entry(scope, key)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
 
-fn discord_os_entry() -> Result<Entry, SecretError> {
+fn discord_os_entry(scope: u8) -> Result<Entry, SecretError> {
     ensure_default_store()?;
-    Entry::new(DISCORD_SECRET_SERVICE, DISCORD_SECRET_BOT_TOKEN).map_err(map_keyring_error)
+    let name = scoped_name(scope, DISCORD_SECRET_BOT_TOKEN, false);
+    Entry::new(DISCORD_SECRET_SERVICE, &name).map_err(map_keyring_error)
 }
 
-fn read_discord_os_token() -> Result<Option<String>, SecretError> {
-    match discord_os_entry()?.get_password() {
+fn read_discord_os_token(scope: u8) -> Result<Option<String>, SecretError> {
+    match discord_os_entry(scope)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
 
-fn discord_os_set(value: &str) -> Result<(), SecretError> {
-    discord_os_entry()?
+fn discord_os_set(scope: u8, value: &str) -> Result<(), SecretError> {
+    discord_os_entry(scope)?
         .set_password(value)
         .map_err(map_keyring_error)
 }
 
-fn slack_os_entry(key: SlackSecretKey) -> Result<Entry, SecretError> {
+fn slack_os_entry(scope: u8, key: SlackSecretKey) -> Result<Entry, SecretError> {
     ensure_default_store()?;
-    Entry::new(SLACK_SECRET_SERVICE, key.account()).map_err(map_keyring_error)
+    // The client id, the client secret, and the app token name the app.
+    let shared = matches!(
+        key,
+        SlackSecretKey::ClientId | SlackSecretKey::ClientSecret | SlackSecretKey::AppToken
+    );
+    let name = scoped_name(scope, key.account(), shared);
+    Entry::new(SLACK_SECRET_SERVICE, &name).map_err(map_keyring_error)
 }
 
-fn slack_os_get(key: SlackSecretKey) -> Result<Option<String>, SecretError> {
-    match slack_os_entry(key)?.get_password() {
+fn slack_os_get(scope: u8, key: SlackSecretKey) -> Result<Option<String>, SecretError> {
+    match slack_os_entry(scope, key)?.get_password() {
         Ok(value) => Ok(Some(value)),
         Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(error) => Err(map_keyring_error(error)),
@@ -1184,38 +1244,38 @@ fn requeue_slack(dirty: &mut HashSet<SlackSecretKey>, pending: &[SlackSecretKey]
     }
 }
 
-fn slack_os_set(key: SlackSecretKey, value: &str) -> Result<(), SecretError> {
-    slack_os_entry(key)?
+fn slack_os_set(scope: u8, key: SlackSecretKey, value: &str) -> Result<(), SecretError> {
+    slack_os_entry(scope, key)?
         .set_password(value)
         .map_err(map_keyring_error)
 }
 
-fn slack_os_delete(key: SlackSecretKey) -> Result<(), SecretError> {
-    match slack_os_entry(key)?.delete_credential() {
+fn slack_os_delete(scope: u8, key: SlackSecretKey) -> Result<(), SecretError> {
+    match slack_os_entry(scope, key)?.delete_credential() {
         Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
 
-fn read_slack_os() -> Result<Vec<(SlackSecretKey, String)>, SecretError> {
+fn read_slack_os(scope: u8) -> Result<Vec<(SlackSecretKey, String)>, SecretError> {
     let mut found = Vec::new();
     for key in SlackSecretKey::PERSISTENT {
-        if let Some(value) = slack_os_get(key)? {
+        if let Some(value) = slack_os_get(scope, key)? {
             found.push((key, value));
         }
     }
     Ok(found)
 }
 
-fn discord_os_delete() -> Result<(), SecretError> {
-    match discord_os_entry()?.delete_credential() {
+fn discord_os_delete(scope: u8) -> Result<(), SecretError> {
+    match discord_os_entry(scope)?.delete_credential() {
         Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(error) => Err(map_keyring_error(error)),
     }
 }
 
-fn os_delete(key: SecretKey) -> Result<(), SecretError> {
-    match os_entry(key)?.delete_credential() {
+fn os_delete(scope: u8, key: SecretKey) -> Result<(), SecretError> {
+    match os_entry(scope, key)?.delete_credential() {
         Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(error) => Err(map_keyring_error(error)),
     }

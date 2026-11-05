@@ -13,19 +13,21 @@ use super::theme;
 use super::ui::edited;
 use thinwire_core::state::{Snapshot, WhatsAppScreen};
 use thinwire_core::{Intent, ProtocolId, SecretText, View, WhatsAppIntent};
+use thinwire_protocol::ProtocolKind;
 
 /// Start of the link flow, in the middle column. The full notice is the next
 /// step. With no helper program there is no button: the account row already
 /// says to reinstall (ADR 0013 decision 6).
 pub(crate) fn link_offer(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
-    if snapshot.selected_protocol != ProtocolId::WhatsApp || !snapshot.whatsapp_pairing_available()
+    if !snapshot.selected_protocol.is(ProtocolKind::WhatsApp)
+        || !snapshot.whatsapp_pairing_available()
     {
         return;
     }
     let linked = snapshot
         .accounts
         .iter()
-        .any(|row| row.caps.id == ProtocolId::WhatsApp && row.linked());
+        .any(|row| row.caps.id.is(ProtocolKind::WhatsApp) && row.linked());
     if linked || snapshot.helper_missing(ProtocolId::WhatsApp) {
         return;
     }

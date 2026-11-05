@@ -122,7 +122,13 @@ pub struct Settings {
     /// Accepted WhatsApp ban gate copy. `0` means the user has not accepted
     /// the current gate. Any other value is the version they accepted.
     whatsapp_gate_version: u64,
+    /// The accounts after account 0 of each protocol (ADR 0014), in the
+    /// order the user added them.
+    extra_accounts: Vec<thinwire_protocol::ProtocolId>,
 }
+
+/// Settings key of the accounts after account 0.
+const ACCOUNTS_KEY: &str = "accounts";
 
 /// Settings key of the WhatsApp helper path.
 const WHATSAPP_HELPER_KEY: &str = "whatsapp_helper";
@@ -156,6 +162,7 @@ impl Settings {
         let signal_helper = read_path(&path, SIGNAL_HELPER_KEY);
         let signal_notice_version = read_u64(&path, SIGNAL_NOTICE_VERSION_KEY).unwrap_or(0);
         let whatsapp_gate_version = read_u64(&path, WHATSAPP_GATE_VERSION_KEY).unwrap_or(0);
+        let extra_accounts = read_accounts(&path);
         Self {
             theme,
             notifications: read_bool(&path, "notifications").unwrap_or(true),
@@ -171,6 +178,7 @@ impl Settings {
             signal_helper,
             signal_notice_version,
             whatsapp_gate_version,
+            extra_accounts,
         }
     }
 
@@ -193,6 +201,7 @@ impl Settings {
             signal_helper: None,
             signal_notice_version: 0,
             whatsapp_gate_version: 0,
+            extra_accounts: Vec::new(),
         }
     }
 
@@ -207,6 +216,32 @@ impl Settings {
     pub fn set_signal_notice_version(&mut self, version: u64) {
         if self.signal_notice_version != version {
             self.signal_notice_version = version;
+            self.persist_pending = true;
+        }
+    }
+
+    /// The accounts after account 0 of each protocol, in the order the
+    /// user added them.
+    #[must_use]
+    pub fn extra_accounts(&self) -> &[thinwire_protocol::ProtocolId] {
+        &self.extra_accounts
+    }
+
+    /// Remember one more account. Account 0 and a known account change
+    /// nothing. Disk persist is queued.
+    pub fn add_extra_account(&mut self, account: thinwire_protocol::ProtocolId) {
+        if account.slot() == 0 || self.extra_accounts.contains(&account) {
+            return;
+        }
+        self.extra_accounts.push(account);
+        self.persist_pending = true;
+    }
+
+    /// Forget one account. Its keychain values and files stay.
+    pub fn remove_extra_account(&mut self, account: thinwire_protocol::ProtocolId) {
+        let before = self.extra_accounts.len();
+        self.extra_accounts.retain(|known| *known != account);
+        if self.extra_accounts.len() != before {
             self.persist_pending = true;
         }
     }
@@ -357,6 +392,14 @@ impl Settings {
                 self.whatsapp_gate_version
             ));
         }
+        if !self.extra_accounts.is_empty() {
+            let keys: Vec<String> = self
+                .extra_accounts
+                .iter()
+                .map(|account| account.key())
+                .collect();
+            text.push_str(&format!("{ACCOUNTS_KEY} = \"{}\"\n", keys.join(",")));
+        }
         // Keep the helper paths of the user when another setting changes.
         for (key, path) in [
             (WHATSAPP_HELPER_KEY, &self.whatsapp_helper),
@@ -390,6 +433,30 @@ fn read_u64(path: &std::path::Path, wanted: &str) -> Option<u64> {
         }
         value.trim().parse().ok()
     })
+}
+
+/// The `accounts = "telegram#1,whatsapp#2"` line. A name that is not an
+/// account after account 0 is skipped.
+fn read_accounts(path: &std::path::Path) -> Vec<thinwire_protocol::ProtocolId> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Some(value) = contents.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        (key.trim() == ACCOUNTS_KEY).then(|| value.trim().trim_matches('"').to_owned())
+    }) else {
+        return Vec::new();
+    };
+    let mut accounts = Vec::new();
+    for name in value.split(',') {
+        if let Some(account) = thinwire_protocol::ProtocolId::from_key(name.trim())
+            && account.slot() > 0
+            && !accounts.contains(&account)
+        {
+            accounts.push(account);
+        }
+    }
+    accounts
 }
 
 /// A `key = true|false` line. Anything else is `None`.
@@ -591,6 +658,43 @@ mod tests {
             "the helper path still reads"
         );
         assert_eq!(Settings::in_memory().signal_notice_version(), 0);
+    }
+
+    /// The accounts after account 0 persist in their order. A bad name is
+    /// skipped, and account 0 never goes in the list.
+    #[test]
+    fn extra_accounts_persist_in_order() {
+        use thinwire_protocol::{ProtocolId, ProtocolKind};
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.extra_accounts().is_empty());
+        let second = ProtocolId::account(ProtocolKind::WhatsApp, 1).expect("slot");
+        let third = ProtocolId::account(ProtocolKind::Telegram, 2).expect("slot");
+        settings.add_extra_account(second);
+        settings.add_extra_account(third);
+        settings.add_extra_account(second);
+        settings.add_extra_account(ProtocolId::Telegram);
+        settings.persist_now().expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            text.contains("accounts = \"whatsapp#1,telegram#2\""),
+            "{text}"
+        );
+        let loaded = Settings::load_from(path.clone());
+        assert_eq!(loaded.extra_accounts(), [second, third]);
+        settings.remove_extra_account(second);
+        settings.persist_now().expect("save");
+        assert_eq!(Settings::load_from(path.clone()).extra_accounts(), [third]);
+        fs::write(
+            &path,
+            "accounts = \"telegram#1,nope#2,signal#0,telegram#99\"\n",
+        )
+        .expect("write");
+        let read = Settings::load_from(path);
+        assert_eq!(
+            read.extra_accounts(),
+            [ProtocolId::account(ProtocolKind::Telegram, 1).expect("slot")]
+        );
     }
 
     #[test]

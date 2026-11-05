@@ -15,18 +15,20 @@ use thinwire_core::signal_notice::{
 };
 use thinwire_core::state::{SignalScreen, Snapshot};
 use thinwire_core::{Intent, ProtocolId, SignalIntent, View};
+use thinwire_protocol::ProtocolKind;
 
 /// Start of the link flow, in the middle column. The full notice is the next
 /// step. With no helper program there is no button: the account row already
 /// says to reinstall (ADR 0013 decision 6).
 pub(crate) fn link_offer(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
-    if snapshot.selected_protocol != ProtocolId::Signal || !snapshot.signal_linking_available() {
+    if !snapshot.selected_protocol.is(ProtocolKind::Signal) || !snapshot.signal_linking_available()
+    {
         return;
     }
     let linked = snapshot
         .accounts
         .iter()
-        .any(|row| row.caps.id == ProtocolId::Signal && row.linked());
+        .any(|row| row.caps.id.is(ProtocolKind::Signal) && row.linked());
     if linked || snapshot.helper_missing(ProtocolId::Signal) {
         return;
     }

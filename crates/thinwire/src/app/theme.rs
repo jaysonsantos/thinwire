@@ -16,6 +16,7 @@ use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Margin,
     Stroke, TextStyle, Theme, Vec2,
 };
+use thinwire_protocol::ProtocolKind;
 
 /// Semantic colors for one theme. UI code reads colors only from here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,13 +356,12 @@ pub(crate) const FIELD_RING: f32 = 2.0;
 /// [`avatar_ink`], so the pair keeps its 4.5:1 initials contrast.
 #[must_use]
 pub(crate) const fn protocol_tile(protocol: thinwire_protocol::ProtocolId) -> u8 {
-    use thinwire_protocol::ProtocolId;
-    match protocol {
-        ProtocolId::Telegram => 5,
-        ProtocolId::WhatsApp => 3,
-        ProtocolId::Discord => 2,
-        ProtocolId::Slack => 6,
-        ProtocolId::Signal => 4,
+    match protocol.kind() {
+        ProtocolKind::Telegram => 5,
+        ProtocolKind::WhatsApp => 3,
+        ProtocolKind::Discord => 2,
+        ProtocolKind::Slack => 6,
+        ProtocolKind::Signal => 4,
     }
 }
 
@@ -371,14 +371,14 @@ pub(crate) const fn protocol_tile(protocol: thinwire_protocol::ProtocolId) -> u8
 pub(crate) const fn protocol_badge_ink(
     protocol: thinwire_protocol::ProtocolId,
 ) -> (Color32, Color32) {
-    use thinwire_protocol::ProtocolId;
     let mark = Color32::from_rgb(255, 255, 255);
-    let fill = match protocol {
-        ProtocolId::Telegram => hex(0x2A_AB_EE),
-        ProtocolId::WhatsApp => hex(0x25_D3_66),
-        ProtocolId::Signal => hex(0x3A_76_F0),
-        ProtocolId::Discord => hex(0x58_65_F2),
-        ProtocolId::Slack => hex(0xE0_1E_5A),
+    // Every account of a protocol has the same color (ADR 0014).
+    let fill = match protocol.kind() {
+        ProtocolKind::Telegram => hex(0x2A_AB_EE),
+        ProtocolKind::WhatsApp => hex(0x25_D3_66),
+        ProtocolKind::Signal => hex(0x3A_76_F0),
+        ProtocolKind::Discord => hex(0x58_65_F2),
+        ProtocolKind::Slack => hex(0xE0_1E_5A),
     };
     (fill, mark)
 }

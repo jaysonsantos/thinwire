@@ -19,9 +19,10 @@ pub const APP_CLOSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 /// the value it started with. The host drops stale ones (issue #42).
 pub(crate) type LoginEpoch = std::sync::Arc<std::sync::atomic::AtomicU64>;
 
-/// Protocol identifiers. Signal runs in its helper process and needs feature `signal-local`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProtocolId {
+/// The messaging services. Signal runs in its helper process and needs
+/// feature `signal-local`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ProtocolKind {
     Telegram,
     WhatsApp,
     Discord,
@@ -29,7 +30,7 @@ pub enum ProtocolId {
     Signal,
 }
 
-impl ProtocolId {
+impl ProtocolKind {
     pub const ALL: [Self; 5] = [
         Self::Telegram,
         Self::WhatsApp,
@@ -49,17 +50,171 @@ impl ProtocolId {
         }
     }
 
+    /// The lowercase name of settings keys and conversation ids.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Telegram => "telegram",
+            Self::WhatsApp => "whatsapp",
+            Self::Discord => "discord",
+            Self::Slack => "slack",
+            Self::Signal => "signal",
+        }
+    }
+}
+
+/// Highest account number of one protocol. Account 0 is the first account.
+pub const MAX_ACCOUNT_SLOT: u8 = 8;
+
+/// One account of one protocol: the protocol and the account number.
+///
+/// Account 0 is the account that thinwire had before it had more than one.
+/// It keeps its keychain names, folders, and settings keys. Account `n` of
+/// a protocol uses names with `#n` (ADR 0014). The constants
+/// `ProtocolId::Telegram` and the others are account 0.
+///
+/// An adapter sees account 0 only: the host gives each account its own
+/// adapter and tags the events of that adapter with the account.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProtocolId {
+    kind: ProtocolKind,
+    slot: u8,
+}
+
+#[allow(non_upper_case_globals)]
+impl ProtocolId {
+    pub const Telegram: Self = Self::primary(ProtocolKind::Telegram);
+    pub const WhatsApp: Self = Self::primary(ProtocolKind::WhatsApp);
+    pub const Discord: Self = Self::primary(ProtocolKind::Discord);
+    pub const Slack: Self = Self::primary(ProtocolKind::Slack);
+    pub const Signal: Self = Self::primary(ProtocolKind::Signal);
+
+    /// Account 0 of each protocol.
+    pub const ALL: [Self; 5] = [
+        Self::Telegram,
+        Self::WhatsApp,
+        Self::Discord,
+        Self::Slack,
+        Self::Signal,
+    ];
+
+    /// Account 0 of `kind`.
+    #[must_use]
+    pub const fn primary(kind: ProtocolKind) -> Self {
+        Self { kind, slot: 0 }
+    }
+
+    /// Account `slot` of `kind`. `None` above [`MAX_ACCOUNT_SLOT`].
+    #[must_use]
+    pub const fn account(kind: ProtocolKind, slot: u8) -> Option<Self> {
+        if slot > MAX_ACCOUNT_SLOT {
+            None
+        } else {
+            Some(Self { kind, slot })
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> ProtocolKind {
+        self.kind
+    }
+
+    /// The account number. 0 is the first account.
+    #[must_use]
+    pub const fn slot(self) -> u8 {
+        self.slot
+    }
+
+    /// Account 0 of the same protocol. An adapter sees this id.
+    #[must_use]
+    pub const fn first_account(self) -> Self {
+        Self::primary(self.kind)
+    }
+
+    /// The same protocol, account or not.
+    #[must_use]
+    pub const fn is(self, kind: ProtocolKind) -> bool {
+        self.kind as u8 == kind as u8
+    }
+
+    /// The same protocol as `other`, in any account.
+    #[must_use]
+    pub const fn same_protocol(self, other: Self) -> bool {
+        self.kind as u8 == other.kind as u8
+    }
+
+    /// The protocol name, the same for every account.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        self.kind.display_name()
+    }
+
+    /// The protocol name, with the account number after account 0:
+    /// "Telegram", "Telegram 2".
+    #[must_use]
+    pub fn label(self) -> String {
+        if self.slot == 0 {
+            self.display_name().to_owned()
+        } else {
+            format!("{} {}", self.display_name(), u16::from(self.slot) + 1)
+        }
+    }
+
+    /// The key of settings and keychain names: "telegram", "telegram#1".
+    #[must_use]
+    pub fn key(self) -> String {
+        if self.slot == 0 {
+            self.kind.key().to_owned()
+        } else {
+            format!("{}#{}", self.kind.key(), self.slot)
+        }
+    }
+
+    /// Read [`Self::key`] back. `None` for another text.
+    #[must_use]
+    pub fn from_key(text: &str) -> Option<Self> {
+        let (name, slot) = match text.split_once('#') {
+            Some((name, slot)) => (name, slot.parse::<u8>().ok().filter(|slot| *slot > 0)?),
+            None => (text, 0),
+        };
+        let kind = ProtocolKind::ALL
+            .into_iter()
+            .find(|kind| kind.key() == name)?;
+        Self::account(kind, slot)
+    }
+
+    /// A name for an account in the keychain or on disk: `name` for account
+    /// 0, `name#n` for account `n`.
+    #[must_use]
+    pub fn scoped(self, name: &str) -> String {
+        if self.slot == 0 {
+            name.to_owned()
+        } else {
+            format!("{name}#{}", self.slot)
+        }
+    }
+
     /// The inbox downloads a chat photo for this protocol.
     /// The other protocols draw initials.
     #[must_use]
     pub const fn downloads_avatar(self) -> bool {
-        matches!(self, Self::Telegram)
+        self.is(ProtocolKind::Telegram)
+    }
+}
+
+impl fmt::Debug for ProtocolId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.slot == 0 {
+            write!(f, "{:?}", self.kind)
+        } else {
+            write!(f, "{:?}#{}", self.kind, self.slot)
+        }
     }
 }
 
 impl fmt::Display for ProtocolId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.display_name())
+        f.write_str(&self.label())
     }
 }
 
@@ -403,6 +558,23 @@ pub enum AdapterCommand {
         body: String,
         request: u64,
     },
+    /// The host starts the adapter of this account (ADR 0014). Account 0 of
+    /// each protocol starts with the host. No adapter sees this command.
+    AddAccount {
+        protocol: ProtocolId,
+    },
+    /// The host shuts the adapter of this account down and drops it. Its
+    /// data stays. No adapter sees this command.
+    RemoveAccount {
+        protocol: ProtocolId,
+    },
+    /// `command` for the adapter of `account`. The core wraps a command with
+    /// no protocol field (a login step, a pairing) for an account other than
+    /// account 0. The host unwraps it.
+    ToAccount {
+        account: ProtocolId,
+        command: Box<AdapterCommand>,
+    },
     /// Records that the full-screen WhatsApp ban gate was accepted.
     /// Carries no secrets and does not open a network session.
     WhatsAppAcknowledgeRisk,
@@ -473,8 +645,11 @@ impl AdapterCommand {
             | Self::ViewTopic { protocol, .. }
             | Self::RestartHelper { protocol }
             | Self::RetryStoreKey { protocol }
+            | Self::AddAccount { protocol }
+            | Self::RemoveAccount { protocol }
             | Self::DownloadFile { protocol, .. }
             | Self::DownloadVoice { protocol, .. } => protocol,
+            Self::ToAccount { account, .. } => account,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
             Self::WhatsAppAcknowledgeRisk
@@ -483,6 +658,77 @@ impl AdapterCommand {
             Self::SignalAcknowledgeNotice
             | Self::SignalBeginLink { .. }
             | Self::SignalCancelLink => ProtocolId::Signal,
+        }
+    }
+
+    /// The command for `account`. A command with a protocol field gets the
+    /// account there. Another command, for an account other than 0, goes in
+    /// [`Self::ToAccount`].
+    #[must_use]
+    pub fn for_account(mut self, account: ProtocolId) -> Self {
+        if self.set_protocol(account) || account.slot() == 0 {
+            self
+        } else {
+            Self::ToAccount {
+                account,
+                command: Box::new(self),
+            }
+        }
+    }
+
+    /// The account this command is for, and the command as its adapter
+    /// sees it: every protocol field names account 0 (ADR 0014).
+    #[must_use]
+    pub fn route(self) -> (ProtocolId, Self) {
+        let account = self.protocol();
+        let mut command = match self {
+            Self::ToAccount { command, .. } => *command,
+            other => other,
+        };
+        command.set_protocol(account.first_account());
+        (account, command)
+    }
+
+    /// Set every protocol field. `false` when the command has none.
+    fn set_protocol(&mut self, account: ProtocolId) -> bool {
+        match self {
+            Self::Connect { protocol }
+            | Self::Disconnect { protocol }
+            | Self::LoadChats { protocol }
+            | Self::OpenChat { protocol, .. }
+            | Self::OpenTopic { protocol, .. }
+            | Self::Shutdown { protocol }
+            | Self::LoadOlderMessages { protocol, .. }
+            | Self::LoadOlderTopic { protocol, .. }
+            | Self::SendText { protocol, .. }
+            | Self::SendTopicText { protocol, .. }
+            | Self::SendMedia { protocol, .. }
+            | Self::ResendMessage { protocol, .. }
+            | Self::ViewChat { protocol, .. }
+            | Self::ViewTopic { protocol, .. }
+            | Self::RestartHelper { protocol }
+            | Self::RetryStoreKey { protocol }
+            | Self::AddAccount { protocol }
+            | Self::RemoveAccount { protocol }
+            | Self::DownloadFile { protocol, .. }
+            | Self::DownloadVoice { protocol, .. } => {
+                *protocol = account;
+                true
+            }
+            Self::ToAccount {
+                account: target, ..
+            } => {
+                *target = account;
+                true
+            }
+            Self::ConnectDiscord { .. }
+            | Self::TelegramAuth { .. }
+            | Self::WhatsAppAcknowledgeRisk
+            | Self::WhatsAppBeginLink { .. }
+            | Self::WhatsAppCancelLink
+            | Self::SignalAcknowledgeNotice
+            | Self::SignalBeginLink { .. }
+            | Self::SignalCancelLink => false,
         }
     }
 }
@@ -752,9 +998,113 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         state: HelperState,
     },
+    /// `event` of the adapter of `account`, for an event with no protocol
+    /// field (a login step, a QR code) of an account other than 0. The host
+    /// wraps it (ADR 0014).
+    FromAccount {
+        account: ProtocolId,
+        event: Box<AdapterEvent>,
+    },
 }
 
 impl AdapterEvent {
+    /// The event of the adapter of `account`: every protocol field names the
+    /// account. An event with no protocol field, of an account other than 0,
+    /// goes in [`Self::FromAccount`]. The host calls this for each event.
+    #[must_use]
+    pub fn for_account(mut self, account: ProtocolId) -> Self {
+        if self.set_account(account) || account.slot() == 0 {
+            self
+        } else {
+            Self::FromAccount {
+                account,
+                event: Box::new(self),
+            }
+        }
+    }
+
+    /// The account of the event and the event, with any
+    /// [`Self::FromAccount`] removed. `None` for an event with no protocol
+    /// field: that is account 0 of its protocol.
+    #[must_use]
+    pub fn from_account(self) -> (Option<ProtocolId>, Self) {
+        match self {
+            Self::FromAccount { account, event } => (Some(account), *event),
+            other => (None, other),
+        }
+    }
+
+    /// Set every protocol field, also inside a chat, a topic, or a message.
+    /// `false` when the event has none.
+    fn set_account(&mut self, account: ProtocolId) -> bool {
+        match self {
+            Self::Status { protocol, .. }
+            | Self::StoreAccess { protocol, .. }
+            | Self::AccountEnded { protocol }
+            | Self::ConversationRemoved { protocol, .. }
+            | Self::MessageBody { protocol, .. }
+            | Self::MessageMedia { protocol, .. }
+            | Self::MessageLinks { protocol, .. }
+            | Self::PhotoReady { protocol, .. }
+            | Self::PhotoFailed { protocol, .. }
+            | Self::VoiceReady { protocol, .. }
+            | Self::VoiceFailed { protocol, .. }
+            | Self::MessagesRemoved { protocol, .. }
+            | Self::SendAccepted { protocol, .. }
+            | Self::SendRejected { protocol, .. }
+            | Self::Stopped { protocol }
+            | Self::Account { protocol, .. }
+            | Self::CommandFailed { protocol, .. }
+            | Self::Notice { protocol, .. }
+            | Self::MessageDelivery { protocol, .. }
+            | Self::OutboxRead { protocol, .. }
+            | Self::ChatListLoaded { protocol }
+            | Self::OlderHistoryLoaded { protocol, .. }
+            | Self::HistoryLoaded { protocol, .. }
+            | Self::Helper { protocol, .. } => {
+                *protocol = account;
+                true
+            }
+            Self::ConversationUpsert { conversation } => {
+                conversation.protocol = account;
+                true
+            }
+            Self::TopicUpsert { topic } => {
+                topic.protocol = account;
+                true
+            }
+            Self::MessageReceived { message } => {
+                message.protocol = account;
+                true
+            }
+            Self::MessageReplaced {
+                protocol, message, ..
+            } => {
+                *protocol = account;
+                message.protocol = account;
+                true
+            }
+            Self::FromAccount {
+                account: source, ..
+            } => {
+                *source = account;
+                true
+            }
+            // A login event goes in `FromAccount` as a whole, so the epoch
+            // check of the host still sees `Login` first.
+            Self::Login { .. }
+            | Self::TelegramAuth { .. }
+            | Self::TelegramAuthRejected { .. }
+            | Self::TelegramDataReset { .. }
+            | Self::TelegramSessionEnded
+            | Self::TelegramCodeSent { .. }
+            | Self::FlushSecrets
+            | Self::WhatsAppQr { .. }
+            | Self::WhatsAppPairCode { .. }
+            | Self::SignalQr { .. } => false,
+        }
+    }
+
     /// The protocol of an inbox event: chats, messages, sends, and list
     /// loads. `None` for login, status, and session events. A frontend drops
     /// an inbox event of an account that is not linked (PR #49 review).
@@ -1462,5 +1812,123 @@ mod plain_words_tests {
                 assert!(!text.contains(jargon), "{text:?} contains {jargon:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+
+    fn second(kind: ProtocolKind) -> ProtocolId {
+        ProtocolId::account(kind, 1).expect("slot 1")
+    }
+
+    /// Account 0 keeps its old names. Another account adds its number.
+    #[test]
+    fn an_account_has_a_key_a_label_and_scoped_names() {
+        assert_eq!(ProtocolId::Telegram.key(), "telegram");
+        assert_eq!(ProtocolId::Telegram.label(), "Telegram");
+        assert_eq!(
+            ProtocolId::Telegram.scoped("telegram.session"),
+            "telegram.session"
+        );
+        let other = second(ProtocolKind::WhatsApp);
+        assert_eq!(other.key(), "whatsapp#1");
+        assert_eq!(other.label(), "WhatsApp 2");
+        assert_eq!(other.scoped("whatsapp.store_key"), "whatsapp.store_key#1");
+        assert_eq!(format!("{other:?}"), "WhatsApp#1");
+        assert_eq!(ProtocolId::from_key("whatsapp#1"), Some(other));
+        assert_eq!(ProtocolId::from_key("slack"), Some(ProtocolId::Slack));
+        assert_eq!(
+            ProtocolId::from_key("slack#0"),
+            None,
+            "account 0 has no number"
+        );
+        assert_eq!(ProtocolId::from_key("slack#9"), None, "above the limit");
+        assert_eq!(ProtocolId::from_key("irc"), None);
+        assert!(other.is(ProtocolKind::WhatsApp));
+        assert!(other.same_protocol(ProtocolId::WhatsApp));
+        assert_ne!(other, ProtocolId::WhatsApp);
+        assert_eq!(other.first_account(), ProtocolId::WhatsApp);
+        assert!(ProtocolId::account(ProtocolKind::Signal, MAX_ACCOUNT_SLOT).is_some());
+        assert!(ProtocolId::account(ProtocolKind::Signal, MAX_ACCOUNT_SLOT + 1).is_none());
+    }
+
+    /// A command for another account names it, and its adapter sees
+    /// account 0. A login step with no protocol field goes in `ToAccount`.
+    #[test]
+    fn a_command_routes_to_its_account_and_the_adapter_sees_account_0() {
+        let account = second(ProtocolKind::Telegram);
+        let open = AdapterCommand::OpenChat {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+        }
+        .for_account(account);
+        assert_eq!(open.protocol(), account);
+        let (to, seen) = open.route();
+        assert_eq!(to, account);
+        assert_eq!(seen.protocol(), ProtocolId::Telegram);
+
+        let step = AdapterCommand::TelegramAuth {
+            step: TelegramAuthStep::Phone,
+            epoch: 3,
+        };
+        let wrapped = step.clone().for_account(account);
+        assert!(matches!(wrapped, AdapterCommand::ToAccount { .. }));
+        assert_eq!(wrapped.protocol(), account);
+        let (to, seen) = wrapped.route();
+        assert_eq!(to, account);
+        assert_eq!(seen, step);
+        // Account 0 needs no wrapper.
+        assert_eq!(step.clone().for_account(ProtocolId::Telegram), step);
+    }
+
+    /// The host tags each event of an adapter with its account, also inside
+    /// a chat row. An event with no protocol field goes in `FromAccount`.
+    #[test]
+    fn an_event_gets_its_account() {
+        let account = second(ProtocolKind::Telegram);
+        let message = ChatMessage {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            id: "telegram:1:1".into(),
+            sender: "Ana".into(),
+            body: "hi".into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: 1,
+            arrival: Arrival::Live,
+            topic: None,
+            links: Vec::new(),
+            photo: None,
+            audio: None,
+        };
+        let AdapterEvent::MessageReplaced {
+            protocol, message, ..
+        } = (AdapterEvent::MessageReplaced {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            old_id: "old".into(),
+            message,
+        })
+        .for_account(account)
+        else {
+            panic!("a replace stays a replace");
+        };
+        assert_eq!(protocol, account);
+        assert_eq!(message.protocol, account);
+
+        let phase = AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        };
+        let (from, inner) = phase.clone().for_account(account).from_account();
+        assert_eq!(from, Some(account));
+        assert_eq!(inner, phase);
+        let (from, inner) = phase
+            .clone()
+            .for_account(ProtocolId::Telegram)
+            .from_account();
+        assert_eq!(from, None, "account 0 needs no wrapper");
+        assert_eq!(inner, phase);
     }
 }

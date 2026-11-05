@@ -2,7 +2,7 @@ mod engine;
 
 use eframe::egui::{self, RichText};
 use thinwire_core::Intent;
-use thinwire_protocol::{AudioPath, ChatMessage, MessageAudio, ProtocolId};
+use thinwire_protocol::{AudioPath, ChatMessage, MessageAudio, ProtocolId, ProtocolKind};
 
 use super::motion;
 use super::theme;
@@ -90,7 +90,7 @@ fn click(session: &Session, key: VoiceKey, note: NoteState) -> Transition {
     match note {
         NoteState::Local { path } => playing(key, path),
         NoteState::Remote { file_id } | NoteState::Broken { file_id }
-            if key.protocol == ProtocolId::Telegram =>
+            if key.protocol.is(ProtocolKind::Telegram) =>
         {
             if leaving_play {
                 waiting_stop(key, file_id)

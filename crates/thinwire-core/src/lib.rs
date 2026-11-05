@@ -35,7 +35,7 @@ mod theme;
 mod view;
 
 pub use crate::clock::{Clock, ViewNow};
-pub use crate::core::{Core, CoreConfig};
+pub use crate::core::{Core, CoreConfig, HelperBuilder, HelperPaths};
 pub use intent::{
     AuthField, DiscordIntent, Intent, SignalIntent, SlackIntent, TelegramIntent, WhatsAppIntent,
 };

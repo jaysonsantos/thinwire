@@ -6,6 +6,7 @@ use std::time::Instant;
 use eframe::egui::{self, AtomExt, RichText};
 use thinwire_core::ViewNow;
 use thinwire_core::mutes::ChatMute;
+use thinwire_protocol::ProtocolKind;
 use thinwire_protocol::{
     AccountState, AdapterStatus, ChatAvatar, Delivery, MessageLink, MessagePhoto, MessageTopic,
     ProtocolId, SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, StoreAccessReason, topic_mute_id,
@@ -327,9 +328,12 @@ fn rail_footer(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         }))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = ROW_GAP;
-            if snapshot.can_add_account() && rail_button(ui, "Add account", icons::plus).clicked() {
-                out.push(Intent::Telegram(TelegramIntent::AddAccount));
-            }
+            // Any service, also one with an account already (ADR 0014).
+            let add = rail_button(ui, "Add account", icons::plus);
+            egui::Popup::menu(&add)
+                .align(egui::RectAlign::TOP_START)
+                .gap(space::XS)
+                .show(|ui| add_account_menu(ui, snapshot, out));
             add_slack_workspace(ui, snapshot, out);
             let settings = rail_button(ui, "Settings", icons::gear);
             egui::Popup::menu(&settings)
@@ -337,6 +341,32 @@ fn rail_footer(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                 .gap(space::XS)
                 .show(|ui| settings_menu(ui, snapshot, out));
         });
+}
+
+/// What Add account opens: one entry for each service of this build. A
+/// service whose helper program is missing shows disabled.
+fn add_account_menu(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    ui.set_min_width(200.0);
+    ui.spacing_mut().button_padding = egui::vec2(space::S, 6.0);
+    for kind in ProtocolKind::ALL {
+        let first = ProtocolId::primary(kind);
+        if !snapshot.account_surface_visible(first) {
+            continue;
+        }
+        let enabled = !snapshot.helper_missing(first);
+        let entry = ui.add_enabled(enabled, egui::Button::new(kind.display_name()));
+        entry.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::Role::Button,
+                enabled,
+                format!("Add a {} account", kind.display_name()),
+            )
+        });
+        if entry.clicked() {
+            out.push(Intent::AddAccount(kind));
+            ui.close();
+        }
+    }
 }
 
 /// What the Settings button opens.
@@ -704,6 +734,7 @@ fn account_rows(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                 clicked = Some(account.caps.id);
             }
         }
+        extra_account_actions(ui, account, out);
         store_protection_line(ui, account, out);
         helper_actions(ui, account, out);
         removed_signal_link(ui, snapshot, account, out);
@@ -711,6 +742,35 @@ fn account_rows(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     if let Some(protocol) = clicked {
         out.push(Intent::SelectProtocol(protocol));
     }
+}
+
+/// Link and Remove for an account after account 0 that is not linked
+/// (ADR 0014). Account 0 keeps the links of its own protocol screens.
+fn extra_account_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
+    let id = account.caps.id;
+    if id.slot() == 0
+        || account.signal_retained.is_some()
+        || account.linked()
+        || account.helper_stopped()
+        || account.helper_missing()
+    {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(theme::ROW_INSET.x);
+        if ui.button("Link").clicked() {
+            out.push(Intent::LinkAccount(id));
+        }
+        let remove = ui
+            .button("Remove")
+            .on_hover_text("Remove this account from thinwire. Its saved data stays.");
+        remove.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Remove {}", id.label()))
+        });
+        if remove.clicked() {
+            out.push(Intent::RemoveAccount(id));
+        }
+    });
 }
 
 /// Middle column: the selected account's chats, at the full height of the window.
@@ -741,7 +801,7 @@ fn account_info(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     ui.horizontal(|ui| {
         ui.add_space(theme::ROW_INSET.x);
         ui.label(
-            RichText::new(protocol.display_name())
+            RichText::new(protocol.label())
                 .text_style(egui::TextStyle::Heading)
                 .color(palette.text),
         );
@@ -889,7 +949,7 @@ fn account_chip(
         let name_font = theme::row_title().resolve(child.style());
         let name = child
             .painter()
-            .layout_no_wrap(caps.id.display_name().to_owned(), name_font, palette.text)
+            .layout_no_wrap(caps.id.label(), name_font, palette.text)
             .size()
             .x;
         name + space::S + unofficial_pill_width(&child) <= text_width
@@ -916,7 +976,7 @@ fn account_chip(
             ui.spacing_mut().item_spacing.x = space::S;
             ui.add(
                 egui::Label::new(
-                    RichText::new(caps.id.display_name())
+                    RichText::new(caps.id.label())
                         .text_style(theme::row_title())
                         .color(palette.text),
                 )
@@ -947,12 +1007,7 @@ fn account_chip(
         });
     }
     response.widget_info(|| {
-        egui::WidgetInfo::selected(
-            egui::Role::Button,
-            enabled,
-            selected,
-            caps.id.display_name(),
-        )
+        egui::WidgetInfo::selected(egui::Role::Button, enabled, selected, caps.id.label())
     });
     if let Some(note) = account_footnote(caps.id, account.linked()) {
         ui.label(RichText::new(note).small().weak());
@@ -1007,7 +1062,7 @@ fn removed_signal_link(
     out: &mut Vec<Intent>,
 ) {
     if account.signal_retained.is_some()
-        || account.caps.id != ProtocolId::Signal
+        || !account.caps.id.is(ProtocolKind::Signal)
         || !snapshot.signal_device_removed()
     {
         return;
@@ -1069,10 +1124,10 @@ fn store_row_intent(account: &AccountRow) -> Option<Intent> {
         Some(StoreAccessReason::KeychainDenied | StoreAccessReason::MoveFailed) => {
             Some(Intent::RetryStoreKey(account.caps.id))
         }
-        Some(StoreAccessReason::WrongKey) if account.caps.id == ProtocolId::Signal => {
+        Some(StoreAccessReason::WrongKey) if account.caps.id.is(ProtocolKind::Signal) => {
             Some(Intent::Signal(SignalIntent::Relink))
         }
-        Some(StoreAccessReason::WrongKey) if account.caps.id == ProtocolId::WhatsApp => {
+        Some(StoreAccessReason::WrongKey) if account.caps.id.is(ProtocolKind::WhatsApp) => {
             Some(Intent::WhatsApp(WhatsAppIntent::OpenRiskGate))
         }
         Some(StoreAccessReason::WrongKey) | None => None,
@@ -1898,10 +1953,10 @@ fn badge_text(unread: u32) -> Option<String> {
 /// Unofficial label and the Ban risk link instead of a permanent risk line.
 #[must_use]
 fn account_footnote(id: ProtocolId, linked: bool) -> Option<&'static str> {
-    let slack_sign_in = id == ProtocolId::Slack && cfg!(feature = "slack-oauth");
-    let has_link_ui = (id == ProtocolId::WhatsApp && cfg!(feature = "whatsapp-web"))
-        || (id == ProtocolId::Signal && cfg!(feature = "signal-local"));
-    if linked || id == ProtocolId::Telegram || slack_sign_in || has_link_ui {
+    let slack_sign_in = id.is(ProtocolKind::Slack) && cfg!(feature = "slack-oauth");
+    let has_link_ui = (id.is(ProtocolKind::WhatsApp) && cfg!(feature = "whatsapp-web"))
+        || (id.is(ProtocolKind::Signal) && cfg!(feature = "signal-local"));
+    if linked || id.is(ProtocolKind::Telegram) || slack_sign_in || has_link_ui {
         None
     } else {
         Some("not ready — no login UI this beat")
@@ -1920,10 +1975,10 @@ fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> String {
     if let Some(slot) = account.signal_retained {
         return snapshot.signal_retained_chip_label(slot);
     }
-    if account.caps.id == ProtocolId::Signal && snapshot.signal_link_checking() {
+    if account.caps.id.is(ProtocolKind::Signal) && snapshot.signal_link_checking() {
         return SIGNAL_LINK_CHECK.to_owned();
     }
-    if account.caps.id == ProtocolId::Signal && snapshot.signal_device_removed() {
+    if account.caps.id.is(ProtocolKind::Signal) && snapshot.signal_device_removed() {
         return SIGNAL_DEVICE_REMOVED.to_owned();
     }
     // The helper state wins: with no helper, the adapter status is old.
@@ -1946,7 +2001,7 @@ fn chip_label(snapshot: &Snapshot, account: &AccountRow) -> String {
     }
     let session_moving = snapshot.auth != AuthScreen::Idle
         || matches!(snapshot.center_view(), CenterView::Resuming { .. });
-    if account.caps.id == ProtocolId::Telegram
+    if account.caps.id.is(ProtocolKind::Telegram)
         && account.status == AdapterStatus::Connecting
         && !snapshot.telegram_ready()
         && !session_moving
@@ -2156,7 +2211,7 @@ fn add_slack_workspace(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Int
     let slack = snapshot
         .accounts
         .iter()
-        .find(|row| row.caps.id == ProtocolId::Slack);
+        .find(|row| row.caps.id.is(ProtocolKind::Slack));
     if slack.is_some_and(|row| row.status == AdapterStatus::Connecting) {
         if ui.button("Cancel").clicked() {
             out.push(Intent::Slack(SlackIntent::Cancel));
@@ -2192,7 +2247,7 @@ fn thread(
     thread_header(ui, snapshot, out);
     let palette = theme::palette(ui);
     let signal_removed =
-        snapshot.signal_device_removed() && snapshot.selected_protocol == ProtocolId::Signal;
+        snapshot.signal_device_removed() && snapshot.selected_protocol.is(ProtocolKind::Signal);
     if snapshot.signal_read_only_reason().is_some() || signal_removed {
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::S as i8))
@@ -2966,9 +3021,9 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
                 None => (conversation.id.clone(), mute),
             };
             let kind = if conversation.is_group {
-                format!("Group · {}", conversation.protocol.display_name())
+                format!("Group · {}", conversation.protocol.label())
             } else {
-                conversation.protocol.display_name().to_owned()
+                conversation.protocol.label()
             };
             // The left side pushes here: the right side holds `out`.
             let mut avatar_out = Vec::new();
@@ -3562,7 +3617,7 @@ fn compose(
     let closed = snapshot.topic_closed();
     // A closed topic already disables this field. Sending is off after the
     // phone removes the device, so the field uses that same switch.
-    let sending_off = snapshot.selected_protocol == ProtocolId::Signal
+    let sending_off = snapshot.selected_protocol.is(ProtocolKind::Signal)
         && (snapshot.signal_device_removed() || snapshot.signal_read_only_reason().is_some());
     let compose_open = !closed && !sending_off;
     // Dropped and pasted photos and videos go to the tray of this thread.

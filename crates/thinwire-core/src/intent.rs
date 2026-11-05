@@ -17,6 +17,16 @@ use crate::{SecretText, ThemeMode};
 pub enum Intent {
     /// Show the accounts and chats of one protocol.
     SelectProtocol(ProtocolId),
+    /// Add an account of this protocol and open its login screen. Account 0
+    /// is used while it is free: not linked and not in a login. Else the
+    /// lowest free account number (ADR 0014).
+    AddAccount(thinwire_protocol::ProtocolKind),
+    /// Open the login screen of this account again, for example after its
+    /// session ended.
+    LinkAccount(ProtocolId),
+    /// Remove an account after account 0 that is not linked. Its keychain
+    /// values and files stay.
+    RemoveAccount(ProtocolId),
     /// Show one previous Signal account. The slot is not an account id.
     /// Sending stays off. The history stays.
     SelectRetainedSignal(u32),

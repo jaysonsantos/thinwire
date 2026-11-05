@@ -80,6 +80,22 @@ impl ProcessLauncher {
     }
 }
 
+/// The launcher of the helper of account `slot`: `--account n` after
+/// account 0 (ADR 0014).
+#[must_use]
+pub fn account_launcher(
+    program: &'static str,
+    configured: Option<PathBuf>,
+    slot: u8,
+) -> ProcessLauncher {
+    let launcher = ProcessLauncher::new(program, configured);
+    if slot == 0 {
+        launcher
+    } else {
+        launcher.with_args(["--account".to_owned(), slot.to_string()])
+    }
+}
+
 /// The path of `program` in the folder of the app binary `exe`.
 fn beside(exe: &Path, program: &str) -> Option<PathBuf> {
     let name = format!("{program}{}", std::env::consts::EXE_SUFFIX);

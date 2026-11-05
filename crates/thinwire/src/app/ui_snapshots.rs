@@ -365,6 +365,64 @@ mod settings_menu {
     }
 }
 
+/// ADR 0014: a second Telegram account that is not linked shows its number,
+/// Link, and Remove. Add account is open above it with the services of the
+/// build.
+mod add_account_menu {
+    use super::*;
+
+    fn shoot_open(theme: ThemeMode, size: [f32; 2]) {
+        let name = format!(
+            "add_account_menu-{}-{}x{}",
+            theme_slug(theme),
+            size[0] as u32,
+            size[1] as u32
+        );
+        let (runtime, mut built) = scene(Scenario::LongChat, theme);
+        built.core.dispatch(Intent::AddAccount(
+            thinwire_protocol::ProtocolKind::Telegram,
+        ));
+        built
+            .core
+            .dispatch(Intent::Telegram(thinwire_core::TelegramIntent::Cancel));
+        let mut harness = Harness::builder()
+            .with_size(size)
+            .wgpu()
+            .build_ui_state(draw, built);
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::Button, "Add account")
+            .click();
+        harness.run();
+        settle_images(&mut harness);
+        harness.get_by_role_and_label(Role::Button, "Add a Telegram account");
+        harness.get_by_role_and_label(Role::Button, "Remove Telegram 2");
+        harness.snapshot(&name);
+        drop(harness);
+        drop(runtime);
+    }
+
+    #[test]
+    fn light_1100x720() {
+        shoot_open(ThemeMode::Light, [1100.0, 720.0]);
+    }
+
+    #[test]
+    fn dark_1100x720() {
+        shoot_open(ThemeMode::Dark, [1100.0, 720.0]);
+    }
+
+    #[test]
+    fn light_800x600() {
+        shoot_open(ThemeMode::Light, [800.0, 600.0]);
+    }
+
+    #[test]
+    fn dark_800x600() {
+        shoot_open(ThemeMode::Dark, [800.0, 600.0]);
+    }
+}
+
 /// The login card is taller than a short window. The column scrolls, so
 /// Change number and Cancel stay in reach. Before it scrolled, they were cut
 /// off at 800x600 with no way to get to them.

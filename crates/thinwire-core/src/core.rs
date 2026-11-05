@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault as PhoneVault;
 use thinwire_protocol::{
-    AdapterCommand, AdapterEvent, AdapterHost, Arrival, ChatMessage, DiscordAdapter,
-    DiscordSecretVault, HostSender, MessageTopic, ProtocolAdapter, ProtocolId, SlackAdapter,
-    SlackSecretVault, TelegramSecretVault, WhatsAppPhoneVault, catalog,
+    AccountAdapter, AccountFactory, AdapterCommand, AdapterEvent, AdapterHost, Arrival,
+    ChatMessage, DiscordAdapter, DiscordSecretVault, HostSender, MessageTopic, ProtocolAdapter,
+    ProtocolId, ProtocolKind, SlackAdapter, SlackSecretVault, TelegramSecretVault,
+    WhatsAppPhoneVault,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -52,12 +53,44 @@ const HELD_TOPIC_NOTICE_COUNT: u32 = 99;
 const HELD_TOPIC_NOTICE_WAIT: Duration = Duration::from_secs(4);
 
 /// Start-up input for [`Core::new`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CoreConfig {
     settings: Settings,
     memory_secrets: bool,
     clock: Clock,
+    helpers: Option<HelperBuilder>,
 }
+
+impl std::fmt::Debug for CoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreConfig")
+            .field("settings", &self.settings)
+            .field("memory_secrets", &self.memory_secrets)
+            .field("clock", &self.clock)
+            .field("helpers", &self.helpers.is_some())
+            .finish()
+    }
+}
+
+/// The helper program paths from the settings, for [`HelperBuilder`].
+#[derive(Debug, Clone, Default)]
+pub struct HelperPaths {
+    pub whatsapp: Option<std::path::PathBuf>,
+    pub signal: Option<std::path::PathBuf>,
+}
+
+/// Builds the helper adapter of a WhatsApp or Signal account after account 0
+/// (ADR 0014). The app gives it: the core crate does not depend on the
+/// helper programs. Every WhatsApp account shares the phone vault.
+pub type HelperBuilder = Arc<
+    dyn Fn(ProtocolId, &Arc<WhatsAppPhoneVault>, &HelperPaths) -> Option<Box<dyn ProtocolAdapter>>
+        + Send
+        + Sync,
+>;
+
+/// The secret stores of the Telegram, Discord, and Slack accounts after
+/// account 0. The host factory reads it when an account starts.
+type AccountStores = Arc<std::sync::Mutex<std::collections::HashMap<ProtocolId, Arc<SecretStore>>>>;
 
 impl CoreConfig {
     /// Settings from the platform config dir. Missing file means System.
@@ -73,6 +106,7 @@ impl CoreConfig {
             settings,
             memory_secrets: false,
             clock: Clock::System,
+            helpers: None,
         }
     }
 
@@ -81,6 +115,14 @@ impl CoreConfig {
     #[must_use]
     pub const fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Build the helper adapters of more WhatsApp and Signal accounts with
+    /// `builder` (ADR 0014).
+    #[must_use]
+    pub fn with_helper_builder(mut self, builder: HelperBuilder) -> Self {
+        self.helpers = Some(builder);
         self
     }
 
@@ -120,6 +162,12 @@ pub struct Core {
     commands_sent: std::sync::atomic::AtomicU64,
     events_read: u64,
     secrets: Arc<SecretStore>,
+    /// The stores of the accounts after account 0 (ADR 0014).
+    account_stores: AccountStores,
+    /// New accounts keep their secrets in memory too.
+    memory_secrets: bool,
+    /// Accounts after account 0 whose saved session was resumed at start.
+    resumed: std::collections::HashSet<ProtocolId>,
     whatsapp_phone: Arc<WhatsAppPhoneVault>,
     notifier: ChangeNotifier,
     closing: bool,
@@ -230,15 +278,21 @@ impl Core {
         whatsapp_phone: Arc<WhatsAppPhoneVault>,
         replacements: Vec<Box<dyn ProtocolAdapter>>,
     ) -> Self {
-        let host = AdapterHost::spawn(
+        let stores = AccountStores::default();
+        let factory = account_factory(&stores, &config, &whatsapp_phone);
+        let host = AdapterHost::spawn_with_accounts(
             runtime,
             Arc::clone(&secrets) as Arc<dyn TelegramSecretVault>,
             Arc::clone(&secrets) as Arc<dyn DiscordSecretVault>,
             Arc::clone(&secrets) as Arc<dyn SlackSecretVault>,
             Arc::clone(&whatsapp_phone),
             replacements,
+            Some(factory),
         );
-        Self::with_host(runtime, config, secrets, whatsapp_phone, host)
+        let mut core = Self::with_host(runtime, config, secrets, whatsapp_phone, host);
+        core.account_stores = stores;
+        core.restore_accounts();
+        core
     }
 
     /// A core over a host that the caller spawned, for example with the demo
@@ -267,6 +321,9 @@ impl Core {
             commands,
             events,
             state,
+            account_stores: AccountStores::default(),
+            memory_secrets: config.memory_secrets,
+            resumed: std::collections::HashSet::new(),
             settings: config.settings,
             clock: config.clock,
             commands_sent: std::sync::atomic::AtomicU64::new(0),
@@ -283,6 +340,187 @@ impl Core {
         core.restore_whatsapp_gate();
         core
     }
+
+    // region: accounts
+
+    /// Start the accounts after account 0 that the settings list.
+    fn restore_accounts(&mut self) {
+        let saved = self.settings.extra_accounts().to_vec();
+        for account in saved {
+            self.register_account(account);
+            self.resume_helper_account(account);
+        }
+    }
+
+    /// A WhatsApp or Signal account after account 0 starts its helper at
+    /// start when the user accepted the current gate copy. The helper opens
+    /// a saved session with no QR code, as account 0 does.
+    fn resume_helper_account(&mut self, account: ProtocolId) {
+        let accepted = match account.kind() {
+            #[cfg(feature = "whatsapp-web")]
+            ProtocolKind::WhatsApp => {
+                self.settings.whatsapp_gate_version() == crate::state::WHATSAPP_GATE_VERSION
+            }
+            #[cfg(feature = "signal-local")]
+            ProtocolKind::Signal => {
+                self.settings.signal_notice_version() == crate::signal_notice::SIGNAL_NOTICE_VERSION
+            }
+            _ => false,
+        };
+        if accepted {
+            self.state.resume_helper_account(account);
+        }
+    }
+
+    /// Make the store, the row, and the adapter of `account`. The store
+    /// goes in the map before the host reads it in `AddAccount`.
+    fn register_account(&mut self, account: ProtocolId) {
+        if account.slot() == 0 || !self.state.add_account_row(account) {
+            return;
+        }
+        if matches!(
+            account.kind(),
+            ProtocolKind::Telegram | ProtocolKind::Discord | ProtocolKind::Slack
+        ) {
+            let store = if self.memory_secrets {
+                Arc::new(SecretStore::memory_for_account(account.slot()))
+            } else {
+                SecretStore::for_account(&self.runtime, account.slot())
+            };
+            self.bind_after_hydrate(account, &store);
+            self.account_stores
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(account, store);
+        }
+        self.send(AdapterCommand::AddAccount { protocol: account });
+    }
+
+    /// A Discord or Slack account connects when its token is in memory, as
+    /// account 0 does.
+    fn bind_after_hydrate(&self, account: ProtocolId, store: &Arc<SecretStore>) {
+        let commands = self.commands.clone();
+        match account.kind() {
+            ProtocolKind::Discord if DiscordAdapter::bot_inbox_compiled() => {
+                store.on_discord_token_hydrated(move || {
+                    let _ = commands.send(AdapterCommand::Connect { protocol: account });
+                });
+            }
+            ProtocolKind::Slack if SlackAdapter::slack_oauth_compiled() => {
+                store.on_slack_token_hydrated(move || {
+                    let _ = commands.send(AdapterCommand::Connect { protocol: account });
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// The secret store of `account`. Account 0 uses the main store.
+    fn store_of(&self, account: ProtocolId) -> Arc<SecretStore> {
+        if account.slot() == 0 {
+            return Arc::clone(&self.secrets);
+        }
+        self.account_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&account)
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&self.secrets))
+    }
+
+    /// Every store: account 0 first.
+    fn all_stores(&self) -> Vec<Arc<SecretStore>> {
+        let mut stores = vec![Arc::clone(&self.secrets)];
+        stores.extend(
+            self.account_stores
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .cloned(),
+        );
+        stores
+    }
+
+    /// Add an account of `kind` and open its login. Account 0 when free.
+    fn add_account(&mut self, kind: ProtocolKind) {
+        // One login screen for each protocol: no new row while one is open.
+        if self.state.login_open(kind) {
+            self.state.status_text = format!(
+                "Finish or cancel the open {} sign-in first.",
+                kind.display_name()
+            );
+            return;
+        }
+        let first = ProtocolId::primary(kind);
+        // An added account that is not linked yet comes before a new one.
+        let unlinked = self.state.account_ids().into_iter().find(|account| {
+            account.is(kind) && account.slot() != 0 && !self.state.protocol_is_linked(*account)
+        });
+        let account = if self.state.account_free(first) {
+            first
+        } else if let Some(unlinked) = unlinked {
+            unlinked
+        } else {
+            let Some(next) = self.state.next_account(kind) else {
+                self.state.status_text = format!(
+                    "{} has {} accounts at most.",
+                    kind.display_name(),
+                    thinwire_protocol::MAX_ACCOUNT_SLOT + 1
+                );
+                return;
+            };
+            self.register_account(next);
+            self.settings.add_extra_account(next);
+            next
+        };
+        self.link_account(account);
+    }
+
+    /// Open the login screen of `account`.
+    fn link_account(&mut self, account: ProtocolId) {
+        let store = self.store_of(account);
+        self.state.open_login(account, &store);
+    }
+
+    /// Remove an account after account 0 that is not linked.
+    fn remove_account(&mut self, account: ProtocolId) {
+        if account.slot() == 0 || self.state.protocol_is_linked(account) {
+            return;
+        }
+        self.state.end_login_of(account);
+        self.send(AdapterCommand::RemoveAccount { protocol: account });
+        self.state.remove_account_row(account);
+        self.account_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&account);
+        self.resumed.remove(&account);
+        self.settings.remove_extra_account(account);
+    }
+
+    /// Resume the saved Telegram session of an account after account 0 once
+    /// its keychain read ended. No screen opens: the row links.
+    fn resume_accounts(&mut self) {
+        let waiting: Vec<(ProtocolId, Arc<SecretStore>)> = self
+            .account_stores
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(account, _)| {
+                account.is(ProtocolKind::Telegram) && !self.resumed.contains(*account)
+            })
+            .map(|(account, store)| (*account, Arc::clone(store)))
+            .collect();
+        for (account, store) in waiting {
+            if !store.attach_settled() {
+                continue;
+            }
+            self.resumed.insert(account);
+            self.state.resume_account(account, &store);
+        }
+    }
+
+    // endregion: accounts
 
     /// A saved acceptance of the current WhatsApp ban gate starts the helper,
     /// and the helper opens the saved session. Another saved copy, or none,
@@ -428,6 +666,7 @@ impl Core {
             self.state.status_text = text;
         }
         self.state.poll_resume(&self.secrets);
+        self.resume_accounts();
         self.resume_denied_store_keys();
         self.state.sync_viewed();
         self.state.sync_timeout_hint();
@@ -626,6 +865,9 @@ impl Core {
     pub fn dispatch(&mut self, intent: Intent) {
         match intent {
             Intent::SelectProtocol(protocol) => self.state.select_protocol(protocol),
+            Intent::AddAccount(kind) => self.add_account(kind),
+            Intent::LinkAccount(account) => self.link_account(account),
+            Intent::RemoveAccount(account) => self.remove_account(account),
             Intent::SelectRetainedSignal(slot) => self.state.select_retained_signal(slot),
             Intent::SelectConversation { id } => self.state.select_conversation(id),
             Intent::SelectTopic {
@@ -825,16 +1067,22 @@ impl Core {
     ///
     /// Frontend thread only. See [`Core`] "Threads".
     pub fn flush_keychain(&self) {
-        self.secrets.spawn_os_flush(&self.runtime);
+        for store in self.all_stores() {
+            store.spawn_os_flush(&self.runtime);
+        }
     }
 
     /// [`Self::flush_keychain`] for another thread, for example an exit
     /// watchdog that runs while the frontend thread is stuck. The hook only
     /// spawns the flush on the runtime; it does not wait for it.
     pub fn keychain_flush_hook(&self) -> impl FnOnce() + Send + 'static {
-        let secrets = Arc::clone(&self.secrets);
+        let stores = self.all_stores();
         let runtime = self.runtime.clone();
-        move || secrets.spawn_os_flush(&runtime)
+        move || {
+            for store in stores {
+                store.spawn_os_flush(&runtime);
+            }
+        }
     }
 
     /// Every adapter answered [`Intent::Shutdown`] with `Stopped`.
@@ -915,14 +1163,14 @@ impl Core {
         self.notify.close();
         // Every adapter closes its sessions (TDLib, the WhatsApp session,
         // Discord, Slack) and answers `Stopped`. `stopped` waits for all.
-        for caps in catalog() {
-            self.send(AdapterCommand::Shutdown { protocol: caps.id });
+        for account in self.state.account_ids() {
+            self.send(AdapterCommand::Shutdown { protocol: account });
         }
         self.state.status_text = CLOSING_STATUS.into();
     }
 
     fn telegram(&mut self, intent: TelegramIntent) {
-        let store = &self.secrets;
+        let store = &self.store_of(self.state.telegram_login_account());
         match intent {
             TelegramIntent::AddAccount => self.state.open_add_account(store),
             TelegramIntent::OpenApiOverride => self.state.open_api_override(store),
@@ -954,10 +1202,12 @@ impl Core {
         match intent {
             WhatsAppIntent::OpenRiskGate => self.state.open_whatsapp_risk_gate(),
             WhatsAppIntent::CloseGate => {
-                // A close after the acceptance is Cancel: forget the saved gate.
+                // A close after the acceptance is Cancel: forget the saved
+                // gate. A cancel for another account keeps it (ADR 0014).
                 let accepted = self.state.whatsapp_gate_accepted();
+                let first = self.state.whatsapp_link_account().slot() == 0;
                 self.state.close_whatsapp_gate(phone);
-                if accepted && !self.state.whatsapp_gate_accepted() {
+                if first && accepted && !self.state.whatsapp_gate_accepted() {
                     self.settings.set_whatsapp_gate_version(0);
                 }
             }
@@ -974,8 +1224,11 @@ impl Core {
             WhatsAppIntent::BeginLink => self.state.begin_whatsapp_link(phone),
             WhatsAppIntent::LinkWithPhone => self.state.open_whatsapp_phone_link(phone),
             WhatsAppIntent::CancelLink => {
+                let first = self.state.whatsapp_link_account().slot() == 0;
                 self.state.cancel_whatsapp_link(phone);
-                self.settings.set_whatsapp_gate_version(0);
+                if first {
+                    self.settings.set_whatsapp_gate_version(0);
+                }
             }
         }
     }
@@ -1039,7 +1292,9 @@ impl Core {
             }
         }
         if self.state.take_keychain_flush() {
-            self.secrets.spawn_os_flush(&self.runtime);
+            for store in self.all_stores() {
+                store.spawn_os_flush(&self.runtime);
+            }
         }
         if self.state.take_keychain_retry() {
             // Read again off the caller thread, with a fresh watch: the old
@@ -1131,6 +1386,52 @@ async fn watch_until(done: impl Fn() -> bool, notifier: WeakNotifier, step: Dura
         }
         tokio::time::sleep(step).await;
     }
+}
+
+/// The host factory of the accounts after account 0: their stores, or the
+/// helper adapter from the app's builder.
+fn account_factory(
+    stores: &AccountStores,
+    config: &CoreConfig,
+    phone: &Arc<WhatsAppPhoneVault>,
+) -> AccountFactory {
+    let stores = Arc::clone(stores);
+    let helpers = config.helpers.clone();
+    let paths = HelperPaths {
+        whatsapp: config
+            .settings
+            .whatsapp_helper()
+            .map(std::path::Path::to_path_buf),
+        signal: config
+            .settings
+            .signal_helper()
+            .map(std::path::Path::to_path_buf),
+    };
+    let phone = Arc::clone(phone);
+    Arc::new(move |account| {
+        let store = || {
+            stores
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&account)
+                .cloned()
+        };
+        match account.kind() {
+            ProtocolKind::Telegram => Some(AccountAdapter::Telegram(
+                store()? as Arc<dyn TelegramSecretVault>
+            )),
+            ProtocolKind::Discord => Some(AccountAdapter::Discord(
+                store()? as Arc<dyn DiscordSecretVault>
+            )),
+            ProtocolKind::Slack => {
+                Some(AccountAdapter::Slack(store()? as Arc<dyn SlackSecretVault>))
+            }
+            ProtocolKind::WhatsApp | ProtocolKind::Signal => helpers
+                .as_ref()
+                .and_then(|build| build(account, &phone, &paths))
+                .map(AccountAdapter::Ready),
+        }
+    })
 }
 
 fn bind_slack_after_hydrate(secrets: &SecretStore, host: &AdapterHost) {
@@ -1294,6 +1595,88 @@ mod tests {
         assert!(!shown.contains("5550100"));
     }
 
+    /// A saved second account gets its row and its adapter at start. The
+    /// close waits for it too. Remove forgets it in the settings.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_second_account_starts_stops_and_removes() {
+        let second = ProtocolId::account(ProtocolKind::Telegram, 1).expect("slot");
+        let mut settings = temp_settings();
+        settings.add_extra_account(second);
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        assert!(core.view().account_ids().contains(&second));
+        assert!(
+            core.account_stores
+                .lock()
+                .expect("stores")
+                .contains_key(&second)
+        );
+        assert_eq!(core.store_of(second).scope(), 1);
+        assert_eq!(core.store_of(ProtocolId::Telegram).scope(), 0);
+        core.dispatch(Intent::RemoveAccount(second));
+        assert!(!core.view().account_ids().contains(&second));
+        assert!(core.settings.extra_accounts().is_empty());
+        core.dispatch(Intent::RemoveAccount(ProtocolId::Telegram));
+        assert!(core.view().account_ids().contains(&ProtocolId::Telegram));
+
+        let mut settings = temp_settings();
+        settings.add_extra_account(second);
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        core.dispatch(Intent::Shutdown);
+        pump_until(&mut core, Core::stopped).await;
+        assert!(core.state.stopped_contains(second));
+    }
+
+    /// Add account uses account 0 when it is free. With account 0 linked,
+    /// it adds account 1 and remembers it. A second click uses that account
+    /// again while it is not linked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn add_account_reuses_an_account_that_is_not_linked() {
+        let mut core = memory_core();
+        core.dispatch(Intent::AddAccount(ProtocolKind::Telegram));
+        assert!(
+            core.settings.extra_accounts().is_empty(),
+            "account 0 was free"
+        );
+        core.dispatch(Intent::Telegram(crate::TelegramIntent::Cancel));
+        core.state.apply(AdapterEvent::TelegramAuth {
+            phase: thinwire_protocol::TelegramAuthPhase::Ready,
+        });
+        core.state.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: thinwire_protocol::AccountState::Linked,
+        });
+        assert!(core.state.protocol_is_linked(ProtocolId::Telegram));
+        let second = ProtocolId::account(ProtocolKind::Telegram, 1).expect("slot");
+        for _ in 0..2 {
+            core.dispatch(Intent::AddAccount(ProtocolKind::Telegram));
+            core.state.end_login_of(second);
+        }
+        assert_eq!(core.settings.extra_accounts(), [second]);
+        assert!(core.view().account_ids().contains(&second));
+    }
+
+    /// A WhatsApp account with no helper builder has no adapter. Its row
+    /// still stops, so the close does not wait for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_account_with_no_adapter_does_not_hold_the_close() {
+        let second = ProtocolId::account(ProtocolKind::WhatsApp, 1).expect("slot");
+        let mut settings = temp_settings();
+        settings.add_extra_account(second);
+        let mut core = Core::new(
+            &Handle::current(),
+            CoreConfig::new(settings).with_memory_secrets(),
+        );
+        assert!(core.view().account_ids().contains(&second));
+        core.dispatch(Intent::Shutdown);
+        pump_until(&mut core, Core::stopped).await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_reports_stopped_and_drops_later_commands() {
         let mut core = memory_core();
@@ -1384,7 +1767,7 @@ mod tests {
             whatsapp_phone,
             Vec::new(),
         );
-        for caps in catalog() {
+        for caps in thinwire_protocol::catalog() {
             host.send(AdapterCommand::Shutdown { protocol: caps.id });
         }
         let mut snapshot = Snapshot::new();
@@ -1402,7 +1785,7 @@ mod tests {
         let src = include_str!("core.rs");
         let shutdown = &src[src.find("fn shutdown(&mut self)").expect("shutdown")..];
         let shutdown = &shutdown[..shutdown.find("\n    }\n").expect("end")];
-        assert!(shutdown.contains("for caps in catalog()"));
+        assert!(shutdown.contains("for account in self.state.account_ids()"));
         let stopped = &src[src.find("pub fn stopped(").expect("stopped")..];
         let stopped = &stopped[..stopped.find("\n    }\n").expect("end")];
         assert!(stopped.contains("self.state.all_stopped()"));
@@ -1504,7 +1887,7 @@ mod tests {
         while sent.try_recv().is_ok() {}
 
         core.dispatch(Intent::Shutdown);
-        for caps in catalog() {
+        for caps in thinwire_protocol::catalog() {
             assert_eq!(
                 sent.try_recv().ok(),
                 Some(AdapterCommand::Shutdown { protocol: caps.id }),

@@ -403,7 +403,8 @@ impl ThinwireApp {
     #[must_use]
     pub fn new(settings: Settings, ctx: &egui::Context) -> Self {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime for protocol adapters");
-        let config = CoreConfig::new(settings);
+        let config =
+            CoreConfig::new(settings).with_helper_builder(Arc::new(account_helper_adapter));
         let core = Core::with_replacement_adapters(runtime.handle(), config, replacement_adapters);
         repaint_on_change(&runtime, &core, ctx.clone());
         close_on_stop_signal(runtime.handle(), ctx.clone());
@@ -579,6 +580,31 @@ fn replacement_adapters(
             _settings.signal_helper().map(std::path::Path::to_path_buf),
         )),
     ]
+}
+
+/// The helper adapter of a WhatsApp or Signal account after account 0
+/// (ADR 0014). Each one starts its own helper with `--account n`. `None` in
+/// a build without that protocol.
+fn account_helper_adapter(
+    account: thinwire_protocol::ProtocolId,
+    _phone: &Arc<thinwire_protocol::WhatsAppPhoneVault>,
+    _paths: &thinwire_core::HelperPaths,
+) -> Option<Box<dyn thinwire_protocol::ProtocolAdapter>> {
+    match account.kind() {
+        #[cfg(feature = "whatsapp-web")]
+        thinwire_protocol::ProtocolKind::WhatsApp => {
+            Some(Box::new(thinwire_protocol::whatsapp_helper_adapter_for(
+                Arc::clone(_phone),
+                _paths.whatsapp.clone(),
+                account.slot(),
+            )))
+        }
+        #[cfg(feature = "signal-local")]
+        thinwire_protocol::ProtocolKind::Signal => Some(Box::new(
+            thinwire_protocol::signal_helper_adapter_for(_paths.signal.clone(), account.slot()),
+        )),
+        _ => None,
+    }
 }
 
 /// Window title with the unread count of chats that are not muted.

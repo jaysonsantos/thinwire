@@ -24,7 +24,7 @@ use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, EventTx, ProtocolAdapter,
     ProtocolCapabilities, ProtocolId,
 };
-use crate::host::dispatch;
+use crate::host::dispatch_adapters;
 
 /// Longest wait for one answer. The fakes answer in milliseconds.
 const ANSWER_WAIT: Duration = Duration::from_secs(2);
@@ -98,7 +98,7 @@ impl Contract {
         {
             self.generations.insert(*generation);
         }
-        dispatch(&mut self.adapters, command, &self.tx)
+        dispatch_adapters(&mut self.adapters, command, &self.tx)
     }
 
     /// Wait until an event matches. Fails after [`ANSWER_WAIT`] and names

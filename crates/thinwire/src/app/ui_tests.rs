@@ -277,7 +277,10 @@ fn a_live_session_hides_add_account_and_cancel_keeps_it() {
     let mut snapshot = ready_with_chats(&store);
     store.set_secret(SecretKey::Session, "live-session");
     assert!(snapshot.telegram_ready());
-    assert!(!snapshot.can_add_account(), "one Telegram account (ux F8)");
+    assert!(
+        !snapshot.can_add_account(),
+        "no new login of the linked account (ux F8)"
+    );
     snapshot.open_add_account(&store);
     assert_eq!(snapshot.auth, AuthScreen::Idle);
     assert!(snapshot.take_commands().is_empty());
@@ -316,9 +319,12 @@ fn a_live_session_hides_add_account_and_cancel_keeps_it() {
     let ui = include_str!("ui.rs");
     let footer = &ui[ui.find("fn rail_footer(").expect("sidebar foot")..];
     let footer = &footer[..footer.find("\nfn ").expect("next")];
-    let guard = footer.find("can_add_account()").expect("guard");
+    // ADR 0014: Add account stays, and opens the menu of every service. A
+    // linked Telegram account adds a second one, not a new login of the
+    // first.
     let button = footer.find("\"Add account\"").expect("button");
-    assert!(guard < button, "Add account hides when Telegram is ready");
+    let menu = footer.find("add_account_menu").expect("menu");
+    assert!(button < menu, "Add account opens the service menu");
     let menu = &ui[ui.find("fn settings_menu(").expect("settings menu")..];
     let menu = &menu[..menu.find("\nfn ").expect("next")];
     let advanced = menu.find("\"Advanced\"").expect("advanced");

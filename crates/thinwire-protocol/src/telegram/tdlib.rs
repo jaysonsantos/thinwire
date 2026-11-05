@@ -3078,7 +3078,7 @@ async fn set_parameters(
         );
         return;
     }
-    let dir = match tdlib_data_dir(secrets.persists(), secrets.tdlib_folder_name()) {
+    let dir = match tdlib_data_dir(secrets.persists(), &secrets.tdlib_folder_name()) {
         Ok(dir) => dir,
         Err(error) => {
             tracing::warn!(%error, "no private folder for the Telegram session");

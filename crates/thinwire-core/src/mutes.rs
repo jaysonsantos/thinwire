@@ -182,21 +182,14 @@ impl ChatMutes {
     }
 }
 
-/// The file key of a protocol. Never changes: the file keeps it.
-const fn key(protocol: ProtocolId) -> &'static str {
-    match protocol {
-        ProtocolId::Telegram => "telegram",
-        ProtocolId::WhatsApp => "whatsapp",
-        ProtocolId::Discord => "discord",
-        ProtocolId::Slack => "slack",
-        ProtocolId::Signal => "signal",
-    }
+/// The file key of an account. Never changes: the file keeps it. Account 0
+/// is the protocol name, as before ADR 0014. Another account adds `#n`.
+fn key(protocol: ProtocolId) -> String {
+    protocol.key()
 }
 
 fn protocol_of(key_text: &str) -> Option<ProtocolId> {
-    ProtocolId::ALL
-        .into_iter()
-        .find(|protocol| key(*protocol) == key_text)
+    ProtocolId::from_key(key_text)
 }
 
 /// The mutes in the file. A line that is empty, a comment, not UTF-8, or
@@ -232,7 +225,15 @@ fn parse(contents: &[u8]) -> Chats {
 /// only: it cannot be one line.
 fn render(chats: &Chats) -> String {
     let mut text = format!("{HEADER}\n");
-    for protocol in ProtocolId::ALL {
+    let mut accounts: Vec<ProtocolId> = chats.keys().copied().collect();
+    // The order of `ProtocolId::ALL`, then the account number.
+    accounts.sort_by_key(|account| {
+        let first = ProtocolId::ALL
+            .iter()
+            .position(|known| *known == account.first_account());
+        (first, account.slot())
+    });
+    for protocol in accounts {
         let Some(ids) = chats.get(&protocol) else {
             continue;
         };
@@ -241,7 +242,7 @@ fn render(chats: &Chats) -> String {
             if id.contains(['\n', '\r']) {
                 continue;
             }
-            text.push_str(key(protocol));
+            text.push_str(&key(protocol));
             text.push(' ');
             text.push_str(id);
             text.push('\n');
@@ -325,6 +326,29 @@ mod tests {
         assert!(!ChatMute::None.is_muted());
         assert!(ChatMute::Here.is_muted());
         assert!(ChatMute::Protocol.is_muted());
+    }
+
+    /// A mute of another account keeps its account. The same chat id of
+    /// account 0 is not muted (ADR 0014).
+    #[test]
+    fn a_mute_of_another_account_keeps_its_account() {
+        let path = temp_file("accounts");
+        let _ = fs::remove_file(&path);
+        let second =
+            ProtocolId::account(thinwire_protocol::ProtocolKind::Telegram, 1).expect("slot");
+        let mut mutes = ChatMutes::load_from(path.clone());
+        assert!(mutes.set(second, "telegram:1", true));
+        assert!(mutes.set(ProtocolId::Telegram, "telegram:2", true));
+        mutes.take_persist_job().expect("a write").run();
+        let text = fs::read_to_string(&path).expect("file");
+        assert!(
+            text.contains("\ntelegram telegram:2\ntelegram#1 telegram:1\n"),
+            "{text}"
+        );
+        let loaded = ChatMutes::load_from(path);
+        assert!(loaded.contains(second, "telegram:1"));
+        assert!(!loaded.contains(ProtocolId::Telegram, "telegram:1"));
+        assert!(loaded.contains(ProtocolId::Telegram, "telegram:2"));
     }
 
     #[test]

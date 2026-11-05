@@ -12,6 +12,7 @@ use thinwire_ipc::{
 
 use crate::media::{ImageBytes, MediaKind, MessagePhoto, OutgoingFile, PhotoSize};
 
+use crate::ProtocolKind;
 use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, Arrival, ChatMessage, Conversation,
     Delivery, HistorySkipRun, HistoryStoreCursor, MAX_HISTORY_CURSOR_RUNS, ProtocolId,
@@ -22,10 +23,10 @@ use crate::adapter::{
 /// that runs in the app.
 #[must_use]
 pub(crate) const fn wire_protocol(protocol: ProtocolId) -> Option<WireProtocol> {
-    match protocol {
-        ProtocolId::WhatsApp => Some(WireProtocol::WhatsApp),
-        ProtocolId::Signal => Some(WireProtocol::Signal),
-        ProtocolId::Telegram | ProtocolId::Discord | ProtocolId::Slack => None,
+    match protocol.kind() {
+        ProtocolKind::WhatsApp => Some(WireProtocol::WhatsApp),
+        ProtocolKind::Signal => Some(WireProtocol::Signal),
+        ProtocolKind::Telegram | ProtocolKind::Discord | ProtocolKind::Slack => None,
     }
 }
 
@@ -130,6 +131,10 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::LoadOlderTopic { .. }
         | AdapterCommand::SendTopicText { .. }
         | AdapterCommand::SendMedia { topic: Some(_), .. }
+        // The host answers these. A routed command has no `ToAccount`.
+        | AdapterCommand::AddAccount { .. }
+        | AdapterCommand::RemoveAccount { .. }
+        | AdapterCommand::ToAccount { .. }
         | AdapterCommand::ViewTopic { .. }
         | AdapterCommand::DownloadFile { .. }
         | AdapterCommand::DownloadVoice { .. } => return None,

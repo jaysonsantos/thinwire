@@ -16,5 +16,5 @@ mod whatsapp;
 
 pub use whatsapp::{
     SessionLock, SessionLockError, WhatsAppAdapter, lock_session, parse_whatsapp_chat_id,
-    set_session_dir,
+    set_account, set_session_dir,
 };

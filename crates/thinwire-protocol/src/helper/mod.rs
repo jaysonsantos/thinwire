@@ -21,7 +21,9 @@ mod supervisor;
 #[cfg(test)]
 mod tests;
 
-pub use launch::{HelperInput, HelperLauncher, HelperOutput, HelperProcess, ProcessLauncher};
+pub use launch::{
+    HelperInput, HelperLauncher, HelperOutput, HelperProcess, ProcessLauncher, account_launcher,
+};
 pub use serve::{ServeConfig, ServeEnd, refuse, serve};
 pub use supervisor::{ADAPTER_STOP_WAIT, HelperAdapter, HelperSpec, HelperTiming};
 pub use thinwire_ipc::HelperRefusal;

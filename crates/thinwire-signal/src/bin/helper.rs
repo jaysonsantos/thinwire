@@ -16,7 +16,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use thinwire_protocol::helper::{HelperRefusal, ServeConfig, ServeEnd, refuse, serve};
-use thinwire_signal::{SessionLockError, SignalAdapter, lock_session, set_session_dir};
+use thinwire_signal::{
+    SessionLockError, SignalAdapter, lock_session, set_account, set_session_dir,
+};
 
 /// Names of the environment variables of this program.
 mod env {
@@ -51,6 +53,11 @@ struct Cli {
     /// Keep the session store in this folder, not under the app-data folder.
     #[arg(long, env = env::SESSION_DIR)]
     session_dir: Option<PathBuf>,
+    /// Run as this account of the app (ADR 0014). 0 is the first account.
+    /// Account `n` keeps its store in its own folder and its key under its
+    /// own keychain name.
+    #[arg(long, env = "THINWIRE_SIGNAL_ACCOUNT", default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=8))]
+    account: u8,
     /// Run a build that has no Signal client. Only for the process tests:
     /// such a build cannot link, so without this flag it refuses to run.
     #[arg(long, env = env::ALLOW_NO_CLIENT)]
@@ -109,6 +116,8 @@ async fn run(cli: Cli) -> i32 {
         refuse(&mut stdout, HelperRefusal::NoClient).await;
         return exit::REFUSED;
     }
+    // The first and only call: `main` runs once.
+    let _ = set_account(cli.account);
     if let Some(dir) = cli.session_dir {
         // The first and only call: `main` runs once.
         let _ = set_session_dir(dir);

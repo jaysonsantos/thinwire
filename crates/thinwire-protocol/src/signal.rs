@@ -153,14 +153,25 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
 /// goes to this helper.
 #[must_use]
 pub fn signal_helper_adapter(configured: Option<PathBuf>) -> crate::helper::HelperAdapter {
+    signal_helper_adapter_for(configured, 0)
+}
+
+/// The helper adapter of Signal account `slot` (ADR 0014). Account `n`
+/// starts its own helper with `--account n`.
+#[must_use]
+pub fn signal_helper_adapter_for(
+    configured: Option<PathBuf>,
+    slot: u8,
+) -> crate::helper::HelperAdapter {
     crate::helper::HelperAdapter::new(
         crate::helper::HelperSpec {
             protocol: ProtocolId::Signal,
             capabilities: HELPER_CAPABILITIES,
         },
-        Arc::new(crate::helper::ProcessLauncher::new(
+        Arc::new(crate::helper::account_launcher(
             SIGNAL_HELPER_PROGRAM,
             configured,
+            slot,
         )),
         None,
     )

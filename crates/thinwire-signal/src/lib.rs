@@ -12,4 +12,6 @@
 
 mod signal;
 
-pub use signal::{SessionLock, SessionLockError, SignalAdapter, lock_session, set_session_dir};
+pub use signal::{
+    SessionLock, SessionLockError, SignalAdapter, lock_session, set_account, set_session_dir,
+};

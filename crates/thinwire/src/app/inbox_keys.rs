@@ -29,6 +29,8 @@ struct InboxUi {
     apply_hints: bool,
     /// Protocols whose Restart the user clicked (#246).
     restarts: Vec<ProtocolId>,
+    /// The account intents of the clicks (ADR 0014).
+    account_intents: Vec<Intent>,
 }
 
 impl InboxUi {
@@ -65,6 +67,7 @@ impl InboxUi {
             selects: 0,
             apply_hints: false,
             restarts: Vec::new(),
+            account_intents: Vec::new(),
         }
     }
 
@@ -103,6 +106,10 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
                 state.snapshot.select_conversation(id);
             }
             Intent::RestartHelper(protocol) => state.restarts.push(protocol),
+            intent
+            @ (Intent::AddAccount(_) | Intent::LinkAccount(_) | Intent::RemoveAccount(_)) => {
+                state.account_intents.push(intent)
+            }
             Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
             Intent::AddAttachments {
                 protocol,
@@ -347,6 +354,40 @@ fn a_click_on_the_account_name_selects_the_account() {
     assert_eq!(
         harness.state().snapshot.selected_protocol,
         ProtocolId::Telegram
+    );
+}
+
+/// ADR 0014: Add account opens a menu of the services, also with a linked
+/// Telegram account. A second account row has its number, Link, and
+/// Remove. Account 0 has neither button.
+#[test]
+fn add_account_lists_the_services_and_a_second_row_has_link_and_remove() {
+    let mut state = InboxUi::ready();
+    let second = ProtocolId::account(thinwire_protocol::ProtocolKind::Telegram, 1).expect("slot");
+    assert!(state.snapshot.add_account_row(second));
+    let mut harness = harness(state);
+    harness.run_steps(3);
+    harness.get_by_label("Add account").click();
+    harness.run_steps(3);
+    harness.get_by_label("Add a Telegram account").click();
+    harness.run_steps(3);
+    assert!(
+        harness.query_by_label("Add a WhatsApp account").is_none(),
+        "a hidden service has no entry"
+    );
+    harness.get_by_label("Link").click();
+    harness.run_steps(2);
+    harness.get_by_label("Remove Telegram 2").click();
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Remove Telegram").is_none());
+    assert!(harness.query_all_by_label("Telegram 2").next().is_some());
+    assert_eq!(
+        harness.state().account_intents,
+        vec![
+            Intent::AddAccount(thinwire_protocol::ProtocolKind::Telegram),
+            Intent::LinkAccount(second),
+            Intent::RemoveAccount(second),
+        ]
     );
 }
 
