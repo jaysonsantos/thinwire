@@ -5,8 +5,9 @@
 #
 # Linux and Windows binaries stay unsigned. On macOS, the stage step signs
 # Thinwire.app with the identity in MACOS_SIGNING_P12 when that secret is
-# set. An empty secret keeps the ad-hoc signature. There is no notarization.
-# Those secrets are step env on the macOS stage step only. Do not put them
+# set, then notarizes and staples a Developer ID signature. An empty secret
+# keeps the ad-hoc signature and does not contact Apple. The signing and
+# notary secrets are step env on the macOS stage step only. Do not put them
 # in an if: condition, and do not copy them into a pull_request workflow.
 #
 # Each archive holds the MIT app and two AGPL-3.0-only helper programs: the

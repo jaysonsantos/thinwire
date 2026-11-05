@@ -388,6 +388,16 @@ mod tests {
             1,
             "notarytool submit has one call site"
         );
+        let readme = include_str!("../../../../README.md");
+        assert!(
+            !readme.contains("There is no notarization."),
+            "the main macOS artifact is notarized"
+        );
+        let adr = include_str!("../../../../decisions/0003-main-only-ci-artifacts.md");
+        assert!(
+            !adr.contains("notarization on these artifacts"),
+            "ADR 0003 allows notarization of the main macOS artifact"
+        );
         assert!(
             stage.contains(
                 "::error::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."

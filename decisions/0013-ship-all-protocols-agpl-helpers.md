@@ -36,6 +36,8 @@ ADR 0012 analyzed a helper process and recommended "Later" until a lawyer answer
     - Signing follows ADR 0003: on macOS each helper gets the same ad-hoc signature as the app. There is no Developer ID and no notarization (Developer ID since 2026-10-29, see below). Linux and Windows helpers are unsigned.
 
     Amendment (2026-10-29, Developer ID identity): ADR 0003 (2026-10-29) supersedes the ad-hoc signature text above for the identity type. The same amendment supersedes the "no Developer ID" sentence. The stage script signs each nested helper Mach-O with the selected identity. The script then signs the app with the same identity. On `main`, that identity is Developer ID Application. Hardened runtime is on for that identity. There is still no notarization. An empty `MACOS_SIGNING_P12` keeps the ad-hoc signature. Linux and Windows helpers stay unsigned.
+
+    Amendment (2026-11-05, notarized bundle): ADR 0003 (2026-11-05) supersedes the "there is still no notarization" sentence for the main artifact. The helpers are inside the one notarized bundle and are not submitted separately. An empty `MACOS_SIGNING_P12` keeps the ad-hoc signature. Linux and Windows helpers stay unsigned.
 7. The default public CI jobs stay feature-off. One separate, explicit release-feature job builds and tests every feature that a release ships: `telegram-tdlib`, `slack-oauth`, `discord-bot` and the helper crates. This starts in the first PR of #246. The workflow change needs an owner push, because the bot token has no workflow scope.
     - `scripts/check-agpl-deps.sh` and `scripts/check-release-tree.sh` change: they allow AGPL crates in the helper crates only, and they still fail if the MIT app binary links AGPL code.
 8. Each release contains:

@@ -3,9 +3,9 @@
 # actions/upload-artifact wraps downloads in an outer zip and stores loose
 # files as 644. The tar.gz is what keeps executable bits and the .app tree.
 # macOS: sign Thinwire.app with the identity in MACOS_SIGNING_P12 when that
-# variable is set. An empty variable keeps the ad-hoc signature. Hardened
-# runtime is only for a Developer ID Application identity. There is no
-# notarization. Linux and Windows: flat binaries plus notices.
+# variable is set. Developer ID uses a secure timestamp, then the notarize
+# script staples the ticket. An empty variable keeps the ad-hoc signature
+# and does not contact Apple. Linux and Windows: flat binaries plus notices.
 #
 # The payload has three programs (ADR 0013): the MIT app, and next to it
 # the AGPL-3.0-only WhatsApp helper and the AGPL-3.0-only Signal helper. The
@@ -658,8 +658,7 @@ sign_macos_app() {
     echo "macOS signing: ad-hoc signature (MACOS_SIGNING_P12 is empty)"
     sign_nested_machos "$app" adhoc
     # Ad-hoc signature for the whole bundle. The notification center needs
-    # it (#161). It is not a Developer ID signature and there is no
-    # notarization (ADR 0003).
+    # it (#161). This path is not Developer ID, so the staple step skips it.
     codesign --force --sign - "$app"
   fi
   codesign --verify --strict --deep --verbose=2 "$app"
