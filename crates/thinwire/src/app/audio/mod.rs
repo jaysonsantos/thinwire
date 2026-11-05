@@ -258,27 +258,33 @@ impl<B: Backend> Player<B> {
         self.video.shutdown();
     }
 
-    /// The video frame of this message is on screen, in the place of its
-    /// thumbnail. Always `false` in a build with no `video` feature.
-    pub(crate) fn video_covers(
-        &self,
-        protocol: ProtocolId,
-        conversation_id: &str,
-        message_id: &str,
-    ) -> bool {
+    /// Close the video view, as Esc does. `true` when one was open.
+    pub(crate) fn take_video_escape(&mut self) -> bool {
         #[cfg(feature = "video")]
         {
-            self.video.covers(protocol, conversation_id, message_id)
+            self.video.take_escape()
         }
         #[cfg(not(feature = "video"))]
         {
-            let _ = (protocol, conversation_id, message_id);
             false
         }
     }
 
-    /// The frame and the controls of a video. A build with no `video`
-    /// feature draws nothing: the row keeps its thumbnail and its label.
+    /// The video view over the whole window, when a clip plays.
+    pub(crate) fn video_overlay(&mut self, ui: &mut egui::Ui, messages: &[ChatMessage]) {
+        #[cfg(feature = "video")]
+        self.video.overlay(ui, messages);
+        #[cfg(not(feature = "video"))]
+        let _ = (ui, messages);
+    }
+
+    /// The controls of a video in its row. `tapped` is a tap on its
+    /// thumbnail. A build with no `video` feature draws nothing: the row
+    /// keeps its thumbnail and its label.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one row: its ids, its clip, and the tap"
+    )]
     pub(crate) fn show_video(
         &mut self,
         ui: &mut egui::Ui,
@@ -286,15 +292,31 @@ impl<B: Backend> Player<B> {
         conversation_id: &str,
         message_id: &str,
         video: Option<&MessageVideo>,
+        tapped: bool,
         out: &mut Vec<Intent>,
     ) {
         #[cfg(feature = "video")]
         if let Some(video) = video {
-            self.video
-                .show(ui, protocol, conversation_id, message_id, video, out);
+            self.video.show(
+                ui,
+                protocol,
+                conversation_id,
+                message_id,
+                video,
+                tapped,
+                out,
+            );
         }
         #[cfg(not(feature = "video"))]
-        let _ = (ui, protocol, conversation_id, message_id, video, out);
+        let _ = (
+            ui,
+            protocol,
+            conversation_id,
+            message_id,
+            video,
+            tapped,
+            out,
+        );
     }
 
     pub(crate) fn sync(&mut self, messages: &[ChatMessage]) {

@@ -192,6 +192,7 @@ pub(crate) fn draw(
     notice_review(ui, snapshot, out);
     super::links::confirm(ui);
     super::photos::overlay(ui, snapshot.selected_messages());
+    player.video_overlay(ui, snapshot.selected_messages());
 }
 
 /// Single-line or multiline text bound to a core value. A change becomes an intent.
@@ -2052,8 +2053,9 @@ fn center_panel(
             )
         });
         if escape {
-            let closed =
-                super::photos::take_escape(ui.ctx()) || super::links::take_escape(ui.ctx());
+            let closed = player.take_video_escape()
+                || super::photos::take_escape(ui.ctx())
+                || super::links::take_escape(ui.ctx());
             if !closed {
                 out.push(Intent::Key(AuthKey::Escape));
             }
@@ -3264,27 +3266,26 @@ fn bubble(
                         // The pane name already includes the sender.
                         hide_from_accesskit(ui, response.id);
                     }
-                    // A playing video takes the place of its thumbnail.
-                    let covered =
-                        player.video_covers(message.protocol, message.conversation_id, message.id);
-                    if let Some(photo) = message.photo
-                        && !covered
-                    {
+                    // A tap on the thumbnail of a video plays the video, not
+                    // the still picture.
+                    let tapped = message.photo.is_some_and(|photo| {
                         super::photos::show(
                             ui,
                             message.protocol,
                             message.conversation_id,
                             message.id,
                             photo,
+                            message.video.is_none(),
                             out,
-                        );
-                    }
+                        )
+                    });
                     player.show_video(
                         ui,
                         message.protocol,
                         message.conversation_id,
                         message.id,
                         message.video,
+                        tapped,
                         out,
                     );
                     player.show(

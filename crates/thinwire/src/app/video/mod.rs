@@ -1,8 +1,9 @@
 //! In-app video (feature `video`, ADR 0015).
 //!
-//! One video plays at a time. Play on a clip with no file asks the core for
-//! the download, and the clip starts when its path comes. The newest frame
-//! takes the place of the thumbnail in the row.
+//! One video plays at a time, over the whole window. Play, or a tap on the
+//! thumbnail, on a clip with no file asks the core for the download, and the
+//! clip starts when its path comes. Esc, Close, and a click outside the
+//! frame close the view.
 
 mod player;
 
@@ -12,9 +13,6 @@ use thinwire_protocol::{ChatMessage, MessageVideo, ProtocolId};
 
 use super::{motion, theme};
 use player::{PlayState, VideoPlayer};
-
-/// The widest frame in a row, in points.
-const MAX_WIDTH: f32 = 320.0;
 
 /// How often a playing video checks its end with no new frame.
 const POLL: std::time::Duration = std::time::Duration::from_millis(250);
@@ -71,21 +69,19 @@ impl VideoSlot {
         self.slot = Slot::Idle;
     }
 
-    /// The frame of this clip is on screen: the row does not draw its
-    /// thumbnail.
-    pub(crate) fn covers(
-        &self,
-        protocol: ProtocolId,
-        conversation_id: &str,
-        message_id: &str,
-    ) -> bool {
-        matches!(
-            &self.slot,
-            Slot::Playing { key, texture: Some(_), .. } if is(key, protocol, conversation_id, message_id)
-        )
+    /// Close the video view, as Esc does. `true` when one was open.
+    pub(crate) fn take_escape(&mut self) -> bool {
+        let open = !matches!(self.slot, Slot::Idle);
+        self.slot = Slot::Idle;
+        open
     }
 
-    /// The frame and the controls of the clip in one row.
+    /// The controls of the clip in its row. `tapped` is a tap on the
+    /// thumbnail: it plays the clip, as Play does.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one row: its ids, its clip, and the tap"
+    )]
     pub(crate) fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -93,6 +89,7 @@ impl VideoSlot {
         conversation_id: &str,
         message_id: &str,
         video: &MessageVideo,
+        tapped: bool,
         out: &mut Vec<Intent>,
     ) {
         let key = VideoKey {
@@ -100,54 +97,20 @@ impl VideoSlot {
             conversation_id: conversation_id.to_owned(),
             message_id: message_id.to_owned(),
         };
-        self.advance(ui.ctx(), &key, video);
         let palette = theme::palette(ui);
-        let mut action = Action::None;
-        ui.push_id(
-            (conversation_id, message_id, "video"),
-            |ui| match &mut self.slot {
-                Slot::Playing {
-                    key: playing,
-                    player,
-                    texture,
-                } if *playing == key => {
-                    if let Some(texture) = texture.as_ref() {
-                        let size = texture.size_vec2();
-                        let width = size.x.min(MAX_WIDTH).min(ui.available_width());
-                        let scale = if size.x > 0.0 { width / size.x } else { 1.0 };
-                        ui.add(egui::Image::new((texture.id(), size * scale)));
-                    }
-                    let state = player.poll();
-                    ui.horizontal(|ui| {
-                        if state == PlayState::Failed {
-                            ui.label(
-                                RichText::new("Couldn't play this video.")
-                                    .small()
-                                    .color(palette.error),
-                            );
-                            if small_button(ui, "Close") {
-                                action = Action::Close;
-                            }
-                            return;
-                        }
-                        let label = match state {
-                            PlayState::Paused => "Play",
-                            PlayState::Ended => "Replay",
-                            PlayState::Playing | PlayState::Failed => "Pause",
-                        };
-                        if small_button(ui, label) {
-                            player.toggle();
-                        }
-                        if small_button(ui, "Close") {
-                            action = Action::Close;
-                        }
-                    });
+        let mut press = tapped;
+        ui.push_id((conversation_id, message_id, "video"), |ui| {
+            match &self.slot {
+                Slot::Playing { key: playing, .. } if *playing == key => {
+                    ui.label(RichText::new("Playing…").small().color(palette.text2));
+                    press = false;
                 }
                 Slot::Waiting(waiting) if *waiting == key => {
                     ui.horizontal(|ui| {
                         motion::spinner(ui);
                         ui.label(RichText::new("Loading video…").small().color(palette.text2));
                     });
+                    press = false;
                 }
                 Slot::Failed(failed) if *failed == key => {
                     ui.horizontal(|ui| {
@@ -157,7 +120,7 @@ impl VideoSlot {
                                 .color(palette.error),
                         );
                         if small_button(ui, "Retry") {
-                            action = Action::Press;
+                            press = true;
                         }
                     });
                 }
@@ -167,15 +130,111 @@ impl VideoSlot {
                         secs => format!("Play video {}:{:02}", secs / 60, secs % 60),
                     };
                     if small_button(ui, &label) {
-                        action = Action::Press;
+                        press = true;
                     }
                 }
-            },
-        );
+            }
+        });
+        if press {
+            self.press(ui.ctx(), key, video, out);
+        }
+    }
+
+    /// The playing clip over the whole window. A waiting clip starts here
+    /// when its file comes. Close and a click outside the frame close it.
+    pub(crate) fn overlay(&mut self, ui: &mut egui::Ui, messages: &[ChatMessage]) {
+        if let Slot::Waiting(key) = &self.slot {
+            let key = key.clone();
+            if let Some(video) = video_of(messages, &key) {
+                self.advance(ui.ctx(), &key, &video);
+            }
+        }
+        if let Slot::Playing { key, .. } = &self.slot {
+            let key = key.clone();
+            if let Some(video) = video_of(messages, &key) {
+                self.advance(ui.ctx(), &key, &video);
+            }
+        }
+        let Slot::Playing {
+            player, texture, ..
+        } = &mut self.slot
+        else {
+            return;
+        };
+        let state = player.poll();
+        let screen = ui.ctx().content_rect();
+        let mut action = Action::None;
+        egui::Area::new(egui::Id::unique("video-overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ui.ctx(), |ui| {
+                let backdrop = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(200));
+                let room = screen.shrink(48.0);
+                let bar = 40.0;
+                let space = egui::vec2(room.width(), (room.height() - bar).max(1.0));
+                let frame = texture.as_ref().map_or(egui::Vec2::splat(64.0), |texture| {
+                    let size = texture.size_vec2();
+                    let scale = (space.x / size.x).min(space.y / size.y).clamp(0.0, 1.0);
+                    size * scale
+                });
+                let rect = egui::Rect::from_center_size(
+                    screen.center() - egui::vec2(0.0, bar / 2.0),
+                    frame,
+                );
+                match texture.as_ref() {
+                    Some(texture) => {
+                        ui.painter().image(
+                            texture.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    None => {
+                        let _ = ui.place(rect, |ui: &mut egui::Ui| {
+                            ui.centered_and_justified(motion::spinner).response
+                        });
+                    }
+                }
+                let controls = egui::Rect::from_center_size(
+                    egui::pos2(screen.center().x, rect.bottom() + bar / 2.0 + 4.0),
+                    egui::vec2(220.0, 28.0),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(controls), |ui| {
+                    ui.horizontal_centered(|ui| {
+                        if state == PlayState::Failed {
+                            ui.label(
+                                RichText::new("Couldn't play this video.")
+                                    .small()
+                                    .color(egui::Color32::WHITE),
+                            );
+                        } else {
+                            let label = match state {
+                                PlayState::Paused => "Play",
+                                PlayState::Ended => "Replay",
+                                PlayState::Playing | PlayState::Failed => "Pause",
+                            };
+                            if ui.button(label).clicked() {
+                                action = Action::Toggle;
+                            }
+                        }
+                        if ui.button("Close").clicked() {
+                            action = Action::Close;
+                        }
+                    });
+                });
+                let outside = backdrop.clicked()
+                    && super::photos::outside(backdrop.interact_pointer_pos(), &[rect, controls]);
+                if outside {
+                    action = Action::Close;
+                }
+            });
         match action {
             Action::None => {}
+            Action::Toggle => player.toggle(),
             Action::Close => self.slot = Slot::Idle,
-            Action::Press => self.press(ui.ctx(), key, video, out),
         }
     }
 
@@ -257,11 +316,11 @@ impl VideoSlot {
     }
 }
 
-/// What a click in the row asks for.
+/// What a click in the video view asks for.
 enum Action {
     None,
+    Toggle,
     Close,
-    Press,
 }
 
 fn small_button(ui: &mut egui::Ui, label: &str) -> bool {
@@ -269,10 +328,16 @@ fn small_button(ui: &mut egui::Ui, label: &str) -> bool {
         .clicked()
 }
 
-fn is(key: &VideoKey, protocol: ProtocolId, conversation_id: &str, message_id: &str) -> bool {
-    key.protocol == protocol
-        && key.conversation_id == conversation_id
-        && key.message_id == message_id
+/// The clip of the message `key`, while it is in the open chat.
+fn video_of(messages: &[ChatMessage], key: &VideoKey) -> Option<MessageVideo> {
+    messages
+        .iter()
+        .find(|message| {
+            message.protocol == key.protocol
+                && message.conversation_id == key.conversation_id
+                && message.id == key.message_id
+        })
+        .and_then(|message| message.video.clone())
 }
 
 #[cfg(test)]
@@ -333,7 +398,6 @@ mod tests {
         failed.mark_failed();
         slot.advance(&ctx, &key(), &failed);
         assert!(matches!(slot.slot, Slot::Failed(_)));
-        assert!(!slot.covers(ProtocolId::Telegram, "telegram:1", "telegram:1:5"));
 
         slot.sync(&[row(Some(clip))]);
         assert!(

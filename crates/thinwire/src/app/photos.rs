@@ -345,8 +345,9 @@ pub(crate) fn show(
     conversation_id: &str,
     message_id: &str,
     photo: &MessagePhoto,
+    opens_full: bool,
     out: &mut Vec<Intent>,
-) {
+) -> bool {
     prune_loads(ui.ctx());
     let size = photo_box(photo.width, photo.height);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -366,7 +367,8 @@ pub(crate) fn show(
         selected_image(ui, message_id, photo, rect.width())
     };
     // The click that reveals a spoiler does not also open the full view.
-    if response.clicked() && !spoiler_was_hidden && !photo.is_secret && selected.is_some() {
+    let tapped = response.clicked() && !spoiler_was_hidden;
+    if tapped && opens_full && !photo.is_secret && selected.is_some() {
         open_overlay(ui.ctx(), message_id);
     }
     paint(
@@ -379,10 +381,10 @@ pub(crate) fn show(
     );
     if photo.failed {
         failure(ui, rect, protocol, conversation_id, message_id, photo, out);
-        return;
+        return tapped;
     }
     if spoiler_hidden {
-        return;
+        return tapped;
     }
     maybe_download(ui, rect, protocol, conversation_id, message_id, photo, out);
     if selected.is_none() {
@@ -392,6 +394,7 @@ pub(crate) fn show(
             ui.centered_and_justified(motion::spinner).response
         });
     }
+    tapped
 }
 
 fn paint(
@@ -802,7 +805,8 @@ fn fingerprint(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// The full photo, fitted in the window. Esc and Close leave it.
+/// The full photo, fitted in the window. Esc, Close, and a click outside
+/// the photo leave it.
 pub(crate) fn overlay(ui: &mut egui::Ui, messages: &[thinwire_protocol::ChatMessage]) {
     prune_loads(ui.ctx());
     let Some(message_id) = photo_ui(ui.ctx()).overlay.clone() else {
@@ -826,7 +830,7 @@ pub(crate) fn overlay(ui: &mut egui::Ui, messages: &[thinwire_protocol::ChatMess
         .order(egui::Order::Foreground)
         .fixed_pos(screen.min)
         .show(ui.ctx(), |ui| {
-            let _ = ui.allocate_rect(screen, Sense::click());
+            let backdrop = ui.allocate_rect(screen, Sense::click());
             ui.painter()
                 .rect_filled(screen, 0.0, Color32::from_black_alpha(180));
             let margin = 48.0;
@@ -837,10 +841,20 @@ pub(crate) fn overlay(ui: &mut egui::Ui, messages: &[thinwire_protocol::ChatMess
                 screen.right_top() + egui::vec2(-88.0, 16.0),
                 egui::vec2(72.0, 28.0),
             );
-            if ui.put(close, egui::Button::new("Close")).clicked() {
+            let close_clicked = ui.put(close, egui::Button::new("Close")).clicked();
+            // A click on the dark area closes the view, as Esc does. A click
+            // on the photo itself does not.
+            let outside = backdrop.clicked() && outside(backdrop.interact_pointer_pos(), &[rect]);
+            if close_clicked || outside {
                 take_escape(ui.ctx());
             }
         });
+}
+
+/// A click at `pointer` closes a full view: it is on the dark area, not on
+/// one of the `keep` rects (the photo, the frame, or the controls).
+pub(crate) fn outside(pointer: Option<egui::Pos2>, keep: &[egui::Rect]) -> bool {
+    pointer.is_some_and(|pos| !keep.iter().any(|rect| rect.contains(pos)))
 }
 
 /// Fit the photo's own pixel size into `bounds`. A large photo can grow past
@@ -1050,6 +1064,22 @@ mod tests {
     }
 
     #[test]
+    fn a_click_on_the_dark_area_closes_the_view() {
+        let photo = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(200.0, 100.0));
+        let bar = egui::Rect::from_min_size(egui::pos2(100.0, 210.0), egui::vec2(200.0, 28.0));
+        assert!(outside(Some(egui::pos2(10.0, 10.0)), &[photo, bar]));
+        assert!(
+            !outside(Some(egui::pos2(150.0, 150.0)), &[photo, bar]),
+            "on the photo"
+        );
+        assert!(
+            !outside(Some(egui::pos2(150.0, 220.0)), &[photo, bar]),
+            "on the controls"
+        );
+        assert!(!outside(None, &[photo]), "no pointer");
+    }
+
+    #[test]
     fn the_overlay_fits_the_photo_to_the_window() {
         let inline = photo_box(2000, 1000);
         let bounds = Vec2::new(1000.0, 800.0);
@@ -1238,6 +1268,7 @@ mod tests {
                     "telegram:1",
                     "telegram:1:2",
                     photo,
+                    true,
                     out,
                 );
             });
@@ -1266,6 +1297,7 @@ mod tests {
                     "telegram:1",
                     "telegram:1:2",
                     &photo,
+                    true,
                     &mut Vec::new(),
                 );
                 ui.label("Hello");
