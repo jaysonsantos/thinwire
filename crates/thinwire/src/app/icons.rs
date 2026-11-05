@@ -257,10 +257,8 @@ fn whatsapp(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
 /// A speech bubble: Signal-like.
 fn signal(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     let unit = size / 16.0;
-    let body = egui::Rect::from_center_size(
-        at(center, unit, 0.0, -1.0),
-        Vec2::new(12.0, 10.0) * unit,
-    );
+    let body =
+        egui::Rect::from_center_size(at(center, unit, 0.0, -1.0), Vec2::new(12.0, 10.0) * unit);
     painter.rect_filled(
         body,
         egui::CornerRadius::same((4.5 * unit).round().clamp(2.0, 255.0) as u8),
@@ -283,10 +281,8 @@ fn signal(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
 /// across the chin notch under `Shape::convex_polygon`.
 fn discord(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     let unit = size / 16.0;
-    let body = egui::Rect::from_center_size(
-        at(center, unit, 0.0, -0.5),
-        Vec2::new(13.0, 10.0) * unit,
-    );
+    let body =
+        egui::Rect::from_center_size(at(center, unit, 0.0, -0.5), Vec2::new(13.0, 10.0) * unit);
     painter.rect_filled(
         body,
         egui::CornerRadius::same((5.0 * unit).round().clamp(2.0, 255.0) as u8),
