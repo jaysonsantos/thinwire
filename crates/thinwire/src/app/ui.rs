@@ -2642,7 +2642,8 @@ struct MetaInk {
     action: egui::Color32,
 }
 
-/// A message of one to three emoji and nothing else. It draws large, with no bubble.
+/// A message of one to three emoji and nothing else. It draws large, with no
+/// bubble. A photo, a voice note, or a link keeps its bubble.
 fn is_emoji_only(message: &Bubble<'_>) -> bool {
     message.photo.is_none()
         && message.audio.is_none()

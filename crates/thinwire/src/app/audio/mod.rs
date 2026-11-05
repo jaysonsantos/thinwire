@@ -259,7 +259,6 @@ impl<B: Backend> Player<B> {
         self.session = Session::Idle;
     }
 
-    /// The open thread, after the core has applied this frame's events.
     pub(crate) fn sync(&mut self, messages: &[ChatMessage]) {
         // A completion can already be queued when a newer play replaces it.
         // The worker stamps the play that produced it. Applying an older one
@@ -704,8 +703,6 @@ mod tests {
             assert_step(&session, Input::Rejected, session.clone(), &[]);
         }
 
-        // A download that finishes after pause stays on the message and does
-        // not start. Seen during Idle does not autoplay.
         assert_step(
             &Session::Idle,
             Input::Seen {

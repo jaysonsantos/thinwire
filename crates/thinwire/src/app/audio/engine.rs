@@ -1,5 +1,3 @@
-//! The UI thread never calls into rodio.
-//!
 //! rodio 0.23's symphonia features decode Vorbis, not Opus. Telegram voice
 //! notes are Opus inside Ogg, so this module reads those packets itself.
 

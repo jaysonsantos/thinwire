@@ -634,8 +634,6 @@ impl eframe::App for ThinwireApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let view = self.core.view();
-        // logic() already pumped, so a voice file that landed this frame
-        // can start before the bubble paints.
         self.player.sync(view.selected_messages());
         let mut hints = ui::Hints::from_view(&view);
         ui::draw(ui, &view, &mut hints, &mut self.player, &mut self.intents);
@@ -675,7 +673,6 @@ impl ThinwireApp {
     /// Last step at exit: try the keychain flush first, then stop the runtime
     /// within the close deadline instead of waiting for every blocking task.
     fn finish_exit(&mut self) {
-        // The device thread must not outlive the window.
         self.player.shutdown();
         // Each send with no answer yet is named in the log (protocol and
         // chat id, never the text), so none ends without a trace.
