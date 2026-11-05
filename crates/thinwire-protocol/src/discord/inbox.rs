@@ -249,6 +249,7 @@ pub(crate) fn chat_message(
         topic: None,
         links: Vec::new(),
         photo: None,
+        audio: None,
     }
 }
 

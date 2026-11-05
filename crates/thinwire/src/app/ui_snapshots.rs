@@ -725,6 +725,7 @@ mod signal_removed {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         core.dispatch(Intent::SelectConversation {

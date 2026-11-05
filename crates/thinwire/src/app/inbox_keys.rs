@@ -875,6 +875,7 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         topic: None,
         links: Vec::new(),
         photo: None,
+        audio: None,
     }
 }
 

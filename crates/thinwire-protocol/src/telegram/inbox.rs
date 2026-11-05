@@ -910,6 +910,7 @@ pub(super) fn to_chat_message(
         topic: message.topic,
         links: Vec::new(),
         photo: None,
+        audio: None,
     }
 }
 

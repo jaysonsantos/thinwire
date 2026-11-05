@@ -24,13 +24,14 @@ use super::lifecycle::{
 };
 use super::router::{self, Router};
 use crate::adapter::{
-    AdapterStatus, Arrival, ChatMessage, ChatTopic, Delivery, EventTx, LoginEpoch, MessageTopic,
-    OutgoingUpdate, ProtocolId, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
-    TelegramCodeVia, emit_chat_list_loaded, emit_conversation, emit_conversation_removed,
-    emit_history_loaded, emit_message, emit_message_delivery, emit_message_links,
-    emit_message_media, emit_message_replaced, emit_messages_removed, emit_older_history_loaded,
-    emit_outbox_read, emit_photo_failed, emit_photo_ready, emit_send_accepted, emit_send_rejected,
-    emit_status, emit_stopped, emit_telegram_session_ended, emit_topic, outgoing_delivery,
+    AdapterEvent, AdapterStatus, Arrival, ChatMessage, ChatTopic, Delivery, EventTx, LoginEpoch,
+    MessageTopic, OutgoingUpdate, ProtocolId, TelegramAuthError, TelegramAuthPhase,
+    TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
+    emit_conversation_removed, emit_history_loaded, emit_message, emit_message_delivery,
+    emit_message_links, emit_message_media, emit_message_replaced, emit_messages_removed,
+    emit_older_history_loaded, emit_outbox_read, emit_photo_failed, emit_photo_ready,
+    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped, emit_telegram_session_ended,
+    emit_topic, outgoing_delivery,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -97,6 +98,10 @@ enum TdlibCommand {
         file_id: i32,
         secret: bool,
     },
+    /// Download one voice file. The path stays. The bytes are not read.
+    DownloadVoice {
+        file_id: i32,
+    },
     /// Send photos and videos, with the caption on the first file.
     SendMedia {
         conversation_id: String,
@@ -162,9 +167,29 @@ struct LiveInbox {
     /// returned after the window blurred. Focus calls `viewMessages` through
     /// this id. The id stays until that call succeeds (#174 items 12 and 13).
     unviewed: Arc<Mutex<HashMap<i64, i64>>>,
-    /// Photo downloads this worker started. The value is secret, then whether
-    /// TDLib has reported the download as active.
-    downloads: HashMap<i32, (bool, bool)>,
+    /// Downloads this worker started. The first kind for an id wins.
+    downloads: HashMap<i32, InFlight>,
+}
+
+/// A file this worker asked TDLib to download.
+#[derive(Clone, Copy)]
+enum InFlight {
+    Photo { secret: bool, saw_active: bool },
+    Voice { saw_active: bool },
+}
+
+impl InFlight {
+    fn saw_active(self) -> bool {
+        match self {
+            Self::Photo { saw_active, .. } | Self::Voice { saw_active } => saw_active,
+        }
+    }
+
+    fn mark_active(&mut self) {
+        match self {
+            Self::Photo { saw_active, .. } | Self::Voice { saw_active } => *saw_active = true,
+        }
+    }
 }
 
 impl LiveInbox {
@@ -438,6 +463,21 @@ impl TdlibRuntime {
     ) {
         self.enqueue(
             TdlibCommand::DownloadFile { file_id, secret },
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    pub fn download_voice(
+        &mut self,
+        file_id: i32,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::DownloadVoice { file_id },
             secrets,
             source,
             events,
@@ -915,6 +955,9 @@ fn spawn_tdlib_worker(
                         }
                         TdlibCommand::DownloadFile { file_id, secret } => {
                             start_download(client_id, file_id, secret, &mut live, &events).await;
+                        }
+                        TdlibCommand::DownloadVoice { file_id } => {
+                            start_voice(client_id, file_id, &mut live, &events).await;
                         }
                     }
                 }
@@ -1712,6 +1755,7 @@ async fn apply_chat_update(
                 mapped.text.clone(),
                 mapped.links,
                 mapped.photo,
+                mapped.audio,
             );
             if mapped.scan {
                 schedule_text_entities(
@@ -1976,6 +2020,7 @@ fn emit_mapped_message_as(
     let mut mapped = ChatMessage { arrival, ..mapped };
     mapped.links = media.links;
     mapped.photo = media.photo;
+    mapped.audio = media.audio;
     if media.scan {
         schedule_text_entities(
             client_id,
@@ -2025,23 +2070,57 @@ async fn start_download(
     live: &mut LiveInbox,
     events: &EventTx,
 ) {
-    live.downloads.insert(file_id, (secret, false));
+    begin_download(
+        client_id,
+        file_id,
+        InFlight::Photo {
+            secret,
+            saw_active: false,
+        },
+        live,
+        events,
+    )
+    .await;
+}
+
+async fn start_voice(client_id: i32, file_id: i32, live: &mut LiveInbox, events: &EventTx) {
+    begin_download(
+        client_id,
+        file_id,
+        InFlight::Voice { saw_active: false },
+        live,
+        events,
+    )
+    .await;
+}
+
+async fn begin_download(
+    client_id: i32,
+    file_id: i32,
+    kind: InFlight,
+    live: &mut LiveInbox,
+    events: &EventTx,
+) {
+    if live.downloads.contains_key(&file_id) {
+        return;
+    }
+    live.downloads.insert(file_id, kind);
     match tdlib_rs::functions::download_file(file_id, 1, 0, 0, false, client_id).await {
         Ok(tdlib_rs::enums::File::File(file)) => {
             if file.local.is_downloading_completed {
                 live.downloads.remove(&file_id);
-                finish_photo(client_id, file, secret, events).await;
+                finish_download(client_id, file, kind, events).await;
             } else if !file.local.is_downloading_active {
                 live.downloads.remove(&file_id);
-                emit_photo_failed(events, ProtocolId::Telegram, file_id);
+                fail_download(kind, file_id, events);
             } else if let Some(row) = live.downloads.get_mut(&file_id) {
-                row.1 = true;
+                row.mark_active();
             }
         }
         Err(error) => {
             log_tdlib_error("downloadFile", &error);
             live.downloads.remove(&file_id);
-            emit_photo_failed(events, ProtocolId::Telegram, file_id);
+            fail_download(kind, file_id, events);
         }
     }
 }
@@ -2052,19 +2131,65 @@ async fn note_file(
     live: &mut LiveInbox,
     events: &EventTx,
 ) {
-    let Some((secret, saw_active)) = live.downloads.get(&file.id).copied() else {
+    let Some(kind) = live.downloads.get(&file.id).copied() else {
         return;
     };
     if file.local.is_downloading_completed {
         live.downloads.remove(&file.id);
-        finish_photo(client_id, file, secret, events).await;
+        finish_download(client_id, file, kind, events).await;
     } else if file.local.is_downloading_active {
         if let Some(row) = live.downloads.get_mut(&file.id) {
-            row.1 = true;
+            row.mark_active();
         }
-    } else if saw_active {
+    } else if kind.saw_active() {
         live.downloads.remove(&file.id);
-        emit_photo_failed(events, ProtocolId::Telegram, file.id);
+        fail_download(kind, file.id, events);
+    }
+}
+
+async fn finish_download(
+    client_id: i32,
+    file: tdlib_rs::types::File,
+    kind: InFlight,
+    events: &EventTx,
+) {
+    match kind {
+        InFlight::Photo { secret, .. } => finish_photo(client_id, file, secret, events).await,
+        InFlight::Voice { .. } => finish_voice(file, events),
+    }
+}
+
+fn fail_download(kind: InFlight, file_id: i32, events: &EventTx) {
+    let event = match kind {
+        InFlight::Photo { .. } => {
+            emit_photo_failed(events, ProtocolId::Telegram, file_id);
+            return;
+        }
+        InFlight::Voice { .. } => voice_event(file_id, false, ""),
+    };
+    let _ = events.send(event);
+}
+
+fn finish_voice(file: tdlib_rs::types::File, events: &EventTx) {
+    let event = voice_event(
+        file.id,
+        file.local.is_downloading_completed,
+        &file.local.path,
+    );
+    let _ = events.send(event);
+}
+
+fn voice_event(file_id: i32, completed: bool, path: &str) -> AdapterEvent {
+    match crate::AudioPath::new(path).filter(|_| completed) {
+        Some(path) => AdapterEvent::VoiceReady {
+            protocol: ProtocolId::Telegram,
+            file_id,
+            path,
+        },
+        None => AdapterEvent::VoiceFailed {
+            protocol: ProtocolId::Telegram,
+            file_id,
+        },
     }
 }
 
@@ -3616,5 +3741,34 @@ mod tests {
         assert_eq!(live_read_of(&incoming, None), None);
         let outgoing = live_message(42, 100, true);
         assert_eq!(live_read_of(&outgoing, Some(42)), None);
+    }
+
+    #[test]
+    fn an_empty_voice_path_is_a_failed_download() {
+        let failed = voice_event(42, true, "");
+        assert!(matches!(
+            failed,
+            AdapterEvent::VoiceFailed {
+                protocol: ProtocolId::Telegram,
+                file_id: 42,
+            }
+        ));
+        let waiting = voice_event(42, false, "/tmp/hidden-voice.ogg");
+        assert!(matches!(
+            waiting,
+            AdapterEvent::VoiceFailed { file_id: 42, .. }
+        ));
+        let ready = voice_event(42, true, "/tmp/hidden-voice.ogg");
+        match ready {
+            AdapterEvent::VoiceReady { file_id, path, .. } => {
+                assert_eq!(file_id, 42);
+                assert_eq!(
+                    path.as_path(),
+                    std::path::Path::new("/tmp/hidden-voice.ogg")
+                );
+                assert!(!format!("{path:?}").contains("hidden-voice"));
+            }
+            other => panic!("ready voice file, got {other:?}"),
+        }
     }
 }

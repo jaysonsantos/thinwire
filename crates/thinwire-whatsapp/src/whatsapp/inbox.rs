@@ -1190,6 +1190,7 @@ impl Inbox {
             topic: None,
             links: Vec::new(),
             photo,
+            audio: None,
         }
     }
 }

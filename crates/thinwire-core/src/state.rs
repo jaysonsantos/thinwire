@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
-    AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, ChatTopic,
+    AccountState, AdapterCommand, AdapterEvent, AdapterStatus, AudioPath, ChatMessage, ChatTopic,
     Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, HistoryStoreCursor,
-    MAX_ATTACHMENTS, MessageTopic, OutgoingFile, ProtocolCapabilities, ProtocolId,
+    MAX_ATTACHMENTS, MessageAudio, MessageTopic, OutgoingFile, ProtocolCapabilities, ProtocolId,
     StoreAccessReason, TelegramApiSource, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
     TelegramCodeVia, TelegramSecretVault, catalog, ordered_topics, telegram_api_available,
     topic_mute_id, with_outbox_read,
@@ -1392,6 +1392,7 @@ impl Snapshot {
                 body,
                 links,
                 photo,
+                audio,
             } => self.patch_message_media(
                 protocol,
                 &conversation_id,
@@ -1399,6 +1400,7 @@ impl Snapshot {
                 body,
                 links,
                 photo,
+                audio,
             ),
             AdapterEvent::MessageLinks {
                 protocol,
@@ -1412,6 +1414,12 @@ impl Snapshot {
                 file,
             } => self.photo_ready(protocol, file_id, file),
             AdapterEvent::PhotoFailed { protocol, file_id } => self.photo_failed(protocol, file_id),
+            AdapterEvent::VoiceReady {
+                protocol,
+                file_id,
+                path,
+            } => self.voice_ready(protocol, file_id, path),
+            AdapterEvent::VoiceFailed { protocol, file_id } => self.voice_failed(protocol, file_id),
             AdapterEvent::MessagesRemoved {
                 protocol,
                 conversation_id,
@@ -4727,7 +4735,9 @@ impl Snapshot {
         self.pending.retain(|command| {
             !matches!(
                 command,
-                AdapterCommand::DownloadFile { protocol: owner, .. } if *owner == protocol
+                AdapterCommand::DownloadFile { protocol: owner, .. }
+                    | AdapterCommand::DownloadVoice { protocol: owner, .. }
+                    if *owner == protocol
             )
         });
         self.notices.remove(&protocol);
@@ -5137,6 +5147,7 @@ impl Snapshot {
         let key = thread_key(message.protocol, &message.conversation_id, message.topic);
         let list = self.messages.entry(key).or_default();
         if let Some(existing) = list.iter_mut().find(|row| row.id == message.id) {
+            Self::keep_voice_file(&mut message.audio, existing.audio.as_ref());
             *existing = message;
         } else {
             list.push(message);
@@ -5192,6 +5203,8 @@ impl Snapshot {
         }
     }
 
+    // One argument per `MessageMedia` field. A wrapper struct would only rename the call.
+    #[allow(clippy::too_many_arguments)]
     fn patch_message_media(
         &mut self,
         protocol: ProtocolId,
@@ -5200,13 +5213,39 @@ impl Snapshot {
         body: String,
         links: Vec<thinwire_protocol::MessageLink>,
         photo: Option<thinwire_protocol::MessagePhoto>,
+        audio: Option<MessageAudio>,
     ) {
         let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
             return;
         };
+        let stored = message.audio.clone();
         message.body = body;
         message.links = links;
         message.photo = photo;
+        message.audio = audio;
+        Self::keep_voice_file(&mut message.audio, stored.as_ref());
+    }
+
+    /// A refresh may omit a path TDLib has not reported yet. Keep the path
+    /// and the failed flag already stored for the same file id.
+    fn keep_voice_file(incoming: &mut Option<MessageAudio>, stored: Option<&MessageAudio>) {
+        let Some(stored) = stored else {
+            return;
+        };
+        let Some(incoming) = incoming.as_mut() else {
+            return;
+        };
+        if incoming.file_id() != stored.file_id() || incoming.file().is_some() {
+            return;
+        }
+        if let Some(path) = stored.file().cloned() {
+            incoming.set_file(path);
+        }
+        if stored.failed() {
+            incoming.mark_failed();
+        } else {
+            incoming.clear_failed();
+        }
     }
 
     fn patch_message_links(
@@ -5266,6 +5305,42 @@ impl Snapshot {
             file_id,
             secret,
         });
+    }
+
+    /// Download the voice file on the open message. A repeat queues again.
+    /// A path, another file, or a message that is not on screen does nothing.
+    pub(crate) fn play_audio(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        file_id: i32,
+    ) {
+        if protocol != ProtocolId::Telegram {
+            return;
+        }
+        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+            return;
+        }
+        let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
+            return;
+        };
+        if key.2 != self.selected_topic {
+            return;
+        }
+        {
+            let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
+                return;
+            };
+            let Some(audio) = message.audio.as_mut() else {
+                return;
+            };
+            if audio.file_id() != file_id || audio.file().is_some() {
+                return;
+            }
+            audio.clear_failed();
+        }
+        self.queue(AdapterCommand::DownloadVoice { protocol, file_id });
     }
 
     /// Download the small photo of an inbox row. A second request while the
@@ -5384,6 +5459,38 @@ impl Snapshot {
         for row in list.iter_mut() {
             if row.avatar.file_id == Some(file_id) {
                 row.avatar.failed = true;
+            }
+        }
+    }
+
+    fn voice_ready(&mut self, protocol: ProtocolId, file_id: i32, path: AudioPath) {
+        for list in self.messages.values_mut() {
+            for message in list.iter_mut() {
+                if message.protocol != protocol {
+                    continue;
+                }
+                let Some(audio) = message.audio.as_mut() else {
+                    continue;
+                };
+                if audio.file_id() == file_id {
+                    audio.set_file(path.clone());
+                }
+            }
+        }
+    }
+
+    fn voice_failed(&mut self, protocol: ProtocolId, file_id: i32) {
+        for list in self.messages.values_mut() {
+            for message in list.iter_mut() {
+                if message.protocol != protocol {
+                    continue;
+                }
+                let Some(audio) = message.audio.as_mut() else {
+                    continue;
+                };
+                if audio.file_id() == file_id {
+                    audio.mark_failed();
+                }
             }
         }
     }
@@ -7490,6 +7597,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         }
     }
 
@@ -7558,6 +7666,163 @@ mod tests {
         });
         snapshot.load_photo(ProtocolId::Telegram, chat, id, 7);
         assert_eq!(downloads(&snapshot.take_commands()), 1);
+    }
+
+    #[test]
+    fn play_audio_downloads_a_voice_note_that_has_no_path() {
+        use thinwire_protocol::{
+            AudioPath, ImagePath, MessageAudio, MessagePhoto, PhotoFile, PhotoSize,
+        };
+
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:1".into(),
+                title: "Ada".into(),
+                participant: "Ada".into(),
+                preview: String::new(),
+                unread: 0,
+                order: 1,
+                last_at: 1,
+                is_group: false,
+                writable: true,
+                placeholder: false,
+                muted: false,
+                has_topics: false,
+                avatar: Default::default(),
+            },
+        });
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        let mut message = telegram_text(1, 5, "Voice message");
+        let mut audio = MessageAudio::telegram(12, 42, None).expect("note");
+        audio.mark_failed();
+        message.audio = Some(audio);
+        message.photo = Some(MessagePhoto {
+            width: 100,
+            height: 80,
+            mini: None,
+            sizes: vec![PhotoSize {
+                width: 100,
+                height: 80,
+                file_id: Some(7),
+                path: None,
+                bytes: None,
+            }],
+            has_spoiler: false,
+            is_secret: false,
+            failed: false,
+        });
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        let chat = "telegram:1";
+        let id = "telegram:1:5";
+        let audio_of = |snapshot: &Snapshot| {
+            snapshot
+                .messages
+                .values()
+                .flatten()
+                .find(|message| message.id == id)
+                .and_then(|message| message.audio.as_ref())
+                .expect("voice")
+                .clone()
+        };
+        snapshot.play_audio(ProtocolId::Slack, chat, id, 42);
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 99);
+        snapshot.play_audio(ProtocolId::Telegram, "telegram:9", id, 42);
+        assert!(snapshot.take_commands().is_empty());
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 42);
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 42);
+        let commands = snapshot.take_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    AdapterCommand::DownloadVoice { file_id: 42, .. }
+                ))
+                .count(),
+            2
+        );
+        assert!(
+            !snapshot
+                .photo_downloads
+                .contains(&(ProtocolId::Telegram, 42))
+        );
+        assert!(!audio_of(&snapshot).failed());
+        assert!(audio_of(&snapshot).file().is_none());
+        snapshot.apply(AdapterEvent::PhotoReady {
+            protocol: ProtocolId::Telegram,
+            file_id: 7,
+            file: PhotoFile::from_path(ImagePath::new("/tmp/hidden-photo")),
+        });
+        assert!(audio_of(&snapshot).file().is_none());
+        let photo_path = snapshot
+            .messages
+            .values()
+            .flatten()
+            .find(|message| message.id == id)
+            .and_then(|message| message.photo.as_ref())
+            .and_then(|photo| photo.sizes.iter().find(|size| size.file_id == Some(7)))
+            .and_then(|size| size.path.as_ref())
+            .map(|path| path.as_str().to_string());
+        assert_eq!(photo_path.as_deref(), Some("/tmp/hidden-photo"));
+        let voice = AudioPath::new("/tmp/hidden-voice.ogg").expect("path");
+        snapshot.apply(AdapterEvent::VoiceReady {
+            protocol: ProtocolId::Telegram,
+            file_id: 42,
+            path: voice,
+        });
+        assert_eq!(
+            audio_of(&snapshot).file().map(AudioPath::as_path),
+            Some(std::path::Path::new("/tmp/hidden-voice.ogg"))
+        );
+        assert!(!audio_of(&snapshot).failed());
+        let sizes = snapshot
+            .messages
+            .values()
+            .flatten()
+            .find(|message| message.id == id)
+            .and_then(|message| message.photo.as_ref())
+            .map(|photo| photo.sizes.clone())
+            .expect("photo");
+        assert!(sizes.iter().all(|size| {
+            size.bytes.is_none()
+                && size
+                    .path
+                    .as_ref()
+                    .is_none_or(|path| path.as_str() != "/tmp/hidden-voice.ogg")
+        }));
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 42);
+        assert!(snapshot.take_commands().is_empty());
+        let mut kept = telegram_text(1, 5, "Voice message");
+        kept.audio = MessageAudio::telegram(12, 42, None);
+        snapshot.apply(AdapterEvent::MessageReceived { message: kept });
+        assert_eq!(
+            audio_of(&snapshot).file().map(AudioPath::as_path),
+            Some(std::path::Path::new("/tmp/hidden-voice.ogg"))
+        );
+        let mut again = telegram_text(1, 5, "Voice message");
+        again.audio = MessageAudio::telegram(12, 43, None);
+        snapshot.apply(AdapterEvent::MessageReceived { message: again });
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 43);
+        assert!(
+            snapshot.pending.iter().any(|command| matches!(
+                command,
+                AdapterCommand::DownloadVoice { file_id: 43, .. }
+            ))
+        );
+        snapshot.end_session(ProtocolId::Telegram);
+        assert!(
+            !snapshot
+                .pending
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::DownloadVoice { .. }))
+        );
     }
 
     #[test]
@@ -8832,6 +9097,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         }
     }
 
@@ -9118,6 +9384,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::OlderHistoryLoaded {
@@ -9153,6 +9420,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -10512,6 +10780,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -10626,6 +10895,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -10721,6 +10991,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: conversation.clone(),
@@ -10820,6 +11091,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: previous,
@@ -10878,6 +11150,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
 
@@ -11069,6 +11342,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -11117,6 +11391,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -12086,6 +12361,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         assert_eq!(
@@ -12404,6 +12680,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -12420,6 +12697,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -12436,6 +12714,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -12461,6 +12740,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -12501,6 +12781,7 @@ mod tests {
                     topic: None,
                     links: Vec::new(),
                     photo: None,
+                    audio: None,
                 },
             });
         }
@@ -12559,6 +12840,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         let _ = snapshot.take_commands();
@@ -12746,6 +13028,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -13025,6 +13308,7 @@ mod tests {
                     topic: None,
                     links: Vec::new(),
                     photo: None,
+                    audio: None,
                 },
             });
             snapshot.apply(AdapterEvent::HistoryLoaded {
@@ -13104,6 +13388,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageDelivery {
@@ -14028,6 +14313,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.take_commands();
@@ -14074,6 +14360,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.take_commands();
@@ -14616,6 +14903,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.retry_send("discord:pending:2:1");
@@ -14685,6 +14973,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.retry_send("discord:row-b");
@@ -15852,6 +16141,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.retry_send("slack:C1:m1");

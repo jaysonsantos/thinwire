@@ -1,4 +1,4 @@
-//! Links and photos on a chat message.
+//! Links, photos, and voice notes on a chat message.
 //!
 //! Offsets in [`MessageLink`] are UTF-8 byte indexes into the message body.
 //! TDLib reports entity offsets in UTF-16 code units. [`links_in`] converts
@@ -71,6 +71,103 @@ impl ImagePath {
 impl fmt::Debug for ImagePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ImagePath")
+    }
+}
+
+/// A local voice file. `Debug` prints `AudioPath` and no path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AudioPath(String);
+
+impl AudioPath {
+    /// Empty is refused. Callers at the TDLib boundary discard `None`.
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Option<Self> {
+        let path = path.into();
+        (!path.is_empty()).then_some(Self(path))
+    }
+
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl fmt::Debug for AudioPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AudioPath")
+    }
+}
+
+/// One Telegram voice note the user can play.
+///
+/// There is no byte constructor. A value that means "read the file and
+/// delete it" cannot be built.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MessageAudio {
+    duration_secs: u32,
+    file_id: i32,
+    file: Option<AudioPath>,
+    failed: bool,
+}
+
+impl MessageAudio {
+    /// `None` when `file_id` is not positive. A negative duration becomes 0.
+    #[must_use]
+    pub fn telegram(duration_secs: i32, file_id: i32, file: Option<AudioPath>) -> Option<Self> {
+        if file_id <= 0 {
+            return None;
+        }
+        Some(Self {
+            duration_secs: u32::try_from(duration_secs).unwrap_or(0),
+            file_id,
+            file,
+            failed: false,
+        })
+    }
+
+    #[must_use]
+    pub fn duration_secs(&self) -> u32 {
+        self.duration_secs
+    }
+
+    #[must_use]
+    pub fn file_id(&self) -> i32 {
+        self.file_id
+    }
+
+    #[must_use]
+    pub fn file(&self) -> Option<&AudioPath> {
+        self.file.as_ref()
+    }
+
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// A finished download. Clears [`Self::failed`].
+    pub fn set_file(&mut self, path: AudioPath) {
+        self.file = Some(path);
+        self.failed = false;
+    }
+
+    pub fn mark_failed(&mut self) {
+        self.failed = true;
+    }
+
+    pub fn clear_failed(&mut self) {
+        self.failed = false;
+    }
+}
+
+impl fmt::Debug for MessageAudio {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessageAudio")
+            .field("duration_secs", &self.duration_secs)
+            .field("file_id", &self.file_id)
+            .field("file", &self.file)
+            .field("failed", &self.failed)
+            .finish()
     }
 }
 
@@ -625,6 +722,36 @@ mod tests {
         assert!(!photo_debug.contains("jpeg"));
         assert!(photo_debug.contains("is_secret"));
         assert!(photo_debug.contains("ImageBytes"));
+    }
+
+    #[test]
+    fn a_voice_note_keeps_a_path_and_debug_hides_it() {
+        assert!(AudioPath::new("").is_none());
+        assert!(MessageAudio::telegram(3, 0, None).is_none());
+        assert!(MessageAudio::telegram(3, -1, None).is_none());
+        let path = AudioPath::new("/tmp/hidden-voice.ogg").expect("path");
+        assert_eq!(
+            path.as_path(),
+            std::path::Path::new("/tmp/hidden-voice.ogg")
+        );
+        let mut audio = MessageAudio::telegram(-4, 42, None).expect("note");
+        assert_eq!(audio.duration_secs(), 0);
+        assert_eq!(audio.file_id(), 42);
+        assert!(audio.file().is_none());
+        assert!(!audio.failed());
+        audio.mark_failed();
+        assert!(audio.failed());
+        audio.set_file(path);
+        assert!(!audio.failed());
+        assert!(audio.file().is_some());
+        let debug = format!("{audio:?}");
+        assert!(!debug.contains("hidden-voice"));
+        assert!(debug.contains("AudioPath"));
+        audio.mark_failed();
+        assert!(audio.failed());
+        assert!(audio.file().is_some());
+        audio.clear_failed();
+        assert!(!audio.failed());
     }
 }
 
