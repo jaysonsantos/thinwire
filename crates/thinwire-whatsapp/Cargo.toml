@@ -46,7 +46,7 @@ tokio = { workspace = true, features = ["fs", "io-std"] }
 tracing.workspace = true
 # The log of the helper program. The tests also read log lines with it (#238).
 tracing-subscriber.workspace = true
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "e634d245f71d66e2ae55f79ef714c4ca01615ed8", optional = true, default-features = false, features = [
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "0ea7b0a1c10d5ee25d9e70d984bf3307a54d5859", optional = true, default-features = false, features = [
   "sqlite-storage",
   "tokio-transport",
   "tokio-runtime",
