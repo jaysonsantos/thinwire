@@ -24,6 +24,8 @@ mod ui;
 mod ui_snapshots;
 #[cfg(test)]
 mod ui_tests;
+#[cfg(feature = "video")]
+mod video;
 #[cfg(feature = "whatsapp-web")]
 mod whatsapp_gate;
 

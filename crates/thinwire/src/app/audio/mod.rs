@@ -2,7 +2,7 @@ mod engine;
 
 use eframe::egui::{self, RichText};
 use thinwire_core::Intent;
-use thinwire_protocol::{AudioPath, ChatMessage, MessageAudio, ProtocolId};
+use thinwire_protocol::{AudioPath, ChatMessage, MessageAudio, MessageVideo, ProtocolId};
 
 use super::motion;
 use super::theme;
@@ -226,6 +226,9 @@ pub(crate) struct Player<B: Backend = engine::Engine> {
     /// Latest play sent to the device. Any other completion is ignored.
     generation: u64,
     engine: B,
+    /// The video of the open chat (ADR 0015).
+    #[cfg(feature = "video")]
+    video: super::video::VideoSlot,
 }
 
 impl Player<engine::Engine> {
@@ -235,6 +238,8 @@ impl Player<engine::Engine> {
             session: Session::Idle,
             generation: 0,
             engine: engine::Engine::new(),
+            #[cfg(feature = "video")]
+            video: super::video::VideoSlot::default(),
         }
     }
 }
@@ -249,9 +254,52 @@ impl<B: Backend> Player<B> {
     pub(crate) fn shutdown(&mut self) {
         self.engine.shutdown();
         self.session = Session::Idle;
+        #[cfg(feature = "video")]
+        self.video.shutdown();
+    }
+
+    /// The video frame of this message is on screen, in the place of its
+    /// thumbnail. Always `false` in a build with no `video` feature.
+    pub(crate) fn video_covers(
+        &self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> bool {
+        #[cfg(feature = "video")]
+        {
+            self.video.covers(protocol, conversation_id, message_id)
+        }
+        #[cfg(not(feature = "video"))]
+        {
+            let _ = (protocol, conversation_id, message_id);
+            false
+        }
+    }
+
+    /// The frame and the controls of a video. A build with no `video`
+    /// feature draws nothing: the row keeps its thumbnail and its label.
+    pub(crate) fn show_video(
+        &mut self,
+        ui: &mut egui::Ui,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        video: Option<&MessageVideo>,
+        out: &mut Vec<Intent>,
+    ) {
+        #[cfg(feature = "video")]
+        if let Some(video) = video {
+            self.video
+                .show(ui, protocol, conversation_id, message_id, video, out);
+        }
+        #[cfg(not(feature = "video"))]
+        let _ = (ui, protocol, conversation_id, message_id, video, out);
     }
 
     pub(crate) fn sync(&mut self, messages: &[ChatMessage]) {
+        #[cfg(feature = "video")]
+        self.video.sync(messages);
         // A completion can already be queued when a newer play replaces it.
         // The worker stamps the play that produced it. Applying an older one
         // would stop or clear the note that is current now.
@@ -435,6 +483,8 @@ mod tests {
             session: Session::Idle,
             generation: 0,
             engine: Fake::default(),
+            #[cfg(feature = "video")]
+            video: super::super::video::VideoSlot::default(),
         }
     }
 
@@ -732,6 +782,7 @@ mod tests {
             links: Vec::new(),
             photo: None,
             audio,
+            video: None,
         }
     }
 

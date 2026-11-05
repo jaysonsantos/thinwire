@@ -263,6 +263,7 @@ pub(crate) fn chat_message(
         audio: message.audio.as_ref().and_then(|audio| {
             crate::MessageAudio::new(audio.duration_secs, voice_file_id(message.id), None)
         }),
+        video: None,
     }
 }
 

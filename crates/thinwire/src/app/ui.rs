@@ -2296,6 +2296,7 @@ fn thread(
             links: &message.links,
             photo: message.photo.as_ref(),
             audio: message.audio.as_ref(),
+            video: message.video.as_ref(),
             delivery: message.delivery,
             group: is_group,
             layout,
@@ -2706,6 +2707,7 @@ struct MetaInk {
 fn is_emoji_only(message: &Bubble<'_>) -> bool {
     message.photo.is_none()
         && message.audio.is_none()
+        && message.video.is_none()
         && message.links.is_empty()
         && only_emoji(message.body)
 }
@@ -2752,6 +2754,7 @@ struct Bubble<'a> {
     links: &'a [MessageLink],
     photo: Option<&'a MessagePhoto>,
     audio: Option<&'a thinwire_protocol::MessageAudio>,
+    video: Option<&'a thinwire_protocol::MessageVideo>,
     delivery: Delivery,
     /// Group chat. The AccessKit name keeps the sender on every row.
     group: bool,
@@ -3261,7 +3264,12 @@ fn bubble(
                         // The pane name already includes the sender.
                         hide_from_accesskit(ui, response.id);
                     }
-                    if let Some(photo) = message.photo {
+                    // A playing video takes the place of its thumbnail.
+                    let covered =
+                        player.video_covers(message.protocol, message.conversation_id, message.id);
+                    if let Some(photo) = message.photo
+                        && !covered
+                    {
                         super::photos::show(
                             ui,
                             message.protocol,
@@ -3271,6 +3279,14 @@ fn bubble(
                             out,
                         );
                     }
+                    player.show_video(
+                        ui,
+                        message.protocol,
+                        message.conversation_id,
+                        message.id,
+                        message.video,
+                        out,
+                    );
                     player.show(
                         ui,
                         message.protocol,

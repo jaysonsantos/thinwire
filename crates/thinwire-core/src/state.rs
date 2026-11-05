@@ -1475,6 +1475,7 @@ impl Snapshot {
                 links,
                 photo,
                 audio,
+                video,
             } => self.patch_message_media(
                 protocol,
                 &conversation_id,
@@ -1483,6 +1484,7 @@ impl Snapshot {
                 links,
                 photo,
                 audio,
+                video,
             ),
             AdapterEvent::MessageLinks {
                 protocol,
@@ -1502,6 +1504,12 @@ impl Snapshot {
                 path,
             } => self.voice_ready(protocol, file_id, path),
             AdapterEvent::VoiceFailed { protocol, file_id } => self.voice_failed(protocol, file_id),
+            AdapterEvent::VideoReady {
+                protocol,
+                file_id,
+                path,
+            } => self.video_ready(protocol, file_id, path),
+            AdapterEvent::VideoFailed { protocol, file_id } => self.video_failed(protocol, file_id),
             AdapterEvent::MessagesRemoved {
                 protocol,
                 conversation_id,
@@ -5813,6 +5821,7 @@ impl Snapshot {
         let list = self.messages.entry(key).or_default();
         if let Some(existing) = list.iter_mut().find(|row| row.id == message.id) {
             Self::keep_voice_file(&mut message.audio, existing.audio.as_ref());
+            Self::keep_video_file(&mut message.video, existing.video.as_ref());
             *existing = message;
         } else {
             list.push(message);
@@ -5878,16 +5887,39 @@ impl Snapshot {
         links: Vec<thinwire_protocol::MessageLink>,
         photo: Option<thinwire_protocol::MessagePhoto>,
         audio: Option<MessageAudio>,
+        video: Option<thinwire_protocol::MessageVideo>,
     ) {
         let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
             return;
         };
         let stored = message.audio.clone();
+        let stored_video = message.video.clone();
         message.body = body;
         message.links = links;
         message.photo = photo;
         message.audio = audio;
+        message.video = video;
         Self::keep_voice_file(&mut message.audio, stored.as_ref());
+        Self::keep_video_file(&mut message.video, stored_video.as_ref());
+    }
+
+    /// As [`Self::keep_voice_file`], for a video.
+    fn keep_video_file(
+        incoming: &mut Option<thinwire_protocol::MessageVideo>,
+        stored: Option<&thinwire_protocol::MessageVideo>,
+    ) {
+        let (Some(incoming), Some(stored)) = (incoming.as_mut(), stored) else {
+            return;
+        };
+        if incoming.file_id() != stored.file_id() || incoming.file().is_some() {
+            return;
+        }
+        if let Some(path) = stored.file().cloned() {
+            incoming.set_file(path);
+        }
+        if stored.failed() {
+            incoming.mark_failed();
+        }
     }
 
     /// A refresh may omit a path TDLib has not reported yet. Keep the path
@@ -6153,6 +6185,65 @@ impl Snapshot {
                 }
             }
         }
+    }
+
+    fn video_ready(&mut self, protocol: ProtocolId, file_id: i32, path: AudioPath) {
+        for message in self.messages.values_mut().flatten() {
+            if message.protocol != protocol {
+                continue;
+            }
+            if let Some(video) = message.video.as_mut()
+                && video.file_id() == file_id
+            {
+                video.set_file(path.clone());
+            }
+        }
+    }
+
+    fn video_failed(&mut self, protocol: ProtocolId, file_id: i32) {
+        for message in self.messages.values_mut().flatten() {
+            if message.protocol != protocol {
+                continue;
+            }
+            if let Some(video) = message.video.as_mut()
+                && video.file_id() == file_id
+            {
+                video.mark_failed();
+            }
+        }
+    }
+
+    /// Ask the adapter for the video of an open message (ADR 0015). The
+    /// same guards as [`Self::play_audio`].
+    pub(crate) fn play_video(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        file_id: i32,
+    ) {
+        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+            return;
+        }
+        let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
+            return;
+        };
+        if key.2 != self.selected_topic {
+            return;
+        }
+        {
+            let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
+                return;
+            };
+            let Some(video) = message.video.as_mut() else {
+                return;
+            };
+            if video.file_id() != file_id || video.file().is_some() {
+                return;
+            }
+            video.clear_failed();
+        }
+        self.queue(AdapterCommand::DownloadVideo { protocol, file_id });
     }
 
     fn message_mut(
@@ -8264,6 +8355,7 @@ mod tests {
             links: Vec::new(),
             photo: None,
             audio: None,
+            video: None,
         }
     }
 
@@ -8332,6 +8424,78 @@ mod tests {
         });
         snapshot.load_photo(ProtocolId::Telegram, chat, id, 7);
         assert_eq!(downloads(&snapshot.take_commands()), 1);
+    }
+
+    /// Play on a clip with no file asks for its download once. The path
+    /// comes back to the row, and a refresh of the row keeps it. A failed
+    /// download marks the clip.
+    #[test]
+    fn play_video_downloads_a_clip_and_keeps_its_path() {
+        use thinwire_protocol::{AudioPath, MessageVideo};
+
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(1, "Ada", 1),
+        });
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        let clip = || {
+            let mut message = telegram_text(1, 5, "Video");
+            message.video = MessageVideo::new(12, 640, 360, 31, None);
+            message
+        };
+        snapshot.apply(AdapterEvent::MessageReceived { message: clip() });
+        let (chat, id) = ("telegram:1", "telegram:1:5");
+        let video_of = |snapshot: &Snapshot| {
+            snapshot
+                .messages
+                .values()
+                .flatten()
+                .find(|message| message.id == id)
+                .and_then(|message| message.video.clone())
+                .expect("clip")
+        };
+        snapshot.play_video(ProtocolId::Telegram, chat, id, 99);
+        assert!(snapshot.take_commands().is_empty(), "another file");
+        snapshot.play_video(ProtocolId::Telegram, chat, id, 31);
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![AdapterCommand::DownloadVideo {
+                protocol: ProtocolId::Telegram,
+                file_id: 31
+            }]
+        );
+        snapshot.apply(AdapterEvent::VideoReady {
+            protocol: ProtocolId::Telegram,
+            file_id: 31,
+            path: AudioPath::new("/tmp/clip.mp4".to_string()).expect("path"),
+        });
+        assert!(video_of(&snapshot).file().is_some());
+        snapshot.play_video(ProtocolId::Telegram, chat, id, 31);
+        assert!(snapshot.take_commands().is_empty(), "the file is here");
+        // A refresh of the row with no path keeps the stored path.
+        snapshot.apply(AdapterEvent::MessageReceived { message: clip() });
+        assert!(video_of(&snapshot).file().is_some());
+
+        let mut other = telegram_text(1, 6, "Video");
+        other.video = MessageVideo::new(3, 0, 0, 32, None);
+        snapshot.apply(AdapterEvent::MessageReceived { message: other });
+        snapshot.apply(AdapterEvent::VideoFailed {
+            protocol: ProtocolId::Telegram,
+            file_id: 32,
+        });
+        let failed = snapshot
+            .messages
+            .values()
+            .flatten()
+            .find(|message| message.id == "telegram:1:6")
+            .and_then(|message| message.video.clone())
+            .expect("clip");
+        assert!(failed.failed());
     }
 
     #[test]
@@ -9764,6 +9928,7 @@ mod tests {
             links: Vec::new(),
             photo: None,
             audio: None,
+            video: None,
         }
     }
 
@@ -10051,6 +10216,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.apply(AdapterEvent::OlderHistoryLoaded {
@@ -10087,6 +10253,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -11447,6 +11614,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -11562,6 +11730,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -11658,6 +11827,7 @@ mod tests {
             links: Vec::new(),
             photo: None,
             audio: None,
+            video: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: conversation.clone(),
@@ -11758,6 +11928,7 @@ mod tests {
             links: Vec::new(),
             photo: None,
             audio: None,
+            video: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: previous,
@@ -11817,6 +11988,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
 
@@ -12009,6 +12181,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -12058,6 +12231,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -12141,6 +12315,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -12279,6 +12454,7 @@ mod tests {
                     links: Vec::new(),
                     photo: None,
                     audio: None,
+                    video: None,
                 },
             });
             snapshot.apply(AdapterEvent::Status {
@@ -12393,6 +12569,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -12571,6 +12748,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.select_retained_signal(1);
@@ -13483,6 +13661,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         assert_eq!(
@@ -13802,6 +13981,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -13819,6 +13999,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -13836,6 +14017,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -13862,6 +14044,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -13903,6 +14086,7 @@ mod tests {
                     links: Vec::new(),
                     photo: None,
                     audio: None,
+                    video: None,
                 },
             });
         }
@@ -13962,6 +14146,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         let _ = snapshot.take_commands();
@@ -14150,6 +14335,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -14430,6 +14616,7 @@ mod tests {
                     links: Vec::new(),
                     photo: None,
                     audio: None,
+                    video: None,
                 },
             });
             snapshot.apply(AdapterEvent::HistoryLoaded {
@@ -14510,6 +14697,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageDelivery {
@@ -15435,6 +15623,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.take_commands();
@@ -15482,6 +15671,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.take_commands();
@@ -16025,6 +16215,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.retry_send("discord:pending:2:1");
@@ -16095,6 +16286,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.retry_send("discord:row-b");
@@ -17263,6 +17455,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         });
         snapshot.retry_send("slack:C1:m1");
@@ -17347,6 +17540,7 @@ mod tests {
             links: Vec::new(),
             photo: None,
             audio: None,
+            video: None,
         }
     }
 

@@ -644,6 +644,7 @@ mod tests {
                 links: Vec::new(),
                 photo: None,
                 audio: None,
+                video: None,
             },
         };
         let events = [

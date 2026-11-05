@@ -154,6 +154,14 @@ pub enum Intent {
         message_id: String,
         file_id: i32,
     },
+    /// Download this video for the in-app player (ADR 0015). The open
+    /// message must be that file and must not already have a path.
+    PlayVideo {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        file_id: i32,
+    },
     /// Telegram login and account actions.
     Telegram(TelegramIntent),
     /// Experimental WhatsApp pairing. Only a `whatsapp-web` build acts on it.

@@ -496,6 +496,10 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 file_id,
             } => self.dispatch_live(events, LiveCall::DownloadVoice { file_id }),
+            AdapterCommand::DownloadVideo {
+                protocol: ProtocolId::Telegram,
+                file_id,
+            } => self.dispatch_live(events, LiveCall::DownloadVideo { file_id }),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -609,6 +613,9 @@ enum LiveCall {
     DownloadVoice {
         file_id: i32,
     },
+    DownloadVideo {
+        file_id: i32,
+    },
     SendMedia {
         conversation_id: String,
         topic: Option<MessageTopic>,
@@ -707,6 +714,9 @@ impl TelegramAdapter {
                 }
                 LiveCall::DownloadVoice { file_id } => {
                     self.tdlib.download_voice(file_id, secrets, source, events);
+                }
+                LiveCall::DownloadVideo { file_id } => {
+                    self.tdlib.download_video(file_id, secrets, source, events);
                 }
                 LiveCall::SendMedia {
                     conversation_id,

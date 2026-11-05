@@ -911,6 +911,7 @@ pub(super) fn to_chat_message(
         links: Vec::new(),
         photo: None,
         audio: None,
+        video: None,
     }
 }
 

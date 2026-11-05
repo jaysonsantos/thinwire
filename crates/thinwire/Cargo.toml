@@ -25,15 +25,22 @@ discord-bot = ["thinwire-core/discord-bot", "thinwire-protocol/discord-bot"]
 # app does not link the AGPL client: it talks to the helper over a pipe.
 # Release builds turn this on. The default UI stays feature-off.
 signal-local = ["dep:qrcode", "thinwire-core/signal-local"]
+# In-app video through GStreamer (ADR 0015). It links GStreamer at run time:
+# the system or the dev shell must have it, with its base, good, and libav
+# or platform decoder plugins.
+video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # Every protocol of a release build, in one switch for a local build. It is the
 # list of `release_features` in `scripts/test-release-features.sh` without the
 # Cargo prefix, and `scripts/check-local-only-features.sh` keeps both the same.
+# `video` is not a protocol: it is the in-app video player (ADR 0015). The OS
+# zips do not have it yet.
 all-protocols = [
   "telegram-tdlib",
   "slack-oauth",
   "discord-bot",
   "whatsapp-web",
   "signal-local",
+  "video",
 ]
 # macOS Keychain through /usr/bin/security. LOCAL BUILDS ONLY (see
 # `thinwire-core`). `scripts/local-build.sh` is the one place that turns it on.
@@ -70,6 +77,9 @@ rodio = { version = "0.23", default-features = false, features = [
 ] }
 ogg = "0.9"
 opus = "0.4"
+gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
+gstreamer-video = { version = "0.25", optional = true }
 # `hardened` rejects every scheme except http and https (webbrowser 1.2).
 webbrowser = { version = "1.2", features = ["hardened"] }
 # Host display for the link confirm dialog. `host_str` is the punycode form.

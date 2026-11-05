@@ -102,6 +102,10 @@ enum TdlibCommand {
     DownloadVoice {
         file_id: i32,
     },
+    /// Download one video file for the in-app player. The path stays.
+    DownloadVideo {
+        file_id: i32,
+    },
     /// Send photos and videos, with the caption on the first file.
     SendMedia {
         conversation_id: String,
@@ -175,18 +179,23 @@ struct LiveInbox {
 enum InFlight {
     Photo { secret: bool, saw_active: bool },
     Voice { saw_active: bool },
+    Video { saw_active: bool },
 }
 
 impl InFlight {
     fn saw_active(self) -> bool {
         match self {
-            Self::Photo { saw_active, .. } | Self::Voice { saw_active } => saw_active,
+            Self::Photo { saw_active, .. }
+            | Self::Voice { saw_active }
+            | Self::Video { saw_active } => saw_active,
         }
     }
 
     fn mark_active(&mut self) {
         match self {
-            Self::Photo { saw_active, .. } | Self::Voice { saw_active } => *saw_active = true,
+            Self::Photo { saw_active, .. }
+            | Self::Voice { saw_active }
+            | Self::Video { saw_active } => *saw_active = true,
         }
     }
 }
@@ -477,6 +486,21 @@ impl TdlibRuntime {
     ) {
         self.enqueue(
             TdlibCommand::DownloadVoice { file_id },
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    pub fn download_video(
+        &mut self,
+        file_id: i32,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::DownloadVideo { file_id },
             secrets,
             source,
             events,
@@ -957,6 +981,16 @@ fn spawn_tdlib_worker(
                         }
                         TdlibCommand::DownloadVoice { file_id } => {
                             start_voice(client_id, file_id, &mut live, &events).await;
+                        }
+                        TdlibCommand::DownloadVideo { file_id } => {
+                            begin_download(
+                                client_id,
+                                file_id,
+                                InFlight::Video { saw_active: false },
+                                &mut live,
+                                &events,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1755,6 +1789,7 @@ async fn apply_chat_update(
                 mapped.links,
                 mapped.photo,
                 mapped.audio,
+                mapped.video,
             );
             if mapped.scan {
                 schedule_text_entities(
@@ -2020,6 +2055,7 @@ fn emit_mapped_message_as(
     mapped.links = media.links;
     mapped.photo = media.photo;
     mapped.audio = media.audio;
+    mapped.video = media.video;
     if media.scan {
         schedule_text_entities(
             client_id,
@@ -2155,6 +2191,13 @@ async fn finish_download(
     match kind {
         InFlight::Photo { secret, .. } => finish_photo(client_id, file, secret, events).await,
         InFlight::Voice { .. } => finish_voice(file, events),
+        InFlight::Video { .. } => {
+            let _ = events.send(video_event(
+                file.id,
+                file.local.is_downloading_completed,
+                &file.local.path,
+            ));
+        }
     }
 }
 
@@ -2165,8 +2208,23 @@ fn fail_download(kind: InFlight, file_id: i32, events: &EventTx) {
             return;
         }
         InFlight::Voice { .. } => voice_event(file_id, false, ""),
+        InFlight::Video { .. } => video_event(file_id, false, ""),
     };
     let _ = events.send(event);
+}
+
+fn video_event(file_id: i32, completed: bool, path: &str) -> AdapterEvent {
+    match crate::AudioPath::new(path).filter(|_| completed) {
+        Some(path) => AdapterEvent::VideoReady {
+            protocol: ProtocolId::Telegram,
+            file_id,
+            path,
+        },
+        None => AdapterEvent::VideoFailed {
+            protocol: ProtocolId::Telegram,
+            file_id,
+        },
+    }
 }
 
 fn finish_voice(file: tdlib_rs::types::File, events: &EventTx) {

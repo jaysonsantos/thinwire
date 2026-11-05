@@ -623,6 +623,12 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         file_id: i32,
     },
+    /// Download one video file for the in-app player (ADR 0015). The file
+    /// stays on disk. The adapter reports a path.
+    DownloadVideo {
+        protocol: ProtocolId,
+        file_id: i32,
+    },
 }
 
 impl AdapterCommand {
@@ -648,7 +654,8 @@ impl AdapterCommand {
             | Self::AddAccount { protocol }
             | Self::RemoveAccount { protocol }
             | Self::DownloadFile { protocol, .. }
-            | Self::DownloadVoice { protocol, .. } => protocol,
+            | Self::DownloadVoice { protocol, .. }
+            | Self::DownloadVideo { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
@@ -711,7 +718,8 @@ impl AdapterCommand {
             | Self::AddAccount { protocol }
             | Self::RemoveAccount { protocol }
             | Self::DownloadFile { protocol, .. }
-            | Self::DownloadVoice { protocol, .. } => {
+            | Self::DownloadVoice { protocol, .. }
+            | Self::DownloadVideo { protocol, .. } => {
                 *protocol = account;
                 true
             }
@@ -849,6 +857,7 @@ pub enum AdapterEvent {
         links: Vec<crate::media::MessageLink>,
         photo: Option<crate::media::MessagePhoto>,
         audio: Option<crate::media::MessageAudio>,
+        video: Option<crate::media::MessageVideo>,
     },
     /// Links found after the message was shown. Does not change the body.
     MessageLinks {
@@ -876,6 +885,16 @@ pub enum AdapterEvent {
         path: crate::media::AudioPath,
     },
     VoiceFailed {
+        protocol: ProtocolId,
+        file_id: i32,
+    },
+    /// The video `file_id` is a local file now.
+    VideoReady {
+        protocol: ProtocolId,
+        file_id: i32,
+        path: crate::media::AudioPath,
+    },
+    VideoFailed {
         protocol: ProtocolId,
         file_id: i32,
     },
@@ -1049,6 +1068,8 @@ impl AdapterEvent {
             | Self::PhotoFailed { protocol, .. }
             | Self::VoiceReady { protocol, .. }
             | Self::VoiceFailed { protocol, .. }
+            | Self::VideoReady { protocol, .. }
+            | Self::VideoFailed { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }
@@ -1123,6 +1144,8 @@ impl AdapterEvent {
             | Self::PhotoFailed { protocol, .. }
             | Self::VoiceReady { protocol, .. }
             | Self::VoiceFailed { protocol, .. }
+            | Self::VideoReady { protocol, .. }
+            | Self::VideoFailed { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }
@@ -1384,6 +1407,8 @@ pub struct ChatMessage {
     /// A photo. [`Self::body`] is the caption, and it can be empty.
     pub photo: Option<crate::media::MessagePhoto>,
     pub audio: Option<crate::media::MessageAudio>,
+    /// A video clip. `photo` is its first picture, when the protocol sends one.
+    pub video: Option<crate::media::MessageVideo>,
 }
 
 /// How a message reached the app.
@@ -1558,6 +1583,7 @@ pub(crate) fn emit_message_media(
     links: Vec<crate::media::MessageLink>,
     photo: Option<crate::media::MessagePhoto>,
     audio: Option<crate::media::MessageAudio>,
+    video: Option<crate::media::MessageVideo>,
 ) {
     let _ = events.send(AdapterEvent::MessageMedia {
         protocol,
@@ -1567,6 +1593,7 @@ pub(crate) fn emit_message_media(
         links,
         photo,
         audio,
+        video,
     });
 }
 
@@ -1902,6 +1929,7 @@ mod account_tests {
             links: Vec::new(),
             photo: None,
             audio: None,
+            video: None,
         };
         let AdapterEvent::MessageReplaced {
             protocol, message, ..

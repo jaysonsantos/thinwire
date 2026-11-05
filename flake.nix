@@ -32,6 +32,15 @@
           cxxLibs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.llvmPackages.libcxx ];
           # rodio's output device (cpal) links ALSA for in-app voice notes.
           audioLibs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
+          # In-app video (feature `video`, ADR 0015). The dev shell has the
+          # libav plugin for H.264, H.265, and VP9. A release ships only LGPL
+          # parts and the decoders of the platform.
+          gstLibs = [
+            pkgs.gst_all_1.gstreamer
+            pkgs.gst_all_1.gst-plugins-base
+            pkgs.gst_all_1.gst-plugins-good
+            pkgs.gst_all_1.gst-libav
+          ];
           # Nix libglvnd does not see host GL drivers on non-NixOS Linux.
           # Point it at nixpkgs mesa (AMD / Intel). NVIDIA hosts need nixGL.
           glDrivers = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.mesa ];
@@ -65,11 +74,16 @@
                 pkgs.editorconfig-checker
               ]
               ++ guiLibs;
-              buildInputs = cxxLibs ++ audioLibs;
+              buildInputs = cxxLibs ++ audioLibs ++ gstLibs;
 
               RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
               RUST_LOG = "info";
-              LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (guiLibs ++ cxxLibs ++ glDrivers ++ audioLibs);
+              LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (
+                guiLibs ++ cxxLibs ++ glDrivers ++ audioLibs ++ gstLibs
+              );
+              # The app finds the GStreamer plugins of the dev shell, also when
+              # it runs after `nix develop --command` returns.
+              GST_PLUGIN_SYSTEM_PATH_1_0 = pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstLibs;
             }
             // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
               __EGL_VENDOR_LIBRARY_DIRS = "${pkgs.mesa}/share/glvnd/egl_vendor.d";

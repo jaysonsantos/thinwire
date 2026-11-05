@@ -4,8 +4,8 @@
 #
 # `scripts/test.sh` stays feature-off. This script is the one explicit job
 # that turns on every feature that a release ships: `telegram-tdlib`,
-# `slack-oauth`, `discord-bot`, `whatsapp-web`, and `signal-local` for the
-# app, and the AGPL WhatsApp and Signal helpers with their clients.
+# `slack-oauth`, `discord-bot`, `whatsapp-web`, `signal-local`, and `video`
+# for the app, and the AGPL WhatsApp and Signal helpers with their clients.
 # `telegram-tdlib` downloads TDLib here. The Signal client needs `protoc`
 # (the nix dev shell has it). No publisher secret is set: pull-request CI
 # never gets one.
@@ -16,7 +16,8 @@ cd "$(dirname "$script_dir")"
 
 # The MIT app with the release protocol features. No AGPL crate is in this
 # build: the WhatsApp and Signal clients are behind the helper adapters.
-release_features=(telegram-tdlib slack-oauth discord-bot whatsapp-web signal-local)
+# `video` (ADR 0015) plays clips through GStreamer: the dev shell has it.
+release_features=(telegram-tdlib slack-oauth discord-bot whatsapp-web signal-local video)
 app_packages=(-p thinwire -p thinwire-core -p thinwire-protocol -p thinwire-ipc)
 app_features="$(printf 'thinwire/%s,' "${release_features[@]}")"
 app_features="${app_features%,}"

@@ -3,7 +3,8 @@
 //! Offsets from TDLib are UTF-16. [`crate::links_in`] stores UTF-8 indexes.
 
 use crate::media::{
-    AudioPath, MessageAudio, MessageLink, MessagePhoto, PhotoSize, TextKind, TextSpan, links_in,
+    AudioPath, MessageAudio, MessageLink, MessagePhoto, MessageVideo, PhotoSize, TextKind,
+    TextSpan, links_in,
 };
 use crate::{ImageBytes, ImagePath};
 
@@ -13,6 +14,8 @@ pub(super) struct Mapped {
     pub links: Vec<MessageLink>,
     pub photo: Option<MessagePhoto>,
     pub audio: Option<MessageAudio>,
+    /// A clip for the in-app player. `photo` is then its thumbnail.
+    pub video: Option<MessageVideo>,
     /// Plain text with no entities: the worker asks `getTextEntities`.
     pub scan: bool,
 }
@@ -27,6 +30,7 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 links,
                 photo: None,
                 audio: None,
+                video: None,
                 scan,
             }
         }
@@ -44,12 +48,54 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 links,
                 photo: Some(mapped),
                 audio: None,
+                video: None,
                 scan,
             }
         }
         tdlib_rs::enums::MessageContent::MessageSticker(_) => label("Sticker"),
-        tdlib_rs::enums::MessageContent::MessageVideo(_) => label("Video"),
-        tdlib_rs::enums::MessageContent::MessageAnimation(_) => label("Animation"),
+        tdlib_rs::enums::MessageContent::MessageVideo(message) => map_clip(
+            &Clip {
+                label: "Video",
+                duration: message.video.duration,
+                width: message.video.width,
+                height: message.video.height,
+                minithumbnail: message.video.minithumbnail.as_ref(),
+                thumbnail: message.video.thumbnail.as_ref(),
+                file: &message.video.video,
+                secret: message.is_secret,
+                spoiler: message.has_spoiler,
+            },
+            Some(&message.caption),
+        ),
+        tdlib_rs::enums::MessageContent::MessageAnimation(message) => map_clip(
+            &Clip {
+                label: "Animation",
+                duration: message.animation.duration,
+                width: message.animation.width,
+                height: message.animation.height,
+                minithumbnail: message.animation.minithumbnail.as_ref(),
+                thumbnail: message.animation.thumbnail.as_ref(),
+                file: &message.animation.animation,
+                secret: message.is_secret,
+                spoiler: message.has_spoiler,
+            },
+            Some(&message.caption),
+        ),
+        tdlib_rs::enums::MessageContent::MessageVideoNote(message) => map_clip(
+            &Clip {
+                label: "Video message",
+                duration: message.video_note.duration,
+                width: message.video_note.length,
+                height: message.video_note.length,
+                minithumbnail: message.video_note.minithumbnail.as_ref(),
+                thumbnail: message.video_note.thumbnail.as_ref(),
+                file: &message.video_note.video,
+                secret: message.is_secret,
+                spoiler: false,
+            },
+            None,
+        ),
+        tdlib_rs::enums::MessageContent::MessageAudio(message) => map_music(message),
         // This TDLib build has no `is_secret` on a voice note. An expired
         // voice note is `MessageExpiredVoiceNote` and stays on the label arm.
         tdlib_rs::enums::MessageContent::MessageVoiceNote(note) => map_voice(note),
@@ -65,8 +111,103 @@ fn label(text: &str) -> Mapped {
         links: Vec::new(),
         photo: None,
         audio: None,
+        video: None,
         scan: false,
     }
+}
+
+/// The parts of a video, an animation, or a video note.
+struct Clip<'a> {
+    label: &'static str,
+    duration: i32,
+    width: i32,
+    height: i32,
+    minithumbnail: Option<&'a tdlib_rs::types::Minithumbnail>,
+    thumbnail: Option<&'a tdlib_rs::types::Thumbnail>,
+    file: &'a tdlib_rs::types::File,
+    secret: bool,
+    spoiler: bool,
+}
+
+/// A clip: its thumbnail is the photo of the row, and the file plays in the
+/// app (ADR 0015). A secret clip keeps its label only.
+fn map_clip(clip: &Clip<'_>, caption: Option<&tdlib_rs::types::FormattedText>) -> Mapped {
+    let (text, links, scan) =
+        caption.map_or_else(|| (String::new(), Vec::new(), false), from_formatted);
+    let mut mapped = label(clip.label);
+    if !text.is_empty() {
+        mapped.preview.clone_from(&text);
+        mapped.text = text;
+        mapped.links = links;
+        mapped.scan = scan;
+    }
+    if clip.secret {
+        return mapped;
+    }
+    let size = |value: i32| u32::try_from(value).unwrap_or(0);
+    let (width, height) = (size(clip.width), size(clip.height));
+    let sizes: Vec<PhotoSize> = clip
+        .thumbnail
+        .filter(|thumbnail| {
+            matches!(
+                thumbnail.format,
+                tdlib_rs::enums::ThumbnailFormat::Jpeg
+                    | tdlib_rs::enums::ThumbnailFormat::Png
+                    | tdlib_rs::enums::ThumbnailFormat::Webp
+            )
+        })
+        .map(|thumbnail| PhotoSize {
+            width: size(thumbnail.width),
+            height: size(thumbnail.height),
+            file_id: (thumbnail.file.id > 0).then_some(thumbnail.file.id),
+            path: local_path(&thumbnail.file, false),
+            bytes: None,
+        })
+        .into_iter()
+        .collect();
+    let mini = clip
+        .minithumbnail
+        .and_then(|mini| thumbnail_bytes(&mini.data))
+        .map(ImageBytes::new);
+    if !sizes.is_empty() || mini.is_some() {
+        mapped.photo = Some(MessagePhoto {
+            width,
+            height,
+            mini,
+            sizes,
+            has_spoiler: clip.spoiler,
+            is_secret: false,
+            failed: false,
+        });
+    }
+    let local = clip
+        .file
+        .local
+        .is_downloading_completed
+        .then(|| AudioPath::new(clip.file.local.path.clone()))
+        .flatten();
+    mapped.video = MessageVideo::new(size(clip.duration), width, height, clip.file.id, local);
+    mapped
+}
+
+/// A music file: it plays as a voice note does.
+fn map_music(message: &tdlib_rs::types::MessageAudio) -> Mapped {
+    let (text, links, scan) = from_formatted(&message.caption);
+    let mut mapped = label("Audio");
+    if !text.is_empty() {
+        mapped.preview.clone_from(&text);
+        mapped.text = text;
+        mapped.links = links;
+        mapped.scan = scan;
+    }
+    let file = &message.audio.audio;
+    let local = file
+        .local
+        .is_downloading_completed
+        .then(|| AudioPath::new(file.local.path.clone()))
+        .flatten();
+    mapped.audio = MessageAudio::telegram(message.audio.duration, file.id, local);
+    mapped
 }
 
 fn map_voice(note: &tdlib_rs::types::MessageVoiceNote) -> Mapped {
@@ -184,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn a_voice_note_is_playable_and_other_audio_stays_a_label() {
+    fn a_voice_note_and_music_play_and_a_secret_clip_stays_a_label() {
         let mapped = map_content(&voice(42, 15, false, ""));
         assert_eq!(mapped.text, "Voice message");
         assert_eq!(mapped.preview, "Voice message");
@@ -223,9 +364,10 @@ mod tests {
             },
             caption: tdlib_rs::types::FormattedText::default(),
         });
+        // Music plays as a voice note does.
         let music = map_content(&music);
-        assert!(music.audio.is_none());
-        assert_eq!(music.preview, "Message");
+        assert_eq!(music.audio.expect("music").file_id(), 9);
+        assert_eq!(music.preview, "Audio");
 
         let note =
             tdlib_rs::enums::MessageContent::MessageVideoNote(tdlib_rs::types::MessageVideoNote {
@@ -244,12 +386,87 @@ mod tests {
                 is_viewed: false,
                 is_secret: true,
             });
+        // A secret video note keeps its label: no file plays in the app.
         let note = map_content(&note);
         assert!(note.audio.is_none());
-        assert_eq!(note.preview, "Message");
+        assert!(note.video.is_none());
+        assert_eq!(note.preview, "Video message");
 
         let expired = map_content(&tdlib_rs::enums::MessageContent::MessageExpiredVoiceNote);
         assert!(expired.audio.is_none());
         assert_eq!(expired.preview, "Message");
+    }
+
+    /// A video has its thumbnail as the photo, the blurred minithumbnail,
+    /// and a clip with the size and the file of the video. Its caption is the
+    /// body. A GIF thumbnail is not a photo.
+    #[test]
+    fn a_video_has_a_thumbnail_and_a_clip() {
+        let file = |id: i32| tdlib_rs::types::File {
+            id,
+            ..tdlib_rs::types::File::default()
+        };
+        let mut message = tdlib_rs::types::MessageVideo {
+            video: tdlib_rs::types::Video {
+                duration: 12,
+                width: 1280,
+                height: 720,
+                file_name: "lake.mp4".into(),
+                mime_type: "video/mp4".into(),
+                has_stickers: false,
+                supports_streaming: true,
+                minithumbnail: Some(tdlib_rs::types::Minithumbnail {
+                    width: 40,
+                    height: 22,
+                    data: "/9j/".into(),
+                }),
+                thumbnail: Some(tdlib_rs::types::Thumbnail {
+                    format: tdlib_rs::enums::ThumbnailFormat::Jpeg,
+                    width: 320,
+                    height: 180,
+                    file: file(32),
+                }),
+                video: file(31),
+            },
+            alternative_videos: Vec::new(),
+            storyboards: Vec::new(),
+            cover: None,
+            start_timestamp: 0,
+            caption: tdlib_rs::types::FormattedText {
+                text: "at the lake".into(),
+                ..tdlib_rs::types::FormattedText::default()
+            },
+            show_caption_above_media: false,
+            has_spoiler: false,
+            is_secret: false,
+        };
+        let mapped = map_content(&tdlib_rs::enums::MessageContent::MessageVideo(
+            message.clone(),
+        ));
+        assert_eq!(mapped.text, "at the lake");
+        let video = mapped.video.expect("clip");
+        assert_eq!(
+            (video.file_id(), video.duration_secs(), video.size()),
+            (31, 12, (1280, 720))
+        );
+        assert!(video.file().is_none());
+        let photo = mapped.photo.expect("thumbnail");
+        assert_eq!((photo.width, photo.height), (1280, 720));
+        assert_eq!(photo.sizes.len(), 1);
+        assert_eq!(photo.sizes[0].file_id, Some(32));
+        assert!(photo.mini.is_some());
+
+        message.video.thumbnail = Some(tdlib_rs::types::Thumbnail {
+            format: tdlib_rs::enums::ThumbnailFormat::Gif,
+            width: 320,
+            height: 180,
+            file: file(33),
+        });
+        message.video.minithumbnail = None;
+        message.caption.text.clear();
+        let no_photo = map_content(&tdlib_rs::enums::MessageContent::MessageVideo(message));
+        assert!(no_photo.photo.is_none(), "a GIF thumbnail is not drawn");
+        assert!(no_photo.video.is_some());
+        assert_eq!(no_photo.preview, "Video");
     }
 }

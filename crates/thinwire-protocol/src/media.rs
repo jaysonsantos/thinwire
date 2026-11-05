@@ -177,6 +177,93 @@ impl fmt::Debug for MessageAudio {
     }
 }
 
+/// One video clip the user can play in the app (ADR 0015). `file_id` names
+/// the download for its adapter, as [`MessageAudio`] does. The path is an
+/// [`AudioPath`]: a local media file whose `Debug` shows no path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MessageVideo {
+    duration_secs: u32,
+    width: u32,
+    height: u32,
+    file_id: i32,
+    file: Option<AudioPath>,
+    failed: bool,
+}
+
+impl MessageVideo {
+    /// `None` when `file_id` is not positive. A zero duration or size means
+    /// that the protocol does not say.
+    #[must_use]
+    pub fn new(
+        duration_secs: u32,
+        width: u32,
+        height: u32,
+        file_id: i32,
+        file: Option<AudioPath>,
+    ) -> Option<Self> {
+        (file_id > 0).then_some(Self {
+            duration_secs,
+            width,
+            height,
+            file_id,
+            file,
+            failed: false,
+        })
+    }
+
+    #[must_use]
+    pub fn duration_secs(&self) -> u32 {
+        self.duration_secs
+    }
+
+    /// Pixel size from the protocol. Zero when it does not say.
+    #[must_use]
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    #[must_use]
+    pub fn file_id(&self) -> i32 {
+        self.file_id
+    }
+
+    #[must_use]
+    pub fn file(&self) -> Option<&AudioPath> {
+        self.file.as_ref()
+    }
+
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Stores `path` and clears `failed`.
+    pub fn set_file(&mut self, path: AudioPath) {
+        self.file = Some(path);
+        self.failed = false;
+    }
+
+    pub fn mark_failed(&mut self) {
+        self.failed = true;
+    }
+
+    pub fn clear_failed(&mut self) {
+        self.failed = false;
+    }
+}
+
+impl fmt::Debug for MessageVideo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessageVideo")
+            .field("duration_secs", &self.duration_secs)
+            .field("size", &(self.width, self.height))
+            .field("file_id", &self.file_id)
+            .field("file", &self.file)
+            .field("failed", &self.failed)
+            .finish()
+    }
+}
+
 /// A downloaded photo. It has a path, bytes, or both.
 ///
 /// `finish_photo` sends `PhotoFailed` when the file has neither, so this

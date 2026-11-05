@@ -1293,6 +1293,7 @@ impl Owner {
                         links: Vec::new(),
                         photo: None,
                         audio: None,
+                        video: None,
                     },
                 );
                 (body, message_id, SendRow::Pending)
@@ -1332,6 +1333,7 @@ impl Owner {
                         links: Vec::new(),
                         photo: None,
                         audio: None,
+                        video: None,
                     },
                 );
                 (body, message_id, SendRow::Pending)

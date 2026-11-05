@@ -365,6 +365,7 @@ impl GatedFake {
             links: Vec::new(),
             photo: None,
             audio: None,
+            video: None,
         }
     }
 

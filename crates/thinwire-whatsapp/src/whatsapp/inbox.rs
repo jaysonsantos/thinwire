@@ -1262,6 +1262,7 @@ impl Inbox {
                     None,
                 )
             }),
+            video: None,
         }
     }
 }

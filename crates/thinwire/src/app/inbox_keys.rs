@@ -918,6 +918,7 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         links: Vec::new(),
         photo: None,
         audio: None,
+        video: None,
     }
 }
 
