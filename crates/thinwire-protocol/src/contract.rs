@@ -216,7 +216,11 @@ impl Contract {
             self.until("9", "answer to OpenChat", |event| {
                 matches!(
                     event,
-                    AdapterEvent::HistoryLoaded { protocol: seen, conversation_id }
+                    AdapterEvent::HistoryLoaded {
+                        protocol: seen,
+                        conversation_id,
+                        ..
+                    }
                         if *seen == protocol && conversation_id == chat
                 ) || fails_load(event, protocol, Some(chat))
             })
