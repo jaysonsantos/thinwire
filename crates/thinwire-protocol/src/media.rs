@@ -79,7 +79,7 @@ impl fmt::Debug for ImagePath {
 pub struct AudioPath(String);
 
 impl AudioPath {
-    /// Empty is refused. Callers at the TDLib boundary discard `None`.
+    /// Empty is refused.
     #[must_use]
     pub fn new(path: impl Into<String>) -> Option<Self> {
         let path = path.into();
@@ -99,9 +99,6 @@ impl fmt::Debug for AudioPath {
 }
 
 /// One Telegram voice note the user can play.
-///
-/// There is no byte constructor. A value that means "read the file and
-/// delete it" cannot be built.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MessageAudio {
     duration_secs: u32,
@@ -145,7 +142,7 @@ impl MessageAudio {
         self.failed
     }
 
-    /// A finished download. Clears [`Self::failed`].
+    /// Stores `path` and clears `failed`.
     pub fn set_file(&mut self, path: AudioPath) {
         self.file = Some(path);
         self.failed = false;

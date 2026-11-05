@@ -624,13 +624,11 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         file_id: i32,
     },
-    /// A voice file finished downloading. The path is the file on disk.
     VoiceReady {
         protocol: ProtocolId,
         file_id: i32,
         path: crate::media::AudioPath,
     },
-    /// A voice file did not download.
     VoiceFailed {
         protocol: ProtocolId,
         file_id: i32,
@@ -1035,8 +1033,6 @@ pub struct ChatMessage {
     pub links: Vec<crate::media::MessageLink>,
     /// A photo. [`Self::body`] is the caption, and it can be empty.
     pub photo: Option<crate::media::MessagePhoto>,
-    /// Playable Telegram voice note. Absent for a label, a photo, a video note,
-    /// a secret policy we refuse, and every non-Telegram message.
     pub audio: Option<crate::media::MessageAudio>,
 }
 
@@ -1202,7 +1198,6 @@ pub(crate) fn emit_message_body(
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
-// One argument per `MessageMedia` field. A wrapper struct would only rename the call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_message_media(
     events: &EventTx,

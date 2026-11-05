@@ -1,6 +1,3 @@
-//! One Telegram voice note at a time. The session is the playback state.
-//! Stop is a click on the note that is already playing, and it stays here.
-
 mod engine;
 
 use eframe::egui::{self, RichText};
@@ -10,7 +7,6 @@ use thinwire_protocol::{AudioPath, ChatMessage, MessageAudio, ProtocolId};
 use super::motion;
 use super::theme;
 
-/// The device. Tests substitute a recorder that never opens one.
 pub(super) trait Backend {
     fn send(&mut self, cmd: engine::Cmd);
     fn take_done(&mut self) -> Option<engine::Done>;
@@ -24,7 +20,6 @@ struct VoiceKey {
     message_id: String,
 }
 
-/// One note, or none. A second sink cannot be represented.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Session {
     Idle,
@@ -94,20 +89,20 @@ fn click(session: &Session, key: VoiceKey, note: NoteState) -> Transition {
     let leaving_play = matches!(session, Session::Playing(_));
     match note {
         NoteState::Local { path } => playing(key, path),
-        NoteState::Remote { file_id } | NoteState::Broken { file_id } => {
-            // A fixture can name a protocol that has no voice file. v1 never
-            // builds that note. Downloading it would spin.
-            if key.protocol != ProtocolId::Telegram {
-                return if leaving_play {
-                    failed_stop(key)
-                } else {
-                    failed(key)
-                };
-            }
+        NoteState::Remote { file_id } | NoteState::Broken { file_id }
+            if key.protocol == ProtocolId::Telegram =>
+        {
             if leaving_play {
                 waiting_stop(key, file_id)
             } else {
                 waiting(key, file_id)
+            }
+        }
+        NoteState::Remote { .. } | NoteState::Broken { .. } => {
+            if leaving_play {
+                failed_stop(key)
+            } else {
+                failed(key)
             }
         }
     }
@@ -234,7 +229,6 @@ fn clock(total_secs: u32) -> String {
     format!("{}:{:02}", total_secs / 60, total_secs % 60)
 }
 
-/// Playback of the open thread. At most one note.
 pub(crate) struct Player<B: Backend = engine::Engine> {
     session: Session,
     engine: B,
@@ -257,7 +251,6 @@ impl<B: Backend> Drop for Player<B> {
 }
 
 impl<B: Backend> Player<B> {
-    /// Stop playback and join the device thread.
     pub(crate) fn shutdown(&mut self) {
         self.engine.shutdown();
         self.session = Session::Idle;
@@ -288,8 +281,6 @@ impl<B: Backend> Player<B> {
         self.commit(step(&self.session, input));
     }
 
-    /// Paint the control. A click that still needs the file appends one
-    /// [`Intent::PlayAudio`]. A file that is already local does not.
     pub(crate) fn show(
         &mut self,
         ui: &mut egui::Ui,

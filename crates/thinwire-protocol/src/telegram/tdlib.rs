@@ -167,11 +167,10 @@ struct LiveInbox {
     /// returned after the window blurred. Focus calls `viewMessages` through
     /// this id. The id stays until that call succeeds (#174 items 12 and 13).
     unviewed: Arc<Mutex<HashMap<i64, i64>>>,
-    /// Downloads this worker started. The first kind for an id wins.
+    /// Downloads this worker started.
     downloads: HashMap<i32, InFlight>,
 }
 
-/// A file this worker asked TDLib to download.
 #[derive(Clone, Copy)]
 enum InFlight {
     Photo { secret: bool, saw_active: bool },

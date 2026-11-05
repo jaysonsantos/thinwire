@@ -22,7 +22,6 @@ if grep -E '^thinwire-(signal|whatsapp)[ @]' <<<"$tree"; then
   exit 1
 fi
 
-# Playback imports compile only in the desktop engine.
 playback="$(grep -R -n -E --include='*.rs' 'use (rodio|cpal|symphonia)\b' crates || true)"
 allowed="crates/thinwire/src/app/audio/engine.rs"
 if [[ -n "$playback" ]]; then
