@@ -22,8 +22,8 @@ default = []
 # helper program only (ADR 0013). No MIT crate depends on this crate. The
 # git revision is pinned so the spike builds on stable Rust. Not a supported
 # messenger. `sqlite-storage` (not `sqlite-storage-bundled`) so the lock can
-# use libsqlite3-sys 0.36. The 0.38 pin cannot share the graph with the
-# Signal sqlite store. The bundled build is the direct dependency below.
+# use libsqlite3-sys 0.39. One libsqlite3-sys version must serve diesel, sqlx,
+# and presage. The bundled build is the direct dependency below.
 whatsapp-web = [
   "dep:whatsapp-rust",
   "dep:libsqlite3-sys",
@@ -46,7 +46,7 @@ tokio = { workspace = true, features = ["fs", "io-std"] }
 tracing.workspace = true
 # The log of the helper program. The tests also read log lines with it (#238).
 tracing-subscriber.workspace = true
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "e634d245f71d66e2ae55f79ef714c4ca01615ed8", optional = true, default-features = false, features = [
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "52fb6643ba3a97c7271ce6ffe5814c32d47070d8", optional = true, default-features = false, features = [
   "sqlite-storage",
   "tokio-transport",
   "tokio-runtime",
@@ -55,14 +55,14 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "e634
 ] }
 # Same SQLCipher build as the Signal helper. Vendored OpenSSL keeps the
 # helper off the system libssl. The key lives in the OS keychain.
-libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
+libsqlite3-sys = { version = "0.39", optional = true, default-features = false, features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
 # The connection hook sets the raw key. `sqlite` does not bundle a second SQLite.
 diesel = { version = "2.3.14", optional = true, default-features = false, features = [
   "sqlite",
 ] }
-rusqlite = { version = "0.38", optional = true, default-features = false, features = [
+rusqlite = { version = "0.41", optional = true, default-features = false, features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
 thinwire-core = { workspace = true, optional = true }

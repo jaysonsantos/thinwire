@@ -365,6 +365,24 @@ pub(crate) const fn protocol_tile(protocol: thinwire_protocol::ProtocolId) -> u8
     }
 }
 
+/// Fill and mark for a protocol badge on a chat avatar. Approximate brand
+/// hues, not the official assets.
+#[must_use]
+pub(crate) const fn protocol_badge_ink(
+    protocol: thinwire_protocol::ProtocolId,
+) -> (Color32, Color32) {
+    use thinwire_protocol::ProtocolId;
+    let mark = Color32::from_rgb(255, 255, 255);
+    let fill = match protocol {
+        ProtocolId::Telegram => hex(0x2A_AB_EE),
+        ProtocolId::WhatsApp => hex(0x25_D3_66),
+        ProtocolId::Signal => hex(0x3A_76_F0),
+        ProtocolId::Discord => hex(0x58_65_F2),
+        ProtocolId::Slack => hex(0xE0_1E_5A),
+    };
+    (fill, mark)
+}
+
 /// Palette for the theme that `ui` draws with now.
 #[must_use]
 pub(crate) fn palette(ui: &egui::Ui) -> &'static Palette {
@@ -824,6 +842,15 @@ mod tests {
                 let ratio = contrast(color, ink.on);
                 assert!(ratio >= TEXT_AA, "{theme} {part}: {ratio:.2} < {TEXT_AA}");
             }
+        }
+    }
+
+    #[test]
+    fn every_protocol_badge_has_a_fill_and_a_mark() {
+        for protocol in thinwire_protocol::ProtocolId::ALL {
+            let (fill, mark) = protocol_badge_ink(protocol);
+            assert_ne!(fill, mark, "{protocol}");
+            assert_eq!(mark, Color32::WHITE, "{protocol}");
         }
     }
 

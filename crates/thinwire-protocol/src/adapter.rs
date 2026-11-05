@@ -337,10 +337,13 @@ pub enum AdapterCommand {
     },
     /// Load one page of messages older than `before_message_id` (the oldest
     /// message the UI has for this chat). Ids are not secrets.
+    /// `store_cursor` is an exclusive store timestamp. It is not a message id.
+    /// `None` reads before `before_message_id`.
     LoadOlderMessages {
         protocol: ProtocolId,
         conversation_id: String,
         before_message_id: String,
+        store_cursor: Option<u64>,
     },
     /// One older page of one topic. Ids are not secrets.
     LoadOlderTopic {
@@ -442,6 +445,12 @@ pub enum AdapterCommand {
         file_id: i32,
         secret: bool,
     },
+    /// Download one Telegram voice file. The file stays on disk. The worker
+    /// reports a path and never reads the bytes into this process.
+    DownloadVoice {
+        protocol: ProtocolId,
+        file_id: i32,
+    },
 }
 
 impl AdapterCommand {
@@ -464,7 +473,8 @@ impl AdapterCommand {
             | Self::ViewTopic { protocol, .. }
             | Self::RestartHelper { protocol }
             | Self::RetryStoreKey { protocol }
-            | Self::DownloadFile { protocol, .. } => protocol,
+            | Self::DownloadFile { protocol, .. }
+            | Self::DownloadVoice { protocol, .. } => protocol,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
             Self::TelegramAuth { .. } => ProtocolId::Telegram,
             Self::WhatsAppAcknowledgeRisk
@@ -583,8 +593,8 @@ pub enum AdapterEvent {
         message_id: String,
         body: String,
     },
-    /// Replace the caption, the links, and the photo of a message. A text
-    /// edit sets `photo` to `None`.
+    /// Replace the caption, the links, the photo, and the voice note.
+    /// A text edit sets `photo` and `audio` to `None`.
     MessageMedia {
         protocol: ProtocolId,
         conversation_id: String,
@@ -592,6 +602,7 @@ pub enum AdapterEvent {
         body: String,
         links: Vec<crate::media::MessageLink>,
         photo: Option<crate::media::MessagePhoto>,
+        audio: Option<crate::media::MessageAudio>,
     },
     /// Links found after the message was shown. Does not change the body.
     MessageLinks {
@@ -610,6 +621,15 @@ pub enum AdapterEvent {
     },
     /// A photo file did not download.
     PhotoFailed {
+        protocol: ProtocolId,
+        file_id: i32,
+    },
+    VoiceReady {
+        protocol: ProtocolId,
+        file_id: i32,
+        path: crate::media::AudioPath,
+    },
+    VoiceFailed {
         protocol: ProtocolId,
         file_id: i32,
     },
@@ -693,11 +713,17 @@ pub enum AdapterEvent {
         /// Paging state is per topic, so an answer for one topic does not end
         /// another topic of the same chat.
         topic: Option<MessageTopic>,
+        /// Store position for the next page, and how many rows this page
+        /// could not read. `None` when this page skipped nothing and the
+        /// next page can use `before_message_id`.
+        store_cursor: Option<HistoryStoreCursor>,
     },
     /// A history load for one chat ended. The UI stops "Loading messages…".
     HistoryLoaded {
         protocol: ProtocolId,
         conversation_id: String,
+        /// Set when the first page stopped on rows it could not read.
+        store_cursor: Option<HistoryStoreCursor>,
     },
     /// Experimental WhatsApp QR payload. Debug output is redacted.
     /// Never log [`RedactedPairingSecret::reveal`].
@@ -745,6 +771,8 @@ impl AdapterEvent {
             | Self::MessageLinks { protocol, .. }
             | Self::PhotoReady { protocol, .. }
             | Self::PhotoFailed { protocol, .. }
+            | Self::VoiceReady { protocol, .. }
+            | Self::VoiceFailed { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }
@@ -756,6 +784,43 @@ impl AdapterEvent {
             _ => None,
         }
     }
+}
+
+/// Most unreadable runs one store cursor may carry.
+///
+/// One history page scans at most 208 rows, so a cursor cannot honestly name
+/// more runs than that. The helper decode drops a longer list.
+pub const MAX_HISTORY_CURSOR_RUNS: usize = 208;
+
+/// One unreadable stretch on a history page, and the shown message it sits
+/// older than.
+///
+/// `after_id` is that message's id. `None` means the stretch is newer than
+/// every row this page shows, so the core places it at the request anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySkipRun {
+    pub after_id: Option<String>,
+    pub skipped: u32,
+}
+
+/// Where the next Signal history read starts, and how many rows this page
+/// could not read.
+///
+/// `before_ms` is an exclusive store timestamp. It is not a shown message id.
+/// The skip count and the position of each stretch are part of this value.
+/// The wire adds this one field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryStoreCursor {
+    pub before_ms: u64,
+    /// Rows in this page that the store could not read.
+    pub skipped: u32,
+    /// The next read starts at `before_ms`. `false` means the next read still
+    /// uses the oldest shown message id. The count is still shown.
+    pub resume: bool,
+    /// Where those rows sit among the rows this page shows. When `runs` is
+    /// empty, the core draws one line for `skipped` at the oldest edge of
+    /// the page.
+    pub runs: Vec<HistorySkipRun>,
 }
 
 /// Pairing material shown only on the experimental WhatsApp screen.
@@ -968,6 +1033,7 @@ pub struct ChatMessage {
     pub links: Vec<crate::media::MessageLink>,
     /// A photo. [`Self::body`] is the caption, and it can be empty.
     pub photo: Option<crate::media::MessagePhoto>,
+    pub audio: Option<crate::media::MessageAudio>,
 }
 
 /// How a message reached the app.
@@ -1132,6 +1198,7 @@ pub(crate) fn emit_message_body(
 }
 
 #[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_message_media(
     events: &EventTx,
     protocol: ProtocolId,
@@ -1140,6 +1207,7 @@ pub(crate) fn emit_message_media(
     body: impl Into<String>,
     links: Vec<crate::media::MessageLink>,
     photo: Option<crate::media::MessagePhoto>,
+    audio: Option<crate::media::MessageAudio>,
 ) {
     let _ = events.send(AdapterEvent::MessageMedia {
         protocol,
@@ -1148,6 +1216,7 @@ pub(crate) fn emit_message_media(
         body: body.into(),
         links,
         photo,
+        audio,
     });
 }
 
@@ -1292,6 +1361,7 @@ pub fn emit_older_history_loaded(
         more,
         note,
         topic,
+        store_cursor: None,
     });
 }
 
@@ -1309,6 +1379,7 @@ pub fn emit_history_loaded(
     let _ = events.send(AdapterEvent::HistoryLoaded {
         protocol,
         conversation_id: conversation_id.into(),
+        store_cursor: None,
     });
 }
 

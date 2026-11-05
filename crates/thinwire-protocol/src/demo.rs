@@ -219,6 +219,7 @@ impl DemoAdapter {
             AdapterEvent::HistoryLoaded {
                 protocol,
                 conversation_id: chat,
+                store_cursor: None,
             },
         );
     }
@@ -231,6 +232,7 @@ impl DemoAdapter {
                 AdapterEvent::HistoryLoaded {
                     protocol,
                     conversation_id: chat,
+                    store_cursor: None,
                 },
             );
             return;
@@ -253,6 +255,7 @@ impl DemoAdapter {
             AdapterEvent::HistoryLoaded {
                 protocol,
                 conversation_id: chat,
+                store_cursor: None,
             },
         );
     }
@@ -289,6 +292,7 @@ impl DemoAdapter {
                 more: from > 0,
                 note: None,
                 topic: None,
+                store_cursor: None,
             },
         );
     }
@@ -337,6 +341,7 @@ impl DemoAdapter {
                 more: from > 0,
                 note: None,
                 topic: Some(topic),
+                store_cursor: None,
             },
         );
     }
@@ -371,6 +376,7 @@ impl DemoAdapter {
                     topic,
                     links: Vec::new(),
                     photo: None,
+                    audio: None,
                 },
             },
         );
@@ -573,6 +579,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         }
     }
 

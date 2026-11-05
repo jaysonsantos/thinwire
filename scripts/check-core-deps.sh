@@ -13,7 +13,23 @@ if grep -E '^(egui|eframe|winit|epaint|egui-winit|egui_glow)[ @]' <<<"$tree"; th
   echo "thinwire-core depends on a GUI toolkit crate (ADR 0010)" >&2
   exit 1
 fi
+if grep -E '^(rodio|cpal|symphonia)[ @]' <<<"$tree"; then
+  echo "thinwire-core depends on an audio playback crate" >&2
+  exit 1
+fi
 if grep -E '^thinwire-(signal|whatsapp)[ @]' <<<"$tree"; then
   echo "thinwire-core depends on an AGPL protocol crate (ADR 0013)" >&2
   exit 1
+fi
+
+playback="$(grep -R -n -E --include='*.rs' 'use (rodio|cpal|symphonia)\b' crates || true)"
+allowed="crates/thinwire/src/app/audio/engine.rs"
+if [[ -n "$playback" ]]; then
+  while IFS= read -r hit; do
+    file="${hit%%:*}"
+    if [[ "$file" != "$allowed" ]]; then
+      echo "audio playback import outside $allowed: $hit" >&2
+      exit 1
+    fi
+  done <<<"$playback"
 fi

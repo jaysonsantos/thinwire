@@ -364,6 +364,7 @@ impl GatedFake {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         }
     }
 
@@ -895,6 +896,7 @@ async fn no_helper_starts_before_the_gate_and_every_command_ends() {
             protocol: PROTOCOL,
             conversation_id: CHAT.into(),
             before_message_id: "m1".into(),
+            store_cursor: None,
         },
     ] {
         probe.send(command);
@@ -910,6 +912,7 @@ async fn no_helper_starts_before_the_gate_and_every_command_ends() {
         == AdapterEvent::HistoryLoaded {
             protocol: PROTOCOL,
             conversation_id: CHAT.into(),
+            store_cursor: None,
         }));
     assert!(probe.saw(|event| *event
         == AdapterEvent::SendRejected {

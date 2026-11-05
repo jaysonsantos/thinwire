@@ -1,11 +1,26 @@
-//! Icons painted with strokes. Inter and the egui fallback fonts miss several
-//! symbol glyphs, so the shell draws each icon itself. Every icon fits a square
-//! of `size` centered on `center`.
+//! Icons the shell draws itself. Inter and the egui fallback fonts miss several
+//! symbol glyphs, so each mark is painted here. Every icon fits a square of
+//! `size` centered on `center`. Stroke icons and filled protocol marks share
+//! this module.
+//!
+//! Protocol marks are original drawings that only resemble the common shapes.
+//! They are not the brand assets.
 
-use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
+use eframe::egui::{self, Color32, Pos2, Shape, Stroke, Vec2};
+use thinwire_protocol::ProtocolId;
 
 fn at(center: Pos2, unit: f32, x: f32, y: f32) -> Pos2 {
     center + Vec2::new(x, y) * unit
+}
+
+/// A contrasting cut color for details drawn on top of `fill`.
+fn cut_on(fill: Color32) -> Color32 {
+    let luma = u16::from(fill.r()) + u16::from(fill.g()) + u16::from(fill.b());
+    if luma > 400 {
+        Color32::from_rgb(20, 28, 48)
+    } else {
+        Color32::from_white_alpha(230)
+    }
 }
 
 /// A plus: add an account.
@@ -164,4 +179,186 @@ pub(crate) fn bell_off(painter: &egui::Painter, center: Pos2, size: f32, color: 
         [at(center, unit, -6.5, -6.5), at(center, unit, 6.5, 6.5)],
         stroke,
     );
+}
+
+/// The mark of a protocol, for a tile or a badge. Filled shapes so a 12 px
+/// badge still reads.
+pub(crate) fn protocol(
+    painter: &egui::Painter,
+    center: Pos2,
+    size: f32,
+    protocol: ProtocolId,
+    color: Color32,
+) {
+    match protocol {
+        ProtocolId::Telegram => telegram(painter, center, size, color),
+        ProtocolId::WhatsApp => whatsapp(painter, center, size, color),
+        ProtocolId::Signal => signal(painter, center, size, color),
+        ProtocolId::Discord => discord(painter, center, size, color),
+        ProtocolId::Slack => slack(painter, center, size, color),
+    }
+}
+
+/// A paper plane that points up-right: Telegram-like.
+///
+/// One body triangle plus an opaque fold triangle. Split fills with
+/// feathered edges left hairline seams, and `gamma_multiply` also scaled
+/// alpha so the fold blended with the tile behind it.
+fn telegram(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let unit = size / 16.0;
+    let tip = at(center, unit, 6.0, -5.0);
+    let left = at(center, unit, -6.0, 0.5);
+    let bottom = at(center, unit, -2.0, 6.0);
+    let fold = at(center, unit, 0.5, 1.0);
+    painter.add(Shape::convex_polygon(
+        vec![left, tip, bottom],
+        color,
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(
+        vec![fold, tip, bottom],
+        darken(color, 0.78),
+        Stroke::NONE,
+    ));
+}
+
+/// Keep alpha; scale only the RGB channels.
+fn darken(color: Color32, factor: f32) -> Color32 {
+    let scale = |channel: u8| (f32::from(channel) * factor).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(
+        scale(color.r()),
+        scale(color.g()),
+        scale(color.b()),
+        color.a(),
+    )
+}
+
+/// A round bubble with a phone handset: WhatsApp-like.
+fn whatsapp(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let unit = size / 16.0;
+    painter.circle_filled(at(center, unit, -0.5, -0.8), 6.2 * unit, color);
+    painter.add(Shape::convex_polygon(
+        vec![
+            at(center, unit, -4.5, 3.5),
+            at(center, unit, -7.0, 7.0),
+            at(center, unit, -1.5, 5.0),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+    // Keep the stroke thick enough that a ~9 px badge still shows a handset.
+    let stroke = Stroke::new((size * 0.16).clamp(1.5, 2.5), cut_on(color));
+    painter.add(Shape::line(
+        vec![
+            at(center, unit, -3.0, -2.4),
+            at(center, unit, -3.8, -0.6),
+            at(center, unit, -3.0, 1.0),
+            at(center, unit, -1.2, 2.4),
+            at(center, unit, 0.8, 2.6),
+            at(center, unit, 2.2, 1.2),
+            at(center, unit, 2.6, -0.4),
+        ],
+        stroke,
+    ));
+}
+
+/// A speech bubble: Signal-like.
+fn signal(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let unit = size / 16.0;
+    let body =
+        egui::Rect::from_center_size(at(center, unit, 0.0, -1.0), Vec2::new(12.0, 10.0) * unit);
+    painter.rect_filled(
+        body,
+        egui::CornerRadius::same((4.5 * unit).round().clamp(2.0, 255.0) as u8),
+        color,
+    );
+    painter.add(Shape::convex_polygon(
+        vec![
+            at(center, unit, -2.5, 3.5),
+            at(center, unit, -5.5, 7.0),
+            at(center, unit, 0.5, 4.0),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+/// A soft face with two eyes: Discord-like without the brand asset.
+///
+/// Body and legs are separate convex fills. A single concave outline spilled
+/// across the chin notch under `Shape::convex_polygon`.
+fn discord(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let unit = size / 16.0;
+    let body =
+        egui::Rect::from_center_size(at(center, unit, 0.0, -0.5), Vec2::new(13.0, 10.0) * unit);
+    painter.rect_filled(
+        body,
+        egui::CornerRadius::same((5.0 * unit).round().clamp(2.0, 255.0) as u8),
+        color,
+    );
+    painter.add(Shape::convex_polygon(
+        vec![
+            at(center, unit, -5.0, 3.5),
+            at(center, unit, -3.2, 6.2),
+            at(center, unit, -1.2, 3.5),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(
+        vec![
+            at(center, unit, 1.2, 3.5),
+            at(center, unit, 3.2, 6.2),
+            at(center, unit, 5.0, 3.5),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+    let eye = cut_on(color);
+    painter.circle_filled(at(center, unit, -2.4, -0.5), 1.35 * unit, eye);
+    painter.circle_filled(at(center, unit, 2.4, -0.5), 1.35 * unit, eye);
+}
+
+/// Four rounded bars in a hash: Slack-like.
+fn slack(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let unit = size / 16.0;
+    let corner = (1.4 * unit).round().clamp(1.0, 255.0) as u8;
+    let bar = |painter: &egui::Painter, x: f32, y: f32, w: f32, h: f32| {
+        painter.rect_filled(
+            egui::Rect::from_center_size(at(center, unit, x, y), Vec2::new(w, h) * unit),
+            egui::CornerRadius::same(corner),
+            color,
+        );
+    };
+    bar(painter, -2.6, -3.4, 3.0, 7.5);
+    bar(painter, 2.6, 3.4, 3.0, 7.5);
+    bar(painter, -3.4, 2.6, 7.5, 3.0);
+    bar(painter, 3.4, -2.6, 7.5, 3.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_protocol_mark_paints() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(64.0, 64.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let center = ui.max_rect().center();
+                for id in ProtocolId::ALL {
+                    protocol(ui.painter(), center, 24.0, id, Color32::WHITE);
+                    protocol(ui.painter(), center, 12.0, id, Color32::BLACK);
+                }
+            });
+        });
+        output.textures_delta.clear();
+    }
 }

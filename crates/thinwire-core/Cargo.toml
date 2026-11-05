@@ -8,8 +8,9 @@ publish.workspace = true
 repository.workspace = true
 description = "Frontend-independent thinwire state, intents, and change signal"
 
-# ADR 0010: no egui, eframe, or winit here. `scripts/check-core-deps.sh`
-# fails the test run if one of them shows up in `cargo tree`.
+# ADR 0010: no egui, eframe, or winit here, and no audio playback crate.
+# `scripts/check-core-deps.sh` fails the test run if one shows up in
+# `cargo tree`.
 [features]
 default = []
 # Protocol features live here. The frontend crate forwards them.

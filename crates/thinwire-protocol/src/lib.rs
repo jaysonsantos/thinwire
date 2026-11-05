@@ -23,12 +23,13 @@ mod whatsapp;
 pub use adapter::{
     APP_CLOSE_LIMIT, AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus,
     Arrival, ChatMessage, ChatTopic, Conversation, Delivery, DiscordAuthMode, EventTx, HelperFault,
-    HelperState, MessageTopic, OutgoingUpdate, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
-    RedactedPairingSecret, StoreAccessReason, SupportClass, TelegramAuthError, TelegramAuthPhase,
-    TelegramAuthStep, TelegramCodeVia, command_reads_session_key, emit_account,
-    emit_chat_list_loaded, emit_conversation, emit_history_loaded, emit_message,
-    emit_older_history_loaded, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
-    ordered_topics, outgoing_delivery, topic_mute_id, with_outbox_read,
+    HelperState, HistorySkipRun, HistoryStoreCursor, MAX_HISTORY_CURSOR_RUNS, MessageTopic,
+    OutgoingUpdate, ProtocolAdapter, ProtocolCapabilities, ProtocolId, RedactedPairingSecret,
+    StoreAccessReason, SupportClass, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
+    TelegramCodeVia, command_reads_session_key, emit_account, emit_chat_list_loaded,
+    emit_conversation, emit_history_loaded, emit_message, emit_older_history_loaded,
+    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped, ordered_topics,
+    outgoing_delivery, topic_mute_id, with_outbox_read,
 };
 pub use discord::{
     DISCORD_SECRET_BOT_TOKEN, DISCORD_SECRET_SERVICE, DiscordAdapter, DiscordOAuthInstall,
@@ -39,9 +40,9 @@ pub use helper::{HelperAdapter, HelperLauncher, HelperSpec, ProcessLauncher};
 pub use host::{AdapterHost, HostSender};
 pub use log_id::LogChatId;
 pub use media::{
-    ChatAvatar, FILES_PER_MESSAGE, ImageBytes, ImagePath, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS,
-    MediaKind, MessageLink, MessagePhoto, OutgoingFile, PhotoFile, PhotoSize, TextKind, TextSpan,
-    links_in, openable_url, utf16_range, with_scheme,
+    AudioPath, ChatAvatar, FILES_PER_MESSAGE, ImageBytes, ImagePath, MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS, MediaKind, MessageAudio, MessageLink, MessagePhoto, OutgoingFile, PhotoFile,
+    PhotoSize, TextKind, TextSpan, links_in, openable_url, utf16_range, with_scheme,
 };
 pub use risk::{
     CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3, CRITIC_RISK_BULLETS, critic_bullets_for,

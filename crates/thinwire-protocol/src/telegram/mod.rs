@@ -303,6 +303,7 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
                 before_message_id,
+                store_cursor: _,
             } => {
                 let owned = inbox::parse_message_id(&before_message_id)
                     .is_some_and(|(chat_id, _)| inbox::conversation_id(chat_id) == conversation_id);
@@ -491,6 +492,10 @@ impl ProtocolAdapter for TelegramAdapter {
                 file_id,
                 secret,
             } => self.dispatch_live(events, LiveCall::DownloadFile { file_id, secret }),
+            AdapterCommand::DownloadVoice {
+                protocol: ProtocolId::Telegram,
+                file_id,
+            } => self.dispatch_live(events, LiveCall::DownloadVoice { file_id }),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -601,6 +606,9 @@ enum LiveCall {
         file_id: i32,
         secret: bool,
     },
+    DownloadVoice {
+        file_id: i32,
+    },
     SendMedia {
         conversation_id: String,
         topic: Option<MessageTopic>,
@@ -696,6 +704,9 @@ impl TelegramAdapter {
                 LiveCall::DownloadFile { file_id, secret } => {
                     self.tdlib
                         .download_file(file_id, secret, secrets, source, events);
+                }
+                LiveCall::DownloadVoice { file_id } => {
+                    self.tdlib.download_voice(file_id, secrets, source, events);
                 }
                 LiveCall::SendMedia {
                     conversation_id,
@@ -1387,6 +1398,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
                 before_message_id: "telegram:2:50".into(),
+                store_cursor: None,
             },
             &tx,
         );
@@ -1405,6 +1417,7 @@ mod tests {
                 more: false,
                 note: None,
                 topic: None,
+                store_cursor: None,
             }
         );
         let valid = adapter.handle(
@@ -1412,6 +1425,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
                 before_message_id: "telegram:1:50".into(),
+                store_cursor: None,
             },
             &tx,
         );
@@ -1435,6 +1449,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
                 before_message_id: "telegram:1:50".into(),
+                store_cursor: None,
             }
         );
         assert!(debug.contains("telegram:1:50"), "ids only, no secret");

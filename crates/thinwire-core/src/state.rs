@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "whatsapp-web")]
 use thinwire_protocol::WhatsAppPhoneVault;
 use thinwire_protocol::{
-    AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, ChatTopic,
-    Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, MAX_ATTACHMENTS,
-    MessageTopic, OutgoingFile, ProtocolCapabilities, ProtocolId, StoreAccessReason,
-    TelegramApiSource, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep, TelegramCodeVia,
-    TelegramSecretVault, catalog, ordered_topics, telegram_api_available, topic_mute_id,
-    with_outbox_read,
+    AccountState, AdapterCommand, AdapterEvent, AdapterStatus, AudioPath, ChatMessage, ChatTopic,
+    Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, HistoryStoreCursor,
+    MAX_ATTACHMENTS, MessageAudio, MessageTopic, OutgoingFile, ProtocolCapabilities, ProtocolId,
+    StoreAccessReason, TelegramApiSource, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
+    TelegramCodeVia, TelegramSecretVault, catalog, ordered_topics, telegram_api_available,
+    topic_mute_id, with_outbox_read,
 };
 
 use crate::mutes::{ChatMute, ChatMutes};
@@ -135,6 +135,58 @@ pub enum OlderState {
     Loading,
     /// "Start of chat": nothing older.
     StartOfChat,
+}
+
+/// One history page that records unreadable rows.
+struct UnreadablePage<'a> {
+    protocol: ProtocolId,
+    chat: &'a str,
+    topic: Option<MessageTopic>,
+    request_before: &'a str,
+    cursor: HistoryStoreCursor,
+    more: bool,
+    initial: bool,
+}
+
+/// One closed run of stored rows the thread could not read.
+///
+/// The line is drawn once. `before_id` is the message the run sits older
+/// than. `None` means the run is the newest content, so it is drawn after
+/// every message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableRun {
+    pub before_id: Option<String>,
+    /// `0` means the count is not known.
+    pub skipped: u32,
+}
+
+/// The weak line for one unreadable run. `skipped == 0` is the sentence
+/// used when the count is not known.
+#[must_use]
+pub fn unreadable_messages_line(skipped: u32) -> String {
+    match skipped {
+        0 => "Some messages here could not be read. They were not deleted.".to_string(),
+        1 => "1 message here could not be read. It was not deleted.".to_string(),
+        count => format!("{count} messages here could not be read. They were not deleted."),
+    }
+}
+
+fn push_unreadable(runs: &mut Vec<UnreadableRun>, before_id: Option<String>, skipped: u32) {
+    if skipped == 0 {
+        return;
+    }
+    if let Some(run) = runs.iter_mut().find(|run| run.before_id == before_id) {
+        run.skipped = run.skipped.saturating_add(skipped);
+        return;
+    }
+    runs.push(UnreadableRun { before_id, skipped });
+}
+
+/// Skips not drawn yet. Empty pages add to it until a page shows rows or
+/// the store ends.
+struct OpenUnreadable {
+    before_id: Option<String>,
+    skipped: u32,
 }
 
 /// What the thread shows for the selected chat.
@@ -612,6 +664,15 @@ pub struct Snapshot {
     /// Threads whose last older page did not load. A later success clears
     /// that thread. The thread shows plain text only (#57).
     older_note: HashSet<OlderPageKey>,
+    /// Closed runs of unreadable stored rows, oldest request first.
+    unreadable: HashMap<OlderPageKey, Vec<UnreadableRun>>,
+    /// A run that is still loading. Empty pages add to it.
+    open_unreadable: HashMap<OlderPageKey, OpenUnreadable>,
+    /// The next older read of this thread starts at this store timestamp.
+    history_resume: HashMap<OlderPageKey, u64>,
+    /// The store timestamp last sent for this thread. The next cursor must
+    /// be older, so a stuck cursor cannot loop.
+    history_asked: HashMap<OlderPageKey, u64>,
     /// Scroll the open chat into view once, after the user opens it.
     /// A message that reorders the list does not set this.
     scroll_to_selected: bool,
@@ -902,6 +963,10 @@ impl Snapshot {
             #[cfg(any(test, feature = "test-support"))]
             hidden_for_test: HashSet::new(),
             older_note: HashSet::new(),
+            unreadable: HashMap::new(),
+            open_unreadable: HashMap::new(),
+            history_resume: HashMap::new(),
+            history_asked: HashMap::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
             seen_visible_ids: Vec::new(),
@@ -1195,11 +1260,13 @@ impl Snapshot {
                 more,
                 note,
                 topic,
+                store_cursor,
             } => {
                 // Every protocol: a failure sets the thread's note, a success
                 // clears it. The thread shows plain text only. The topic is
                 // part of the key, so an answer for topic A does not end topic B.
                 let key = older_key(protocol, &conversation_id, topic);
+                let failed = note.is_some();
                 match note {
                     Some(detail) => {
                         tracing::debug!(?protocol, %detail, "older page did not load");
@@ -1210,6 +1277,32 @@ impl Snapshot {
                     }
                 }
                 self.older_loading.remove(&key);
+                // A failed page keeps the open run and the store cursor, so
+                // the retry sends the same read. The asked timestamp is the
+                // in-flight cursor; leaving it set makes that retry look like
+                // a cursor that did not move. A success closes or continues
+                // the run, and a success that does not move still drops it.
+                let continued = if failed {
+                    self.history_asked.remove(&key);
+                    false
+                } else if let Some(cursor) = store_cursor {
+                    self.note_unreadable(UnreadablePage {
+                        protocol,
+                        chat: &conversation_id,
+                        topic,
+                        request_before: &before_message_id,
+                        cursor,
+                        more,
+                        initial: false,
+                    })
+                } else {
+                    self.close_open_run(&key);
+                    self.history_resume.remove(&key);
+                    false
+                };
+                if continued {
+                    return;
+                }
                 let oldest = self
                     .message_bucket(protocol, &conversation_id, &before_message_id)
                     .and_then(|bucket| self.messages.get(&bucket))
@@ -1237,6 +1330,7 @@ impl Snapshot {
             AdapterEvent::HistoryLoaded {
                 protocol,
                 conversation_id,
+                store_cursor,
             } => {
                 let key = (protocol, conversation_id);
                 // The history came during a reconnect: Linked need not load
@@ -1245,6 +1339,20 @@ impl Snapshot {
                     self.open_on_link = None;
                 }
                 self.history_loading.remove(&key);
+                if let Some(cursor) = store_cursor {
+                    let chat = key.1.clone();
+                    let more =
+                        cursor.resume || self.oldest_message_id(protocol, &chat, None).is_some();
+                    self.note_unreadable(UnreadablePage {
+                        protocol,
+                        chat: &chat,
+                        topic: None,
+                        request_before: "",
+                        cursor,
+                        more,
+                        initial: true,
+                    });
+                }
             }
             AdapterEvent::ConversationRemoved { protocol, id } => {
                 self.remove_conversation(protocol, &id);
@@ -1284,6 +1392,7 @@ impl Snapshot {
                 body,
                 links,
                 photo,
+                audio,
             } => self.patch_message_media(
                 protocol,
                 &conversation_id,
@@ -1291,6 +1400,7 @@ impl Snapshot {
                 body,
                 links,
                 photo,
+                audio,
             ),
             AdapterEvent::MessageLinks {
                 protocol,
@@ -1304,6 +1414,12 @@ impl Snapshot {
                 file,
             } => self.photo_ready(protocol, file_id, file),
             AdapterEvent::PhotoFailed { protocol, file_id } => self.photo_failed(protocol, file_id),
+            AdapterEvent::VoiceReady {
+                protocol,
+                file_id,
+                path,
+            } => self.voice_ready(protocol, file_id, path),
+            AdapterEvent::VoiceFailed { protocol, file_id } => self.voice_failed(protocol, file_id),
             AdapterEvent::MessagesRemoved {
                 protocol,
                 conversation_id,
@@ -1892,6 +2008,10 @@ impl Snapshot {
         self.older_at_start.retain(|key| !same(key));
         self.older_retry.retain(|key, _| !same(key));
         self.older_note.retain(|key| !same(key));
+        self.unreadable.retain(|key, _| !same(key));
+        self.open_unreadable.retain(|key, _| !same(key));
+        self.history_resume.retain(|key, _| !same(key));
+        self.history_asked.retain(|key, _| !same(key));
     }
 
     /// Drop older-page memory of one protocol.
@@ -1900,6 +2020,10 @@ impl Snapshot {
         self.older_at_start.retain(|key| key.0 != protocol);
         self.older_retry.retain(|key, _| key.0 != protocol);
         self.older_note.retain(|key| key.0 != protocol);
+        self.unreadable.retain(|key, _| key.0 != protocol);
+        self.open_unreadable.retain(|key, _| key.0 != protocol);
+        self.history_resume.retain(|key, _| key.0 != protocol);
+        self.history_asked.retain(|key, _| key.0 != protocol);
     }
 
     /// Every adapter answered `Shutdown` with `Stopped`: no session of any
@@ -2366,6 +2490,7 @@ impl Snapshot {
         };
         let protocol = self.selected_protocol;
         let topic = self.selected_topic;
+        let store_cursor = self.take_resume_cursor(protocol, &id, topic);
         self.older_loading.insert(older_key(protocol, &id, topic));
         if let Some(topic) = topic {
             self.pending.push(AdapterCommand::LoadOlderTopic {
@@ -2379,8 +2504,244 @@ impl Snapshot {
                 protocol,
                 conversation_id: id,
                 before_message_id: oldest,
+                store_cursor,
             });
         }
+    }
+
+    /// Closed runs of unreadable rows in the open thread.
+    #[must_use]
+    pub fn unreadable_runs(&self) -> &[UnreadableRun] {
+        let Some(id) = self.selected_conversation.as_ref() else {
+            return &[];
+        };
+        self.unreadable
+            .get(&older_key(self.selected_protocol, id, self.selected_topic))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn oldest_message_id(
+        &self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+    ) -> Option<String> {
+        self.messages
+            .get(&thread_key(protocol, chat, topic))
+            .and_then(|list| list.first())
+            .map(|row| row.id.clone())
+    }
+
+    /// Record one page's store cursor. `true` when the next page was queued
+    /// at once, because this page held no rows.
+    fn note_unreadable(&mut self, page: UnreadablePage<'_>) -> bool {
+        let UnreadablePage {
+            protocol,
+            chat,
+            topic,
+            request_before,
+            cursor,
+            more,
+            initial,
+        } = page;
+        let key = older_key(protocol, chat, topic);
+        let oldest = self.oldest_message_id(protocol, chat, topic);
+        let added = if initial {
+            oldest.is_some()
+        } else {
+            oldest.as_deref().is_some_and(|id| id != request_before)
+        };
+        let moves = self
+            .history_asked
+            .get(&key)
+            .is_none_or(|asked| cursor.before_ms < *asked);
+        if !added && cursor.resume && moves && more && topic.is_none() {
+            let before_id = self.open_unreadable.get(&key).map_or_else(
+                || {
+                    if initial || request_before.is_empty() {
+                        None
+                    } else {
+                        Some(request_before.to_string())
+                    }
+                },
+                |open| open.before_id.clone(),
+            );
+            let skipped = self
+                .open_unreadable
+                .get(&key)
+                .map(|open| open.skipped)
+                .unwrap_or(0)
+                .saturating_add(cursor.skipped);
+            self.open_unreadable
+                .insert(key, OpenUnreadable { before_id, skipped });
+            return self.queue_store_page(protocol, chat, request_before, cursor.before_ms);
+        }
+        let pending = self.open_unreadable.remove(&key);
+        if cursor.runs.is_empty() {
+            let skipped = pending
+                .as_ref()
+                .map(|open| open.skipped)
+                .unwrap_or(0)
+                .saturating_add(cursor.skipped);
+            if skipped > 0 {
+                let before_id = pending.map_or_else(
+                    || Self::unreadable_anchor(initial, request_before, oldest),
+                    |open| open.before_id,
+                );
+                self.unreadable
+                    .entry(key.clone())
+                    .or_default()
+                    .push(UnreadableRun { before_id, skipped });
+            }
+        } else {
+            let mut leading = pending.as_ref().map(|open| open.skipped).unwrap_or(0);
+            let pending_anchor = pending.map(|open| open.before_id);
+            let mut edge = 0u32;
+            let mut placed = Vec::new();
+            for run in cursor.runs {
+                if run.skipped == 0 {
+                    continue;
+                }
+                match run.after_id {
+                    None => leading = leading.saturating_add(run.skipped),
+                    Some(id) if self.message_is_loaded(protocol, chat, topic, &id) => {
+                        push_unreadable(&mut placed, Some(id), run.skipped);
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            "history run names a message that is not loaded; the count joins the oldest line"
+                        );
+                        edge = edge.saturating_add(run.skipped);
+                    }
+                }
+            }
+            if edge > 0 {
+                push_unreadable(&mut placed, oldest.clone(), edge);
+            }
+            if leading > 0 {
+                let before_id = pending_anchor
+                    .unwrap_or_else(|| Self::unreadable_anchor(initial, request_before, oldest));
+                push_unreadable(&mut placed, before_id, leading);
+            }
+            if !placed.is_empty() {
+                self.unreadable
+                    .entry(key.clone())
+                    .or_default()
+                    .extend(placed);
+            }
+        }
+        if cursor.resume && moves && more && added && topic.is_none() {
+            self.history_resume.insert(key, cursor.before_ms);
+        } else {
+            self.history_resume.remove(&key);
+        }
+        false
+    }
+
+    fn message_is_loaded(
+        &self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        id: &str,
+    ) -> bool {
+        self.messages
+            .get(&thread_key(protocol, chat, topic))
+            .is_some_and(|rows| rows.iter().any(|row| row.id == id))
+    }
+
+    fn unreadable_anchor(
+        initial: bool,
+        request_before: &str,
+        oldest: Option<String>,
+    ) -> Option<String> {
+        if initial {
+            oldest
+        } else if request_before.is_empty() {
+            None
+        } else {
+            Some(request_before.to_string())
+        }
+    }
+
+    fn close_open_run(&mut self, key: &OlderPageKey) {
+        let Some(open) = self.open_unreadable.remove(key) else {
+            return;
+        };
+        if open.skipped == 0 {
+            return;
+        }
+        self.unreadable
+            .entry(key.clone())
+            .or_default()
+            .push(UnreadableRun {
+                before_id: open.before_id,
+                skipped: open.skipped,
+            });
+    }
+
+    /// Queue the next page from `before_ms`. `false` when that timestamp does
+    /// not move older than the last request.
+    fn queue_store_page(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        request_before: &str,
+        before_ms: u64,
+    ) -> bool {
+        let key = older_key(protocol, chat, None);
+        if self
+            .history_asked
+            .get(&key)
+            .is_some_and(|asked| before_ms >= *asked)
+        {
+            self.history_resume.remove(&key);
+            return false;
+        }
+        self.history_resume.insert(key.clone(), before_ms);
+        self.history_asked.insert(key.clone(), before_ms);
+        self.older_loading.insert(key.clone());
+        self.older_retry.remove(&key);
+        self.older_at_start.remove(&key);
+        let before_message_id = if request_before.is_empty() {
+            before_ms.to_string()
+        } else {
+            request_before.to_string()
+        };
+        self.pending.push(AdapterCommand::LoadOlderMessages {
+            protocol,
+            conversation_id: chat.to_string(),
+            before_message_id,
+            store_cursor: Some(before_ms),
+        });
+        true
+    }
+
+    /// The saved store cursor, when it is older than the last finished
+    /// request. A failed read clears that timestamp, so the same cursor is
+    /// sent again. A cursor that a finished read did not move is dropped.
+    fn take_resume_cursor(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+    ) -> Option<u64> {
+        if topic.is_some() {
+            return None;
+        }
+        let key = older_key(protocol, chat, topic);
+        let cursor = self.history_resume.get(&key).copied()?;
+        if self
+            .history_asked
+            .get(&key)
+            .is_some_and(|asked| cursor >= *asked)
+        {
+            self.history_resume.remove(&key);
+            return None;
+        }
+        self.history_asked.insert(key, cursor);
+        Some(cursor)
     }
 
     /// A request for older messages of the selected chat would go out now.
@@ -4374,7 +4735,9 @@ impl Snapshot {
         self.pending.retain(|command| {
             !matches!(
                 command,
-                AdapterCommand::DownloadFile { protocol: owner, .. } if *owner == protocol
+                AdapterCommand::DownloadFile { protocol: owner, .. }
+                    | AdapterCommand::DownloadVoice { protocol: owner, .. }
+                    if *owner == protocol
             )
         });
         self.notices.remove(&protocol);
@@ -4784,6 +5147,7 @@ impl Snapshot {
         let key = thread_key(message.protocol, &message.conversation_id, message.topic);
         let list = self.messages.entry(key).or_default();
         if let Some(existing) = list.iter_mut().find(|row| row.id == message.id) {
+            Self::keep_voice_file(&mut message.audio, existing.audio.as_ref());
             *existing = message;
         } else {
             list.push(message);
@@ -4839,6 +5203,7 @@ impl Snapshot {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn patch_message_media(
         &mut self,
         protocol: ProtocolId,
@@ -4847,13 +5212,39 @@ impl Snapshot {
         body: String,
         links: Vec<thinwire_protocol::MessageLink>,
         photo: Option<thinwire_protocol::MessagePhoto>,
+        audio: Option<MessageAudio>,
     ) {
         let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
             return;
         };
+        let stored = message.audio.clone();
         message.body = body;
         message.links = links;
         message.photo = photo;
+        message.audio = audio;
+        Self::keep_voice_file(&mut message.audio, stored.as_ref());
+    }
+
+    /// A refresh may omit a path TDLib has not reported yet. Keep the path
+    /// and the failed flag already stored for the same file id.
+    fn keep_voice_file(incoming: &mut Option<MessageAudio>, stored: Option<&MessageAudio>) {
+        let Some(stored) = stored else {
+            return;
+        };
+        let Some(incoming) = incoming.as_mut() else {
+            return;
+        };
+        if incoming.file_id() != stored.file_id() || incoming.file().is_some() {
+            return;
+        }
+        if let Some(path) = stored.file().cloned() {
+            incoming.set_file(path);
+        }
+        if stored.failed() {
+            incoming.mark_failed();
+        } else {
+            incoming.clear_failed();
+        }
     }
 
     fn patch_message_links(
@@ -4913,6 +5304,40 @@ impl Snapshot {
             file_id,
             secret,
         });
+    }
+
+    pub(crate) fn play_audio(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        file_id: i32,
+    ) {
+        if protocol != ProtocolId::Telegram {
+            return;
+        }
+        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+            return;
+        }
+        let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
+            return;
+        };
+        if key.2 != self.selected_topic {
+            return;
+        }
+        {
+            let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
+                return;
+            };
+            let Some(audio) = message.audio.as_mut() else {
+                return;
+            };
+            if audio.file_id() != file_id || audio.file().is_some() {
+                return;
+            }
+            audio.clear_failed();
+        }
+        self.queue(AdapterCommand::DownloadVoice { protocol, file_id });
     }
 
     /// Download the small photo of an inbox row. A second request while the
@@ -5031,6 +5456,38 @@ impl Snapshot {
         for row in list.iter_mut() {
             if row.avatar.file_id == Some(file_id) {
                 row.avatar.failed = true;
+            }
+        }
+    }
+
+    fn voice_ready(&mut self, protocol: ProtocolId, file_id: i32, path: AudioPath) {
+        for list in self.messages.values_mut() {
+            for message in list.iter_mut() {
+                if message.protocol != protocol {
+                    continue;
+                }
+                let Some(audio) = message.audio.as_mut() else {
+                    continue;
+                };
+                if audio.file_id() == file_id {
+                    audio.set_file(path.clone());
+                }
+            }
+        }
+    }
+
+    fn voice_failed(&mut self, protocol: ProtocolId, file_id: i32) {
+        for list in self.messages.values_mut() {
+            for message in list.iter_mut() {
+                if message.protocol != protocol {
+                    continue;
+                }
+                let Some(audio) = message.audio.as_mut() else {
+                    continue;
+                };
+                if audio.file_id() == file_id {
+                    audio.mark_failed();
+                }
             }
         }
     }
@@ -5725,7 +6182,7 @@ mod tests {
         );
     }
 
-    fn signal_chat() -> Conversation {
+    fn signal_ada_chat() -> Conversation {
         let mut chat = telegram_chat(1, "Ada", 1);
         chat.protocol = ProtocolId::Signal;
         chat.id = "signal:ada".into();
@@ -5738,7 +6195,7 @@ mod tests {
             state: AccountState::Linked,
         });
         snapshot.apply(AdapterEvent::ConversationUpsert {
-            conversation: signal_chat(),
+            conversation: signal_ada_chat(),
         });
         snapshot.take_commands();
     }
@@ -7137,6 +7594,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         }
     }
 
@@ -7205,6 +7663,163 @@ mod tests {
         });
         snapshot.load_photo(ProtocolId::Telegram, chat, id, 7);
         assert_eq!(downloads(&snapshot.take_commands()), 1);
+    }
+
+    #[test]
+    fn play_audio_downloads_a_voice_note_that_has_no_path() {
+        use thinwire_protocol::{
+            AudioPath, ImagePath, MessageAudio, MessagePhoto, PhotoFile, PhotoSize,
+        };
+
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: Conversation {
+                protocol: ProtocolId::Telegram,
+                id: "telegram:1".into(),
+                title: "Ada".into(),
+                participant: "Ada".into(),
+                preview: String::new(),
+                unread: 0,
+                order: 1,
+                last_at: 1,
+                is_group: false,
+                writable: true,
+                placeholder: false,
+                muted: false,
+                has_topics: false,
+                avatar: Default::default(),
+            },
+        });
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        let mut message = telegram_text(1, 5, "Voice message");
+        let mut audio = MessageAudio::telegram(12, 42, None).expect("note");
+        audio.mark_failed();
+        message.audio = Some(audio);
+        message.photo = Some(MessagePhoto {
+            width: 100,
+            height: 80,
+            mini: None,
+            sizes: vec![PhotoSize {
+                width: 100,
+                height: 80,
+                file_id: Some(7),
+                path: None,
+                bytes: None,
+            }],
+            has_spoiler: false,
+            is_secret: false,
+            failed: false,
+        });
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        let chat = "telegram:1";
+        let id = "telegram:1:5";
+        let audio_of = |snapshot: &Snapshot| {
+            snapshot
+                .messages
+                .values()
+                .flatten()
+                .find(|message| message.id == id)
+                .and_then(|message| message.audio.as_ref())
+                .expect("voice")
+                .clone()
+        };
+        snapshot.play_audio(ProtocolId::Slack, chat, id, 42);
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 99);
+        snapshot.play_audio(ProtocolId::Telegram, "telegram:9", id, 42);
+        assert!(snapshot.take_commands().is_empty());
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 42);
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 42);
+        let commands = snapshot.take_commands();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    AdapterCommand::DownloadVoice { file_id: 42, .. }
+                ))
+                .count(),
+            2
+        );
+        assert!(
+            !snapshot
+                .photo_downloads
+                .contains(&(ProtocolId::Telegram, 42))
+        );
+        assert!(!audio_of(&snapshot).failed());
+        assert!(audio_of(&snapshot).file().is_none());
+        snapshot.apply(AdapterEvent::PhotoReady {
+            protocol: ProtocolId::Telegram,
+            file_id: 7,
+            file: PhotoFile::from_path(ImagePath::new("/tmp/hidden-photo")),
+        });
+        assert!(audio_of(&snapshot).file().is_none());
+        let photo_path = snapshot
+            .messages
+            .values()
+            .flatten()
+            .find(|message| message.id == id)
+            .and_then(|message| message.photo.as_ref())
+            .and_then(|photo| photo.sizes.iter().find(|size| size.file_id == Some(7)))
+            .and_then(|size| size.path.as_ref())
+            .map(|path| path.as_str().to_string());
+        assert_eq!(photo_path.as_deref(), Some("/tmp/hidden-photo"));
+        let voice = AudioPath::new("/tmp/hidden-voice.ogg").expect("path");
+        snapshot.apply(AdapterEvent::VoiceReady {
+            protocol: ProtocolId::Telegram,
+            file_id: 42,
+            path: voice,
+        });
+        assert_eq!(
+            audio_of(&snapshot).file().map(AudioPath::as_path),
+            Some(std::path::Path::new("/tmp/hidden-voice.ogg"))
+        );
+        assert!(!audio_of(&snapshot).failed());
+        let sizes = snapshot
+            .messages
+            .values()
+            .flatten()
+            .find(|message| message.id == id)
+            .and_then(|message| message.photo.as_ref())
+            .map(|photo| photo.sizes.clone())
+            .expect("photo");
+        assert!(sizes.iter().all(|size| {
+            size.bytes.is_none()
+                && size
+                    .path
+                    .as_ref()
+                    .is_none_or(|path| path.as_str() != "/tmp/hidden-voice.ogg")
+        }));
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 42);
+        assert!(snapshot.take_commands().is_empty());
+        let mut kept = telegram_text(1, 5, "Voice message");
+        kept.audio = MessageAudio::telegram(12, 42, None);
+        snapshot.apply(AdapterEvent::MessageReceived { message: kept });
+        assert_eq!(
+            audio_of(&snapshot).file().map(AudioPath::as_path),
+            Some(std::path::Path::new("/tmp/hidden-voice.ogg"))
+        );
+        let mut again = telegram_text(1, 5, "Voice message");
+        again.audio = MessageAudio::telegram(12, 43, None);
+        snapshot.apply(AdapterEvent::MessageReceived { message: again });
+        snapshot.play_audio(ProtocolId::Telegram, chat, id, 43);
+        assert!(
+            snapshot.pending.iter().any(|command| matches!(
+                command,
+                AdapterCommand::DownloadVoice { file_id: 43, .. }
+            ))
+        );
+        snapshot.end_session(ProtocolId::Telegram);
+        assert!(
+            !snapshot
+                .pending
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::DownloadVoice { .. }))
+        );
     }
 
     #[test]
@@ -7801,6 +8416,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            store_cursor: None,
         });
         assert_eq!(snapshot.thread_state(), ThreadState::Empty);
 
@@ -8243,6 +8859,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:9".into(),
+            store_cursor: None,
         });
         snapshot.take_commands();
         snapshot.load_older();
@@ -8251,6 +8868,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:9".into(),
+            store_cursor: None,
         });
         snapshot.take_commands();
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -8261,6 +8879,7 @@ mod tests {
             more: false,
             note: None,
             topic: Some(trail),
+            store_cursor: None,
         });
         assert_eq!(
             snapshot.older_state(),
@@ -8278,6 +8897,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:9".into(),
+            store_cursor: None,
         });
         assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
         let _ = store;
@@ -8474,6 +9094,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         }
     }
 
@@ -8498,6 +9119,7 @@ mod tests {
             more,
             note: None,
             topic: None,
+            store_cursor: None,
         }
     }
 
@@ -8516,6 +9138,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:1".into(),
+            store_cursor: None,
         });
         snapshot.take_commands();
         snapshot
@@ -8614,6 +9237,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Telegram,
             conversation_id: "telegram:2".into(),
+            store_cursor: None,
         });
         snapshot.take_commands();
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -8666,6 +9290,7 @@ mod tests {
             more: true,
             note: Some("Could not load older messages (TDLib 500).".into()),
             topic: None,
+            store_cursor: None,
         };
         snapshot.apply(failed);
         assert!(!snapshot.is_loading());
@@ -8700,6 +9325,7 @@ mod tests {
             more: true,
             note: Some("group-7f3a is not in the local store".into()),
             topic: None,
+            store_cursor: None,
         };
         for protocol in [ProtocolId::Signal, ProtocolId::Telegram] {
             snapshot.apply(AdapterEvent::Account {
@@ -8755,6 +9381,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::OlderHistoryLoaded {
@@ -8764,6 +9391,7 @@ mod tests {
             more: false,
             note: None,
             topic: None,
+            store_cursor: None,
         });
         assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
         assert!(!snapshot.older_can_ask());
@@ -8789,6 +9417,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -10148,6 +10777,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -10262,6 +10892,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -10357,6 +10988,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: conversation.clone(),
@@ -10456,6 +11088,7 @@ mod tests {
             topic: None,
             links: Vec::new(),
             photo: None,
+            audio: None,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: previous,
@@ -10514,6 +11147,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
 
@@ -10705,6 +11339,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -10753,6 +11388,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -11722,6 +12358,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         assert_eq!(
@@ -12040,6 +12677,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -12056,6 +12694,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -12072,6 +12711,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -12097,6 +12737,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -12137,6 +12778,7 @@ mod tests {
                     topic: None,
                     links: Vec::new(),
                     photo: None,
+                    audio: None,
                 },
             });
         }
@@ -12195,6 +12837,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         let _ = snapshot.take_commands();
@@ -12382,6 +13025,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -12661,11 +13305,13 @@ mod tests {
                     topic: None,
                     links: Vec::new(),
                     photo: None,
+                    audio: None,
                 },
             });
             snapshot.apply(AdapterEvent::HistoryLoaded {
                 protocol,
                 conversation_id: id.into(),
+                store_cursor: None,
             });
         }
 
@@ -12688,6 +13334,7 @@ mod tests {
             more: false,
             note: None,
             topic: None,
+            store_cursor: None,
         });
         assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
         assert!(!snapshot.older_can_ask());
@@ -12738,6 +13385,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.apply(AdapterEvent::MessageDelivery {
@@ -12814,6 +13462,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Slack,
             conversation_id: "slack:C1".into(),
+            store_cursor: None,
         });
         assert_eq!(snapshot.thread_state(), ThreadState::Empty);
 
@@ -13661,6 +14310,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.take_commands();
@@ -13707,6 +14357,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.take_commands();
@@ -14249,6 +14900,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.retry_send("discord:pending:2:1");
@@ -14318,6 +14970,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.retry_send("discord:row-b");
@@ -14538,6 +15191,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Slack,
             conversation_id: "slack:C1".into(),
+            store_cursor: None,
         });
         snapshot.apply(AdapterEvent::Account {
             protocol: ProtocolId::Slack,
@@ -14742,6 +15396,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Slack,
             conversation_id: "slack:C1".into(),
+            store_cursor: None,
         });
         link(&mut snapshot, ProtocolId::Slack);
         assert!(open_chats(&mut snapshot).is_empty(), "no reload");
@@ -15318,6 +15973,7 @@ mod tests {
         snapshot.apply(AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::Slack,
             conversation_id: "slack:C1".into(),
+            store_cursor: None,
         });
         assert_eq!(snapshot.status_line(), "Telegram connection lost.");
         assert!(!snapshot.status_line_loads(), "a failure is not busy");
@@ -15482,6 +16138,7 @@ mod tests {
                 topic: None,
                 links: Vec::new(),
                 photo: None,
+                audio: None,
             },
         });
         snapshot.retry_send("slack:C1:m1");
@@ -15530,6 +16187,569 @@ mod tests {
             .find(|row| row.caps.id == ProtocolId::Discord)
             .expect("discord stays in the catalog");
         assert_eq!(discord.state, AccountState::Unlinked);
+    }
+
+    fn signal_chat(id: &str) -> Conversation {
+        Conversation {
+            protocol: ProtocolId::Signal,
+            id: id.into(),
+            title: "Ada".into(),
+            participant: "Ada".into(),
+            preview: String::new(),
+            unread: 0,
+            order: 1,
+            last_at: 0,
+            is_group: false,
+            writable: true,
+            placeholder: false,
+            muted: false,
+            has_topics: false,
+            avatar: Default::default(),
+        }
+    }
+
+    fn signal_row(chat: &str, millis: i64, body: &str) -> ChatMessage {
+        ChatMessage {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            id: format!("{millis}:ada"),
+            sender: "Ada".into(),
+            body: body.into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: millis,
+            arrival: thinwire_protocol::Arrival::History,
+            topic: None,
+            links: Vec::new(),
+            photo: None,
+            audio: None,
+        }
+    }
+
+    fn linked_signal_chat() -> (Snapshot, &'static str) {
+        let mut snapshot = Snapshot::new();
+        show_protocol(&mut snapshot, ProtocolId::Signal);
+        show_only(&mut snapshot, &[ProtocolId::Signal]);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        let chat = "signal-chat";
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: signal_chat(chat),
+        });
+        snapshot.select_conversation(chat.to_string());
+        snapshot.take_commands();
+        (snapshot, chat)
+    }
+
+    fn older_store_cursors(snapshot: &mut Snapshot) -> Vec<Option<u64>> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::LoadOlderMessages { store_cursor, .. } => Some(store_cursor),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unreadable_lines_name_the_count_without_a_fault_word() {
+        assert_eq!(
+            unreadable_messages_line(0),
+            "Some messages here could not be read. They were not deleted."
+        );
+        assert_eq!(
+            unreadable_messages_line(1),
+            "1 message here could not be read. It was not deleted."
+        );
+        assert_eq!(
+            unreadable_messages_line(300),
+            "300 messages here could not be read. They were not deleted."
+        );
+        for count in [0, 1, 2, 300] {
+            let line = unreadable_messages_line(count).to_lowercase();
+            assert!(!line.contains("corrupt"), "{line}");
+            assert!(!line.contains("error"), "{line}");
+            assert!(!line.contains("failed"), "{line}");
+        }
+    }
+
+    #[test]
+    fn three_hundred_unreadable_rows_show_one_marker_and_the_good_rows() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 5_000,
+                skipped: 208,
+                resume: true,
+                runs: Vec::new(),
+            }),
+        });
+        assert_eq!(snapshot.older_state(), OlderState::Loading);
+        assert!(snapshot.unreadable_runs().is_empty(), "the run stays open");
+        assert_eq!(older_store_cursors(&mut snapshot), vec![Some(5_000)]);
+        for n in 1..=5 {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: signal_row(chat, 1_000 + n, &format!("good-{n}")),
+            });
+        }
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "5000".into(),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 1_000,
+                skipped: 92,
+                resume: false,
+                runs: Vec::new(),
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].skipped, 300);
+        assert_eq!(runs[0].before_id, None, "the run is the newest content");
+        assert_eq!(snapshot.selected_messages().len(), 5);
+        assert_eq!(snapshot.selected_messages()[0].body, "good-1");
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+        assert!(older_store_cursors(&mut snapshot).is_empty());
+    }
+
+    #[test]
+    fn an_empty_page_of_208_unreadable_rows_loads_the_good_rows() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 4_000,
+                skipped: 208,
+                resume: true,
+                runs: Vec::new(),
+            }),
+        });
+        assert_eq!(older_store_cursors(&mut snapshot), vec![Some(4_000)]);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 100, "kept"),
+        });
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "4000".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 50,
+                skipped: 0,
+                resume: false,
+                runs: Vec::new(),
+            }),
+        });
+        assert_eq!(snapshot.unreadable_runs().len(), 1);
+        assert_eq!(snapshot.unreadable_runs()[0].skipped, 208);
+        assert_eq!(snapshot.selected_messages()[0].body, "kept");
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+    }
+
+    #[test]
+    fn an_all_skipped_page_loads_the_next_page_without_a_marker() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 9_000, "on screen"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.load_older();
+        assert_eq!(older_store_cursors(&mut snapshot), vec![None]);
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 3_000,
+                skipped: 208,
+                resume: true,
+                runs: Vec::new(),
+            }),
+        });
+        assert!(snapshot.unreadable_runs().is_empty());
+        assert_eq!(snapshot.older_state(), OlderState::Loading);
+        assert_eq!(older_store_cursors(&mut snapshot), vec![Some(3_000)]);
+        for n in 1..=3 {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: signal_row(chat, n, &format!("old-{n}")),
+            });
+        }
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 1,
+                skipped: 92,
+                resume: false,
+                runs: Vec::new(),
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].skipped, 300);
+        assert_eq!(runs[0].before_id.as_deref(), Some("9000:ada"));
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+        assert_eq!(snapshot.selected_messages().len(), 4);
+    }
+
+    #[test]
+    fn one_unreadable_row_uses_the_singular_line() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 5_000, "newer"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.load_older();
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 4_000, "older"),
+        });
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "5000:ada".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 3_000,
+                skipped: 1,
+                resume: false,
+                runs: Vec::new(),
+            }),
+        });
+        assert_eq!(snapshot.unreadable_runs()[0].skipped, 1);
+        assert_eq!(
+            snapshot.unreadable_runs()[0].before_id.as_deref(),
+            Some("5000:ada")
+        );
+        assert_eq!(
+            unreadable_messages_line(1),
+            "1 message here could not be read. It was not deleted."
+        );
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+    }
+
+    #[test]
+    fn a_store_cursor_that_does_not_move_is_not_asked_again() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 100,
+                skipped: 10,
+                resume: true,
+                runs: Vec::new(),
+            }),
+        });
+        assert_eq!(older_store_cursors(&mut snapshot), vec![Some(100)]);
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "100".into(),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 100,
+                skipped: 10,
+                resume: true,
+                runs: Vec::new(),
+            }),
+        });
+        assert!(older_store_cursors(&mut snapshot).is_empty());
+        assert_eq!(snapshot.unreadable_runs()[0].skipped, 20);
+        assert_ne!(snapshot.older_state(), OlderState::Loading);
+    }
+
+    #[test]
+    fn a_failed_store_cursor_continuation_is_asked_again() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 9_000, "on screen"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.load_older();
+        assert_eq!(older_store_cursors(&mut snapshot), vec![None]);
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 3_000,
+                skipped: 208,
+                resume: true,
+                runs: Vec::new(),
+            }),
+        });
+        assert_eq!(older_store_cursors(&mut snapshot), vec![Some(3_000)]);
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: true,
+            note: Some("the store read failed".into()),
+            topic: None,
+            store_cursor: None,
+        });
+        assert!(
+            snapshot.unreadable_runs().is_empty(),
+            "a failed continuation does not close the run"
+        );
+        snapshot.load_older_at(Instant::now() + OLDER_RETRY_DELAY + Duration::from_secs(1));
+        assert_eq!(
+            older_store_cursors(&mut snapshot),
+            vec![Some(3_000)],
+            "the retry sends the same store cursor"
+        );
+    }
+
+    #[test]
+    fn unreadable_runs_sit_between_the_readable_rows() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 9_000, "anchor"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        for (millis, body) in [(8_000, "newer"), (6_000, "middle"), (4_000, "older")] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: signal_row(chat, millis, body),
+            });
+        }
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 3_000,
+                skipped: 3,
+                resume: false,
+                runs: vec![
+                    thinwire_protocol::HistorySkipRun {
+                        after_id: Some("8000:ada".into()),
+                        skipped: 1,
+                    },
+                    thinwire_protocol::HistorySkipRun {
+                        after_id: Some("6000:ada".into()),
+                        skipped: 2,
+                    },
+                ],
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].before_id.as_deref(), Some("8000:ada"));
+        assert_eq!(runs[0].skipped, 1);
+        assert_eq!(runs[1].before_id.as_deref(), Some("6000:ada"));
+        assert_eq!(runs[1].skipped, 2);
+        assert!(
+            runs.iter()
+                .all(|run| run.before_id.as_deref() != Some("9000:ada")),
+            "the runs do not collapse onto the request anchor"
+        );
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+    }
+
+    #[test]
+    fn an_oldest_unreadable_run_stays_when_the_store_ends() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 8_000, "oldest readable"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "8000:ada".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 1_000,
+                skipped: 3,
+                resume: false,
+                runs: vec![thinwire_protocol::HistorySkipRun {
+                    after_id: Some("8000:ada".into()),
+                    skipped: 3,
+                }],
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 1, "the oldest run is still drawn");
+        assert_eq!(runs[0].skipped, 3);
+        assert_eq!(runs[0].before_id.as_deref(), Some("8000:ada"));
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+    }
+
+    #[test]
+    fn a_run_across_a_page_edge_is_one_line() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 9_000, "anchor"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 8_000, "page edge"),
+        });
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: None,
+        });
+        assert!(
+            snapshot.unreadable_runs().is_empty(),
+            "the trailing part of the run is not drawn on this page"
+        );
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 5_000, "older"),
+        });
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "8000:ada".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 4_000,
+                skipped: 4,
+                resume: false,
+                runs: vec![thinwire_protocol::HistorySkipRun {
+                    after_id: None,
+                    skipped: 4,
+                }],
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].skipped, 4, "the whole run is counted once");
+        assert_eq!(runs[0].before_id.as_deref(), Some("8000:ada"));
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+    }
+
+    #[test]
+    fn a_run_for_an_unknown_message_joins_the_oldest_line() {
+        let (mut snapshot, chat) = linked_signal_chat();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 8_000, "newer"),
+        });
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: signal_row(chat, 6_000, "oldest"),
+        });
+        snapshot.apply(AdapterEvent::HistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            store_cursor: None,
+        });
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: chat.into(),
+            before_message_id: "9000:ada".into(),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: Some(HistoryStoreCursor {
+                before_ms: 1,
+                skipped: 5,
+                resume: false,
+                runs: vec![
+                    thinwire_protocol::HistorySkipRun {
+                        after_id: Some("8000:ada".into()),
+                        skipped: 2,
+                    },
+                    thinwire_protocol::HistorySkipRun {
+                        after_id: Some("missing".into()),
+                        skipped: 3,
+                    },
+                ],
+            }),
+        });
+        let runs = snapshot.unreadable_runs();
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs.iter()
+                .all(|run| run.before_id.as_deref() != Some("missing")),
+            "an unknown id is not a draw position"
+        );
+        assert_eq!(
+            runs.iter()
+                .find(|run| run.before_id.as_deref() == Some("6000:ada"))
+                .map(|run| run.skipped),
+            Some(3),
+            "the unknown count joins the oldest message"
+        );
+        assert_eq!(
+            runs.iter()
+                .find(|run| run.before_id.as_deref() == Some("8000:ada"))
+                .map(|run| run.skipped),
+            Some(2)
+        );
+        assert_eq!(
+            runs.iter().map(|run| run.skipped).sum::<u32>(),
+            5,
+            "the count is not dropped"
+        );
     }
 
     // endregion: #135
