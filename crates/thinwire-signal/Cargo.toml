@@ -51,7 +51,7 @@ presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "
 libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
-rusqlite = { version = "0.38", optional = true, default-features = false, features = [
+rusqlite = { version = "0.41", optional = true, default-features = false, features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
 thinwire-core = { workspace = true, optional = true }
