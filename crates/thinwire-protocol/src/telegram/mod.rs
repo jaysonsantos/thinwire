@@ -303,6 +303,7 @@ impl ProtocolAdapter for TelegramAdapter {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
                 before_message_id,
+                store_cursor: _,
             } => {
                 let owned = inbox::parse_message_id(&before_message_id)
                     .is_some_and(|(chat_id, _)| inbox::conversation_id(chat_id) == conversation_id);
@@ -1387,6 +1388,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
                 before_message_id: "telegram:2:50".into(),
+                store_cursor: None,
             },
             &tx,
         );
@@ -1405,6 +1407,7 @@ mod tests {
                 more: false,
                 note: None,
                 topic: None,
+                store_cursor: None,
             }
         );
         let valid = adapter.handle(
@@ -1412,6 +1415,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
                 before_message_id: "telegram:1:50".into(),
+                store_cursor: None,
             },
             &tx,
         );
@@ -1435,6 +1439,7 @@ mod tests {
                 protocol: ProtocolId::Telegram,
                 conversation_id: "telegram:1".into(),
                 before_message_id: "telegram:1:50".into(),
+                store_cursor: None,
             }
         );
         assert!(debug.contains("telegram:1:50"), "ids only, no secret");
