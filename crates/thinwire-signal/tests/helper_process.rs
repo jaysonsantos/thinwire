@@ -237,6 +237,7 @@ async fn the_app_talks_to_the_helper_process() {
         protocol: PROTOCOL,
         conversation_id: CHAT.into(),
         before_message_id: "m-1".into(),
+        store_cursor: None,
     });
     app.until("OlderHistoryLoaded", |event| {
         matches!(

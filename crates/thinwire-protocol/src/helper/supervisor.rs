@@ -669,6 +669,7 @@ impl Supervisor {
             WireCommand::LoadOlderMessages {
                 conversation_id,
                 before_message_id,
+                store_cursor: _,
             } => emit_older_history_loaded(
                 events,
                 protocol,
