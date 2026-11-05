@@ -55,6 +55,7 @@ Product lock change (2026-09-23): WhatsApp, Discord, and Slack run in parallel w
 
 - [ ] #34 — WhatsApp experimental linked-device inbox (feature `whatsapp-web`, `0001`). The AGPL client runs in the WhatsApp helper program (`0013`, #246). Release builds turn it on. Honest ToS labels. Full-screen ToS/ban gate before QR or pair. Never call it reliable.
 - [ ] #36 — Slack workspace-app OAuth inbox (feature `slack-oauth`, `0008`). Official OAuth v2 only. Not a personal desktop clone.
+- [ ] #477 — play Slack voice clips and audio files. It needs the `files:read` scope, so each workspace must install the app again. Telegram, WhatsApp, Signal, and Discord audio is on `main` (85d6657).
 
 ### AGPL helpers (`0013`)
 
