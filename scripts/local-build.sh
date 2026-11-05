@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Local build for macOS with every protocol on and the Keychain read through
-# the `security` command. Run it from a checkout, inside `nix develop`:
+# Local build with every protocol on. On macOS it also reads the Keychain
+# through the `security` command. On Linux the secrets go through the native
+# keyring, as in a release. Run it from a checkout, inside `nix develop`:
 #
 #   nix develop --command scripts/local-build.sh             # debug build
 #   nix develop --command scripts/local-build.sh --release   # extra arguments go to cargo build
 #
 # It builds the app and both helper programs, each in its own cargo run, as
 # `os-zips.yml` does for a release. The app finds a helper beside its own
-# binary, and all three land in `target/<profile>/`. Each run turns on the
-# Keychain feature of `thinwire-core`, so the helpers read their store keys
-# through `security` too.
+# binary, and all three land in `target/<profile>/`. On macOS each run turns on
+# the Keychain feature of `thinwire-core`, so the helpers read their store
+# keys through `security` too.
 #
 # Do not merge the three into one run. Cargo unifies features across one run,
 # so `telegram-tdlib` would reach the helpers: they would link TDLib, and the
@@ -45,14 +46,29 @@ under_ci() {
   [[ -n "$value" && "$value" != "0" && "$value" != "false" ]]
 }
 
-[[ "$(uname -s)" == "Darwin" ]] || die "macOS only: the Keychain store runs /usr/bin/security"
 if under_ci CI || under_ci GITHUB_ACTIONS; then
   die "local builds only: do not run this in CI or for a release"
 fi
 
-# The app forwards this feature to `thinwire-core`. A helper has no such
-# feature of its own, so it names the one of `thinwire-core` directly.
-keychain=thinwire-core/keychain-security-cli
+case "$(uname -s)" in
+  Darwin)
+    # The app forwards this feature to `thinwire-core`. A helper has no such
+    # feature of its own, so it names the one of `thinwire-core` directly.
+    app_features="all-protocols,keychain-security-cli"
+    helper_features=",thinwire-core/keychain-security-cli"
+    store="the security command store"
+    ;;
+  Linux)
+    # `keychain-security-cli` reads the macOS Keychain. Linux keeps the
+    # native keyring (Secret Service, or the kernel keyring).
+    app_features="all-protocols"
+    helper_features=""
+    store="the native keyring"
+    ;;
+  *)
+    die "macOS and Linux only"
+    ;;
+esac
 
 if [[ -z "${TELEGRAM_API_ID:-}" || -z "${TELEGRAM_API_HASH:-}" ]]; then
   echo "note: TELEGRAM_API_ID or TELEGRAM_API_HASH is not set." >&2
@@ -60,13 +76,13 @@ if [[ -z "${TELEGRAM_API_ID:-}" || -z "${TELEGRAM_API_HASH:-}" ]]; then
 fi
 
 cargo build -p thinwire \
-  --features "all-protocols,keychain-security-cli" \
+  --features "$app_features" \
   --bin thinwire "$@"
 cargo build -p thinwire-whatsapp \
-  --features "whatsapp-web,$keychain" \
+  --features "whatsapp-web$helper_features" \
   --bin thinwire-whatsapp-helper "$@"
 cargo build -p thinwire-signal \
-  --features "signal-local,$keychain" \
+  --features "signal-local$helper_features" \
   --bin thinwire-signal-helper "$@"
 
 profile="debug"
@@ -74,7 +90,7 @@ for arg in "$@"; do
   [[ "$arg" == "--release" ]] && profile="release"
 done
 echo
-echo "Built with every protocol and the security command store."
+echo "Built with every protocol and $store."
 echo "Run it with: target/${profile}/thinwire"
 echo "The helpers are beside it, where the app looks for them."
 echo "(A custom --profile builds into target/<profile>/.)"
