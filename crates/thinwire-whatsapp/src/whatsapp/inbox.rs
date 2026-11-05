@@ -633,6 +633,37 @@ impl Inbox {
         removed
     }
 
+    /// The newest chats of the inbox, newest first, at most `limit`.
+    pub(super) fn recent_chats(&self, limit: usize) -> Vec<String> {
+        let mut chats: Vec<(&String, i64)> = self
+            .chats
+            .iter()
+            .filter(|(jid, _)| is_inbox_chat(jid))
+            .map(|(jid, record)| (jid, record.timestamp))
+            .collect();
+        chats.sort_by_key(|(_, timestamp)| std::cmp::Reverse(*timestamp));
+        chats
+            .into_iter()
+            .take(limit)
+            .map(|(jid, _)| jid.clone())
+            .collect()
+    }
+
+    /// The subject of a group from the server. A known chat gets it and
+    /// comes again. A group with no chat here is not added.
+    pub(super) fn set_group_name(&mut self, jid: &str, name: &str) -> Option<AdapterEvent> {
+        let name = name.trim();
+        if !is_group(jid) || name.is_empty() {
+            return None;
+        }
+        let record = self.chats.get_mut(jid)?;
+        if record.name.as_deref() == Some(name) {
+            return None;
+        }
+        record.name = Some(name.to_string());
+        self.upsert_event(jid)
+    }
+
     /// The audio of the message with the handle `file_id`, while the
     /// message is in the cache.
     pub(super) fn voice_media(&self, file_id: i32) -> Option<MediaRef> {
@@ -1398,7 +1429,7 @@ pub(super) mod tests {
     }
 
     /// A 1x1 PNG.
-    const PIXEL_PNG: [u8; 67] = [
+    pub(in crate::whatsapp) const PIXEL_PNG: [u8; 67] = [
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
         0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
         0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,

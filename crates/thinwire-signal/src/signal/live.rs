@@ -1867,6 +1867,7 @@ async fn run_linked(
                 return LinkedEnd::Stopped;
             }
         };
+    start_avatar_fetches(&manager, &session, token, &events);
     let mut names = contact_names(&manager).await;
     emit_status(
         &events,
@@ -3850,6 +3851,67 @@ async fn wait_backoff(session: &Session, token: u64, delay: std::time::Duration)
         tokio::time::sleep(slice).await;
     }
     false
+}
+
+/// Contact pictures that one linked run fetches.
+const AVATAR_CHATS: usize = 50;
+
+/// Fetch the profile pictures of the first contacts of the inbox, one at a
+/// time. Presage keeps a fetched picture in the store, so the next run
+/// reads it from disk. Each picture comes as `ChatAvatar` for its chat.
+fn start_avatar_fetches(
+    manager: &Manager<SqliteStore, Registered>,
+    session: &Arc<Session>,
+    token: u64,
+    events: &EventTx,
+) {
+    use presage::libsignal_service::zkgroup::profiles::ProfileKey;
+    let manager = manager.clone();
+    let session = Arc::clone(session);
+    let events = events.clone();
+    tokio::spawn(async move {
+        let Ok(contacts) = manager.store().contacts().await else {
+            return;
+        };
+        let mut picked: Vec<(u32, Uuid, [u8; 32])> = contacts
+            .flatten()
+            .filter_map(|contact| {
+                let key = <[u8; 32]>::try_from(contact.profile_key.as_slice()).ok()?;
+                Some((contact.inbox_position, contact.uuid, key))
+            })
+            .collect();
+        picked.sort_by_key(|(position, _, _)| *position);
+        for (_, uuid, key) in picked.into_iter().take(AVATAR_CHATS) {
+            if !session.is_current(token) {
+                return;
+            }
+            let _permit = Arc::clone(&session.downloads).acquire_owned().await.ok();
+            let mut lookup = manager.clone();
+            let Ok(Some(bytes)) = lookup
+                .retrieve_profile_avatar_by_uuid(uuid, ProfileKey::create(key))
+                .await
+            else {
+                continue;
+            };
+            let small = tokio::task::spawn_blocking(move || {
+                thinwire_protocol::photo_resize::avatar_from_bytes(&bytes)
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(small) = small else {
+                continue;
+            };
+            if !session.is_current(token) {
+                return;
+            }
+            let _ = events.send(AdapterEvent::ChatAvatar {
+                protocol: ProtocolId::Signal,
+                conversation_id: uuid.to_string(),
+                bytes: thinwire_protocol::ImageBytes::new(small),
+            });
+        }
+    });
 }
 
 /// Start the photo downloads that wait for `conversation_id`. Each photo

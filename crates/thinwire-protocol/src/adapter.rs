@@ -888,6 +888,13 @@ pub enum AdapterEvent {
         protocol: ProtocolId,
         file_id: i32,
     },
+    /// The small picture of a chat, as image bytes: a contact or a group
+    /// picture. It changes only the picture of that row.
+    ChatAvatar {
+        protocol: ProtocolId,
+        conversation_id: String,
+        bytes: crate::media::ImageBytes,
+    },
     /// The video `file_id` is a local file now.
     VideoReady {
         protocol: ProtocolId,
@@ -1070,6 +1077,7 @@ impl AdapterEvent {
             | Self::VoiceFailed { protocol, .. }
             | Self::VideoReady { protocol, .. }
             | Self::VideoFailed { protocol, .. }
+            | Self::ChatAvatar { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }
@@ -1146,6 +1154,7 @@ impl AdapterEvent {
             | Self::VoiceFailed { protocol, .. }
             | Self::VideoReady { protocol, .. }
             | Self::VideoFailed { protocol, .. }
+            | Self::ChatAvatar { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
             | Self::SendAccepted { protocol, .. }
             | Self::SendRejected { protocol, .. }

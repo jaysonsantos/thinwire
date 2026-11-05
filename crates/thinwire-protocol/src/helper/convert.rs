@@ -372,6 +372,21 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
             protocol: seen,
             file_id,
         } if own(seen) => WireEvent::VoiceFailed { file_id },
+        // A picture that does not fit one line does not cross.
+        AdapterEvent::ChatAvatar {
+            protocol: seen,
+            conversation_id,
+            bytes,
+        } if own(seen) && !bytes.is_empty() && bytes.as_slice().len() <= WirePhoto::MAX_BYTES => {
+            WireEvent::Avatar {
+                conversation_id,
+                photo: WirePhoto {
+                    width: 0,
+                    height: 0,
+                    bytes: bytes.as_slice().to_vec(),
+                },
+            }
+        }
         AdapterEvent::ChatListLoaded { protocol: seen } if own(seen) => WireEvent::ChatListLoaded,
         AdapterEvent::HistoryLoaded {
             protocol: seen,
@@ -559,6 +574,19 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
             }
         }
         WireEvent::VoiceFailed { file_id } => AdapterEvent::VoiceFailed { protocol, file_id },
+        WireEvent::Avatar {
+            conversation_id,
+            photo,
+        } => {
+            if photo.bytes.is_empty() {
+                return None;
+            }
+            AdapterEvent::ChatAvatar {
+                protocol,
+                conversation_id,
+                bytes: ImageBytes::new(photo.bytes),
+            }
+        }
     })
 }
 
@@ -907,6 +935,34 @@ mod tests {
             event_from_wire(ProtocolId::Signal, relative),
             Some(AdapterEvent::VoiceFailed { file_id: 9, .. })
         ));
+    }
+
+    /// A chat picture crosses as image bytes and comes back for its chat.
+    /// An empty picture does not cross.
+    #[test]
+    fn a_chat_picture_crosses_the_pipe() {
+        let event = AdapterEvent::ChatAvatar {
+            protocol: ProtocolId::Signal,
+            conversation_id: "signal:1".into(),
+            bytes: ImageBytes::new(vec![0xFF, 0xD8, 1]),
+        };
+        let wire = event_to_wire(ProtocolId::Signal, event).expect("crosses");
+        let Some(AdapterEvent::ChatAvatar {
+            conversation_id,
+            bytes,
+            ..
+        }) = event_from_wire(ProtocolId::Signal, wire)
+        else {
+            panic!("a chat picture");
+        };
+        assert_eq!(conversation_id, "signal:1");
+        assert_eq!(bytes.as_slice(), [0xFF, 0xD8, 1]);
+        let empty = AdapterEvent::ChatAvatar {
+            protocol: ProtocolId::Signal,
+            conversation_id: "signal:1".into(),
+            bytes: ImageBytes::new(Vec::new()),
+        };
+        assert!(event_to_wire(ProtocolId::Signal, empty).is_none());
     }
 
     /// A sticker image crosses the pipe with its size and its bytes. An

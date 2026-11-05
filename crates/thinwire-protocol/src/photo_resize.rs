@@ -72,6 +72,28 @@ pub fn photo_from_bytes(bytes: &[u8]) -> Option<MessagePhoto> {
     None
 }
 
+/// The longest side of a chat picture, in pixels.
+const AVATAR_SIDE: u32 = 128;
+
+/// A small JPEG chat picture from a downloaded image. `None` when the
+/// bytes are not an image.
+#[must_use]
+pub fn avatar_from_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(DECODE_MAX_SIDE);
+    limits.max_image_height = Some(DECODE_MAX_SIDE);
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    let image = reader.decode().ok()?;
+    let small = image.thumbnail(AVATAR_SIDE, AVATAR_SIDE).to_rgb8();
+    let mut out = Vec::new();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80);
+    small.write_with_encoder(encoder).ok()?;
+    Some(out)
+}
+
 /// A photo of one size with its bytes.
 #[must_use]
 pub fn photo(width: u32, height: u32, bytes: Vec<u8>) -> MessagePhoto {
@@ -118,6 +140,15 @@ mod tests {
         let shown = photo.sizes[0].bytes.as_ref().expect("bytes");
         assert_eq!(shown.as_slice(), bytes.as_slice());
         assert!(photo_from_bytes(b"not an image").is_none());
+    }
+
+    #[test]
+    fn a_chat_picture_is_a_small_jpeg() {
+        let small = avatar_from_bytes(&png(400, 200)).expect("a picture");
+        assert!(small.starts_with(&[0xFF, 0xD8]));
+        let image = image::load_from_memory(&small).expect("decodes");
+        assert_eq!((image.width(), image.height()), (128, 64));
+        assert!(avatar_from_bytes(b"not an image").is_none());
     }
 
     /// A large photo becomes a JPEG that fits the pipe, with its long side

@@ -1510,6 +1510,20 @@ impl Snapshot {
                 path,
             } => self.video_ready(protocol, file_id, path),
             AdapterEvent::VideoFailed { protocol, file_id } => self.video_failed(protocol, file_id),
+            AdapterEvent::ChatAvatar {
+                protocol,
+                conversation_id,
+                bytes,
+            } => {
+                if let Some(row) = self
+                    .conversations
+                    .get_mut(&protocol)
+                    .and_then(|rows| rows.iter_mut().find(|row| row.id == conversation_id))
+                {
+                    row.avatar.bytes = Some(bytes);
+                    row.avatar.failed = false;
+                }
+            }
             AdapterEvent::MessagesRemoved {
                 protocol,
                 conversation_id,
@@ -8424,6 +8438,40 @@ mod tests {
         });
         snapshot.load_photo(ProtocolId::Telegram, chat, id, 7);
         assert_eq!(downloads(&snapshot.take_commands()), 1);
+    }
+
+    /// A chat picture sets the picture of its row only. A later update of
+    /// the row with no picture keeps it.
+    #[test]
+    fn a_chat_picture_stays_on_its_row() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(1, "Ada", 1),
+        });
+        snapshot.apply(AdapterEvent::ChatAvatar {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            bytes: thinwire_protocol::ImageBytes::new(vec![1, 2, 3]),
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(1, "Ada Park", 2),
+        });
+        let row = snapshot.conversations[&ProtocolId::Telegram]
+            .iter()
+            .find(|row| row.id == "telegram:1")
+            .expect("row");
+        assert_eq!(row.title, "Ada Park");
+        assert_eq!(
+            row.avatar
+                .bytes
+                .as_ref()
+                .map(thinwire_protocol::ImageBytes::as_slice),
+            Some([1, 2, 3].as_slice())
+        );
     }
 
     /// Play on a clip with no file asks for its download once. The path

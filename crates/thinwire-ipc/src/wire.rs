@@ -19,9 +19,9 @@ use crate::SecretText;
 /// `history_loaded`, and `older_history_loaded`. `runs` on that cursor names
 /// the shown message each unreadable stretch sits older than. Version 4
 /// adds [`WireMessage::audio`], [`WireCommand::DownloadVoice`],
-/// [`WireEvent::VoiceReady`], and [`WireEvent::VoiceFailed`]. An older peer
-/// cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// [`WireEvent::VoiceReady`], and [`WireEvent::VoiceFailed`]. Version 5 adds
+/// [`WireEvent::Avatar`]. An older peer cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// One unreadable stretch on a history page.
 ///
@@ -491,6 +491,11 @@ pub enum WireEvent {
     VoiceFailed {
         file_id: i32,
     },
+    /// The small picture of the chat `conversation_id`.
+    Avatar {
+        conversation_id: String,
+        photo: WirePhoto,
+    },
 }
 
 /// Why the helper could not use the session key.
@@ -530,6 +535,7 @@ impl WireEvent {
             Self::StoreAccess { .. } => "store_access",
             Self::VoiceReady { .. } => "voice_ready",
             Self::VoiceFailed { .. } => "voice_failed",
+            Self::Avatar { .. } => "avatar",
         }
     }
 }

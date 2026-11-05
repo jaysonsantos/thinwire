@@ -27,7 +27,9 @@ use super::path::{
     prepare_session_dir, remove_device_store, restrict_store_file, revoked_marker,
     whatsapp_device_store_path,
 };
-use super::session::{DownloadFuture, LinkEvent, SendFailure, SendFuture, WhatsAppSender};
+use super::session::{
+    DownloadFuture, LinkEvent, NamesFuture, SendFailure, SendFuture, WhatsAppSender,
+};
 use thinwire_protocol::RedactedPairingSecret;
 
 /// whatsapp-rust client work for the link owner. No state of its own.
@@ -521,7 +523,68 @@ struct LiveSender {
     client: Arc<Client>,
 }
 
+/// The largest profile picture the helper reads. A preview is far less.
+const PICTURE_MAX_BYTES: usize = 1024 * 1024;
+
 impl WhatsAppSender for LiveSender {
+    fn group_names(&self) -> NamesFuture<'_> {
+        Box::pin(async move {
+            // The error can name a group. It stays out of the log.
+            let groups = self
+                .client
+                .groups()
+                .list_participating()
+                .await
+                .map_err(|_| ())?;
+            Ok(groups
+                .into_iter()
+                .filter_map(|group| {
+                    let subject = group.subject?.trim().to_string();
+                    (!subject.is_empty()).then(|| (group.id.to_string(), subject))
+                })
+                .collect())
+        })
+    }
+
+    fn profile_picture<'a>(&'a self, jid: &'a str) -> DownloadFuture<'a> {
+        use whatsapp_rust::wacore::iq::contacts::ProfilePictureLookup;
+        use whatsapp_rust::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
+        Box::pin(async move {
+            let jid: Jid = jid.parse().map_err(|_| ())?;
+            let target = if jid.to_string().ends_with("@g.us") {
+                ProfilePictureTarget::Group(&jid)
+            } else {
+                ProfilePictureTarget::Contact(&jid)
+            };
+            let lookup = self
+                .client
+                .pictures()
+                .lookup(ProfilePictureRequest::new(
+                    target,
+                    ProfilePictureType::Preview,
+                ))
+                .await
+                .map_err(|_| ())?;
+            let ProfilePictureLookup::Found(picture) = lookup else {
+                return Err(());
+            };
+            // The URL holds a signed token. It stays out of the log.
+            let response = self
+                .client
+                .http_client()
+                .execute(whatsapp_rust::wacore::net::HttpRequest::get(picture.url))
+                .await
+                .map_err(|_| ())?;
+            if !(200..300).contains(&response.status_code)
+                || response.body.is_empty()
+                || response.body.len() > PICTURE_MAX_BYTES
+            {
+                return Err(());
+            }
+            Ok(response.body)
+        })
+    }
+
     fn send_text<'a>(&'a self, chat_jid: &'a str, body: &'a str) -> SendFuture<'a> {
         Box::pin(async move {
             let jid: Jid = chat_jid.parse().map_err(|_| SendFailure::Rejected)?;

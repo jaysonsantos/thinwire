@@ -81,7 +81,29 @@ pub(super) trait WhatsAppSender: Send + Sync {
     fn download<'a>(&'a self, _media: &'a MediaRef) -> DownloadFuture<'a> {
         Box::pin(async { Err(()) })
     }
+
+    /// The subject of each group of the account, as `(jid, subject)`.
+    fn group_names(&self) -> NamesFuture<'_> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// The small profile picture of a contact or a group, as image bytes.
+    /// `Err` when there is none, or when the privacy of the contact hides it.
+    fn profile_picture<'a>(&'a self, _jid: &'a str) -> DownloadFuture<'a> {
+        Box::pin(async { Err(()) })
+    }
 }
+
+/// Boxed group list. The error has no text.
+pub(super) type NamesFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, ()>> + Send + 'a>>;
+
+/// Chat pictures that one run fetches: the newest chats only. A lookup for
+/// every chat at each start is a load that WhatsApp can see.
+const AVATAR_CHATS: usize = 50;
+
+/// Picture lookups that run at one time.
+const AVATAR_LOOKUPS: usize = 2;
 
 /// Boxed media download. Resolves to the plain bytes. The error has no text.
 pub(super) type DownloadFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, ()>> + Send + 'a>>;
@@ -147,6 +169,8 @@ struct State {
     closed: bool,
     /// Limits the sticker downloads that run at one time.
     media_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// This link fetched its chat pictures. A reconnect does not again.
+    avatars_asked: bool,
 }
 
 /// The timer for the next timed mute end (#168 item 13).
@@ -259,6 +283,7 @@ impl Session {
         state.sender = None;
         state.stopped = None;
         state.generation = NO_LINK;
+        state.avatars_asked = false;
         let removed = state.inbox.clear();
         // Rows the shell never saw need no removal.
         if std::mem::take(&mut state.announced) {
@@ -446,6 +471,85 @@ impl Session {
         });
     }
 
+    /// After a connection: the group names, then the pictures of the
+    /// newest chats, one time for each link. A result of an old or a closed
+    /// link is dropped.
+    ///
+    /// A first pairing connects before its history sync. So a history sync
+    /// asks for the pictures too, when the link has not asked yet.
+    fn spawn_chat_details(&self, state: &mut State, names: bool, events: &EventTx) {
+        let (Some(sender), Ok(runtime)) =
+            (state.sender.clone(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let generation = state.generation;
+        let avatars = if state.avatars_asked || !state.connected {
+            Vec::new()
+        } else {
+            state.inbox.recent_chats(AVATAR_CHATS)
+        };
+        if !avatars.is_empty() {
+            state.avatars_asked = true;
+        }
+        if !names && avatars.is_empty() {
+            return;
+        }
+        let session = self.clone();
+        let events = events.clone();
+        runtime.spawn(async move {
+            if names && let Ok(names) = sender.group_names().await {
+                session.finish_group_names(generation, names, &events);
+            }
+            let gate = Arc::new(tokio::sync::Semaphore::new(AVATAR_LOOKUPS));
+            let mut lookups = tokio::task::JoinSet::new();
+            for jid in avatars {
+                let sender = sender.clone();
+                let gate = gate.clone();
+                lookups.spawn(async move {
+                    let _permit = gate.acquire_owned().await.ok();
+                    let bytes = sender.profile_picture(&jid).await.ok()?;
+                    let small = tokio::task::spawn_blocking(move || {
+                        thinwire_protocol::photo_resize::avatar_from_bytes(&bytes)
+                    })
+                    .await
+                    .ok()
+                    .flatten()?;
+                    Some((jid, small))
+                });
+            }
+            while let Some(result) = lookups.join_next().await {
+                if let Ok(Some((jid, bytes))) = result {
+                    session.finish_avatar(generation, &jid, bytes, &events);
+                }
+            }
+        });
+    }
+
+    fn finish_group_names(&self, generation: u64, names: Vec<(String, String)>, events: &EventTx) {
+        let mut state = self.lock();
+        if state.closed || state.generation != generation {
+            return;
+        }
+        for (jid, name) in names {
+            if let Some(row) = state.inbox.set_group_name(&jid, &name) {
+                let _ = events.send(row);
+            }
+        }
+    }
+
+    fn finish_avatar(&self, generation: u64, jid: &str, bytes: Vec<u8>, events: &EventTx) {
+        let state = self.lock();
+        if state.closed || state.generation != generation || bytes.is_empty() {
+            return;
+        }
+        let _ = events.send(AdapterEvent::ChatAvatar {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: inbox::conversation_id(jid),
+            bytes: thinwire_protocol::ImageBytes::new(bytes),
+        });
+    }
+
     /// One download ended. A result of an old or a closed link is dropped.
     fn finish_media(
         &self,
@@ -481,6 +585,8 @@ impl Session {
             return;
         }
         let stop = event.stop_detail();
+        let connected_now = matches!(event, LinkEvent::Connected);
+        let history_now = matches!(event, LinkEvent::History { .. });
         let mute_may_change = matches!(event, LinkEvent::History { .. } | LinkEvent::Mute { .. });
         let out = match event {
             LinkEvent::Qr(code) => vec![AdapterEvent::WhatsAppQr {
@@ -562,6 +668,9 @@ impl Session {
         // A history sync does not download its photos: the chat asks when
         // it opens.
         self.spawn_media(&mut state, &out, false, events);
+        if connected_now || history_now {
+            self.spawn_chat_details(&mut state, connected_now, events);
+        }
         if let Some(detail) = stop {
             state.connected = false;
             state.stopped = Some(detail);
@@ -743,7 +852,7 @@ fn status(events: &EventTx, status: AdapterStatus, detail: &str) {
 pub(super) mod fake {
     use std::sync::Mutex;
 
-    use super::{DownloadFuture, MediaRef, SendFailure, SendFuture, WhatsAppSender};
+    use super::{DownloadFuture, MediaRef, NamesFuture, SendFailure, SendFuture, WhatsAppSender};
 
     /// Records sends. Returns `SRV<n>` ids, or the failure in `fail`. A
     /// download returns `media` when set, else it fails.
@@ -753,6 +862,10 @@ pub(super) mod fake {
         pub fail: Option<SendFailure>,
         pub media: Option<Vec<u8>>,
         pub downloads: Mutex<u32>,
+        /// The group subjects of `group_names`.
+        pub names: Vec<(String, String)>,
+        /// The bytes of each `profile_picture`. `None` has no picture.
+        pub picture: Option<Vec<u8>>,
     }
 
     impl WhatsAppSender for FakeSender {
@@ -773,6 +886,14 @@ pub(super) mod fake {
                 *self.downloads.lock().expect("fake lock") += 1;
                 self.media.clone().ok_or(())
             })
+        }
+
+        fn group_names(&self) -> NamesFuture<'_> {
+            Box::pin(async move { Ok(self.names.clone()) })
+        }
+
+        fn profile_picture<'a>(&'a self, _jid: &'a str) -> DownloadFuture<'a> {
+            Box::pin(async move { self.picture.clone().ok_or(()) })
         }
     }
 }
@@ -917,6 +1038,55 @@ mod tests {
             .expect("an answer");
         assert!(matches!(failed, Some(AdapterEvent::VoiceFailed { .. })));
         let _ = std::fs::remove_file(ready.as_path());
+    }
+
+    /// A connection asks for the group subjects and the chat pictures. A
+    /// group with no name gets its subject, and the chat gets a small JPEG
+    /// picture. A reconnect of the same link does not ask for the pictures
+    /// again.
+    #[tokio::test]
+    async fn a_connection_names_groups_and_fetches_chat_pictures() {
+        const GROUP: &str = "120363000000000001@g.us";
+        let (session, tx, mut rx) = linked();
+        let sender = Arc::new(fake::FakeSender {
+            names: vec![(GROUP.into(), "Lake trip".into())],
+            picture: Some(crate::whatsapp::inbox::tests::PIXEL_PNG.to_vec()),
+            ..Default::default()
+        });
+        assert!(session.attach_sender(1, sender.clone()));
+        session.apply(LinkEvent::Connected, 1, &tx);
+        session.apply(
+            LinkEvent::Messages(vec![message(GROUP, "g1", "hi all", 5)]),
+            1,
+            &tx,
+        );
+        session.apply(LinkEvent::Disconnected, 1, &tx);
+        session.apply(LinkEvent::Connected, 1, &tx);
+        let mut named = false;
+        let mut pictures = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !(named && pictures > 0) {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(AdapterEvent::ConversationUpsert { conversation }))
+                    if conversation.title == "Lake trip" =>
+                {
+                    named = true;
+                }
+                Ok(Some(AdapterEvent::ChatAvatar {
+                    bytes,
+                    conversation_id,
+                    ..
+                })) => {
+                    assert_eq!(conversation_id, inbox::conversation_id(GROUP));
+                    assert!(bytes.as_slice().starts_with(&[0xFF, 0xD8]), "a JPEG");
+                    pictures += 1;
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+        assert!(named, "the group got its subject");
+        assert_eq!(pictures, 1, "one picture for the one chat, one time");
     }
 
     /// #168 item 12: the session tells the inbox about each connection. A
