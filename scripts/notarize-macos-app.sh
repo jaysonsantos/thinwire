@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
-# Staple a Developer ID Thinwire.app, or check that a tar still has the ticket.
-# Notary auth is one App Store Connect API key. Run this file. Sourcing it
-# defines nothing, so the stage script cannot call these functions in-process.
-
-# `exit` would kill the shell that sourced the file. `return` stops before
-# any function exists, and the message tells that shell to run the file.
+# `exit` would kill the shell that sourced the file.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   echo "Run scripts/notarize-macos-app.sh. Do not source it." >&2
   return 1
@@ -376,14 +371,14 @@ notarize_and_staple() {
   local app="$1"
   local status=0 transport_retries=0 staple_attempt=0 staple_status=0
   local max_transport_retries=3
+  local max_staple_attempts=6
+  local staple_retry_seconds=10
   if [[ "$notary_credential_state" != "ready" || -z "$notary_work" || -n "${MACOS_NOTARY_KEY+x}" ]]; then
     echo "::error::notarization: credential is not ready."
     exit 1
   fi
   echo "notarization: key id ${notary_key_id} issuer ${notary_issuer}"
   ditto -c -k --keepParent "$app" "$notary_zip"
-  # A dropped upload is retried against the same zip. Invalid and Rejected
-  # are answers from Apple, so they stop the loop.
   while true; do
     status=0
     xcrun notarytool submit "$notary_zip" \
@@ -408,19 +403,18 @@ notarize_and_staple() {
     fi
   done
   rm -f "$notary_zip"
-  # The ticket is sometimes not fetchable in the first minute.
   staple_attempt=1
-  while [[ "$staple_attempt" -le 6 ]]; do
+  while [[ "$staple_attempt" -le "$max_staple_attempts" ]]; do
     staple_status=0
     xcrun stapler staple "$app" || staple_status=$?
     if [[ "$staple_status" -eq 0 ]]; then
       break
     fi
-    if [[ "$staple_attempt" -eq 6 ]]; then
+    if [[ "$staple_attempt" -eq "$max_staple_attempts" ]]; then
       echo "::error::notarization: the ticket was not stapled."
       exit 1
     fi
-    sleep 10
+    sleep "$staple_retry_seconds"
     staple_attempt=$((staple_attempt + 1))
   done
   assert_stapled "$app"

@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Run notarize-macos-app.sh against fake codesign, ditto, notarytool, and stapler.
-# Do not source the notarize script. Sourcing it must define nothing.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

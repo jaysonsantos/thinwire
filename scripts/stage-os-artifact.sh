@@ -3,9 +3,8 @@
 # actions/upload-artifact wraps downloads in an outer zip and stores loose
 # files as 644. The tar.gz is what keeps executable bits and the .app tree.
 # macOS: sign Thinwire.app with the identity in MACOS_SIGNING_P12 when that
-# variable is set. Developer ID uses a secure timestamp, then the notarize
-# script staples the ticket. An empty variable keeps the ad-hoc signature
-# and does not contact Apple. Linux and Windows: flat binaries plus notices.
+# variable is set. Developer ID uses a secure timestamp. An empty variable
+# keeps the ad-hoc signature. Linux and Windows: flat binaries plus notices.
 #
 # The payload has three programs (ADR 0013): the MIT app, and next to it
 # the AGPL-3.0-only WhatsApp helper and the AGPL-3.0-only Signal helper. The
@@ -539,8 +538,6 @@ import_macos_signing_identity() {
       sign_use_hardened_runtime=1
     fi
   else
-    # The string is not a hash or a name in this keychain. Signing it
-    # would write a signature the job cannot name.
     echo "::error::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
     log_parsed_identities
     exit 1
@@ -572,17 +569,12 @@ macho_file() {
 # Hardened runtime checks the Team ID of every library. A self-signed
 # identity has no Team ID, so dlopen of a bundled libtdjson fails.
 # --options runtime is only for Developer ID Application.
-# That identity also needs a secure timestamp. Notarization rejects
-# Timestamp=none, and a timestamp-server failure must not fall back.
 sign_with_identity() {
   local target="$1"
   local entitlements_from="${2:-$1}"
   local entitlements status missing
   local -a args
   if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
-    # An unstapled Developer ID app still needs Open Anyway. Stop before
-    # codesign writes those bytes. Emptiness only. The .p8 stays in the
-    # notarize process.
     missing=""
     if [[ -z "${MACOS_NOTARY_KEY:-}" ]]; then
       missing+=" MACOS_NOTARY_KEY"
@@ -657,8 +649,7 @@ sign_macos_app() {
   else
     echo "macOS signing: ad-hoc signature (MACOS_SIGNING_P12 is empty)"
     sign_nested_machos "$app" adhoc
-    # Ad-hoc signature for the whole bundle. The notification center needs
-    # it (#161). This path is not Developer ID, so the staple step skips it.
+    # Ad-hoc signature for the whole bundle. The notification center needs it (#161).
     codesign --force --sign - "$app"
   fi
   codesign --verify --strict --deep --verbose=2 "$app"

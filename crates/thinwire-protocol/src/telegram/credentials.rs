@@ -588,8 +588,6 @@ mod tests {
         );
     }
 
-    /// Developer ID without a notary key exits before notarytool.
-    /// An ad-hoc signature skips.
     #[cfg(unix)]
     #[test]
     fn notarize_macos_app_gates_on_the_credential_and_the_signature() {
