@@ -321,6 +321,11 @@ impl<B: LinkBackend> Owner<B> {
                 Msg::Client { generation, event } => self.client(generation, event).await,
                 Msg::Cancel => {
                     self.stop().await;
+                    // The pairing is over. A later gate acceptance resumes
+                    // a saved store again.
+                    self.last_phone = None;
+                    self.last_pairing = None;
+                    self.last_resume = false;
                 }
                 Msg::Shutdown { done } => {
                     // Confirm only a client that really stopped. With no
@@ -814,6 +819,21 @@ pub(super) mod tests {
         handle.resume();
         handle.flush().await;
         assert_eq!(fake.log(), vec!["resume 1"]);
+    }
+
+    /// A Cancel ends the pairing. The next gate acceptance resumes the
+    /// saved store again.
+    #[tokio::test]
+    async fn a_resume_after_a_cancel_opens_the_saved_store() {
+        let (fake, handle, _session, _rx) = owner(Fake::default());
+        handle.begin(None, 3);
+        handle.flush().await;
+        handle.cancel();
+        handle.flush().await;
+        handle.resume();
+        handle.flush().await;
+        assert_eq!(fake.log(), vec!["start 1", "stop 1", "resume 3"]);
+        assert!(handle.is_active());
     }
 
     /// No store, a revoked store, and a store with no paired device start no

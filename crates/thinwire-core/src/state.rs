@@ -5237,7 +5237,11 @@ impl Snapshot {
         {
             self.status_text = WHATSAPP_LINKED.into();
         }
-        if !self.whatsapp_started || self.whatsapp_screen != WhatsAppScreen::Pair {
+        // The pair screen closes on any link: the pairing the user started,
+        // or the saved session that opened after the gate. A Cancel on a
+        // pair screen that stays open would end that session. A reconnect
+        // does not close the risk gate: that is another screen.
+        if self.whatsapp_screen != WhatsAppScreen::Pair {
             return;
         }
         self.whatsapp_screen = WhatsAppScreen::Hidden;
@@ -6495,6 +6499,25 @@ mod tests {
             state: AccountState::Linked,
         });
         assert_eq!(snapshot.status_line(), WHATSAPP_LINKED);
+    }
+
+    /// The saved session opens after the gate, with no pairing. The pair
+    /// screen then closes, so its Cancel cannot end that session.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn a_saved_session_that_opens_after_the_gate_closes_the_pair_screen() {
+        let mut snapshot = Snapshot::new();
+        snapshot.open_whatsapp_risk_gate();
+        snapshot.acknowledge_whatsapp_risk();
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Pair);
+        assert!(!snapshot.whatsapp_started);
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        });
+        assert_eq!(snapshot.whatsapp_screen, WhatsAppScreen::Hidden);
+        assert_eq!(snapshot.status_line(), WHATSAPP_LINKED);
+        assert!(whatsapp_row(&snapshot).linked());
     }
 
     /// ADR 0013 decision 6: a missing helper keeps the account row, with
