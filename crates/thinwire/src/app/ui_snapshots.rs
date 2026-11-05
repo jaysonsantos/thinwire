@@ -61,7 +61,8 @@ fn draw(ui: &mut egui::Ui, state: &mut Scene) {
     }
     let mut out = Vec::new();
     let view = state.core.view();
-    ui::draw(ui, &view, &mut state.hints, &mut out);
+    let mut player = super::audio::Player::new();
+    ui::draw(ui, &view, &mut state.hints, &mut player, &mut out);
     state.photo_box_height = ui.data(|data| {
         data.get_temp(egui::Id::unique("thinwire-photo-box-height"))
             .unwrap_or(0.0)
@@ -82,7 +83,8 @@ fn draw_signal(ui: &mut egui::Ui, state: &mut Scene) {
     }
     let mut out = Vec::new();
     let view = state.core.view();
-    ui::draw(ui, &view, &mut state.hints, &mut out);
+    let mut player = super::audio::Player::new();
+    ui::draw(ui, &view, &mut state.hints, &mut player, &mut out);
     for intent in out {
         if matches!(
             intent,

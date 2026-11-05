@@ -11,6 +11,7 @@ use thinwire_protocol::{
     ProtocolId, SIGNAL_DEVICE_REMOVED, SIGNAL_LINK_CHECK, StoreAccessReason, topic_mute_id,
 };
 
+use super::audio::Player;
 use super::auth;
 use super::icons;
 use super::motion;
@@ -169,6 +170,7 @@ pub(crate) fn draw(
     ui: &mut egui::Ui,
     snapshot: &View<'_>,
     hints: &mut Hints,
+    player: &mut Player,
     out: &mut Vec<Intent>,
 ) {
     super::theme_mode::apply(ui.ctx(), snapshot.theme());
@@ -185,7 +187,7 @@ pub(crate) fn draw(
     status_strip(ui, snapshot, out);
     account_rail(ui, snapshot, out);
     chat_column(ui, snapshot, hints, out);
-    center_panel(ui, snapshot, hints, out);
+    center_panel(ui, snapshot, hints, player, out);
     notice_review(ui, snapshot, out);
     super::links::confirm(ui);
     super::photos::overlay(ui, snapshot.selected_messages());
@@ -1977,7 +1979,13 @@ fn account_label(status: AdapterStatus) -> &'static str {
     }
 }
 
-fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
+fn center_panel(
+    ui: &mut egui::Ui,
+    snapshot: &View<'_>,
+    hints: &mut Hints,
+    player: &mut Player,
+    out: &mut Vec<Intent>,
+) {
     let fill = theme::palette(ui).bg;
     // The thread runs edge to edge: its header and compose bar own their
     // padding. The other views sit in a padded frame below.
@@ -2014,7 +2022,7 @@ fn center_panel(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: 
             motion::FADE,
         ));
         if view == CenterView::Thread {
-            thread(ui, snapshot, hints, out);
+            thread(ui, snapshot, hints, player, out);
             return;
         }
         // A card can be taller than a short window: a long error, or a notice
@@ -2174,7 +2182,13 @@ fn add_slack_workspace(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Int
 #[cfg(not(feature = "slack-oauth"))]
 fn add_slack_workspace(_ui: &mut egui::Ui, _snapshot: &View<'_>, _out: &mut Vec<Intent>) {}
 
-fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut Vec<Intent>) {
+fn thread(
+    ui: &mut egui::Ui,
+    snapshot: &View<'_>,
+    hints: &mut Hints,
+    player: &mut Player,
+    out: &mut Vec<Intent>,
+) {
     if snapshot.selected_conversation_row().is_none() {
         empty_thread(ui, snapshot);
         return;
@@ -2230,6 +2244,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
             body: &message.body,
             links: &message.links,
             photo: message.photo.as_ref(),
+            audio: message.audio.as_ref(),
             delivery: message.delivery,
             group: is_group,
             layout,
@@ -2332,7 +2347,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &View<'_>, hints: &mut Hints, out: &mut V
                     }) {
                         unreadable_run_label(ui, run.skipped);
                     }
-                    bubble(ui, message, &mut retry, gap_before, out);
+                    bubble(ui, message, &mut retry, gap_before, player, out);
                     gap_before = Some(message.layout.run_end);
                 }
                 for run in runs.iter().filter(|run| run.before_id.is_none()) {
@@ -2628,9 +2643,12 @@ struct MetaInk {
 }
 
 /// A message of one to three emoji and nothing else. It draws large, with no
-/// bubble. A photo or a link keeps its bubble.
+/// bubble. A photo, a voice note, or a link keeps its bubble.
 fn is_emoji_only(message: &Bubble<'_>) -> bool {
-    message.photo.is_none() && message.links.is_empty() && only_emoji(message.body)
+    message.photo.is_none()
+        && message.audio.is_none()
+        && message.links.is_empty()
+        && only_emoji(message.body)
 }
 
 /// One to three emoji, with the joiners, skin tones, and spaces between them.
@@ -2674,6 +2692,7 @@ struct Bubble<'a> {
     body: &'a str,
     links: &'a [MessageLink],
     photo: Option<&'a MessagePhoto>,
+    audio: Option<&'a thinwire_protocol::MessageAudio>,
     delivery: Delivery,
     /// Group chat. The AccessKit name keeps the sender on every row.
     group: bool,
@@ -3100,6 +3119,7 @@ fn bubble(
     message: &Bubble<'_>,
     retry: &mut Option<String>,
     previous_run_ended: Option<bool>,
+    player: &mut Player,
     out: &mut Vec<Intent>,
 ) {
     let palette = theme::palette(ui);
@@ -3191,6 +3211,14 @@ fn bubble(
                             out,
                         );
                     }
+                    player.show(
+                        ui,
+                        message.protocol,
+                        message.conversation_id,
+                        message.id,
+                        message.audio,
+                        out,
+                    );
                     let caption = !message.body.is_empty() || message.photo.is_none();
                     if !caption {
                         meta_line(ui, message, &ink, false);
@@ -4744,7 +4772,8 @@ mod tests {
             let view = View::from_parts(snapshot, store, settings);
             let mut hints = Hints::default();
             let mut out = Vec::new();
-            draw(ui, &view, &mut hints, &mut out);
+            let mut player = crate::app::audio::Player::new();
+            draw(ui, &view, &mut hints, &mut player, &mut out);
         }
 
         assert_still(
@@ -4803,7 +4832,8 @@ mod tests {
             let view = core.view();
             let mut hints = Hints::default();
             let mut out = Vec::new();
-            draw(ui, &view, &mut hints, &mut out);
+            let mut player = crate::app::audio::Player::new();
+            draw(ui, &view, &mut hints, &mut player, &mut out);
         });
         drop(core);
         drop(runtime);
@@ -4863,7 +4893,8 @@ mod tests {
                 let view = View::from_parts(&snapshot, &store, &settings);
                 let mut hints = Hints::default();
                 let mut out = Vec::new();
-                draw(ui, &view, &mut hints, &mut out);
+                let mut player = crate::app::audio::Player::new();
+                draw(ui, &view, &mut hints, &mut player, &mut out);
             });
         harness.run_steps(4);
         let copies = harness
@@ -4990,7 +5021,8 @@ mod tests {
                 let view = View::from_parts(&snapshot, &store, &settings);
                 let mut hints = Hints::default();
                 let mut out = Vec::new();
-                draw(ui, &view, &mut hints, &mut out);
+                let mut player = crate::app::audio::Player::new();
+                draw(ui, &view, &mut hints, &mut player, &mut out);
             });
         harness.run_steps(4);
         for label in [
@@ -5069,7 +5101,8 @@ mod tests {
                 let view = View::from_parts(&snapshot, &store, &settings);
                 let mut hints = Hints::default();
                 let mut out = Vec::new();
-                draw(ui, &view, &mut hints, &mut out);
+                let mut player = crate::app::audio::Player::new();
+                draw(ui, &view, &mut hints, &mut player, &mut out);
             });
         harness.run_steps(4);
         assert!(
