@@ -6982,6 +6982,8 @@ dependencies = [
  "libsqlite3-sys",
  "log",
  "rusqlite",
+ "serde",
+ "serde_json",
  "thinwire-core",
  "thinwire-ipc",
  "thinwire-protocol",
