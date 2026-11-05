@@ -47,6 +47,11 @@ const STOP_ENDED: &str =
     "The last WhatsApp client stopped. No linked-device session is running. You can pair again.";
 const BUILD_FAILED: &str =
     "WhatsApp pairing client could not be built. No session material was logged.";
+const NOT_PAIRED: &str = "WhatsApp has no linked device.";
+
+/// Pairing id of a resume at app start. The shell has no pairing with this
+/// id, so it drops any QR code or pair code of a resume.
+const RESUME_PAIRING: u64 = 0;
 
 /// Why a start failed. No path, OS text, or session material.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +74,8 @@ pub(super) enum StartError {
     /// account-row sentence. It does not contain the key.
     #[cfg(feature = "whatsapp-web")]
     Reported(String),
+    /// A resume found no paired device in the store. No client started.
+    NotPaired,
 }
 
 impl StartError {
@@ -83,6 +90,7 @@ impl StartError {
             Self::MoveFailed => thinwire_protocol::whatsapp_key_wrong_kept(),
             #[cfg(feature = "whatsapp-web")]
             Self::Reported(text) => text,
+            Self::NotPaired => NOT_PAIRED,
         }
     }
 }
@@ -99,13 +107,18 @@ pub(super) trait LinkBackend: Clone + Send + Sync + 'static {
     type Bot: Send + 'static;
 
     /// Open the device store, build the client, and spawn it. Client events
-    /// go to `callbacks`.
+    /// go to `callbacks`. With `resume`, a store with no paired device
+    /// returns [`StartError::NotPaired`] before any client is built.
     fn start(
         &self,
         generation: u64,
         phone: Option<String>,
         callbacks: Callbacks,
+        resume: bool,
     ) -> impl Future<Output = Result<Started<Self::Bot>, StartError>> + Send;
+
+    /// A device store file is on disk.
+    fn has_store(&self) -> impl Future<Output = bool> + Send;
 
     /// Stop a client and close its store.
     fn stop(&self, bot: Self::Bot) -> impl Future<Output = ()> + Send;
@@ -132,6 +145,9 @@ enum Msg {
     },
     /// Read the session key again. This is not a new link.
     Retry,
+    /// The app started with a saved gate acceptance. Open a saved, paired
+    /// session. A new link still waits for `Begin`.
+    Resume,
     Client {
         generation: u64,
         event: LinkEvent,
@@ -205,6 +221,7 @@ impl LinkHandle {
             stopping: None,
             last_phone: None,
             last_pairing: None,
+            last_resume: false,
         };
         tokio::spawn(owner.run(rx));
         Self { tx, active }
@@ -219,6 +236,11 @@ impl LinkHandle {
     /// Read the session key again. Does not delete the store.
     pub(super) fn retry(&self) {
         let _ = self.tx.send(Msg::Retry);
+    }
+
+    /// Open the saved session, if one is on disk and paired. No QR code.
+    pub(super) fn resume(&self) {
+        let _ = self.tx.send(Msg::Resume);
     }
 
     /// Stop the link. Later callbacks of the old generation are dropped.
@@ -285,14 +307,17 @@ struct Owner<B: LinkBackend> {
     /// Phone and pairing of the last Begin. A key retry uses these again.
     last_phone: Option<String>,
     last_pairing: Option<u64>,
+    /// The last start was a resume. A key retry is a resume again.
+    last_resume: bool,
 }
 
 impl<B: LinkBackend> Owner<B> {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Msg>) {
         while let Some(msg) = rx.recv().await {
             match msg {
-                Msg::Begin { phone, pairing } => self.begin(phone, pairing, true).await,
+                Msg::Begin { phone, pairing } => self.begin(phone, pairing, true, false).await,
                 Msg::Retry => self.retry_key().await,
+                Msg::Resume => self.resume().await,
                 Msg::Client { generation, event } => self.client(generation, event).await,
                 Msg::Cancel => {
                     self.stop().await;
@@ -326,12 +351,33 @@ impl<B: LinkBackend> Owner<B> {
             return;
         };
         let phone = self.last_phone.clone();
-        self.begin(phone, pairing, false).await;
+        let resume = self.last_resume;
+        self.begin(phone, pairing, false, resume).await;
     }
 
-    async fn begin(&mut self, phone: Option<String>, pairing: u64, allow_delete: bool) {
+    /// Open the saved session at app start. A link that already runs or was
+    /// asked for stays as it is. No store, a revoked store, and a store with
+    /// no paired device start no client, so no QR code goes out.
+    async fn resume(&mut self) {
+        if self.bot.is_some() || self.last_pairing.is_some() || self.still_stopping() {
+            return;
+        }
+        if self.stale || self.backend.is_revoked().await || !self.backend.has_store().await {
+            return;
+        }
+        self.begin(None, RESUME_PAIRING, false, true).await;
+    }
+
+    async fn begin(
+        &mut self,
+        phone: Option<String>,
+        pairing: u64,
+        allow_delete: bool,
+        resume: bool,
+    ) {
         self.last_phone.clone_from(&phone);
         self.last_pairing = Some(pairing);
+        self.last_resume = resume;
         self.generation += 1;
         let generation = self.generation;
         // A client that did not stop yet still holds the store (#98).
@@ -363,7 +409,10 @@ impl<B: LinkBackend> Owner<B> {
             generation,
             tx: self.callbacks.clone(),
         };
-        let result = self.backend.start(generation, phone, callbacks).await;
+        let result = self
+            .backend
+            .start(generation, phone, callbacks, resume)
+            .await;
         // The user can cancel while the start runs: the adapter reset the
         // session and sent Unlinked. Then this start is over, with no late
         // status (the Cancel message waits behind it in the queue).
@@ -382,6 +431,12 @@ impl<B: LinkBackend> Owner<B> {
                 self.session.attach_sender(generation, started.sender);
                 self.active.store(true, Ordering::SeqCst);
                 self.status(AdapterStatus::Connecting, PAIRING_RUNNING);
+            }
+            Err(StartError::NotPaired) => {
+                // Nothing to open. The next Begin is a normal first link.
+                self.last_pairing = None;
+                self.last_resume = false;
+                self.fail(StartError::NotPaired);
             }
             Err(error) => self.fail(error),
         }
@@ -528,6 +583,10 @@ impl<B: LinkBackend> Owner<B> {
                     thinwire_protocol::whatsapp_key_wrong_kept(),
                 );
             }
+            StartError::NotPaired => {
+                self.status(AdapterStatus::Stubbed, NOT_PAIRED);
+                let _ = self.events.send(account(AccountState::Unlinked));
+            }
             other => {
                 self.status(AdapterStatus::Error, other.detail());
                 let _ = self.events.send(account(AccountState::Unlinked));
@@ -572,6 +631,10 @@ pub(super) mod tests {
         pub revoked: AtomicBool,
         /// `mark_revoked` fails (a read-only app-data folder).
         pub mark_fails: bool,
+        /// No device store file is on disk.
+        pub no_store: bool,
+        /// The store has no paired device. A resume start refuses it.
+        pub unpaired: bool,
     }
 
     #[derive(Clone, Default)]
@@ -585,12 +648,17 @@ pub(super) mod tests {
             generation: u64,
             _phone: Option<String>,
             callbacks: Callbacks,
+            resume: bool,
         ) -> Result<Started<u64>, StartError> {
+            let entry = if resume { "resume" } else { "start" };
             self.0
                 .log
                 .lock()
                 .expect("log")
-                .push(format!("start {generation}"));
+                .push(format!("{entry} {generation}"));
+            if resume && self.0.unpaired {
+                return Err(StartError::NotPaired);
+            }
             self.0
                 .callbacks
                 .lock()
@@ -656,6 +724,10 @@ pub(super) mod tests {
         async fn is_revoked(&self) -> bool {
             self.0.revoked.load(Ordering::SeqCst)
         }
+
+        async fn has_store(&self) -> bool {
+            !self.0.no_store
+        }
     }
 
     impl Shared {
@@ -719,6 +791,76 @@ pub(super) mod tests {
             "a pairing is Linking until the client connects"
         );
         assert!(handle.is_active());
+    }
+
+    /// A resume at app start opens a saved, paired store with no shell
+    /// pairing. It links like a normal start.
+    #[tokio::test]
+    async fn a_resume_opens_a_saved_paired_store() {
+        let (fake, handle, session, mut rx) = owner(Fake::default());
+        handle.resume();
+        handle.flush().await;
+        assert_eq!(fake.log(), vec!["resume 1"]);
+        assert!(handle.is_active());
+        fake.callback(1).send(LinkEvent::Connected);
+        handle.flush().await;
+        assert!(session.is_connected());
+        let events = drain(&mut rx);
+        assert!(events.contains(&AdapterEvent::Account {
+            protocol: ProtocolId::WhatsApp,
+            state: AccountState::Linked,
+        }));
+        // A second resume, or a resume while a link runs, starts nothing.
+        handle.resume();
+        handle.flush().await;
+        assert_eq!(fake.log(), vec!["resume 1"]);
+    }
+
+    /// No store, a revoked store, and a store with no paired device start no
+    /// client at app start. A later Begin is a normal first link.
+    #[tokio::test]
+    async fn a_resume_without_a_paired_store_starts_no_client() {
+        let (fake, handle, _session, mut rx) = owner(Fake {
+            no_store: true,
+            ..Fake::default()
+        });
+        handle.resume();
+        handle.flush().await;
+        assert!(fake.log().is_empty(), "no store: {:?}", fake.log());
+        assert!(drain(&mut rx).is_empty(), "no event for no store");
+
+        let revoked = Fake::default();
+        revoked.revoked.store(true, Ordering::SeqCst);
+        let (fake, handle, _session, _rx) = owner(revoked);
+        handle.resume();
+        handle.flush().await;
+        assert!(fake.log().is_empty(), "revoked: {:?}", fake.log());
+
+        let (fake, handle, _session, mut rx) = owner(Fake {
+            unpaired: true,
+            ..Fake::default()
+        });
+        handle.resume();
+        handle.flush().await;
+        assert_eq!(fake.log(), vec!["resume 1"]);
+        assert!(!handle.is_active());
+        let events = drain(&mut rx);
+        assert_eq!(
+            events.last(),
+            Some(&AdapterEvent::Account {
+                protocol: ProtocolId::WhatsApp,
+                state: AccountState::Unlinked,
+            })
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::WhatsAppQr { .. })),
+            "no QR code at app start"
+        );
+        handle.begin(None, 9);
+        handle.flush().await;
+        assert_eq!(fake.log(), vec!["resume 1", "start 2"]);
     }
 
     /// ADR 0010 rule 8: QR codes and pair codes carry the shell's pairing

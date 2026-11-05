@@ -8,8 +8,9 @@
 //!
 //! Lifetime of the helper:
 //!
-//! - It starts when the user accepts the protocol's gate. Before that, the
-//!   supervisor answers every command itself, like the feature-off stub.
+//! - It starts when the user accepts the protocol's gate, or when the app
+//!   starts with a saved acceptance. Before that, the supervisor answers
+//!   every command itself, like the feature-off stub.
 //! - It stops when the app closes (`Shutdown`).
 //! - If it ends by itself, the supervisor starts it again after a wait
 //!   (ADR 0012 "Failure") and sends the gate and the pairing again, so the

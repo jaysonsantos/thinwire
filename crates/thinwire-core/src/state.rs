@@ -400,6 +400,12 @@ pub const ATTACH_TOO_MANY: &str = "30 files at most in one send.";
 /// The tray note when this account cannot send files.
 pub const ATTACH_NOT_HERE: &str = "This account cannot send photos or videos.";
 
+/// Identity of the WhatsApp ban gate copy: its README risk bullets. The
+/// settings file keeps it when the user accepts the gate. A saved value of
+/// another copy does not count, so a new copy shows the gate again.
+pub const WHATSAPP_GATE_VERSION: u64 =
+    crate::signal_notice::notice_version(&thinwire_protocol::CRITIC_RISK_BULLETS);
+
 /// Status line after the user starts a WhatsApp pairing.
 pub const WHATSAPP_PAIRING_REQUESTED: &str = "WhatsApp pairing requested.";
 /// Status line after the user accepts the WhatsApp ban gate.
@@ -5092,6 +5098,30 @@ impl Snapshot {
         self.whatsapp_phone.clear();
         self.whatsapp_phone_note = None;
         phone.clear();
+    }
+
+    /// The user accepted the ban gate of this pairing.
+    #[must_use]
+    pub const fn whatsapp_gate_accepted(&self) -> bool {
+        #[cfg(feature = "whatsapp-web")]
+        {
+            self.whatsapp_risk_acknowledged
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        {
+            false
+        }
+    }
+
+    /// The app starts with a saved acceptance of the current ban gate. The
+    /// helper starts and opens a saved, paired session. No screen opens, and
+    /// a new link still shows the gate.
+    #[cfg(feature = "whatsapp-web")]
+    pub(crate) fn restore_whatsapp_gate(&mut self) {
+        if self.helper_missing(ProtocolId::WhatsApp) {
+            return;
+        }
+        self.pending.push(AdapterCommand::WhatsAppAcknowledgeRisk);
     }
 
     #[cfg(feature = "whatsapp-web")]

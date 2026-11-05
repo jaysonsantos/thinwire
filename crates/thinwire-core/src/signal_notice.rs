@@ -44,7 +44,8 @@ pub const SIGNAL_NOTICE_PARTS: [&str; 5] = [
 /// Identity of the notice copy. Saved acceptances of another value do not count.
 pub const SIGNAL_NOTICE_VERSION: u64 = notice_version(&SIGNAL_NOTICE_PARTS);
 
-const fn notice_version(parts: &[&str]) -> u64 {
+/// A hash of a copy, one part at a time. Never `0`: `0` means "not accepted".
+pub(crate) const fn notice_version(parts: &[&str]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
     while i < parts.len() {
