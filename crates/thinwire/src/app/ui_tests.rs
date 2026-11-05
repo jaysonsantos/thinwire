@@ -423,18 +423,17 @@ fn signal_ui_is_feature_gated_and_uses_the_helper() {
     assert!(notice.contains("No provisioning URL is shown on this screen."));
     let readme = include_str!("../../../../README.md");
     assert!(readme.contains("Signal: no supported third-party API, expect breakage."));
-    // The harness tests draw the labels, the read-only line, and the kept line.
+    // The harness tests draw the labels and the read-only line.
     // These checks keep the same names on the draw path.
     assert!(ui.contains("SIGNAL_PREVIOUS_ACCOUNT"));
     assert!(ui.contains("signal_retained_chip_label"));
     assert!(ui.contains("Signal: no supported third-party API, expect breakage."));
     assert!(ui.contains("signal_read_only_reason()"));
-    // Hidden retained rows stay explained until the next link publishes them.
-    assert!(ui.contains("signal_history_kept_line()"));
+    // Retained rows stay in the switcher. No line says they return after a link.
+    assert!(!ui.contains("signal_history_kept_line"));
     assert!(
-        include_str!("../../../thinwire-protocol/src/signal.rs").contains(
-            "Old Signal history for the previous number is kept. It shows again after you link."
-        )
+        !include_str!("../../../thinwire-protocol/src/signal.rs")
+            .contains("It shows again after you link.")
     );
     assert!(!gate.contains("local build"), "Signal is in release builds");
     // With no helper program the entry stays, disabled, with the reason.
