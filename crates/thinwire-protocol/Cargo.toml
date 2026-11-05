@@ -78,3 +78,8 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+# The helper starts with its standard streams only: the child marks every
+# other descriptor close-on-exec (`helper::fds`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -111,6 +111,8 @@ impl HelperLauncher for ProcessLauncher {
             .stderr(Stdio::piped())
             // The helper never outlives the app's handle to it.
             .kill_on_drop(true);
+        // No socket or file of the app reaches the helper.
+        super::fds::standard_streams_only(&mut command);
         #[cfg(windows)]
         command.creation_flags(CREATE_NO_WINDOW);
         let mut child = command.spawn()?;

@@ -275,6 +275,7 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 protocol: ProtocolId::WhatsApp,
                 conversation_id,
                 before_message_id,
+                store_cursor: _,
             } => {
                 emit_older_history_loaded(
                     events,
@@ -370,6 +371,7 @@ mod tests {
                 protocol: ProtocolId::WhatsApp,
                 conversation_id: chat.clone(),
                 before_message_id: "m1".into(),
+                store_cursor: None,
             },
         ] {
             adapter.handle(command, &tx).expect("no adapter error");
@@ -386,6 +388,7 @@ mod tests {
         assert!(events.contains(&AdapterEvent::HistoryLoaded {
             protocol: ProtocolId::WhatsApp,
             conversation_id: chat.clone(),
+            store_cursor: None,
         }));
         for request in [7, 8] {
             assert!(events.contains(&AdapterEvent::SendRejected {

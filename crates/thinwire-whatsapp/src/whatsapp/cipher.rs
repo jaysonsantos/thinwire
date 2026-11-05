@@ -89,6 +89,12 @@ fn store_error() -> Box<dyn std::error::Error + Send + Sync> {
     "the session store did not open".into()
 }
 
+/// The session key, for the chat cache beside the device store. The open
+/// of the device store reads it first.
+pub(super) fn cache_key() -> Result<[u8; 32], ()> {
+    session_key()
+}
+
 fn session_key() -> Result<[u8; 32], ()> {
     if let Some(key) = SESSION_KEY.get() {
         return Ok(*key);
