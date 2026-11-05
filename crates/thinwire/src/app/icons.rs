@@ -1,9 +1,10 @@
-//! Icons painted with strokes. Inter and the egui fallback fonts miss several
-//! symbol glyphs, so the shell draws each icon itself. Every icon fits a square
-//! of `size` centered on `center`.
+//! Icons the shell draws itself. Inter and the egui fallback fonts miss several
+//! symbol glyphs, so each mark is painted here. Every icon fits a square of
+//! `size` centered on `center`. Stroke icons and filled protocol marks share
+//! this module.
 //!
-//! Protocol marks are original stroke drawings that only resemble the common
-//! shapes. They are not the brand assets.
+//! Protocol marks are original drawings that only resemble the common shapes.
+//! They are not the brand assets.
 
 use eframe::egui::{self, Color32, Pos2, Shape, Stroke, Vec2};
 use thinwire_protocol::ProtocolId;
@@ -199,25 +200,28 @@ pub(crate) fn protocol(
 }
 
 /// A paper plane that points up-right: Telegram-like.
+///
+/// Built from two convex triangles so egui's triangle-fan fill stays inside
+/// the mark (a single concave quad spiked past the badge in snapshots).
 fn telegram(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     let unit = size / 16.0;
+    let tip = at(center, unit, 6.0, -5.0);
+    let left = at(center, unit, -6.0, 0.5);
+    let bottom = at(center, unit, -2.0, 6.0);
+    let fold = at(center, unit, 0.5, 1.0);
     painter.add(Shape::convex_polygon(
-        vec![
-            at(center, unit, -6.5, 1.0),
-            at(center, unit, 6.5, -5.5),
-            at(center, unit, 1.0, 0.5),
-            at(center, unit, -1.5, 6.0),
-        ],
+        vec![left, tip, fold],
         color,
         Stroke::NONE,
     ));
     painter.add(Shape::convex_polygon(
-        vec![
-            at(center, unit, 1.0, 0.5),
-            at(center, unit, 6.5, -5.5),
-            at(center, unit, -0.5, 2.5),
-        ],
-        color.gamma_multiply(0.72),
+        vec![fold, tip, bottom],
+        color.gamma_multiply(0.78),
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(
+        vec![left, fold, bottom],
+        color,
         Stroke::NONE,
     ));
 }
@@ -274,22 +278,34 @@ fn signal(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
 }
 
 /// A soft face with two eyes: Discord-like without the brand asset.
+///
+/// Body and legs are separate convex fills. A single concave outline spilled
+/// across the chin notch under `Shape::convex_polygon`.
 fn discord(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     let unit = size / 16.0;
+    let body = egui::Rect::from_center_size(
+        at(center, unit, 0.0, -0.5),
+        Vec2::new(13.0, 10.0) * unit,
+    );
+    painter.rect_filled(
+        body,
+        egui::CornerRadius::same((5.0 * unit).round().clamp(2.0, 255.0) as u8),
+        color,
+    );
     painter.add(Shape::convex_polygon(
         vec![
-            at(center, unit, -7.0, -1.5),
-            at(center, unit, -5.5, -5.5),
-            at(center, unit, -2.0, -6.5),
-            at(center, unit, 2.0, -6.5),
-            at(center, unit, 5.5, -5.5),
-            at(center, unit, 7.0, -1.5),
-            at(center, unit, 6.0, 3.5),
-            at(center, unit, 3.5, 6.0),
-            at(center, unit, 1.5, 4.0),
-            at(center, unit, -1.5, 4.0),
-            at(center, unit, -3.5, 6.0),
-            at(center, unit, -6.0, 3.5),
+            at(center, unit, -5.0, 3.5),
+            at(center, unit, -3.2, 6.2),
+            at(center, unit, -1.2, 3.5),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(
+        vec![
+            at(center, unit, 1.2, 3.5),
+            at(center, unit, 3.2, 6.2),
+            at(center, unit, 5.0, 3.5),
         ],
         color,
         Stroke::NONE,
