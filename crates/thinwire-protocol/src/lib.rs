@@ -18,6 +18,7 @@ mod signal;
 mod slack;
 mod store_protect;
 mod telegram;
+pub mod voice_files;
 mod whatsapp;
 
 pub use adapter::{

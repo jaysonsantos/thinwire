@@ -5,12 +5,14 @@
 //! protocol.
 
 use thinwire_ipc::{
-    SecretText, WireAccountState, WireArrival, WireCommand, WireConversation, WireDelivery,
-    WireEvent, WireFile, WireHistoryCursor, WireHistorySkip, WireMediaKind, WireMessage, WirePhoto,
-    WireProtocol, WireStatus, WireStoreAccess,
+    SecretText, WireAccountState, WireArrival, WireAudio, WireCommand, WireConversation,
+    WireDelivery, WireEvent, WireFile, WireHistoryCursor, WireHistorySkip, WireMediaKind,
+    WireMessage, WirePhoto, WireProtocol, WireStatus, WireStoreAccess,
 };
 
-use crate::media::{ImageBytes, MediaKind, MessagePhoto, OutgoingFile, PhotoSize};
+use crate::media::{
+    AudioPath, ImageBytes, MediaKind, MessageAudio, MessagePhoto, OutgoingFile, PhotoSize,
+};
 
 use crate::ProtocolKind;
 use crate::adapter::{
@@ -121,6 +123,9 @@ pub(crate) fn command_to_wire(
             WireCommand::CancelLink
         }
         AdapterCommand::RetryStoreKey { .. } => WireCommand::RetryStoreKey,
+        AdapterCommand::DownloadVoice { file_id, .. } => WireCommand::DownloadVoice {
+            file_id: *file_id,
+        },
         // The app answers these itself. They never cross the pipe.
         // Topic commands are Telegram-only. A helper never sees them.
         AdapterCommand::Shutdown { .. }
@@ -136,8 +141,7 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::RemoveAccount { .. }
         | AdapterCommand::ToAccount { .. }
         | AdapterCommand::ViewTopic { .. }
-        | AdapterCommand::DownloadFile { .. }
-        | AdapterCommand::DownloadVoice { .. } => return None,
+        | AdapterCommand::DownloadFile { .. } => return None,
     })
 }
 
@@ -230,6 +234,9 @@ pub(crate) fn command_from_wire(
             _ => return None,
         },
         WireCommand::RetryStoreKey => AdapterCommand::RetryStoreKey { protocol },
+        WireCommand::DownloadVoice { file_id } => {
+            AdapterCommand::DownloadVoice { protocol, file_id }
+        }
     };
     Some((command, None))
 }
@@ -351,6 +358,18 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
             protocol: seen,
             text,
         } if own(seen) => WireEvent::Notice { text },
+        AdapterEvent::VoiceReady {
+            protocol: seen,
+            file_id,
+            path,
+        } if own(seen) => WireEvent::VoiceReady {
+            file_id,
+            path: path.as_path().to_string_lossy().into_owned(),
+        },
+        AdapterEvent::VoiceFailed {
+            protocol: seen,
+            file_id,
+        } if own(seen) => WireEvent::VoiceFailed { file_id },
         AdapterEvent::ChatListLoaded { protocol: seen } if own(seen) => WireEvent::ChatListLoaded,
         AdapterEvent::HistoryLoaded {
             protocol: seen,
@@ -525,6 +544,19 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
             },
             _ => return None,
         },
+        // The app opens only an absolute path. Anything else is a failed
+        // download, so the player does not wait for it.
+        WireEvent::VoiceReady { file_id, path } => {
+            match AudioPath::new(path).filter(|path| path.as_path().is_absolute()) {
+                Some(path) => AdapterEvent::VoiceReady {
+                    protocol,
+                    file_id,
+                    path,
+                },
+                None => AdapterEvent::VoiceFailed { protocol, file_id },
+            }
+        }
+        WireEvent::VoiceFailed { file_id } => AdapterEvent::VoiceFailed { protocol, file_id },
     })
 }
 
@@ -695,7 +727,17 @@ fn message_to_wire(message: ChatMessage) -> WireMessage {
         sent_at: message.sent_at,
         arrival: arrival_to_wire(message.arrival),
         photo: message.photo.as_ref().and_then(photo_to_wire),
+        audio: message.audio.as_ref().and_then(audio_to_wire),
     }
+}
+
+/// Audio that the helper can download. A file that is already local does
+/// not cross: its path is a path of the helper.
+fn audio_to_wire(audio: &MessageAudio) -> Option<WireAudio> {
+    (audio.file_id() > 0).then(|| WireAudio {
+        duration_secs: audio.duration_secs(),
+        file_id: audio.file_id(),
+    })
 }
 
 /// The first size that holds its bytes. A photo with no bytes, or with too
@@ -748,7 +790,9 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
         topic: None,
         links: Vec::new(),
         photo: message.photo.and_then(photo_from_wire),
-        audio: None,
+        audio: message
+            .audio
+            .and_then(|audio| MessageAudio::new(audio.duration_secs, audio.file_id, None)),
     }
 }
 
@@ -800,6 +844,61 @@ mod tests {
             has_topics: false,
             avatar: Default::default(),
         }
+    }
+
+    /// The audio of a message crosses as its handle and its duration: no
+    /// path and no bytes. A download command and both answers cross too.
+    /// A path that is not absolute is a failed download in the app.
+    #[test]
+    fn audio_crosses_as_a_handle_and_a_relative_path_fails() {
+        let mut voice = message(ProtocolId::Signal);
+        voice.audio = MessageAudio::new(4, 9, AudioPath::new("/tmp/helper-only.audio".to_string()));
+        let wire = message_to_wire(voice);
+        assert_eq!(
+            wire.audio,
+            Some(WireAudio {
+                duration_secs: 4,
+                file_id: 9
+            })
+        );
+        let back = message_from_wire(ProtocolId::Signal, wire);
+        let audio = back.audio.expect("audio");
+        assert_eq!((audio.duration_secs(), audio.file_id()), (4, 9));
+        assert!(
+            audio.file().is_none(),
+            "the helper path stays in the helper"
+        );
+
+        let command = AdapterCommand::DownloadVoice {
+            protocol: ProtocolId::Signal,
+            file_id: 9,
+        };
+        let wire = command_to_wire(ProtocolId::Signal, &command, || None).expect("crosses");
+        assert_eq!(wire, WireCommand::DownloadVoice { file_id: 9 });
+        let (back, _) = command_from_wire(ProtocolId::Signal, wire).expect("back");
+        assert_eq!(back, command);
+
+        let ready = event_to_wire(
+            ProtocolId::Signal,
+            AdapterEvent::VoiceReady {
+                protocol: ProtocolId::Signal,
+                file_id: 9,
+                path: AudioPath::new("/tmp/9.audio".to_string()).expect("path"),
+            },
+        )
+        .expect("crosses");
+        assert!(matches!(
+            event_from_wire(ProtocolId::Signal, ready),
+            Some(AdapterEvent::VoiceReady { file_id: 9, .. })
+        ));
+        let relative = WireEvent::VoiceReady {
+            file_id: 9,
+            path: "voice/9.audio".into(),
+        };
+        assert!(matches!(
+            event_from_wire(ProtocolId::Signal, relative),
+            Some(AdapterEvent::VoiceFailed { file_id: 9, .. })
+        ));
     }
 
     /// A sticker image crosses the pipe with its size and its bytes. An
@@ -1056,10 +1155,6 @@ mod tests {
                 protocol: ProtocolId::Telegram,
             },
             AdapterCommand::SignalBeginLink { generation: 1 },
-            AdapterCommand::DownloadVoice {
-                protocol,
-                file_id: 42,
-            },
             AdapterCommand::DownloadFile {
                 protocol,
                 file_id: 7,

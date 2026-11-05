@@ -385,6 +385,61 @@ impl Session {
         }
     }
 
+    /// Download the audio `file_id` into the voice folder. The answer is
+    /// `VoiceReady`, or `VoiceFailed` when the link is down, the message left
+    /// the cache, or the download or the write failed.
+    pub(super) fn download_voice(&self, file_id: i32, events: &EventTx) {
+        let failed = move |events: &EventTx| {
+            let _ = events.send(AdapterEvent::VoiceFailed {
+                protocol: ProtocolId::WhatsApp,
+                file_id,
+            });
+        };
+        let mut state = self.lock();
+        let ready = (!state.closed && state.connected)
+            .then(|| state.sender.clone().zip(state.inbox.voice_media(file_id)))
+            .flatten();
+        let (Some((sender, media)), Ok(runtime), Ok(dir)) = (
+            ready,
+            tokio::runtime::Handle::try_current(),
+            super::path::voice_dir(),
+        ) else {
+            drop(state);
+            failed(events);
+            return;
+        };
+        let gate = state
+            .media_gate
+            .get_or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MEDIA_DOWNLOADS)))
+            .clone();
+        drop(state);
+        let events = events.clone();
+        runtime.spawn(async move {
+            let _permit = gate.acquire_owned().await.ok();
+            let stored = match sender.download(&media).await {
+                Ok(bytes) => tokio::task::spawn_blocking(move || {
+                    thinwire_protocol::voice_files::store(&dir, file_id, &bytes).map_err(|_| ())
+                })
+                .await
+                .unwrap_or(Err(())),
+                Err(()) => Err(()),
+            };
+            match stored {
+                Ok(path) => {
+                    let _ = events.send(AdapterEvent::VoiceReady {
+                        protocol: ProtocolId::WhatsApp,
+                        file_id,
+                        path,
+                    });
+                }
+                Err(()) => {
+                    tracing::debug!("whatsapp audio download failed");
+                    failed(&events);
+                }
+            }
+        });
+    }
+
     /// One download ended. A result of an old or a closed link is dropped.
     fn finish_media(
         &self,
@@ -798,6 +853,62 @@ mod tests {
         session.apply(LinkEvent::Messages(vec![late]), 1, &tx);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(*sender.downloads.lock().expect("lock"), 1);
+    }
+
+    /// A voice note row has audio with the handle of its message. Play
+    /// downloads it into the voice folder. A handle with no message fails.
+    #[tokio::test]
+    async fn a_voice_note_downloads_into_the_voice_folder() {
+        let (session, tx, mut rx) = linked();
+        let sender = Arc::new(fake::FakeSender {
+            media: Some(b"OggS-voice".to_vec()),
+            ..Default::default()
+        });
+        assert!(session.attach_sender(1, sender.clone()));
+        let voice = WaMessage {
+            voice: Some(crate::whatsapp::inbox::Voice {
+                seconds: 7,
+                media: MediaRef::new("audio".to_string()),
+            }),
+            ..message(CHAT, "v1", "[voice message]", 5)
+        };
+        session.apply(LinkEvent::Messages(vec![voice]), 1, &tx);
+        let mut audio = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::MessageReceived { message } = event
+                && message.id == "v1"
+            {
+                audio = message.audio;
+            }
+        }
+        let audio = audio.expect("the row has audio");
+        assert_eq!(audio.duration_secs(), 7);
+        let file_id = audio.file_id();
+        assert_eq!(file_id, crate::whatsapp::inbox::voice_file_id(CHAT, "v1"));
+        session.download_voice(file_id, &tx);
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(AdapterEvent::VoiceReady {
+                        file_id: id, path, ..
+                    }) if id == file_id => {
+                        return Some(path);
+                    }
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("an answer")
+        .expect("ready");
+        assert_eq!(std::fs::read(ready.as_path()).expect("file"), b"OggS-voice");
+        session.download_voice(file_id.wrapping_add(1).max(1), &tx);
+        let failed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an answer");
+        assert!(matches!(failed, Some(AdapterEvent::VoiceFailed { .. })));
+        let _ = std::fs::remove_file(ready.as_path());
     }
 
     /// #168 item 12: the session tells the inbox about each connection. A

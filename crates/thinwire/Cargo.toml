@@ -55,12 +55,18 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ] }
-# Voice notes. `playback` is the output device. rodio 0.23's symphonia
-# features decode Vorbis, not Opus, and Telegram voice notes are Opus in
-# Ogg, so `ogg` and `opus` decode that file in `app/audio/engine.rs`.
+# Voice notes and audio files. `playback` is the output device. rodio
+# 0.23's symphonia features decode Vorbis, AAC (`mp4`: M4A and ADTS), MP3,
+# WAV, and FLAC, not Opus. Telegram, WhatsApp, and Discord voice notes are
+# Opus in Ogg, so `ogg` and `opus` decode that file in `app/audio/engine.rs`.
+# Signal voice notes are AAC.
 rodio = { version = "0.23", default-features = false, features = [
   "playback",
   "vorbis",
+  "mp4",
+  "mp3",
+  "wav",
+  "flac",
 ] }
 ogg = "0.9"
 opus = "0.4"

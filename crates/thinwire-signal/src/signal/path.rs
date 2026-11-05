@@ -117,6 +117,20 @@ pub(crate) fn set_test_session_dir(dir: Option<PathBuf>) {
     TEST_SESSION_DIR.with(|slot| *slot.borrow_mut() = dir);
 }
 
+/// The folder of the audio files of the player, in the session folder.
+#[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
+pub(crate) fn voice_dir() -> Result<PathBuf, ()> {
+    signal_session_path().map(|dir| dir.join("voice"))
+}
+
+/// Delete the audio files of an earlier run. Call it after
+/// [`lock_session`]: no other helper of this account writes there then.
+pub fn clear_voice_files() {
+    if let Ok(dir) = voice_dir() {
+        thinwire_protocol::voice_files::clear(&dir);
+    }
+}
+
 pub(crate) fn signal_session_path() -> Result<PathBuf, ()> {
     #[cfg(all(test, feature = "signal-local"))]
     {

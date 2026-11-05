@@ -17,9 +17,11 @@ use crate::SecretText;
 /// [`WireEvent::StoreAccess`]. Version 3 adds [`WireCommand::SendMedia`],
 /// [`WireMessage::photo`], and `store_cursor` on `load_older_messages`,
 /// `history_loaded`, and `older_history_loaded`. `runs` on that cursor names
-/// the shown message each unreadable stretch sits older than. An older peer
+/// the shown message each unreadable stretch sits older than. Version 4
+/// adds [`WireMessage::audio`], [`WireCommand::DownloadVoice`],
+/// [`WireEvent::VoiceReady`], and [`WireEvent::VoiceFailed`]. An older peer
 /// cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// One unreadable stretch on a history page.
 ///
@@ -153,6 +155,11 @@ pub enum WireCommand {
     ViewChat {
         conversation_id: Option<String>,
     },
+    /// Download the audio `file_id` of [`WireMessage::audio`]. The helper
+    /// answers [`WireEvent::VoiceReady`] or [`WireEvent::VoiceFailed`].
+    DownloadVoice {
+        file_id: i32,
+    },
     /// The user accepted the full-screen gate of this protocol in the app.
     AcknowledgeGate,
     /// Start pairing. `phone` is the optional number for a pair code. It is
@@ -182,6 +189,7 @@ impl WireCommand {
             Self::ResendMessage { .. } => "resend_message",
             Self::SendMedia { .. } => "send_media",
             Self::ViewChat { .. } => "view_chat",
+            Self::DownloadVoice { .. } => "download_voice",
             Self::AcknowledgeGate => "acknowledge_gate",
             Self::BeginLink { .. } => "begin_link",
             Self::CancelLink => "cancel_link",
@@ -313,6 +321,21 @@ pub struct WireMessage {
     /// message has no image, or when the helper did not download it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub photo: Option<WirePhoto>,
+    /// A voice note or an audio file of the message. The audio does not
+    /// cross with the message: [`WireCommand::DownloadVoice`] asks for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<WireAudio>,
+}
+
+/// The audio of a message. `file_id` is a handle of the helper for this
+/// run, not a file of a protocol server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireAudio {
+    /// Zero when the protocol does not say.
+    pub duration_secs: u32,
+    /// Positive.
+    pub file_id: i32,
 }
 
 /// An image of a message, as encoded bytes (WebP, PNG, or JPEG).
@@ -458,6 +481,16 @@ pub enum WireEvent {
     StoreAccess {
         reason: WireStoreAccess,
     },
+    /// The audio `file_id` is a local file now. The helper keeps the file
+    /// in its own folder. The path is absolute.
+    VoiceReady {
+        file_id: i32,
+        path: String,
+    },
+    /// The audio `file_id` did not download.
+    VoiceFailed {
+        file_id: i32,
+    },
 }
 
 /// Why the helper could not use the session key.
@@ -495,6 +528,8 @@ impl WireEvent {
             Self::Qr { .. } => "qr",
             Self::PairCode { .. } => "pair_code",
             Self::StoreAccess { .. } => "store_access",
+            Self::VoiceReady { .. } => "voice_ready",
+            Self::VoiceFailed { .. } => "voice_failed",
         }
     }
 }
@@ -526,6 +561,7 @@ mod tests {
             sent_at: 1_790_000_000,
             arrival: WireArrival::Live,
             photo: None,
+            audio: None,
         }
     }
 

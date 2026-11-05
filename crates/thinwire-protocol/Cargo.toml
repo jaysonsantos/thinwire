@@ -30,7 +30,15 @@ slack-oauth = [
 ]
 # Bot/OAuth guild inbox spike via twilight. Default CI stays feature-off.
 # No user-token client. Never put a Discord token in CI or the MIT tree.
-discord-bot = ["dep:twilight-http", "dep:twilight-model", "dep:rustls"]
+discord-bot = [
+  "dep:twilight-http",
+  "dep:twilight-model",
+  "dep:rustls",
+  "dep:hyper",
+  "dep:hyper-util",
+  "dep:hyper-rustls",
+  "dep:http-body-util",
+]
 # Test support: the adapter contract kit (`thinwire_protocol::contract`,
 # ADR 0010) for adapter crates such as thinwire-signal. Only a
 # dev-dependency turns it on. The app never does.
@@ -58,6 +66,23 @@ twilight-model = { version = "0.18.0", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = [
   "ring",
 ] }
+# A Discord audio attachment downloads from the CDN for the player. These are
+# the HTTP crates of twilight-http, so the tree gets no new crate.
+hyper = { version = "1", optional = true, default-features = false, features = [
+  "client",
+  "http1",
+] }
+hyper-util = { version = "0.1", optional = true, default-features = false, features = [
+  "client-legacy",
+  "http1",
+  "tokio",
+] }
+hyper-rustls = { version = "0.27", optional = true, default-features = false, features = [
+  "http1",
+  "native-tokio",
+  "ring",
+] }
+http-body-util = { version = "0.1", optional = true }
 dirs.workspace = true
 getrandom = "0.4"
 # SQLCipher amalgamation plus vendored OpenSSL. `default-features = false`

@@ -13,5 +13,6 @@
 mod signal;
 
 pub use signal::{
-    SessionLock, SessionLockError, SignalAdapter, lock_session, set_account, set_session_dir,
+    SessionLock, SessionLockError, SignalAdapter, clear_voice_files, lock_session, set_account,
+    set_session_dir,
 };

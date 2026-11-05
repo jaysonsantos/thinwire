@@ -364,7 +364,9 @@ mod tests {
 
     use rodio::source::Source;
 
-    use super::{MAX_DECODED_SAMPLES, VoiceDecode, decode_opus, voice_buffer};
+    use thinwire_protocol::AudioPath;
+
+    use super::{MAX_DECODED_SAMPLES, VoiceDecode, decode_opus, read_voice, voice_buffer};
 
     #[test]
     fn bytes_that_are_not_ogg_opus_are_refused() {
@@ -394,6 +396,30 @@ mod tests {
             decode_opus(Cursor::new(bytes), count - 1),
             VoiceDecode::Rejected
         ));
+    }
+
+    /// Signal voice notes are AAC, in M4A or in ADTS. Audio files can be
+    /// MP3. Each one decodes through the path that the player uses. The
+    /// samples are 0.4 s of a 440 Hz tone, made with ffmpeg.
+    #[test]
+    fn aac_and_mp3_files_decode_for_the_player() {
+        let dir = std::env::temp_dir()
+            .join("thinwire-engine-tests")
+            .join(std::process::id().to_string());
+        std::fs::create_dir_all(&dir).expect("dir");
+        for (name, bytes) in [
+            ("voice.m4a", &include_bytes!("fixtures/voice.m4a")[..]),
+            ("voice.aac", &include_bytes!("fixtures/voice.aac")[..]),
+            ("audio.mp3", &include_bytes!("fixtures/audio.mp3")[..]),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).expect("write");
+            let audio = AudioPath::new(path.to_string_lossy().into_owned()).expect("path");
+            let buffer = read_voice(&audio).unwrap_or_else(|()| panic!("{name} decodes"));
+            assert_eq!(buffer.channels().get(), 1, "{name}");
+            assert!(buffer.into_iter().count() > 1_000, "{name} has samples");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

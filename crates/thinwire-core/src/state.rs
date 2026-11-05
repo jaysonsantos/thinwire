@@ -5978,9 +5978,7 @@ impl Snapshot {
         message_id: &str,
         file_id: i32,
     ) {
-        if protocol != ProtocolId::Telegram {
-            return;
-        }
+        // Every adapter that sets audio on a message can download it.
         if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
             return;
         }

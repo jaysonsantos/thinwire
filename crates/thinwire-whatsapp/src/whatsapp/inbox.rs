@@ -11,8 +11,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use thinwire_protocol::{
-    AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ImageBytes, MessagePhoto,
-    PhotoSize, ProtocolId,
+    AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ImageBytes, MessageAudio,
+    MessagePhoto, PhotoSize, ProtocolId,
 };
 
 /// Prefix on every WhatsApp conversation id. The rest is the chat JID.
@@ -113,6 +113,23 @@ impl Sticker {
     }
 }
 
+/// A voice note or an audio file on a message. It downloads when the user
+/// presses Play.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Voice {
+    /// Zero when the message does not say.
+    pub seconds: u32,
+    pub media: MediaRef,
+}
+
+/// The handle of the audio of one message for `DownloadVoice`. The same
+/// message has the same handle in every run, so a row from before a helper
+/// restart still downloads. Always positive.
+pub(super) fn voice_file_id(jid: &str, id: &str) -> i32 {
+    let low = u32::try_from(hash_of(&(jid, id)) & 0x7fff_ffff).unwrap_or(1);
+    i32::try_from(low).unwrap_or(1).max(1)
+}
+
 /// The display size of a sticker: the longest side is [`STICKER_SIDE`]. A
 /// sticker with no size is a square.
 fn sticker_side(width: u32, height: u32) -> (u32, u32) {
@@ -165,6 +182,8 @@ pub(super) struct WaMessage {
     pub timestamp: i64,
     /// The sticker of a sticker message. `body` is then "[sticker]".
     pub sticker: Option<Sticker>,
+    /// The audio of a voice note or an audio message.
+    pub voice: Option<Voice>,
 }
 
 /// One conversation from a history-sync chunk.
@@ -578,6 +597,7 @@ impl Inbox {
                         body: message.body,
                         timestamp: message.timestamp,
                         sticker: None,
+                        voice: None,
                     })
                     .collect(),
                 ..ChatRecord::default()
@@ -598,6 +618,21 @@ impl Inbox {
             .collect();
         *self = Self::default();
         removed
+    }
+
+    /// The audio of the message with the handle `file_id`, while the
+    /// message is in the cache.
+    pub(super) fn voice_media(&self, file_id: i32) -> Option<MediaRef> {
+        self.chats.iter().find_map(|(jid, record)| {
+            record
+                .messages
+                .iter()
+                .find(|message| {
+                    message.voice.is_some() && voice_file_id(jid, &message.id) == file_id
+                })
+                .and_then(|message| message.voice.as_ref())
+                .map(|voice| voice.media.clone())
+        })
     }
 
     /// The sticker downloads for the rows in `events`. Each sticker asks
@@ -914,6 +949,7 @@ impl Inbox {
             body: body.to_string(),
             timestamp: now,
             sticker: None,
+            voice: None,
         };
         let record = self.chats.entry(jid.to_string()).or_default();
         record.timestamp = record.timestamp.max(now);
@@ -1190,7 +1226,13 @@ impl Inbox {
             topic: None,
             links: Vec::new(),
             photo,
-            audio: None,
+            audio: message.voice.as_ref().and_then(|voice| {
+                MessageAudio::new(
+                    voice.seconds,
+                    voice_file_id(&message.chat_jid, &message.id),
+                    None,
+                )
+            }),
         }
     }
 }
@@ -1302,6 +1344,7 @@ pub(super) mod tests {
             body: body.into(),
             timestamp: ts,
             sticker: None,
+            voice: None,
         }
     }
 

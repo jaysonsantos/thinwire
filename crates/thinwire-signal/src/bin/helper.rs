@@ -135,6 +135,9 @@ async fn run(cli: Cli) -> i32 {
             return exit::REFUSED;
         }
     };
+    // The audio files of an earlier run are plain audio. This run has the
+    // lock, so no other helper writes there.
+    thinwire_signal::clear_voice_files();
     let config = ServeConfig {
         helper_version: env!("CARGO_PKG_VERSION"),
         // Signal links with a QR only: no phone number crosses the pipe.

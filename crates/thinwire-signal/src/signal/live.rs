@@ -98,6 +98,9 @@ const SIGNAL_ATTACHMENTS: usize = 32;
 
 /// One page of stored history. The same size as the Telegram older page.
 const HISTORY_PAGE: usize = 50;
+
+/// Photo and audio downloads that run at one time.
+const MEDIA_DOWNLOADS: usize = 4;
 /// Rows one store read may return. One extra row is the older-page cursor.
 /// One more tells the page that older rows exist. The store primary key is
 /// `(ts, thread_id)`, so a time window can still hold more rows than a page.
@@ -127,6 +130,8 @@ pub(super) enum WorkerJob {
     /// The user opened or left a chat. The id is the chat at enqueue time.
     /// Clear that chat's unread count.
     Viewed(Option<String>),
+    /// Download the audio of this handle for the player.
+    Voice(i32),
 }
 
 pub(super) struct Session {
@@ -146,6 +151,10 @@ pub(super) struct Session {
     /// One retained publish at a time. The pre-link task and the post-link
     /// publish share it, so their reset and settled lines cannot cross.
     retained_lock: Arc<Mutex<()>>,
+    /// Photos and audio handles of the live account.
+    media: Arc<super::media::MediaBook>,
+    /// Photo and audio downloads that run at one time.
+    downloads: Arc<tokio::sync::Semaphore>,
     /// Tests pause the pre-link publish here. Production builds have no pause.
     #[cfg(test)]
     prelink_hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -165,6 +174,8 @@ impl Session {
             history_resume: std::sync::Mutex::new(HashMap::new()),
             resume_only: AtomicBool::new(false),
             retained_lock: Arc::new(Mutex::new(())),
+            media: Arc::default(),
+            downloads: Arc::new(tokio::sync::Semaphore::new(MEDIA_DOWNLOADS)),
             #[cfg(test)]
             prelink_hold: std::sync::Mutex::new(None),
         }
@@ -308,6 +319,15 @@ impl Session {
 
     pub(super) fn request_refresh(&self) -> bool {
         self.enqueue(WorkerJob::Refresh)
+    }
+
+    /// Queue the download of the audio `file_id`. `false`: no worker runs.
+    pub(super) fn request_voice(&self, file_id: i32) -> bool {
+        self.enqueue(WorkerJob::Voice(file_id))
+    }
+
+    pub(super) fn media(&self) -> &super::media::MediaBook {
+        &self.media
     }
 
     /// Queue a clear for the chat just opened or left.
@@ -1953,6 +1973,7 @@ async fn run_linked(
                                         &mut group_titles,
                                     )
                                     .await;
+                                    let viewed = session.viewed();
                                     emit_incoming(
                                         &events,
                                         content.as_ref(),
@@ -1960,9 +1981,14 @@ async fn run_linked(
                                         &group_titles,
                                         &mut known,
                                         &mut unread,
-                                        session.viewed().as_deref(),
+                                        viewed.as_deref(),
                                         &mut rows,
+                                        Some(session.media()),
                                     );
+                                    // A photo of the open chat downloads now.
+                                    if let Some(viewed) = viewed.as_deref() {
+                                        start_photo_downloads(&manager, &session, token, &events, viewed);
+                                    }
                                 }
                             }
                             StreamPoll::Reconnect { after } => {
@@ -2055,6 +2081,7 @@ async fn run_linked(
                         &mut rows,
                     )
                     .await;
+                    start_photo_downloads(&manager, &session, token, &events, &conversation_id);
                 }
             }
             Some(WorkerJob::Refresh) => {
@@ -2066,10 +2093,20 @@ async fn run_linked(
                     }
                     Err(()) => fail(&events, SYNC_FAILED),
                 }
+                if let Some(viewed) = session.viewed() {
+                    start_photo_downloads(&manager, &session, token, &events, &viewed);
+                }
                 thinwire_protocol::emit_chat_list_loaded(&events, ProtocolId::Signal);
             }
             Some(WorkerJob::Viewed(conversation_id)) => {
+                // The photos of the chat the user opened download now.
+                if let Some(id) = conversation_id.as_deref() {
+                    start_photo_downloads(&manager, &session, token, &events, id);
+                }
                 clear_viewed(&events, &mut unread, &mut rows, conversation_id);
+            }
+            Some(WorkerJob::Voice(file_id)) => {
+                download_voice(&manager, &session, token, &events, file_id);
             }
             None => {}
         }
@@ -2154,7 +2191,15 @@ async fn publish_chats(
             session.stash_history_resume(chat_id, cursor);
         }
         for message in page.rows {
-            emit_content(events, &message, &names, &group_titles, rows, Some(unread));
+            emit_content(
+                events,
+                &message,
+                &names,
+                &group_titles,
+                rows,
+                Some(unread),
+                Some(session.media()),
+            );
         }
     }
     let groups = manager.store().groups().await.map_err(|_| ())?;
@@ -2180,7 +2225,15 @@ async fn publish_chats(
             session.stash_history_resume(chat_id, cursor);
         }
         for message in page.rows {
-            emit_content(events, &message, &names, &group_titles, rows, Some(unread));
+            emit_content(
+                events,
+                &message,
+                &names,
+                &group_titles,
+                rows,
+                Some(unread),
+                Some(session.media()),
+            );
         }
     }
     Ok((known, group_titles))
@@ -2472,11 +2525,13 @@ fn emit_retained_content(
     group_titles: &HashMap<String, String>,
     rows: &mut HashMap<String, Conversation>,
 ) {
+    // The history of a previous number shows labels: no download.
     let Some((mut conversation, mut message)) = row_and_message(
         content,
         names,
         group_titles,
         thinwire_protocol::Arrival::History,
+        None,
     ) else {
         return;
     };
@@ -2677,7 +2732,15 @@ async fn load_older_page(
     .await;
     let (page, more, note, cursor) = older_page_outcome(loaded);
     for message in page {
-        emit_content(events, &message, names, group_titles, rows, None);
+        emit_content(
+            events,
+            &message,
+            names,
+            group_titles,
+            rows,
+            None,
+            Some(session.media()),
+        );
     }
     let _ = events.send(AdapterEvent::OlderHistoryLoaded {
         protocol: ProtocolId::Signal,
@@ -3344,11 +3407,18 @@ fn remember_row(rows: &mut HashMap<String, Conversation>, conversation: &Convers
     rows.insert(conversation.id.clone(), conversation.clone());
 }
 
-fn sent_sync_body(sync: &presage::libsignal_service::proto::SyncMessage) -> Option<&str> {
+/// The text and the attachments of a transcript of a message that this
+/// account sent from another device.
+fn sent_sync_parts(
+    sync: &presage::libsignal_service::proto::SyncMessage,
+) -> (Option<&str>, &[presage::proto::AttachmentPointer]) {
     use presage::libsignal_service::proto::sync_message::Content as SyncContent;
-    match sync.content.as_ref()? {
-        SyncContent::Sent(sent) => sent.message.as_ref()?.body.as_deref(),
-        _ => None,
+    match sync.content.as_ref() {
+        Some(SyncContent::Sent(sent)) => match sent.message.as_ref() {
+            Some(message) => (message.body.as_deref(), message.attachments.as_slice()),
+            None => (None, &[]),
+        },
+        _ => (None, &[]),
     }
 }
 
@@ -3428,6 +3498,7 @@ fn emit_incoming(
     unread: &mut HashMap<String, u32>,
     viewed: Option<&str>,
     rows: &mut HashMap<String, Conversation>,
+    media: Option<&super::media::MediaBook>,
 ) {
     // The receive stream: a message that the server pushes now (#32).
     let Some((mut conversation, message)) = row_and_message(
@@ -3435,6 +3506,7 @@ fn emit_incoming(
         names,
         group_titles,
         thinwire_protocol::Arrival::Live,
+        media,
     ) else {
         return;
     };
@@ -3453,6 +3525,7 @@ fn emit_content(
     group_titles: &HashMap<String, String>,
     rows: &mut HashMap<String, Conversation>,
     unread: Option<&HashMap<String, u32>>,
+    media: Option<&super::media::MediaBook>,
 ) {
     // Stored messages (chat list, older pages): never notify.
     let Some((conversation, message)) = row_and_message(
@@ -3460,6 +3533,7 @@ fn emit_content(
         names,
         group_titles,
         thinwire_protocol::Arrival::History,
+        media,
     ) else {
         return;
     };
@@ -3477,14 +3551,27 @@ fn row_and_message(
     names: &HashMap<String, String>,
     group_titles: &HashMap<String, String>,
     arrival: thinwire_protocol::Arrival,
+    media: Option<&super::media::MediaBook>,
 ) -> Option<(Conversation, ChatMessage)> {
-    let incoming = match &content.body {
-        ContentBody::DataMessage(DataMessage { body, .. }) => {
-            super::message::Incoming::Data(body.as_deref())
+    let (text, attachments, sent) = match &content.body {
+        ContentBody::DataMessage(data) => {
+            (data.body.as_deref(), data.attachments.as_slice(), false)
         }
         ContentBody::SynchronizeMessage(sync) => {
-            super::message::Incoming::SentSync(sent_sync_body(sync))
+            let (text, attachments) = sent_sync_parts(sync);
+            (text, attachments, true)
         }
+        _ => (None, &[][..], false),
+    };
+    // A message with no text shows the label of its first attachment.
+    let caption = text.filter(|text| !text.is_empty());
+    let label = attachments
+        .first()
+        .map(|pointer| super::media::label(super::media::kind(pointer)));
+    let body = caption.or(label);
+    let incoming = match &content.body {
+        ContentBody::DataMessage(_) => super::message::Incoming::Data(body),
+        ContentBody::SynchronizeMessage(_) if sent => super::message::Incoming::SentSync(body),
         _ => super::message::Incoming::Other,
     };
     let shown = super::message::visible_text(incoming)?;
@@ -3517,7 +3604,7 @@ fn row_and_message(
     };
     let sent_millis =
         u64::try_from(content.metadata.client_timestamp.timestamp_millis()).unwrap_or(0);
-    let message = ChatMessage {
+    let mut message = ChatMessage {
         protocol: ProtocolId::Signal,
         conversation_id: conversation_id.clone(),
         id: signal_message_id(sent_millis, &contact_id(&content.metadata.sender)),
@@ -3536,6 +3623,9 @@ fn row_and_message(
         photo: None,
         audio: None,
     };
+    if let Some(media) = media {
+        media.dress(&mut message, attachments, caption);
+    }
     let conversation = Conversation {
         protocol: ProtocolId::Signal,
         id: conversation_id.clone(),
@@ -3760,6 +3850,98 @@ async fn wait_backoff(session: &Session, token: u64, delay: std::time::Duration)
     false
 }
 
+/// Start the photo downloads that wait for `conversation_id`. Each photo
+/// comes back as its row with the image. A result of an ended attempt is
+/// dropped.
+fn start_photo_downloads(
+    manager: &Manager<SqliteStore, Registered>,
+    session: &Arc<Session>,
+    token: u64,
+    events: &EventTx,
+    conversation_id: &str,
+) {
+    for job in session.media().take_jobs(conversation_id) {
+        let manager = manager.clone();
+        let session = Arc::clone(session);
+        let events = events.clone();
+        tokio::spawn(async move {
+            let _permit = Arc::clone(&session.downloads).acquire_owned().await.ok();
+            let bytes = manager.get_attachment(&job.pointer).await.ok();
+            let photo = match bytes {
+                Some(bytes) => {
+                    tokio::task::spawn_blocking(move || super::media::photo_from_bytes(&bytes))
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                None => None,
+            };
+            if photo.is_none() {
+                tracing::debug!("a signal photo did not download");
+            }
+            if !session.is_current(token) {
+                return;
+            }
+            if let Some(message) = session.media().finish(job, photo) {
+                emit_message(&events, message);
+            }
+        });
+    }
+}
+
+/// Download the audio `file_id` into the voice folder. The answer is
+/// `VoiceReady`, or `VoiceFailed` when no row has the handle, or when the
+/// download or the write failed.
+fn download_voice(
+    manager: &Manager<SqliteStore, Registered>,
+    session: &Arc<Session>,
+    token: u64,
+    events: &EventTx,
+    file_id: i32,
+) {
+    let failed = move |events: &EventTx| {
+        let _ = events.send(AdapterEvent::VoiceFailed {
+            protocol: ProtocolId::Signal,
+            file_id,
+        });
+    };
+    let (Some(pointer), Ok(dir)) = (session.media().voice(file_id), super::path::voice_dir())
+    else {
+        failed(events);
+        return;
+    };
+    let manager = manager.clone();
+    let session = Arc::clone(session);
+    let events = events.clone();
+    tokio::spawn(async move {
+        let _permit = Arc::clone(&session.downloads).acquire_owned().await.ok();
+        let stored = match manager.get_attachment(&pointer).await {
+            Ok(bytes) => tokio::task::spawn_blocking(move || {
+                thinwire_protocol::voice_files::store(&dir, file_id, &bytes).map_err(|_| ())
+            })
+            .await
+            .unwrap_or(Err(())),
+            Err(_) => Err(()),
+        };
+        if !session.is_current(token) {
+            return;
+        }
+        match stored {
+            Ok(path) => {
+                let _ = events.send(AdapterEvent::VoiceReady {
+                    protocol: ProtocolId::Signal,
+                    file_id,
+                    path,
+                });
+            }
+            Err(()) => {
+                tracing::debug!("a signal audio file did not download");
+                failed(&events);
+            }
+        }
+    });
+}
+
 fn fail(events: &EventTx, detail: &str) {
     emit_status(events, ProtocolId::Signal, AdapterStatus::Error, detail);
 }
@@ -3839,6 +4021,7 @@ mod tests {
             unread,
             viewed,
             &mut rows,
+            None,
         );
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -3867,7 +4050,15 @@ mod tests {
         );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut rows = HashMap::new();
-        emit_content(&tx, &content, &names, &HashMap::new(), &mut rows, None);
+        emit_content(
+            &tx,
+            &content,
+            &names,
+            &HashMap::new(),
+            &mut rows,
+            None,
+            None,
+        );
         let mut stored = Vec::new();
         while let Ok(event) = rx.try_recv() {
             stored.push(event);
@@ -3876,6 +4067,87 @@ mod tests {
             arrival_of(stored),
             Some(thinwire_protocol::Arrival::History),
             "a stored message never notifies"
+        );
+    }
+
+    /// A message with only an attachment is not dropped: it shows the label
+    /// of the attachment. With the media book of the live account, a photo
+    /// waits for its chat and a voice note gets a handle. A caption stays the
+    /// body.
+    #[test]
+    fn an_attachment_message_shows_a_label_and_its_media() {
+        let attachment = |content_type: &str, flags: u32| presage::proto::AttachmentPointer {
+            content_type: Some(content_type.into()),
+            flags: Some(flags),
+            size: Some(1_000),
+            ..Default::default()
+        };
+        let photo = envelope(
+            Uuid::from_u128(7),
+            DataMessage {
+                attachments: vec![attachment("image/jpeg", 0)],
+                ..Default::default()
+            },
+        );
+        let book = super::super::media::MediaBook::default();
+        let names = HashMap::new();
+        let (_, message) = row_and_message(
+            &photo,
+            &names,
+            &HashMap::new(),
+            thinwire_protocol::Arrival::Live,
+            Some(&book),
+        )
+        .expect("a row");
+        assert_eq!(message.body, "[photo]");
+        assert!(message.photo.is_none(), "the photo downloads later");
+        assert_eq!(book.take_jobs(&message.conversation_id).len(), 1);
+
+        let voice = envelope(
+            Uuid::from_u128(7),
+            DataMessage {
+                body: Some("listen".into()),
+                attachments: vec![attachment("audio/aac", 1)],
+                ..Default::default()
+            },
+        );
+        let (_, message) = row_and_message(
+            &voice,
+            &names,
+            &HashMap::new(),
+            thinwire_protocol::Arrival::Live,
+            Some(&book),
+        )
+        .expect("a row");
+        assert_eq!(message.body, "listen");
+        let audio = message.audio.expect("audio");
+        assert_eq!(
+            audio.file_id(),
+            super::super::media::voice_file_id(&message.id)
+        );
+        assert!(book.voice(audio.file_id()).is_some());
+
+        // A previous number has no media book: the label only.
+        let (_, label_only) = row_and_message(
+            &voice,
+            &names,
+            &HashMap::new(),
+            thinwire_protocol::Arrival::History,
+            None,
+        )
+        .expect("a row");
+        assert!(label_only.audio.is_none());
+        let empty = envelope(Uuid::from_u128(7), DataMessage::default());
+        assert!(
+            row_and_message(
+                &empty,
+                &names,
+                &HashMap::new(),
+                thinwire_protocol::Arrival::Live,
+                None
+            )
+            .is_none(),
+            "no text and no attachment stays hidden"
         );
     }
 
@@ -7235,6 +7507,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             &mut unread,
             None,
             &mut rows,
+            None,
         );
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -7932,6 +8205,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             &mut unread,
             None,
             &mut rows,
+            None,
         );
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -8295,6 +8569,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             &HashMap::new(),
             &mut rows,
             Some(&unread),
+            None,
         );
         let mut counts = Vec::new();
         while let Ok(event) = rx.try_recv() {

@@ -98,7 +98,9 @@ impl fmt::Debug for AudioPath {
     }
 }
 
-/// One Telegram voice note the user can play.
+/// One voice note or audio file the user can play. `file_id` names the
+/// download for its adapter: a TDLib file, or a handle of a helper or an
+/// in-app adapter for this run.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MessageAudio {
     duration_secs: u32,
@@ -111,11 +113,18 @@ impl MessageAudio {
     /// `None` when `file_id` is not positive. A negative duration becomes 0.
     #[must_use]
     pub fn telegram(duration_secs: i32, file_id: i32, file: Option<AudioPath>) -> Option<Self> {
+        Self::new(u32::try_from(duration_secs).unwrap_or(0), file_id, file)
+    }
+
+    /// `None` when `file_id` is not positive. A zero duration means that the
+    /// protocol does not say.
+    #[must_use]
+    pub fn new(duration_secs: u32, file_id: i32, file: Option<AudioPath>) -> Option<Self> {
         if file_id <= 0 {
             return None;
         }
         Some(Self {
-            duration_secs: u32::try_from(duration_secs).unwrap_or(0),
+            duration_secs,
             file_id,
             file,
             failed: false,

@@ -140,6 +140,23 @@ fn message_summary(message: Message) -> MessageSummary {
     let author = message.author.global_name.unwrap_or(message.author.name);
     let mut images = 0;
     let mut files = 0;
+    let voice = message.flags.is_some_and(|flags| {
+        flags.contains(twilight_model::channel::message::MessageFlags::IS_VOICE_MESSAGE)
+    });
+    let audio = message
+        .attachments
+        .iter()
+        .find(|attachment| {
+            attachment
+                .content_type
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("audio/"))
+        })
+        .map(|attachment| super::api::AudioSummary {
+            url: attachment.url.clone(),
+            duration_secs: whole_seconds(attachment.duration_secs),
+            voice,
+        });
     for attachment in &message.attachments {
         if attachment
             .content_type
@@ -160,6 +177,21 @@ fn message_summary(message: Message) -> MessageSummary {
         files,
         embeds: message.embeds.len(),
         stickers: message.sticker_items.len(),
+        audio,
+    }
+}
+
+/// Whole seconds of a Discord duration. Zero when it is missing or not a
+/// usable number.
+fn whole_seconds(duration: Option<f64>) -> u32 {
+    let Some(seconds) = duration.map(f64::round) else {
+        return 0;
+    };
+    if seconds.is_finite() && (0.0..=f64::from(u32::MAX)).contains(&seconds) {
+        // In range and whole: the cast keeps the value.
+        seconds as u32
+    } else {
+        0
     }
 }
 
@@ -261,6 +293,10 @@ impl DiscordApi for TwilightApi {
                 .map_err(|_| DiscordApiError::Transport)?;
             Ok(message_summary(message))
         })
+    }
+
+    fn download(&self, url: String) -> ApiFuture<'_, Vec<u8>> {
+        Box::pin(async move { super::download::fetch(&url).await })
     }
 
     fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary> {

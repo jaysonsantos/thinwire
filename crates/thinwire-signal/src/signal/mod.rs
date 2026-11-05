@@ -11,7 +11,9 @@ mod device;
 mod group;
 mod message;
 mod path;
-pub use path::{SessionLock, SessionLockError, lock_session, set_account, set_session_dir};
+pub use path::{
+    SessionLock, SessionLockError, clear_voice_files, lock_session, set_account, set_session_dir,
+};
 mod reconnect;
 mod time;
 mod wake;
@@ -20,6 +22,8 @@ mod wake;
 mod cipher;
 #[cfg(feature = "signal-local")]
 mod live;
+#[cfg(feature = "signal-local")]
+mod media;
 #[cfg(feature = "signal-local")]
 mod owner;
 
@@ -720,6 +724,23 @@ impl ProtocolAdapter for SignalAdapter {
                 request,
                 ..
             } => self.send_media(&conversation_id, &caption, files, request, events),
+            AdapterCommand::DownloadVoice {
+                protocol: ProtocolId::Signal,
+                file_id,
+            } => {
+                let queued = match &self.engine {
+                    Engine::Sync(_) => false,
+                    #[cfg(feature = "signal-local")]
+                    Engine::Live(session) => session.request_voice(file_id),
+                };
+                if !queued {
+                    let _ = events.send(AdapterEvent::VoiceFailed {
+                        protocol: ProtocolId::Signal,
+                        file_id,
+                    });
+                }
+                Ok(())
+            }
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Signal,
                 reason: "command is not handled by the Signal adapter",

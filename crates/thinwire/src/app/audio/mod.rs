@@ -2,7 +2,7 @@ mod engine;
 
 use eframe::egui::{self, RichText};
 use thinwire_core::Intent;
-use thinwire_protocol::{AudioPath, ChatMessage, MessageAudio, ProtocolId, ProtocolKind};
+use thinwire_protocol::{AudioPath, ChatMessage, MessageAudio, ProtocolId};
 
 use super::motion;
 use super::theme;
@@ -89,20 +89,12 @@ fn click(session: &Session, key: VoiceKey, note: NoteState) -> Transition {
     let leaving_play = matches!(session, Session::Playing(_));
     match note {
         NoteState::Local { path } => playing(key, path),
-        NoteState::Remote { file_id } | NoteState::Broken { file_id }
-            if key.protocol.is(ProtocolKind::Telegram) =>
-        {
+        // Every adapter that sets audio on a message can download it.
+        NoteState::Remote { file_id } | NoteState::Broken { file_id } => {
             if leaving_play {
                 waiting_stop(key, file_id)
             } else {
                 waiting(key, file_id)
-            }
-        }
-        NoteState::Remote { .. } | NoteState::Broken { .. } => {
-            if leaving_play {
-                failed_stop(key)
-            } else {
-                failed(key)
             }
         }
     }
@@ -374,6 +366,8 @@ fn same_message(message: &ChatMessage, key: &VoiceKey) -> bool {
 fn paint(ui: &mut egui::Ui, face: Face, audio: &MessageAudio) -> bool {
     let palette = theme::palette(ui);
     match face {
+        // Signal and some audio files do not say how long they are.
+        Face::Play if audio.duration_secs() == 0 => voice_button(ui, "Play"),
         Face::Play => voice_button(ui, &format!("Play {}", clock(audio.duration_secs()))),
         Face::Pause => voice_button(ui, "Pause"),
         Face::Loading => {
@@ -499,16 +493,17 @@ mod tests {
             Session::Waiting(k.clone()),
             std::slice::from_ref(&download),
         );
-        let mut slack = k.clone();
-        slack.protocol = ProtocolId::Slack;
+        // A helper protocol downloads its audio too.
+        let mut signal = k.clone();
+        signal.protocol = ProtocolId::Signal;
         assert_step(
             &Session::Idle,
             Input::Click {
-                key: slack.clone(),
+                key: signal.clone(),
                 note: NoteState::Remote { file_id: 42 },
             },
-            Session::Failed(slack),
-            &[],
+            Session::Waiting(signal),
+            std::slice::from_ref(&download),
         );
         assert_step(
             &Session::Idle,

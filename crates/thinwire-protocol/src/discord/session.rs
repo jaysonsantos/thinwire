@@ -295,6 +295,10 @@ enum Msg {
     View {
         conversation_id: Option<String>,
     },
+    /// Download the audio of this handle for the player.
+    Voice {
+        file_id: i32,
+    },
     ReloadDone {
         ticket: u64,
         result: Result<(u64, Vec<InboxChannel>), DiscordApiError>,
@@ -471,6 +475,7 @@ impl Session {
             shutdown: None,
             pending_end: None,
             settle_armed: false,
+            voices: HashMap::new(),
         };
         let _ = tx.send(Msg::Reload);
         tokio::spawn(owner.run(rx, handoff));
@@ -582,6 +587,12 @@ impl Session {
     /// answers with `CommandFailed`.
     pub(crate) fn view(&self, conversation_id: Option<String>) {
         let _ = self.tx.send(Msg::View { conversation_id });
+    }
+
+    /// Download the audio `file_id`. The answer is `VoiceReady` or
+    /// `VoiceFailed`. `false`: the owner is gone.
+    pub(crate) fn voice(&self, file_id: i32) -> bool {
+        self.tx.send(Msg::Voice { file_id }).is_ok()
     }
 
     fn check_ready(&self) -> Result<(), AdapterError> {
@@ -779,9 +790,52 @@ struct Owner {
     pending_end: Option<AccountEnd>,
     /// The settle timer is already armed.
     settle_armed: bool,
+    /// The CDN address of each audio handle of a history row.
+    voices: HashMap<i32, String>,
 }
 
 impl Owner {
+    /// Download the audio `file_id` into the voice folder. The answer is
+    /// `VoiceReady`, or `VoiceFailed` when no history row has the handle,
+    /// or when the download or the write failed.
+    fn download_voice(&mut self, file_id: i32) {
+        let events = self.events.clone();
+        let failed = move |events: &EventTx| {
+            let _ = events.send(AdapterEvent::VoiceFailed {
+                protocol: ProtocolId::Discord,
+                file_id,
+            });
+        };
+        let (Some(url), Ok(dir)) = (self.voices.get(&file_id).cloned(), super::voice_dir()) else {
+            failed(&events);
+            return;
+        };
+        let api = Arc::clone(&self.api);
+        tokio::spawn(async move {
+            let stored = match api.download(url).await {
+                Ok(bytes) => tokio::task::spawn_blocking(move || {
+                    crate::voice_files::store(&dir, file_id, &bytes).map_err(|_| ())
+                })
+                .await
+                .unwrap_or(Err(())),
+                Err(_) => Err(()),
+            };
+            match stored {
+                Ok(path) => {
+                    let _ = events.send(AdapterEvent::VoiceReady {
+                        protocol: ProtocolId::Discord,
+                        file_id,
+                        path,
+                    });
+                }
+                Err(()) => {
+                    tracing::debug!("a discord audio file did not download");
+                    failed(&events);
+                }
+            }
+        });
+    }
+
     async fn run(
         mut self,
         mut rx: mpsc::UnboundedReceiver<Msg>,
@@ -836,6 +890,7 @@ impl Owner {
                     );
                 }
             }
+            Msg::Voice { file_id } => self.download_voice(file_id),
             Msg::ReloadDone { ticket, result } => self.reload_done(ticket, result),
             Msg::PreviewCheck {
                 ticket,
@@ -1345,6 +1400,12 @@ impl Owner {
         match result {
             Ok(messages) => {
                 let bot_id = self.bot_id.unwrap_or_default();
+                for message in &messages {
+                    if let Some(audio) = &message.audio {
+                        self.voices
+                            .insert(super::inbox::voice_file_id(message.id), audio.url.clone());
+                    }
+                }
                 let rows: Vec<ChatMessage> = messages
                     .iter()
                     .rev()

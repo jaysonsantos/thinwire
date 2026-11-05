@@ -72,6 +72,28 @@ pub(crate) struct MessageSummary {
     pub files: usize,
     pub embeds: usize,
     pub stickers: usize,
+    /// The first audio attachment: a voice message or an audio file.
+    pub audio: Option<AudioSummary>,
+}
+
+/// An audio attachment of a message. `Debug` shows no URL.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AudioSummary {
+    /// The CDN address of the file.
+    pub url: String,
+    /// Zero when Discord does not say.
+    pub duration_secs: u32,
+    /// A voice message, not an audio file.
+    pub voice: bool,
+}
+
+impl std::fmt::Debug for AudioSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioSummary")
+            .field("duration_secs", &self.duration_secs)
+            .field("voice", &self.voice)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Discord HTTP failure. Never carries a token or a response body.
@@ -148,6 +170,12 @@ pub(crate) trait DiscordApi: Send + Sync {
         body: String,
         files: Vec<UploadFile>,
     ) -> ApiFuture<'_, MessageSummary>;
+
+    /// Download one attachment from the Discord CDN. A client with no HTTP
+    /// download refuses.
+    fn download(&self, _url: String) -> ApiFuture<'_, Vec<u8>> {
+        Box::pin(async { Err(DiscordApiError::Transport) })
+    }
 
     /// Set by tests. The live client leaves this empty.
     ///

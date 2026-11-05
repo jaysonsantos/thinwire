@@ -213,7 +213,15 @@ pub(crate) fn message_body(message: &MessageSummary) -> String {
     if message.images > 0 {
         labels.push("[image]");
     }
-    if message.files > 0 {
+    if let Some(audio) = &message.audio {
+        labels.push(if audio.voice {
+            "[voice message]"
+        } else {
+            "[audio]"
+        });
+    }
+    // The audio attachment is one of the files.
+    if message.files > usize::from(message.audio.is_some()) {
         labels.push("[attachment]");
     }
     if message.embeds > 0 {
@@ -249,8 +257,20 @@ pub(crate) fn chat_message(
         topic: None,
         links: Vec::new(),
         photo: None,
-        audio: None,
+        audio: message.audio.as_ref().and_then(|audio| {
+            crate::MessageAudio::new(audio.duration_secs, voice_file_id(message.id), None)
+        }),
     }
+}
+
+/// The handle of the audio of one message for `DownloadVoice`. The same
+/// message has the same handle in every run. Always positive.
+#[must_use]
+pub(crate) fn voice_file_id(message_id: u64) -> i32 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(message_id);
+    let low = u32::try_from(hash & 0x7fff_ffff).unwrap_or(1);
+    i32::try_from(low).unwrap_or(1).max(1)
 }
 
 /// Discord snowflake epoch, 2015-01-01T00:00:00Z, in milliseconds.
@@ -285,6 +305,7 @@ mod tests {
                 files: 0,
                 embeds: 0,
                 stickers: 0,
+                audio: None,
             },
         );
         assert_eq!(row.sent_at, 1_700_000_000);
@@ -316,6 +337,7 @@ mod tests {
             files: 0,
             embeds: 0,
             stickers: 0,
+            audio: None,
         };
         assert_eq!(message_body(&row), "hello");
         row.content.clear();

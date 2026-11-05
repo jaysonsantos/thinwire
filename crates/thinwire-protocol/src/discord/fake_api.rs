@@ -30,6 +30,8 @@ pub(crate) struct FakeState {
     pub sent: Vec<(u64, String)>,
     /// Each file send: the channel, the text, and the file names.
     pub sent_files: Vec<(u64, String, Vec<String>)>,
+    /// The bytes of each CDN address that a download can read.
+    pub downloads: HashMap<String, Vec<u8>>,
     /// Every call returns 401 until this is cleared. A revoked bot token.
     pub unauthorized: bool,
     pub send_error: Option<DiscordApiError>,
@@ -104,6 +106,7 @@ fn message(id: u64, author_id: u64, author: &str, content: &str) -> MessageSumma
         files: 0,
         embeds: 0,
         stickers: 0,
+        audio: None,
     }
 }
 
@@ -367,6 +370,18 @@ impl DiscordApi for FakeDiscordApi {
             let names = files.into_iter().map(|file| file.name).collect();
             state.sent_files.push((channel_id, body.clone(), names));
             Ok(message(id, BOT_ID, "thinwire-bot", &body))
+        })
+    }
+
+    fn download(&self, url: String) -> ApiFuture<'_, Vec<u8>> {
+        Box::pin(async move {
+            self.check_token()?;
+            let state = self.state();
+            state
+                .downloads
+                .get(&url)
+                .cloned()
+                .ok_or(DiscordApiError::NotFound)
         })
     }
 }

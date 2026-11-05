@@ -8,6 +8,8 @@
 
 #[cfg(any(test, feature = "discord-bot"))]
 mod api;
+#[cfg(feature = "discord-bot")]
+mod download;
 #[cfg(test)]
 mod fake_api;
 #[cfg(any(test, feature = "discord-bot"))]
@@ -18,6 +20,21 @@ mod permissions;
 #[cfg(any(test, feature = "discord-bot"))]
 mod session;
 mod token;
+
+/// The folder of the audio files of the player. Every Discord account uses
+/// it: a file name is the handle of one message. A test writes in the temp
+/// folder, never in the cache folder of the user.
+#[cfg(any(test, feature = "discord-bot"))]
+fn voice_dir() -> Result<std::path::PathBuf, ()> {
+    if cfg!(test) {
+        return Ok(std::env::temp_dir()
+            .join("thinwire-discord-voice-tests")
+            .join(std::process::id().to_string()));
+    }
+    dirs::cache_dir()
+        .map(|dir| dir.join("thinwire").join("discord").join("voice"))
+        .ok_or(())
+}
 #[cfg(feature = "discord-bot")]
 mod twilight;
 
@@ -398,6 +415,18 @@ impl DiscordAdapter {
         self.session_mut()?.open(conversation_id)
     }
 
+    /// `false` when no session can download.
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn download_voice(&mut self, file_id: i32) -> bool {
+        self.session_mut()
+            .is_ok_and(|session| session.voice(file_id))
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn download_voice(&mut self, _file_id: i32) -> bool {
+        false
+    }
+
     #[cfg(any(test, feature = "discord-bot"))]
     fn send_text(
         &mut self,
@@ -532,6 +561,11 @@ impl ProtocolAdapter for DiscordAdapter {
             bot_inbox = Self::bot_inbox_compiled(),
             "discord adapter start (bot/oauth inbox; self-bots refused)"
         );
+        // The audio files of an earlier run are plain audio.
+        #[cfg(feature = "discord-bot")]
+        if let (Ok(dir), Ok(runtime)) = (voice_dir(), tokio::runtime::Handle::try_current()) {
+            runtime.spawn_blocking(move || crate::voice_files::clear(&dir));
+        }
         // A refused token already emitted one Refused and one Unlinked.
         let _ = self.connect_bot_inbox(&events);
     }
@@ -681,6 +715,18 @@ impl ProtocolAdapter for DiscordAdapter {
                 message_id,
                 request,
             } => self.resend(conversation_id, message_id, request, events),
+            AdapterCommand::DownloadVoice {
+                protocol: ProtocolId::Discord,
+                file_id,
+            } => {
+                if !self.download_voice(file_id) {
+                    let _ = events.send(crate::AdapterEvent::VoiceFailed {
+                        protocol: ProtocolId::Discord,
+                        file_id,
+                    });
+                }
+                Ok(())
+            }
             _ => Err(AdapterError::Unavailable {
                 protocol: ProtocolId::Discord,
                 reason: "command is not handled by the Discord adapter",
@@ -1040,6 +1086,7 @@ mod tests {
                 files: 0,
                 embeds: 0,
                 stickers: 0,
+                audio: None,
             }],
         );
         // A 500 is `Rejected`, not Forbidden or NotFound.
@@ -1286,6 +1333,102 @@ mod tests {
         assert_eq!(rows[0].sender, "alice");
         assert!(!rows[0].outbound);
         assert!(rows[2].outbound, "bot {BOT_ID} messages are outbound");
+    }
+
+    /// A voice message in the history has a player. Play downloads it from
+    /// the CDN into the voice folder. A handle with no history row fails.
+    #[tokio::test]
+    async fn a_voice_message_downloads_for_the_player() {
+        const URL: &str = "https://cdn.discordapp.com/attachments/1/2/voice-message.ogg";
+        let fake = FakeDiscordApi::guild_fixture();
+        {
+            let mut state = fake.state();
+            let history = state.history.get_mut(&GENERAL).expect("general");
+            let row = history
+                .iter_mut()
+                .find(|message| message.id == 2)
+                .expect("the empty message");
+            row.files = 1;
+            row.audio = Some(super::api::AudioSummary {
+                url: URL.into(),
+                duration_secs: 3,
+                voice: true,
+            });
+            state.downloads.insert(URL.into(), b"OggS-voice".to_vec());
+        }
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+            )
+        })
+        .await;
+        let rows = messages(&events);
+        let voice = rows
+            .iter()
+            .find(|row| row.body == "[voice message]")
+            .expect("the voice row");
+        let audio = voice.audio.as_ref().expect("a player");
+        assert_eq!(audio.duration_secs(), 3);
+        assert_eq!(audio.file_id(), super::inbox::voice_file_id(2));
+        let file_id = audio.file_id();
+        adapter
+            .handle(
+                AdapterCommand::DownloadVoice {
+                    protocol: ProtocolId::Discord,
+                    file_id,
+                },
+                &tx,
+            )
+            .expect("download");
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::VoiceReady { .. } | AdapterEvent::VoiceFailed { .. }
+            )
+        })
+        .await;
+        let path = events
+            .iter()
+            .find_map(|event| match event {
+                AdapterEvent::VoiceReady { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .expect("ready");
+        assert_eq!(std::fs::read(path.as_path()).expect("file"), b"OggS-voice");
+        let _ = std::fs::remove_file(path.as_path());
+        adapter
+            .handle(
+                AdapterCommand::DownloadVoice {
+                    protocol: ProtocolId::Discord,
+                    file_id: file_id.wrapping_add(1).max(1),
+                },
+                &tx,
+            )
+            .expect("download");
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::VoiceReady { .. } | AdapterEvent::VoiceFailed { .. }
+            )
+        })
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::VoiceFailed { .. }))
+        );
     }
 
     #[tokio::test]

@@ -18,7 +18,9 @@ mod cipher;
 #[cfg(feature = "whatsapp-web")]
 mod live;
 
-pub use path::{SessionLock, SessionLockError, lock_session, set_account, set_session_dir};
+pub use path::{
+    SessionLock, SessionLockError, clear_voice_files, lock_session, set_account, set_session_dir,
+};
 
 use std::sync::Arc;
 
@@ -793,6 +795,13 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 request,
             } => {
                 self.resend(&conversation_id, &message_id, request, events);
+                Ok(())
+            }
+            AdapterCommand::DownloadVoice {
+                protocol: ProtocolId::WhatsApp,
+                file_id,
+            } => {
+                self.session.download_voice(file_id, events);
                 Ok(())
             }
             AdapterCommand::Disconnect {

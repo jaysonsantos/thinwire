@@ -713,6 +713,14 @@ impl Supervisor {
                 self.send_idle_status();
             }
             WireCommand::ViewChat { .. } => {}
+            // No helper has the file. The player shows the failure and does
+            // not wait.
+            WireCommand::DownloadVoice { file_id } => {
+                let _ = self.events.send(AdapterEvent::VoiceFailed {
+                    protocol,
+                    file_id: *file_id,
+                });
+            }
             // A start that failed: `launch` reported it.
             WireCommand::AcknowledgeGate | WireCommand::BeginLink { .. } => {}
             // The helper is not running. Do not start it: a start would

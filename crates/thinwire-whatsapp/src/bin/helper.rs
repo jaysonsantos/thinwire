@@ -136,6 +136,9 @@ async fn run(cli: Cli) -> i32 {
             return exit::REFUSED;
         }
     };
+    // The audio files of an earlier run are plain audio. This run has the
+    // lock, so no other helper writes there.
+    thinwire_whatsapp::clear_voice_files();
     let phone = Arc::new(WhatsAppPhoneVault::new());
     let adapter = WhatsAppAdapter::new(Arc::clone(&phone));
     let config = ServeConfig {

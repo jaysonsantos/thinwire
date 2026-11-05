@@ -19,7 +19,7 @@ use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::{Client, ClientError, Jid, RunCompletionReason};
 
-use super::inbox::{HistoryChat, MEDIA_MAX_BYTES, MediaRef, Mute, Sticker, WaMessage};
+use super::inbox::{HistoryChat, MEDIA_MAX_BYTES, MediaRef, Mute, Sticker, Voice, WaMessage};
 use super::link::{Callbacks, LinkBackend, StartError, Started};
 use super::path::{
     prepare_session_dir, remove_device_store, restrict_store_file, revoked_marker,
@@ -129,8 +129,12 @@ impl LinkBackend for LiveBackend {
     async fn delete_store(&self) -> Result<(), ()> {
         let path = whatsapp_device_store_path()?;
         tokio::task::spawn_blocking(move || {
-            // The chats of a revoked device go with its store.
+            // The chats and the audio files of a revoked device go with its
+            // store.
             super::cache::remove_cache_files(&super::cache::cache_path(&path));
+            if let Some(dir) = path.parent() {
+                thinwire_protocol::voice_files::clear(&super::path::voice_dir_of(dir));
+            }
             remove_device_store(&path)
         })
         .await
@@ -266,6 +270,7 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
                         body: body_of(&inbound.message)?,
                         timestamp: info.timestamp.timestamp(),
                         sticker: sticker_of(&inbound.message),
+                        voice: voice_of(&inbound.message),
                     })
                 })
                 .collect(),
@@ -331,6 +336,7 @@ fn map_history_message(chat_jid: &str, info: &wa::WebMessageInfo) -> Option<WaMe
             .and_then(|ts| i64::try_from(ts).ok())
             .unwrap_or(0),
         sticker: info.message.as_option().and_then(sticker_of),
+        voice: info.message.as_option().and_then(voice_of),
     })
 }
 
@@ -359,6 +365,23 @@ fn sticker_of(message: &wa::Message) -> Option<Sticker> {
     })
 }
 
+/// The audio of a voice note or an audio message, when it is not larger
+/// than the helper keeps.
+fn voice_of(message: &wa::Message) -> Option<Voice> {
+    let audio = message.get_base_message().audio_message.as_option()?;
+    let fits = audio.file_length.is_none_or(|length| {
+        usize::try_from(length)
+            .is_ok_and(|length| length <= thinwire_protocol::voice_files::VOICE_MAX_BYTES)
+    });
+    if !fits {
+        return None;
+    }
+    Some(Voice {
+        seconds: audio.seconds.unwrap_or(0),
+        media: MediaRef::new(audio.clone()),
+    })
+}
+
 /// Plain text, a media caption, or a short media label. Protocol-only
 /// messages (reactions, key distribution, receipts) return `None`.
 fn body_of(message: &wa::Message) -> Option<String> {
@@ -370,6 +393,12 @@ fn body_of(message: &wa::Message) -> Option<String> {
         "[photo]"
     } else if base.video_message.is_set() {
         "[video]"
+    } else if base
+        .audio_message
+        .as_option()
+        .is_some_and(|audio| audio.ptt == Some(true))
+    {
+        "[voice message]"
     } else if base.audio_message.is_set() {
         "[audio]"
     } else if base.document_message.is_set() {
@@ -549,17 +578,24 @@ impl WhatsAppSender for LiveSender {
 
     fn download<'a>(&'a self, media: &'a MediaRef) -> DownloadFuture<'a> {
         Box::pin(async move {
-            let sticker = media.get::<wa::message::StickerMessage>().ok_or(())?;
             // The error can name a host or a path. It stays out of the log.
+            if let Some(sticker) = media.get::<wa::message::StickerMessage>() {
+                let bytes = self
+                    .client
+                    .download(sticker, Default::default())
+                    .await
+                    .map_err(|_| ())?;
+                return (bytes.len() <= MEDIA_MAX_BYTES).then_some(bytes).ok_or(());
+            }
+            let audio = media.get::<wa::message::AudioMessage>().ok_or(())?;
             let bytes = self
                 .client
-                .download(sticker, Default::default())
+                .download(audio, Default::default())
                 .await
                 .map_err(|_| ())?;
-            if bytes.len() > MEDIA_MAX_BYTES {
-                return Err(());
-            }
-            Ok(bytes)
+            (bytes.len() <= thinwire_protocol::voice_files::VOICE_MAX_BYTES)
+                .then_some(bytes)
+                .ok_or(())
         })
     }
 }
