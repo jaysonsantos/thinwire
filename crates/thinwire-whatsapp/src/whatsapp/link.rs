@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
+use super::inbox::{InboxStore, SavedHashes, SavedInbox};
 use super::session::{LinkEvent, Session, WhatsAppSender, account};
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, StoreAccessReason, emit_status,
@@ -29,6 +30,13 @@ use thinwire_protocol::{
 /// Longest wait of [`LinkHandle::shutdown`]. Below the 5 s close limit of
 /// the app, so `Stopped` still fits (#44).
 pub(super) const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
+
+/// How often the chat cache takes the changes of a linked session.
+pub(super) const CACHE_FLUSH: Duration = Duration::from_secs(5);
+
+/// Longest wait of a shutdown for the last cache write. Below
+/// [`SHUTDOWN_WAIT`], with room for the client stop.
+const CACHE_FLUSH_WAIT: Duration = Duration::from_millis(500);
 
 /// Longest wait of the owner for one client stop. Below [`SHUTDOWN_WAIT`],
 /// so a shutdown still gets its answer in time (#98).
@@ -99,6 +107,44 @@ impl StartError {
 pub(super) struct Started<B> {
     pub bot: B,
     pub sender: Arc<dyn WhatsAppSender>,
+    /// The chat list that the disk kept for this device. Empty for a new
+    /// pairing.
+    pub saved: SavedInbox,
+    /// Where the chat list of this session goes. `None`: no cache.
+    pub cache: Option<Arc<dyn InboxStore>>,
+}
+
+/// Writes the changed chats of one session to its cache.
+pub(super) struct CacheWriter {
+    store: Arc<dyn InboxStore>,
+    saved: std::sync::Mutex<SavedHashes>,
+}
+
+impl CacheWriter {
+    fn new(store: Arc<dyn InboxStore>, saved: SavedHashes) -> Self {
+        Self {
+            store,
+            saved: std::sync::Mutex::new(saved),
+        }
+    }
+
+    /// Write what changed since the last write. Blocking: call it off the
+    /// async workers. A failed write tries the same changes next time.
+    pub(super) fn flush(&self, session: &Session) {
+        let mut saved = self
+            .saved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changes = session.with_inbox(|inbox| inbox.changes(&saved));
+        if changes.is_empty() {
+            return;
+        }
+        if self.store.save(&changes).is_ok() {
+            saved.apply(&changes);
+        } else {
+            tracing::warn!("whatsapp chat cache write failed");
+        }
+    }
 }
 
 /// Platform work of the link. Only the owner calls it, one call at a time.
@@ -222,6 +268,7 @@ impl LinkHandle {
             last_phone: None,
             last_pairing: None,
             last_resume: false,
+            cache: None,
         };
         tokio::spawn(owner.run(rx));
         Self { tx, active }
@@ -309,6 +356,8 @@ struct Owner<B: LinkBackend> {
     last_pairing: Option<u64>,
     /// The last start was a resume. A key retry is a resume again.
     last_resume: bool,
+    /// The chat cache of the running client.
+    cache: Option<Arc<CacheWriter>>,
 }
 
 impl<B: LinkBackend> Owner<B> {
@@ -328,6 +377,8 @@ impl<B: LinkBackend> Owner<B> {
                     self.last_resume = false;
                 }
                 Msg::Shutdown { done } => {
+                    // The chat list goes to disk before the client stops.
+                    flush_cache(self.cache.clone(), self.session.clone()).await;
                     // Confirm only a client that really stopped. With no
                     // answer the adapter sends an error, not `Stopped`.
                     if self.stop().await && !self.still_stopping() {
@@ -396,6 +447,8 @@ impl<B: LinkBackend> Owner<B> {
             self.fail(StartError::StillRunning);
             return;
         }
+        // The old client's cache ends with it. A new start makes its own.
+        self.cache = None;
         self.session.begin(generation);
         self.session.set_pairing(pairing);
         // A first login: the shell drops inbox events until Linked.
@@ -433,6 +486,15 @@ impl<B: LinkBackend> Owner<B> {
         match result {
             Ok(started) => {
                 self.bot = Some(started.bot);
+                // The saved chats load before the first chat page.
+                let hashes = self
+                    .session
+                    .with_inbox(|inbox| inbox.restore(started.saved));
+                self.cache = started.cache.map(|store| {
+                    let writer = Arc::new(CacheWriter::new(store, hashes));
+                    spawn_cache_flush(Arc::clone(&writer), self.session.clone(), generation);
+                    writer
+                });
                 self.session.attach_sender(generation, started.sender);
                 self.active.store(true, Ordering::SeqCst);
                 self.status(AdapterStatus::Connecting, PAIRING_RUNNING);
@@ -456,8 +518,10 @@ impl<B: LinkBackend> Owner<B> {
             return;
         }
         let invalidate = event.invalidates_device();
-        // Later callbacks of this link are stale from here on.
+        // Later callbacks of this link are stale from here on. A stopped
+        // link writes no more chats.
         self.generation += 1;
+        self.cache = None;
         self.session.apply(event, generation, &self.events);
         let marked = if invalidate {
             self.stale = true;
@@ -485,6 +549,7 @@ impl<B: LinkBackend> Owner<B> {
 
     /// Stop the current client. `false` if it did not stop in time.
     async fn stop(&mut self) -> bool {
+        self.cache = None;
         self.generation += 1;
         let stopped = match self.bot.take() {
             Some(bot) => self.stop_bot(bot).await,
@@ -604,6 +669,37 @@ impl<B: LinkBackend> Owner<B> {
     }
 }
 
+/// Write the changed chats now, bounded by [`CACHE_FLUSH_WAIT`].
+async fn flush_cache(writer: Option<Arc<CacheWriter>>, session: Session) {
+    let Some(writer) = writer else {
+        return;
+    };
+    let write = tokio::task::spawn_blocking(move || writer.flush(&session));
+    if tokio::time::timeout(CACHE_FLUSH_WAIT, write).await.is_err() {
+        tracing::warn!("whatsapp chat cache: the last write did not end in time");
+    }
+}
+
+/// Write the changed chats every [`CACHE_FLUSH`] while link `generation`
+/// runs. The task ends with the link: a logout or a cancel writes nothing
+/// more, and a shutdown writes through [`flush_cache`].
+fn spawn_cache_flush(writer: Arc<CacheWriter>, session: Session, generation: u64) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(CACHE_FLUSH);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if !session.is_link(generation) || session.is_closed() {
+                break;
+            }
+            let writer = Arc::clone(&writer);
+            let held = session.clone();
+            let _ = tokio::task::spawn_blocking(move || writer.flush(&held)).await;
+        }
+    });
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use std::collections::HashMap;
@@ -640,6 +736,23 @@ pub(super) mod tests {
         pub no_store: bool,
         /// The store has no paired device. A resume start refuses it.
         pub unpaired: bool,
+        /// The chat list that `start` hands back as saved.
+        pub saved: Mutex<SavedInbox>,
+        /// The cache that `start` hands back.
+        pub cache: Option<Arc<FakeCache>>,
+    }
+
+    /// Records every cache write.
+    #[derive(Default)]
+    pub(in crate::whatsapp) struct FakeCache {
+        pub writes: Mutex<Vec<crate::whatsapp::inbox::InboxChanges>>,
+    }
+
+    impl InboxStore for FakeCache {
+        fn save(&self, changes: &crate::whatsapp::inbox::InboxChanges) -> Result<(), ()> {
+            self.writes.lock().expect("writes").push(changes.clone());
+            Ok(())
+        }
     }
 
     #[derive(Clone, Default)]
@@ -678,6 +791,12 @@ pub(super) mod tests {
             Ok(Started {
                 bot: generation,
                 sender: Arc::new(FakeSender::default()),
+                saved: self.0.saved.lock().expect("saved").clone(),
+                cache: self
+                    .0
+                    .cache
+                    .clone()
+                    .map(|cache| cache as Arc<dyn InboxStore>),
             })
         }
 
@@ -819,6 +938,71 @@ pub(super) mod tests {
         handle.resume();
         handle.flush().await;
         assert_eq!(fake.log(), vec!["resume 1"]);
+    }
+
+    /// A saved session shows its saved chats when it connects. A shutdown
+    /// writes the chats that changed. A logout writes nothing more.
+    #[tokio::test]
+    async fn saved_chats_come_back_and_a_shutdown_writes_the_changes() {
+        use crate::whatsapp::inbox::{SavedChat, SavedMessage};
+        let chat = "111@s.whatsapp.net";
+        let saved = SavedInbox {
+            chats: vec![(
+                chat.to_string(),
+                SavedChat {
+                    name: Some("Ana".into()),
+                    unread: 2,
+                    timestamp: 9,
+                    read_at: None,
+                    history_at: 9,
+                    mute: crate::whatsapp::inbox::Mute::Off,
+                    messages: vec![SavedMessage {
+                        id: "m1".into(),
+                        from_me: false,
+                        sender_name: Some("Ana".into()),
+                        sender_jid: Some(chat.into()),
+                        body: "saved".into(),
+                        timestamp: 9,
+                    }],
+                },
+            )],
+            names: Vec::new(),
+        };
+        let cache = Arc::new(FakeCache::default());
+        let (fake, handle, _session, mut rx) = owner(Fake {
+            saved: Mutex::new(saved),
+            cache: Some(Arc::clone(&cache)),
+            ..Fake::default()
+        });
+        handle.resume();
+        handle.flush().await;
+        fake.callback(1).send(LinkEvent::Connected);
+        handle.flush().await;
+        let rows: Vec<_> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                AdapterEvent::ConversationUpsert { conversation } => Some(conversation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "the saved chat shows");
+        assert_eq!(rows[0].title, "Ana");
+        assert_eq!(rows[0].unread, 2);
+
+        // Nothing changed: the shutdown has nothing to write.
+        fake.callback(1).send(LinkEvent::Messages(vec![
+            crate::whatsapp::inbox::tests::message(chat, "m2", "new", 10),
+        ]));
+        handle.flush().await;
+        assert!(handle.shutdown().await);
+        let writes = cache.writes.lock().expect("writes").clone();
+        assert_eq!(writes.len(), 1, "one write at shutdown");
+        assert_eq!(writes[0].chats.len(), 1);
+        assert_eq!(
+            writes[0].chats[0].2.messages.len(),
+            2,
+            "the new message too"
+        );
     }
 
     /// A Cancel ends the pairing. The next gate acceptance resumes the

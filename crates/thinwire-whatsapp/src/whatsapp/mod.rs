@@ -6,6 +6,8 @@
 //! commands. A build without this crate uses the MIT stub in
 //! `thinwire-protocol` (#77).
 
+#[cfg(feature = "whatsapp-web")]
+mod cache;
 mod inbox;
 mod link;
 mod path;

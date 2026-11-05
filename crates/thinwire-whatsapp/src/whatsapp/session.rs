@@ -308,6 +308,12 @@ impl Session {
         }
     }
 
+    /// The adapter shut down.
+    #[must_use]
+    pub(super) fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
     /// The session still belongs to link `generation`: no cancel reset it
     /// and no newer link began.
     #[must_use]

@@ -81,18 +81,35 @@ impl LinkBackend for LiveBackend {
         let _ = restrict_store_file(&path);
         // A store from a pairing that did not end has no phone number. A
         // resume of it would ask for a new QR code: stop before the client.
-        if resume {
+        let paired = {
             use whatsapp_rust::store::DeviceStore as _;
-            let paired = backend
+            backend
                 .load()
                 .await
                 .ok()
                 .flatten()
-                .is_some_and(|device| device.pn.is_some());
-            if !paired {
-                return Err(StartError::NotPaired);
-            }
+                .is_some_and(|device| device.pn.is_some())
+        };
+        if resume && !paired {
+            return Err(StartError::NotPaired);
         }
+        // The chat cache belongs to the paired device of this store. A new
+        // pairing starts with an empty cache.
+        let key = super::cipher::cache_key().map_err(|()| StartError::Store)?;
+        let cache = Arc::new(super::cache::DiskCache::beside(&path, key));
+        let saved = {
+            let cache = Arc::clone(&cache);
+            tokio::task::spawn_blocking(move || {
+                if paired {
+                    cache.load()
+                } else {
+                    cache.remove();
+                    super::inbox::SavedInbox::default()
+                }
+            })
+            .await
+            .unwrap_or_default()
+        };
         let bot = build_bot(backend, digits_only(phone), callbacks)
             .await
             .map_err(|()| StartError::Build)?;
@@ -100,6 +117,8 @@ impl LinkBackend for LiveBackend {
         Ok(Started {
             bot: bot.spawn(),
             sender: Arc::new(LiveSender { client }),
+            saved,
+            cache: Some(cache),
         })
     }
 
@@ -109,10 +128,14 @@ impl LinkBackend for LiveBackend {
 
     async fn delete_store(&self) -> Result<(), ()> {
         let path = whatsapp_device_store_path()?;
-        tokio::task::spawn_blocking(move || remove_device_store(&path))
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())
+        tokio::task::spawn_blocking(move || {
+            // The chats of a revoked device go with its store.
+            super::cache::remove_cache_files(&super::cache::cache_path(&path));
+            remove_device_store(&path)
+        })
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
     }
 
     async fn mark_revoked(&self) -> Result<(), ()> {

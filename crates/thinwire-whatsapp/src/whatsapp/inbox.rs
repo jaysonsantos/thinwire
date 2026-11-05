@@ -183,7 +183,9 @@ pub(super) struct HistoryChat {
 /// A WhatsApp chat mute, as the phone set it (#32). A muted chat does not
 /// notify.
 #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub(super) enum Mute {
     #[default]
     Off,
@@ -378,6 +380,119 @@ impl ChatRecord {
     }
 }
 
+// region: disk cache
+
+/// One saved message. A pending or failed send is not saved.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(super) struct SavedMessage {
+    pub id: String,
+    pub from_me: bool,
+    pub sender_name: Option<String>,
+    pub sender_jid: Option<String>,
+    pub body: String,
+    pub timestamp: i64,
+}
+
+/// One saved chat: the row and its newest messages.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(super) struct SavedChat {
+    pub name: Option<String>,
+    pub unread: u32,
+    pub timestamp: i64,
+    pub read_at: Option<i64>,
+    pub history_at: i64,
+    pub mute: Mute,
+    pub messages: Vec<SavedMessage>,
+}
+
+/// The chat list that a saved session loads at its start.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct SavedInbox {
+    pub chats: Vec<(String, SavedChat)>,
+    pub names: Vec<(String, String)>,
+}
+
+/// What changed since the last save: chats to write, chats to remove, and
+/// the push names when they changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct InboxChanges {
+    pub chats: Vec<(String, u64, SavedChat)>,
+    pub removed: Vec<String>,
+    pub names: Option<(u64, Vec<(String, String)>)>,
+}
+
+impl InboxChanges {
+    pub(super) fn is_empty(&self) -> bool {
+        self.chats.is_empty() && self.removed.is_empty() && self.names.is_none()
+    }
+}
+
+/// Hashes of the chats and the names that the disk holds now.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct SavedHashes {
+    chats: HashMap<String, u64>,
+    names: u64,
+}
+
+impl SavedHashes {
+    /// The disk took these changes.
+    pub(super) fn apply(&mut self, changes: &InboxChanges) {
+        for (jid, hash, _) in &changes.chats {
+            self.chats.insert(jid.clone(), *hash);
+        }
+        for jid in &changes.removed {
+            self.chats.remove(jid);
+        }
+        if let Some((hash, _)) = &changes.names {
+            self.names = *hash;
+        }
+    }
+}
+
+/// Writes the chat cache. The live client keeps it in an encrypted file
+/// beside the device store. Tests use a fake.
+pub(super) trait InboxStore: Send + Sync {
+    /// Write the changes in one transaction.
+    fn save(&self, changes: &InboxChanges) -> Result<(), ()>;
+}
+
+fn saved_message(message: &WaMessage) -> SavedMessage {
+    SavedMessage {
+        id: message.id.clone(),
+        from_me: message.from_me,
+        sender_name: message.sender_name.clone(),
+        sender_jid: message.sender_jid.clone(),
+        body: message.body.clone(),
+        timestamp: message.timestamp,
+    }
+}
+
+fn hash_of(value: &impl std::hash::Hash) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(value)
+}
+
+impl ChatRecord {
+    fn saved(&self) -> SavedChat {
+        SavedChat {
+            name: self.name.clone(),
+            unread: self.unread,
+            timestamp: self.timestamp,
+            read_at: self.read_at,
+            history_at: self.history_at,
+            mute: self.mute,
+            messages: self
+                .messages
+                .iter()
+                .filter(|row| !row.id.starts_with(PENDING_PREFIX))
+                .map(saved_message)
+                .collect(),
+        }
+    }
+}
+
+// endregion: disk cache
+
 /// In-memory WhatsApp inbox for one linked device.
 #[derive(Debug, Default)]
 pub(super) struct Inbox {
@@ -395,6 +510,83 @@ pub(super) struct Inbox {
 }
 
 impl Inbox {
+    /// The chats and the names that changed since `saved`. A chat with no
+    /// row any more is in `removed`.
+    pub(super) fn changes(&self, saved: &SavedHashes) -> InboxChanges {
+        let mut changes = InboxChanges::default();
+        for (jid, record) in &self.chats {
+            let chat = record.saved();
+            let hash = hash_of(&chat);
+            if saved.chats.get(jid) != Some(&hash) {
+                changes.chats.push((jid.clone(), hash, chat));
+            }
+        }
+        changes.removed = saved
+            .chats
+            .keys()
+            .filter(|jid| !self.chats.contains_key(*jid))
+            .cloned()
+            .collect();
+        let mut names: Vec<(String, String)> = self
+            .names
+            .iter()
+            .map(|(jid, name)| (jid.clone(), name.clone()))
+            .collect();
+        names.sort();
+        let hash = hash_of(&names);
+        if hash != saved.names {
+            changes.names = Some((hash, names));
+        }
+        changes
+    }
+
+    /// Load the saved chat list of this device. A chat the inbox already
+    /// has stays as it is. Returns the hashes of what the disk holds.
+    pub(super) fn restore(&mut self, saved: SavedInbox) -> SavedHashes {
+        let mut hashes = SavedHashes::default();
+        for (jid, name) in saved.names {
+            self.names.entry(jid).or_insert(name);
+        }
+        let mut names: Vec<(String, String)> = self
+            .names
+            .iter()
+            .map(|(jid, name)| (jid.clone(), name.clone()))
+            .collect();
+        names.sort();
+        hashes.names = hash_of(&names);
+        for (jid, chat) in saved.chats {
+            if !is_inbox_chat(&jid) || self.chats.contains_key(&jid) {
+                continue;
+            }
+            hashes.chats.insert(jid.clone(), hash_of(&chat));
+            let record = ChatRecord {
+                name: chat.name,
+                unread: chat.unread,
+                timestamp: chat.timestamp,
+                read_at: chat.read_at,
+                history_at: chat.history_at,
+                mute: chat.mute,
+                messages: chat
+                    .messages
+                    .into_iter()
+                    .map(|message| WaMessage {
+                        chat_jid: jid.clone(),
+                        id: message.id,
+                        from_me: message.from_me,
+                        sender_name: message.sender_name,
+                        sender_jid: message.sender_jid,
+                        body: message.body,
+                        timestamp: message.timestamp,
+                        sticker: None,
+                    })
+                    .collect(),
+                ..ChatRecord::default()
+            };
+            self.chats.insert(jid, record);
+        }
+        hashes
+    }
+
     pub(super) fn clear(&mut self) -> Vec<AdapterEvent> {
         let removed = self
             .chats

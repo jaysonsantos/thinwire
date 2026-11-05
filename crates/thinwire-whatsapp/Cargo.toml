@@ -36,6 +36,9 @@ whatsapp-web = [
 [dependencies]
 # The command line of the helper program.
 clap.workspace = true
+# The chat cache on disk: one JSON value for each chat.
+serde.workspace = true
+serde_json.workspace = true
 dirs.workspace = true
 thinwire-protocol.workspace = true
 # `io-std`: the helper talks over its stdin and stdout.
