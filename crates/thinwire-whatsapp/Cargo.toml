@@ -22,7 +22,7 @@ default = []
 # helper program only (ADR 0013). No MIT crate depends on this crate. The
 # git revision is pinned so the spike builds on stable Rust. Not a supported
 # messenger. `sqlite-storage` (not `sqlite-storage-bundled`) so the lock can
-# use libsqlite3-sys 0.36. The 0.38 pin cannot share the graph with the
+# use libsqlite3-sys 0.39. A second bundled pin cannot share the graph with the
 # Signal sqlite store. The bundled build is the direct dependency below.
 whatsapp-web = [
   "dep:whatsapp-rust",
@@ -52,7 +52,7 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "e634
 ] }
 # Same SQLCipher build as the Signal helper. Vendored OpenSSL keeps the
 # helper off the system libssl. The key lives in the OS keychain.
-libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
+libsqlite3-sys = { version = "0.39", optional = true, default-features = false, features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
 # The connection hook sets the raw key. `sqlite` does not bundle a second SQLite.

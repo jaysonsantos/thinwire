@@ -48,7 +48,7 @@ presage = { git = "https://github.com/whisperfish/presage", rev = "291c7ee10d2fd
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "291c7ee10d2fd3ae04cea48e586ad55bdb89cd23", optional = true, default-features = false }
 # Bundled SQLCipher and vendored OpenSSL. The helper does not need a system
 # libsqlite or libssl. The key lives in the OS keychain, not in this file.
-libsqlite3-sys = { version = "0.36", optional = true, default-features = false, features = [
+libsqlite3-sys = { version = "0.39", optional = true, default-features = false, features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
 rusqlite = { version = "0.41", optional = true, default-features = false, features = [

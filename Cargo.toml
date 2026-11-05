@@ -95,5 +95,18 @@ windows-native-keyring-store = { version = "1", default-features = false }
 # with zip 9.0.5, the first release that closes the critical zip extract
 # advisory. Remove this patch when a crates.io release allows zip 9.0.5.
 # The branch history is tdlib-rs. Do not merge it into thinwire main.
+#
+# rusqlite 0.41 requires libsqlite3-sys ^0.39. diesel 2.3.14 stops before
+# 0.39, sqlx-sqlite 0.9.0 stops before 0.38, and presage-store-sqlite at
+# 291c7ee pins 0.36.0. libsqlite3-sys sets `links = "sqlite3"`, so one
+# version has to satisfy all of them. The branch is those sources with the
+# bound moved to 0.39. The presage crate also names the same presage git
+# revision instead of a path. Remove the patch when crates.io and presage
+# allow 0.39 on their own.
 [patch.crates-io]
 tdlib-rs = { git = "https://github.com/jaysonsantos/thinwire", branch = "cursor/tdlib-rs-zip-9-bed5" }
+sqlx-sqlite = { git = "https://github.com/jaysonsantos/thinwire", branch = "cursor/sqlite-0-39-bound-fd1d" }
+diesel = { git = "https://github.com/jaysonsantos/thinwire", branch = "cursor/sqlite-0-39-bound-fd1d" }
+
+[patch."https://github.com/whisperfish/presage"]
+presage-store-sqlite = { git = "https://github.com/jaysonsantos/thinwire", branch = "cursor/sqlite-0-39-bound-fd1d" }
