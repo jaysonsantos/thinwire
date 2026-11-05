@@ -35,60 +35,120 @@ EOF
 chmod +x "${root}/bin/codesign"
 
 run_case() {
-  local runtime="$1"
-  local log="${root}/log-${runtime}"
-  local payload="${root}/work/payload-${runtime}"
-  local returned="${root}/returned-${runtime}"
+  local name="$1"
+  local runtime="$2"
+  local notary="$3"
+  local want_status="$4"
+  local log="${root}/log-${name}"
+  local out="${root}/out-${name}"
+  local payload="${root}/work/payload-${name}"
+  local returned="${root}/returned-${name}"
   local status=0
   : >"$payload"
-  rm -f "$log" "$returned"
+  rm -f "$log" "$returned" "$out"
   (
     set -euo pipefail
     export PATH="${root}/bin:${PATH}"
     export FAKE_CODESIGN_LOG="$log"
     export TMPDIR="${root}/tmp"
+    unset MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER
+    case "$notary" in
+      ready)
+        export MACOS_NOTARY_KEY="notary-key-sentinel"
+        export MACOS_NOTARY_KEY_ID="notary-id-sentinel"
+        export MACOS_NOTARY_ISSUER="notary-issuer-sentinel"
+        ;;
+      partial)
+        export MACOS_NOTARY_KEY="notary-key-sentinel"
+        ;;
+      absent) ;;
+      *)
+        echo "unknown notary case ${notary}" >&2
+        exit 1
+        ;;
+    esac
     {
       echo 'sign_identity=TESTIDENTITY'
       echo "sign_use_hardened_runtime=${runtime}"
       cat "${root}/sign.sh"
-    } >"${root}/run-${runtime}.sh"
+    } >"${root}/run-${name}.sh"
     # Generated above from sign_with_identity. ShellCheck cannot follow it.
     # shellcheck disable=SC1090,SC1091
-    source "${root}/run-${runtime}.sh"
+    source "${root}/run-${name}.sh"
     sign_with_identity "$payload"
     echo RETURNED >"$returned"
-  ) || status=$?
-  if [[ "$status" -ne 42 ]]; then
-    echo "sign_use_hardened_runtime=${runtime}: expected exit 42, got ${status}" >&2
+  ) >"$out" || status=$?
+  if [[ "$status" -ne "$want_status" ]]; then
+    echo "${name}: expected exit ${want_status}, got ${status}" >&2
+    echo "stdout: $(cat "$out")" >&2
     exit 1
   fi
   if [[ -f "$returned" ]]; then
-    echo "sign_use_hardened_runtime=${runtime}: the function returned after codesign failed" >&2
+    echo "${name}: the function returned after it should have exited" >&2
     exit 1
   fi
   if [[ -n "$(find "${root}/tmp" -type f -print)" ]]; then
-    echo "sign_use_hardened_runtime=${runtime}: entitlements temp file was left behind" >&2
+    echo "${name}: entitlements temp file was left behind" >&2
     find "${root}/tmp" -type f -print >&2
     exit 1
   fi
-  if [[ ! -s "$log" ]]; then
-    echo "sign_use_hardened_runtime=${runtime}: codesign was not called" >&2
+  if grep -F -e 'notary-key-sentinel' -e 'notary-id-sentinel' -e 'notary-issuer-sentinel' "$out"; then
+    echo "${name}: the function printed a notary variable" >&2
     exit 1
   fi
-  local expected
-  if [[ "$runtime" -eq 1 ]]; then
-    expected="--force --options runtime --timestamp=none --sign TESTIDENTITY ${payload}"
-  else
-    expected="--force --timestamp=none --sign TESTIDENTITY ${payload}"
-  fi
-  if [[ "$(cat "$log")" != "$expected" ]]; then
-    echo "sign_use_hardened_runtime=${runtime}: unexpected codesign arguments" >&2
+  local expected=""
+  case "$name" in
+    runtime-off)
+      expected="--force --timestamp=none --sign TESTIDENTITY ${payload}"
+      ;;
+    runtime-on)
+      expected="--force --options runtime --timestamp --sign TESTIDENTITY ${payload}"
+      ;;
+  esac
+  if [[ -n "$expected" ]]; then
+    if [[ ! -s "$log" ]]; then
+      echo "${name}: codesign was not called" >&2
+      exit 1
+    fi
+    if [[ "$(cat "$log")" != "$expected" ]]; then
+      echo "${name}: unexpected codesign arguments" >&2
+      echo "got: $(cat "$log")" >&2
+      echo "want: ${expected}" >&2
+      exit 1
+    fi
+  elif [[ -s "$log" ]]; then
+    echo "${name}: codesign ran before the notary variables were set" >&2
     echo "got: $(cat "$log")" >&2
-    echo "want: ${expected}" >&2
+    exit 1
+  fi
+  local gate_message=""
+  case "$name" in
+    runtime-on-absent)
+      gate_message="::error::Developer ID builds must be notarized. Missing MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER."
+      ;;
+    runtime-on-partial)
+      gate_message="::error::Developer ID builds must be notarized. Missing MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER."
+      ;;
+  esac
+  if [[ -n "$gate_message" ]] && ! grep -qx "$gate_message" "$out"; then
+    echo "${name}: notarization error did not name the empty variables" >&2
+    echo "stdout: $(cat "$out")" >&2
     exit 1
   fi
 }
 
-run_case 0
-run_case 1
+run_case runtime-off 0 absent 42
+run_case runtime-on 1 ready 42
+run_case runtime-on-absent 1 absent 1
+run_case runtime-on-partial 1 partial 1
+
+if grep -q '::warning::MACOS_SIGNING_IDENTITY did not match' "$stage"; then
+  echo "unmatched MACOS_SIGNING_IDENTITY must fail, not warn" >&2
+  exit 1
+fi
+if ! grep -q '::error::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain.' "$stage"; then
+  echo "unmatched MACOS_SIGNING_IDENTITY must name the mismatch and exit" >&2
+  exit 1
+fi
+
 echo "sign_with_identity propagated codesign exit 42"

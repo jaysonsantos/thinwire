@@ -3,9 +3,8 @@
 # actions/upload-artifact wraps downloads in an outer zip and stores loose
 # files as 644. The tar.gz is what keeps executable bits and the .app tree.
 # macOS: sign Thinwire.app with the identity in MACOS_SIGNING_P12 when that
-# variable is set. An empty variable keeps the ad-hoc signature. Hardened
-# runtime is only for a Developer ID Application identity. There is no
-# notarization. Linux and Windows: flat binaries plus notices.
+# variable is set. Developer ID uses a secure timestamp. An empty variable
+# keeps the ad-hoc signature. Linux and Windows: flat binaries plus notices.
 #
 # The payload has three programs (ADR 0013): the MIT app, and next to it
 # the AGPL-3.0-only WhatsApp helper and the AGPL-3.0-only Signal helper. The
@@ -539,14 +538,16 @@ import_macos_signing_identity() {
       sign_use_hardened_runtime=1
     fi
   else
-    echo "::warning::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
+    echo "::error::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
     log_parsed_identities
-    kind="unmatched identity"
+    exit 1
   fi
   if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
     echo "codesign hardened runtime: on (Developer ID Application)"
+    echo "codesign timestamp: secure (Developer ID Application)"
   else
     echo "codesign hardened runtime: off (${kind})"
+    echo "codesign timestamp: none (${kind})"
   fi
   if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
     echo "codesign sign argument: ${MACOS_SIGNING_IDENTITY}"
@@ -571,14 +572,32 @@ macho_file() {
 sign_with_identity() {
   local target="$1"
   local entitlements_from="${2:-$1}"
-  local entitlements status
+  local entitlements status missing
   local -a args
+  if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
+    missing=""
+    if [[ -z "${MACOS_NOTARY_KEY:-}" ]]; then
+      missing+=" MACOS_NOTARY_KEY"
+    fi
+    if [[ -z "${MACOS_NOTARY_KEY_ID:-}" ]]; then
+      missing+=" MACOS_NOTARY_KEY_ID"
+    fi
+    if [[ -z "${MACOS_NOTARY_ISSUER:-}" ]]; then
+      missing+=" MACOS_NOTARY_ISSUER"
+    fi
+    if [[ -n "$missing" ]]; then
+      echo "::error::Developer ID builds must be notarized. Missing${missing}."
+      exit 1
+    fi
+  fi
   entitlements="$(mktemp)"
   args=(--force)
   if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
-    args+=(--options runtime)
+    args+=(--options runtime --timestamp)
+  else
+    args+=(--timestamp=none)
   fi
-  args+=(--timestamp=none --sign "$sign_identity")
+  args+=(--sign "$sign_identity")
   if codesign -d --entitlements :- "$entitlements_from" >"$entitlements" 2>/dev/null \
     && grep -q '<plist' "$entitlements"; then
     args+=(--entitlements "$entitlements")
@@ -630,9 +649,7 @@ sign_macos_app() {
   else
     echo "macOS signing: ad-hoc signature (MACOS_SIGNING_P12 is empty)"
     sign_nested_machos "$app" adhoc
-    # Ad-hoc signature for the whole bundle. The notification center needs
-    # it (#161). It is not a Developer ID signature and there is no
-    # notarization (ADR 0003).
+    # Ad-hoc signature for the whole bundle. The notification center needs it (#161).
     codesign --force --sign - "$app"
   fi
   codesign --verify --strict --deep --verbose=2 "$app"
@@ -744,6 +761,7 @@ EOF
   # Mach-O files are signed from the inside out, then the bundle. --deep
   # is only used on the verify inside sign_macos_app.
   sign_macos_app "$app"
+  "${script_dir}/notarize-macos-app.sh" staple "$app"
 fi
 
 if [[ -f dist/thinwire.exe ]]; then
@@ -894,6 +912,10 @@ with tarfile.open(archive, "r:gz") as tf:
 
 print(f"archive ok: {norm(binary.name)} mode {oct(mode)}")
 PY
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  "${script_dir}/notarize-macos-app.sh" validate-archive "$archive"
+fi
 
 echo "Staged payload:"
 find dist -print | sort

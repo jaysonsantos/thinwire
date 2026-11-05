@@ -8,7 +8,7 @@ Rule: an ADR accepted is not Done until the matching change is on `main`.
 
 - Multi-protocol option B without Signal in v1 release builds — `0001`, `0004`, amended for local builds by `0011`. Superseded by `0013` (see AGPL helpers below)
 - egui + eframe + glow (no wgpu) — `0002`
-- Main-only unsigned CI artifacts + caveat — `0003`
+- Main-only CI artifacts, notarized on macOS, not a release (`0003`)
 - System light/dark by default — `0005`
 - Live TDLib path + hard constraints — `0006` (on `main` via #15 / `eff31de`)
 - Official release inject for main OS zips — `0007` (on `main` via #19 / `5c46222`)

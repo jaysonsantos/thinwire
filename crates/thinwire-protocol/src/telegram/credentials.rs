@@ -343,7 +343,71 @@ mod tests {
         );
         assert!(stage.contains("-T /usr/bin/codesign"));
         assert!(stage.contains("--options runtime"));
-        assert!(stage.contains("--timestamp=none"));
+        assert!(
+            stage.contains("args+=(--options runtime --timestamp)"),
+            "Developer ID signs with a secure timestamp"
+        );
+        assert!(
+            stage.contains("args+=(--timestamp=none)"),
+            "other identities stay offline"
+        );
+        assert!(stage.contains("codesign timestamp: secure (Developer ID Application)"));
+        assert!(stage.contains("codesign timestamp: none"));
+        assert!(
+            stage.contains("::error::Developer ID builds must be notarized. Missing"),
+            "a Developer ID signature stops before codesign when a notary variable is empty"
+        );
+        assert!(stage.contains("MACOS_NOTARY_KEY"));
+        assert!(stage.contains("MACOS_NOTARY_KEY_ID"));
+        assert!(stage.contains("MACOS_NOTARY_ISSUER"));
+        assert!(
+            !stage.contains("echo \"$MACOS_NOTARY_KEY\""),
+            "the stage script must not print the notary key"
+        );
+        assert!(
+            !stage.contains("unset MACOS_NOTARY_KEY"),
+            "the signing shell only checks that the notary variables are non-empty"
+        );
+        assert!(
+            !stage.contains("notarytool"),
+            "the stage script does not submit to the notary service"
+        );
+        let notarize = include_str!("../../../../scripts/notarize-macos-app.sh");
+        assert!(
+            notarize.contains("${MACOS_NOTARY_KEY:-}"),
+            "the notarize script is the reader of the notary key"
+        );
+        assert!(
+            !notarize.contains("echo \"$MACOS_NOTARY_KEY\""),
+            "the notarize script must not print the notary key"
+        );
+        assert!(!notarize.contains("apple-id"));
+        assert!(!notarize.contains("store-credentials"));
+        assert_eq!(
+            notarize.matches("notarytool submit").count(),
+            1,
+            "notarytool submit has one call site"
+        );
+        let readme = include_str!("../../../../README.md");
+        assert!(
+            !readme.contains("There is no notarization."),
+            "the main macOS artifact is notarized"
+        );
+        let adr = include_str!("../../../../decisions/0003-main-only-ci-artifacts.md");
+        assert!(
+            !adr.contains("notarization on these artifacts"),
+            "ADR 0003 allows notarization of the main macOS artifact"
+        );
+        assert!(
+            stage.contains(
+                "::error::MACOS_SIGNING_IDENTITY did not match a hash or name in the temporary keychain."
+            ),
+            "an unmatched MACOS_SIGNING_IDENTITY fails the job"
+        );
+        assert!(
+            !stage.contains("::warning::MACOS_SIGNING_IDENTITY did not match"),
+            "an unmatched MACOS_SIGNING_IDENTITY must not warn and continue"
+        );
         assert!(
             stage.contains(r#"codesign "${args[@]}" "$target" || status=$?"#),
             "sign_with_identity must keep the codesign status"
@@ -403,6 +467,44 @@ mod tests {
                 .contains("MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}")
         );
         assert!(os_zips.contains("MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}"));
+        for secret in [
+            "MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}",
+            "MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}",
+            "MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}",
+        ] {
+            assert_eq!(
+                os_zips.matches(secret).count(),
+                1,
+                "the notary secret belongs only on the macOS stage step: {secret}"
+            );
+        }
+        let macos_stage = os_zips
+            .split("Stage, sign, and archive the macOS app")
+            .nth(1)
+            .expect("macOS stage step");
+        let macos_stage = macos_stage
+            .split("\n      - ")
+            .next()
+            .expect("macOS stage step body");
+        assert!(macos_stage.contains("MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}"));
+        assert!(macos_stage.contains("MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}"));
+        assert!(macos_stage.contains("MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}"));
+        let sign_at = stage
+            .find("sign_macos_app \"$app\"")
+            .expect("sign_macos_app");
+        let staple_at = stage
+            .find("notarize-macos-app.sh\" staple")
+            .expect("staple");
+        assert!(sign_at < staple_at, "staple the app after sign_macos_app");
+        let tar_at = stage.find("tar -czf").expect("tar");
+        let validate_at = stage
+            .find("notarize-macos-app.sh\" validate-archive")
+            .expect("validate-archive");
+        assert!(tar_at < validate_at, "validate the archive after tar -czf");
+        assert!(
+            ci.contains(r"scripts/notarize-macos-app\.sh$"),
+            "notify-os runs when the notarize script changes"
+        );
         for (name, src) in [
             ("ci.yml", ci),
             ("release-tag.yml", release),
@@ -412,6 +514,10 @@ mod tests {
             assert!(
                 !src.contains("MACOS_SIGNING"),
                 "{name} must not read the macOS signing secrets"
+            );
+            assert!(
+                !src.contains("MACOS_NOTARY"),
+                "{name} must not read the notary secrets"
             );
         }
         for line in os_zips.lines() {
@@ -477,6 +583,23 @@ mod tests {
         assert!(
             output.status.success(),
             "identity kind bash test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notarize_macos_app_gates_on_the_credential_and_the_signature() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/test-notarize-macos-app.sh");
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .output()
+            .expect("run the notarize bash test");
+        assert!(
+            output.status.success(),
+            "notarize bash test failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
