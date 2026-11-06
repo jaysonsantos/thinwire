@@ -8744,6 +8744,71 @@ mod tests {
         assert_eq!(downloads(&snapshot.take_commands()), 1);
     }
 
+    /// A failed thumbnail stays failed. The bubble asks again only from Retry.
+    #[test]
+    fn a_failed_document_preview_does_not_download_again() {
+        use thinwire_protocol::{MessageFile, MessagePhoto, PhotoSize};
+
+        let mut snapshot = telegram_chat_with_rows(&[(2, false)]);
+        let mut message = telegram_text(1, 8, "");
+        message.file = Some(MessageFile::new(
+            "notes.pdf",
+            "application/pdf",
+            2048,
+            11,
+            None,
+            Some(MessagePhoto {
+                width: 40,
+                height: 52,
+                mini: None,
+                sizes: vec![PhotoSize {
+                    width: 40,
+                    height: 52,
+                    file_id: Some(32),
+                    path: None,
+                    bytes: None,
+                }],
+                has_spoiler: false,
+                is_secret: false,
+                failed: false,
+            }),
+        ));
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        let chat = "telegram:1";
+        let id = "telegram:1:8";
+        snapshot.load_photo(ProtocolId::Telegram, chat, id, 32);
+        let downloads = |commands: &[AdapterCommand]| {
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(command, AdapterCommand::DownloadFile { file_id: 32, .. })
+                })
+                .count()
+        };
+        assert_eq!(downloads(&snapshot.take_commands()), 1);
+        snapshot.apply(AdapterEvent::PhotoFailed {
+            protocol: ProtocolId::Telegram,
+            file_id: 32,
+        });
+        let failed = snapshot
+            .selected_messages()
+            .iter()
+            .find(|row| row.id == id)
+            .and_then(|row| row.file.as_ref())
+            .and_then(|file| file.preview())
+            .is_some_and(|preview| preview.failed);
+        assert!(failed, "the preview shows the failure");
+        // The next frame asks only while the preview is still loading.
+        if !failed {
+            snapshot.load_photo(ProtocolId::Telegram, chat, id, 32);
+        }
+        assert_eq!(
+            downloads(&snapshot.take_commands()),
+            0,
+            "a failed preview does not download again"
+        );
+    }
+
     /// A PDF preview is the thumbnail already on that message.
     #[test]
     fn a_document_downloads_once_and_a_pdf_preview_stays() {
