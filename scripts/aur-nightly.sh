@@ -45,7 +45,7 @@ fi
 
 sed -i -e "s/^pkgver=.*/pkgver=${version}/" -e 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
 id -u "$BUILD_USER" >/dev/null 2>&1 || useradd --create-home "$BUILD_USER"
-chown -R "$BUILD_USER" "$work/pkg"
+chown -R "$BUILD_USER" "$work"
 runuser -u "$BUILD_USER" -- updpkgsums
 runuser -u "$BUILD_USER" -- sh -c 'makepkg --printsrcinfo > .SRCINFO'
 
