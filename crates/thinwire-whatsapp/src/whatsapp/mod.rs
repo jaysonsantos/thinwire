@@ -2910,7 +2910,14 @@ mod tests {
         let sender = Arc::new(FakeSender::default());
         let mut adapter = with_sender(sender.clone());
         let cached: Vec<_> = (0..inbox::MESSAGES_PER_CHAT)
-            .map(|n| message(CHAT, &format!("m{n:03}"), "cached", i64::try_from(n).unwrap_or(0)))
+            .map(|n| {
+                message(
+                    CHAT,
+                    &format!("m{n:03}"),
+                    "cached",
+                    i64::try_from(n).unwrap_or(0),
+                )
+            })
             .collect();
         adapter.session.apply(
             LinkEvent::History {
@@ -2985,6 +2992,36 @@ mod tests {
                 Some(AdapterEvent::OlderHistoryLoaded { more: true, .. })
             ),
             "a non-empty phone page is not the start of the chat: {events:?}"
+        );
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    before_message_id: "older".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("never an adapter error");
+        let asks = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let asks = sender.history_asks.lock().expect("fake lock").clone();
+                if asks.len() >= 2 {
+                    return asks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the next page is still asked");
+        assert_eq!(asks[1].oldest_id, "older");
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::OlderHistoryLoaded { more: false, .. })),
+            "the full cache did not end the chat: {events:?}"
         );
     }
 

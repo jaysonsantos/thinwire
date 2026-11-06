@@ -1143,17 +1143,16 @@ impl Inbox {
         }
     }
 
+    pub(super) fn history_row(&self, message: &WaMessage) -> AdapterEvent {
+        AdapterEvent::MessageReceived {
+            message: self.chat_message(message, Arrival::History),
+        }
+    }
+
     pub(super) fn mark_history_ended(&mut self, jid: &str) {
         if let Some(record) = self.chats.get_mut(jid) {
             record.history_ended = true;
         }
-    }
-
-    #[must_use]
-    pub(super) fn history_has_ended(&self, jid: &str) -> bool {
-        self.chats
-            .get(jid)
-            .is_some_and(|record| record.history_ended)
     }
 
     /// The chat the user looks at now (`None`: no WhatsApp chat). Messages
@@ -1569,6 +1568,9 @@ fn remember_name(names: &mut HashMap<String, String>, message: &WaMessage) {
 }
 
 fn insert_message(messages: &mut Vec<WaMessage>, mut message: WaMessage) {
+    // A row older than the window already here is a page the user asked
+    // for. The cap still drops the oldest rows of the old window.
+    let floor = messages.first().map(|row| (row.timestamp, row.id.clone()));
     if let Some(existing) = messages.iter_mut().find(|row| row.id == message.id) {
         // A refresh with no reactions keeps the reactions the cache counted.
         if message.reactions.is_empty() {
@@ -1585,6 +1587,11 @@ fn insert_message(messages: &mut Vec<WaMessage>, mut message: WaMessage) {
     if excess > 0 {
         messages.retain(|row| {
             if excess == 0 || row.id.starts_with(PENDING_PREFIX) {
+                return true;
+            }
+            if floor.as_ref().is_some_and(|(timestamp, id)| {
+                (row.timestamp, row.id.as_str()) < (*timestamp, id.as_str())
+            }) {
                 return true;
             }
             excess -= 1;

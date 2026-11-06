@@ -892,6 +892,23 @@ impl Session {
                 request_id,
                 ended,
             } => {
+                // The cache drops rows past its cap, oldest first. Read the
+                // phone's page here, before that drop, and give those rows
+                // to the shell directly.
+                let phone_page = request_id.as_ref().and_then(|id| {
+                    let wait = state.older_waits.get(id)?;
+                    let mut messages: Vec<inbox::WaMessage> = chats
+                        .iter()
+                        .filter(|chat| chat.jid == wait.jid)
+                        .flat_map(|chat| chat.messages.iter().cloned())
+                        .collect();
+                    messages.sort_by(|left, right| {
+                        left.timestamp
+                            .cmp(&right.timestamp)
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    Some(messages)
+                });
                 let mut rows = state.inbox.apply_history(chats, push_names);
                 for jid in &ended {
                     state.inbox.mark_history_ended(jid);
@@ -905,20 +922,19 @@ impl Session {
                     if let Some(timer) = wait.timer {
                         timer.abort();
                     }
-                    let page = state.inbox.older_decision(
-                        &wait.jid,
-                        &wait.before,
-                        inbox::OPEN_CHAT_MESSAGES,
-                    );
-                    let empty = page.events.is_empty();
-                    if empty {
+                    let messages = phone_page.unwrap_or_default();
+                    let chat_ended = ended.iter().any(|jid| jid == &wait.jid);
+                    if messages.is_empty() || chat_ended {
                         state.inbox.mark_history_ended(&wait.jid);
                     }
-                    let more =
-                        !empty && (page.more_cached || !state.inbox.history_has_ended(&wait.jid));
+                    let more = !messages.is_empty() && !chat_ended;
                     if state.announced {
-                        older_media.clone_from(&page.events);
-                        rows.extend(page.events);
+                        let events: Vec<_> = messages
+                            .iter()
+                            .map(|message| state.inbox.history_row(message))
+                            .collect();
+                        older_media.clone_from(&events);
+                        rows.extend(events);
                         rows.push(AdapterEvent::OlderHistoryLoaded {
                             protocol: ProtocolId::WhatsApp,
                             conversation_id: wait.conversation_id,
