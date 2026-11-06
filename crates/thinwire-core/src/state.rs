@@ -6397,6 +6397,21 @@ impl Snapshot {
                 }
             }
         }
+        for message in self.messages.values_mut().flatten() {
+            if message.protocol != protocol {
+                continue;
+            }
+            let Some(preview) = message.file.as_mut().and_then(|file| file.preview_mut()) else {
+                continue;
+            };
+            if preview
+                .sizes
+                .iter()
+                .any(|size| size.file_id == Some(file_id))
+            {
+                preview.failed = true;
+            }
+        }
         let Some(list) = self.conversations.get_mut(&protocol) else {
             return;
         };
