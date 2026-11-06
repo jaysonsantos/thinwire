@@ -264,6 +264,7 @@ pub(crate) fn chat_message(
             crate::MessageAudio::new(audio.duration_secs, voice_file_id(message.id), None)
         }),
         video: None,
+        file: None,
         reactions: message.reactions.clone(),
         reply_to: message
             .reply_to

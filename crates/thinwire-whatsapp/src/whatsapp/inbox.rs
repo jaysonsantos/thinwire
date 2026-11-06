@@ -1530,6 +1530,7 @@ impl Inbox {
                 )
             }),
             video: None,
+            file: None,
             reactions: reaction_counts(&message.reactions),
             reply_to: message.reply_to.clone(),
         }
