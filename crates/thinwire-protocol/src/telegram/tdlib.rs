@@ -1999,7 +1999,9 @@ async fn apply_chat_update(
                 if emit {
                     emit_topic(events, topic.clone());
                 }
-            } else if emit {
+            } else if emit && live.topic_lists.is_loaded(update.info.chat_id) {
+                // A new topic of a loaded forum. A forum with no list gets
+                // this topic from its list load.
                 refresh_forum_topic(
                     client_id,
                     update.info.chat_id,
@@ -2012,8 +2014,17 @@ async fn apply_chat_update(
         }
         tdlib_rs::enums::Update::ForumTopic(update) => {
             // This update carries the mute. Unread and the last message come
-            // from `getForumTopic`, including a topic that was not loaded yet.
-            if emit {
+            // from `getForumTopic`. TDLib sends this update for each topic of
+            // each forum at start, and a fetch for each one held the update
+            // queue for minutes. So fetch only a topic whose read mark moved,
+            // or a new topic of a forum whose list loaded.
+            if emit
+                && live.topic_lists.needs_fetch(
+                    update.chat_id,
+                    update.forum_topic_id,
+                    update.last_read_inbox_message_id,
+                )
+            {
                 refresh_forum_topic(
                     client_id,
                     update.chat_id,
@@ -2604,6 +2615,11 @@ async fn load_forum_topics(
         };
         let count = i32::try_from(page.topics.len()).unwrap_or(i32::MAX);
         for topic in page.topics {
+            live.topic_lists.note_read(
+                chat_id,
+                topic.info.forum_topic_id,
+                topic.last_read_inbox_message_id,
+            );
             let row = forum_topic_row(chat_id, &topic);
             if inbox::cache_topic(&mut live.topics, &row) {
                 emit_topic(events, row);
@@ -2655,6 +2671,11 @@ async fn refresh_forum_topic(
 ) -> bool {
     match tdlib_rs::functions::get_forum_topic(chat_id, forum_topic_id, client_id).await {
         Ok(tdlib_rs::enums::ForumTopic::ForumTopic(topic)) => {
+            live.topic_lists.note_read(
+                chat_id,
+                topic.info.forum_topic_id,
+                topic.last_read_inbox_message_id,
+            );
             let row = forum_topic_row(chat_id, &topic);
             if inbox::cache_topic(&mut live.topics, &row) {
                 emit_topic(events, row);
