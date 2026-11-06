@@ -1,10 +1,10 @@
-//! Turn a TDLib message into a caption, links, a photo, and a voice note.
+//! Turn a TDLib message into a caption, links, a photo, a voice note, or a document.
 //!
 //! Offsets from TDLib are UTF-16. [`crate::links_in`] stores UTF-8 indexes.
 
 use crate::media::{
-    AudioPath, MessageAudio, MessageLink, MessagePhoto, MessageVideo, PhotoSize, TextKind,
-    TextSpan, links_in,
+    AudioPath, MessageAudio, MessageFile, MessageLink, MessagePhoto, MessageVideo, PhotoSize,
+    TextKind, TextSpan, links_in,
 };
 use crate::{ImageBytes, ImagePath};
 
@@ -16,6 +16,8 @@ pub(super) struct Mapped {
     pub audio: Option<MessageAudio>,
     /// A clip for the in-app player. `photo` is then its thumbnail.
     pub video: Option<MessageVideo>,
+    /// A document. `photo` stays empty. A preview lives on the file.
+    pub file: Option<MessageFile>,
     /// Plain text with no entities: the worker asks `getTextEntities`.
     pub scan: bool,
 }
@@ -31,6 +33,7 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 scan,
             }
         }
@@ -49,6 +52,7 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 photo: Some(mapped),
                 audio: None,
                 video: None,
+                file: None,
                 scan,
             }
         }
@@ -99,7 +103,7 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
         // This TDLib build has no `is_secret` on a voice note. An expired
         // voice note is `MessageExpiredVoiceNote` and stays on the label arm.
         tdlib_rs::enums::MessageContent::MessageVoiceNote(note) => map_voice(note),
-        tdlib_rs::enums::MessageContent::MessageDocument(_) => label("File"),
+        tdlib_rs::enums::MessageContent::MessageDocument(message) => map_document(message),
         _ => label("Message"),
     }
 }
@@ -112,6 +116,7 @@ fn label(text: &str) -> Mapped {
         photo: None,
         audio: None,
         video: None,
+        file: None,
         scan: false,
     }
 }
@@ -255,6 +260,86 @@ fn map_voice(note: &tdlib_rs::types::MessageVoiceNote) -> Mapped {
     mapped.audio =
         MessageAudio::telegram(note.voice_note.duration, note.voice_note.voice.id, local);
     mapped
+}
+
+/// A thumbnail or minithumbnail is the preview. The app does not render a page.
+fn map_document(message: &tdlib_rs::types::MessageDocument) -> Mapped {
+    let (text, links, scan) = from_formatted(&message.caption);
+    let doc = &message.document;
+    let local = doc
+        .document
+        .local
+        .is_downloading_completed
+        .then(|| AudioPath::new(doc.document.local.path.clone()))
+        .flatten();
+    let file = MessageFile::new(
+        doc.file_name.clone(),
+        doc.mime_type.clone(),
+        byte_size(&doc.document),
+        doc.document.id,
+        local,
+        document_preview(doc),
+    );
+    let mut mapped = label("File");
+    mapped.preview = if text.is_empty() {
+        file.name().to_string()
+    } else {
+        text.clone()
+    };
+    mapped.text = text;
+    mapped.links = links;
+    mapped.scan = scan;
+    mapped.file = Some(file);
+    mapped
+}
+
+fn byte_size(file: &tdlib_rs::types::File) -> u64 {
+    let size = file.size.max(file.expected_size);
+    u64::try_from(size).unwrap_or(0)
+}
+
+fn document_preview(doc: &tdlib_rs::types::Document) -> Option<MessagePhoto> {
+    let mini_src = doc.minithumbnail.as_ref();
+    let mini = mini_src
+        .and_then(|mini| thumbnail_bytes(&mini.data))
+        .map(ImageBytes::new);
+    let size = |value: i32| u32::try_from(value).unwrap_or(0);
+    let thumb = doc
+        .thumbnail
+        .as_ref()
+        .filter(|thumbnail| {
+            matches!(
+                thumbnail.format,
+                tdlib_rs::enums::ThumbnailFormat::Jpeg
+                    | tdlib_rs::enums::ThumbnailFormat::Png
+                    | tdlib_rs::enums::ThumbnailFormat::Webp
+            )
+        })
+        .map(|thumbnail| PhotoSize {
+            width: size(thumbnail.width),
+            height: size(thumbnail.height),
+            file_id: (thumbnail.file.id > 0).then_some(thumbnail.file.id),
+            path: local_path(&thumbnail.file, false),
+            bytes: None,
+        });
+    if mini.is_none() && thumb.is_none() {
+        return None;
+    }
+    let (width, height) = thumb
+        .as_ref()
+        .map(|size| (size.width, size.height))
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .or_else(|| mini_src.map(|mini| (size(mini.width), size(mini.height))))
+        .unwrap_or((0, 0));
+    Some(MessagePhoto {
+        width,
+        height,
+        mini,
+        sizes: thumb.into_iter().collect(),
+        has_spoiler: false,
+        is_secret: false,
+        failed: false,
+    })
 }
 
 fn from_formatted(text: &tdlib_rs::types::FormattedText) -> (String, Vec<MessageLink>, bool) {
@@ -501,5 +586,46 @@ mod tests {
         assert!(no_photo.photo.is_none(), "a GIF thumbnail is not drawn");
         assert!(no_photo.video.is_some());
         assert_eq!(no_photo.preview, "Video");
+    }
+
+    #[test]
+    fn a_pdf_keeps_its_preview_and_a_plain_file_stays_downloadable() {
+        let mut pdf = tdlib_rs::types::MessageDocument::default();
+        pdf.document.file_name = "notes.pdf".into();
+        pdf.document.mime_type = "application/pdf".into();
+        pdf.document.document.id = 11;
+        pdf.document.document.size = 2048;
+        pdf.document.minithumbnail = Some(tdlib_rs::types::Minithumbnail {
+            width: 40,
+            height: 52,
+            data: "/9j/".into(),
+        });
+        let mapped = map_content(&tdlib_rs::enums::MessageContent::MessageDocument(pdf));
+        assert!(mapped.text.is_empty());
+        assert_eq!(mapped.preview, "notes.pdf");
+        let file = mapped.file.expect("document");
+        assert_eq!(file.name(), "notes.pdf");
+        assert_eq!(file.kind_label(), "PDF");
+        assert_eq!(file.size(), 2048);
+        assert_eq!(file.file_id(), 11);
+        assert!(file.file().is_none());
+        let preview = file.preview().expect("pdf preview");
+        assert!(preview.mini.is_some());
+        assert_eq!((preview.width, preview.height), (40, 52));
+        assert!(!format!("{file:?}").contains("/9j/"));
+
+        let mut plain = tdlib_rs::types::MessageDocument::default();
+        plain.document.file_name = "notes.txt".into();
+        plain.document.mime_type = "text/plain".into();
+        plain.document.document.id = 12;
+        plain.caption.text = "the notes".into();
+        let mapped = map_content(&tdlib_rs::enums::MessageContent::MessageDocument(plain));
+        assert_eq!(mapped.text, "the notes");
+        assert_eq!(mapped.preview, "the notes");
+        let file = mapped.file.expect("document");
+        assert!(file.preview().is_none());
+        assert_eq!(file.name(), "notes.txt");
+        assert_eq!(file.file_id(), 12);
+        assert_eq!(file.kind_label(), "TXT");
     }
 }

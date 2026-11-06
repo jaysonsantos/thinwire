@@ -752,6 +752,7 @@ pub struct Snapshot {
     api_source: TelegramApiSource,
     /// Telegram photo downloads in flight, keyed by protocol and file id.
     photo_downloads: HashSet<(ProtocolId, i32)>,
+    file_downloads: HashSet<(ProtocolId, i32)>,
     pending: Vec<AdapterCommand>,
     /// The Telegram account that the login screens are for (ADR 0014).
     /// Login steps go to it, and only its login events change the screens.
@@ -1053,6 +1054,7 @@ impl Snapshot {
             whatsapp_link_account: ProtocolId::WhatsApp,
             signal_link_account: ProtocolId::Signal,
             photo_downloads: HashSet::new(),
+            file_downloads: HashSet::new(),
             keychain_flush: false,
             ended_accounts: Vec::new(),
             helper_errors: HashMap::new(),
@@ -1493,6 +1495,7 @@ impl Snapshot {
                 photo,
                 audio,
                 video,
+                file,
             } => self.patch_message_media(
                 protocol,
                 &conversation_id,
@@ -1502,6 +1505,7 @@ impl Snapshot {
                 photo,
                 audio,
                 video,
+                file,
             ),
             AdapterEvent::MessageLinks {
                 protocol,
@@ -1527,6 +1531,12 @@ impl Snapshot {
                 path,
             } => self.video_ready(protocol, file_id, path),
             AdapterEvent::VideoFailed { protocol, file_id } => self.video_failed(protocol, file_id),
+            AdapterEvent::FileReady {
+                protocol,
+                file_id,
+                path,
+            } => self.file_ready(protocol, file_id, path),
+            AdapterEvent::FileFailed { protocol, file_id } => self.file_failed(protocol, file_id),
             AdapterEvent::MessageReactions {
                 protocol,
                 conversation_id,
@@ -5578,11 +5588,13 @@ impl Snapshot {
         // A download in flight dies with the session. Forget it, and drop a
         // queued one, so the next sign-in can request that file again.
         self.photo_downloads.retain(|(owner, _)| *owner != protocol);
+        self.file_downloads.retain(|(owner, _)| *owner != protocol);
         self.pending.retain(|command| {
             !matches!(
                 command,
                 AdapterCommand::DownloadFile { protocol: owner, .. }
                     | AdapterCommand::DownloadVoice { protocol: owner, .. }
+                    | AdapterCommand::DownloadDocument { protocol: owner, .. }
                     if *owner == protocol
             )
         });
@@ -6003,6 +6015,7 @@ impl Snapshot {
         if let Some(existing) = list.iter_mut().find(|row| row.id == message.id) {
             Self::keep_voice_file(&mut message.audio, existing.audio.as_ref());
             Self::keep_video_file(&mut message.video, existing.video.as_ref());
+            Self::keep_document(&mut message.file, existing.file.as_ref());
             *existing = message;
         } else {
             list.push(message);
@@ -6069,25 +6082,47 @@ impl Snapshot {
         photo: Option<thinwire_protocol::MessagePhoto>,
         audio: Option<MessageAudio>,
         video: Option<thinwire_protocol::MessageVideo>,
+        file: Option<thinwire_protocol::MessageFile>,
     ) {
         let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
             return;
         };
         let stored = message.audio.clone();
         let stored_video = message.video.clone();
+        let stored_file = message.file.clone();
         message.body = body;
         message.links = links;
         message.photo = photo;
         message.audio = audio;
         message.video = video;
+        message.file = file;
         Self::keep_voice_file(&mut message.audio, stored.as_ref());
         Self::keep_video_file(&mut message.video, stored_video.as_ref());
+        Self::keep_document(&mut message.file, stored_file.as_ref());
     }
 
     /// As [`Self::keep_voice_file`], for a video.
     fn keep_video_file(
         incoming: &mut Option<thinwire_protocol::MessageVideo>,
         stored: Option<&thinwire_protocol::MessageVideo>,
+    ) {
+        let (Some(incoming), Some(stored)) = (incoming.as_mut(), stored) else {
+            return;
+        };
+        if incoming.file_id() != stored.file_id() || incoming.file().is_some() {
+            return;
+        }
+        if let Some(path) = stored.file().cloned() {
+            incoming.set_file(path);
+        }
+        if stored.failed() {
+            incoming.mark_failed();
+        }
+    }
+
+    fn keep_document(
+        incoming: &mut Option<thinwire_protocol::MessageFile>,
+        stored: Option<&thinwire_protocol::MessageFile>,
     ) {
         let (Some(incoming), Some(stored)) = (incoming.as_mut(), stored) else {
             return;
@@ -6161,18 +6196,32 @@ impl Snapshot {
             let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
                 return;
             };
-            let Some(photo) = message.photo.as_mut() else {
-                return;
-            };
-            let known = photo.sizes.iter().any(|size| size.file_id == Some(file_id));
-            let ready = photo
-                .sizes
-                .iter()
-                .any(|size| size.file_id == Some(file_id) && size.ready());
-            if known && !ready {
-                photo.failed = false;
+            let mut known = false;
+            let mut ready = false;
+            let mut secret = false;
+            let photos = [
+                message.photo.as_mut(),
+                message
+                    .file
+                    .as_mut()
+                    .and_then(thinwire_protocol::MessageFile::preview_mut),
+            ];
+            for photo in photos.into_iter().flatten() {
+                let hit = photo.sizes.iter().any(|size| size.file_id == Some(file_id));
+                let done = photo
+                    .sizes
+                    .iter()
+                    .any(|size| size.file_id == Some(file_id) && size.ready());
+                if hit && !done {
+                    photo.failed = false;
+                }
+                if hit {
+                    known = true;
+                    ready = done;
+                    secret = photo.is_secret;
+                }
             }
-            (known, ready, photo.is_secret)
+            (known, ready, secret)
         };
         if !known || ready || !self.photo_downloads.insert((protocol, file_id)) {
             return;
@@ -6294,6 +6343,28 @@ impl Snapshot {
                 }
             }
         }
+        for message in self.messages.values_mut().flatten() {
+            if message.protocol != protocol {
+                continue;
+            }
+            let Some(preview) = message.file.as_mut().and_then(|file| file.preview_mut()) else {
+                continue;
+            };
+            let mut hit = false;
+            for size in &mut preview.sizes {
+                if size.file_id != Some(file_id) {
+                    continue;
+                }
+                hit = true;
+                size.path.clone_from(&path);
+                if bytes.is_some() {
+                    size.bytes.clone_from(&bytes);
+                }
+            }
+            if hit {
+                preview.failed = false;
+            }
+        }
         let Some(list) = self.conversations.get_mut(&protocol) else {
             return;
         };
@@ -6332,6 +6403,69 @@ impl Snapshot {
         for row in list.iter_mut() {
             if row.avatar.file_id == Some(file_id) {
                 row.avatar.failed = true;
+            }
+        }
+    }
+
+    /// `FileFailed`, or the session ending, lets a later request try again.
+    pub(crate) fn download_document(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+        file_id: i32,
+    ) {
+        if !self.is_selected_thread(protocol, conversation_id, self.selected_topic) {
+            return;
+        }
+        let Some(key) = self.message_bucket(protocol, conversation_id, message_id) else {
+            return;
+        };
+        if key.2 != self.selected_topic {
+            return;
+        }
+        {
+            let Some(message) = self.message_mut(protocol, conversation_id, message_id) else {
+                return;
+            };
+            let Some(file) = message.file.as_mut() else {
+                return;
+            };
+            if file.file_id() != file_id || file.file().is_some() {
+                return;
+            }
+            file.clear_failed();
+        }
+        if !self.file_downloads.insert((protocol, file_id)) {
+            return;
+        }
+        self.queue(AdapterCommand::DownloadDocument { protocol, file_id });
+    }
+
+    fn file_ready(&mut self, protocol: ProtocolId, file_id: i32, path: AudioPath) {
+        self.file_downloads.remove(&(protocol, file_id));
+        for message in self.messages.values_mut().flatten() {
+            if message.protocol != protocol {
+                continue;
+            }
+            if let Some(file) = message.file.as_mut()
+                && file.file_id() == file_id
+            {
+                file.set_file(path.clone());
+            }
+        }
+    }
+
+    fn file_failed(&mut self, protocol: ProtocolId, file_id: i32) {
+        self.file_downloads.remove(&(protocol, file_id));
+        for message in self.messages.values_mut().flatten() {
+            if message.protocol != protocol {
+                continue;
+            }
+            if let Some(file) = message.file.as_mut()
+                && file.file_id() == file_id
+            {
+                file.mark_failed();
             }
         }
     }
@@ -8537,6 +8671,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         }
@@ -8607,6 +8742,183 @@ mod tests {
         });
         snapshot.load_photo(ProtocolId::Telegram, chat, id, 7);
         assert_eq!(downloads(&snapshot.take_commands()), 1);
+    }
+
+    /// A PDF preview is the thumbnail already on that message.
+    #[test]
+    fn a_document_downloads_once_and_a_pdf_preview_stays() {
+        use std::path::Path;
+
+        use thinwire_protocol::{AudioPath, ImageBytes, MessageFile, MessagePhoto, PhotoSize};
+
+        let mut snapshot = telegram_chat_with_rows(&[(2, false)]);
+        let preview = MessagePhoto {
+            width: 40,
+            height: 52,
+            mini: Some(ImageBytes::new(vec![0xff, 0xd8, 0xff])),
+            sizes: vec![PhotoSize {
+                width: 40,
+                height: 52,
+                file_id: Some(32),
+                path: None,
+                bytes: None,
+            }],
+            has_spoiler: false,
+            is_secret: false,
+            failed: false,
+        };
+        let mut message = telegram_text(1, 3, "");
+        message.file = Some(MessageFile::new(
+            "notes.pdf",
+            "application/pdf",
+            2048,
+            11,
+            None,
+            Some(preview),
+        ));
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        let chat = "telegram:1";
+        let id = "telegram:1:3";
+        {
+            let file = snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.file.as_ref())
+                .expect("pdf");
+            assert_eq!(file.name(), "notes.pdf");
+            assert_eq!(file.kind_label(), "PDF");
+            assert_eq!(file.size_label().as_deref(), Some("2 KB"));
+            assert_eq!(
+                file.preview()
+                    .and_then(|photo| photo.mini.as_ref())
+                    .map(ImageBytes::as_slice),
+                Some([0xff, 0xd8, 0xff].as_slice())
+            );
+            assert!(
+                file.preview()
+                    .is_some_and(|photo| photo.sizes.iter().any(|size| size.file_id == Some(32)))
+            );
+        }
+        snapshot.load_photo(ProtocolId::Telegram, chat, id, 32);
+        assert!(
+            snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::DownloadFile { file_id: 32, .. })),
+            "the pdf thumbnail was not requested"
+        );
+        snapshot.apply(AdapterEvent::PhotoReady {
+            protocol: ProtocolId::Telegram,
+            file_id: 32,
+            file: thinwire_protocol::PhotoFile::from_path(thinwire_protocol::ImagePath::new(
+                "/tmp/hidden-preview.jpg",
+            )),
+        });
+        {
+            let preview = snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.file.as_ref())
+                .and_then(|file| file.preview())
+                .expect("preview");
+            assert_eq!(
+                preview.sizes[0].path.as_ref().map(|path| path.as_str()),
+                Some("/tmp/hidden-preview.jpg")
+            );
+            assert!(!format!("{preview:?}").contains("hidden-preview"));
+        }
+
+        snapshot.download_document(ProtocolId::Telegram, chat, id, 11);
+        snapshot.download_document(ProtocolId::Telegram, chat, id, 11);
+        let downloads = |commands: &[AdapterCommand]| {
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command,
+                        AdapterCommand::DownloadDocument { file_id: 11, .. }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(downloads(&snapshot.take_commands()), 1);
+
+        snapshot.apply(AdapterEvent::FileReady {
+            protocol: ProtocolId::Telegram,
+            file_id: 11,
+            path: AudioPath::new("/tmp/hidden-document.bin").expect("path"),
+        });
+        let preview = {
+            let file = snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.file.as_ref())
+                .expect("saved pdf");
+            assert_eq!(
+                file.file().expect("path").as_path(),
+                Path::new("/tmp/hidden-document.bin")
+            );
+            assert!(!format!("{file:?}").contains("hidden-document"));
+            file.preview().cloned()
+        };
+        snapshot.download_document(ProtocolId::Telegram, chat, id, 11);
+        assert_eq!(downloads(&snapshot.take_commands()), 0, "already saved");
+
+        let mut refresh = telegram_text(1, 3, "");
+        refresh.file = Some(MessageFile::new(
+            "notes.pdf",
+            "application/pdf",
+            2048,
+            11,
+            None,
+            preview,
+        ));
+        snapshot.apply(AdapterEvent::MessageReceived { message: refresh });
+        {
+            let kept = snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.file.as_ref())
+                .expect("refreshed pdf");
+            assert_eq!(
+                kept.file().map(AudioPath::as_path),
+                Some(Path::new("/tmp/hidden-document.bin"))
+            );
+            assert!(kept.preview().is_some());
+        }
+
+        let mut plain = telegram_text(1, 4, "");
+        plain.file = Some(MessageFile::new(
+            "notes.txt",
+            "text/plain",
+            12,
+            12,
+            None,
+            None,
+        ));
+        snapshot.apply(AdapterEvent::MessageReceived { message: plain });
+        let plain_id = "telegram:1:4";
+        {
+            let plain_file = snapshot
+                .selected_messages()
+                .iter()
+                .find(|row| row.id == plain_id)
+                .and_then(|row| row.file.as_ref())
+                .expect("plain file");
+            assert!(plain_file.preview().is_none());
+            assert_eq!(plain_file.name(), "notes.txt");
+        }
+        snapshot.download_document(ProtocolId::Telegram, chat, plain_id, 12);
+        assert!(snapshot.take_commands().iter().any(|command| {
+            matches!(
+                command,
+                AdapterCommand::DownloadDocument { file_id: 12, .. }
+            )
+        }));
     }
 
     /// A chat picture sets the picture of its row only. A later update of
@@ -10281,6 +10593,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         }
@@ -10571,6 +10884,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -10610,6 +10924,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -11973,6 +12288,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -12091,6 +12407,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -12190,6 +12507,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -12293,6 +12611,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -12355,6 +12674,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -12550,6 +12870,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -12602,6 +12923,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -12688,6 +13010,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -12829,6 +13152,7 @@ mod tests {
                     photo: None,
                     audio: None,
                     video: None,
+                    file: None,
                     reactions: Vec::new(),
                     reply_to: None,
                 },
@@ -12946,6 +13270,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -13127,6 +13452,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -14042,6 +14368,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -14364,6 +14691,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -14384,6 +14712,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -14404,6 +14733,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -14433,6 +14763,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -14477,6 +14808,7 @@ mod tests {
                     photo: None,
                     audio: None,
                     video: None,
+                    file: None,
                     reactions: Vec::new(),
                     reply_to: None,
                 },
@@ -14539,6 +14871,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -14730,6 +15063,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -15013,6 +15347,7 @@ mod tests {
                     photo: None,
                     audio: None,
                     video: None,
+                    file: None,
                     reactions: Vec::new(),
                     reply_to: None,
                 },
@@ -15096,6 +15431,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -16024,6 +16360,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -16074,6 +16411,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -16620,6 +16958,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -16693,6 +17032,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -17864,6 +18204,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
@@ -17951,6 +18292,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         }

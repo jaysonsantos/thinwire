@@ -261,6 +261,10 @@ impl Notifications {
             preview: if ctx.preview {
                 let text = if message.body.is_empty() && message.photo.is_some() {
                     "Photo"
+                } else if message.body.is_empty()
+                    && let Some(file) = message.file.as_ref()
+                {
+                    file.name()
                 } else {
                     message.body.as_str()
                 };
@@ -474,6 +478,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         }

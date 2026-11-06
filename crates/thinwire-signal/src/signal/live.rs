@@ -3777,6 +3777,7 @@ fn row_and_message(
         photo: None,
         audio: None,
         video: None,
+        file: None,
         reactions: Vec::new(),
         reply_to: quote_of(content),
     };
@@ -3889,6 +3890,7 @@ async fn send_text(
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: outbound.reply_to.clone(),
         },

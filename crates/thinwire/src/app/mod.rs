@@ -4,6 +4,7 @@ mod attach;
 mod audio;
 mod auth;
 mod dock;
+mod files;
 mod icons;
 #[cfg(test)]
 mod inbox_keys;

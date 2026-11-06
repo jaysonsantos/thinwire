@@ -1025,6 +1025,14 @@ impl Core {
             } => self
                 .state
                 .play_video(protocol, &conversation_id, &message_id, file_id),
+            Intent::DownloadDocument {
+                protocol,
+                conversation_id,
+                message_id,
+                file_id,
+            } => self
+                .state
+                .download_document(protocol, &conversation_id, &message_id, file_id),
             Intent::ReplyTo {
                 protocol,
                 conversation_id,
@@ -2931,6 +2939,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         });
@@ -2971,6 +2980,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -3032,6 +3042,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -3122,6 +3133,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -3210,6 +3222,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -3326,6 +3339,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -3476,6 +3490,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -3772,6 +3787,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -4099,6 +4115,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };
@@ -4168,6 +4185,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         });
@@ -4762,6 +4780,7 @@ mod tests {
                 photo: None,
                 audio: None,
                 video: None,
+                file: None,
                 reactions: Vec::new(),
                 reply_to: None,
             },
