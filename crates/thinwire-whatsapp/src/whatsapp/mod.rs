@@ -684,12 +684,12 @@ impl WhatsAppAdapter {
         let Some((generation, sender)) = self.session.sender() else {
             return false;
         };
-        let Some(request_id) = sender.allocate_history_id() else {
-            return false;
-        };
         if tokio::runtime::Handle::try_current().is_err() {
             return false;
         }
+        let Some(request_id) = sender.allocate_history_id() else {
+            return false;
+        };
         self.session.note_older_wait(
             generation,
             request_id.clone(),

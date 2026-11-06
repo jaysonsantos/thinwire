@@ -347,6 +347,13 @@ fn map_history(sync: &wa::HistorySync) -> LinkEvent {
     }
 }
 
+/// The phone says this chat has no older page this device can read.
+///
+/// `COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY` means the primary has
+/// nothing older. `COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS`
+/// means the primary still has older messages, and this linked device is
+/// not allowed to read them. Another request cannot return those messages,
+/// so the chat ends here.
 fn no_older_messages(conversation: &wa::Conversation) -> bool {
     use whatsapp_rust::waproto::whatsapp::conversation::EndOfHistoryTransferType;
     matches!(

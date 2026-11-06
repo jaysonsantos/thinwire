@@ -248,6 +248,9 @@ struct State {
     /// This link fetched its chat pictures. A reconnect does not again.
     avatars_asked: bool,
     subjects_listed: bool,
+    /// Groups this link already asked for a subject. A query that fails
+    /// or returns no name stays here until `begin` or `reset`. A socket
+    /// reconnect does not clear it, so a miss is not asked again then.
     subjects_asked: HashSet<String>,
     older_waits: HashMap<String, OlderWait>,
 }
@@ -653,9 +656,12 @@ impl Session {
             .unnamed_groups()
             .into_iter()
             .filter(|jid| state.subjects_asked.insert(jid.clone()))
+            .take(AVATAR_CHATS)
             .collect()
     }
 
+    /// At most [`AVATAR_CHATS`] metadata queries per call. Groups past
+    /// that stay unnamed until a later history row or live message.
     async fn fetch_subjects(
         &self,
         generation: u64,
@@ -696,6 +702,7 @@ impl Session {
             .unnamed_groups()
             .into_iter()
             .filter(|jid| state.subjects_asked.insert(jid.clone()))
+            .take(AVATAR_CHATS)
             .collect();
         if pending.is_empty() {
             return;
@@ -887,29 +894,35 @@ impl Session {
             }
             // Before Linked the rows stay in the inbox only (rule 1).
             LinkEvent::History {
-                chats,
+                mut chats,
                 push_names,
                 request_id,
                 ended,
             } => {
-                // The cache drops rows past its cap, oldest first. Read the
-                // phone's page here, before that drop, and give those rows
-                // to the shell directly.
-                let phone_page = request_id.as_ref().and_then(|id| {
-                    let wait = state.older_waits.get(id)?;
-                    let mut messages: Vec<inbox::WaMessage> = chats
-                        .iter()
-                        .filter(|chat| chat.jid == wait.jid)
-                        .flat_map(|chat| chat.messages.iter().cloned())
-                        .collect();
+                let fetched_jid = request_id
+                    .as_ref()
+                    .and_then(|id| state.older_waits.get(id).map(|wait| wait.jid.clone()));
+                let mut fetched_messages = Vec::new();
+                if let Some(jid) = &fetched_jid {
+                    for chat in &mut chats {
+                        if &chat.jid == jid {
+                            fetched_messages.append(&mut chat.messages);
+                        }
+                    }
+                }
+                let phone_page = fetched_jid.as_ref().map(|_| {
+                    let mut messages = fetched_messages.clone();
                     messages.sort_by(|left, right| {
                         left.timestamp
                             .cmp(&right.timestamp)
                             .then_with(|| left.id.cmp(&right.id))
                     });
-                    Some(messages)
+                    messages
                 });
                 let mut rows = state.inbox.apply_history(chats, push_names);
+                if let Some(jid) = &fetched_jid {
+                    state.inbox.apply_fetched(jid, fetched_messages);
+                }
                 for jid in &ended {
                     state.inbox.mark_history_ended(jid);
                 }

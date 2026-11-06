@@ -368,7 +368,7 @@ struct ChatRecord {
     name: Option<String>,
     unread: u32,
     timestamp: i64,
-    /// Sorted by `(timestamp, id)`. Capped at [`MESSAGES_PER_CHAT`].
+    /// Sorted by `(timestamp, id)`.
     messages: Vec<WaMessage>,
     /// Local `pending:` ids whose send failed. The user can resend them.
     failed: HashSet<String>,
@@ -397,8 +397,10 @@ struct ChatRecord {
     /// it (Codex r4131089177).
     history_at: i64,
     history_ended: bool,
-    /// Oldest key of the capped window. Rows older than it were fetched
-    /// on demand and stay for this process. Not saved.
+    /// Oldest key of the window. A fetched page is older than this key
+    /// and is not part of the cap. The key is not written to the cache
+    /// file. The rows are. A restart has no key, so the next insert trims
+    /// them back to [`MESSAGES_PER_CHAT`].
     page_floor: Option<(i64, String)>,
     mute: Mute,
     /// A live `MuteUpdate` of this connection set `mute`: an older history
@@ -913,7 +915,7 @@ impl Inbox {
                 if record.counts_after_read(&message) {
                     added = added.saturating_add(1);
                 }
-                insert_message(&mut record.messages, &mut record.page_floor, message);
+                insert_message(&mut record.messages, &record.page_floor, message);
             }
             // The user reads the open chat, so a later chunk keeps it read.
             // A chat read here changes its count only by new messages (#98):
@@ -1016,20 +1018,30 @@ impl Inbox {
         }
     }
 
-    /// Insert one page the user asked for. The rows share [`insert_message`]
-    /// until the cap can tell this page from any other older row.
-    #[cfg(test)]
+    /// Keep a page the user asked for. The oldest key already in the chat
+    /// becomes `page_floor` once, and rows older than it stay. The window
+    /// itself stays at [`MESSAGES_PER_CHAT`].
     pub(super) fn apply_fetched(&mut self, jid: &str, messages: Vec<WaMessage>) {
-        if !is_inbox_chat(jid) {
+        if messages.is_empty() || !is_inbox_chat(jid) {
             return;
         }
+        for message in &messages {
+            remember_name(&mut self.names, message);
+        }
         let record = self.chats.entry(jid.to_string()).or_default();
+        if record.page_floor.is_none() {
+            record.page_floor = record
+                .messages
+                .first()
+                .map(|row| (row.timestamp, row.id.clone()));
+        }
         for message in messages {
             if message.id.is_empty() {
                 continue;
             }
+            record.optimistic.remove(&message.id);
             record.timestamp = record.timestamp.max(message.timestamp);
-            insert_message(&mut record.messages, &mut record.page_floor, message);
+            insert_message(&mut record.messages, &record.page_floor, message);
         }
     }
 
@@ -1072,11 +1084,7 @@ impl Inbox {
                 record.unread = record.unread.saturating_add(1);
             }
             record.timestamp = record.timestamp.max(message.timestamp);
-            insert_message(
-                &mut record.messages,
-                &mut record.page_floor,
-                message.clone(),
-            );
+            insert_message(&mut record.messages, &record.page_floor, message.clone());
             if is_open {
                 record.mark_read();
             }
@@ -1236,11 +1244,7 @@ impl Inbox {
         };
         let record = self.chats.entry(jid.to_string()).or_default();
         record.timestamp = record.timestamp.max(now);
-        insert_message(
-            &mut record.messages,
-            &mut record.page_floor,
-            message.clone(),
-        );
+        insert_message(&mut record.messages, &record.page_floor, message.clone());
         (
             pending,
             AdapterEvent::MessageReceived {
@@ -1597,15 +1601,9 @@ fn remember_name(names: &mut HashMap<String, String>, message: &WaMessage) {
 
 fn insert_message(
     messages: &mut Vec<WaMessage>,
-    page_floor: &mut Option<(i64, String)>,
+    page_floor: &Option<(i64, String)>,
     mut message: WaMessage,
 ) {
-    // Freeze the capped window the first time an older page arrives.
-    // A later live row must not move that mark, or the page just fetched
-    // is the new oldest and the cap deletes it.
-    let previous = messages.first().map(|row| (row.timestamp, row.id.clone()));
-    let incoming = (message.timestamp, message.id.clone());
-    let replacing = messages.iter().any(|row| row.id == message.id);
     if let Some(existing) = messages.iter_mut().find(|row| row.id == message.id) {
         // A refresh with no reactions keeps the reactions the cache counted.
         if message.reactions.is_empty() {
@@ -1616,26 +1614,19 @@ fn insert_message(
         messages.push(message);
     }
     messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
-    if !replacing
-        && page_floor.is_none()
-        && let Some(oldest) = previous.clone()
-        && (incoming.0, incoming.1.as_str()) < (oldest.0, oldest.1.as_str())
-    {
-        *page_floor = Some(oldest);
-    }
-    let floor = page_floor.clone().or(previous);
-    // Drop the oldest rows first, but never a local `pending:` row. A pending
-    // or failed send must stay until its result or a resend resolves it.
-    // Rows older than `page_floor` are a fetched page and stay.
-    let mut excess = messages.len().saturating_sub(MESSAGES_PER_CHAT);
+    let in_window = |row: &WaMessage| {
+        page_floor.as_ref().is_none_or(|(timestamp, id)| {
+            (row.timestamp, row.id.as_str()) >= (*timestamp, id.as_str())
+        })
+    };
+    let mut excess = messages
+        .iter()
+        .filter(|row| in_window(row))
+        .count()
+        .saturating_sub(MESSAGES_PER_CHAT);
     if excess > 0 {
         messages.retain(|row| {
-            if excess == 0 || row.id.starts_with(PENDING_PREFIX) {
-                return true;
-            }
-            if floor.as_ref().is_some_and(|(timestamp, id)| {
-                (row.timestamp, row.id.as_str()) < (*timestamp, id.as_str())
-            }) {
+            if excess == 0 || row.id.starts_with(PENDING_PREFIX) || !in_window(row) {
                 return true;
             }
             excess -= 1;
