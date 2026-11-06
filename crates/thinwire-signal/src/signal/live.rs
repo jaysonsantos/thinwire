@@ -171,6 +171,9 @@ pub(super) struct Session {
     media: Arc<super::media::MediaBook>,
     /// Photo and audio downloads that run at one time.
     downloads: Arc<tokio::sync::Semaphore>,
+    /// The reactions that this run saw, live and in stored pages, and the
+    /// ACI of this account that names its own messages.
+    reactions: std::sync::Mutex<(String, super::react::ReactionBook)>,
     /// Tests pause the pre-link publish here. Production builds have no pause.
     #[cfg(test)]
     prelink_hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -192,9 +195,31 @@ impl Session {
             retained_lock: Arc::new(Mutex::new(())),
             media: Arc::default(),
             downloads: Arc::new(tokio::sync::Semaphore::new(MEDIA_DOWNLOADS)),
+            reactions: std::sync::Mutex::default(),
             #[cfg(test)]
             prelink_hold: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The ACI of the linked account. Reactions and quotes name its own
+    /// messages with it.
+    fn set_own_aci(&self, aci: String) {
+        self.reactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0 = aci;
+    }
+
+    fn with_reactions<T>(
+        &self,
+        action: impl FnOnce(&str, &mut super::react::ReactionBook) -> T,
+    ) -> T {
+        let mut guard = self
+            .reactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (own, book) = &mut *guard;
+        action(own, book)
     }
 
     /// Pause the next pre-link retained publish until the notify fires.
@@ -1912,7 +1937,7 @@ async fn run_linked(
     let mut names = contact_names(&manager).await;
     // The ACI of this account names its own messages in reactions and quotes.
     let own_aci = manager.registration_data().service_ids.aci.to_string();
-    let mut reaction_book = super::react::ReactionBook::default();
+    session.set_own_aci(own_aci.clone());
     emit_status(
         &events,
         ProtocolId::Signal,
@@ -2019,12 +2044,7 @@ async fn run_linked(
                                     )
                                     .await;
                                     let viewed = session.viewed();
-                                    emit_reaction(
-                                        &events,
-                                        content.as_ref(),
-                                        &own_aci,
-                                        &mut reaction_book,
-                                    );
+                                    emit_reaction(&events, &session, content.as_ref());
                                     emit_incoming(
                                         &events,
                                         content.as_ref(),
@@ -2182,8 +2202,9 @@ async fn run_linked(
                     .await
                     .is_ok()
                 {
-                    let reactions =
-                        reaction_book.apply(&message_id, super::react::ME, &emoji, !add);
+                    let reactions = session.with_reactions(|_, book| {
+                        book.apply(&message_id, super::react::ME, &emoji, !add)
+                    });
                     let _ = events.send(AdapterEvent::MessageReactions {
                         protocol: ProtocolId::Signal,
                         conversation_id,
@@ -2306,10 +2327,10 @@ async fn publish_chats(
         if let Some(cursor) = page.cursor {
             session.stash_history_resume(chat_id, cursor);
         }
-        for message in page.rows {
+        for message in &page.rows {
             emit_content(
                 events,
-                &message,
+                message,
                 &names,
                 &group_titles,
                 rows,
@@ -2317,6 +2338,7 @@ async fn publish_chats(
                 Some(session.media()),
             );
         }
+        emit_page_reactions(events, session, &page.rows);
     }
     let groups = manager.store().groups().await.map_err(|_| ())?;
     for group in groups.flatten() {
@@ -2340,10 +2362,10 @@ async fn publish_chats(
         if let Some(cursor) = page.cursor {
             session.stash_history_resume(chat_id, cursor);
         }
-        for message in page.rows {
+        for message in &page.rows {
             emit_content(
                 events,
-                &message,
+                message,
                 &names,
                 &group_titles,
                 rows,
@@ -2351,6 +2373,7 @@ async fn publish_chats(
                 Some(session.media()),
             );
         }
+        emit_page_reactions(events, session, &page.rows);
     }
     Ok((known, group_titles))
 }
@@ -2608,8 +2631,8 @@ async fn publish_one_retained(
         let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
         let page = retained_history(&store, &url, &thread).await;
         stash_resume(session, &chat_id, page.cursor);
-        for message in page.rows {
-            emit_retained_content(slot, events, &message, &names, &group_titles, &mut rows);
+        for message in &page.rows {
+            emit_retained_content(slot, events, message, &names, &group_titles, &mut rows);
         }
     }
     for (key, group) in &group_list {
@@ -2620,8 +2643,8 @@ async fn publish_one_retained(
         let thread = Thread::Group(*key);
         let page = retained_history(&store, &url, &thread).await;
         stash_resume(session, &chat_id, page.cursor);
-        for message in page.rows {
-            emit_retained_content(slot, events, &message, &names, &group_titles, &mut rows);
+        for message in &page.rows {
+            emit_retained_content(slot, events, message, &names, &group_titles, &mut rows);
         }
     }
     store.close().await;
@@ -2847,10 +2870,10 @@ async fn load_older_page(
     }
     .await;
     let (page, more, note, cursor) = older_page_outcome(loaded);
-    for message in page {
+    for message in &page {
         emit_content(
             events,
-            &message,
+            message,
             names,
             group_titles,
             rows,
@@ -2858,6 +2881,7 @@ async fn load_older_page(
             Some(session.media()),
         );
     }
+    emit_page_reactions(events, session, &page);
     let _ = events.send(AdapterEvent::OlderHistoryLoaded {
         protocol: ProtocolId::Signal,
         conversation_id: conversation_id.to_string(),
@@ -3906,15 +3930,78 @@ async fn send_data(
     }
 }
 
+/// One reaction of `content`: the chat, the row ids of the message, who
+/// reacted, the emoji, and whether it is a removal.
+struct ReactionParts {
+    conversation_id: String,
+    message_ids: Vec<String>,
+    reactor: String,
+    emoji: String,
+    remove: bool,
+}
+
 /// A live reaction: a data message of another person, or a transcript of a
 /// reaction that this account sent from another device. It sends the new
 /// counts of the message.
-fn emit_reaction(
-    events: &EventTx,
-    content: &Content,
-    own_aci: &str,
-    book: &mut super::react::ReactionBook,
-) {
+fn emit_reaction(events: &EventTx, session: &Session, content: &Content) {
+    session.with_reactions(|own_aci, book| {
+        let Some(parts) = reaction_parts(content, own_aci) else {
+            return;
+        };
+        for message_id in parts.message_ids {
+            let reactions = book.apply(&message_id, &parts.reactor, &parts.emoji, parts.remove);
+            let _ = events.send(AdapterEvent::MessageReactions {
+                protocol: ProtocolId::Signal,
+                conversation_id: parts.conversation_id.clone(),
+                message_id,
+                reactions,
+            });
+        }
+    });
+}
+
+/// The reactions in one stored page apply in time order. Then each row of
+/// the page that has reactions gets its counts. The rows are on screen
+/// already, so the counts land on them.
+fn emit_page_reactions(events: &EventTx, session: &Session, page: &[Content]) {
+    session.with_reactions(|own_aci, book| {
+        let mut reactions: Vec<(i64, ReactionParts)> = page
+            .iter()
+            .filter_map(|content| {
+                let at = content.metadata.client_timestamp.timestamp_millis();
+                reaction_parts(content, own_aci).map(|parts| (at, parts))
+            })
+            .collect();
+        reactions.sort_by_key(|(at, _)| *at);
+        for (_, parts) in reactions {
+            for message_id in &parts.message_ids {
+                book.apply(message_id, &parts.reactor, &parts.emoji, parts.remove);
+            }
+        }
+        for content in page {
+            let Ok(thread) = Thread::try_from(content) else {
+                continue;
+            };
+            let millis =
+                u64::try_from(content.metadata.client_timestamp.timestamp_millis()).unwrap_or(0);
+            let message_id = signal_message_id(millis, &contact_id(&content.metadata.sender));
+            let Some(reactions) = book.get(&message_id) else {
+                continue;
+            };
+            let _ = events.send(AdapterEvent::MessageReactions {
+                protocol: ProtocolId::Signal,
+                conversation_id: match &thread {
+                    Thread::Contact(id) => contact_id(id),
+                    Thread::Group(key) => super::group::group_id(key),
+                },
+                message_id,
+                reactions,
+            });
+        }
+    });
+}
+
+fn reaction_parts(content: &Content, own_aci: &str) -> Option<ReactionParts> {
     use presage::libsignal_service::proto::sync_message::Content as SyncContent;
     let (reaction, mine) = match &content.body {
         ContentBody::DataMessage(data) => (data.reaction.as_ref(), false),
@@ -3929,18 +4016,10 @@ fn emit_reaction(
         },
         _ => (None, false),
     };
-    let Some(reaction) = reaction else {
-        return;
-    };
-    let (Some(author), Some(millis)) = (
-        reaction.target_author_aci.as_deref(),
-        reaction.target_sent_timestamp,
-    ) else {
-        return;
-    };
-    let Ok(thread) = Thread::try_from(content) else {
-        return;
-    };
+    let reaction = reaction?;
+    let author = reaction.target_author_aci.as_deref()?;
+    let millis = reaction.target_sent_timestamp?;
+    let thread = Thread::try_from(content).ok()?;
     let conversation_id = match &thread {
         Thread::Contact(id) => contact_id(id),
         Thread::Group(key) => super::group::group_id(key),
@@ -3951,17 +4030,13 @@ fn emit_reaction(
     } else {
         sender
     };
-    let emoji = reaction.emoji.as_deref().unwrap_or_default();
-    let remove = reaction.remove.unwrap_or(false);
-    for message_id in super::react::row_ids(millis, author, own_aci) {
-        let reactions = book.apply(&message_id, &reactor, emoji, remove);
-        let _ = events.send(AdapterEvent::MessageReactions {
-            protocol: ProtocolId::Signal,
-            conversation_id: conversation_id.clone(),
-            message_id,
-            reactions,
-        });
-    }
+    Some(ReactionParts {
+        conversation_id,
+        message_ids: super::react::row_ids(millis, author, own_aci),
+        reactor,
+        emoji: reaction.emoji.clone().unwrap_or_default(),
+        remove: reaction.remove.unwrap_or(false),
+    })
 }
 
 fn command_failed(events: &EventTx, conversation_id: &str, detail: &str) {
@@ -4305,6 +4380,85 @@ mod tests {
                 server_guid: None,
             },
         )
+    }
+
+    /// The stored reactions of a page apply in time order: a later change
+    /// of the same person wins. The row of the page gets the counts, also
+    /// when its reaction came first in the page. A quote marks a reply.
+    #[test]
+    fn a_stored_page_counts_its_reactions_and_quotes() {
+        use presage::libsignal_service::proto::data_message::{Quote, Reaction};
+        let author = Uuid::from_u128(7);
+        let target = envelope(
+            author,
+            DataMessage {
+                body: Some("hi".into()),
+                ..Default::default()
+            },
+        );
+        let reaction = |emoji: &str, at: i64| {
+            let mut content = envelope(
+                Uuid::from_u128(8),
+                DataMessage {
+                    reaction: Some(Reaction {
+                        emoji: Some(emoji.into()),
+                        remove: Some(false),
+                        target_author_aci: Some(author.to_string()),
+                        target_sent_timestamp: Some(1_700_000_000_000),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            );
+            content.metadata.client_timestamp =
+                chrono::DateTime::from_timestamp_millis(at).expect("time");
+            content
+        };
+        // Newest first, as a page can come.
+        let page = vec![
+            reaction("❤️", 1_700_000_002_000),
+            reaction("👍", 1_700_000_001_000),
+            target,
+        ];
+        let session = Session::new();
+        session.set_own_aci(Uuid::from_u128(1).to_string());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        emit_page_reactions(&tx, &session, &page);
+        let id = format!("1700000000000:{author}");
+        let mut counts = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::MessageReactions {
+                message_id,
+                reactions,
+                ..
+            } = event
+                && message_id == id
+            {
+                counts = Some(reactions);
+            }
+        }
+        assert_eq!(
+            counts,
+            Some(vec![thinwire_protocol::Reaction {
+                emoji: "❤️".into(),
+                count: 1,
+                mine: false
+            }])
+        );
+
+        let reply = envelope(
+            Uuid::from_u128(8),
+            DataMessage {
+                body: Some("yes".into()),
+                quote: Some(Quote {
+                    id: Some(1_700_000_000_000),
+                    author_aci: Some(author.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(quote_of(&reply), Some(id));
     }
 
     fn events_for(content: &Content, names: &HashMap<String, String>) -> Vec<AdapterEvent> {

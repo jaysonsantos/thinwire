@@ -67,6 +67,13 @@ impl ReactionBook {
         }
         counts(reactions)
     }
+
+    /// The counts of `message_id`, when this run saw a reaction to it.
+    pub(crate) fn get(&self, message_id: &str) -> Option<Vec<Reaction>> {
+        self.by_message
+            .get(message_id)
+            .map(|reactions| counts(reactions))
+    }
 }
 
 /// The count of each emoji, in the order of the first person who chose it.
