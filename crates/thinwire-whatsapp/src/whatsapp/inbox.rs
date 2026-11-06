@@ -1016,6 +1016,23 @@ impl Inbox {
         }
     }
 
+    /// Insert one page the user asked for. The rows share [`insert_message`]
+    /// until the cap can tell this page from any other older row.
+    #[cfg(test)]
+    pub(super) fn apply_fetched(&mut self, jid: &str, messages: Vec<WaMessage>) {
+        if !is_inbox_chat(jid) {
+            return;
+        }
+        let record = self.chats.entry(jid.to_string()).or_default();
+        for message in messages {
+            if message.id.is_empty() {
+                continue;
+            }
+            record.timestamp = record.timestamp.max(message.timestamp);
+            insert_message(&mut record.messages, &mut record.page_floor, message);
+        }
+    }
+
     pub(super) fn apply_messages(&mut self, messages: Vec<WaMessage>) -> Vec<AdapterEvent> {
         let mut events = Vec::new();
         for message in messages {
@@ -2946,6 +2963,133 @@ pub(super) mod tests {
         assert!(
             !record.messages.iter().any(|row| row.id == "m0000"),
             "the oldest history row is evicted"
+        );
+    }
+
+    /// A fetched page stays, and a later live row drops only the oldest
+    /// window row. The ids in between stay, so the thread has no hole.
+    #[test]
+    fn a_fetched_page_and_a_live_message_leave_no_gap() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let window: Vec<WaMessage> = (0..MESSAGES_PER_CHAT)
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("w{n:04}"),
+                    "cached",
+                    1_000 + i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        let oldest_window = window[0].id.clone();
+        inbox.apply_history(
+            vec![HistoryChat {
+                mute: Default::default(),
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 1_000,
+                messages: window.clone(),
+            }],
+            Vec::new(),
+        );
+        let fetched: Vec<WaMessage> = (0..OPEN_CHAT_MESSAGES)
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("f{n:04}"),
+                    "page",
+                    i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        inbox.apply_fetched(chat, fetched.clone());
+        let live_at = 1_000 + i64::try_from(MESSAGES_PER_CHAT).expect("small");
+        inbox.apply_messages(vec![message(chat, "live", "now", live_at)]);
+
+        let ids: Vec<&str> = inbox.chats[chat]
+            .messages
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        for row in &fetched {
+            assert!(
+                ids.contains(&row.id.as_str()),
+                "fetched {} left the cache",
+                row.id
+            );
+        }
+        for row in &window {
+            let present = ids.contains(&row.id.as_str());
+            if row.id == oldest_window {
+                assert!(!present, "the oldest window row stays");
+            } else {
+                assert!(present, "window {} left the cache", row.id);
+            }
+        }
+        let mut expected: Vec<i64> = fetched.iter().map(|row| row.timestamp).collect();
+        expected.extend(window.iter().skip(1).map(|row| row.timestamp));
+        expected.push(live_at);
+        expected.sort_unstable();
+        let stamps: Vec<i64> = inbox.chats[chat]
+            .messages
+            .iter()
+            .map(|row| row.timestamp)
+            .collect();
+        assert_eq!(stamps, expected, "a hole between the page and the window");
+    }
+
+    /// A history chunk that arrives newest-first is not a page the user
+    /// asked for. The cache keeps at most [`MESSAGES_PER_CHAT`] rows.
+    #[test]
+    fn descending_history_stays_within_the_message_cap() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let total = MESSAGES_PER_CHAT + 100;
+        let messages: Vec<WaMessage> = (0..total)
+            .rev()
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("h{n:04}"),
+                    "history",
+                    i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        inbox.apply_history(
+            vec![HistoryChat {
+                mute: Default::default(),
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: i64::try_from(total).expect("small"),
+                messages,
+            }],
+            Vec::new(),
+        );
+        let record = inbox.chats.get(chat).expect("chat");
+        assert!(
+            record.messages.len() <= MESSAGES_PER_CHAT,
+            "got {} rows",
+            record.messages.len()
+        );
+        let newest = total - 1;
+        assert!(
+            record
+                .messages
+                .iter()
+                .any(|row| row.id == format!("h{newest:04}")),
+            "the newest row stays"
+        );
+        let oldest_kept = i64::try_from(total - MESSAGES_PER_CHAT).expect("small");
+        assert!(
+            record
+                .messages
+                .iter()
+                .all(|row| row.timestamp >= oldest_kept),
+            "the cap keeps the newest rows"
         );
     }
 
