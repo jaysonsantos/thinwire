@@ -4172,62 +4172,73 @@ async fn wait_backoff(session: &Session, token: u64, delay: std::time::Duration)
     false
 }
 
-/// Contact and group pictures that one linked run fetches.
 const AVATAR_CHATS: usize = 50;
 
-/// A group whose picture is not in the cache. `retrieve_group_avatar` uses
-/// the master key and the revision.
 struct GroupAvatarFetch {
     key: [u8; 32],
     revision: u32,
 }
 
-/// Pictures this link can show, and the downloads still to do.
-/// `ready` is image bytes already in the store. `profiles` is a contact
-/// with a profile key and no stored picture. `groups` is a group that names
-/// a picture the cache does not have yet.
 struct AvatarPlan {
     ready: Vec<(String, Vec<u8>)>,
     profiles: Vec<(Uuid, [u8; 32])>,
     groups: Vec<GroupAvatarFetch>,
 }
 
-/// The first chats to picture.
-///
 /// Contact sync stores the picture on the contact and stores no profile key
-/// (`ContactDetails.profileKey` is reserved). A profile download is only for
-/// a contact that has a key and no picture yet. A group picture is the
-/// cached file, or a download when the group names a picture and the cache
-/// is empty. Presage keeps a downloaded picture, so the next run reads it.
+/// (`ContactDetails.profileKey` is reserved). Presage keeps a downloaded
+/// picture, so the next run reads it.
 async fn avatar_plan(store: &SqliteStore) -> AvatarPlan {
+    let mut ready = Vec::new();
     let mut profiles = Vec::new();
-    let Ok(contacts) = store.contacts().await else {
-        return AvatarPlan {
-            ready: Vec::new(),
-            profiles,
-            groups: Vec::new(),
-        };
-    };
-    let mut picked: Vec<(u32, Uuid, [u8; 32])> = contacts
-        .flatten()
-        .filter_map(|contact| {
-            let key = <[u8; 32]>::try_from(contact.profile_key.as_slice()).ok()?;
-            Some((contact.inbox_position, contact.uuid, key))
-        })
-        .collect();
-    picked.sort_by_key(|(position, _, _)| *position);
-    for (_, uuid, key) in picked.into_iter().take(AVATAR_CHATS) {
-        profiles.push((uuid, key));
+    let mut groups = Vec::new();
+    if let Ok(contacts) = store.contacts().await {
+        let mut people: Vec<Contact> = contacts.flatten().collect();
+        people.sort_by_key(|contact| contact.inbox_position);
+        for contact in people.into_iter().take(AVATAR_CHATS) {
+            if let Some(picture) = contact
+                .avatar
+                .as_ref()
+                .filter(|avatar| !avatar.reader.is_empty())
+            {
+                ready.push((contact.uuid.to_string(), picture.reader.to_vec()));
+                continue;
+            }
+            if let Ok(key) = <[u8; 32]>::try_from(contact.profile_key.as_slice()) {
+                profiles.push((contact.uuid, key));
+            }
+        }
+    }
+    if let Ok(stored) = store.groups().await {
+        let mut pictured = 0;
+        for item in stored.flatten() {
+            if pictured >= AVATAR_CHATS {
+                break;
+            }
+            let (key, group) = item;
+            if let Ok(Some(bytes)) = store.group_avatar(key).await
+                && !bytes.is_empty()
+            {
+                ready.push((super::group::group_id(&key), bytes));
+                pictured += 1;
+                continue;
+            }
+            if !group.avatar.is_empty() {
+                groups.push(GroupAvatarFetch {
+                    key,
+                    revision: group.revision,
+                });
+                pictured += 1;
+            }
+        }
     }
     AvatarPlan {
-        ready: Vec::new(),
+        ready,
         profiles,
-        groups: Vec::new(),
+        groups,
     }
 }
 
-/// Fetch chat pictures and send each one as `ChatAvatar`.
-/// The resize runs off the UI thread, on this helper task.
 fn start_avatar_fetches(
     manager: &Manager<SqliteStore, Registered>,
     session: &Arc<Session>,
@@ -9221,10 +9232,6 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         }
     }
 
-    /// The inbox shows a stored contact picture and a stored group picture.
-    /// A contact with no picture stays on initials. A group that only names
-    /// a picture is fetched. A contact that only has a profile key is still
-    /// fetched.
     #[tokio::test]
     async fn a_person_and_a_group_with_a_picture_show_it() {
         let dir = temp_session_dir("avatars");
@@ -9313,7 +9320,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             "a cached group picture is not downloaded again"
         );
 
-        let mut rows = vec![
+        let mut rows = [
             conversation_from_contact(&person),
             conversation_from_contact(&blank),
             conversation_from_group(&cached_key, &cached),
