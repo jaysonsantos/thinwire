@@ -1041,6 +1041,14 @@ impl Core {
                 .state
                 .begin_reply(protocol, &conversation_id, &message_id),
             Intent::CancelReply => self.state.cancel_reply(),
+            Intent::EditMessage {
+                protocol,
+                conversation_id,
+                message_id,
+            } => self
+                .state
+                .begin_edit(protocol, &conversation_id, &message_id),
+            Intent::CancelEdit => self.state.cancel_edit(),
             Intent::DeleteMessage {
                 protocol,
                 conversation_id,
@@ -2942,6 +2950,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         });
         assert!(
             matches!(&core.take_notify()[..], [NotifyCommand::Show(note)] if note.title == "Bob"),
@@ -2983,6 +2992,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         core.notify_message(&live);
         assert!(
@@ -3045,6 +3055,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         // Chat 1 is open and the window has focus: nothing.
         core.notify_message(&live(1, "seen"));
@@ -3136,6 +3147,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         core.notify_message(&live(1, 3, "secret"));
         assert!(
@@ -3225,6 +3237,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
             for event in events {
@@ -3342,6 +3355,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         let pump = |core: &mut Core, events: Vec<AdapterEvent>| {
             for event in events {
@@ -3493,6 +3507,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         let general = |muted: bool| ChatTopic {
             protocol: ProtocolId::Telegram,
@@ -3790,6 +3805,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         let key = NotifyKey {
             protocol: ProtocolId::Telegram,
@@ -4118,6 +4134,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         core.notify_message(&live(2));
         assert_eq!(core.take_notify().len(), 1);
@@ -4188,6 +4205,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         });
         assert_eq!(
             core.take_notify().len(),
@@ -4783,6 +4801,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         };
         events_tx.send(row(Delivery::Pending)).expect("queue");

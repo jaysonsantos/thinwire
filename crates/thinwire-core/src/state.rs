@@ -722,6 +722,9 @@ pub struct Snapshot {
     /// The message that the next send of its thread replies to. Another
     /// open thread does not show it or use it.
     replying: Option<ReplyTarget>,
+    /// The own message that the compose field edits. Enter saves the edit,
+    /// and Esc puts the draft of the thread back.
+    editing: Option<EditTarget>,
     /// Photos and videos attached to a thread and not sent yet, in order.
     attachments: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<OutgoingFile>>,
     /// Why the last attach skipped files. The tray shows it until the next
@@ -839,6 +842,26 @@ pub struct Snapshot {
 /// The longest emoji a reaction may name, in bytes. A family or a flag with
 /// skin tones fits.
 const MAX_EMOJI_BYTES: usize = 32;
+
+/// The own message that the compose field of one thread edits.
+#[derive(Clone, PartialEq, Eq)]
+struct EditTarget {
+    protocol: ProtocolId,
+    conversation_id: String,
+    topic: Option<MessageTopic>,
+    message_id: String,
+    /// The compose text before the edit. It comes back after the edit.
+    draft: String,
+}
+
+impl std::fmt::Debug for EditTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditTarget")
+            .field("protocol", &self.protocol)
+            .field("draft_len", &self.draft.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// The message that the next send of one thread replies to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1037,6 +1060,7 @@ impl Snapshot {
             seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
             replying: None,
+            editing: None,
             attachments: HashMap::new(),
             attachment_note: None,
             rejected_bodies: HashMap::new(),
@@ -1118,6 +1142,11 @@ impl Snapshot {
                 Some(target) => self.apply_from_account(target.first_account(), event),
                 None => self.apply_unchecked(event),
             },
+        }
+        // The edited message left the thread, for example by a delete or
+        // an unlink: the draft comes back.
+        if self.editing.is_some() && self.edit_target().is_none() {
+            self.cancel_edit();
         }
     }
 
@@ -1485,7 +1514,15 @@ impl Snapshot {
                 conversation_id,
                 message_id,
                 body,
-            } => self.patch_message_body(protocol, &conversation_id, &message_id, body),
+            } => {
+                self.patch_message_body(protocol, &conversation_id, &message_id, body);
+                self.mark_edited(protocol, &conversation_id, &message_id);
+            }
+            AdapterEvent::MessageEdited {
+                protocol,
+                conversation_id,
+                message_id,
+            } => self.mark_edited(protocol, &conversation_id, &message_id),
             AdapterEvent::MessageMedia {
                 protocol,
                 conversation_id,
@@ -2569,6 +2606,7 @@ impl Snapshot {
         {
             return;
         }
+        self.cancel_edit();
         self.replying = Some(ReplyTarget {
             protocol,
             conversation_id: conversation_id.to_owned(),
@@ -2589,6 +2627,89 @@ impl Snapshot {
             self.replying = None;
         }
         id
+    }
+
+    /// The own message that the compose field of the open thread edits.
+    #[must_use]
+    pub fn edit_target(&self) -> Option<&ChatMessage> {
+        let target = self.editing.as_ref()?;
+        if !self.is_selected_thread(target.protocol, &target.conversation_id, target.topic) {
+            return None;
+        }
+        self.selected_messages()
+            .iter()
+            .find(|message| message.id == target.message_id)
+    }
+
+    /// Edit one own text message of the open thread: its text goes in the
+    /// compose field, and the draft waits until the edit ends.
+    pub(crate) fn begin_edit(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+    ) {
+        if !self.message_actions(protocol).edit
+            || !self.is_selected_thread(protocol, conversation_id, self.selected_topic)
+        {
+            return;
+        }
+        let Some(body) = self
+            .selected_messages()
+            .iter()
+            .find(|row| row.id == message_id)
+            .filter(|row| can_edit(row))
+            .map(|row| row.body.clone())
+        else {
+            return;
+        };
+        let draft = match self.editing.take() {
+            Some(old) => old.draft,
+            None => std::mem::take(&mut self.compose),
+        };
+        self.replying = None;
+        self.editing = Some(EditTarget {
+            protocol,
+            conversation_id: conversation_id.to_owned(),
+            topic: self.selected_topic,
+            message_id: message_id.to_owned(),
+            draft,
+        });
+        self.compose = body;
+        self.focus_compose = true;
+    }
+
+    /// End the edit with no change. The draft of the thread comes back.
+    pub(crate) fn cancel_edit(&mut self) {
+        if let Some(target) = self.editing.take() {
+            self.compose = target.draft;
+        }
+    }
+
+    /// Enter while the compose field edits a message: ask the adapter to
+    /// save the new text. An empty text keeps the edit open. The same text
+    /// ends the edit with no command.
+    fn save_edit(&mut self) {
+        let body = self.compose.trim().to_owned();
+        let Some(message) = self.edit_target() else {
+            self.cancel_edit();
+            return;
+        };
+        if body.is_empty() {
+            return;
+        }
+        let unchanged = message.body.trim() == body;
+        let command = AdapterCommand::EditMessage {
+            protocol: message.protocol,
+            conversation_id: message.conversation_id.clone(),
+            message_id: message.id.clone(),
+            body,
+        };
+        self.cancel_edit();
+        if !unchanged {
+            self.error = None;
+            self.queue(command);
+        }
     }
 
     /// Ask the adapter to delete one message of the open chat. `for_everyone`
@@ -2676,6 +2797,8 @@ impl Snapshot {
         if self.selected_conversation == id && self.selected_topic == topic {
             return;
         }
+        // The edit text never becomes a draft.
+        self.cancel_edit();
         let draft = std::mem::take(&mut self.compose);
         if let Some(old) = self.selected_conversation.clone()
             && !draft.is_empty()
@@ -2760,6 +2883,9 @@ impl Snapshot {
             .selected_conversation
             .as_deref()
             .is_some_and(|id| thinwire_protocol::signal_retained_slot(id).is_some());
+        if self.edit_target().is_some() {
+            return sends_text && !retained && !self.compose.trim().is_empty();
+        }
         let has_files = !self.compose_attachments().is_empty();
         sends_text
             && !retained
@@ -4214,6 +4340,12 @@ impl Snapshot {
     /// Queue the compose text. Does nothing when [`Self::can_send`] is false;
     /// the Send button is disabled in that case, so no error block shows.
     pub fn send_compose(&mut self) {
+        if self.editing.is_some() {
+            if self.can_send() {
+                self.save_edit();
+            }
+            return;
+        }
         if !self.can_send() {
             return;
         }
@@ -6053,6 +6185,12 @@ impl Snapshot {
         }
     }
 
+    fn mark_edited(&mut self, protocol: ProtocolId, conversation_id: &str, message_id: &str) {
+        if let Some(message) = self.message_mut(protocol, conversation_id, message_id) {
+            message.edited = true;
+        }
+    }
+
     fn patch_message_body(
         &mut self,
         protocol: ProtocolId,
@@ -7088,6 +7226,19 @@ impl Snapshot {
         self.push(AdapterCommand::SignalCancelLink);
         self.signal_link_account = ProtocolId::Signal;
     }
+}
+
+/// An own text message that the server has: Edit offers it. The adapters
+/// edit text only, not a caption.
+#[must_use]
+pub fn can_edit(message: &ChatMessage) -> bool {
+    message.outbound
+        && !message.body.trim().is_empty()
+        && matches!(message.delivery, Delivery::Sent | Delivery::Read)
+        && message.photo.is_none()
+        && message.audio.is_none()
+        && message.video.is_none()
+        && message.file.is_none()
 }
 
 fn sort_conversations(list: &mut [Conversation]) {
@@ -8689,6 +8840,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         }
     }
 
@@ -9166,8 +9318,146 @@ mod tests {
         );
         snapshot.delete_message(ProtocolId::Telegram, "telegram:1", "telegram:1:6", false);
         snapshot.begin_reply(ProtocolId::Telegram, "telegram:1", "telegram:1:5");
+        snapshot.begin_edit(ProtocolId::Telegram, "telegram:1", "telegram:1:6");
         assert!(snapshot.take_commands().is_empty(), "no message actions");
         assert!(snapshot.reply_target().is_none());
+        assert!(snapshot.edit_target().is_none());
+    }
+
+    /// Edit puts the text of an own message in the compose field. Enter
+    /// sends the new text once, and the draft of the thread comes back.
+    #[test]
+    fn an_edit_sends_the_new_text_and_brings_the_draft_back() {
+        let mut snapshot = telegram_chat_with_rows(&[(5, false), (6, true)]);
+        snapshot.compose = "draft".into();
+        snapshot.begin_edit(ProtocolId::Telegram, "telegram:1", "telegram:1:5");
+        assert!(snapshot.edit_target().is_none(), "not an own message");
+        assert_eq!(snapshot.compose, "draft");
+
+        snapshot.begin_reply(ProtocolId::Telegram, "telegram:1", "telegram:1:5");
+        snapshot.begin_edit(ProtocolId::Telegram, "telegram:1", "telegram:1:6");
+        assert_eq!(
+            snapshot.edit_target().map(|message| message.id.as_str()),
+            Some("telegram:1:6")
+        );
+        assert!(snapshot.reply_target().is_none(), "an edit ends the reply");
+        assert_eq!(snapshot.compose, "Hi");
+
+        snapshot.compose = "  ".into();
+        assert!(!snapshot.can_send(), "an empty text");
+        snapshot.send_compose();
+        assert!(snapshot.take_commands().is_empty());
+        assert!(snapshot.edit_target().is_some(), "the edit stays open");
+
+        snapshot.compose = "Hello ".into();
+        assert!(snapshot.can_send());
+        snapshot.send_compose();
+        assert_eq!(
+            snapshot.take_commands(),
+            vec![AdapterCommand::EditMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                message_id: "telegram:1:6".into(),
+                body: "Hello".into(),
+            }]
+        );
+        assert!(snapshot.edit_target().is_none());
+        assert_eq!(snapshot.compose, "draft");
+        snapshot.send_compose();
+        assert!(
+            !snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::EditMessage { .. })),
+            "the next send is a new message"
+        );
+    }
+
+    /// Cancel, a chat switch, the same text, and a delete each end the edit.
+    /// The edit text never becomes the draft.
+    #[test]
+    fn an_edit_ends_with_the_draft_in_place() {
+        let mut snapshot = telegram_chat_with_rows(&[(6, true)]);
+        let edit = |snapshot: &mut Snapshot| {
+            snapshot.begin_edit(ProtocolId::Telegram, "telegram:1", "telegram:1:6");
+            assert!(snapshot.edit_target().is_some());
+            snapshot.compose = "changed".into();
+        };
+        snapshot.compose = "draft".into();
+        edit(&mut snapshot);
+        snapshot.cancel_edit();
+        assert_eq!(snapshot.compose, "draft");
+
+        edit(&mut snapshot);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(2, "Bob", 1),
+        });
+        snapshot.select_conversation("telegram:2".into());
+        assert!(snapshot.compose.is_empty());
+        snapshot.select_conversation("telegram:1".into());
+        assert!(snapshot.edit_target().is_none(), "a chat switch ends it");
+        assert_eq!(snapshot.compose, "draft", "the edit text is not a draft");
+
+        edit(&mut snapshot);
+        snapshot.compose = "Hi".into();
+        snapshot.send_compose();
+        assert_eq!(snapshot.compose, "draft");
+
+        edit(&mut snapshot);
+        snapshot.apply(AdapterEvent::MessagesRemoved {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_ids: vec!["telegram:1:6".into()],
+        });
+        assert!(snapshot.edit_target().is_none(), "the message is gone");
+        assert_eq!(snapshot.compose, "draft");
+        assert!(
+            !snapshot
+                .take_commands()
+                .iter()
+                .any(|command| matches!(command, AdapterCommand::EditMessage { .. })),
+            "no edit left the app"
+        );
+    }
+
+    /// `MessageEdited` and an incoming new text mark the row "edited".
+    #[test]
+    fn an_edit_event_marks_the_message() {
+        let mut snapshot = telegram_chat_with_rows(&[(5, false), (6, false), (7, false)]);
+        snapshot.apply(AdapterEvent::MessageEdited {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:5".into(),
+        });
+        snapshot.apply(AdapterEvent::MessageBody {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            message_id: "telegram:1:6".into(),
+            body: "new".into(),
+        });
+        let edited: Vec<bool> = snapshot
+            .selected_messages()
+            .iter()
+            .map(|message| message.edited)
+            .collect();
+        assert_eq!(edited, vec![true, true, false]);
+    }
+
+    /// Edit offers only an own text message that the server has.
+    #[test]
+    fn edit_needs_an_own_sent_text() {
+        let mut message = telegram_text(1, 5, "Hi");
+        assert!(!can_edit(&message), "incoming");
+        message.outbound = true;
+        assert!(can_edit(&message));
+        for delivery in [Delivery::Pending, Delivery::Failed] {
+            message.delivery = delivery;
+            assert!(!can_edit(&message), "{delivery:?}");
+        }
+        message.delivery = Delivery::Read;
+        assert!(can_edit(&message));
+        message.body = " ".into();
+        assert!(!can_edit(&message), "no text");
     }
 
     /// Play on a clip with no file asks for its download once. The path
@@ -10676,6 +10966,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         }
     }
 
@@ -10967,6 +11258,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.apply(AdapterEvent::OlderHistoryLoaded {
@@ -11007,6 +11299,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         assert_eq!(snapshot.older_state(), OlderState::Idle);
@@ -12371,6 +12664,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -12490,6 +12784,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.select_conversation("ada".into());
@@ -12590,6 +12885,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: conversation.clone(),
@@ -12694,6 +12990,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         snapshot.apply(AdapterEvent::ConversationUpsert {
             conversation: previous,
@@ -12757,6 +13054,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
 
@@ -12953,6 +13251,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -13006,6 +13305,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.selected_protocol = ProtocolId::Signal;
@@ -13093,6 +13393,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.select_retained_signal(1);
@@ -13235,6 +13536,7 @@ mod tests {
                     file: None,
                     reactions: Vec::new(),
                     reply_to: None,
+                    edited: false,
                 },
             });
             snapshot.apply(AdapterEvent::Status {
@@ -13353,6 +13655,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.select_retained_signal(1);
@@ -13535,6 +13838,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.select_retained_signal(1);
@@ -14451,6 +14755,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         assert_eq!(
@@ -14774,6 +15079,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -14795,6 +15101,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.apply(AdapterEvent::MessageReceived {
@@ -14816,6 +15123,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         let bodies: Vec<_> = snapshot
@@ -14846,6 +15154,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.apply(AdapterEvent::MessageBody {
@@ -14891,6 +15200,7 @@ mod tests {
                     file: None,
                     reactions: Vec::new(),
                     reply_to: None,
+                    edited: false,
                 },
             });
         }
@@ -14954,6 +15264,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         let _ = snapshot.take_commands();
@@ -15146,6 +15457,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.apply(AdapterEvent::ChatListLoaded {
@@ -15430,6 +15742,7 @@ mod tests {
                     file: None,
                     reactions: Vec::new(),
                     reply_to: None,
+                    edited: false,
                 },
             });
             snapshot.apply(AdapterEvent::HistoryLoaded {
@@ -15514,6 +15827,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.apply(AdapterEvent::MessageDelivery {
@@ -16443,6 +16757,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.take_commands();
@@ -16494,6 +16809,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.take_commands();
@@ -17041,6 +17357,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.retry_send("discord:pending:2:1");
@@ -17115,6 +17432,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.retry_send("discord:row-b");
@@ -18287,6 +18605,7 @@ mod tests {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         snapshot.retry_send("slack:C1:m1");
@@ -18375,6 +18694,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         }
     }
 

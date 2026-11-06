@@ -7,6 +7,9 @@ use thinwire_protocol::ChatMessage;
 /// Days back that the chat list shows as a weekday name.
 const WEEKDAY_WINDOW_DAYS: i64 = 6;
 
+/// The mark before the time of an edited message.
+const EDITED: &str = "edited";
+
 /// How the thread draws one message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RowLayout {
@@ -14,7 +17,8 @@ pub(crate) struct RowLayout {
     pub day_break: Option<String>,
     /// Show the sender name above this row.
     pub show_sender: bool,
-    /// Local "HH:MM". Empty when the time is unknown.
+    /// Local "HH:MM", after "edited" for an edited message. Empty when the
+    /// time is unknown and the message has no edit.
     pub time: String,
     /// Last bubble of a sender run. The next row is another sender, the
     /// other side, a new day, or the end of the thread.
@@ -52,11 +56,16 @@ where
         let new_run = previous.is_none_or(|previous| {
             previous.outbound || previous.sender != message.sender || day_break.is_some()
         });
+        let time = local
+            .map(|local| local.format("%H:%M").to_string())
+            .unwrap_or_default();
         rows.push(RowLayout {
             show_sender: is_group && !message.outbound && new_run,
-            time: local
-                .map(|local| local.format("%H:%M").to_string())
-                .unwrap_or_default(),
+            time: match (message.edited, time.is_empty()) {
+                (false, _) => time,
+                (true, true) => EDITED.to_owned(),
+                (true, false) => format!("{EDITED} {time}"),
+            },
             day_break,
             run_end: false,
         });
@@ -144,6 +153,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         }
     }
 
@@ -180,6 +190,17 @@ mod tests {
         );
         assert_eq!(rows[4].time, "11:00");
         assert_eq!(rows[5].time, "", "unknown time shows nothing");
+    }
+
+    #[test]
+    fn an_edited_message_shows_edited_before_its_time() {
+        let mut edited = message("Ada", false, NOON - HOUR);
+        edited.edited = true;
+        let mut unknown = message("Ada", false, 0);
+        unknown.edited = true;
+        let rows = thread_rows(&[edited, unknown], false, &now(0));
+        assert_eq!(rows[0].time, "edited 11:00");
+        assert_eq!(rows[1].time, "edited");
     }
 
     /// Codex on #121 (DST): a zone with daylight saving time converts each

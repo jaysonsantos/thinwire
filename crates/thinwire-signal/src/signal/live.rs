@@ -3780,6 +3780,7 @@ fn row_and_message(
         file: None,
         reactions: Vec::new(),
         reply_to: quote_of(content),
+        edited: false,
     };
     if let Some(media) = media {
         media.dress(&mut message, attachments, caption);
@@ -3893,6 +3894,7 @@ async fn send_text(
             file: None,
             reactions: Vec::new(),
             reply_to: outbound.reply_to.clone(),
+            edited: false,
         },
     );
     // A media row keeps no files, so it cannot be sent again.

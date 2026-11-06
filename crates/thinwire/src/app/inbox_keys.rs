@@ -116,6 +116,8 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             intent @ (Intent::React { .. }
             | Intent::ReplyTo { .. }
             | Intent::DeleteMessage { .. }
+            | Intent::EditMessage { .. }
+            | Intent::CancelEdit
             | Intent::CancelReply) => state.message_intents.push(intent),
             Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
             Intent::AddAttachments {
@@ -929,6 +931,7 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         file: None,
         reactions: Vec::new(),
         reply_to: None,
+        edited: false,
     }
 }
 
@@ -990,6 +993,53 @@ fn a_right_click_opens_the_message_menu_and_delete_asks() {
     assert!(
         harness.query_by_label("Also delete for everyone").is_none(),
         "the question closed"
+    );
+}
+
+/// Edit shows only for an own text message, and it asks the core to edit
+/// that message. An edited row still opens its menu.
+#[test]
+fn the_message_menu_offers_edit_for_an_own_text() {
+    let mut state = InboxUi::ready();
+    let theirs = chat_message("telegram:1:8", "Their line", 1_790_299_000);
+    let mut own = chat_message("telegram:1:9", "My own line", 1_790_300_000);
+    own.outbound = true;
+    own.sender = "you".into();
+    own.edited = true;
+    for message in [theirs, own] {
+        state
+            .snapshot
+            .apply(AdapterEvent::MessageReceived { message });
+    }
+    let mut harness = harness(state);
+    harness.run();
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Pane, "Their line")
+        .click_secondary();
+    harness.run();
+    assert!(
+        harness.query_by_label("Edit").is_none(),
+        "not an own message"
+    );
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Pane, "My own line")
+        .click_secondary();
+    harness.run();
+    harness.get_by_label("Edit").click();
+    harness.run();
+    assert!(
+        harness
+            .state_mut()
+            .message_intents
+            .contains(&Intent::EditMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:1".into(),
+                message_id: "telegram:1:9".into(),
+            })
     );
 }
 

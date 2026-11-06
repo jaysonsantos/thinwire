@@ -54,7 +54,11 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: true,
     pages_history: true,
     sends_media: true,
-    message_actions: crate::MessageActions::ALL,
+    // The helper has no edit yet (#519).
+    message_actions: crate::MessageActions {
+        edit: false,
+        ..crate::MessageActions::ALL
+    },
 };
 
 /// The WhatsApp adapter of a `whatsapp-web` build: it runs the AGPL client

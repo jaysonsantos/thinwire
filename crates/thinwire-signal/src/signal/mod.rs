@@ -869,6 +869,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         }
     }
 

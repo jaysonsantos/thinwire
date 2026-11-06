@@ -537,6 +537,19 @@ impl ProtocolAdapter for TelegramAdapter {
                     add,
                 },
             ),
+            AdapterCommand::EditMessage {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                message_id,
+                body,
+            } => self.dispatch_live(
+                events,
+                LiveCall::EditMessage {
+                    conversation_id,
+                    message_id,
+                    body,
+                },
+            ),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -630,6 +643,11 @@ enum LiveCall {
         message_id: String,
         emoji: String,
         add: bool,
+    },
+    EditMessage {
+        conversation_id: String,
+        message_id: String,
+        body: String,
     },
     Resend {
         conversation_id: String,
@@ -813,6 +831,22 @@ impl TelegramAdapter {
                             message_id,
                             emoji,
                             add,
+                        },
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::EditMessage {
+                    conversation_id,
+                    message_id,
+                    body,
+                } => {
+                    self.tdlib.enqueue_message_action(
+                        tdlib::TdlibCommand::EditMessage {
+                            conversation_id,
+                            message_id,
+                            body,
                         },
                         secrets,
                         source,
@@ -1039,6 +1073,14 @@ mod tests {
         assert!(updates.contains("Update::DeleteMessages"));
         assert!(updates.contains("update.from_cache"));
         assert!(updates.contains("emit_messages_removed"));
+        assert!(updates.contains("Update::MessageEdited"));
+        assert!(updates.contains("emit_message_edited"));
+        let edit = fn_body(src, "async fn edit_message");
+        assert!(
+            edit.find("properties.can_be_edited") < edit.find("functions::edit_message_text"),
+            "an edit asks Telegram first if the message can change"
+        );
+        assert!(edit.contains("emit_command_failed"));
         assert!(updates.contains("set_preview(update.chat_id, \"\", 0)"));
         let open = fn_body(src, "async fn open_chat");
         assert!(open.contains("load_history"));

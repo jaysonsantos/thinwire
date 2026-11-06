@@ -134,6 +134,7 @@ impl SignalDevice for FakeDevice {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         self.history
             .entry(conversation_id.to_string())

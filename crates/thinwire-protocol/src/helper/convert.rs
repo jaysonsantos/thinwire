@@ -168,7 +168,9 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::DownloadFile { .. }
         // A helper sends no video yet (ADR 0015).
         | AdapterCommand::DownloadVideo { .. }
-        | AdapterCommand::DownloadDocument { .. } => return None,
+        | AdapterCommand::DownloadDocument { .. }
+        // A helper has no edit yet (#519, #520).
+        | AdapterCommand::EditMessage { .. } => return None,
     })
 }
 
@@ -922,6 +924,7 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
         file: None,
         reactions: reactions_from_wire(message.reactions),
         reply_to: message.reply_to,
+        edited: false,
     }
 }
 
@@ -957,6 +960,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         }
     }
 

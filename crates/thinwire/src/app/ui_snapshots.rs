@@ -790,6 +790,7 @@ mod signal_removed {
                 file: None,
                 reactions: Vec::new(),
                 reply_to: None,
+                edited: false,
             },
         });
         core.dispatch(Intent::SelectConversation {

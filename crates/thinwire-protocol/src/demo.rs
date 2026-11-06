@@ -381,6 +381,7 @@ impl DemoAdapter {
                     file: None,
                     reactions: Vec::new(),
                     reply_to: None,
+                    edited: false,
                 },
             },
         );
@@ -588,6 +589,7 @@ mod tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         }
     }
 

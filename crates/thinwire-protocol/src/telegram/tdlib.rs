@@ -28,10 +28,10 @@ use crate::adapter::{
     MessageTopic, OutgoingUpdate, ProtocolId, TelegramAuthError, TelegramAuthPhase,
     TelegramAuthStep, TelegramCodeVia, emit_chat_list_loaded, emit_conversation,
     emit_conversation_removed, emit_history_loaded, emit_message, emit_message_delivery,
-    emit_message_links, emit_message_media, emit_message_replaced, emit_messages_removed,
-    emit_older_history_loaded, emit_outbox_read, emit_photo_failed, emit_photo_ready,
-    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped, emit_telegram_session_ended,
-    emit_topic, outgoing_delivery,
+    emit_message_edited, emit_message_links, emit_message_media, emit_message_replaced,
+    emit_messages_removed, emit_older_history_loaded, emit_outbox_read, emit_photo_failed,
+    emit_photo_ready, emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
+    emit_telegram_session_ended, emit_topic, outgoing_delivery,
 };
 use crate::secrets::{TelegramSecretKey, TelegramSecretVault};
 
@@ -61,6 +61,12 @@ pub(super) enum TdlibCommand {
         message_id: String,
         emoji: String,
         add: bool,
+    },
+    /// Put `body` in the place of the text of one own message.
+    EditMessage {
+        conversation_id: String,
+        message_id: String,
+        body: String,
     },
     Resend {
         conversation_id: String,
@@ -998,6 +1004,14 @@ fn spawn_tdlib_worker(
                             )
                             .await;
                         }
+                        TdlibCommand::EditMessage {
+                            conversation_id,
+                            message_id,
+                            body,
+                        } => {
+                            edit_message(client_id, &conversation_id, &message_id, &body, &events)
+                                .await;
+                        }
                         TdlibCommand::React {
                             conversation_id,
                             message_id,
@@ -1904,6 +1918,17 @@ async fn apply_chat_update(
                 );
             }
         }
+        tdlib_rs::enums::Update::MessageEdited(update) => {
+            // The new text came in `updateMessageContent` just before.
+            if emit {
+                emit_message_edited(
+                    events,
+                    ProtocolId::Telegram,
+                    inbox::conversation_id(update.chat_id),
+                    inbox::message_id(update.chat_id, update.message_id),
+                );
+            }
+        }
         tdlib_rs::enums::Update::ChatViewAsTopics(update) => {
             let effect = live
                 .directory
@@ -2162,6 +2187,7 @@ fn emit_mapped_message_as(
     mapped.file = media.file;
     mapped.reactions = super::media_map::reactions_of(message.interaction_info.as_ref());
     mapped.reply_to = super::media_map::reply_of(message);
+    mapped.edited = message.edit_date != 0;
     if media.scan {
         schedule_text_entities(
             client_id,
@@ -3085,6 +3111,63 @@ async fn delete_message(
             Some(conversation_id.to_string()),
             "Telegram did not delete the message.",
         );
+    }
+}
+
+/// Put `body` in the place of the text of one own message. TDLib sends
+/// `updateMessageContent` and `updateMessageEdited`, and these updates change
+/// the row. A message that Telegram does not let this account edit, for
+/// example one older than the edit limit, gets `CommandFailed`.
+async fn edit_message(
+    client_id: i32,
+    conversation_id: &str,
+    message_id: &str,
+    body: &str,
+    events: &EventTx,
+) {
+    let Some((chat_id, id)) = inbox::parse_message_id(message_id) else {
+        return;
+    };
+    let failed = |detail: &str| {
+        crate::adapter::emit_command_failed(
+            events,
+            ProtocolId::Telegram,
+            Some(conversation_id.to_string()),
+            detail,
+        );
+    };
+    let text = body.trim();
+    if text.is_empty() {
+        failed("Telegram does not save an empty message.");
+        return;
+    }
+    match tdlib_rs::functions::get_message_properties(chat_id, id, client_id).await {
+        Ok(tdlib_rs::enums::MessageProperties::MessageProperties(properties))
+            if properties.can_be_edited => {}
+        Ok(_) => {
+            failed("Telegram does not let you edit this message.");
+            return;
+        }
+        Err(error) => {
+            log_tdlib_error("getMessageProperties", &error);
+            failed("Telegram did not save the edit.");
+            return;
+        }
+    }
+    let content =
+        tdlib_rs::enums::InputMessageContent::InputMessageText(tdlib_rs::types::InputMessageText {
+            text: tdlib_rs::types::FormattedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            },
+            link_preview_options: None,
+            clear_draft: false,
+        });
+    if let Err(error) =
+        tdlib_rs::functions::edit_message_text(chat_id, id, content, client_id).await
+    {
+        log_tdlib_error("editMessageText", &error);
+        failed("Telegram did not save the edit.");
     }
 }
 

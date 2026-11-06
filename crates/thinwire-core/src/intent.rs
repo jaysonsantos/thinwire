@@ -195,6 +195,15 @@ pub enum Intent {
         emoji: String,
         add: bool,
     },
+    /// Edit one own text message of the open thread. Its text goes in the
+    /// compose field. Only a protocol with `MessageActions::edit`.
+    EditMessage {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+    },
+    /// End the edit with no change. The draft of the thread comes back.
+    CancelEdit,
     /// Telegram login and account actions.
     Telegram(TelegramIntent),
     /// Experimental WhatsApp pairing. Only a `whatsapp-web` build acts on it.

@@ -278,6 +278,8 @@ pub struct MessageActions {
     pub delete_for_everyone: bool,
     /// A new reaction of this account takes the place of its old one.
     pub one_reaction: bool,
+    /// `EditMessage` changes the text of an own text message.
+    pub edit: bool,
 }
 
 impl MessageActions {
@@ -288,6 +290,7 @@ impl MessageActions {
         delete_for_me: false,
         delete_for_everyone: false,
         one_reaction: false,
+        edit: false,
     };
 
     /// Every action, with one reaction for each person, as Telegram (with
@@ -298,6 +301,7 @@ impl MessageActions {
         delete_for_me: true,
         delete_for_everyone: true,
         one_reaction: true,
+        edit: true,
     };
 }
 
@@ -731,6 +735,15 @@ pub enum AdapterCommand {
         emoji: String,
         add: bool,
     },
+    /// Put `body` in the place of the text of one own message. The adapter
+    /// answers with `MessageBody` or `MessageMedia` and `MessageEdited`, or
+    /// with `CommandFailed`.
+    EditMessage {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        body: String,
+    },
     /// Download one video file for the in-app player (ADR 0015). The file
     /// stays on disk. The adapter reports a path.
     DownloadVideo {
@@ -772,6 +785,7 @@ impl AdapterCommand {
             | Self::DownloadVideo { protocol, .. }
             | Self::DownloadDocument { protocol, .. }
             | Self::DeleteMessage { protocol, .. }
+            | Self::EditMessage { protocol, .. }
             | Self::React { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
@@ -839,6 +853,7 @@ impl AdapterCommand {
             | Self::DownloadVideo { protocol, .. }
             | Self::DownloadDocument { protocol, .. }
             | Self::DeleteMessage { protocol, .. }
+            | Self::EditMessage { protocol, .. }
             | Self::React { protocol, .. } => {
                 *protocol = account;
                 true
@@ -966,6 +981,13 @@ pub enum AdapterEvent {
         conversation_id: String,
         message_id: String,
         body: String,
+    },
+    /// The sender changed the text of a message after the send. The new text
+    /// comes in `MessageBody` or `MessageMedia`. The thread shows "edited".
+    MessageEdited {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
     },
     /// Replace the caption, the links, and the media on a message.
     /// A text edit sets `photo`, `audio`, `video`, and `file` to `None`.
@@ -1206,6 +1228,7 @@ impl AdapterEvent {
             | Self::AccountEnded { protocol }
             | Self::ConversationRemoved { protocol, .. }
             | Self::MessageBody { protocol, .. }
+            | Self::MessageEdited { protocol, .. }
             | Self::MessageMedia { protocol, .. }
             | Self::MessageLinks { protocol, .. }
             | Self::PhotoReady { protocol, .. }
@@ -1286,6 +1309,7 @@ impl AdapterEvent {
             Self::ConversationRemoved { protocol, .. }
             | Self::MessageReplaced { protocol, .. }
             | Self::MessageBody { protocol, .. }
+            | Self::MessageEdited { protocol, .. }
             | Self::MessageMedia { protocol, .. }
             | Self::MessageLinks { protocol, .. }
             | Self::PhotoReady { protocol, .. }
@@ -1568,6 +1592,8 @@ pub struct ChatMessage {
     /// The id of the message that this one replies to. The shell finds its
     /// sender and text in the open thread.
     pub reply_to: Option<String>,
+    /// The sender changed the text after the send.
+    pub edited: bool,
 }
 
 /// How a message reached the app.
@@ -1728,6 +1754,20 @@ pub(crate) fn emit_message_body(
         conversation_id: conversation_id.into(),
         message_id: message_id.into(),
         body: body.into(),
+    });
+}
+
+#[cfg_attr(not(feature = "telegram-tdlib"), allow(dead_code))]
+pub(crate) fn emit_message_edited(
+    events: &EventTx,
+    protocol: ProtocolId,
+    conversation_id: impl Into<String>,
+    message_id: impl Into<String>,
+) {
+    let _ = events.send(AdapterEvent::MessageEdited {
+        protocol,
+        conversation_id: conversation_id.into(),
+        message_id: message_id.into(),
     });
 }
 
@@ -2132,6 +2172,7 @@ mod account_tests {
             file: None,
             reactions: Vec::new(),
             reply_to: None,
+            edited: false,
         };
         let AdapterEvent::MessageReplaced {
             protocol, message, ..

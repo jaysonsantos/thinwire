@@ -99,6 +99,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
         delete_for_me: false,
         delete_for_everyone: cfg!(feature = "discord-bot"),
         one_reaction: false,
+        edit: false,
     },
 };
 

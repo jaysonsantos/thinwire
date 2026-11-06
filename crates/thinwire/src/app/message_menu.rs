@@ -1,7 +1,7 @@
 //! The menu of one message: a right click on its bubble. It offers only what
 //! the protocol of the message allows (`MessageActions`): reply, an emoji
-//! reaction, copy, and delete. The reactions of a message show under its
-//! bubble, and a reply shows the message it answers.
+//! reaction, copy, edit, and delete. The reactions of a message show under
+//! its bubble, and a reply shows the message it answers.
 
 use eframe::egui::{self, RichText};
 use thinwire_core::{Intent, View};
@@ -26,6 +26,8 @@ pub(crate) struct Target<'a> {
     pub(crate) body: &'a str,
     pub(crate) outbound: bool,
     pub(crate) reactions: &'a [Reaction],
+    /// An own text message that the server has (`state::can_edit`).
+    pub(crate) editable: bool,
 }
 
 impl Target<'_> {
@@ -96,6 +98,15 @@ fn menu(ui: &mut egui::Ui, target: &Target<'_>, actions: MessageActions, out: &m
     }
     if !target.body.is_empty() && ui.button("Copy text").clicked() {
         ui.ctx().copy_text(target.body.to_owned());
+        ui.close();
+    }
+    if actions.edit && target.editable && ui.button("Edit").clicked() {
+        out.push(Intent::EditMessage {
+            protocol: target.protocol,
+            conversation_id: target.conversation_id.to_owned(),
+            message_id: target.message_id.to_owned(),
+        });
+        ui.memory_mut(|memory| memory.request_focus(egui::Id::unique("thread-compose")));
         ui.close();
     }
     let (me, everyone) = delete_choices(actions, target.outbound);
@@ -190,10 +201,25 @@ pub(crate) fn quote(ui: &mut egui::Ui, replied: Option<&ChatMessage>, outbound: 
     ui.add_space(space::XS);
 }
 
-/// The reply line over the compose field: the message the next send answers,
-/// and a button that cancels the reply.
+/// The line over the compose field: the message that the next send answers,
+/// or the message that the compose field edits. Its button cancels the reply
+/// or the edit.
 pub(crate) fn reply_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
-    let Some(message) = snapshot.reply_target() else {
+    let (message, title, hover, cancel) = if let Some(message) = snapshot.edit_target() {
+        (
+            message,
+            "Edit message".to_owned(),
+            "Cancel edit",
+            Intent::CancelEdit,
+        )
+    } else if let Some(message) = snapshot.reply_target() {
+        (
+            message,
+            format!("Reply to {}", message.sender),
+            "Cancel reply",
+            Intent::CancelReply,
+        )
+    } else {
         return;
     };
     let palette = theme::palette(ui);
@@ -205,7 +231,7 @@ pub(crate) fn reply_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<In
             |ui| {
                 lined(ui, palette.accent, |ui| {
                     ui.label(
-                        RichText::new(format!("Reply to {}", message.sender))
+                        RichText::new(title)
                             .small()
                             .family(theme::semibold())
                             .color(palette.accent),
@@ -223,18 +249,18 @@ pub(crate) fn reply_bar(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<In
         );
         if ui
             .add(egui::Button::new("✕").frame(false))
-            .on_hover_text("Cancel reply")
+            .on_hover_text(hover)
             .clicked()
         {
-            out.push(Intent::CancelReply);
+            out.push(cancel);
         }
     });
     ui.add_space(space::XS);
 }
 
-/// The height of [`reply_bar`]: nothing when no reply is open.
+/// The height of [`reply_bar`]: nothing when no reply or edit is open.
 pub(crate) fn reply_bar_height(ui: &egui::Ui, snapshot: &View<'_>) -> f32 {
-    if snapshot.reply_target().is_none() {
+    if snapshot.reply_target().is_none() && snapshot.edit_target().is_none() {
         return 0.0;
     }
     let line = ui.text_style_height(&egui::TextStyle::Small);

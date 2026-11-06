@@ -109,6 +109,7 @@ impl ProtocolAdapter for FakeAdapter {
                         file: None,
                         reactions: Vec::new(),
                         reply_to: None,
+                        edited: false,
                     },
                 );
                 Ok(())

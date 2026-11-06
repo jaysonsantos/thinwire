@@ -1573,6 +1573,7 @@ impl Owner {
                         file: None,
                         reactions: Vec::new(),
                         reply_to: reply_to.map(|id| format!("{CONVERSATION_PREFIX}{id}")),
+                        edited: false,
                     },
                 );
                 (body, message_id, SendRow::Pending)
@@ -1616,6 +1617,7 @@ impl Owner {
                         file: None,
                         reactions: Vec::new(),
                         reply_to: None,
+                        edited: false,
                     },
                 );
                 (body, message_id, SendRow::Pending)

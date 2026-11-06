@@ -151,6 +151,7 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
         delete_for_me: false,
         delete_for_everyone: true,
         one_reaction: true,
+        edit: false,
     },
 };
 

@@ -2058,6 +2058,10 @@ fn center_panel(
                 || player.take_video_escape()
                 || super::photos::take_escape(ui.ctx())
                 || super::links::take_escape(ui.ctx())
+                || (snapshot.edit_target().is_some() && {
+                    out.push(Intent::CancelEdit);
+                    true
+                })
                 || (snapshot.reply_target().is_some() && {
                     out.push(Intent::CancelReply);
                     true
@@ -2311,6 +2315,7 @@ fn thread(
             reactions: &message.reactions,
             reply: message.reply_to.as_deref().map(replied),
             actions,
+            editable: thinwire_core::state::can_edit(message),
             delivery: message.delivery,
             group: is_group,
             layout,
@@ -2776,6 +2781,8 @@ struct Bubble<'a> {
     reply: Option<Option<&'a thinwire_protocol::ChatMessage>>,
     /// What the menu of the message offers.
     actions: thinwire_protocol::MessageActions,
+    /// Edit can change this message.
+    editable: bool,
     delivery: Delivery,
     /// Group chat. The AccessKit name keeps the sender on every row.
     group: bool,
@@ -3460,6 +3467,7 @@ fn bubble(
             body: message.body,
             outbound: message.outbound,
             reactions: message.reactions,
+            editable: message.editable,
         };
         super::message_menu::attach(&frame, &target, message.actions, out);
         super::message_menu::reactions(ui, &target, message.actions, out);
@@ -3801,8 +3809,13 @@ fn compose(
                 let label =
                     motion::mix(send_label(false, palette), send_label(true, palette), ready);
                 let fill = motion::mix(send_fill(false, palette), send_fill(true, palette), ready);
+                let name = if snapshot.edit_target().is_some() {
+                    "Save edit"
+                } else {
+                    "Send"
+                };
                 if ui
-                    .add_enabled_ui(snapshot.can_send(), |ui| send_button(ui, fill, label))
+                    .add_enabled_ui(snapshot.can_send(), |ui| send_button(ui, fill, label, name))
                     .inner
                     .clicked()
                     && let Some((protocol, conversation_id, topic)) = chat.clone()
@@ -3817,9 +3830,15 @@ fn compose(
         });
 }
 
-/// The round Send button: an arrow on `fill`. Its name for a screen reader is
-/// "Send". A disabled button does not answer clicks (the caller disables it).
-fn send_button(ui: &mut egui::Ui, fill: egui::Color32, ink: egui::Color32) -> egui::Response {
+/// The round Send button: an arrow on `fill`. `name` is its name for a screen
+/// reader: "Send", or "Save edit" while the compose field edits a message. A
+/// disabled button does not answer clicks (the caller disables it).
+fn send_button(
+    ui: &mut egui::Ui,
+    fill: egui::Color32,
+    ink: egui::Color32,
+    name: &str,
+) -> egui::Response {
     let icon_id = egui::IdSalt::new("send-icon");
     let enabled = ui.is_enabled();
     let shown = egui::Button::new(egui::Atom::custom(icon_id, egui::vec2(18.0, 18.0)))
@@ -3831,7 +3850,7 @@ fn send_button(ui: &mut egui::Ui, fill: egui::Color32, ink: egui::Color32) -> eg
         icons::arrow_up(ui.painter(), rect.center(), 18.0, ink);
     }
     let response = shown.response;
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, "Send"));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, name));
     response
 }
 
