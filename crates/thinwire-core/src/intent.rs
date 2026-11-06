@@ -162,6 +162,14 @@ pub enum Intent {
         message_id: String,
         file_id: i32,
     },
+    /// Download one document of the open message. The core sends one request
+    /// until that file finishes or fails.
+    DownloadDocument {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+        file_id: i32,
+    },
     /// The next send of the open chat replies to this message. Only a
     /// protocol with `MessageActions::reply`.
     ReplyTo {

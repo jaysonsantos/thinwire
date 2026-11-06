@@ -1,4 +1,4 @@
-//! Links, photos, and voice notes on a chat message.
+//! Links, photos, voice notes, and documents on a chat message.
 //!
 //! Offsets in [`MessageLink`] are UTF-8 byte indexes into the message body.
 //! TDLib reports entity offsets in UTF-16 code units. [`links_in`] converts
@@ -396,6 +396,172 @@ impl fmt::Debug for MessagePhoto {
             .field("failed", &self.failed)
             .finish()
     }
+}
+
+/// One document the user can download. `file_id` names the download for its
+/// adapter, as [`MessageAudio`] does. The path is an [`AudioPath`]: a local
+/// file whose `Debug` shows no path. [`Self::preview`] is a thumbnail the
+/// protocol already sent. It is not a rendered page.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MessageFile {
+    name: String,
+    mime: String,
+    size: u64,
+    file_id: i32,
+    file: Option<AudioPath>,
+    failed: bool,
+    preview: Option<MessagePhoto>,
+}
+
+impl MessageFile {
+    /// `name` is the file name, not a path. An empty name is shown as "File".
+    /// `size` is bytes, or 0 when the protocol does not say. `file_id` may be
+    /// 0 when the file cannot be downloaded.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        mime: impl Into<String>,
+        size: u64,
+        file_id: i32,
+        file: Option<AudioPath>,
+        preview: Option<MessagePhoto>,
+    ) -> Self {
+        Self {
+            name: display_name(&name.into()),
+            mime: mime.into(),
+            size,
+            file_id,
+            file,
+            failed: false,
+            preview,
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn mime(&self) -> &str {
+        &self.mime
+    }
+
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub fn kind_label(&self) -> String {
+        if is_pdf(&self.name, &self.mime) {
+            return "PDF".to_string();
+        }
+        if let Some(ext) = extension(&self.name)
+            && (1..=5).contains(&ext.len())
+            && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+        {
+            return ext.to_ascii_uppercase();
+        }
+        "File".to_string()
+    }
+
+    /// `None` when the protocol did not say.
+    #[must_use]
+    pub fn size_label(&self) -> Option<String> {
+        size_label(self.size)
+    }
+
+    #[must_use]
+    pub fn file_id(&self) -> i32 {
+        self.file_id
+    }
+
+    #[must_use]
+    pub fn file(&self) -> Option<&AudioPath> {
+        self.file.as_ref()
+    }
+
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// A thumbnail or minithumbnail, when the protocol sent one.
+    #[must_use]
+    pub fn preview(&self) -> Option<&MessagePhoto> {
+        self.preview.as_ref()
+    }
+
+    #[must_use]
+    pub fn preview_mut(&mut self) -> Option<&mut MessagePhoto> {
+        self.preview.as_mut()
+    }
+
+    pub fn set_file(&mut self, path: AudioPath) {
+        self.file = Some(path);
+        self.failed = false;
+    }
+
+    pub fn mark_failed(&mut self) {
+        self.failed = true;
+    }
+
+    pub fn clear_failed(&mut self) {
+        self.failed = false;
+    }
+}
+
+impl fmt::Debug for MessageFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessageFile")
+            .field("name", &self.name)
+            .field("mime", &self.mime)
+            .field("size", &self.size)
+            .field("file_id", &self.file_id)
+            .field("file", &self.file)
+            .field("failed", &self.failed)
+            .field("preview", &self.preview)
+            .finish()
+    }
+}
+
+fn display_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    if base.is_empty() {
+        "File".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+fn extension(name: &str) -> Option<&str> {
+    let ext = name.rsplit_once('.')?.1;
+    (!ext.is_empty() && !ext.contains(['/', '\\'])).then_some(ext)
+}
+
+fn is_pdf(name: &str, mime: &str) -> bool {
+    mime.eq_ignore_ascii_case("application/pdf")
+        || extension(name).is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+}
+
+fn size_label(size: u64) -> Option<String> {
+    if size == 0 {
+        return None;
+    }
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let (value, unit) = if size < KIB {
+        return Some(format!("{size} B"));
+    } else if size < MIB {
+        (size.div_ceil(KIB), "KB")
+    } else if size < GIB {
+        (size.div_ceil(MIB), "MB")
+    } else {
+        (size.div_ceil(GIB), "GB")
+    };
+    Some(format!("{value} {unit}"))
 }
 
 /// Still chat photo for an inbox avatar, plus the accent used for initials.
@@ -957,5 +1123,25 @@ mod outgoing_tests {
         let file = OutgoingFile::new("/home/secret-user/cat.png".into()).expect("photo");
         assert_eq!(file.file_name(), "cat.png");
         assert!(!format!("{file:?}").contains("secret-user"));
+    }
+
+    #[test]
+    fn a_document_shows_its_name_and_not_a_directory() {
+        let file = MessageFile::new(
+            "/home/secret-user/notes.pdf",
+            "application/pdf",
+            2048,
+            11,
+            None,
+            None,
+        );
+        assert_eq!(file.name(), "notes.pdf");
+        assert_eq!(file.kind_label(), "PDF");
+        assert_eq!(file.size_label().as_deref(), Some("2 KB"));
+        assert!(!format!("{file:?}").contains("secret-user"));
+        let plain = MessageFile::new("notes.txt", "text/plain", 0, 12, None, None);
+        assert!(plain.preview().is_none());
+        assert_eq!(plain.kind_label(), "TXT");
+        assert!(plain.size_label().is_none());
     }
 }

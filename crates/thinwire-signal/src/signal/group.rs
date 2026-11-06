@@ -160,6 +160,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };

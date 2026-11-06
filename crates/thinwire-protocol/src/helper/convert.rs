@@ -167,7 +167,8 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::ViewTopic { .. }
         | AdapterCommand::DownloadFile { .. }
         // A helper sends no video yet (ADR 0015).
-        | AdapterCommand::DownloadVideo { .. } => return None,
+        | AdapterCommand::DownloadVideo { .. }
+        | AdapterCommand::DownloadDocument { .. } => return None,
     })
 }
 
@@ -918,6 +919,7 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
             .audio
             .and_then(|audio| MessageAudio::new(audio.duration_secs, audio.file_id, None)),
         video: None,
+        file: None,
         reactions: reactions_from_wire(message.reactions),
         reply_to: message.reply_to,
     }
@@ -952,6 +954,7 @@ mod tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         }
