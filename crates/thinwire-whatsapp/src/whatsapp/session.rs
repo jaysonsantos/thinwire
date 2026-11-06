@@ -1600,6 +1600,64 @@ mod tests {
         assert!(!asks.contains(&NAMED.to_string()));
     }
 
+    /// One link asks for at most [`AVATAR_CHATS`] unnamed subjects. A later
+    /// message does not start another batch.
+    #[tokio::test]
+    async fn a_link_asks_for_at_most_fifty_unnamed_subjects() {
+        let session = Session::default();
+        session.begin(1);
+        let (tx, _rx) = unbounded_channel();
+        let sender = Arc::new(fake::FakeSender::default());
+        assert!(session.attach_sender(1, sender.clone()));
+        let total = AVATAR_CHATS + 10;
+        let chats: Vec<HistoryChat> = (0..total)
+            .map(|n| {
+                let jid = format!("120363{n:012}@g.us");
+                HistoryChat {
+                    jid: jid.clone(),
+                    name: None,
+                    unread: 0,
+                    timestamp: 10,
+                    messages: vec![message(&jid, "m1", "hi", 10)],
+                    mute: Mute::Off,
+                }
+            })
+            .collect();
+        session.apply(
+            LinkEvent::History {
+                chats,
+                push_names: Vec::new(),
+                request_id: None,
+                ended: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        session.apply(LinkEvent::Connected, 1, &tx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline
+            && sender.subject_asks.lock().expect("fake lock").len() < AVATAR_CHATS
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            sender.subject_asks.lock().expect("fake lock").len(),
+            AVATAR_CHATS,
+            "the connect pass stopped before the cap"
+        );
+        session.apply(
+            LinkEvent::Messages(vec![message("120363000000000000@g.us", "m2", "again", 11)]),
+            1,
+            &tx,
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let asks = sender.subject_asks.lock().expect("fake lock").len();
+        assert_eq!(
+            asks, AVATAR_CHATS,
+            "a later message asked for {asks} subjects in one run"
+        );
+    }
+
     /// #168 item 12: the session tells the inbox about each connection. A
     /// history value after a reconnect refreshes a mute that a live change
     /// of the last connection set.
