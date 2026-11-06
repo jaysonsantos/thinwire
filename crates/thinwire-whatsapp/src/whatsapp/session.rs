@@ -646,22 +646,31 @@ impl Session {
         }
     }
 
+    /// Unnamed groups this link has not asked yet. The link stops at
+    /// [`AVATAR_CHATS`] queries. A later history row or live message does
+    /// not start another batch. A new link can ask again. Groups past the
+    /// cap stay unnamed until then.
+    fn take_subject_asks(state: &mut State) -> Vec<String> {
+        let mut pending = Vec::new();
+        for jid in state.inbox.unnamed_groups() {
+            if state.subjects_asked.len() >= AVATAR_CHATS {
+                break;
+            }
+            if state.subjects_asked.insert(jid.clone()) {
+                pending.push(jid);
+            }
+        }
+        pending
+    }
+
     fn claim_unnamed(&self, generation: u64) -> Vec<String> {
         let mut state = self.lock();
         if state.closed || state.generation != generation || !state.subjects_listed {
             return Vec::new();
         }
-        state
-            .inbox
-            .unnamed_groups()
-            .into_iter()
-            .filter(|jid| state.subjects_asked.insert(jid.clone()))
-            .take(AVATAR_CHATS)
-            .collect()
+        Self::take_subject_asks(&mut state)
     }
 
-    /// At most [`AVATAR_CHATS`] metadata queries per call. Groups past
-    /// that stay unnamed until a later history row or live message.
     async fn fetch_subjects(
         &self,
         generation: u64,
@@ -697,13 +706,7 @@ impl Session {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let pending: Vec<String> = state
-            .inbox
-            .unnamed_groups()
-            .into_iter()
-            .filter(|jid| state.subjects_asked.insert(jid.clone()))
-            .take(AVATAR_CHATS)
-            .collect();
+        let pending = Self::take_subject_asks(state);
         if pending.is_empty() {
             return;
         }
