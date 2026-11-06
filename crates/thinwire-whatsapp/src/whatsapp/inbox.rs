@@ -256,6 +256,32 @@ pub(super) fn reaction_counts(reactions: &[(String, String)]) -> Vec<thinwire_pr
     counts
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HistoryAnchor {
+    pub id: String,
+    pub from_me: bool,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OlderDecision {
+    pub events: Vec<AdapterEvent>,
+    pub more_cached: bool,
+    pub anchor: Option<HistoryAnchor>,
+    pub ended: bool,
+}
+
+impl OlderDecision {
+    pub(super) fn closed() -> Self {
+        Self {
+            events: Vec::new(),
+            more_cached: false,
+            anchor: None,
+            ended: true,
+        }
+    }
+}
+
 /// One conversation from a history-sync chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct HistoryChat {
@@ -370,6 +396,7 @@ struct ChatRecord {
     /// Newest activity time from history sync. A dropped send falls back to
     /// it (Codex r4131089177).
     history_at: i64,
+    history_ended: bool,
     mute: Mute,
     /// A live `MuteUpdate` of this connection set `mute`: an older history
     /// chunk does not change it again. A reconnect clears it (#168 item 12).
@@ -729,6 +756,23 @@ impl Inbox {
         self.upsert_event(jid)
     }
 
+    pub(super) fn unnamed_groups(&self) -> Vec<String> {
+        let mut jids: Vec<String> = self
+            .chats
+            .iter()
+            .filter(|(jid, record)| {
+                is_group(jid)
+                    && record
+                        .name
+                        .as_deref()
+                        .is_none_or(|name| name.trim().is_empty())
+            })
+            .map(|(jid, _)| jid.clone())
+            .collect();
+        jids.sort();
+        jids
+    }
+
     /// The audio of the message with the handle `file_id`, while the
     /// message is in the cache.
     pub(super) fn voice_media(&self, file_id: i32) -> Option<MediaRef> {
@@ -1072,28 +1116,44 @@ impl Inbox {
         Some(events)
     }
 
-    /// Up to `limit` messages older than `before`, oldest first, and whether
-    /// still older rows exist. An unknown chat or id gives no rows and `false`.
-    pub(super) fn older_page(
-        &self,
-        jid: &str,
-        before: &str,
-        limit: usize,
-    ) -> (Vec<AdapterEvent>, bool) {
+    pub(super) fn older_decision(&self, jid: &str, before: &str, limit: usize) -> OlderDecision {
         let Some(record) = self.chats.get(jid) else {
-            return (Vec::new(), false);
+            return OlderDecision::closed();
         };
         let Some(end) = record.messages.iter().position(|row| row.id == before) else {
-            return (Vec::new(), false);
+            return OlderDecision::closed();
         };
+        let anchor = &record.messages[end];
         let start = end.saturating_sub(limit);
-        let page = record.messages[start..end]
+        let events = record.messages[start..end]
             .iter()
             .map(|message| AdapterEvent::MessageReceived {
                 message: self.chat_message(message, Arrival::History),
             })
             .collect();
-        (page, start > 0)
+        OlderDecision {
+            events,
+            more_cached: start > 0,
+            anchor: Some(HistoryAnchor {
+                id: anchor.id.clone(),
+                from_me: anchor.from_me,
+                timestamp: anchor.timestamp,
+            }),
+            ended: record.history_ended,
+        }
+    }
+
+    pub(super) fn mark_history_ended(&mut self, jid: &str) {
+        if let Some(record) = self.chats.get_mut(jid) {
+            record.history_ended = true;
+        }
+    }
+
+    #[must_use]
+    pub(super) fn history_has_ended(&self, jid: &str) -> bool {
+        self.chats
+            .get(jid)
+            .is_some_and(|record| record.history_ended)
     }
 
     /// The chat the user looks at now (`None`: no WhatsApp chat). Messages

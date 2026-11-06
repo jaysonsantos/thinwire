@@ -5,6 +5,7 @@
 //! [`LinkEvent`] values. Tests feed the same values from fakes. Pairing
 //! material travels only inside [`RedactedPairingSecret`].
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -34,6 +35,10 @@ pub(super) const SEND_NETWORK: &str = "WhatsApp send failed: no connection. Noth
 pub(super) const SEND_UNLINKED: &str = "WhatsApp unlinked this device. Nothing was sent. Open the ban gate again to pair a new session.";
 pub(super) const SEND_REJECTED: &str = "WhatsApp did not accept the message. Nothing was sent.";
 pub(super) const QR_EXHAUSTED: &str = thinwire_protocol::WHATSAPP_QR_EXHAUSTED;
+
+const HISTORY_WAIT: Duration = Duration::from_secs(20);
+
+const OLDER_HISTORY_FAILED: &str = "Could not load older WhatsApp messages.";
 
 /// Boxed send future. Resolves to the server message id.
 pub(super) type SendFuture<'a> =
@@ -127,12 +132,31 @@ pub(super) trait WhatsAppSender: Send + Sync {
         Box::pin(async { Err(()) })
     }
 
-    /// The subject of one group that has no stored name. `Ok(None)` when
-    /// the group has no subject. The default does not ask.
-    #[allow(dead_code)]
     fn group_subject<'a>(&'a self, _jid: &'a str) -> SubjectFuture<'a> {
         Box::pin(async { Ok(None) })
     }
+
+    /// Record the id before [`Self::request_history`]. The history
+    /// notification can arrive before that send finishes.
+    fn allocate_history_id(&self) -> Option<String> {
+        None
+    }
+
+    /// The messages arrive later as a history sync that carries
+    /// `ask.request_id`.
+    fn request_history<'a>(&'a self, _ask: &'a HistoryAsk<'a>) -> ActionFuture<'a> {
+        Box::pin(async { Err(()) })
+    }
+}
+
+#[cfg_attr(not(feature = "whatsapp-web"), allow(dead_code))]
+pub(super) struct HistoryAsk<'a> {
+    pub chat_jid: &'a str,
+    pub oldest_id: &'a str,
+    pub oldest_from_me: bool,
+    pub oldest_timestamp_ms: i64,
+    pub count: i32,
+    pub request_id: &'a str,
 }
 
 /// Boxed message action: a reaction or a delete. The error has no text.
@@ -142,8 +166,6 @@ pub(super) type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> +
 pub(super) type NamesFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, ()>> + Send + 'a>>;
 
-/// The subject of one group. `Ok(None)` is a group with no subject.
-#[allow(dead_code)]
 pub(super) type SubjectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<String>, ()>> + Send + 'a>>;
 
@@ -178,6 +200,9 @@ pub(super) enum LinkEvent {
     History {
         chats: Vec<HistoryChat>,
         push_names: Vec<(String, String)>,
+        /// `None` on a server push. `Some` answers `request_history`.
+        request_id: Option<String>,
+        ended: Vec<String>,
     },
     Messages(Vec<WaMessage>),
     /// Live reactions to cached messages.
@@ -222,6 +247,16 @@ struct State {
     media_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// This link fetched its chat pictures. A reconnect does not again.
     avatars_asked: bool,
+    subjects_listed: bool,
+    subjects_asked: HashSet<String>,
+    older_waits: HashMap<String, OlderWait>,
+}
+
+struct OlderWait {
+    conversation_id: String,
+    before: String,
+    jid: String,
+    timer: Option<tokio::task::AbortHandle>,
 }
 
 /// The timer for the next timed mute end (#168 item 13).
@@ -335,6 +370,9 @@ impl Session {
         state.stopped = None;
         state.generation = NO_LINK;
         state.avatars_asked = false;
+        state.subjects_listed = false;
+        state.subjects_asked.clear();
+        Self::clear_older_waits(state);
         let removed = state.inbox.clear();
         // Rows the shell never saw need no removal.
         if std::mem::take(&mut state.announced) {
@@ -358,6 +396,9 @@ impl Session {
         state.generation = generation;
         state.sender = None;
         state.announced = false;
+        state.subjects_listed = false;
+        state.subjects_asked.clear();
+        Self::clear_older_waits(&mut state);
         // A timer of the old link has a stale generation: it would never end
         // a mute of this link (Codex r4138502157).
         Self::abort_mute_timer(&mut state);
@@ -549,8 +590,14 @@ impl Session {
         let session = self.clone();
         let events = events.clone();
         runtime.spawn(async move {
-            if names && let Ok(names) = sender.group_names().await {
-                session.finish_group_names(generation, names, &events);
+            if names {
+                let listed = sender.group_names().await.unwrap_or_default();
+                session.finish_group_names(generation, listed, &events);
+                session.mark_subjects_listed(generation);
+                let pending = session.claim_unnamed(generation);
+                session
+                    .fetch_subjects(generation, sender.as_ref(), &pending, &events)
+                    .await;
             }
             let gate = Arc::new(tokio::sync::Semaphore::new(AVATAR_LOOKUPS));
             let mut lookups = tokio::task::JoinSet::new();
@@ -585,6 +632,145 @@ impl Session {
         for (jid, name) in names {
             if let Some(row) = state.inbox.set_group_name(&jid, &name) {
                 let _ = events.send(row);
+            }
+        }
+    }
+
+    fn mark_subjects_listed(&self, generation: u64) {
+        let mut state = self.lock();
+        if !state.closed && state.generation == generation {
+            state.subjects_listed = true;
+        }
+    }
+
+    fn claim_unnamed(&self, generation: u64) -> Vec<String> {
+        let mut state = self.lock();
+        if state.closed || state.generation != generation || !state.subjects_listed {
+            return Vec::new();
+        }
+        state
+            .inbox
+            .unnamed_groups()
+            .into_iter()
+            .filter(|jid| state.subjects_asked.insert(jid.clone()))
+            .collect()
+    }
+
+    async fn fetch_subjects(
+        &self,
+        generation: u64,
+        sender: &dyn WhatsAppSender,
+        pending: &[String],
+        events: &EventTx,
+    ) {
+        for jid in pending {
+            let Some(name) = sender.group_subject(jid).await.ok().flatten() else {
+                continue;
+            };
+            self.finish_one_group_name(generation, jid, &name, events);
+        }
+    }
+
+    fn finish_one_group_name(&self, generation: u64, jid: &str, name: &str, events: &EventTx) {
+        let mut state = self.lock();
+        if state.closed || state.generation != generation {
+            return;
+        }
+        if let Some(row) = state.inbox.set_group_name(jid, name) {
+            let _ = events.send(row);
+        }
+    }
+
+    fn spawn_missing_subjects(&self, state: &mut State, events: &EventTx) {
+        if !state.subjects_listed || state.closed {
+            return;
+        }
+        let Some(sender) = state.sender.clone() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let pending: Vec<String> = state
+            .inbox
+            .unnamed_groups()
+            .into_iter()
+            .filter(|jid| state.subjects_asked.insert(jid.clone()))
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let generation = state.generation;
+        let session = self.clone();
+        let events = events.clone();
+        runtime.spawn(async move {
+            session
+                .fetch_subjects(generation, sender.as_ref(), &pending, &events)
+                .await;
+        });
+    }
+
+    pub(super) fn note_older_wait(
+        &self,
+        generation: u64,
+        request_id: String,
+        jid: &str,
+        before: &str,
+        conversation_id: &str,
+        events: &EventTx,
+    ) {
+        let mut state = self.lock();
+        if state.closed || state.generation != generation {
+            return;
+        }
+        let session = self.clone();
+        let events = events.clone();
+        let id = request_id.clone();
+        let timer = tokio::runtime::Handle::current().spawn(async move {
+            tokio::time::sleep(HISTORY_WAIT).await;
+            session.expire_older(generation, &id, &events);
+        });
+        state.older_waits.insert(
+            request_id,
+            OlderWait {
+                conversation_id: conversation_id.to_string(),
+                before: before.to_string(),
+                jid: jid.to_string(),
+                timer: Some(timer.abort_handle()),
+            },
+        );
+    }
+
+    pub(super) fn expire_older(&self, generation: u64, request_id: &str, events: &EventTx) {
+        let mut state = self.lock();
+        if state.generation != generation {
+            return;
+        }
+        let Some(wait) = state.older_waits.remove(request_id) else {
+            return;
+        };
+        if let Some(timer) = wait.timer {
+            timer.abort();
+        }
+        if state.closed || !state.announced {
+            return;
+        }
+        tracing::debug!("whatsapp older history did not load");
+        let _ = events.send(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: wait.conversation_id,
+            before_message_id: wait.before,
+            more: true,
+            note: Some(OLDER_HISTORY_FAILED.to_string()),
+            topic: None,
+            store_cursor: None,
+        });
+    }
+
+    fn clear_older_waits(state: &mut State) {
+        for (_, wait) in state.older_waits.drain() {
+            if let Some(timer) = wait.timer {
+                timer.abort();
             }
         }
     }
@@ -638,7 +824,9 @@ impl Session {
         let stop = event.stop_detail();
         let connected_now = matches!(event, LinkEvent::Connected);
         let history_now = matches!(event, LinkEvent::History { .. });
+        let messages_now = matches!(event, LinkEvent::Messages(_));
         let mute_may_change = matches!(event, LinkEvent::History { .. } | LinkEvent::Mute { .. });
+        let mut older_media = Vec::new();
         let out = match event {
             LinkEvent::Qr(code) => vec![AdapterEvent::WhatsAppQr {
                 code,
@@ -698,9 +886,51 @@ impl Session {
                 Vec::new()
             }
             // Before Linked the rows stay in the inbox only (rule 1).
-            LinkEvent::History { chats, push_names } => {
-                let rows = state.inbox.apply_history(chats, push_names);
-                if state.announced { rows } else { Vec::new() }
+            LinkEvent::History {
+                chats,
+                push_names,
+                request_id,
+                ended,
+            } => {
+                let mut rows = state.inbox.apply_history(chats, push_names);
+                for jid in &ended {
+                    state.inbox.mark_history_ended(jid);
+                }
+                if !state.announced {
+                    rows.clear();
+                }
+                if let Some(request_id) = request_id
+                    && let Some(wait) = state.older_waits.remove(&request_id)
+                {
+                    if let Some(timer) = wait.timer {
+                        timer.abort();
+                    }
+                    let page = state.inbox.older_decision(
+                        &wait.jid,
+                        &wait.before,
+                        inbox::OPEN_CHAT_MESSAGES,
+                    );
+                    let empty = page.events.is_empty();
+                    if empty {
+                        state.inbox.mark_history_ended(&wait.jid);
+                    }
+                    let more =
+                        !empty && (page.more_cached || !state.inbox.history_has_ended(&wait.jid));
+                    if state.announced {
+                        older_media.clone_from(&page.events);
+                        rows.extend(page.events);
+                        rows.push(AdapterEvent::OlderHistoryLoaded {
+                            protocol: ProtocolId::WhatsApp,
+                            conversation_id: wait.conversation_id,
+                            before_message_id: wait.before,
+                            more,
+                            note: None,
+                            topic: None,
+                            store_cursor: None,
+                        });
+                    }
+                }
+                rows
             }
             LinkEvent::Messages(messages) => {
                 let rows = state.inbox.apply_messages(messages);
@@ -723,8 +953,14 @@ impl Session {
         // A history sync does not download its photos: the chat asks when
         // it opens.
         self.spawn_media(&mut state, &out, false, events);
+        if !older_media.is_empty() {
+            self.spawn_media(&mut state, &older_media, true, events);
+        }
         if connected_now || history_now {
             self.spawn_chat_details(&mut state, connected_now, events);
+        }
+        if history_now || messages_now {
+            self.spawn_missing_subjects(&mut state, events);
         }
         if let Some(detail) = stop {
             state.connected = false;
@@ -906,11 +1142,22 @@ fn status(events: &EventTx, status: AdapterStatus, detail: &str) {
 #[cfg(test)]
 pub(super) mod fake {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        ActionFuture, DownloadFuture, MediaRef, NamesFuture, SendFailure, SendFuture,
+        ActionFuture, DownloadFuture, HistoryAsk, MediaRef, NamesFuture, SendFailure, SendFuture,
         SubjectFuture, TargetRef, WhatsAppSender,
     };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(in crate::whatsapp) struct RecordedHistory {
+        pub chat_jid: String,
+        pub oldest_id: String,
+        pub from_me: bool,
+        pub timestamp_ms: i64,
+        pub count: i32,
+        pub request_id: String,
+    }
 
     /// Records sends. Returns `SRV<n>` ids, or the failure in `fail`. A
     /// download returns `media` when set, else it fails.
@@ -920,13 +1167,12 @@ pub(super) mod fake {
         pub fail: Option<SendFailure>,
         pub media: Option<Vec<u8>>,
         pub downloads: Mutex<u32>,
-        /// The group subjects of `group_names` (the participating list).
+        /// The group subjects of `group_names`.
         pub names: Vec<(String, String)>,
-        /// The subject `group_subject` returns for one group, and the
-        /// groups it was asked for.
-        #[allow(dead_code)]
         pub subjects: Vec<(String, String)>,
         pub subject_asks: Mutex<Vec<String>>,
+        pub history_seq: AtomicU64,
+        pub history_asks: Mutex<Vec<RecordedHistory>>,
         /// The bytes of each `profile_picture`. `None` has no picture.
         pub picture: Option<Vec<u8>>,
         /// Each reply, reaction, and delete, as "kind id".
@@ -976,6 +1222,26 @@ pub(super) mod fake {
                     .find(|(id, _)| id == jid)
                     .map(|(_, name)| name.clone()))
             })
+        }
+
+        fn allocate_history_id(&self) -> Option<String> {
+            let n = self.history_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            Some(format!("hist-{n}"))
+        }
+
+        fn request_history<'a>(&'a self, ask: &'a HistoryAsk<'a>) -> ActionFuture<'a> {
+            self.history_asks
+                .lock()
+                .expect("fake lock")
+                .push(RecordedHistory {
+                    chat_jid: ask.chat_jid.to_string(),
+                    oldest_id: ask.oldest_id.to_string(),
+                    from_me: ask.oldest_from_me,
+                    timestamp_ms: ask.oldest_timestamp_ms,
+                    count: ask.count,
+                    request_id: ask.request_id.to_string(),
+                });
+            Box::pin(async { Ok(()) })
         }
 
         fn profile_picture<'a>(&'a self, _jid: &'a str) -> DownloadFuture<'a> {
@@ -1052,6 +1318,8 @@ mod tests {
                 mute,
             }],
             push_names: Vec::new(),
+            request_id: None,
+            ended: Vec::new(),
         }
     }
 
@@ -1212,9 +1480,6 @@ mod tests {
         assert_eq!(pictures, 1, "one picture for the one chat, one time");
     }
 
-    /// A group with no stored name is asked for its subject, and the title
-    /// changes when that subject arrives. A group that already has a name
-    /// is not asked. A group that appears later with no name is asked too.
     #[tokio::test]
     async fn a_group_with_no_stored_name_gets_its_subject() {
         const UNNAMED: &str = "120363000000000001@g.us";
@@ -1247,6 +1512,8 @@ mod tests {
                     chat(NAMED, Some("Family"), "hi"),
                 ],
                 push_names: Vec::new(),
+                request_id: None,
+                ended: Vec::new(),
             },
             1,
             &tx,
