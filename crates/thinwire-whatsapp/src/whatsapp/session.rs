@@ -646,10 +646,6 @@ impl Session {
         }
     }
 
-    /// Unnamed groups this link has not asked yet. The link stops at
-    /// [`AVATAR_CHATS`] queries. A later history row or live message does
-    /// not start another batch. A new link can ask again. Groups past the
-    /// cap stay unnamed until then.
     fn take_subject_asks(state: &mut State) -> Vec<String> {
         let mut pending = Vec::new();
         for jid in state.inbox.unnamed_groups() {
@@ -1603,8 +1599,6 @@ mod tests {
         assert!(!asks.contains(&NAMED.to_string()));
     }
 
-    /// One link asks for at most [`AVATAR_CHATS`] unnamed subjects. A later
-    /// message does not start another batch.
     #[tokio::test]
     async fn a_link_asks_for_at_most_fifty_unnamed_subjects() {
         let session = Session::default();

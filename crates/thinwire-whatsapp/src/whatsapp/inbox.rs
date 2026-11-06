@@ -18,8 +18,7 @@ use thinwire_protocol::{
 /// Prefix on every WhatsApp conversation id. The rest is the chat JID.
 pub(super) const CONVERSATION_PREFIX: &str = "whatsapp:";
 
-/// Messages kept per chat before the user fetches an older page. Older
-/// ones drop off the front. After a fetch, the thread stays whole.
+/// Messages kept per chat. Older ones drop off the front.
 pub(super) const MESSAGES_PER_CHAT: usize = 200;
 
 /// Handled ids kept per chat. Past this, the older half goes, oldest first
@@ -398,9 +397,6 @@ struct ChatRecord {
     /// it (Codex r4131089177).
     history_at: i64,
     history_ended: bool,
-    /// The user loaded an older page. Later inserts keep every row, so
-    /// that page stays against the window. The flag is not saved. A
-    /// restart trims on the next insert.
     keeps_older: bool,
     mute: Mute,
     /// A live `MuteUpdate` of this connection set `mute`: an older history
@@ -518,9 +514,7 @@ pub(super) struct SavedMessage {
     pub reactions: Vec<(String, String)>,
 }
 
-/// One saved chat: the row and its messages. A fetched older page is
-/// included. A restart has no in-memory mark for that page, so the next
-/// insert trims the chat to the newest [`MESSAGES_PER_CHAT`].
+/// One saved chat: the row and its messages.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct SavedChat {
     pub name: Option<String>,
@@ -1020,8 +1014,6 @@ impl Inbox {
         }
     }
 
-    /// Keep a page the user asked for. The chat keeps every row from here
-    /// on, so a later message cannot open a hole under this page.
     pub(super) fn apply_fetched(&mut self, jid: &str, messages: Vec<WaMessage>) {
         if messages.is_empty() || !is_inbox_chat(jid) {
             return;
@@ -1607,8 +1599,6 @@ fn insert_message(messages: &mut Vec<WaMessage>, keeps_older: bool, mut message:
         messages.push(message);
     }
     messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
-    // A fetched page and the window are one thread. Dropping the oldest
-    // window row would open a hole under that page.
     if keeps_older {
         return;
     }
@@ -2946,8 +2936,6 @@ pub(super) mod tests {
         );
     }
 
-    /// A fetched page stays against the window after one live row.
-    /// Scrolling shows every row of both, including the oldest window row.
     #[test]
     fn a_fetched_page_and_a_live_message_leave_no_gap() {
         let mut inbox = Inbox::default();
@@ -2993,8 +2981,6 @@ pub(super) mod tests {
         assert_same_thread(&scrolled_thread(&inbox, chat), &expected);
     }
 
-    /// Ids the shell shows, from the newest row back through every cached
-    /// page. The last step is the decision at the oldest row.
     fn scrolled_thread(inbox: &Inbox, chat: &str) -> Vec<String> {
         let newest = inbox.chats[chat]
             .messages
@@ -3055,8 +3041,6 @@ pub(super) mod tests {
         );
     }
 
-    /// Ten live messages after an older page. Scrolling shows every fetched
-    /// row and every window row, and the oldest row asks the phone.
     #[test]
     fn ten_live_messages_after_a_fetch_keep_the_thread_whole() {
         let mut inbox = Inbox::default();
@@ -3103,8 +3087,6 @@ pub(super) mod tests {
         assert_same_thread(&scrolled_thread(&inbox, chat), &expected);
     }
 
-    /// A local send sorts ahead of the window. The older page still sits
-    /// against that window after ten live messages.
     #[test]
     fn a_pending_send_that_sorts_first_stays_against_the_fetched_page() {
         let mut inbox = Inbox::default();

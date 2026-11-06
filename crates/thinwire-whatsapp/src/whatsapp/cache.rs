@@ -4,9 +4,7 @@
 //! WhatsApp sends the chat history only when a device pairs. A saved
 //! session that opens again gets new messages only. The helper thus keeps
 //! the chat list and the newest messages of each chat in this file and
-//! loads them when the saved session opens. An older page the user fetched
-//! is written too. The next start has no mark for it, so the next insert
-//! trims that chat back to the newest messages.
+//! loads them when the saved session opens.
 //!
 //! SQLCipher encrypts the file with the session key of the device store.
 //! The key stays in the OS keychain. One row holds one chat as JSON. A file
