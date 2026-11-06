@@ -156,22 +156,30 @@ pub(crate) fn open_command(path: &Path) -> Option<Command> {
     if !path.is_absolute() {
         return None;
     }
-    let command = if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
-        command.arg("/C");
-        command.arg("start");
-        command.arg("");
+    #[cfg(windows)]
+    {
+        return windows_open_command(path);
+    }
+    #[cfg(not(windows))]
+    {
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut command = Command::new(program);
         command.arg(path);
-        command
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(path);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(path);
-        command
-    };
+        Some(command)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_open_command(path: &Path) -> Option<Command> {
+    let mut command = Command::new("cmd");
+    command.arg("/C");
+    command.arg("start");
+    command.arg("");
+    command.arg(path);
     Some(command)
 }
 
@@ -328,5 +336,44 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args.last().map(String::as_str), Some("/tmp/notes.pdf"));
+    }
+
+    #[test]
+    fn a_program_file_does_not_open() {
+        for extension in [
+            "exe", "bat", "cmd", "com", "scr", "pif", "lnk", "app", "desktop", "sh", "EXE",
+        ] {
+            let path = Path::new("/tmp").join(format!("payload.{extension}"));
+            assert!(open_command(&path).is_none(), "{extension} must not open");
+        }
+        assert!(open_command(Path::new("/tmp/notes.pdf")).is_some());
+    }
+
+    #[test]
+    fn an_ampersand_in_the_name_is_not_a_cmd_separator() {
+        let path = Path::new(r"C:\Users\a\x&calc.pdf");
+        let command = windows_open_command(path).expect("command");
+        let program = command.get_program().to_string_lossy();
+        assert!(
+            program.ends_with(r"\System32\rundll32.exe"),
+            "open must not go through cmd: {program}"
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter()
+                .all(|arg| arg != "/C" && !arg.eq_ignore_ascii_case("start")),
+            "a cmd start line splits on &: {args:?}"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "url.dll,FileProtocolHandler".to_string(),
+                path.display().to_string(),
+            ]
+        );
+        assert!(windows_open_command(Path::new(r"C:\Users\a\x&calc.exe")).is_none());
     }
 }
