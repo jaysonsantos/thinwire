@@ -46,8 +46,8 @@ fi
 sed -i -e "s/^pkgver=.*/pkgver=${version}/" -e 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
 id -u "$BUILD_USER" >/dev/null 2>&1 || useradd --create-home "$BUILD_USER"
 chown -R "$BUILD_USER" "$work"
-runuser -u "$BUILD_USER" -- updpkgsums
-runuser -u "$BUILD_USER" -- sh -c 'makepkg --printsrcinfo > .SRCINFO'
+env -u AUR_SSH_PRIVATE_KEY runuser -u "$BUILD_USER" -- updpkgsums
+env -u AUR_SSH_PRIVATE_KEY runuser -u "$BUILD_USER" -- sh -c 'makepkg --printsrcinfo > .SRCINFO'
 
 # The checksum of the archive must match the SHA256SUMS of the release.
 linux_archive="thinwire-linux-x86_64-${version}.tar.gz"
