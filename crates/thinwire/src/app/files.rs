@@ -151,7 +151,9 @@ fn launch(path: &AudioPath) -> bool {
     let Ok(child) = command.spawn() else {
         return false;
     };
-    watch_open(child).is_ok()
+    // The file is already opening. A failed waiter must not say it did not.
+    let _ = watch_open(child);
+    true
 }
 
 /// Reap the opener. Dropping the `Child` would leave a zombie.
@@ -165,7 +167,7 @@ fn watch_open(
 
 #[must_use]
 pub(crate) fn open_command(path: &Path) -> Option<Command> {
-    if !path.is_absolute() || is_program(path) {
+    if !path.is_absolute() || !can_open(path) {
         return None;
     }
     #[cfg(windows)]
@@ -189,29 +191,72 @@ pub(crate) fn open_command(path: &Path) -> Option<Command> {
 /// the same way a mailto address is opened.
 #[cfg(any(windows, test))]
 fn windows_open_command(path: &Path) -> Option<Command> {
-    if is_program(path) {
+    if !can_open(path) {
         return None;
     }
     let mut command = Command::new(super::links::rundll32_program());
     command.arg("url.dll,FileProtocolHandler");
-    command.arg(path);
+    // `Command` quotes an argument that contains a space, and `rundll32`
+    // keeps those quotes in the path. `raw_arg` passes the path as written.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        command.raw_arg(path);
         command.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    {
+        command.arg(path);
     }
     Some(command)
 }
 
-/// These extensions start a program. Open would run the sender's file.
-fn is_program(path: &Path) -> bool {
-    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
-        return false;
-    };
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "exe" | "bat" | "cmd" | "com" | "scr" | "pif" | "lnk" | "app" | "desktop" | "sh"
-    )
+/// Documents, images, audio, video, and archives. Anything else can start a program.
+fn can_open(path: &Path) -> bool {
+    open_extension(path).is_some_and(|extension| {
+        matches!(
+            extension.as_str(),
+            "pdf"
+                | "txt"
+                | "csv"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "heic"
+                | "heif"
+                | "bmp"
+                | "zip"
+                | "docx"
+                | "xlsx"
+                | "pptx"
+                | "mp3"
+                | "ogg"
+                | "opus"
+                | "m4a"
+                | "aac"
+                | "wav"
+                | "mp4"
+                | "m4v"
+                | "mov"
+                | "webm"
+                | "mkv"
+                | "avi"
+                | "3gp"
+        )
+    })
+}
+
+/// The extension after Windows drops trailing dots and spaces from the name.
+fn open_extension(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let name = name.trim_end_matches(['.', ' ']);
+    let (_, extension) = name.rsplit_once('.')?;
+    if extension.is_empty() {
+        return None;
+    }
+    Some(extension.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -375,10 +420,46 @@ mod tests {
     #[test]
     fn a_program_file_does_not_open() {
         for extension in [
-            "exe", "bat", "cmd", "com", "scr", "pif", "lnk", "app", "desktop", "sh", "EXE", "js",
-            "jse", "vbs", "vbe", "wsf", "wsh", "hta", "msi", "msp", "ps1", "reg", "cpl", "msc",
-            "jar", "url", "scf", "appx", "appref-ms", "gadget", "dll", "command", "workflow",
-            "terminal", "pkg", "dmg", "AppImage", "run", "py", "pl",
+            "exe",
+            "bat",
+            "cmd",
+            "com",
+            "scr",
+            "pif",
+            "lnk",
+            "app",
+            "desktop",
+            "sh",
+            "EXE",
+            "js",
+            "jse",
+            "vbs",
+            "vbe",
+            "wsf",
+            "wsh",
+            "hta",
+            "msi",
+            "msp",
+            "ps1",
+            "reg",
+            "cpl",
+            "msc",
+            "jar",
+            "url",
+            "scf",
+            "appx",
+            "appref-ms",
+            "gadget",
+            "dll",
+            "command",
+            "workflow",
+            "terminal",
+            "pkg",
+            "dmg",
+            "AppImage",
+            "run",
+            "py",
+            "pl",
         ] {
             let path = Path::new("/tmp").join(format!("payload.{extension}"));
             assert!(open_command(&path).is_none(), "{extension} must not open");
@@ -403,6 +484,22 @@ mod tests {
         assert!(open_command(Path::new("/tmp/payload.exe. ")).is_none());
         assert!(windows_open_command(Path::new(r"C:\Users\a\payload.exe.")).is_none());
         assert!(windows_open_command(Path::new(r"C:\Users\a\payload.exe ")).is_none());
+    }
+
+    #[test]
+    fn a_path_with_a_space_is_the_argument_itself() {
+        let path = Path::new(r"C:\Users\Jane Doe\my notes.pdf");
+        let command = windows_open_command(path).expect("command");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let file = args.last().expect("path");
+        assert_eq!(file, r"C:\Users\Jane Doe\my notes.pdf");
+        assert!(
+            !file.contains('"'),
+            "a quote around the path would stay in the rundll32 address: {file}"
+        );
     }
 
     #[test]
