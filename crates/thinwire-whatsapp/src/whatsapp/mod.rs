@@ -2904,6 +2904,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_full_cache_still_delivers_the_phones_older_page() {
+        let (tx, mut rx) = unbounded_channel();
+        let sender = Arc::new(FakeSender::default());
+        let mut adapter = with_sender(sender.clone());
+        let cached: Vec<_> = (0..inbox::MESSAGES_PER_CHAT)
+            .map(|n| message(CHAT, &format!("m{n:03}"), "cached", i64::try_from(n).unwrap_or(0)))
+            .collect();
+        adapter.session.apply(
+            LinkEvent::History {
+                chats: vec![inbox::HistoryChat {
+                    mute: Default::default(),
+                    jid: CHAT.into(),
+                    name: None,
+                    unread: 0,
+                    timestamp: i64::try_from(inbox::MESSAGES_PER_CHAT).unwrap_or(0),
+                    messages: cached,
+                }],
+                push_names: Vec::new(),
+                request_id: None,
+                ended: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    before_message_id: "m000".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("never an adapter error");
+        let asks = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let asks = sender.history_asks.lock().expect("fake lock").clone();
+                if !asks.is_empty() {
+                    return asks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the phone is asked for the page past the cache");
+        adapter.session.apply(
+            LinkEvent::History {
+                chats: vec![inbox::HistoryChat {
+                    mute: Default::default(),
+                    jid: CHAT.into(),
+                    name: None,
+                    unread: 0,
+                    timestamp: 0,
+                    messages: vec![message(CHAT, "older", "from the phone", -1)],
+                }],
+                push_names: Vec::new(),
+                request_id: Some(asks[0].request_id.clone()),
+                ended: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::MessageReceived { message }
+                    if message.id == "older" && message.arrival == thinwire_protocol::Arrival::History
+            )),
+            "the phone's older row reaches the shell: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(AdapterEvent::OlderHistoryLoaded { more: true, .. })
+            ),
+            "a non-empty phone page is not the start of the chat: {events:?}"
+        );
+    }
+
     /// ADR 0010 rule 7: ViewChat marks the viewed chat read, and leaving it
     /// lets new messages count again.
     #[test]

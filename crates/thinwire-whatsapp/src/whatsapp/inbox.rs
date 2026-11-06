@@ -19,7 +19,7 @@ use thinwire_protocol::{
 pub(super) const CONVERSATION_PREFIX: &str = "whatsapp:";
 
 /// Messages kept per chat. Older ones drop off the front.
-const MESSAGES_PER_CHAT: usize = 200;
+pub(super) const MESSAGES_PER_CHAT: usize = 200;
 
 /// Handled ids kept per chat. Past this, the older half goes, oldest first
 /// (#158 review).
