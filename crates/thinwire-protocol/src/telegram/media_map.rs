@@ -588,18 +588,42 @@ mod tests {
         assert_eq!(no_photo.preview, "Video");
     }
 
+    fn document(
+        name: &str,
+        mime: &str,
+        id: i32,
+        size: i64,
+        mini: Option<tdlib_rs::types::Minithumbnail>,
+    ) -> tdlib_rs::types::MessageDocument {
+        tdlib_rs::types::MessageDocument {
+            document: tdlib_rs::types::Document {
+                file_name: name.into(),
+                mime_type: mime.into(),
+                minithumbnail: mini,
+                thumbnail: None,
+                document: tdlib_rs::types::File {
+                    id,
+                    size,
+                    ..tdlib_rs::types::File::default()
+                },
+            },
+            caption: tdlib_rs::types::FormattedText::default(),
+        }
+    }
+
     #[test]
     fn a_pdf_keeps_its_preview_and_a_plain_file_stays_downloadable() {
-        let mut pdf = tdlib_rs::types::MessageDocument::default();
-        pdf.document.file_name = "notes.pdf".into();
-        pdf.document.mime_type = "application/pdf".into();
-        pdf.document.document.id = 11;
-        pdf.document.document.size = 2048;
-        pdf.document.minithumbnail = Some(tdlib_rs::types::Minithumbnail {
-            width: 40,
-            height: 52,
-            data: "/9j/".into(),
-        });
+        let pdf = document(
+            "notes.pdf",
+            "application/pdf",
+            11,
+            2048,
+            Some(tdlib_rs::types::Minithumbnail {
+                width: 40,
+                height: 52,
+                data: "/9j/".into(),
+            }),
+        );
         let mapped = map_content(&tdlib_rs::enums::MessageContent::MessageDocument(pdf));
         assert!(mapped.text.is_empty());
         assert_eq!(mapped.preview, "notes.pdf");
@@ -614,10 +638,7 @@ mod tests {
         assert_eq!((preview.width, preview.height), (40, 52));
         assert!(!format!("{file:?}").contains("/9j/"));
 
-        let mut plain = tdlib_rs::types::MessageDocument::default();
-        plain.document.file_name = "notes.txt".into();
-        plain.document.mime_type = "text/plain".into();
-        plain.document.document.id = 12;
+        let mut plain = document("notes.txt", "text/plain", 12, 0, None);
         plain.caption.text = "the notes".into();
         let mapped = map_content(&tdlib_rs::enums::MessageContent::MessageDocument(plain));
         assert_eq!(mapped.text, "the notes");
