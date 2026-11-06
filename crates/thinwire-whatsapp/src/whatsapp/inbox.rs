@@ -3032,6 +3032,169 @@ pub(super) mod tests {
         assert_eq!(stamps, expected, "a hole between the page and the window");
     }
 
+    /// Ids the shell shows, from the newest row back through every cached
+    /// page. The last step is the decision at the oldest row.
+    fn scrolled_thread(inbox: &Inbox, chat: &str) -> Vec<String> {
+        let newest = inbox.chats[chat]
+            .messages
+            .last()
+            .expect("the chat has a row")
+            .id
+            .clone();
+        let mut before = newest.clone();
+        let mut pages = Vec::new();
+        let mut reached = false;
+        for _ in 0..32 {
+            let page = inbox.older_decision(chat, &before, OPEN_CHAT_MESSAGES);
+            if page.events.is_empty() {
+                assert!(
+                    !page.ended && page.anchor.as_ref().is_some_and(|row| row.id == before),
+                    "scrolling to {before} ends the chat"
+                );
+                reached = true;
+                break;
+            }
+            let ids: Vec<String> = page
+                .events
+                .iter()
+                .map(|event| match event {
+                    AdapterEvent::MessageReceived { message } => message.id.clone(),
+                    other => panic!("older page is not a message: {other:?}"),
+                })
+                .collect();
+            before = ids[0].clone();
+            let more = page.more_cached;
+            pages.push(ids);
+            if !more {
+                let tail = inbox.older_decision(chat, &before, OPEN_CHAT_MESSAGES);
+                assert!(
+                    tail.events.is_empty() && !tail.ended && tail.anchor.is_some(),
+                    "the oldest cached row must ask the phone"
+                );
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "the scroll did not reach the oldest row");
+        let mut ids: Vec<String> = pages.into_iter().rev().flatten().collect();
+        ids.push(newest);
+        ids
+    }
+
+    fn assert_same_thread(scrolled: &[String], expected: &[String]) {
+        let missing: Vec<&String> = expected
+            .iter()
+            .filter(|id| !scrolled.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty() && scrolled == expected,
+            "scrolling skips {missing:?}; got {} ids, want {}",
+            scrolled.len(),
+            expected.len()
+        );
+    }
+
+    /// Ten live messages after an older page. Scrolling shows every fetched
+    /// row and every window row, and the oldest row asks the phone.
+    #[test]
+    fn ten_live_messages_after_a_fetch_keep_the_thread_whole() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let window_ids: Vec<String> = (0..MESSAGES_PER_CHAT).map(|n| format!("w{n:04}")).collect();
+        let window: Vec<WaMessage> = window_ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| message(chat, id, "cached", 1_000 + i64::try_from(n).expect("small")))
+            .collect();
+        inbox.apply_history(
+            vec![HistoryChat {
+                mute: Default::default(),
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 1_000,
+                messages: window,
+            }],
+            Vec::new(),
+        );
+        let fetched_ids: Vec<String> = (0..OPEN_CHAT_MESSAGES)
+            .map(|n| format!("f{n:04}"))
+            .collect();
+        let fetched: Vec<WaMessage> = fetched_ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| message(chat, id, "page", i64::try_from(n).expect("small")))
+            .collect();
+        inbox.apply_fetched(chat, fetched);
+        let live_at = 1_000 + i64::try_from(MESSAGES_PER_CHAT).expect("small");
+        let live_ids: Vec<String> = (0..10).map(|n| format!("live{n:02}")).collect();
+        inbox.apply_messages(
+            live_ids
+                .iter()
+                .enumerate()
+                .map(|(n, id)| message(chat, id, "now", live_at + i64::try_from(n).expect("small")))
+                .collect(),
+        );
+
+        let mut expected = fetched_ids;
+        expected.extend(window_ids);
+        expected.extend(live_ids);
+        assert_same_thread(&scrolled_thread(&inbox, chat), &expected);
+    }
+
+    /// A local send sorts ahead of the window. The older page still sits
+    /// against that window after ten live messages.
+    #[test]
+    fn a_pending_send_that_sorts_first_stays_against_the_fetched_page() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let kept = MESSAGES_PER_CHAT - 1;
+        let window_ids: Vec<String> = (0..kept).map(|n| format!("w{n:04}")).collect();
+        let window: Vec<WaMessage> = window_ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| message(chat, id, "cached", 1_000 + i64::try_from(n).expect("small")))
+            .collect();
+        inbox.apply_history(
+            vec![HistoryChat {
+                mute: Default::default(),
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 1_000,
+                messages: window,
+            }],
+            Vec::new(),
+        );
+        let (pending, _, _) = inbox.begin_send(chat, "local", 999);
+        let fetched_ids: Vec<String> = (0..OPEN_CHAT_MESSAGES)
+            .map(|n| format!("f{n:04}"))
+            .collect();
+        inbox.apply_fetched(
+            chat,
+            fetched_ids
+                .iter()
+                .enumerate()
+                .map(|(n, id)| message(chat, id, "page", i64::try_from(n).expect("small")))
+                .collect(),
+        );
+        let live_at = 1_000 + i64::try_from(kept).expect("small");
+        let live_ids: Vec<String> = (0..10).map(|n| format!("live{n:02}")).collect();
+        inbox.apply_messages(
+            live_ids
+                .iter()
+                .enumerate()
+                .map(|(n, id)| message(chat, id, "now", live_at + i64::try_from(n).expect("small")))
+                .collect(),
+        );
+
+        let mut expected = fetched_ids;
+        expected.push(pending);
+        expected.extend(window_ids);
+        expected.extend(live_ids);
+        assert_same_thread(&scrolled_thread(&inbox, chat), &expected);
+    }
+
     /// A history chunk that arrives newest-first is not a page the user
     /// asked for. The cache keeps at most [`MESSAGES_PER_CHAT`] rows.
     #[test]
