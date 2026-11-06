@@ -4172,35 +4172,84 @@ async fn wait_backoff(session: &Session, token: u64, delay: std::time::Duration)
     false
 }
 
-/// Contact pictures that one linked run fetches.
+/// Contact and group pictures that one linked run fetches.
 const AVATAR_CHATS: usize = 50;
 
-/// Fetch the profile pictures of the first contacts of the inbox, one at a
-/// time. Presage keeps a fetched picture in the store, so the next run
-/// reads it from disk. Each picture comes as `ChatAvatar` for its chat.
+/// A group whose picture is not in the cache. `retrieve_group_avatar` uses
+/// the master key and the revision.
+struct GroupAvatarFetch {
+    key: [u8; 32],
+    revision: u32,
+}
+
+/// Pictures this link can show, and the downloads still to do.
+/// `ready` is image bytes already in the store. `profiles` is a contact
+/// with a profile key and no stored picture. `groups` is a group that names
+/// a picture the cache does not have yet.
+struct AvatarPlan {
+    ready: Vec<(String, Vec<u8>)>,
+    profiles: Vec<(Uuid, [u8; 32])>,
+    groups: Vec<GroupAvatarFetch>,
+}
+
+/// The first chats to picture.
+///
+/// Contact sync stores the picture on the contact and stores no profile key
+/// (`ContactDetails.profileKey` is reserved). A profile download is only for
+/// a contact that has a key and no picture yet. A group picture is the
+/// cached file, or a download when the group names a picture and the cache
+/// is empty. Presage keeps a downloaded picture, so the next run reads it.
+async fn avatar_plan(store: &SqliteStore) -> AvatarPlan {
+    let mut profiles = Vec::new();
+    let Ok(contacts) = store.contacts().await else {
+        return AvatarPlan {
+            ready: Vec::new(),
+            profiles,
+            groups: Vec::new(),
+        };
+    };
+    let mut picked: Vec<(u32, Uuid, [u8; 32])> = contacts
+        .flatten()
+        .filter_map(|contact| {
+            let key = <[u8; 32]>::try_from(contact.profile_key.as_slice()).ok()?;
+            Some((contact.inbox_position, contact.uuid, key))
+        })
+        .collect();
+    picked.sort_by_key(|(position, _, _)| *position);
+    for (_, uuid, key) in picked.into_iter().take(AVATAR_CHATS) {
+        profiles.push((uuid, key));
+    }
+    AvatarPlan {
+        ready: Vec::new(),
+        profiles,
+        groups: Vec::new(),
+    }
+}
+
+/// Fetch chat pictures and send each one as `ChatAvatar`.
+/// The resize runs off the UI thread, on this helper task.
 fn start_avatar_fetches(
     manager: &Manager<SqliteStore, Registered>,
     session: &Arc<Session>,
     token: u64,
     events: &EventTx,
 ) {
+    use presage::libsignal_service::content::GroupContextV2;
     use presage::libsignal_service::zkgroup::profiles::ProfileKey;
     let manager = manager.clone();
     let session = Arc::clone(session);
     let events = events.clone();
-    tokio::spawn(async move {
-        let Ok(contacts) = manager.store().contacts().await else {
-            return;
-        };
-        let mut picked: Vec<(u32, Uuid, [u8; 32])> = contacts
-            .flatten()
-            .filter_map(|contact| {
-                let key = <[u8; 32]>::try_from(contact.profile_key.as_slice()).ok()?;
-                Some((contact.inbox_position, contact.uuid, key))
-            })
-            .collect();
-        picked.sort_by_key(|(position, _, _)| *position);
-        for (_, uuid, key) in picked.into_iter().take(AVATAR_CHATS) {
+    // `retrieve_group_avatar` is not `Send` (presage uses a thread-local rng).
+    // The Signal worker runs on a `LocalSet`, so this task stays on it.
+    tokio::task::spawn_local(async move {
+        let plan = avatar_plan(manager.store()).await;
+        for (id, bytes) in plan.ready {
+            if !session.is_current(token) {
+                return;
+            }
+            send_chat_avatar(&events, &session, token, id, bytes).await;
+        }
+        for (uuid, key) in plan.profiles {
             if !session.is_current(token) {
                 return;
             }
@@ -4212,24 +4261,51 @@ fn start_avatar_fetches(
             else {
                 continue;
             };
-            let small = tokio::task::spawn_blocking(move || {
-                thinwire_protocol::photo_resize::avatar_from_bytes(&bytes)
-            })
-            .await
-            .ok()
-            .flatten();
-            let Some(small) = small else {
-                continue;
-            };
+            send_chat_avatar(&events, &session, token, uuid.to_string(), bytes).await;
+        }
+        for fetch in plan.groups {
             if !session.is_current(token) {
                 return;
             }
-            let _ = events.send(AdapterEvent::ChatAvatar {
-                protocol: ProtocolId::Signal,
-                conversation_id: uuid.to_string(),
-                bytes: thinwire_protocol::ImageBytes::new(small),
-            });
+            let _permit = Arc::clone(&session.downloads).acquire_owned().await.ok();
+            let mut lookup = manager.clone();
+            let context = GroupContextV2 {
+                master_key: Some(fetch.key.to_vec()),
+                revision: Some(fetch.revision),
+                ..Default::default()
+            };
+            let Ok(Some(bytes)) = lookup.retrieve_group_avatar(context).await else {
+                continue;
+            };
+            let id = super::group::group_id(&fetch.key);
+            send_chat_avatar(&events, &session, token, id, bytes).await;
         }
+    });
+}
+
+async fn send_chat_avatar(
+    events: &EventTx,
+    session: &Session,
+    token: u64,
+    conversation_id: String,
+    bytes: Vec<u8>,
+) {
+    let small = tokio::task::spawn_blocking(move || {
+        thinwire_protocol::photo_resize::avatar_from_bytes(&bytes)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(small) = small else {
+        return;
+    };
+    if !session.is_current(token) {
+        return;
+    }
+    let _ = events.send(AdapterEvent::ChatAvatar {
+        protocol: ProtocolId::Signal,
+        conversation_id,
+        bytes: thinwire_protocol::ImageBytes::new(small),
     });
 }
 
@@ -9112,5 +9188,161 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
                 _ => None,
             })
             .expect("message")
+    }
+
+    const PERSON_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x38,
+        0xA1, 0xA1, 0x01, 0x00, 0x02, 0xD4, 0x01, 0x19, 0x05, 0x50, 0x8F, 0xA4, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    const GROUP_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xD0,
+        0x08, 0x38, 0x01, 0x00, 0x01, 0xE4, 0x01, 0x41, 0x18, 0x82, 0xF0, 0xA7, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn pictured_group(title: &str, avatar: &str) -> Group {
+        Group {
+            title: title.to_string(),
+            avatar: avatar.to_string(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 3,
+            members: Vec::new(),
+            pending_members: Vec::new(),
+            requesting_members: Vec::new(),
+            invite_link_password: Vec::new(),
+            description: None,
+        }
+    }
+
+    /// The inbox shows a stored contact picture and a stored group picture.
+    /// A contact with no picture stays on initials. A group that only names
+    /// a picture is fetched. A contact that only has a profile key is still
+    /// fetched.
+    #[tokio::test]
+    async fn a_person_and_a_group_with_a_picture_show_it() {
+        let dir = temp_session_dir("avatars");
+        let (mut store, _, pool) = open_session_db(&dir).await;
+        let mut person = named_contact(0x1111, "Karthikeya Udupa");
+        person.profile_key.clear();
+        let mut blank = named_contact(0x2222, "No Photo");
+        blank.profile_key.clear();
+        let keyed = named_contact(0x3333, "Keyed");
+        store.save_contact(&person).await.expect("person");
+        store.save_contact(&blank).await.expect("blank");
+        store.save_contact(&keyed).await.expect("keyed");
+        sqlx::query("UPDATE contacts SET avatar = ? WHERE uuid = ?")
+            .bind(PERSON_PNG)
+            .bind(person.uuid.as_bytes().as_slice())
+            .execute(&pool)
+            .await
+            .expect("person picture");
+
+        let cached_key = [0x11; 32];
+        let remote_key = [0x22; 32];
+        let empty_key = [0x33; 32];
+        let cached = pictured_group("KFTC forever", "cdn/group");
+        store
+            .save_group(cached_key, pictured_group("KFTC forever", "cdn/group"))
+            .await
+            .expect("cached group");
+        let group_png = GROUP_PNG.to_vec();
+        store
+            .save_group_avatar(cached_key, &group_png)
+            .await
+            .expect("group picture");
+        store
+            .save_group(remote_key, pictured_group("Remote", "cdn/remote"))
+            .await
+            .expect("remote group");
+        store
+            .save_group(empty_key, pictured_group("Plain", ""))
+            .await
+            .expect("plain group");
+
+        let plan = avatar_plan(&store).await;
+        let person_id = person.uuid.to_string();
+        let blank_id = blank.uuid.to_string();
+        let group_id = super::super::group::group_id(&cached_key);
+        let person_bytes = plan
+            .ready
+            .iter()
+            .find(|(id, _)| id == &person_id)
+            .map(|(_, bytes)| bytes.clone());
+        let group_bytes = plan
+            .ready
+            .iter()
+            .find(|(id, _)| id == &group_id)
+            .map(|(_, bytes)| bytes.clone());
+        assert!(
+            person_bytes.is_some(),
+            "a contact with a stored picture is pictured"
+        );
+        assert!(
+            group_bytes.is_some(),
+            "a group with a stored picture is pictured"
+        );
+        assert!(
+            plan.ready.iter().all(|(id, _)| id != &blank_id),
+            "a contact with no picture is not pictured"
+        );
+        assert!(
+            plan.profiles.iter().any(|(id, _)| *id == keyed.uuid),
+            "a contact with a profile key and no picture is fetched"
+        );
+        assert!(
+            plan.profiles.iter().all(|(id, _)| *id != blank.uuid),
+            "a contact with no key and no picture is not fetched"
+        );
+        assert!(
+            plan.groups.iter().any(|group| group.key == remote_key),
+            "a group that names a picture is fetched"
+        );
+        assert!(
+            plan.groups.iter().all(|group| group.key != empty_key),
+            "a group with no picture is not fetched"
+        );
+        assert!(
+            plan.groups.iter().all(|group| group.key != cached_key),
+            "a cached group picture is not downloaded again"
+        );
+
+        let mut rows = vec![
+            conversation_from_contact(&person),
+            conversation_from_contact(&blank),
+            conversation_from_group(&cached_key, &cached),
+        ];
+        for (id, bytes) in [
+            (person_id.clone(), person_bytes),
+            (group_id.clone(), group_bytes),
+        ] {
+            let raw = bytes.expect("picture");
+            let small = thinwire_protocol::photo_resize::avatar_from_bytes(&raw).expect("jpeg");
+            let row = rows.iter_mut().find(|row| row.id == id).expect("row");
+            row.avatar.bytes = Some(thinwire_protocol::ImageBytes::new(small));
+        }
+        let person_row = rows.iter().find(|row| row.id == person_id).expect("person");
+        let group_row = rows.iter().find(|row| row.id == group_id).expect("group");
+        let blank_row = rows.iter().find(|row| row.id == blank_id).expect("blank");
+        assert!(person_row.avatar.ready(), "the person shows the picture");
+        assert!(group_row.avatar.ready(), "the group shows the picture");
+        assert_ne!(
+            person_row.avatar.bytes, group_row.avatar.bytes,
+            "the person and the group keep their own pictures"
+        );
+        assert!(
+            !blank_row.avatar.ready(),
+            "a contact with no picture stays on initials"
+        );
+
+        pool.close().await;
+        store.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
