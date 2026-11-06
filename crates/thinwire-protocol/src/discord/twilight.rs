@@ -182,6 +182,30 @@ fn message_summary(message: Message) -> MessageSummary {
             files += 1;
         }
     }
+    let reactions = message
+        .reactions
+        .iter()
+        .filter_map(|reaction| match &reaction.emoji {
+            twilight_model::channel::message::EmojiReactionType::Unicode { name } => {
+                Some(crate::Reaction {
+                    emoji: name.clone(),
+                    count: u32::try_from(reaction.count).unwrap_or(u32::MAX),
+                    mine: reaction.me,
+                })
+            }
+            twilight_model::channel::message::EmojiReactionType::Custom { .. } => None,
+        })
+        .filter(|reaction| reaction.count > 0)
+        .collect();
+    let reply_to = if message.kind == twilight_model::channel::message::MessageType::Reply {
+        message
+            .reference
+            .as_ref()
+            .and_then(|reference| reference.message_id)
+            .map(Id::get)
+    } else {
+        None
+    };
     MessageSummary {
         id: message.id.get(),
         author_id: message.author.id.get(),
@@ -193,6 +217,8 @@ fn message_summary(message: Message) -> MessageSummary {
         stickers: message.sticker_items.len(),
         audio,
         image,
+        reactions,
+        reply_to,
     }
 }
 
@@ -336,12 +362,31 @@ impl DiscordApi for TwilightApi {
         Box::pin(async move { super::download::fetch(&url).await })
     }
 
-    fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary> {
+    fn send(
+        &self,
+        channel_id: u64,
+        body: String,
+        reply_to: Option<u64>,
+    ) -> ApiFuture<'_, MessageSummary> {
+        Box::pin(async move {
+            let mut request = self.client.create_message(id(channel_id)?).content(&body);
+            if let Some(reply_to) = reply_to {
+                request = request.reply(id(reply_to)?);
+            }
+            let response = request.await.map_err(|e| map_error(&e))?;
+            let message = response
+                .model()
+                .await
+                .map_err(|_| DiscordApiError::Transport)?;
+            Ok(message_summary(message))
+        })
+    }
+
+    fn message(&self, channel_id: u64, message_id: u64) -> ApiFuture<'_, MessageSummary> {
         Box::pin(async move {
             let response = self
                 .client
-                .create_message(id(channel_id)?)
-                .content(&body)
+                .message(id(channel_id)?, id(message_id)?)
                 .await
                 .map_err(|e| map_error(&e))?;
             let message = response
@@ -349,6 +394,44 @@ impl DiscordApi for TwilightApi {
                 .await
                 .map_err(|_| DiscordApiError::Transport)?;
             Ok(message_summary(message))
+        })
+    }
+
+    fn delete_message(&self, channel_id: u64, message_id: u64) -> ApiFuture<'_, ()> {
+        Box::pin(async move {
+            self.client
+                .delete_message(id(channel_id)?, id(message_id)?)
+                .await
+                .map_err(|e| map_error(&e))?;
+            Ok(())
+        })
+    }
+
+    fn react(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        emoji: String,
+        add: bool,
+    ) -> ApiFuture<'_, ()> {
+        Box::pin(async move {
+            let reaction =
+                twilight_http::request::channel::reaction::RequestReactionType::Unicode {
+                    name: &emoji,
+                };
+            let (channel, message) = (id(channel_id)?, id(message_id)?);
+            let result = if add {
+                self.client
+                    .create_reaction(channel, message, &reaction)
+                    .await
+                    .map(|_| ())
+            } else {
+                self.client
+                    .delete_current_user_reaction(channel, message, &reaction)
+                    .await
+                    .map(|_| ())
+            };
+            result.map_err(|e| map_error(&e))
         })
     }
 }

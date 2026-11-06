@@ -36,8 +36,8 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use super::api::{DiscordApi, DiscordApiError, MessageSummary, UploadFile};
 use super::inbox::{
-    HISTORY_LIMIT, IMAGE_LABEL, InboxChannel, PREVIEW_FETCH_CONCURRENCY, PreviewPause,
-    channel_preview, chat_message, load_channels,
+    CONVERSATION_PREFIX, HISTORY_LIMIT, IMAGE_LABEL, InboxChannel, PREVIEW_FETCH_CONCURRENCY,
+    PreviewPause, channel_preview, chat_message, load_channels,
 };
 use super::{BOT_TOKEN_PRESENT, UNKNOWN_CHANNEL_REFUSAL};
 use crate::adapter::{
@@ -271,8 +271,19 @@ async fn send_files(
     first.unwrap_or(Err(DiscordApiError::Rejected))
 }
 
+/// The delete of a message did not go through.
+const DELETE_FAILED: &str =
+    "Discord did not delete the message. The bot deletes only its own messages.";
+
+/// A reaction did not go through.
+const REACT_FAILED: &str = "Discord did not take the reaction. The bot needs Add Reactions.";
+
 enum Outgoing {
-    New(String),
+    /// New text, as a reply to the message `reply_to` when it is set.
+    New {
+        body: String,
+        reply_to: Option<u64>,
+    },
     Retry(String),
     /// Photos and videos, with the text. A media row cannot be sent again:
     /// its files are not kept.
@@ -291,6 +302,18 @@ enum Msg {
         conversation_id: String,
         request: u64,
         outgoing: Outgoing,
+    },
+    /// Delete one message of the bot.
+    Delete {
+        conversation_id: String,
+        message_id: u64,
+    },
+    /// Add or remove a reaction of the bot.
+    React {
+        conversation_id: String,
+        message_id: u64,
+        emoji: String,
+        add: bool,
     },
     View {
         conversation_id: Option<String>,
@@ -536,9 +559,49 @@ impl Session {
         conversation_id: String,
         body: String,
         request: u64,
+        reply_to: Option<u64>,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
-        self.send_outgoing(conversation_id, request, Outgoing::New(body), events)
+        self.send_outgoing(
+            conversation_id,
+            request,
+            Outgoing::New { body, reply_to },
+            events,
+        )
+    }
+
+    /// Deletes one message of the bot. `MessagesRemoved` or `CommandFailed`
+    /// answers.
+    pub(crate) fn delete(
+        &self,
+        conversation_id: String,
+        message_id: u64,
+    ) -> Result<(), AdapterError> {
+        self.check_ready()?;
+        let _ = self.tx.send(Msg::Delete {
+            conversation_id,
+            message_id,
+        });
+        Ok(())
+    }
+
+    /// Adds or removes a reaction of the bot. `MessageReactions` answers with
+    /// the counts of Discord.
+    pub(crate) fn react(
+        &self,
+        conversation_id: String,
+        message_id: u64,
+        emoji: String,
+        add: bool,
+    ) -> Result<(), AdapterError> {
+        self.check_ready()?;
+        let _ = self.tx.send(Msg::React {
+            conversation_id,
+            message_id,
+            emoji,
+            add,
+        });
+        Ok(())
     }
 
     /// Posts photos and videos with the text. The text can be empty.
@@ -1018,6 +1081,78 @@ impl Owner {
     /// Download the audio `file_id` into the voice folder. The answer is
     /// `VoiceReady`, or `VoiceFailed` when no history row has the handle,
     /// or when the download or the write failed.
+    /// Delete one message of the bot. Success removes the row.
+    fn delete(&mut self, conversation_id: String, message_id: u64) {
+        let events = self.events.clone();
+        let Some(access) = self.carried.channels.get(&conversation_id).copied() else {
+            emit_command_failed(
+                &events,
+                ProtocolId::Discord,
+                Some(conversation_id),
+                DELETE_FAILED,
+            );
+            return;
+        };
+        let api = Arc::clone(&self.api);
+        tokio::spawn(async move {
+            match api.delete_message(access.channel_id, message_id).await {
+                Ok(()) => {
+                    let _ = events.send(AdapterEvent::MessagesRemoved {
+                        protocol: ProtocolId::Discord,
+                        message_ids: vec![format!("{CONVERSATION_PREFIX}{message_id}")],
+                        conversation_id,
+                    });
+                }
+                Err(_) => {
+                    emit_command_failed(
+                        &events,
+                        ProtocolId::Discord,
+                        Some(conversation_id),
+                        DELETE_FAILED,
+                    );
+                }
+            }
+        });
+    }
+
+    /// Add or remove a reaction of the bot, then read the counts of the
+    /// message again. They also undo the change of the row after a failure.
+    fn react(&mut self, conversation_id: String, message_id: u64, emoji: String, add: bool) {
+        let events = self.events.clone();
+        let Some(access) = self.carried.channels.get(&conversation_id).copied() else {
+            emit_command_failed(
+                &events,
+                ProtocolId::Discord,
+                Some(conversation_id),
+                REACT_FAILED,
+            );
+            return;
+        };
+        let api = Arc::clone(&self.api);
+        tokio::spawn(async move {
+            if api
+                .react(access.channel_id, message_id, emoji, add)
+                .await
+                .is_err()
+            {
+                emit_command_failed(
+                    &events,
+                    ProtocolId::Discord,
+                    Some(conversation_id.clone()),
+                    REACT_FAILED,
+                );
+            }
+            if let Ok(message) = api.message(access.channel_id, message_id).await {
+                let _ = events.send(AdapterEvent::MessageReactions {
+                    protocol: ProtocolId::Discord,
+                    message_id: format!("{CONVERSATION_PREFIX}{message_id}"),
+                    conversation_id,
+                    reactions: message.reactions,
+                });
+            }
+        });
+    }
+
     fn download_voice(&mut self, file_id: i32) {
         let events = self.events.clone();
         let failed = move |events: &EventTx| {
@@ -1100,6 +1235,16 @@ impl Owner {
                 request,
                 outgoing,
             } => self.send(conversation_id, request, outgoing),
+            Msg::Delete {
+                conversation_id,
+                message_id,
+            } => self.delete(conversation_id, message_id),
+            Msg::React {
+                conversation_id,
+                message_id,
+                emoji,
+                add,
+            } => self.react(conversation_id, message_id, emoji, add),
             Msg::View { conversation_id } => {
                 if let Some(error) = self.ending_error() {
                     emit_command_failed(
@@ -1316,7 +1461,7 @@ impl Owner {
             );
         };
         let empty = match &outgoing {
-            Outgoing::New(body) => body.trim().is_empty(),
+            Outgoing::New { body, .. } => body.trim().is_empty(),
             Outgoing::Media { files, .. } => files.is_empty(),
             Outgoing::Retry(_) => false,
         };
@@ -1360,7 +1505,11 @@ impl Owner {
         }
         let files = match &outgoing {
             Outgoing::Media { files, .. } => Some(files.clone()),
-            Outgoing::New(_) | Outgoing::Retry(_) => None,
+            Outgoing::New { .. } | Outgoing::Retry(_) => None,
+        };
+        let reply_to = match &outgoing {
+            Outgoing::New { reply_to, .. } => *reply_to,
+            Outgoing::Media { .. } | Outgoing::Retry(_) => None,
         };
         let Some(body) = self.register_send(conversation_id, request, outgoing, bot_id) else {
             reject(self);
@@ -1371,7 +1520,7 @@ impl Owner {
         tokio::spawn(async move {
             let result = match files {
                 Some(files) => send_files(api.as_ref(), access.channel_id, body, &files).await,
-                None => api.send(access.channel_id, body).await,
+                None => api.send(access.channel_id, body, reply_to).await,
             };
             let _ = tx.send(Msg::SendDone { request, result });
             // The result is with the owner now. A test can run a 401 here.
@@ -1398,7 +1547,7 @@ impl Owner {
             return None;
         }
         let (body, message_id, row) = match outgoing {
-            Outgoing::New(body) => {
+            Outgoing::New { body, reply_to } => {
                 self.next_pending += 1;
                 let message_id = format!("discord:pending:{}:{}", self.id, self.next_pending);
                 self.carried
@@ -1422,7 +1571,7 @@ impl Owner {
                         audio: None,
                         video: None,
                         reactions: Vec::new(),
-                        reply_to: None,
+                        reply_to: reply_to.map(|id| format!("{CONVERSATION_PREFIX}{id}")),
                     },
                 );
                 (body, message_id, SendRow::Pending)

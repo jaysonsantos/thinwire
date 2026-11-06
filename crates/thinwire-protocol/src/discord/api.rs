@@ -76,6 +76,10 @@ pub(crate) struct MessageSummary {
     pub audio: Option<AudioSummary>,
     /// The CDN address of the first image attachment. The row shows it.
     pub image: Option<ImageSummary>,
+    /// The Unicode emoji reactions. A custom emoji is not shown.
+    pub reactions: Vec<crate::Reaction>,
+    /// The message that this one replies to.
+    pub reply_to: Option<u64>,
 }
 
 /// An image attachment of a message. `Debug` shows no URL.
@@ -182,8 +186,25 @@ pub(crate) trait DiscordApi: Send + Sync {
         before: u64,
         limit: u16,
     ) -> ApiFuture<'_, Vec<MessageSummary>>;
-    /// Send plain text as the bot.
-    fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary>;
+    /// Send plain text as the bot, as a reply to `reply_to` when it is set.
+    fn send(
+        &self,
+        channel_id: u64,
+        body: String,
+        reply_to: Option<u64>,
+    ) -> ApiFuture<'_, MessageSummary>;
+    /// One message, with its reactions now.
+    fn message(&self, channel_id: u64, message_id: u64) -> ApiFuture<'_, MessageSummary>;
+    /// Delete one message. The bot deletes its own messages.
+    fn delete_message(&self, channel_id: u64, message_id: u64) -> ApiFuture<'_, ()>;
+    /// Add or remove the Unicode reaction `emoji` of the bot.
+    fn react(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        emoji: String,
+        add: bool,
+    ) -> ApiFuture<'_, ()>;
     /// Send files as the bot, with `body` as the text. `body` can be empty.
     fn send_files(
         &self,

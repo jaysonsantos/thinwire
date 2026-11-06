@@ -28,6 +28,12 @@ pub(crate) struct FakeState {
     pub channels: HashMap<u64, Vec<ChannelSummary>>,
     pub history: HashMap<u64, Vec<MessageSummary>>,
     pub sent: Vec<(u64, String)>,
+    /// The reply target of each text send, in the order of `sent`.
+    pub sent_replies: Vec<Option<u64>>,
+    /// Each delete: the channel and the message.
+    pub deleted: Vec<(u64, u64)>,
+    /// Each reaction call: the channel, the message, the emoji, and add.
+    pub reacted: Vec<(u64, u64, String, bool)>,
     /// Each file send: the channel, the text, and the file names.
     pub sent_files: Vec<(u64, String, Vec<String>)>,
     /// The bytes of each CDN address that a download can read.
@@ -96,7 +102,7 @@ fn channel(id: u64, name: &str, kind: ChannelKind, overwrites: Vec<Overwrite>) -
     }
 }
 
-fn message(id: u64, author_id: u64, author: &str, content: &str) -> MessageSummary {
+pub(crate) fn message(id: u64, author_id: u64, author: &str, content: &str) -> MessageSummary {
     MessageSummary {
         id,
         author_id,
@@ -108,6 +114,8 @@ fn message(id: u64, author_id: u64, author: &str, content: &str) -> MessageSumma
         stickers: 0,
         audio: None,
         image: None,
+        reactions: Vec::new(),
+        reply_to: None,
     }
 }
 
@@ -330,7 +338,63 @@ impl DiscordApi for FakeDiscordApi {
         Some(hold)
     }
 
-    fn send(&self, channel_id: u64, body: String) -> ApiFuture<'_, MessageSummary> {
+    fn message(&self, channel_id: u64, message_id: u64) -> ApiFuture<'_, MessageSummary> {
+        Box::pin(async move {
+            self.check_token()?;
+            let state = self.state();
+            let mut found = state
+                .history
+                .get(&channel_id)
+                .and_then(|rows| rows.iter().find(|row| row.id == message_id).cloned())
+                .ok_or(DiscordApiError::Rejected)?;
+            // The fake keeps no counts: each reaction of the bot counts one.
+            for (_, _, emoji, add) in state
+                .reacted
+                .iter()
+                .filter(|(channel, message, ..)| *channel == channel_id && *message == message_id)
+            {
+                crate::Reaction::toggle(&mut found.reactions, emoji, *add, false);
+            }
+            Ok(found)
+        })
+    }
+
+    fn delete_message(&self, channel_id: u64, message_id: u64) -> ApiFuture<'_, ()> {
+        Box::pin(async move {
+            self.check_token()?;
+            let mut state = self.state();
+            if let Some(error) = state.next_error.take() {
+                return Err(error);
+            }
+            state.deleted.push((channel_id, message_id));
+            Ok(())
+        })
+    }
+
+    fn react(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        emoji: String,
+        add: bool,
+    ) -> ApiFuture<'_, ()> {
+        Box::pin(async move {
+            self.check_token()?;
+            let mut state = self.state();
+            if let Some(error) = state.next_error.take() {
+                return Err(error);
+            }
+            state.reacted.push((channel_id, message_id, emoji, add));
+            Ok(())
+        })
+    }
+
+    fn send(
+        &self,
+        channel_id: u64,
+        body: String,
+        reply_to: Option<u64>,
+    ) -> ApiFuture<'_, MessageSummary> {
         Box::pin(async move {
             self.check_token()?;
             if let Some(hold) = &self.hold_send {
@@ -345,6 +409,7 @@ impl DiscordApi for FakeDiscordApi {
             state.next_id += 1;
             let id = state.next_id;
             state.sent.push((channel_id, body.clone()));
+            state.sent_replies.push(reply_to);
             let content = if state.echo_empty_content {
                 ""
             } else {

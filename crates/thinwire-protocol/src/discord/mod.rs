@@ -91,7 +91,15 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: cfg!(feature = "discord-bot"),
     pages_history: true,
     sends_media: cfg!(feature = "discord-bot"),
-    message_actions: crate::MessageActions::NONE,
+    // The bot replies, reacts, and deletes its own messages. Discord has no
+    // delete for one account only.
+    message_actions: crate::MessageActions {
+        reply: cfg!(feature = "discord-bot"),
+        react: cfg!(feature = "discord-bot"),
+        delete_for_me: false,
+        delete_for_everyone: cfg!(feature = "discord-bot"),
+        one_reaction: false,
+    },
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.
@@ -446,10 +454,58 @@ impl DiscordAdapter {
         conversation_id: String,
         body: String,
         request: u64,
+        reply_to: Option<&str>,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
+        let reply_to = reply_to.and_then(inbox::message_snowflake);
         self.session_mut()?
-            .send(conversation_id, body, request, events)
+            .send(conversation_id, body, request, reply_to, events)
+    }
+
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn delete_message(
+        &mut self,
+        conversation_id: String,
+        message_id: &str,
+    ) -> Result<(), AdapterError> {
+        let Some(id) = inbox::message_snowflake(message_id) else {
+            return Ok(());
+        };
+        self.session_mut()?.delete(conversation_id, id)
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn delete_message(
+        &mut self,
+        _conversation_id: String,
+        _message_id: &str,
+    ) -> Result<(), AdapterError> {
+        Err(not_ready())
+    }
+
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn react(
+        &mut self,
+        conversation_id: String,
+        message_id: &str,
+        emoji: String,
+        add: bool,
+    ) -> Result<(), AdapterError> {
+        let Some(id) = inbox::message_snowflake(message_id) else {
+            return Ok(());
+        };
+        self.session_mut()?.react(conversation_id, id, emoji, add)
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn react(
+        &mut self,
+        _conversation_id: String,
+        _message_id: &str,
+        _emoji: String,
+        _add: bool,
+    ) -> Result<(), AdapterError> {
+        Err(not_ready())
     }
 
     #[cfg(any(test, feature = "discord-bot"))]
@@ -509,6 +565,7 @@ impl DiscordAdapter {
         _conversation_id: String,
         _body: String,
         _request: u64,
+        _reply_to: Option<&str>,
         _events: &EventTx,
     ) -> Result<(), AdapterError> {
         Err(not_ready())
@@ -724,8 +781,21 @@ impl ProtocolAdapter for DiscordAdapter {
                 conversation_id,
                 body,
                 request,
+                reply_to,
+            } => self.send_text(conversation_id, body, request, reply_to.as_deref(), events),
+            AdapterCommand::DeleteMessage {
+                protocol: ProtocolId::Discord,
+                conversation_id,
+                message_id,
                 ..
-            } => self.send_text(conversation_id, body, request, events),
+            } => self.delete_message(conversation_id, &message_id),
+            AdapterCommand::React {
+                protocol: ProtocolId::Discord,
+                conversation_id,
+                message_id,
+                emoji,
+                add,
+            } => self.react(conversation_id, &message_id, emoji, add),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Discord,
                 conversation_id,
@@ -1121,6 +1191,8 @@ mod tests {
                 stickers: 0,
                 audio: None,
                 image: None,
+                reactions: Vec::new(),
+                reply_to: None,
             }],
         );
         // A 500 is `Rejected`, not Forbidden or NotFound.
@@ -2131,6 +2203,98 @@ mod tests {
             api.state().sent,
             vec![(GENERAL, "hi from thinwire".to_string())]
         );
+    }
+
+    /// A reply names its message. A reaction reads the counts of the
+    /// message again. A delete removes the row.
+    #[tokio::test]
+    async fn reply_react_and_delete_go_to_discord() {
+        let api = Arc::new(FakeDiscordApi::guild_fixture());
+        api.state()
+            .history
+            .entry(GENERAL)
+            .or_default()
+            .push(super::fake_api::message(777, 1, "Ada", "hello"));
+        let (mut adapter, tx, mut rx, _) = connected(Arc::clone(&api)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    body: "yes".into(),
+                    request: 0,
+                    reply_to: Some("discord:777".into()),
+                },
+                &tx,
+            )
+            .expect("send");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReplaced { .. })
+        })
+        .await;
+        assert_eq!(api.state().sent_replies, vec![Some(777)]);
+        assert_eq!(
+            messages(&events)[0].reply_to.as_deref(),
+            Some("discord:777"),
+            "the pending row shows the reply"
+        );
+
+        adapter
+            .handle(
+                AdapterCommand::React {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    message_id: "discord:777".into(),
+                    emoji: "👍".into(),
+                    add: true,
+                },
+                &tx,
+            )
+            .expect("react");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessageReactions { .. })
+        })
+        .await;
+        let Some(AdapterEvent::MessageReactions {
+            message_id,
+            reactions,
+            ..
+        }) = events.last()
+        else {
+            panic!("reactions event");
+        };
+        assert_eq!(message_id, "discord:777");
+        assert_eq!(
+            reactions,
+            &vec![crate::Reaction {
+                emoji: "👍".into(),
+                count: 1,
+                mine: true
+            }]
+        );
+
+        adapter
+            .handle(
+                AdapterCommand::DeleteMessage {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                    message_id: "discord:777".into(),
+                    for_everyone: true,
+                },
+                &tx,
+            )
+            .expect("delete");
+        let events = until(&mut rx, |event| {
+            matches!(event, AdapterEvent::MessagesRemoved { .. })
+        })
+        .await;
+        assert!(matches!(
+            events.last(),
+            Some(AdapterEvent::MessagesRemoved { message_ids, .. })
+                if message_ids == &vec!["discord:777".to_string()]
+        ));
+        assert_eq!(api.state().deleted, vec![(GENERAL, 777)]);
     }
 
     /// Twelve photos go out as two messages of 10 and 2 files. The text goes

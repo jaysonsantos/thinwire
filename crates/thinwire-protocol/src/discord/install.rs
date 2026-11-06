@@ -1,9 +1,10 @@
 //! Bot OAuth install shape for a guild inbox. Scope is `bot` only.
 
-/// Guild inbox permission bits: `VIEW_CHANNEL` | `SEND_MESSAGES` | `READ_MESSAGE_HISTORY`.
+/// Guild inbox permission bits: `ADD_REACTIONS` | `VIEW_CHANNEL` |
+/// `SEND_MESSAGES` | `READ_MESSAGE_HISTORY`.
 ///
 /// The bot sends as itself. Manage and administrator bits are absent.
-pub const INBOX_PERMISSION_BITS: u64 = (1 << 10) | (1 << 11) | (1 << 16);
+pub const INBOX_PERMISSION_BITS: u64 = (1 << 6) | (1 << 10) | (1 << 11) | (1 << 16);
 
 /// Gateway intents for a guild inbox: `GUILDS` | `GUILD_MESSAGES` | `MESSAGE_CONTENT`.
 pub const INBOX_INTENT_BITS: u64 = 1 | (1 << 9) | (1 << 15);
@@ -115,6 +116,7 @@ mod tests {
         assert!(permissions.contains(Permissions::VIEW_CHANNEL));
         assert!(permissions.contains(Permissions::READ_MESSAGE_HISTORY));
         assert!(permissions.contains(Permissions::SEND_MESSAGES));
+        assert!(permissions.contains(Permissions::ADD_REACTIONS));
         assert!(!permissions.contains(Permissions::MANAGE_MESSAGES));
         assert!(!permissions.contains(Permissions::ADMINISTRATOR));
     }

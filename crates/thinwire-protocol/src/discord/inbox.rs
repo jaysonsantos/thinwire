@@ -19,7 +19,7 @@ pub(crate) const PREVIEW_FETCH_CONCURRENCY: usize = 4;
 /// Give up on a preview after this many 429s. The row stays empty.
 const PREVIEW_RATE_LIMIT_ATTEMPTS: u32 = 3;
 
-const CONVERSATION_PREFIX: &str = "discord:";
+pub(crate) const CONVERSATION_PREFIX: &str = "discord:";
 
 /// A guild channel the bot can read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,8 +264,10 @@ pub(crate) fn chat_message(
             crate::MessageAudio::new(audio.duration_secs, voice_file_id(message.id), None)
         }),
         video: None,
-        reactions: Vec::new(),
-        reply_to: None,
+        reactions: message.reactions.clone(),
+        reply_to: message
+            .reply_to
+            .map(|id| format!("{CONVERSATION_PREFIX}{id}")),
     }
 }
 
@@ -319,6 +321,8 @@ mod tests {
                 stickers: 0,
                 audio: None,
                 image: None,
+                reactions: Vec::new(),
+                reply_to: None,
             },
         );
         assert_eq!(row.sent_at, 1_700_000_000);
@@ -352,6 +356,8 @@ mod tests {
             stickers: 0,
             audio: None,
             image: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         assert_eq!(message_body(&row), "hello");
         row.content.clear();
