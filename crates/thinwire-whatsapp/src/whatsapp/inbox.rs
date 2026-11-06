@@ -18,7 +18,8 @@ use thinwire_protocol::{
 /// Prefix on every WhatsApp conversation id. The rest is the chat JID.
 pub(super) const CONVERSATION_PREFIX: &str = "whatsapp:";
 
-/// Messages kept per chat. Older ones drop off the front.
+/// Messages kept per chat before the user fetches an older page. Older
+/// ones drop off the front. After a fetch, the thread stays whole.
 pub(super) const MESSAGES_PER_CHAT: usize = 200;
 
 /// Handled ids kept per chat. Past this, the older half goes, oldest first
@@ -397,11 +398,10 @@ struct ChatRecord {
     /// it (Codex r4131089177).
     history_at: i64,
     history_ended: bool,
-    /// Oldest key of the window. A fetched page is older than this key
-    /// and is not part of the cap. The key is not written to the cache
-    /// file. The rows are. A restart has no key, so the next insert trims
-    /// them back to [`MESSAGES_PER_CHAT`].
-    page_floor: Option<(i64, String)>,
+    /// The user loaded an older page. Later inserts keep every row, so
+    /// that page stays against the window. The flag is not saved. A
+    /// restart trims on the next insert.
+    keeps_older: bool,
     mute: Mute,
     /// A live `MuteUpdate` of this connection set `mute`: an older history
     /// chunk does not change it again. A reconnect clears it (#168 item 12).
@@ -518,7 +518,9 @@ pub(super) struct SavedMessage {
     pub reactions: Vec<(String, String)>,
 }
 
-/// One saved chat: the row and its newest messages.
+/// One saved chat: the row and its messages. A fetched older page is
+/// included. A restart has no in-memory mark for that page, so the next
+/// insert trims the chat to the newest [`MESSAGES_PER_CHAT`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct SavedChat {
     pub name: Option<String>,
@@ -915,7 +917,7 @@ impl Inbox {
                 if record.counts_after_read(&message) {
                     added = added.saturating_add(1);
                 }
-                insert_message(&mut record.messages, &record.page_floor, message);
+                insert_message(&mut record.messages, record.keeps_older, message);
             }
             // The user reads the open chat, so a later chunk keeps it read.
             // A chat read here changes its count only by new messages (#98):
@@ -1018,9 +1020,8 @@ impl Inbox {
         }
     }
 
-    /// Keep a page the user asked for. The oldest key already in the chat
-    /// becomes `page_floor` once, and rows older than it stay. The window
-    /// itself stays at [`MESSAGES_PER_CHAT`].
+    /// Keep a page the user asked for. The chat keeps every row from here
+    /// on, so a later message cannot open a hole under this page.
     pub(super) fn apply_fetched(&mut self, jid: &str, messages: Vec<WaMessage>) {
         if messages.is_empty() || !is_inbox_chat(jid) {
             return;
@@ -1029,19 +1030,14 @@ impl Inbox {
             remember_name(&mut self.names, message);
         }
         let record = self.chats.entry(jid.to_string()).or_default();
-        if record.page_floor.is_none() {
-            record.page_floor = record
-                .messages
-                .first()
-                .map(|row| (row.timestamp, row.id.clone()));
-        }
+        record.keeps_older = true;
         for message in messages {
             if message.id.is_empty() {
                 continue;
             }
             record.optimistic.remove(&message.id);
             record.timestamp = record.timestamp.max(message.timestamp);
-            insert_message(&mut record.messages, &record.page_floor, message);
+            insert_message(&mut record.messages, record.keeps_older, message);
         }
     }
 
@@ -1084,7 +1080,7 @@ impl Inbox {
                 record.unread = record.unread.saturating_add(1);
             }
             record.timestamp = record.timestamp.max(message.timestamp);
-            insert_message(&mut record.messages, &record.page_floor, message.clone());
+            insert_message(&mut record.messages, record.keeps_older, message.clone());
             if is_open {
                 record.mark_read();
             }
@@ -1244,7 +1240,7 @@ impl Inbox {
         };
         let record = self.chats.entry(jid.to_string()).or_default();
         record.timestamp = record.timestamp.max(now);
-        insert_message(&mut record.messages, &record.page_floor, message.clone());
+        insert_message(&mut record.messages, record.keeps_older, message.clone());
         (
             pending,
             AdapterEvent::MessageReceived {
@@ -1600,11 +1596,7 @@ fn remember_name(names: &mut HashMap<String, String>, message: &WaMessage) {
     }
 }
 
-fn insert_message(
-    messages: &mut Vec<WaMessage>,
-    page_floor: &Option<(i64, String)>,
-    mut message: WaMessage,
-) {
+fn insert_message(messages: &mut Vec<WaMessage>, keeps_older: bool, mut message: WaMessage) {
     if let Some(existing) = messages.iter_mut().find(|row| row.id == message.id) {
         // A refresh with no reactions keeps the reactions the cache counted.
         if message.reactions.is_empty() {
@@ -1615,19 +1607,15 @@ fn insert_message(
         messages.push(message);
     }
     messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
-    let in_window = |row: &WaMessage| {
-        page_floor.as_ref().is_none_or(|(timestamp, id)| {
-            (row.timestamp, row.id.as_str()) >= (*timestamp, id.as_str())
-        })
-    };
-    let mut excess = messages
-        .iter()
-        .filter(|row| in_window(row))
-        .count()
-        .saturating_sub(MESSAGES_PER_CHAT);
+    // A fetched page and the window are one thread. Dropping the oldest
+    // window row would open a hole under that page.
+    if keeps_older {
+        return;
+    }
+    let mut excess = messages.len().saturating_sub(MESSAGES_PER_CHAT);
     if excess > 0 {
         messages.retain(|row| {
-            if excess == 0 || row.id.starts_with(PENDING_PREFIX) || !in_window(row) {
+            if excess == 0 || row.id.starts_with(PENDING_PREFIX) {
                 return true;
             }
             excess -= 1;
@@ -2958,8 +2946,8 @@ pub(super) mod tests {
         );
     }
 
-    /// A fetched page stays, and a later live row drops only the oldest
-    /// window row. The ids in between stay, so the thread has no hole.
+    /// A fetched page stays against the window after one live row.
+    /// Scrolling shows every row of both, including the oldest window row.
     #[test]
     fn a_fetched_page_and_a_live_message_leave_no_gap() {
         let mut inbox = Inbox::default();
@@ -2974,7 +2962,6 @@ pub(super) mod tests {
                 )
             })
             .collect();
-        let oldest_window = window[0].id.clone();
         inbox.apply_history(
             vec![HistoryChat {
                 mute: Default::default(),
@@ -3000,36 +2987,10 @@ pub(super) mod tests {
         let live_at = 1_000 + i64::try_from(MESSAGES_PER_CHAT).expect("small");
         inbox.apply_messages(vec![message(chat, "live", "now", live_at)]);
 
-        let ids: Vec<&str> = inbox.chats[chat]
-            .messages
-            .iter()
-            .map(|row| row.id.as_str())
-            .collect();
-        for row in &fetched {
-            assert!(
-                ids.contains(&row.id.as_str()),
-                "fetched {} left the cache",
-                row.id
-            );
-        }
-        for row in &window {
-            let present = ids.contains(&row.id.as_str());
-            if row.id == oldest_window {
-                assert!(!present, "the oldest window row stays");
-            } else {
-                assert!(present, "window {} left the cache", row.id);
-            }
-        }
-        let mut expected: Vec<i64> = fetched.iter().map(|row| row.timestamp).collect();
-        expected.extend(window.iter().skip(1).map(|row| row.timestamp));
-        expected.push(live_at);
-        expected.sort_unstable();
-        let stamps: Vec<i64> = inbox.chats[chat]
-            .messages
-            .iter()
-            .map(|row| row.timestamp)
-            .collect();
-        assert_eq!(stamps, expected, "a hole between the page and the window");
+        let mut expected: Vec<String> = fetched.iter().map(|row| row.id.clone()).collect();
+        expected.extend(window.iter().map(|row| row.id.clone()));
+        expected.push("live".to_string());
+        assert_same_thread(&scrolled_thread(&inbox, chat), &expected);
     }
 
     /// Ids the shell shows, from the newest row back through every cached
