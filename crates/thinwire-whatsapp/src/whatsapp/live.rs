@@ -30,7 +30,8 @@ use super::path::{
     whatsapp_device_store_path,
 };
 use super::session::{
-    ActionFuture, DownloadFuture, LinkEvent, NamesFuture, SendFailure, SendFuture, WhatsAppSender,
+    ActionFuture, DownloadFuture, HistoryAsk, LinkEvent, NamesFuture, SendFailure, SendFuture,
+    SubjectFuture, WhatsAppSender,
 };
 use thinwire_protocol::RedactedPairingSecret;
 
@@ -260,7 +261,17 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
         Event::Disconnected(_) => LinkEvent::Disconnected,
         Event::LoggedOut(_) => LinkEvent::LoggedOut,
         Event::TemporaryBan(_) => LinkEvent::TemporaryBan,
-        Event::HistorySync(sync) => map_history(sync.get()?),
+        Event::HistorySync(sync) => {
+            let request_id = sync.peer_data_request_session_id().map(str::to_string);
+            let mut event = map_history(sync.get()?);
+            if let LinkEvent::History {
+                request_id: slot, ..
+            } = &mut event
+            {
+                *slot = request_id;
+            }
+            event
+        }
         Event::MuteUpdate(update) => LinkEvent::Mute {
             jid: update.jid.to_string(),
             mute: Mute::from_action(update.action.muted, update.action.mute_end_timestamp),
@@ -291,11 +302,15 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
 }
 
 fn map_history(sync: &wa::HistorySync) -> LinkEvent {
+    let mut ended = Vec::new();
     let chats = sync
         .conversations
         .iter()
         .map(|conversation| {
             let jid = conversation.id.clone();
+            if no_older_messages(conversation) {
+                ended.push(jid.clone());
+            }
             let messages = conversation
                 .messages
                 .iter()
@@ -324,7 +339,30 @@ fn map_history(sync: &wa::HistorySync) -> LinkEvent {
         .iter()
         .filter_map(|row| Some((row.id.clone()?, row.pushname.clone()?)))
         .collect();
-    LinkEvent::History { chats, push_names }
+    LinkEvent::History {
+        chats,
+        push_names,
+        request_id: None,
+        ended,
+    }
+}
+
+/// The phone says this chat has no older page this device can read.
+///
+/// `COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY` means the primary has
+/// nothing older. `COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS`
+/// means the primary still has older messages, and this linked device is
+/// not allowed to read them. Another request cannot return those messages,
+/// so the chat ends here.
+fn no_older_messages(conversation: &wa::Conversation) -> bool {
+    use whatsapp_rust::waproto::whatsapp::conversation::EndOfHistoryTransferType;
+    matches!(
+        conversation.end_of_history_transfer_type,
+        Some(
+            EndOfHistoryTransferType::COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY
+                | EndOfHistoryTransferType::COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS,
+        )
+    )
 }
 
 fn map_history_message(chat_jid: &str, info: &wa::WebMessageInfo) -> Option<WaMessage> {
@@ -702,6 +740,44 @@ impl WhatsAppSender for LiveSender {
                     (!subject.is_empty()).then(|| (group.id.to_string(), subject))
                 })
                 .collect())
+        })
+    }
+
+    fn group_subject<'a>(&'a self, jid: &'a str) -> SubjectFuture<'a> {
+        Box::pin(async move {
+            let jid: Jid = jid.parse().map_err(|_| ())?;
+            let meta = self
+                .client
+                .groups()
+                .fetch_metadata(&jid)
+                .await
+                .map_err(|_| ())?;
+            let subject = meta.subject.unwrap_or_default();
+            let subject = subject.trim();
+            Ok((!subject.is_empty()).then(|| subject.to_string()))
+        })
+    }
+
+    fn allocate_history_id(&self) -> Option<String> {
+        Some(self.client.generate_message_id().as_str().to_string())
+    }
+
+    fn request_history<'a>(&'a self, ask: &'a HistoryAsk<'a>) -> ActionFuture<'a> {
+        Box::pin(async move {
+            let chat: Jid = ask.chat_jid.parse().map_err(|_| ())?;
+            let request_id = whatsapp_rust::MessageId::new(ask.request_id).map_err(|_| ())?;
+            self.client
+                .fetch_message_history_with_id(
+                    &chat,
+                    ask.oldest_id,
+                    ask.oldest_from_me,
+                    ask.oldest_timestamp_ms,
+                    ask.count,
+                    &request_id,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|_| ())
         })
     }
 
