@@ -375,12 +375,34 @@ mod tests {
     #[test]
     fn a_program_file_does_not_open() {
         for extension in [
-            "exe", "bat", "cmd", "com", "scr", "pif", "lnk", "app", "desktop", "sh", "EXE",
+            "exe", "bat", "cmd", "com", "scr", "pif", "lnk", "app", "desktop", "sh", "EXE", "js",
+            "jse", "vbs", "vbe", "wsf", "wsh", "hta", "msi", "msp", "ps1", "reg", "cpl", "msc",
+            "jar", "url", "scf", "appx", "appref-ms", "gadget", "dll", "command", "workflow",
+            "terminal", "pkg", "dmg", "AppImage", "run", "py", "pl",
         ] {
             let path = Path::new("/tmp").join(format!("payload.{extension}"));
             assert!(open_command(&path).is_none(), "{extension} must not open");
         }
-        assert!(open_command(Path::new("/tmp/notes.pdf")).is_some());
+        for extension in [
+            "pdf", "txt", "csv", "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "zip",
+            "docx", "xlsx", "pptx", "mp3", "ogg", "opus", "m4a", "aac", "wav", "mp4", "m4v", "mov",
+            "webm", "mkv", "avi", "3gp",
+        ] {
+            let path = Path::new("/tmp").join(format!("notes.{extension}"));
+            assert!(open_command(&path).is_some(), "{extension} should open");
+        }
+        assert!(open_command(Path::new("/tmp/payload")).is_none());
+        let js = MessageFile::new("payload.js", "text/javascript", 4, 9, None, None);
+        assert_eq!(control(&js, false), Control::Download);
+    }
+
+    #[test]
+    fn a_trailing_dot_or_space_does_not_hide_a_program() {
+        assert!(open_command(Path::new("/tmp/payload.exe.")).is_none());
+        assert!(open_command(Path::new("/tmp/payload.exe ")).is_none());
+        assert!(open_command(Path::new("/tmp/payload.exe. ")).is_none());
+        assert!(windows_open_command(Path::new(r"C:\Users\a\payload.exe.")).is_none());
+        assert!(windows_open_command(Path::new(r"C:\Users\a\payload.exe ")).is_none());
     }
 
     #[test]
