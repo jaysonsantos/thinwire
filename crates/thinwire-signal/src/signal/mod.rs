@@ -14,6 +14,7 @@ mod path;
 pub use path::{
     SessionLock, SessionLockError, clear_voice_files, lock_session, set_account, set_session_dir,
 };
+mod react;
 mod reconnect;
 mod time;
 mod wake;
@@ -389,8 +390,12 @@ impl SignalAdapter {
         conversation_id: &str,
         body: &str,
         request: u64,
+        reply_to: Option<String>,
         events: &EventTx,
     ) -> Result<(), AdapterError> {
+        // The test device has no replies.
+        #[cfg(not(feature = "signal-local"))]
+        let _ = &reply_to;
         match &mut self.engine {
             Engine::Sync(device) => {
                 match device.send(conversation_id, body) {
@@ -419,6 +424,7 @@ impl SignalAdapter {
                     body: body.to_string(),
                     request,
                     files: Vec::new(),
+                    reply_to,
                 });
                 if !queued {
                     thinwire_protocol::emit_send_rejected(
@@ -453,6 +459,7 @@ impl SignalAdapter {
                         body: caption.to_string(),
                         request,
                         files,
+                        reply_to: None,
                     })
             }
         };
@@ -518,6 +525,7 @@ impl SignalAdapter {
                         body,
                         request,
                         files: Vec::new(),
+                        reply_to: None,
                     });
                     if !queued {
                         thinwire_protocol::emit_send_rejected(
@@ -716,8 +724,51 @@ impl ProtocolAdapter for SignalAdapter {
                 conversation_id,
                 body,
                 request,
-                ..
-            } => self.send_text(&conversation_id, &body, request, events),
+                reply_to,
+            } => self.send_text(&conversation_id, &body, request, reply_to, events),
+            AdapterCommand::React {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+                message_id,
+                emoji,
+                add,
+            } => {
+                #[cfg(not(feature = "signal-local"))]
+                let _ = (&message_id, &emoji, add);
+                let queued = match &self.engine {
+                    Engine::Sync(_) => false,
+                    #[cfg(feature = "signal-local")]
+                    Engine::Live(session) => {
+                        session.request_react(conversation_id.clone(), message_id, emoji, add)
+                    }
+                };
+                if !queued {
+                    menu_refused(events, conversation_id);
+                }
+                Ok(())
+            }
+            AdapterCommand::DeleteMessage {
+                protocol: ProtocolId::Signal,
+                conversation_id,
+                message_id,
+                for_everyone,
+            } => {
+                #[cfg(not(feature = "signal-local"))]
+                let _ = &message_id;
+                // Signal has no delete for one account.
+                let queued = for_everyone
+                    && match &self.engine {
+                        Engine::Sync(_) => false,
+                        #[cfg(feature = "signal-local")]
+                        Engine::Live(session) => {
+                            session.request_delete(conversation_id.clone(), message_id)
+                        }
+                    };
+                if !queued {
+                    menu_refused(events, conversation_id);
+                }
+                Ok(())
+            }
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Signal,
                 conversation_id,
@@ -758,6 +809,15 @@ impl ProtocolAdapter for SignalAdapter {
             session.request_viewed(self.viewed.clone());
         }
     }
+}
+
+/// A reaction or a delete with no live client, or a delete for one account.
+fn menu_refused(events: &EventTx, conversation_id: String) {
+    let _ = events.send(AdapterEvent::CommandFailed {
+        protocol: ProtocolId::Signal,
+        conversation_id: Some(conversation_id),
+        detail: "Signal can't do that now. Signal deletes only for everyone.".to_string(),
+    });
 }
 
 #[cfg(test)]

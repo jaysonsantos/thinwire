@@ -144,7 +144,14 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     sends_text: true,
     pages_history: true,
     sends_media: true,
-    message_actions: crate::MessageActions::NONE,
+    // Signal deletes only for everyone. Each person has one reaction.
+    message_actions: crate::MessageActions {
+        reply: true,
+        react: true,
+        delete_for_me: false,
+        delete_for_everyone: true,
+        one_reaction: true,
+    },
 };
 
 /// The Signal adapter of a `signal-local` build: it runs the AGPL client in

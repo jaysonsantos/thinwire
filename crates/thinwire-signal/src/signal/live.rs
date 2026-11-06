@@ -49,6 +49,8 @@ const SLED_RELINK: &str = "This build stores the Signal session in SQLite. A ses
 const LINK_FAILED: &str = "Signal linking failed. No provisioning URL was logged.";
 const SYNC_FAILED: &str = "Signal chat list could not be read. Message text was not logged.";
 const SEND_FAILED: &str = "Signal send failed. The message text was not logged.";
+const REACT_FAILED: &str = "Signal did not take the reaction.";
+const DELETE_FAILED: &str = "Signal did not delete the message.";
 const DISCONNECTED: &str = "Signal disconnected. The receive stream ended.";
 const LINKED_READY: &str = "Signal is linked. Experimental client: expect breakage.";
 
@@ -91,6 +93,8 @@ pub(super) struct Outbound {
     pub(super) request: u64,
     /// Photos and videos of the message. `body` is then the caption.
     pub(super) files: Vec<thinwire_protocol::OutgoingFile>,
+    /// The row id of the message this one replies to.
+    pub(super) reply_to: Option<String>,
 }
 
 /// Attachments in one Signal message at most.
@@ -132,6 +136,18 @@ pub(super) enum WorkerJob {
     Viewed(Option<String>),
     /// Download the audio of this handle for the player.
     Voice(i32),
+    /// Set or remove the reaction of this account on one message.
+    React {
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        add: bool,
+    },
+    /// Delete an own message for every member of the chat.
+    Delete {
+        conversation_id: String,
+        message_id: String,
+    },
 }
 
 pub(super) struct Session {
@@ -324,6 +340,31 @@ impl Session {
     /// Queue the download of the audio `file_id`. `false`: no worker runs.
     pub(super) fn request_voice(&self, file_id: i32) -> bool {
         self.enqueue(WorkerJob::Voice(file_id))
+    }
+
+    /// Queue a reaction of this account. `false`: no worker runs.
+    pub(super) fn request_react(
+        &self,
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        add: bool,
+    ) -> bool {
+        self.enqueue(WorkerJob::React {
+            conversation_id,
+            message_id,
+            emoji,
+            add,
+        })
+    }
+
+    /// Queue the delete of an own message for everyone. `false`: no worker
+    /// runs.
+    pub(super) fn request_delete(&self, conversation_id: String, message_id: String) -> bool {
+        self.enqueue(WorkerJob::Delete {
+            conversation_id,
+            message_id,
+        })
     }
 
     pub(super) fn media(&self) -> &super::media::MediaBook {
@@ -1869,6 +1910,9 @@ async fn run_linked(
         };
     start_avatar_fetches(&manager, &session, token, &events);
     let mut names = contact_names(&manager).await;
+    // The ACI of this account names its own messages in reactions and quotes.
+    let own_aci = manager.registration_data().service_ids.aci.to_string();
+    let mut reaction_book = super::react::ReactionBook::default();
     emit_status(
         &events,
         ProtocolId::Signal,
@@ -1975,6 +2019,12 @@ async fn run_linked(
                                     )
                                     .await;
                                     let viewed = session.viewed();
+                                    emit_reaction(
+                                        &events,
+                                        content.as_ref(),
+                                        &own_aci,
+                                        &mut reaction_book,
+                                    );
                                     emit_incoming(
                                         &events,
                                         content.as_ref(),
@@ -2105,6 +2155,71 @@ async fn run_linked(
                     start_photo_downloads(&manager, &session, token, &events, id);
                 }
                 clear_viewed(&events, &mut unread, &mut rows, conversation_id);
+            }
+            Some(WorkerJob::React {
+                conversation_id,
+                message_id,
+                emoji,
+                add,
+            }) => {
+                let Some((millis, author)) = super::react::target_of(&message_id) else {
+                    command_failed(&events, &conversation_id, REACT_FAILED);
+                    continue;
+                };
+                let author = author.unwrap_or(&own_aci).to_string();
+                let reaction = presage::libsignal_service::proto::data_message::Reaction {
+                    emoji: Some(emoji.clone()),
+                    remove: Some(!add),
+                    target_author_aci: Some(author),
+                    target_sent_timestamp: Some(millis),
+                    ..Default::default()
+                };
+                let data = DataMessage {
+                    reaction: Some(reaction),
+                    ..Default::default()
+                };
+                if send_data(&mut manager, &session, &conversation_id, data)
+                    .await
+                    .is_ok()
+                {
+                    let reactions =
+                        reaction_book.apply(&message_id, super::react::ME, &emoji, !add);
+                    let _ = events.send(AdapterEvent::MessageReactions {
+                        protocol: ProtocolId::Signal,
+                        conversation_id,
+                        message_id,
+                        reactions,
+                    });
+                } else {
+                    command_failed(&events, &conversation_id, REACT_FAILED);
+                }
+            }
+            Some(WorkerJob::Delete {
+                conversation_id,
+                message_id,
+            }) => {
+                let Some((millis, _)) = super::react::target_of(&message_id) else {
+                    command_failed(&events, &conversation_id, DELETE_FAILED);
+                    continue;
+                };
+                let data = DataMessage {
+                    delete: Some(presage::libsignal_service::proto::data_message::Delete {
+                        target_sent_timestamp: Some(millis),
+                    }),
+                    ..Default::default()
+                };
+                if send_data(&mut manager, &session, &conversation_id, data)
+                    .await
+                    .is_ok()
+                {
+                    let _ = events.send(AdapterEvent::MessagesRemoved {
+                        protocol: ProtocolId::Signal,
+                        conversation_id,
+                        message_ids: vec![message_id],
+                    });
+                } else {
+                    command_failed(&events, &conversation_id, DELETE_FAILED);
+                }
             }
             Some(WorkerJob::Voice(file_id)) => {
                 download_voice(&manager, &session, token, &events, file_id);
@@ -3410,6 +3525,20 @@ fn remember_row(rows: &mut HashMap<String, Conversation>, conversation: &Convers
 
 /// The text and the attachments of a transcript of a message that this
 /// account sent from another device.
+/// The row id of the message that `content` replies to.
+fn quote_of(content: &Content) -> Option<String> {
+    use presage::libsignal_service::proto::sync_message::Content as SyncContent;
+    let quote = match &content.body {
+        ContentBody::DataMessage(data) => data.quote.as_ref(),
+        ContentBody::SynchronizeMessage(sync) => match sync.content.as_ref() {
+            Some(SyncContent::Sent(sent)) => sent.message.as_ref()?.quote.as_ref(),
+            _ => None,
+        },
+        _ => None,
+    }?;
+    Some(signal_message_id(quote.id?, quote.author_aci.as_deref()?))
+}
+
 fn sent_sync_parts(
     sync: &presage::libsignal_service::proto::SyncMessage,
 ) -> (Option<&str>, &[presage::proto::AttachmentPointer]) {
@@ -3625,7 +3754,7 @@ fn row_and_message(
         audio: None,
         video: None,
         reactions: Vec::new(),
-        reply_to: None,
+        reply_to: quote_of(content),
     };
     if let Some(media) = media {
         media.dress(&mut message, attachments, caption);
@@ -3669,10 +3798,25 @@ async fn send_text(
         .as_millis() as u64;
     let attachments = upload_files(manager, &outbound.files).await?;
     let caption = outbound.body.trim();
+    let own_aci = manager.registration_data().service_ids.aci.to_string();
+    // A reply quotes the time and the author of its message. Signal clients
+    // find the quoted text in their own copy.
+    let quote = outbound
+        .reply_to
+        .as_deref()
+        .and_then(super::react::target_of)
+        .map(
+            |(millis, author)| presage::libsignal_service::proto::data_message::Quote {
+                id: Some(millis),
+                author_aci: Some(author.unwrap_or(&own_aci).to_string()),
+                ..Default::default()
+            },
+        );
     let data_message = DataMessage {
         body: (!caption.is_empty() || attachments.is_empty()).then(|| outbound.body.clone()),
         timestamp: Some(timestamp),
         attachments,
+        quote,
         ..Default::default()
     };
     if super::group::is_group_id(&outbound.conversation_id) {
@@ -3722,7 +3866,7 @@ async fn send_text(
             audio: None,
             video: None,
             reactions: Vec::new(),
-            reply_to: None,
+            reply_to: outbound.reply_to.clone(),
         },
     );
     // A media row keeps no files, so it cannot be sent again.
@@ -3730,6 +3874,102 @@ async fn send_text(
         session.remember(&id, &outbound.body).await;
     }
     Ok(())
+}
+
+/// Send one data message to a contact or a group, with the time of now.
+async fn send_data(
+    manager: &mut Manager<SqliteStore, Registered>,
+    session: &Session,
+    conversation_id: &str,
+    mut data_message: DataMessage,
+) -> Result<(), ()> {
+    if signal_retained_slot(conversation_id).is_some() {
+        return Err(());
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ())?
+        .as_millis() as u64;
+    data_message.timestamp = Some(timestamp);
+    if super::group::is_group_id(conversation_id) {
+        let master_key = session.group_key(conversation_id).await.ok_or(())?;
+        manager
+            .send_message_to_group(&master_key, data_message, timestamp)
+            .await
+            .map_err(|_| ())
+    } else {
+        let service_id = service_id_of(conversation_id).ok_or(())?;
+        manager
+            .send_message(service_id, data_message, timestamp)
+            .await
+            .map_err(|_| ())
+    }
+}
+
+/// A live reaction: a data message of another person, or a transcript of a
+/// reaction that this account sent from another device. It sends the new
+/// counts of the message.
+fn emit_reaction(
+    events: &EventTx,
+    content: &Content,
+    own_aci: &str,
+    book: &mut super::react::ReactionBook,
+) {
+    use presage::libsignal_service::proto::sync_message::Content as SyncContent;
+    let (reaction, mine) = match &content.body {
+        ContentBody::DataMessage(data) => (data.reaction.as_ref(), false),
+        ContentBody::SynchronizeMessage(sync) => match sync.content.as_ref() {
+            Some(SyncContent::Sent(sent)) => (
+                sent.message
+                    .as_ref()
+                    .and_then(|message| message.reaction.as_ref()),
+                true,
+            ),
+            _ => (None, false),
+        },
+        _ => (None, false),
+    };
+    let Some(reaction) = reaction else {
+        return;
+    };
+    let (Some(author), Some(millis)) = (
+        reaction.target_author_aci.as_deref(),
+        reaction.target_sent_timestamp,
+    ) else {
+        return;
+    };
+    let Ok(thread) = Thread::try_from(content) else {
+        return;
+    };
+    let conversation_id = match &thread {
+        Thread::Contact(id) => contact_id(id),
+        Thread::Group(key) => super::group::group_id(key),
+    };
+    let sender = contact_id(&content.metadata.sender);
+    let reactor = if mine || sender == own_aci {
+        super::react::ME.to_string()
+    } else {
+        sender
+    };
+    let emoji = reaction.emoji.as_deref().unwrap_or_default();
+    let remove = reaction.remove.unwrap_or(false);
+    for message_id in super::react::row_ids(millis, author, own_aci) {
+        let reactions = book.apply(&message_id, &reactor, emoji, remove);
+        let _ = events.send(AdapterEvent::MessageReactions {
+            protocol: ProtocolId::Signal,
+            conversation_id: conversation_id.clone(),
+            message_id,
+            reactions,
+        });
+    }
+}
+
+fn command_failed(events: &EventTx, conversation_id: &str, detail: &str) {
+    let _ = events.send(AdapterEvent::CommandFailed {
+        protocol: ProtocolId::Signal,
+        conversation_id: Some(conversation_id.to_string()),
+        detail: detail.to_string(),
+    });
 }
 
 /// The row of a sent message: the text, or what the files are.
@@ -8378,6 +8618,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
             body: "sent line".into(),
             request: 7,
             files: Vec::new(),
+            reply_to: None,
         };
         let mut names = HashMap::new();
         names.insert(id.clone(), "Ada".into());
