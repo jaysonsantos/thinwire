@@ -646,6 +646,8 @@ pub enum AdapterCommand {
         topic: MessageTopic,
         body: String,
         request: u64,
+        /// The message this one replies to. `None` is a plain message.
+        reply_to: Option<String>,
     },
     /// The host starts the adapter of this account (ADR 0014). Account 0 of
     /// each protocol starts with the host. No adapter sees this command.

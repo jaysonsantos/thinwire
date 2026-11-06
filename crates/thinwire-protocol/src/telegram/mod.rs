@@ -462,6 +462,7 @@ impl ProtocolAdapter for TelegramAdapter {
                 topic,
                 body,
                 request,
+                reply_to,
             } => {
                 let rejected = if body.trim().is_empty() {
                     Some("message text is empty")
@@ -482,6 +483,7 @@ impl ProtocolAdapter for TelegramAdapter {
                             topic,
                             body,
                             request,
+                            reply_to,
                         },
                     ),
                 };
@@ -648,6 +650,7 @@ enum LiveCall {
         topic: MessageTopic,
         body: String,
         request: u64,
+        reply_to: Option<String>,
     },
     DownloadFile {
         file_id: i32,
@@ -748,12 +751,14 @@ impl TelegramAdapter {
                     topic,
                     body,
                     request,
+                    reply_to,
                 } => {
                     self.tdlib.send_topic_text(
                         conversation_id,
                         topic,
                         body,
                         request,
+                        reply_to,
                         secrets,
                         source,
                         events,

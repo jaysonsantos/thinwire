@@ -4237,12 +4237,14 @@ impl Snapshot {
                 request,
             });
         } else if let Some(topic) = self.selected_topic {
+            let reply_to = self.take_reply();
             self.push(AdapterCommand::SendTopicText {
                 protocol,
                 conversation_id,
                 topic,
                 body,
                 request,
+                reply_to,
             });
         } else {
             let reply_to = self.take_reply();

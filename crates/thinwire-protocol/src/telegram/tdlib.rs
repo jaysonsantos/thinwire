@@ -85,6 +85,7 @@ pub(super) enum TdlibCommand {
         topic: MessageTopic,
         body: String,
         request: u64,
+        reply_to: Option<String>,
     },
     /// The chat the user looks at. `None` means they left Telegram.
     /// This, not history load, owns `LiveInbox::open_chat`.
@@ -452,12 +453,14 @@ impl TdlibRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn send_topic_text(
         &mut self,
         conversation_id: String,
         topic: MessageTopic,
         body: String,
         request: u64,
+        reply_to: Option<String>,
         secrets: Arc<dyn TelegramSecretVault>,
         source: TelegramApiSource,
         events: &EventTx,
@@ -468,6 +471,7 @@ impl TdlibRuntime {
                 topic,
                 body,
                 request,
+                reply_to,
             },
             secrets,
             source,
@@ -986,6 +990,7 @@ fn spawn_tdlib_worker(
                             topic,
                             body,
                             request,
+                            reply_to,
                         } => {
                             send_text(
                                 client_id,
@@ -993,7 +998,7 @@ fn spawn_tdlib_worker(
                                 &body,
                                 request,
                                 Some(topic),
-                                None,
+                                reply_to.as_deref(),
                                 &live,
                                 &events,
                             )
