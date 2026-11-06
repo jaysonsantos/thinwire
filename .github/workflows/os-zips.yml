@@ -1,4 +1,5 @@
-# OS artifacts on main only. These are not releases.
+# OS artifacts on main only. These are not releases. The `nightly` job also
+# puts them on the rolling `nightly` pre-release (scripts/publish-nightly.sh).
 # GitHub wraps every artifact download in an outer zip. The uploaded file is
 # one mode-preserving .tar.gz so executable bits and the macOS .app survive.
 # pull_request never triggers this workflow, and the job also refuses non-main pushes.
@@ -193,3 +194,36 @@ jobs:
           path: thinwire-helpers-${{ github.sha }}-source.tar.gz
           if-no-files-found: error
           retention-days: 7
+
+  # The rolling `nightly` pre-release: the archives of the newest main commit,
+  # for people who want every push, and for the AUR package
+  # thinwire-nightly-bin (see aur-nightly.yml). It gets no publisher secret:
+  # the build jobs above already baked the Telegram credentials in.
+  nightly:
+    name: nightly
+    needs: [os-zips, helper-source]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: nightly-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the nightly release
+        env:
+          DIST: dist
+          SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/publish-nightly.sh
