@@ -148,12 +148,24 @@ fn launch(path: &AudioPath) -> bool {
     let Some(mut command) = open_command(path.as_path()) else {
         return false;
     };
-    command.spawn().is_ok()
+    let Ok(child) = command.spawn() else {
+        return false;
+    };
+    watch_open(child).is_ok()
+}
+
+/// Reap the opener. Dropping the `Child` would leave a zombie.
+fn watch_open(
+    mut child: std::process::Child,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>> {
+    std::thread::Builder::new()
+        .name("thinwire-open".into())
+        .spawn(move || child.wait())
 }
 
 #[must_use]
 pub(crate) fn open_command(path: &Path) -> Option<Command> {
-    if !path.is_absolute() {
+    if !path.is_absolute() || is_program(path) {
         return None;
     }
     #[cfg(windows)]
@@ -173,14 +185,33 @@ pub(crate) fn open_command(path: &Path) -> Option<Command> {
     }
 }
 
+/// `cmd /C start` splits on `&`. `rundll32` takes the path as one argument,
+/// the same way a mailto address is opened.
 #[cfg(any(windows, test))]
 fn windows_open_command(path: &Path) -> Option<Command> {
-    let mut command = Command::new("cmd");
-    command.arg("/C");
-    command.arg("start");
-    command.arg("");
+    if is_program(path) {
+        return None;
+    }
+    let mut command = Command::new(super::links::rundll32_program());
+    command.arg("url.dll,FileProtocolHandler");
     command.arg(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
     Some(command)
+}
+
+/// These extensions start a program. Open would run the sender's file.
+fn is_program(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "exe" | "bat" | "cmd" | "com" | "scr" | "pif" | "lnk" | "app" | "desktop" | "sh"
+    )
 }
 
 #[cfg(test)]
@@ -320,22 +351,25 @@ mod tests {
     fn open_command_takes_an_absolute_path() {
         assert!(open_command(Path::new("notes.pdf")).is_none());
         assert!(open_command(Path::new("")).is_none());
-        let path = Path::new("/tmp/notes.pdf");
+        let path = if cfg!(windows) {
+            Path::new(r"C:\tmp\notes.pdf")
+        } else {
+            Path::new("/tmp/notes.pdf")
+        };
         let command = open_command(path).expect("command");
         let program = command.get_program().to_string_lossy();
-        let expected = if cfg!(target_os = "windows") {
-            "cmd"
+        if cfg!(windows) {
+            assert!(program.ends_with(r"\System32\rundll32.exe"), "{program}");
         } else if cfg!(target_os = "macos") {
-            "open"
+            assert_eq!(program, "open");
         } else {
-            "xdg-open"
-        };
-        assert_eq!(program, expected);
+            assert_eq!(program, "xdg-open");
+        }
         let args: Vec<String> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args.last().map(String::as_str), Some("/tmp/notes.pdf"));
+        assert_eq!(args.last().map(String::as_str), path.to_str());
     }
 
     #[test]
@@ -375,5 +409,36 @@ mod tests {
             ]
         );
         assert!(windows_open_command(Path::new(r"C:\Users\a\x&calc.exe")).is_none());
+    }
+
+    #[test]
+    fn an_opened_program_is_waited_for() {
+        let child = std::process::Command::new("true").spawn().expect("true");
+        let status = watch_open(child)
+            .expect("thread")
+            .join()
+            .expect("join")
+            .expect("wait");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn a_program_file_shows_the_open_error() {
+        let path = AudioPath::new("/tmp/payload.exe").expect("path");
+        let file = MessageFile::new(
+            "payload.exe",
+            "application/octet-stream",
+            4,
+            9,
+            Some(path),
+            None,
+        );
+        let mut opened = harness(file);
+        opened.run_steps(1);
+        opened
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Open")
+            .click();
+        opened.run_steps(1);
+        opened.get_by_label("Couldn't open this file.");
     }
 }
