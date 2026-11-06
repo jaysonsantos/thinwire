@@ -46,7 +46,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     allows_user_account_automation: false,
     // Only the live spike can send. The default build has no client.
     sends_text: cfg!(feature = "whatsapp-web"),
-    // The session history pages from memory (LoadOlderMessages).
+    // Older messages page from the cache, then from the phone.
     pages_history: cfg!(feature = "whatsapp-web"),
     sends_media: cfg!(feature = "whatsapp-web"),
     message_actions: thinwire_protocol::MessageActions::NONE,
@@ -637,24 +637,26 @@ impl WhatsAppAdapter {
         Ok((jid, body, sender))
     }
 
-    /// Older rows come from the in-memory history of this session. The
-    /// request always ends with `OlderHistoryLoaded`, never with an error:
-    /// an adapter error would mark the account Error and hide the inbox.
     fn load_older(&self, conversation_id: &str, before: &str, events: &EventTx) {
-        // The retained history stays in memory while the link reconnects, so
-        // an offline page still answers with real rows and a real `more`.
-        // `more == false` never comes from a short drop (Codex r4103931208).
-        // After a logout the inbox is empty: an unknown chat ends paging.
-        let (page, more) = match inbox::parse_conversation_id(conversation_id) {
+        let page = match inbox::parse_conversation_id(conversation_id) {
             Some(jid) => self
                 .session
-                .with_inbox(|inbox| inbox.older_page(jid, before, inbox::OPEN_CHAT_MESSAGES)),
-            None => (Vec::new(), false),
+                .with_inbox(|inbox| inbox.older_decision(jid, before, inbox::OPEN_CHAT_MESSAGES)),
+            None => inbox::OlderDecision::closed(),
         };
-        for event in &page {
+        let needs_phone = page.events.is_empty() && page.anchor.is_some() && !page.ended;
+        if needs_phone && self.ask_for_older(conversation_id, before, &page, events) {
+            return;
+        }
+        for event in &page.events {
             let _ = events.send(event.clone());
         }
-        self.session.fetch_media(&page, events);
+        self.session.fetch_media(&page.events, events);
+        let more = if needs_phone {
+            true
+        } else {
+            page.more_cached || (!page.ended && page.anchor.is_some())
+        };
         emit_older_history_loaded(
             events,
             ProtocolId::WhatsApp,
@@ -664,6 +666,60 @@ impl WhatsAppAdapter {
             None,
             None,
         );
+    }
+
+    fn ask_for_older(
+        &self,
+        conversation_id: &str,
+        before: &str,
+        page: &inbox::OlderDecision,
+        events: &EventTx,
+    ) -> bool {
+        let Some(anchor) = page.anchor.as_ref() else {
+            return false;
+        };
+        let Some(jid) = inbox::parse_conversation_id(conversation_id) else {
+            return false;
+        };
+        let Some((generation, sender)) = self.session.sender() else {
+            return false;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return false;
+        }
+        let Some(request_id) = sender.allocate_history_id() else {
+            return false;
+        };
+        self.session.note_older_wait(
+            generation,
+            request_id.clone(),
+            jid,
+            before,
+            conversation_id,
+            events,
+        );
+        let chat_jid = jid.to_string();
+        let oldest_id = anchor.id.clone();
+        let from_me = anchor.from_me;
+        let timestamp_ms = anchor.timestamp.saturating_mul(1_000);
+        let count = i32::try_from(inbox::OPEN_CHAT_MESSAGES).unwrap_or(i32::MAX);
+        let session = self.session.clone();
+        let events = events.clone();
+        let failed_id = request_id.clone();
+        tokio::spawn(async move {
+            let ask = session::HistoryAsk {
+                chat_jid: &chat_jid,
+                oldest_id: &oldest_id,
+                oldest_from_me: from_me,
+                oldest_timestamp_ms: timestamp_ms,
+                count,
+                request_id: &request_id,
+            };
+            if sender.request_history(&ask).await.is_err() {
+                session.expire_older(generation, &failed_id, &events);
+            }
+        });
+        true
     }
 
     /// Send a failed row again under the same local id.
@@ -1279,6 +1335,8 @@ mod tests {
                 ],
             }],
             push_names: Vec::new(),
+            request_id: None,
+            ended: Vec::new(),
         }
     }
 
@@ -2594,6 +2652,8 @@ mod tests {
                     messages: rows,
                 }],
                 push_names: Vec::new(),
+                request_id: None,
+                ended: Vec::new(),
             },
             1,
             &tx,
@@ -2631,10 +2691,13 @@ mod tests {
         ));
 
         older(&mut adapter, "m020");
-        assert!(matches!(
-            drain(&mut rx).last(),
-            Some(AdapterEvent::OlderHistoryLoaded { more: false, .. })
-        ));
+        assert!(
+            matches!(
+                drain(&mut rx).last(),
+                Some(AdapterEvent::OlderHistoryLoaded { more: true, .. })
+            ),
+            "the last cached page is not the start of the chat"
+        );
 
         // An unknown id: no rows, no error, `more == false`.
         older(&mut adapter, "nope");
@@ -2676,6 +2739,402 @@ mod tests {
             drain(&mut rx).last(),
             Some(AdapterEvent::OlderHistoryLoaded { more: false, .. })
         ));
+    }
+
+    #[test]
+    fn a_finished_history_sync_is_the_start_of_the_chat() {
+        let (tx, mut rx) = unbounded_channel();
+        let sender = Arc::new(FakeSender::default());
+        let mut adapter = with_sender(sender.clone());
+        adapter.session.apply(
+            LinkEvent::History {
+                chats: vec![inbox::HistoryChat {
+                    mute: Default::default(),
+                    jid: CHAT.into(),
+                    name: None,
+                    unread: 0,
+                    timestamp: 10,
+                    messages: vec![message(CHAT, "only", "Guten Morgen", 10)],
+                }],
+                push_names: Vec::new(),
+                request_id: None,
+                ended: vec![CHAT.into()],
+            },
+            1,
+            &tx,
+        );
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    before_message_id: "only".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("never an adapter error");
+        assert!(matches!(
+            drain(&mut rx).last(),
+            Some(AdapterEvent::OlderHistoryLoaded { more: false, .. })
+        ));
+        assert!(
+            sender.history_asks.lock().expect("fake lock").is_empty(),
+            "the phone already said there is no older page"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_cached_window_is_not_the_start_of_the_chat() {
+        let (tx, mut rx) = unbounded_channel();
+        let sender = Arc::new(FakeSender::default());
+        let mut adapter = with_sender(sender.clone());
+        let history = |messages, request_id, ended: Vec<String>| LinkEvent::History {
+            chats: vec![inbox::HistoryChat {
+                mute: Default::default(),
+                jid: CHAT.into(),
+                name: None,
+                unread: 0,
+                timestamp: 10,
+                messages,
+            }],
+            push_names: Vec::new(),
+            request_id,
+            ended,
+        };
+        adapter.session.apply(
+            history(
+                vec![message(CHAT, "only", "Guten Morgen", 10)],
+                None,
+                Vec::new(),
+            ),
+            1,
+            &tx,
+        );
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        let older = |adapter: &mut WhatsAppAdapter, before: &str| {
+            adapter
+                .handle(
+                    AdapterCommand::LoadOlderMessages {
+                        protocol: ProtocolId::WhatsApp,
+                        conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                        before_message_id: before.into(),
+                        store_cursor: None,
+                    },
+                    &tx,
+                )
+                .expect("never an adapter error");
+        };
+        older(&mut adapter, "only");
+        let asks = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let asks = sender.history_asks.lock().expect("fake lock").clone();
+                if !asks.is_empty() {
+                    return asks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the phone is asked");
+        assert_eq!(asks[0].oldest_id, "only");
+        assert_eq!(asks[0].timestamp_ms, 10_000);
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::OlderHistoryLoaded { more: false, .. })),
+            "more == false is Start of chat; a cached window is not that: {events:?}"
+        );
+        adapter.session.apply(
+            history(
+                vec![message(CHAT, "earlier", "yesterday", 9)],
+                Some(asks[0].request_id.clone()),
+                Vec::new(),
+            ),
+            1,
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::MessageReceived { message } if message.id == "earlier"
+            )),
+            "the older message is shown: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(AdapterEvent::OlderHistoryLoaded { more: true, .. })
+            ),
+            "the phone still has older messages: {events:?}"
+        );
+        older(&mut adapter, "earlier");
+        let asks = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let asks = sender.history_asks.lock().expect("fake lock").clone();
+                if asks.len() >= 2 {
+                    return asks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the next page is asked");
+        adapter.session.apply(
+            history(
+                Vec::new(),
+                Some(asks[1].request_id.clone()),
+                vec![CHAT.into()],
+            ),
+            1,
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            matches!(
+                events.last(),
+                Some(AdapterEvent::OlderHistoryLoaded { more: false, .. })
+            ),
+            "Start of chat only when the phone has no older page: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_cache_still_delivers_the_phones_older_page() {
+        let (tx, mut rx) = unbounded_channel();
+        let sender = Arc::new(FakeSender::default());
+        let mut adapter = with_sender(sender.clone());
+        let cached: Vec<_> = (0..inbox::MESSAGES_PER_CHAT)
+            .map(|n| {
+                message(
+                    CHAT,
+                    &format!("m{n:03}"),
+                    "cached",
+                    i64::try_from(n).unwrap_or(0),
+                )
+            })
+            .collect();
+        adapter.session.apply(
+            LinkEvent::History {
+                chats: vec![inbox::HistoryChat {
+                    mute: Default::default(),
+                    jid: CHAT.into(),
+                    name: None,
+                    unread: 0,
+                    timestamp: i64::try_from(inbox::MESSAGES_PER_CHAT).unwrap_or(0),
+                    messages: cached,
+                }],
+                push_names: Vec::new(),
+                request_id: None,
+                ended: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    before_message_id: "m000".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("never an adapter error");
+        let asks = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let asks = sender.history_asks.lock().expect("fake lock").clone();
+                if !asks.is_empty() {
+                    return asks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the phone is asked for the page past the cache");
+        adapter.session.apply(
+            LinkEvent::History {
+                chats: vec![inbox::HistoryChat {
+                    mute: Default::default(),
+                    jid: CHAT.into(),
+                    name: None,
+                    unread: 0,
+                    timestamp: 0,
+                    messages: vec![message(CHAT, "older", "from the phone", -1)],
+                }],
+                push_names: Vec::new(),
+                request_id: Some(asks[0].request_id.clone()),
+                ended: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AdapterEvent::MessageReceived { message }
+                    if message.id == "older" && message.arrival == thinwire_protocol::Arrival::History
+            )),
+            "the phone's older row reaches the shell: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(AdapterEvent::OlderHistoryLoaded { more: true, .. })
+            ),
+            "a non-empty phone page is not the start of the chat: {events:?}"
+        );
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    before_message_id: "older".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("never an adapter error");
+        let asks = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let asks = sender.history_asks.lock().expect("fake lock").clone();
+                if asks.len() >= 2 {
+                    return asks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the next page is still asked");
+        assert_eq!(asks[1].oldest_id, "older");
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::OlderHistoryLoaded { more: false, .. })),
+            "the full cache did not end the chat: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_message_does_not_end_a_fetched_page() {
+        let (tx, mut rx) = unbounded_channel();
+        let sender = Arc::new(FakeSender::default());
+        let mut adapter = with_sender(sender.clone());
+        let cached: Vec<_> = (0..inbox::MESSAGES_PER_CHAT)
+            .map(|n| {
+                message(
+                    CHAT,
+                    &format!("m{n:03}"),
+                    "cached",
+                    i64::try_from(n).unwrap_or(0),
+                )
+            })
+            .collect();
+        adapter.session.apply(
+            LinkEvent::History {
+                chats: vec![inbox::HistoryChat {
+                    mute: Default::default(),
+                    jid: CHAT.into(),
+                    name: None,
+                    unread: 0,
+                    timestamp: i64::try_from(inbox::MESSAGES_PER_CHAT).unwrap_or(0),
+                    messages: cached,
+                }],
+                push_names: Vec::new(),
+                request_id: None,
+                ended: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    before_message_id: "m000".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("never an adapter error");
+        let asks = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let asks = sender.history_asks.lock().expect("fake lock").clone();
+                if !asks.is_empty() {
+                    return asks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the phone is asked");
+        adapter.session.apply(
+            LinkEvent::History {
+                chats: vec![inbox::HistoryChat {
+                    mute: Default::default(),
+                    jid: CHAT.into(),
+                    name: None,
+                    unread: 0,
+                    timestamp: 0,
+                    messages: vec![message(CHAT, "older", "from the phone", -1)],
+                }],
+                push_names: Vec::new(),
+                request_id: Some(asks[0].request_id.clone()),
+                ended: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        drain(&mut rx);
+        adapter.session.apply(
+            LinkEvent::Messages(vec![message(CHAT, "live", "just now", 10_000)]),
+            1,
+            &tx,
+        );
+        drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    before_message_id: "older".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("never an adapter error");
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::OlderHistoryLoaded { more: false, .. })),
+            "a live message must not make this the start of the chat: {events:?}"
+        );
+        let asks = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let asks = sender.history_asks.lock().expect("fake lock").clone();
+                if asks.iter().any(|ask| ask.oldest_id == "older") {
+                    return asks;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the oldest fetched row is still a phone request");
+        assert!(asks.iter().any(|ask| ask.oldest_id == "older"));
     }
 
     /// ADR 0010 rule 7: ViewChat marks the viewed chat read, and leaving it
@@ -2818,6 +3277,8 @@ mod tests {
             LinkEvent::History {
                 chats,
                 push_names: Vec::new(),
+                request_id: None,
+                ended: Vec::new(),
             },
             1,
             &tx,

@@ -19,7 +19,7 @@ use thinwire_protocol::{
 pub(super) const CONVERSATION_PREFIX: &str = "whatsapp:";
 
 /// Messages kept per chat. Older ones drop off the front.
-const MESSAGES_PER_CHAT: usize = 200;
+pub(super) const MESSAGES_PER_CHAT: usize = 200;
 
 /// Handled ids kept per chat. Past this, the older half goes, oldest first
 /// (#158 review).
@@ -256,6 +256,32 @@ pub(super) fn reaction_counts(reactions: &[(String, String)]) -> Vec<thinwire_pr
     counts
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HistoryAnchor {
+    pub id: String,
+    pub from_me: bool,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OlderDecision {
+    pub events: Vec<AdapterEvent>,
+    pub more_cached: bool,
+    pub anchor: Option<HistoryAnchor>,
+    pub ended: bool,
+}
+
+impl OlderDecision {
+    pub(super) fn closed() -> Self {
+        Self {
+            events: Vec::new(),
+            more_cached: false,
+            anchor: None,
+            ended: true,
+        }
+    }
+}
+
 /// One conversation from a history-sync chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct HistoryChat {
@@ -342,7 +368,7 @@ struct ChatRecord {
     name: Option<String>,
     unread: u32,
     timestamp: i64,
-    /// Sorted by `(timestamp, id)`. Capped at [`MESSAGES_PER_CHAT`].
+    /// Sorted by `(timestamp, id)`.
     messages: Vec<WaMessage>,
     /// Local `pending:` ids whose send failed. The user can resend them.
     failed: HashSet<String>,
@@ -370,6 +396,8 @@ struct ChatRecord {
     /// Newest activity time from history sync. A dropped send falls back to
     /// it (Codex r4131089177).
     history_at: i64,
+    history_ended: bool,
+    keeps_older: bool,
     mute: Mute,
     /// A live `MuteUpdate` of this connection set `mute`: an older history
     /// chunk does not change it again. A reconnect clears it (#168 item 12).
@@ -486,7 +514,7 @@ pub(super) struct SavedMessage {
     pub reactions: Vec<(String, String)>,
 }
 
-/// One saved chat: the row and its newest messages.
+/// One saved chat: the row and its messages.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct SavedChat {
     pub name: Option<String>,
@@ -729,6 +757,23 @@ impl Inbox {
         self.upsert_event(jid)
     }
 
+    pub(super) fn unnamed_groups(&self) -> Vec<String> {
+        let mut jids: Vec<String> = self
+            .chats
+            .iter()
+            .filter(|(jid, record)| {
+                is_group(jid)
+                    && record
+                        .name
+                        .as_deref()
+                        .is_none_or(|name| name.trim().is_empty())
+            })
+            .map(|(jid, _)| jid.clone())
+            .collect();
+        jids.sort();
+        jids
+    }
+
     /// The audio of the message with the handle `file_id`, while the
     /// message is in the cache.
     pub(super) fn voice_media(&self, file_id: i32) -> Option<MediaRef> {
@@ -866,7 +911,7 @@ impl Inbox {
                 if record.counts_after_read(&message) {
                     added = added.saturating_add(1);
                 }
-                insert_message(&mut record.messages, message);
+                insert_message(&mut record.messages, record.keeps_older, message);
             }
             // The user reads the open chat, so a later chunk keeps it read.
             // A chat read here changes its count only by new messages (#98):
@@ -969,6 +1014,25 @@ impl Inbox {
         }
     }
 
+    pub(super) fn apply_fetched(&mut self, jid: &str, messages: Vec<WaMessage>) {
+        if messages.is_empty() || !is_inbox_chat(jid) {
+            return;
+        }
+        for message in &messages {
+            remember_name(&mut self.names, message);
+        }
+        let record = self.chats.entry(jid.to_string()).or_default();
+        record.keeps_older = true;
+        for message in messages {
+            if message.id.is_empty() {
+                continue;
+            }
+            record.optimistic.remove(&message.id);
+            record.timestamp = record.timestamp.max(message.timestamp);
+            insert_message(&mut record.messages, record.keeps_older, message);
+        }
+    }
+
     pub(super) fn apply_messages(&mut self, messages: Vec<WaMessage>) -> Vec<AdapterEvent> {
         let mut events = Vec::new();
         for message in messages {
@@ -1008,7 +1072,7 @@ impl Inbox {
                 record.unread = record.unread.saturating_add(1);
             }
             record.timestamp = record.timestamp.max(message.timestamp);
-            insert_message(&mut record.messages, message.clone());
+            insert_message(&mut record.messages, record.keeps_older, message.clone());
             if is_open {
                 record.mark_read();
             }
@@ -1072,28 +1136,43 @@ impl Inbox {
         Some(events)
     }
 
-    /// Up to `limit` messages older than `before`, oldest first, and whether
-    /// still older rows exist. An unknown chat or id gives no rows and `false`.
-    pub(super) fn older_page(
-        &self,
-        jid: &str,
-        before: &str,
-        limit: usize,
-    ) -> (Vec<AdapterEvent>, bool) {
+    pub(super) fn older_decision(&self, jid: &str, before: &str, limit: usize) -> OlderDecision {
         let Some(record) = self.chats.get(jid) else {
-            return (Vec::new(), false);
+            return OlderDecision::closed();
         };
         let Some(end) = record.messages.iter().position(|row| row.id == before) else {
-            return (Vec::new(), false);
+            return OlderDecision::closed();
         };
+        let anchor = &record.messages[end];
         let start = end.saturating_sub(limit);
-        let page = record.messages[start..end]
+        let events = record.messages[start..end]
             .iter()
             .map(|message| AdapterEvent::MessageReceived {
                 message: self.chat_message(message, Arrival::History),
             })
             .collect();
-        (page, start > 0)
+        OlderDecision {
+            events,
+            more_cached: start > 0,
+            anchor: Some(HistoryAnchor {
+                id: anchor.id.clone(),
+                from_me: anchor.from_me,
+                timestamp: anchor.timestamp,
+            }),
+            ended: record.history_ended,
+        }
+    }
+
+    pub(super) fn history_row(&self, message: &WaMessage) -> AdapterEvent {
+        AdapterEvent::MessageReceived {
+            message: self.chat_message(message, Arrival::History),
+        }
+    }
+
+    pub(super) fn mark_history_ended(&mut self, jid: &str) {
+        if let Some(record) = self.chats.get_mut(jid) {
+            record.history_ended = true;
+        }
     }
 
     /// The chat the user looks at now (`None`: no WhatsApp chat). Messages
@@ -1153,7 +1232,7 @@ impl Inbox {
         };
         let record = self.chats.entry(jid.to_string()).or_default();
         record.timestamp = record.timestamp.max(now);
-        insert_message(&mut record.messages, message.clone());
+        insert_message(&mut record.messages, record.keeps_older, message.clone());
         (
             pending,
             AdapterEvent::MessageReceived {
@@ -1509,7 +1588,7 @@ fn remember_name(names: &mut HashMap<String, String>, message: &WaMessage) {
     }
 }
 
-fn insert_message(messages: &mut Vec<WaMessage>, mut message: WaMessage) {
+fn insert_message(messages: &mut Vec<WaMessage>, keeps_older: bool, mut message: WaMessage) {
     if let Some(existing) = messages.iter_mut().find(|row| row.id == message.id) {
         // A refresh with no reactions keeps the reactions the cache counted.
         if message.reactions.is_empty() {
@@ -1520,8 +1599,9 @@ fn insert_message(messages: &mut Vec<WaMessage>, mut message: WaMessage) {
         messages.push(message);
     }
     messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
-    // Drop the oldest rows first, but never a local `pending:` row. A pending
-    // or failed send must stay until its result or a resend resolves it.
+    if keeps_older {
+        return;
+    }
     let mut excess = messages.len().saturating_sub(MESSAGES_PER_CHAT);
     if excess > 0 {
         messages.retain(|row| {
@@ -2853,6 +2933,261 @@ pub(super) mod tests {
         assert!(
             !record.messages.iter().any(|row| row.id == "m0000"),
             "the oldest history row is evicted"
+        );
+    }
+
+    #[test]
+    fn a_fetched_page_and_a_live_message_leave_no_gap() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let window: Vec<WaMessage> = (0..MESSAGES_PER_CHAT)
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("w{n:04}"),
+                    "cached",
+                    1_000 + i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        inbox.apply_history(
+            vec![HistoryChat {
+                mute: Default::default(),
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 1_000,
+                messages: window.clone(),
+            }],
+            Vec::new(),
+        );
+        let fetched: Vec<WaMessage> = (0..OPEN_CHAT_MESSAGES)
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("f{n:04}"),
+                    "page",
+                    i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        inbox.apply_fetched(chat, fetched.clone());
+        let live_at = 1_000 + i64::try_from(MESSAGES_PER_CHAT).expect("small");
+        inbox.apply_messages(vec![message(chat, "live", "now", live_at)]);
+
+        let mut expected: Vec<String> = fetched.iter().map(|row| row.id.clone()).collect();
+        expected.extend(window.iter().map(|row| row.id.clone()));
+        expected.push("live".to_string());
+        assert_same_thread(&scrolled_thread(&inbox, chat), &expected);
+    }
+
+    fn scrolled_thread(inbox: &Inbox, chat: &str) -> Vec<String> {
+        let newest = inbox.chats[chat]
+            .messages
+            .last()
+            .expect("the chat has a row")
+            .id
+            .clone();
+        let mut before = newest.clone();
+        let mut pages = Vec::new();
+        let mut reached = false;
+        for _ in 0..32 {
+            let page = inbox.older_decision(chat, &before, OPEN_CHAT_MESSAGES);
+            if page.events.is_empty() {
+                assert!(
+                    !page.ended && page.anchor.as_ref().is_some_and(|row| row.id == before),
+                    "scrolling to {before} ends the chat"
+                );
+                reached = true;
+                break;
+            }
+            let ids: Vec<String> = page
+                .events
+                .iter()
+                .map(|event| match event {
+                    AdapterEvent::MessageReceived { message } => message.id.clone(),
+                    other => panic!("older page is not a message: {other:?}"),
+                })
+                .collect();
+            before = ids[0].clone();
+            let more = page.more_cached;
+            pages.push(ids);
+            if !more {
+                let tail = inbox.older_decision(chat, &before, OPEN_CHAT_MESSAGES);
+                assert!(
+                    tail.events.is_empty() && !tail.ended && tail.anchor.is_some(),
+                    "the oldest cached row must ask the phone"
+                );
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "the scroll did not reach the oldest row");
+        let mut ids: Vec<String> = pages.into_iter().rev().flatten().collect();
+        ids.push(newest);
+        ids
+    }
+
+    fn assert_same_thread(scrolled: &[String], expected: &[String]) {
+        let missing: Vec<&String> = expected
+            .iter()
+            .filter(|id| !scrolled.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty() && scrolled == expected,
+            "scrolling skips {missing:?}; got {} ids, want {}",
+            scrolled.len(),
+            expected.len()
+        );
+    }
+
+    #[test]
+    fn ten_live_messages_after_a_fetch_keep_the_thread_whole() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let window_ids: Vec<String> = (0..MESSAGES_PER_CHAT).map(|n| format!("w{n:04}")).collect();
+        let window: Vec<WaMessage> = window_ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| message(chat, id, "cached", 1_000 + i64::try_from(n).expect("small")))
+            .collect();
+        inbox.apply_history(
+            vec![HistoryChat {
+                mute: Default::default(),
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 1_000,
+                messages: window,
+            }],
+            Vec::new(),
+        );
+        let fetched_ids: Vec<String> = (0..OPEN_CHAT_MESSAGES)
+            .map(|n| format!("f{n:04}"))
+            .collect();
+        let fetched: Vec<WaMessage> = fetched_ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| message(chat, id, "page", i64::try_from(n).expect("small")))
+            .collect();
+        inbox.apply_fetched(chat, fetched);
+        let live_at = 1_000 + i64::try_from(MESSAGES_PER_CHAT).expect("small");
+        let live_ids: Vec<String> = (0..10).map(|n| format!("live{n:02}")).collect();
+        inbox.apply_messages(
+            live_ids
+                .iter()
+                .enumerate()
+                .map(|(n, id)| message(chat, id, "now", live_at + i64::try_from(n).expect("small")))
+                .collect(),
+        );
+
+        let mut expected = fetched_ids;
+        expected.extend(window_ids);
+        expected.extend(live_ids);
+        assert_same_thread(&scrolled_thread(&inbox, chat), &expected);
+    }
+
+    #[test]
+    fn a_pending_send_that_sorts_first_stays_against_the_fetched_page() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let kept = MESSAGES_PER_CHAT - 1;
+        let window_ids: Vec<String> = (0..kept).map(|n| format!("w{n:04}")).collect();
+        let window: Vec<WaMessage> = window_ids
+            .iter()
+            .enumerate()
+            .map(|(n, id)| message(chat, id, "cached", 1_000 + i64::try_from(n).expect("small")))
+            .collect();
+        inbox.apply_history(
+            vec![HistoryChat {
+                mute: Default::default(),
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: 1_000,
+                messages: window,
+            }],
+            Vec::new(),
+        );
+        let (pending, _, _) = inbox.begin_send(chat, "local", 999);
+        let fetched_ids: Vec<String> = (0..OPEN_CHAT_MESSAGES)
+            .map(|n| format!("f{n:04}"))
+            .collect();
+        inbox.apply_fetched(
+            chat,
+            fetched_ids
+                .iter()
+                .enumerate()
+                .map(|(n, id)| message(chat, id, "page", i64::try_from(n).expect("small")))
+                .collect(),
+        );
+        let live_at = 1_000 + i64::try_from(kept).expect("small");
+        let live_ids: Vec<String> = (0..10).map(|n| format!("live{n:02}")).collect();
+        inbox.apply_messages(
+            live_ids
+                .iter()
+                .enumerate()
+                .map(|(n, id)| message(chat, id, "now", live_at + i64::try_from(n).expect("small")))
+                .collect(),
+        );
+
+        let mut expected = fetched_ids;
+        expected.push(pending);
+        expected.extend(window_ids);
+        expected.extend(live_ids);
+        assert_same_thread(&scrolled_thread(&inbox, chat), &expected);
+    }
+
+    /// A history chunk that arrives newest-first is not a page the user
+    /// asked for. The cache keeps at most [`MESSAGES_PER_CHAT`] rows.
+    #[test]
+    fn descending_history_stays_within_the_message_cap() {
+        let mut inbox = Inbox::default();
+        let chat = "111@s.whatsapp.net";
+        let total = MESSAGES_PER_CHAT + 100;
+        let messages: Vec<WaMessage> = (0..total)
+            .rev()
+            .map(|n| {
+                message(
+                    chat,
+                    &format!("h{n:04}"),
+                    "history",
+                    i64::try_from(n).expect("small"),
+                )
+            })
+            .collect();
+        inbox.apply_history(
+            vec![HistoryChat {
+                mute: Default::default(),
+                jid: chat.into(),
+                name: None,
+                unread: 0,
+                timestamp: i64::try_from(total).expect("small"),
+                messages,
+            }],
+            Vec::new(),
+        );
+        let record = inbox.chats.get(chat).expect("chat");
+        assert!(
+            record.messages.len() <= MESSAGES_PER_CHAT,
+            "got {} rows",
+            record.messages.len()
+        );
+        let newest = total - 1;
+        assert!(
+            record
+                .messages
+                .iter()
+                .any(|row| row.id == format!("h{newest:04}")),
+            "the newest row stays"
+        );
+        let oldest_kept = i64::try_from(total - MESSAGES_PER_CHAT).expect("small");
+        assert!(
+            record
+                .messages
+                .iter()
+                .all(|row| row.timestamp >= oldest_kept),
+            "the cap keeps the newest rows"
         );
     }
 
