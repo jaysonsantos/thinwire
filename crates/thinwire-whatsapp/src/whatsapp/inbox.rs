@@ -397,6 +397,9 @@ struct ChatRecord {
     /// it (Codex r4131089177).
     history_at: i64,
     history_ended: bool,
+    /// Oldest key of the capped window. Rows older than it were fetched
+    /// on demand and stay for this process. Not saved.
+    page_floor: Option<(i64, String)>,
     mute: Mute,
     /// A live `MuteUpdate` of this connection set `mute`: an older history
     /// chunk does not change it again. A reconnect clears it (#168 item 12).
@@ -910,7 +913,7 @@ impl Inbox {
                 if record.counts_after_read(&message) {
                     added = added.saturating_add(1);
                 }
-                insert_message(&mut record.messages, message);
+                insert_message(&mut record.messages, &mut record.page_floor, message);
             }
             // The user reads the open chat, so a later chunk keeps it read.
             // A chat read here changes its count only by new messages (#98):
@@ -1052,7 +1055,11 @@ impl Inbox {
                 record.unread = record.unread.saturating_add(1);
             }
             record.timestamp = record.timestamp.max(message.timestamp);
-            insert_message(&mut record.messages, message.clone());
+            insert_message(
+                &mut record.messages,
+                &mut record.page_floor,
+                message.clone(),
+            );
             if is_open {
                 record.mark_read();
             }
@@ -1212,7 +1219,11 @@ impl Inbox {
         };
         let record = self.chats.entry(jid.to_string()).or_default();
         record.timestamp = record.timestamp.max(now);
-        insert_message(&mut record.messages, message.clone());
+        insert_message(
+            &mut record.messages,
+            &mut record.page_floor,
+            message.clone(),
+        );
         (
             pending,
             AdapterEvent::MessageReceived {
@@ -1567,10 +1578,17 @@ fn remember_name(names: &mut HashMap<String, String>, message: &WaMessage) {
     }
 }
 
-fn insert_message(messages: &mut Vec<WaMessage>, mut message: WaMessage) {
-    // A row older than the window already here is a page the user asked
-    // for. The cap still drops the oldest rows of the old window.
-    let floor = messages.first().map(|row| (row.timestamp, row.id.clone()));
+fn insert_message(
+    messages: &mut Vec<WaMessage>,
+    page_floor: &mut Option<(i64, String)>,
+    mut message: WaMessage,
+) {
+    // Freeze the capped window the first time an older page arrives.
+    // A later live row must not move that mark, or the page just fetched
+    // is the new oldest and the cap deletes it.
+    let previous = messages.first().map(|row| (row.timestamp, row.id.clone()));
+    let incoming = (message.timestamp, message.id.clone());
+    let replacing = messages.iter().any(|row| row.id == message.id);
     if let Some(existing) = messages.iter_mut().find(|row| row.id == message.id) {
         // A refresh with no reactions keeps the reactions the cache counted.
         if message.reactions.is_empty() {
@@ -1581,8 +1599,17 @@ fn insert_message(messages: &mut Vec<WaMessage>, mut message: WaMessage) {
         messages.push(message);
     }
     messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+    if !replacing
+        && page_floor.is_none()
+        && let Some(oldest) = previous.clone()
+        && (incoming.0, incoming.1.as_str()) < (oldest.0, oldest.1.as_str())
+    {
+        *page_floor = Some(oldest);
+    }
+    let floor = page_floor.clone().or(previous);
     // Drop the oldest rows first, but never a local `pending:` row. A pending
     // or failed send must stay until its result or a resend resolves it.
+    // Rows older than `page_floor` are a fetched page and stay.
     let mut excess = messages.len().saturating_sub(MESSAGES_PER_CHAT);
     if excess > 0 {
         messages.retain(|row| {
