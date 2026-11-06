@@ -612,18 +612,25 @@ pub(super) fn forget_chat_topics(
     topic_lists.forget(chat_id);
 }
 
-/// The topic lists of the main-list forums: the lists that loaded, and the
-/// time when a failed list can load again.
+/// The topic lists of the main-list forums: the lists that loaded, the time
+/// when a failed list can load again, and the read mark of each topic that
+/// a list load or `getForumTopic` gave.
 ///
 /// The worker asks for the due lists after each update. A failed load waits
 /// [`TOPIC_RETRY_FIRST`], and each failure after it doubles the wait up to
 /// [`TOPIC_RETRY_MAX`]. With no wait, a forum that always fails costs one
 /// server round trip for each update, and all later updates wait for it: a
 /// sent message stays on "Sending…" and an edit does not show.
+///
+/// TDLib sends `updateForumTopic` for each topic of each forum at start. A
+/// topic with the same read mark needs no new fetch: its unread count is
+/// still the one of the last fetch.
 #[derive(Debug, Default)]
 pub(super) struct TopicLists {
     loaded: HashSet<i64>,
     retry: HashMap<i64, TopicRetry>,
+    /// `last_read_inbox_message_id` of each fetched topic.
+    reads: HashMap<(i64, i32), i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -639,6 +646,7 @@ impl TopicLists {
         let keep: HashSet<i64> = listed.iter().copied().collect();
         self.loaded.retain(|id| keep.contains(id));
         self.retry.retain(|id, _| keep.contains(id));
+        self.reads.retain(|(id, _), _| keep.contains(id));
         listed
             .iter()
             .copied()
@@ -672,11 +680,28 @@ impl TopicLists {
     pub(super) fn forget(&mut self, chat_id: i64) {
         self.loaded.remove(&chat_id);
         self.retry.remove(&chat_id);
+        self.reads.retain(|(id, _), _| *id != chat_id);
     }
 
-    #[cfg(test)]
-    fn is_loaded(&self, chat_id: i64) -> bool {
+    /// The list of `chat_id` loaded, so a topic that is not known is new.
+    pub(super) fn is_loaded(&self, chat_id: i64) -> bool {
         self.loaded.contains(&chat_id)
+    }
+
+    /// A fetch gave this read mark for the topic.
+    pub(super) fn note_read(&mut self, chat_id: i64, forum_topic_id: i32, last_read: i64) {
+        self.reads.insert((chat_id, forum_topic_id), last_read);
+    }
+
+    /// `true` when an `updateForumTopic` with this read mark needs
+    /// `getForumTopic`: the read mark moved, so the unread count changed, or
+    /// the topic is new in a forum whose list loaded. A topic of a forum
+    /// with no list waits for the list load.
+    pub(super) fn needs_fetch(&self, chat_id: i64, forum_topic_id: i32, last_read: i64) -> bool {
+        match self.reads.get(&(chat_id, forum_topic_id)) {
+            Some(known) => *known != last_read,
+            None => self.is_loaded(chat_id),
+        }
     }
 }
 
@@ -1317,6 +1342,31 @@ mod tests {
             lists.due(&[3, 5], start),
             vec![3],
             "chat 3 left the list in the last pass, so its list loads again"
+        );
+    }
+
+    /// TDLib sends `updateForumTopic` for each topic at start. Only a moved
+    /// read mark or a new topic of a loaded forum asks the server again.
+    #[test]
+    fn a_topic_update_fetches_only_a_changed_or_new_topic() {
+        let mut lists = TopicLists::default();
+        assert!(
+            !lists.needs_fetch(7, 1, 50),
+            "a forum with no list waits for the list load"
+        );
+        lists.loaded(7);
+        lists.note_read(7, 1, 50);
+        assert!(!lists.needs_fetch(7, 1, 50), "same read mark: no fetch");
+        assert!(lists.needs_fetch(7, 1, 60), "the read mark moved");
+        assert!(lists.needs_fetch(7, 2, 0), "a new topic of a loaded forum");
+        lists.forget(7);
+        assert!(!lists.needs_fetch(7, 1, 50), "the chat left the list");
+        lists.loaded(8);
+        lists.note_read(8, 3, 9);
+        assert!(lists.due(&[9], Instant::now()).contains(&9));
+        assert!(
+            !lists.needs_fetch(8, 3, 10),
+            "a chat that is not listed is forgotten with its read marks"
         );
     }
 

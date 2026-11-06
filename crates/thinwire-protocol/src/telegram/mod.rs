@@ -1090,6 +1090,10 @@ mod tests {
             "the row changes from the reply, not only from the update queue"
         );
         assert!(updates.contains("emit_content("));
+        assert!(
+            updates.contains("topic_lists.needs_fetch("),
+            "updateForumTopic asks the server only for a changed or new topic"
+        );
         let due = fn_body(src, "async fn load_due_forum_topics");
         assert!(
             due.contains("topic_lists.due(") && due.contains("topic_lists.failed("),
