@@ -737,6 +737,12 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         file_id: i32,
     },
+    /// Download one document. The file stays on disk. The adapter reports
+    /// a path and never reads the bytes into this process.
+    DownloadDocument {
+        protocol: ProtocolId,
+        file_id: i32,
+    },
 }
 
 impl AdapterCommand {
@@ -764,6 +770,7 @@ impl AdapterCommand {
             | Self::DownloadFile { protocol, .. }
             | Self::DownloadVoice { protocol, .. }
             | Self::DownloadVideo { protocol, .. }
+            | Self::DownloadDocument { protocol, .. }
             | Self::DeleteMessage { protocol, .. }
             | Self::React { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
@@ -830,6 +837,7 @@ impl AdapterCommand {
             | Self::DownloadFile { protocol, .. }
             | Self::DownloadVoice { protocol, .. }
             | Self::DownloadVideo { protocol, .. }
+            | Self::DownloadDocument { protocol, .. }
             | Self::DeleteMessage { protocol, .. }
             | Self::React { protocol, .. } => {
                 *protocol = account;
@@ -959,8 +967,8 @@ pub enum AdapterEvent {
         message_id: String,
         body: String,
     },
-    /// Replace the caption, the links, the photo, and the voice note.
-    /// A text edit sets `photo` and `audio` to `None`.
+    /// Replace the caption, the links, and the media on a message.
+    /// A text edit sets `photo`, `audio`, `video`, and `file` to `None`.
     MessageMedia {
         protocol: ProtocolId,
         conversation_id: String,
@@ -970,6 +978,7 @@ pub enum AdapterEvent {
         photo: Option<crate::media::MessagePhoto>,
         audio: Option<crate::media::MessageAudio>,
         video: Option<crate::media::MessageVideo>,
+        file: Option<crate::media::MessageFile>,
     },
     /// Links found after the message was shown. Does not change the body.
     MessageLinks {
@@ -1021,6 +1030,15 @@ pub enum AdapterEvent {
         path: crate::media::AudioPath,
     },
     VideoFailed {
+        protocol: ProtocolId,
+        file_id: i32,
+    },
+    FileReady {
+        protocol: ProtocolId,
+        file_id: i32,
+        path: crate::media::AudioPath,
+    },
+    FileFailed {
         protocol: ProtocolId,
         file_id: i32,
     },
@@ -1196,6 +1214,8 @@ impl AdapterEvent {
             | Self::VoiceFailed { protocol, .. }
             | Self::VideoReady { protocol, .. }
             | Self::VideoFailed { protocol, .. }
+            | Self::FileReady { protocol, .. }
+            | Self::FileFailed { protocol, .. }
             | Self::ChatAvatar { protocol, .. }
             | Self::MessageReactions { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
@@ -1274,6 +1294,8 @@ impl AdapterEvent {
             | Self::VoiceFailed { protocol, .. }
             | Self::VideoReady { protocol, .. }
             | Self::VideoFailed { protocol, .. }
+            | Self::FileReady { protocol, .. }
+            | Self::FileFailed { protocol, .. }
             | Self::ChatAvatar { protocol, .. }
             | Self::MessageReactions { protocol, .. }
             | Self::MessagesRemoved { protocol, .. }
@@ -1539,6 +1561,8 @@ pub struct ChatMessage {
     pub audio: Option<crate::media::MessageAudio>,
     /// A video clip. `photo` is its first picture, when the protocol sends one.
     pub video: Option<crate::media::MessageVideo>,
+    /// A document. [`Self::body`] is the caption, and it can be empty.
+    pub file: Option<crate::media::MessageFile>,
     /// The reactions on the message, as the protocol counts them.
     pub reactions: Vec<Reaction>,
     /// The id of the message that this one replies to. The shell finds its
@@ -1719,6 +1743,7 @@ pub(crate) fn emit_message_media(
     photo: Option<crate::media::MessagePhoto>,
     audio: Option<crate::media::MessageAudio>,
     video: Option<crate::media::MessageVideo>,
+    file: Option<crate::media::MessageFile>,
 ) {
     let _ = events.send(AdapterEvent::MessageMedia {
         protocol,
@@ -1729,6 +1754,7 @@ pub(crate) fn emit_message_media(
         photo,
         audio,
         video,
+        file,
     });
 }
 
@@ -2103,6 +2129,7 @@ mod account_tests {
             photo: None,
             audio: None,
             video: None,
+            file: None,
             reactions: Vec::new(),
             reply_to: None,
         };

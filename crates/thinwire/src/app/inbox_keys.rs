@@ -926,6 +926,7 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         photo: None,
         audio: None,
         video: None,
+        file: None,
         reactions: Vec::new(),
         reply_to: None,
     }

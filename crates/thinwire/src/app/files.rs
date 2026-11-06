@@ -1,0 +1,563 @@
+//! A document on a message. The preview is a thumbnail the protocol already
+//! sent. The file downloads only when the user asks, and it opens with the
+//! program the computer uses for that file.
+
+use std::path::Path;
+use std::process::Command;
+
+use eframe::egui;
+use thinwire_core::Intent;
+use thinwire_protocol::{AudioPath, MessageFile, ProtocolId};
+
+use super::theme;
+
+pub(crate) fn show(
+    ui: &mut egui::Ui,
+    protocol: ProtocolId,
+    conversation_id: &str,
+    message_id: &str,
+    file: &MessageFile,
+    out: &mut Vec<Intent>,
+) -> bool {
+    let drew = file.preview().is_some_and(|preview| {
+        super::photos::show(
+            ui,
+            protocol,
+            conversation_id,
+            message_id,
+            preview,
+            false,
+            out,
+        );
+        true
+    });
+    let palette = theme::palette(ui);
+    let waiting = is_waiting(ui.ctx(), message_id, file.file_id());
+    if file.file().is_some() || file.failed() {
+        set_waiting(ui.ctx(), message_id, file.file_id(), false);
+    }
+    let waiting = waiting && file.file().is_none() && !file.failed();
+    ui.vertical(|ui| {
+        ui.set_min_width(160.0);
+        ui.label(egui::RichText::new(file.name()).color(palette.text));
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(file.kind_label())
+                    .small()
+                    .color(palette.text2),
+            );
+            if let Some(size) = file.size_label() {
+                ui.label(egui::RichText::new(size).small().color(palette.text2));
+            }
+        });
+        match control(file, waiting) {
+            Control::Download | Control::Retry => {
+                let label = if file.failed() { "Retry" } else { "Download" };
+                if ui
+                    .add(egui::Button::new(egui::RichText::new(label).small()).small())
+                    .clicked()
+                {
+                    set_waiting(ui.ctx(), message_id, file.file_id(), true);
+                    set_open_failed(ui.ctx(), message_id, false);
+                    out.push(Intent::DownloadDocument {
+                        protocol,
+                        conversation_id: conversation_id.to_owned(),
+                        message_id: message_id.to_owned(),
+                        file_id: file.file_id(),
+                    });
+                }
+            }
+            Control::Downloading => {
+                ui.label(
+                    egui::RichText::new("Downloading…")
+                        .small()
+                        .color(palette.text2),
+                );
+            }
+            Control::Open => {
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("Open").small()).small())
+                    .clicked()
+                    && let Some(path) = file.file()
+                {
+                    set_open_failed(ui.ctx(), message_id, !launch(path));
+                }
+                if open_failed(ui.ctx(), message_id) {
+                    ui.label(
+                        egui::RichText::new("Couldn't open this file.")
+                            .small()
+                            .color(palette.error),
+                    );
+                }
+            }
+            Control::Plain => {}
+        }
+    });
+    drew
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    Download,
+    Downloading,
+    Open,
+    Retry,
+    /// The message names a file and has no download id.
+    Plain,
+}
+
+fn control(file: &MessageFile, waiting: bool) -> Control {
+    if file.file().is_some() {
+        Control::Open
+    } else if file.file_id() <= 0 {
+        Control::Plain
+    } else if file.failed() {
+        Control::Retry
+    } else if waiting {
+        Control::Downloading
+    } else {
+        Control::Download
+    }
+}
+
+fn ask_id(message_id: &str, file_id: i32) -> egui::Id {
+    egui::Id::unique(("thinwire-file-download", message_id, file_id))
+}
+
+fn is_waiting(ctx: &egui::Context, message_id: &str, file_id: i32) -> bool {
+    ctx.data(|data| data.get_temp(ask_id(message_id, file_id)).unwrap_or(false))
+}
+
+fn set_waiting(ctx: &egui::Context, message_id: &str, file_id: i32, waiting: bool) {
+    ctx.data_mut(|data| data.insert_temp(ask_id(message_id, file_id), waiting));
+}
+
+fn open_failed_id(message_id: &str) -> egui::Id {
+    egui::Id::unique(("thinwire-file-open", message_id))
+}
+
+fn open_failed(ctx: &egui::Context, message_id: &str) -> bool {
+    ctx.data(|data| data.get_temp(open_failed_id(message_id)).unwrap_or(false))
+}
+
+fn set_open_failed(ctx: &egui::Context, message_id: &str, failed: bool) {
+    ctx.data_mut(|data| data.insert_temp(open_failed_id(message_id), failed));
+}
+
+fn launch(path: &AudioPath) -> bool {
+    let Some(mut command) = open_command(path.as_path()) else {
+        return false;
+    };
+    let Ok(child) = command.spawn() else {
+        return false;
+    };
+    // The file is already opening. A failed waiter must not say it did not.
+    let _ = watch_open(child);
+    true
+}
+
+/// Reap the opener. Dropping the `Child` would leave a zombie.
+fn watch_open(
+    mut child: std::process::Child,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>> {
+    std::thread::Builder::new()
+        .name("thinwire-open".into())
+        .spawn(move || child.wait())
+}
+
+#[must_use]
+pub(crate) fn open_command(path: &Path) -> Option<Command> {
+    if !path.is_absolute() || !can_open(path) {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        return windows_open_command(path);
+    }
+    #[cfg(not(windows))]
+    {
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut command = Command::new(program);
+        command.arg(path);
+        Some(command)
+    }
+}
+
+/// `cmd /C start` splits on `&`. `rundll32` takes the path as one argument,
+/// the same way a mailto address is opened.
+#[cfg(any(windows, test))]
+fn windows_open_command(path: &Path) -> Option<Command> {
+    if !can_open(path) {
+        return None;
+    }
+    let mut command = Command::new(super::links::rundll32_program());
+    command.arg("url.dll,FileProtocolHandler");
+    // `Command` quotes an argument that contains a space, and `rundll32`
+    // keeps those quotes in the path. `raw_arg` passes the path as written.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.raw_arg(path);
+        command.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    {
+        command.arg(path);
+    }
+    Some(command)
+}
+
+/// Documents, images, audio, video, and archives. Anything else can start a program.
+fn can_open(path: &Path) -> bool {
+    open_extension(path).is_some_and(|extension| {
+        matches!(
+            extension.as_str(),
+            "pdf"
+                | "txt"
+                | "csv"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "heic"
+                | "heif"
+                | "bmp"
+                | "zip"
+                | "docx"
+                | "xlsx"
+                | "pptx"
+                | "mp3"
+                | "ogg"
+                | "opus"
+                | "m4a"
+                | "aac"
+                | "wav"
+                | "mp4"
+                | "m4v"
+                | "mov"
+                | "webm"
+                | "mkv"
+                | "avi"
+                | "3gp"
+        )
+    })
+}
+
+/// The extension after Windows drops trailing dots and spaces from the name.
+fn open_extension(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let name = name.trim_end_matches(['.', ' ']);
+    let (_, extension) = name.rsplit_once('.')?;
+    if extension.is_empty() {
+        return None;
+    }
+    Some(extension.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use thinwire_protocol::{ImageBytes, MessagePhoto, PhotoSize};
+
+    use super::*;
+
+    struct Chip {
+        file: MessageFile,
+        intents: Vec<Intent>,
+    }
+
+    fn draw(ui: &mut egui::Ui, chip: &mut Chip) {
+        super::super::theme::install(ui.ctx());
+        show(
+            ui,
+            ProtocolId::Telegram,
+            "telegram:1",
+            "telegram:1:3",
+            &chip.file,
+            &mut chip.intents,
+        );
+    }
+
+    fn harness(file: MessageFile) -> Harness<'static, Chip> {
+        Harness::builder()
+            .with_size(egui::vec2(420.0, 320.0))
+            .build_ui_state(
+                draw,
+                Chip {
+                    file,
+                    intents: Vec::new(),
+                },
+            )
+    }
+
+    fn pdf() -> MessageFile {
+        MessageFile::new(
+            "notes.pdf",
+            "application/pdf",
+            2048,
+            11,
+            None,
+            Some(MessagePhoto {
+                width: 40,
+                height: 52,
+                mini: Some(ImageBytes::new(vec![0xff, 0xd8, 0xff])),
+                sizes: vec![PhotoSize {
+                    width: 40,
+                    height: 52,
+                    file_id: Some(32),
+                    path: None,
+                    bytes: None,
+                }],
+                has_spoiler: false,
+                is_secret: false,
+                failed: false,
+            }),
+        )
+    }
+
+    #[test]
+    fn a_pdf_preview_is_shown_and_a_plain_file_still_downloads() {
+        let mut pdf = harness(pdf());
+        pdf.run_steps(2);
+        pdf.get_by_label("notes.pdf");
+        pdf.get_by_label("PDF");
+        assert!(
+            pdf.state()
+                .intents
+                .iter()
+                .any(|intent| matches!(intent, Intent::LoadPhoto { file_id: 32, .. })),
+            "the pdf preview was not requested: {:?}",
+            pdf.state().intents
+        );
+        pdf.get_by_role_and_label(egui::accesskit::Role::Button, "Download")
+            .click();
+        pdf.run_steps(1);
+        assert!(
+            pdf.state()
+                .intents
+                .iter()
+                .any(|intent| matches!(intent, Intent::DownloadDocument { file_id: 11, .. })),
+            "the pdf was not downloaded: {:?}",
+            pdf.state().intents
+        );
+
+        let plain = MessageFile::new("notes.txt", "text/plain", 12, 12, None, None);
+        let mut plain = harness(plain);
+        plain.run_steps(2);
+        plain.get_by_label("notes.txt");
+        assert!(
+            plain
+                .state()
+                .intents
+                .iter()
+                .all(|intent| !matches!(intent, Intent::LoadPhoto { .. })),
+            "a file with no preview asked for a photo: {:?}",
+            plain.state().intents
+        );
+        plain
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Download")
+            .click();
+        plain.run_steps(1);
+        assert!(
+            plain
+                .state()
+                .intents
+                .iter()
+                .any(|intent| matches!(intent, Intent::DownloadDocument { file_id: 12, .. })),
+            "the plain file was not downloaded: {:?}",
+            plain.state().intents
+        );
+    }
+
+    #[test]
+    fn a_saved_file_opens_and_a_new_file_downloads() {
+        let fresh = MessageFile::new("notes.pdf", "application/pdf", 2048, 11, None, None);
+        assert_eq!(control(&fresh, false), Control::Download);
+        assert_eq!(control(&fresh, true), Control::Downloading);
+        let mut failed = fresh.clone();
+        failed.mark_failed();
+        assert_eq!(control(&failed, true), Control::Retry);
+        let saved = AudioPath::new("/tmp/hidden-document.bin").expect("path");
+        let ready = MessageFile::new("notes.pdf", "application/pdf", 2048, 11, Some(saved), None);
+        assert_eq!(control(&ready, false), Control::Open);
+        let nameless = MessageFile::new("notes.txt", "text/plain", 0, 0, None, None);
+        assert_eq!(control(&nameless, false), Control::Plain);
+    }
+
+    #[test]
+    fn open_command_takes_an_absolute_path() {
+        assert!(open_command(Path::new("notes.pdf")).is_none());
+        assert!(open_command(Path::new("")).is_none());
+        let path = if cfg!(windows) {
+            Path::new(r"C:\tmp\notes.pdf")
+        } else {
+            Path::new("/tmp/notes.pdf")
+        };
+        let command = open_command(path).expect("command");
+        let program = command.get_program().to_string_lossy();
+        if cfg!(windows) {
+            assert!(program.ends_with(r"\System32\rundll32.exe"), "{program}");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(program, "open");
+        } else {
+            assert_eq!(program, "xdg-open");
+        }
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().map(String::as_str), path.to_str());
+    }
+
+    #[test]
+    fn a_program_file_does_not_open() {
+        for extension in [
+            "exe",
+            "bat",
+            "cmd",
+            "com",
+            "scr",
+            "pif",
+            "lnk",
+            "app",
+            "desktop",
+            "sh",
+            "EXE",
+            "js",
+            "jse",
+            "vbs",
+            "vbe",
+            "wsf",
+            "wsh",
+            "hta",
+            "msi",
+            "msp",
+            "ps1",
+            "reg",
+            "cpl",
+            "msc",
+            "jar",
+            "url",
+            "scf",
+            "appx",
+            "appref-ms",
+            "gadget",
+            "dll",
+            "command",
+            "workflow",
+            "terminal",
+            "pkg",
+            "dmg",
+            "AppImage",
+            "run",
+            "py",
+            "pl",
+        ] {
+            let path = Path::new("/tmp").join(format!("payload.{extension}"));
+            assert!(open_command(&path).is_none(), "{extension} must not open");
+        }
+        for extension in [
+            "pdf", "txt", "csv", "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "zip",
+            "docx", "xlsx", "pptx", "mp3", "ogg", "opus", "m4a", "aac", "wav", "mp4", "m4v", "mov",
+            "webm", "mkv", "avi", "3gp",
+        ] {
+            let path = Path::new("/tmp").join(format!("notes.{extension}"));
+            assert!(open_command(&path).is_some(), "{extension} should open");
+        }
+        assert!(open_command(Path::new("/tmp/payload")).is_none());
+        let js = MessageFile::new("payload.js", "text/javascript", 4, 9, None, None);
+        assert_eq!(control(&js, false), Control::Download);
+    }
+
+    #[test]
+    fn a_trailing_dot_or_space_does_not_hide_a_program() {
+        assert!(open_command(Path::new("/tmp/payload.exe.")).is_none());
+        assert!(open_command(Path::new("/tmp/payload.exe ")).is_none());
+        assert!(open_command(Path::new("/tmp/payload.exe. ")).is_none());
+        assert!(windows_open_command(Path::new(r"C:\Users\a\payload.exe.")).is_none());
+        assert!(windows_open_command(Path::new(r"C:\Users\a\payload.exe ")).is_none());
+    }
+
+    #[test]
+    fn a_path_with_a_space_is_the_argument_itself() {
+        let path = Path::new(r"C:\Users\Jane Doe\my notes.pdf");
+        let command = windows_open_command(path).expect("command");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let file = args.last().expect("path");
+        assert_eq!(file, r"C:\Users\Jane Doe\my notes.pdf");
+        assert!(
+            !file.contains('"'),
+            "a quote around the path would stay in the rundll32 address: {file}"
+        );
+    }
+
+    #[test]
+    fn an_ampersand_in_the_name_is_not_a_cmd_separator() {
+        let path = Path::new(r"C:\Users\a\x&calc.pdf");
+        let command = windows_open_command(path).expect("command");
+        let program = command.get_program().to_string_lossy();
+        assert!(
+            program.ends_with(r"\System32\rundll32.exe"),
+            "open must not go through cmd: {program}"
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter()
+                .all(|arg| arg != "/C" && !arg.eq_ignore_ascii_case("start")),
+            "a cmd start line splits on &: {args:?}"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "url.dll,FileProtocolHandler".to_string(),
+                path.display().to_string(),
+            ]
+        );
+        assert!(windows_open_command(Path::new(r"C:\Users\a\x&calc.exe")).is_none());
+    }
+
+    #[test]
+    fn an_opened_program_is_waited_for() {
+        let child = std::process::Command::new("true").spawn().expect("true");
+        let status = watch_open(child)
+            .expect("thread")
+            .join()
+            .expect("join")
+            .expect("wait");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn a_program_file_shows_the_open_error() {
+        let path = AudioPath::new("/tmp/payload.exe").expect("path");
+        let file = MessageFile::new(
+            "payload.exe",
+            "application/octet-stream",
+            4,
+            9,
+            Some(path),
+            None,
+        );
+        let mut opened = harness(file);
+        opened.run_steps(1);
+        opened
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Open")
+            .click();
+        opened.run_steps(1);
+        opened.get_by_label("Couldn't open this file.");
+    }
+}

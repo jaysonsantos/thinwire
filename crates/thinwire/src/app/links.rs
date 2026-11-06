@@ -481,7 +481,7 @@ fn mailto_command(url: &str) -> std::io::Result<std::process::Command> {
 
 /// `rundll32` in System32, so a `rundll32` earlier on `PATH` is not used.
 #[cfg(any(windows, test))]
-fn rundll32_program() -> String {
+pub(crate) fn rundll32_program() -> String {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let root = root.trim_end_matches(['\\', '/']);
     format!(r"{root}\System32\rundll32.exe")

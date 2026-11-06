@@ -2307,6 +2307,7 @@ fn thread(
             photo: message.photo.as_ref(),
             audio: message.audio.as_ref(),
             video: message.video.as_ref(),
+            file: message.file.as_ref(),
             reactions: &message.reactions,
             reply: message.reply_to.as_deref().map(replied),
             actions,
@@ -2769,6 +2770,7 @@ struct Bubble<'a> {
     photo: Option<&'a MessagePhoto>,
     audio: Option<&'a thinwire_protocol::MessageAudio>,
     video: Option<&'a thinwire_protocol::MessageVideo>,
+    file: Option<&'a thinwire_protocol::MessageFile>,
     reactions: &'a [thinwire_protocol::Reaction],
     /// A reply: the message it answers, when that message is in the thread.
     reply: Option<Option<&'a thinwire_protocol::ChatMessage>>,
@@ -3316,7 +3318,18 @@ fn bubble(
                         message.audio,
                         out,
                     );
-                    let caption = !message.body.is_empty() || message.photo.is_none();
+                    if let Some(file) = message.file {
+                        super::files::show(
+                            ui,
+                            message.protocol,
+                            message.conversation_id,
+                            message.id,
+                            file,
+                            out,
+                        );
+                    }
+                    let caption = !message.body.is_empty()
+                        || (message.photo.is_none() && message.file.is_none());
                     if !caption {
                         meta_line(ui, message, &ink, false);
                         return;
@@ -3583,8 +3596,14 @@ fn meta_column_width(ui: &egui::Ui, time: &str, delivery: Delivery, outbound: bo
 /// keep partial selection. The visual sender header stays on the first row
 /// of a run.
 fn bubble_access_label(message: &Bubble<'_>) -> String {
+    let file_name = message
+        .file
+        .filter(|_| message.body.is_empty())
+        .map(thinwire_protocol::MessageFile::name);
     let body = if message.body.is_empty() && message.photo.is_some() {
         "Photo"
+    } else if let Some(name) = file_name {
+        name
     } else {
         message.body
     };

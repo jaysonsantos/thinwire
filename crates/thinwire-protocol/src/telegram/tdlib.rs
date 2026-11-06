@@ -121,6 +121,10 @@ pub(super) enum TdlibCommand {
     DownloadVideo {
         file_id: i32,
     },
+    /// Download one document. The path stays. The bytes are not read.
+    DownloadDocument {
+        file_id: i32,
+    },
     /// Send photos and videos, with the caption on the first file.
     SendMedia {
         conversation_id: String,
@@ -195,6 +199,7 @@ enum InFlight {
     Photo { secret: bool, saw_active: bool },
     Voice { saw_active: bool },
     Video { saw_active: bool },
+    File { saw_active: bool },
 }
 
 impl InFlight {
@@ -202,7 +207,8 @@ impl InFlight {
         match self {
             Self::Photo { saw_active, .. }
             | Self::Voice { saw_active }
-            | Self::Video { saw_active } => saw_active,
+            | Self::Video { saw_active }
+            | Self::File { saw_active } => saw_active,
         }
     }
 
@@ -210,7 +216,8 @@ impl InFlight {
         match self {
             Self::Photo { saw_active, .. }
             | Self::Voice { saw_active }
-            | Self::Video { saw_active } => *saw_active = true,
+            | Self::Video { saw_active }
+            | Self::File { saw_active } => *saw_active = true,
         }
     }
 }
@@ -504,6 +511,21 @@ impl TdlibRuntime {
     ) {
         self.enqueue(
             TdlibCommand::DownloadVoice { file_id },
+            secrets,
+            source,
+            events,
+        );
+    }
+
+    pub fn download_document(
+        &mut self,
+        file_id: i32,
+        secrets: Arc<dyn TelegramSecretVault>,
+        source: TelegramApiSource,
+        events: &EventTx,
+    ) {
+        self.enqueue(
+            TdlibCommand::DownloadDocument { file_id },
             secrets,
             source,
             events,
@@ -1046,6 +1068,16 @@ fn spawn_tdlib_worker(
                                 client_id,
                                 file_id,
                                 InFlight::Video { saw_active: false },
+                                &mut live,
+                                &events,
+                            )
+                            .await;
+                        }
+                        TdlibCommand::DownloadDocument { file_id } => {
+                            begin_download(
+                                client_id,
+                                file_id,
+                                InFlight::File { saw_active: false },
                                 &mut live,
                                 &events,
                             )
@@ -1860,6 +1892,7 @@ async fn apply_chat_update(
                 mapped.photo,
                 mapped.audio,
                 mapped.video,
+                mapped.file,
             );
             if mapped.scan {
                 schedule_text_entities(
@@ -2126,6 +2159,7 @@ fn emit_mapped_message_as(
     mapped.photo = media.photo;
     mapped.audio = media.audio;
     mapped.video = media.video;
+    mapped.file = media.file;
     mapped.reactions = super::media_map::reactions_of(message.interaction_info.as_ref());
     mapped.reply_to = super::media_map::reply_of(message);
     if media.scan {
@@ -2270,6 +2304,13 @@ async fn finish_download(
                 &file.local.path,
             ));
         }
+        InFlight::File { .. } => {
+            let _ = events.send(file_event(
+                file.id,
+                file.local.is_downloading_completed,
+                &file.local.path,
+            ));
+        }
     }
 }
 
@@ -2281,6 +2322,7 @@ fn fail_download(kind: InFlight, file_id: i32, events: &EventTx) {
         }
         InFlight::Voice { .. } => voice_event(file_id, false, ""),
         InFlight::Video { .. } => video_event(file_id, false, ""),
+        InFlight::File { .. } => file_event(file_id, false, ""),
     };
     let _ = events.send(event);
 }
@@ -2306,6 +2348,20 @@ fn finish_voice(file: tdlib_rs::types::File, events: &EventTx) {
         &file.local.path,
     );
     let _ = events.send(event);
+}
+
+fn file_event(file_id: i32, completed: bool, path: &str) -> AdapterEvent {
+    match crate::AudioPath::new(path).filter(|_| completed) {
+        Some(path) => AdapterEvent::FileReady {
+            protocol: ProtocolId::Telegram,
+            file_id,
+            path,
+        },
+        None => AdapterEvent::FileFailed {
+            protocol: ProtocolId::Telegram,
+            file_id,
+        },
+    }
 }
 
 fn voice_event(file_id: i32, completed: bool, path: &str) -> AdapterEvent {

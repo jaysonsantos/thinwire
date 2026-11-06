@@ -45,7 +45,7 @@ pub use host::{AccountAdapter, AccountFactory, AdapterHost, HostSender};
 pub use log_id::LogChatId;
 pub use media::{
     AudioPath, ChatAvatar, FILES_PER_MESSAGE, ImageBytes, ImagePath, MAX_ATTACHMENT_BYTES,
-    MAX_ATTACHMENTS, MediaKind, MessageAudio, MessageLink, MessagePhoto, MessageVideo,
+    MAX_ATTACHMENTS, MediaKind, MessageAudio, MessageFile, MessageLink, MessagePhoto, MessageVideo,
     OutgoingFile, PhotoFile, PhotoSize, TextKind, TextSpan, links_in, openable_url, utf16_range,
     with_scheme,
 };
