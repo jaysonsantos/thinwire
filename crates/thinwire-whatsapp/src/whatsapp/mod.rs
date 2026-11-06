@@ -78,6 +78,10 @@ const STOP_TIMEOUT: &str =
 const NOT_CONNECTED: &str = "WhatsApp is not connected. Pass the ban gate and pair a device first.";
 const BAD_CHAT_ID: &str = "that conversation is not a WhatsApp chat";
 const UNKNOWN_CHAT: &str = "that WhatsApp chat is not in the synced list";
+const UNKNOWN_MESSAGE: &str = "That WhatsApp message is not in this chat any more.";
+const NOT_OWN_MESSAGE: &str = "Only your own WhatsApp messages can be deleted for everyone.";
+const DELETE_FAILED: &str = "WhatsApp did not delete the message.";
+const REACT_FAILED: &str = "WhatsApp did not take the reaction.";
 const EMPTY_BODY: &str = "the message is empty";
 
 const RISK_GATE_REQUIRED: &str =
@@ -417,14 +421,28 @@ impl WhatsAppAdapter {
     /// A rejection is about this one send, so it does not return `Err`. An
     /// `Err` makes the host report an Error status, and the UI then unlinks
     /// the account and hides the inbox until the next Ready.
-    fn send_text(&self, conversation_id: &str, body: &str, request: u64, events: &EventTx) {
+    fn send_text(
+        &self,
+        conversation_id: &str,
+        body: &str,
+        request: u64,
+        reply_to: Option<&str>,
+        events: &EventTx,
+    ) {
         let Ok((jid, body, sender)) = self.prepare_send(conversation_id, body) else {
             emit_send_rejected(events, ProtocolId::WhatsApp, conversation_id, request);
             return;
         };
-        let (pending, shown, upsert) = self
-            .session
-            .with_inbox(|inbox| inbox.begin_send(&jid, &body, unix_now()));
+        let (pending, shown, upsert, quote) = self.session.with_inbox(|inbox| {
+            // A reply quotes a message that the server has.
+            let quote = reply_to.and_then(|id| inbox.target(&jid, id));
+            let (pending, shown, upsert) = inbox.begin_send(&jid, &body, unix_now());
+            let shown = quote
+                .as_ref()
+                .and_then(|quote| inbox.set_reply(&jid, &pending, &quote.id))
+                .unwrap_or(shown);
+            (pending, shown, upsert, quote)
+        });
         let _ = events.send(shown);
         // The sidebar preview and order come from the chat upsert.
         if let Some(upsert) = upsert {
@@ -436,7 +454,113 @@ impl WhatsAppAdapter {
             request,
             retry: false,
         };
-        self.spawn_send(sender, jid, pending, body, answer, events);
+        self.spawn_send(sender, jid, pending, body, quote, answer, events);
+    }
+
+    /// The key of a cached message of an open chat, and the client. A
+    /// failure answers with `CommandFailed`.
+    fn action_target(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        events: &EventTx,
+    ) -> Option<(String, inbox::TargetRef, session::LinkSender)> {
+        let Some(jid) = inbox::parse_conversation_id(conversation_id).map(str::to_string) else {
+            command_failed(events, Some(conversation_id), &unavailable(BAD_CHAT_ID));
+            return None;
+        };
+        let Some(sender) = self.session.sender() else {
+            command_failed(events, Some(conversation_id), &unavailable(NOT_CONNECTED));
+            return None;
+        };
+        let Some(target) = self
+            .session
+            .with_inbox(|inbox| inbox.target(&jid, message_id))
+        else {
+            command_failed(events, Some(conversation_id), &unavailable(UNKNOWN_MESSAGE));
+            return None;
+        };
+        Some((jid, target, sender))
+    }
+
+    /// Delete one message: a revoke for every member, or a delete on the
+    /// devices of this account. Success removes the row.
+    fn delete_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        for_everyone: bool,
+        events: &EventTx,
+    ) {
+        let Some((jid, target, (_, sender))) =
+            self.action_target(conversation_id, message_id, events)
+        else {
+            return;
+        };
+        if for_everyone && !target.from_me {
+            command_failed(events, Some(conversation_id), &unavailable(NOT_OWN_MESSAGE));
+            return;
+        }
+        let session = self.session.clone();
+        let events = events.clone();
+        let conversation_id = conversation_id.to_string();
+        tokio::spawn(async move {
+            let result = if for_everyone {
+                sender.revoke(&jid, &target).await
+            } else {
+                sender.delete_for_me(&jid, &target).await
+            };
+            match result {
+                Ok(()) => {
+                    let removed =
+                        session.with_inbox(|inbox| inbox.remove_message(&jid, &target.id));
+                    let _ = events.send(removed);
+                }
+                Err(()) => {
+                    command_failed(&events, Some(&conversation_id), &unavailable(DELETE_FAILED));
+                }
+            }
+        });
+    }
+
+    /// Set or remove the reaction of this account. The row changes at once.
+    fn react(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        emoji: &str,
+        add: bool,
+        events: &EventTx,
+    ) {
+        let Some((jid, target, (_, sender))) =
+            self.action_target(conversation_id, message_id, events)
+        else {
+            return;
+        };
+        // WhatsApp removes a reaction with an empty one.
+        let emoji = if add {
+            emoji.to_string()
+        } else {
+            String::new()
+        };
+        let rows = self.session.with_inbox(|inbox| {
+            inbox.apply_reactions(vec![inbox::WaReaction {
+                chat_jid: jid.clone(),
+                target_id: target.id.clone(),
+                reactor: inbox::ME.to_string(),
+                emoji: emoji.clone(),
+            }])
+        });
+        for row in rows {
+            let _ = events.send(row);
+        }
+        let events = events.clone();
+        let conversation_id = conversation_id.to_string();
+        tokio::spawn(async move {
+            if sender.react(&jid, &target, &emoji).await.is_err() {
+                command_failed(&events, Some(&conversation_id), &unavailable(REACT_FAILED));
+            }
+        });
     }
 
     /// Photos and videos go out one message each. The caption goes with
@@ -568,15 +692,25 @@ impl WhatsAppAdapter {
             request,
             retry: true,
         };
-        self.spawn_send(sender, jid, message_id.to_string(), body, answer, events);
+        self.spawn_send(
+            sender,
+            jid,
+            message_id.to_string(),
+            body,
+            None,
+            answer,
+            events,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_send(
         &self,
         (generation, sender): session::LinkSender,
         jid: String,
         pending: String,
         body: String,
+        quote: Option<inbox::TargetRef>,
         answer: session::SendRequest,
         events: &EventTx,
     ) {
@@ -586,7 +720,10 @@ impl WhatsAppAdapter {
         // Counted before the spawn, so a shutdown right after sees it.
         let running = self.sends.begin(&answer.conversation_id);
         tokio::spawn(async move {
-            let result = sender.send_text(&jid, &body).await;
+            let result = match &quote {
+                Some(quote) => sender.send_reply(&jid, &body, quote).await,
+                None => sender.send_text(&jid, &body).await,
+            };
             let revoked = session.finish_send(generation, &jid, &pending, result, &answer, &events);
             running.finish();
             // The phone revoked the device, maybe with no LoggedOut callback.
@@ -765,9 +902,34 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 conversation_id,
                 body,
                 request,
-                ..
+                reply_to,
             } => {
-                self.send_text(&conversation_id, &body, request, events);
+                self.send_text(
+                    &conversation_id,
+                    &body,
+                    request,
+                    reply_to.as_deref(),
+                    events,
+                );
+                Ok(())
+            }
+            AdapterCommand::DeleteMessage {
+                protocol: ProtocolId::WhatsApp,
+                conversation_id,
+                message_id,
+                for_everyone,
+            } => {
+                self.delete_message(&conversation_id, &message_id, for_everyone, events);
+                Ok(())
+            }
+            AdapterCommand::React {
+                protocol: ProtocolId::WhatsApp,
+                conversation_id,
+                message_id,
+                emoji,
+                add,
+            } => {
+                self.react(&conversation_id, &message_id, &emoji, add, events);
                 Ok(())
             }
             AdapterCommand::SendMedia {
@@ -1256,6 +1418,113 @@ mod tests {
             event,
             AdapterEvent::MessageReceived { message } if message.body == "live text"
         )));
+    }
+
+    /// A reaction shows at once and goes to WhatsApp. A live reaction of
+    /// another person adds to the count. A reply quotes its message. Delete
+    /// for everyone needs an own message, and a delete removes the row.
+    #[tokio::test]
+    async fn react_reply_and_delete_reach_the_client() {
+        let (tx, mut rx) = unbounded_channel();
+        let sender = Arc::new(FakeSender::default());
+        let mut adapter = with_sender(Arc::clone(&sender));
+        adapter.session.apply(history(), 1, &tx);
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        let chat = "whatsapp:111@s.whatsapp.net".to_string();
+        let thumbs = |count, mine| {
+            vec![thinwire_protocol::Reaction {
+                emoji: "👍".into(),
+                count,
+                mine,
+            }]
+        };
+        adapter
+            .handle(
+                AdapterCommand::React {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: chat.clone(),
+                    message_id: "h1".into(),
+                    emoji: "👍".into(),
+                    add: true,
+                },
+                &tx,
+            )
+            .expect("react");
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageReactions { reactions, .. } if *reactions == thumbs(1, true)
+        )));
+        adapter.session.apply(
+            LinkEvent::Reactions(vec![inbox::WaReaction {
+                chat_jid: CHAT.into(),
+                target_id: "h1".into(),
+                reactor: "222@s.whatsapp.net".into(),
+                emoji: "👍".into(),
+            }]),
+            1,
+            &tx,
+        );
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageReactions { reactions, .. } if *reactions == thumbs(2, true)
+        )));
+
+        adapter
+            .handle(
+                AdapterCommand::SendText {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: chat.clone(),
+                    body: "yes".into(),
+                    request: 1,
+                    reply_to: Some("h2".into()),
+                },
+                &tx,
+            )
+            .expect("send");
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            AdapterEvent::MessageReceived { message }
+                if message.body == "yes" && message.reply_to.as_deref() == Some("h2")
+        )));
+        for (id, for_everyone) in [("h2", true), ("h1", false)] {
+            adapter
+                .handle(
+                    AdapterCommand::DeleteMessage {
+                        protocol: ProtocolId::WhatsApp,
+                        conversation_id: chat.clone(),
+                        message_id: id.into(),
+                        for_everyone,
+                    },
+                    &tx,
+                )
+                .expect("delete");
+        }
+        let mut removed = None;
+        let mut refused = false;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            for event in drain(&mut rx) {
+                match event {
+                    AdapterEvent::MessagesRemoved { message_ids, .. } => {
+                        removed = Some(message_ids)
+                    }
+                    AdapterEvent::CommandFailed { .. } => refused = true,
+                    _ => {}
+                }
+            }
+            if removed.is_some() {
+                break;
+            }
+        }
+        assert!(
+            refused,
+            "another person's message is not deleted for everyone"
+        );
+        assert_eq!(removed, Some(vec!["h1".to_string()]));
+        let mut actions = sender.actions.lock().expect("fake lock").clone();
+        actions.sort();
+        assert_eq!(actions, vec!["delete_for_me h1", "react h1 👍", "reply h2"]);
     }
 
     #[test]

@@ -963,6 +963,8 @@ pub(super) mod tests {
                         sender_jid: Some(chat.into()),
                         body: "saved".into(),
                         timestamp: 9,
+                        reactions: Vec::new(),
+                        reply_to: None,
                     }],
                 },
             )],

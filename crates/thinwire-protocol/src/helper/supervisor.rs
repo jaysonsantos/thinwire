@@ -713,6 +713,19 @@ impl Supervisor {
                 self.send_idle_status();
             }
             WireCommand::ViewChat { .. } => {}
+            WireCommand::DeleteMessage {
+                conversation_id, ..
+            }
+            | WireCommand::React {
+                conversation_id, ..
+            } => {
+                emit_command_failed(
+                    events,
+                    protocol,
+                    Some(conversation_id.clone()),
+                    self.not_connected(),
+                );
+            }
             // No helper has the file. The player shows the failure and does
             // not wait.
             WireCommand::DownloadVoice { file_id } => {

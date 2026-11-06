@@ -20,8 +20,12 @@ use crate::SecretText;
 /// the shown message each unreadable stretch sits older than. Version 4
 /// adds [`WireMessage::audio`], [`WireCommand::DownloadVoice`],
 /// [`WireEvent::VoiceReady`], and [`WireEvent::VoiceFailed`]. Version 5 adds
-/// [`WireEvent::Avatar`]. An older peer cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// [`WireEvent::Avatar`]. Version 6 adds the message menu:
+/// `reply_to` on [`WireCommand::SendText`], [`WireCommand::DeleteMessage`],
+/// [`WireCommand::React`], [`WireMessage::reactions`],
+/// [`WireMessage::reply_to`], and [`WireEvent::Reactions`]. An older peer
+/// cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// One unreadable stretch on a history page.
 ///
@@ -137,6 +141,23 @@ pub enum WireCommand {
         conversation_id: String,
         body: String,
         request: u64,
+        /// The id of the message this one replies to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
+    },
+    /// Delete one message. `for_everyone` removes an own message for every
+    /// member of the chat.
+    DeleteMessage {
+        conversation_id: String,
+        message_id: String,
+        for_everyone: bool,
+    },
+    /// Add or remove the reaction `emoji` of this account on one message.
+    React {
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        add: bool,
     },
     ResendMessage {
         conversation_id: String,
@@ -186,6 +207,8 @@ impl WireCommand {
             Self::OpenChat { .. } => "open_chat",
             Self::LoadOlderMessages { .. } => "load_older_messages",
             Self::SendText { .. } => "send_text",
+            Self::DeleteMessage { .. } => "delete_message",
+            Self::React { .. } => "react",
             Self::ResendMessage { .. } => "resend_message",
             Self::SendMedia { .. } => "send_media",
             Self::ViewChat { .. } => "view_chat",
@@ -325,6 +348,28 @@ pub struct WireMessage {
     /// cross with the message: [`WireCommand::DownloadVoice`] asks for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<WireAudio>,
+    /// The reactions on the message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<WireReaction>,
+    /// The id of the message that this one replies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+}
+
+/// One emoji on a message, with the number of people who chose it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireReaction {
+    pub emoji: String,
+    pub count: u32,
+    /// This account chose it.
+    pub mine: bool,
+}
+
+impl fmt::Debug for WireReaction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WireReaction({})", self.count)
+    }
 }
 
 /// The audio of a message. `file_id` is a handle of the helper for this
@@ -496,6 +541,12 @@ pub enum WireEvent {
         conversation_id: String,
         photo: WirePhoto,
     },
+    /// The reactions of one message now. An empty list has none.
+    Reactions {
+        conversation_id: String,
+        message_id: String,
+        reactions: Vec<WireReaction>,
+    },
 }
 
 /// Why the helper could not use the session key.
@@ -536,6 +587,7 @@ impl WireEvent {
             Self::VoiceReady { .. } => "voice_ready",
             Self::VoiceFailed { .. } => "voice_failed",
             Self::Avatar { .. } => "avatar",
+            Self::Reactions { .. } => "reactions",
         }
     }
 }
@@ -568,7 +620,59 @@ mod tests {
             arrival: WireArrival::Live,
             photo: None,
             audio: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
+    }
+
+    /// Reactions and a reply cross with the message. A message with neither
+    /// has no key for them, and a reactions event reads back.
+    #[test]
+    fn reactions_and_a_reply_cross_with_the_message() {
+        let mut with_menu = message();
+        with_menu.reactions = vec![WireReaction {
+            emoji: "👍".into(),
+            count: 2,
+            mine: true,
+        }];
+        with_menu.reply_to = Some("m0".into());
+        let line = HelperLine::Event {
+            protocol: WireProtocol::Signal,
+            event: WireEvent::MessageReceived { message: with_menu },
+        };
+        let text = encode(&line).expect("encode");
+        assert_eq!(decode::<HelperLine>(text.trim_end()).expect("decode"), line);
+        let plain = encode(&HelperLine::Event {
+            protocol: WireProtocol::Signal,
+            event: WireEvent::MessageReceived { message: message() },
+        })
+        .expect("encode");
+        assert!(!plain.contains("reactions") && !plain.contains("reply_to"));
+        let reactions = HelperLine::Event {
+            protocol: WireProtocol::WhatsApp,
+            event: WireEvent::Reactions {
+                conversation_id: CHAT.into(),
+                message_id: "m1".into(),
+                reactions: Vec::new(),
+            },
+        };
+        let text = encode(&reactions).expect("encode");
+        assert_eq!(
+            decode::<HelperLine>(text.trim_end()).expect("decode"),
+            reactions
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                WireReaction {
+                    emoji: "👍".into(),
+                    count: 2,
+                    mine: true
+                }
+            ),
+            "WireReaction(2)",
+            "Debug shows no emoji"
+        );
     }
 
     /// A photo crosses as one base64 string. A message with no photo has no
@@ -646,12 +750,42 @@ mod tests {
                     conversation_id: CHAT.into(),
                     body: BODY.into(),
                     request: 900_001,
+                    reply_to: None,
                 },
             },
             AppLine::Request {
                 id: 4,
                 protocol: WireProtocol::Signal,
                 command: WireCommand::RetryStoreKey,
+            },
+            AppLine::Request {
+                id: 5,
+                protocol: WireProtocol::WhatsApp,
+                command: WireCommand::SendText {
+                    conversation_id: CHAT.into(),
+                    body: BODY.into(),
+                    request: 900_002,
+                    reply_to: Some("m1".into()),
+                },
+            },
+            AppLine::Request {
+                id: 6,
+                protocol: WireProtocol::Signal,
+                command: WireCommand::DeleteMessage {
+                    conversation_id: CHAT.into(),
+                    message_id: "m1".into(),
+                    for_everyone: true,
+                },
+            },
+            AppLine::Request {
+                id: 7,
+                protocol: WireProtocol::WhatsApp,
+                command: WireCommand::React {
+                    conversation_id: CHAT.into(),
+                    message_id: "m1".into(),
+                    emoji: "👍".into(),
+                    add: false,
+                },
             },
             AppLine::Shutdown,
         ];
@@ -752,6 +886,7 @@ mod tests {
                         conversation_id: CHAT.into(),
                         body: BODY.into(),
                         request: 1,
+                        reply_to: None,
                     },
                 }
             ),

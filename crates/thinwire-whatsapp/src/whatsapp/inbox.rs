@@ -197,6 +197,63 @@ pub(super) struct WaMessage {
     pub sticker: Option<Sticker>,
     /// The audio of a voice note or an audio message.
     pub voice: Option<Voice>,
+    /// The id of the message that this one replies to.
+    pub reply_to: Option<String>,
+    /// The reactions: who reacted ([`ME`] or a JID) and the emoji. Sorted by
+    /// who, one entry for each person.
+    pub reactions: Vec<(String, String)>,
+}
+
+/// Who reacted, for a reaction of this account.
+pub(super) const ME: &str = "me";
+
+/// One reaction from a live message. An empty `emoji` removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WaReaction {
+    pub chat_jid: String,
+    pub target_id: String,
+    /// [`ME`] for this account, else the sender JID.
+    pub reactor: String,
+    pub emoji: String,
+}
+
+/// The key and the text of one cached message, for a reply, a reaction, or
+/// a delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TargetRef {
+    pub id: String,
+    pub from_me: bool,
+    pub sender_jid: Option<String>,
+    pub body: String,
+    pub timestamp: i64,
+}
+
+/// Set the reaction of `reactor`. An empty `emoji` removes it.
+pub(super) fn set_reaction(reactions: &mut Vec<(String, String)>, reactor: &str, emoji: &str) {
+    reactions.retain(|(who, _)| who != reactor);
+    if !emoji.is_empty() {
+        reactions.push((reactor.to_owned(), emoji.to_owned()));
+        reactions.sort();
+    }
+}
+
+/// The counts of each emoji, in the order of the first person who chose it.
+pub(super) fn reaction_counts(reactions: &[(String, String)]) -> Vec<thinwire_protocol::Reaction> {
+    let mut counts: Vec<thinwire_protocol::Reaction> = Vec::new();
+    for (who, emoji) in reactions {
+        match counts.iter_mut().find(|reaction| &reaction.emoji == emoji) {
+            Some(reaction) => {
+                reaction.count = reaction.count.saturating_add(1);
+                reaction.mine |= who == ME;
+            }
+            None => counts.push(thinwire_protocol::Reaction {
+                emoji: emoji.clone(),
+                count: 1,
+                mine: who == ME,
+            }),
+        }
+    }
+    counts
 }
 
 /// One conversation from a history-sync chunk.
@@ -423,6 +480,10 @@ pub(super) struct SavedMessage {
     pub sender_jid: Option<String>,
     pub body: String,
     pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<(String, String)>,
 }
 
 /// One saved chat: the row and its newest messages.
@@ -496,6 +557,8 @@ fn saved_message(message: &WaMessage) -> SavedMessage {
         sender_jid: message.sender_jid.clone(),
         body: message.body.clone(),
         timestamp: message.timestamp,
+        reply_to: message.reply_to.clone(),
+        reactions: message.reactions.clone(),
     }
 }
 
@@ -611,6 +674,8 @@ impl Inbox {
                         timestamp: message.timestamp,
                         sticker: None,
                         voice: None,
+                        reply_to: message.reply_to,
+                        reactions: message.reactions,
                     })
                     .collect(),
                 ..ChatRecord::default()
@@ -826,6 +891,84 @@ impl Inbox {
 
     /// Merge live messages. Every message goes to the UI; unread grows only
     /// for inbound messages outside the open chat.
+    /// Live reactions. Each one changes the counts of a cached message. A
+    /// reaction to a message that is not in the cache is dropped.
+    pub(super) fn apply_reactions(&mut self, reactions: Vec<WaReaction>) -> Vec<AdapterEvent> {
+        let mut events = Vec::new();
+        for reaction in reactions {
+            let Some(message) = self.chats.get_mut(&reaction.chat_jid).and_then(|record| {
+                record
+                    .messages
+                    .iter_mut()
+                    .find(|row| row.id == reaction.target_id)
+            }) else {
+                continue;
+            };
+            set_reaction(&mut message.reactions, &reaction.reactor, &reaction.emoji);
+            events.push(AdapterEvent::MessageReactions {
+                protocol: ProtocolId::WhatsApp,
+                conversation_id: conversation_id(&reaction.chat_jid),
+                message_id: reaction.target_id.clone(),
+                reactions: reaction_counts(&message.reactions),
+            });
+        }
+        events
+    }
+
+    /// The key and text of a cached message that the server has. A pending
+    /// send has no server id yet.
+    pub(super) fn target(&self, jid: &str, id: &str) -> Option<TargetRef> {
+        if id.starts_with(PENDING_PREFIX) {
+            return None;
+        }
+        let message = self
+            .chats
+            .get(jid)?
+            .messages
+            .iter()
+            .find(|row| row.id == id)?;
+        Some(TargetRef {
+            id: message.id.clone(),
+            from_me: message.from_me,
+            sender_jid: message.sender_jid.clone(),
+            body: message.body.clone(),
+            timestamp: message.timestamp,
+        })
+    }
+
+    /// Mark the cached message `id` as a reply to `reply_to`. Returns the new
+    /// row.
+    pub(super) fn set_reply(
+        &mut self,
+        jid: &str,
+        id: &str,
+        reply_to: &str,
+    ) -> Option<AdapterEvent> {
+        let message = self
+            .chats
+            .get_mut(jid)?
+            .messages
+            .iter_mut()
+            .find(|row| row.id == id)?;
+        message.reply_to = Some(reply_to.to_owned());
+        let message = message.clone();
+        Some(AdapterEvent::MessageReceived {
+            message: self.chat_message(&message, Arrival::History),
+        })
+    }
+
+    /// Drop one message from the cache. The row leaves the thread.
+    pub(super) fn remove_message(&mut self, jid: &str, id: &str) -> AdapterEvent {
+        if let Some(record) = self.chats.get_mut(jid) {
+            record.messages.retain(|row| row.id != id);
+        }
+        AdapterEvent::MessagesRemoved {
+            protocol: ProtocolId::WhatsApp,
+            conversation_id: conversation_id(jid),
+            message_ids: vec![id.to_owned()],
+        }
+    }
+
     pub(super) fn apply_messages(&mut self, messages: Vec<WaMessage>) -> Vec<AdapterEvent> {
         let mut events = Vec::new();
         for message in messages {
@@ -1005,6 +1148,8 @@ impl Inbox {
             timestamp: now,
             sticker: None,
             voice: None,
+            reactions: Vec::new(),
+            reply_to: None,
         };
         let record = self.chats.entry(jid.to_string()).or_default();
         record.timestamp = record.timestamp.max(now);
@@ -1294,8 +1439,8 @@ impl Inbox {
                 )
             }),
             video: None,
-            reactions: Vec::new(),
-            reply_to: None,
+            reactions: reaction_counts(&message.reactions),
+            reply_to: message.reply_to.clone(),
         }
     }
 }
@@ -1363,8 +1508,12 @@ fn remember_name(names: &mut HashMap<String, String>, message: &WaMessage) {
     }
 }
 
-fn insert_message(messages: &mut Vec<WaMessage>, message: WaMessage) {
+fn insert_message(messages: &mut Vec<WaMessage>, mut message: WaMessage) {
     if let Some(existing) = messages.iter_mut().find(|row| row.id == message.id) {
+        // A refresh with no reactions keeps the reactions the cache counted.
+        if message.reactions.is_empty() {
+            message.reactions = std::mem::take(&mut existing.reactions);
+        }
         *existing = message;
     } else {
         messages.push(message);
@@ -1397,6 +1546,31 @@ fn preview(body: &str) -> String {
 pub(super) mod tests {
     use super::*;
 
+    /// A cache file of an older build has no reactions and no replies. It
+    /// still reads. Each person counts once, and a new emoji of the same
+    /// person takes the place of the old one.
+    #[test]
+    fn reactions_count_each_person_once_and_old_saves_still_read() {
+        let old = r#"{"id":"a","from_me":false,"sender_name":null,"sender_jid":null,"body":"hi","timestamp":1}"#;
+        let saved: SavedMessage = serde_json::from_str(old).expect("old line");
+        assert!(saved.reactions.is_empty() && saved.reply_to.is_none());
+
+        let mut reactions = Vec::new();
+        set_reaction(&mut reactions, "b@s.whatsapp.net", "👍");
+        set_reaction(&mut reactions, ME, "👍");
+        set_reaction(&mut reactions, "c@s.whatsapp.net", "❤️");
+        set_reaction(&mut reactions, "c@s.whatsapp.net", "👍");
+        let counts = reaction_counts(&reactions);
+        assert_eq!(counts.len(), 1);
+        assert_eq!((counts[0].count, counts[0].mine), (3, true));
+        set_reaction(&mut reactions, ME, "");
+        assert_eq!(
+            reaction_counts(&reactions)[0].count,
+            2,
+            "an empty emoji removes"
+        );
+    }
+
     pub(in crate::whatsapp) fn message(chat: &str, id: &str, body: &str, ts: i64) -> WaMessage {
         WaMessage {
             chat_jid: chat.into(),
@@ -1408,6 +1582,8 @@ pub(super) mod tests {
             timestamp: ts,
             sticker: None,
             voice: None,
+            reactions: Vec::new(),
+            reply_to: None,
         }
     }
 

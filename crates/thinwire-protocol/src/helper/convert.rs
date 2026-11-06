@@ -68,11 +68,35 @@ pub(crate) fn command_to_wire(
             conversation_id,
             body,
             request,
+            reply_to,
             ..
         } => WireCommand::SendText {
             conversation_id: conversation_id.clone(),
             body: body.clone(),
             request: *request,
+            reply_to: reply_to.clone(),
+        },
+        AdapterCommand::DeleteMessage {
+            conversation_id,
+            message_id,
+            for_everyone,
+            ..
+        } => WireCommand::DeleteMessage {
+            conversation_id: conversation_id.clone(),
+            message_id: message_id.clone(),
+            for_everyone: *for_everyone,
+        },
+        AdapterCommand::React {
+            conversation_id,
+            message_id,
+            emoji,
+            add,
+            ..
+        } => WireCommand::React {
+            conversation_id: conversation_id.clone(),
+            message_id: message_id.clone(),
+            emoji: emoji.clone(),
+            add: *add,
         },
         AdapterCommand::SendMedia {
             conversation_id,
@@ -143,10 +167,7 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::ViewTopic { .. }
         | AdapterCommand::DownloadFile { .. }
         // A helper sends no video yet (ADR 0015).
-        | AdapterCommand::DownloadVideo { .. }
-        // The message menu of a helper protocol comes in a later wire version.
-        | AdapterCommand::DeleteMessage { .. }
-        | AdapterCommand::React { .. } => return None,
+        | AdapterCommand::DownloadVideo { .. } => return None,
     })
 }
 
@@ -178,12 +199,35 @@ pub(crate) fn command_from_wire(
             conversation_id,
             body,
             request,
+            reply_to,
         } => AdapterCommand::SendText {
             protocol,
             conversation_id,
             body,
             request,
-            reply_to: None,
+            reply_to,
+        },
+        WireCommand::DeleteMessage {
+            conversation_id,
+            message_id,
+            for_everyone,
+        } => AdapterCommand::DeleteMessage {
+            protocol,
+            conversation_id,
+            message_id,
+            for_everyone,
+        },
+        WireCommand::React {
+            conversation_id,
+            message_id,
+            emoji,
+            add,
+        } => AdapterCommand::React {
+            protocol,
+            conversation_id,
+            message_id,
+            emoji,
+            add,
         },
         WireCommand::SendMedia {
             conversation_id,
@@ -391,6 +435,16 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
                 },
             }
         }
+        AdapterEvent::MessageReactions {
+            protocol: seen,
+            conversation_id,
+            message_id,
+            reactions,
+        } if own(seen) => WireEvent::Reactions {
+            conversation_id,
+            message_id,
+            reactions: reactions_to_wire(&reactions),
+        },
         AdapterEvent::ChatListLoaded { protocol: seen } if own(seen) => WireEvent::ChatListLoaded,
         AdapterEvent::HistoryLoaded {
             protocol: seen,
@@ -591,7 +645,41 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
                 bytes: ImageBytes::new(photo.bytes),
             }
         }
+        WireEvent::Reactions {
+            conversation_id,
+            message_id,
+            reactions,
+        } => AdapterEvent::MessageReactions {
+            protocol,
+            conversation_id,
+            message_id,
+            reactions: reactions_from_wire(reactions),
+        },
     })
+}
+
+fn reactions_to_wire(reactions: &[crate::Reaction]) -> Vec<thinwire_ipc::WireReaction> {
+    reactions
+        .iter()
+        .map(|reaction| thinwire_ipc::WireReaction {
+            emoji: reaction.emoji.clone(),
+            count: reaction.count,
+            mine: reaction.mine,
+        })
+        .collect()
+}
+
+/// The reactions of a wire line. An empty emoji or a count of 0 is dropped.
+fn reactions_from_wire(reactions: Vec<thinwire_ipc::WireReaction>) -> Vec<crate::Reaction> {
+    reactions
+        .into_iter()
+        .filter(|reaction| !reaction.emoji.is_empty() && reaction.count > 0)
+        .map(|reaction| crate::Reaction {
+            emoji: reaction.emoji,
+            count: reaction.count,
+            mine: reaction.mine,
+        })
+        .collect()
 }
 
 // endregion: events
@@ -762,6 +850,8 @@ fn message_to_wire(message: ChatMessage) -> WireMessage {
         arrival: arrival_to_wire(message.arrival),
         photo: message.photo.as_ref().and_then(photo_to_wire),
         audio: message.audio.as_ref().and_then(audio_to_wire),
+        reactions: reactions_to_wire(&message.reactions),
+        reply_to: message.reply_to.clone(),
     }
 }
 
@@ -828,8 +918,8 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
             .audio
             .and_then(|audio| MessageAudio::new(audio.duration_secs, audio.file_id, None)),
         video: None,
-        reactions: Vec::new(),
-        reply_to: None,
+        reactions: reactions_from_wire(message.reactions),
+        reply_to: message.reply_to,
     }
 }
 

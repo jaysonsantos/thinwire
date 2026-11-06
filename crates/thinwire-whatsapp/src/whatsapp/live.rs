@@ -19,8 +19,10 @@ use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::{Client, ClientError, Jid, RunCompletionReason};
 
+use super::inbox::TargetRef;
 use super::inbox::{
-    HistoryChat, MEDIA_MAX_BYTES, MediaRef, Mute, PHOTO_LABEL, Sticker, Voice, WaMessage,
+    HistoryChat, ME, MEDIA_MAX_BYTES, MediaRef, Mute, PHOTO_LABEL, Sticker, Voice, WaMessage,
+    WaReaction,
 };
 use super::link::{Callbacks, LinkBackend, StartError, Started};
 use super::path::{
@@ -28,7 +30,7 @@ use super::path::{
     whatsapp_device_store_path,
 };
 use super::session::{
-    DownloadFuture, LinkEvent, NamesFuture, SendFailure, SendFuture, WhatsAppSender,
+    ActionFuture, DownloadFuture, LinkEvent, NamesFuture, SendFailure, SendFuture, WhatsAppSender,
 };
 use thinwire_protocol::RedactedPairingSecret;
 
@@ -215,6 +217,9 @@ async fn build_bot(
                 if let Some(link_event) = map_event(&event) {
                     callbacks.send(link_event);
                 }
+                if let Some(reactions) = map_reactions(&event) {
+                    callbacks.send(LinkEvent::Reactions(reactions));
+                }
             }
         });
     if let Some(phone_number) = phone_number {
@@ -275,6 +280,8 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
                         timestamp: info.timestamp.timestamp(),
                         sticker: picture_of(&inbound.message),
                         voice: voice_of(&inbound.message),
+                        reactions: Vec::new(),
+                        reply_to: reply_of(&inbound.message),
                     })
                 })
                 .collect(),
@@ -341,7 +348,64 @@ fn map_history_message(chat_jid: &str, info: &wa::WebMessageInfo) -> Option<WaMe
             .unwrap_or(0),
         sticker: info.message.as_option().and_then(picture_of),
         voice: info.message.as_option().and_then(voice_of),
+        reactions: history_reactions(chat_jid, info),
+        reply_to: info.message.as_option().and_then(reply_of),
     })
+}
+
+/// The id of the message that `message` replies to.
+fn reply_of(message: &wa::Message) -> Option<String> {
+    message
+        .context_info()
+        .and_then(|context| context.stanza_id.clone())
+        .filter(|id| !id.is_empty())
+}
+
+/// The reactions that a history row carries.
+fn history_reactions(chat_jid: &str, info: &wa::WebMessageInfo) -> Vec<(String, String)> {
+    let mut reactions = Vec::new();
+    for reaction in &info.reactions {
+        let Some(key) = reaction.key.as_option() else {
+            continue;
+        };
+        let reactor = if key.from_me.unwrap_or(false) {
+            ME.to_owned()
+        } else if let Some(participant) = key.participant.clone() {
+            participant
+        } else {
+            chat_jid.to_owned()
+        };
+        let emoji = reaction.text.as_deref().unwrap_or_default();
+        super::inbox::set_reaction(&mut reactions, &reactor, emoji);
+    }
+    reactions
+}
+
+/// The live reactions of a message batch. Each reaction message names the
+/// message it reacts to. An empty text removes the reaction.
+fn map_reactions(event: &Event) -> Option<Vec<WaReaction>> {
+    let Event::Messages(batch) = event else {
+        return None;
+    };
+    let reactions: Vec<WaReaction> = batch
+        .iter()
+        .filter_map(|inbound| {
+            let reaction = inbound.message.reaction_message.as_option()?;
+            let target_id = reaction.key.as_option()?.id.clone()?;
+            let info = &inbound.info;
+            Some(WaReaction {
+                chat_jid: info.source.chat.to_string(),
+                target_id,
+                reactor: if info.source.is_from_me {
+                    ME.to_owned()
+                } else {
+                    info.source.sender.to_non_ad().to_string()
+                },
+                emoji: reaction.text.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+    (!reactions.is_empty()).then_some(reactions)
 }
 
 /// The sticker of a sticker message, when the app can draw it: a WebP or a
@@ -526,7 +590,102 @@ struct LiveSender {
 /// The largest profile picture the helper reads. A preview is far less.
 const PICTURE_MAX_BYTES: usize = 1024 * 1024;
 
+impl LiveSender {
+    /// The address of a cached message. A group message of another person
+    /// needs its sender.
+    fn reference<'a>(
+        chat: &'a Jid,
+        sender: Option<&'a Jid>,
+        target: &TargetRef,
+    ) -> Result<whatsapp_rust::MessageRef<'a>, ()> {
+        let id = whatsapp_rust::MessageId::new(&target.id).map_err(|_| ())?;
+        whatsapp_rust::MessageRef::new(chat, id, sender, target.from_me).map_err(|_| ())
+    }
+}
+
 impl WhatsAppSender for LiveSender {
+    fn send_reply<'a>(
+        &'a self,
+        chat_jid: &'a str,
+        body: &'a str,
+        quote: &'a TargetRef,
+    ) -> SendFuture<'a> {
+        Box::pin(async move {
+            let jid: Jid = chat_jid.parse().map_err(|_| SendFailure::Rejected)?;
+            // The quote names who wrote the message: this account, the sender
+            // in a group, or the other person of a direct chat.
+            let author = if quote.from_me {
+                self.client.pn().map(|own| own.to_non_ad().to_string())
+            } else {
+                quote.sender_jid.clone()
+            }
+            .unwrap_or_else(|| chat_jid.to_string());
+            let context = whatsapp_rust::wacore::proto_helpers::build_quote_context(
+                quote.id.clone(),
+                author,
+                &wa::Message::text(quote.body.clone()),
+            );
+            self.client
+                .send_message(jid, wa::Message::text_with_context(body, context))
+                .await
+                .map(|sent| sent.message_id.to_string())
+                .map_err(|error| classify_send_error(&error))
+        })
+    }
+
+    fn react<'a>(
+        &'a self,
+        chat_jid: &'a str,
+        target: &'a TargetRef,
+        emoji: &'a str,
+    ) -> ActionFuture<'a> {
+        Box::pin(async move {
+            let chat: Jid = chat_jid.parse().map_err(|_| ())?;
+            let sender: Option<Jid> = target
+                .sender_jid
+                .as_deref()
+                .and_then(|jid| jid.parse().ok());
+            let reference = Self::reference(&chat, sender.as_ref(), target)?;
+            self.client
+                .send_reaction(&reference, emoji)
+                .await
+                .map(|_| ())
+                .map_err(|_| ())
+        })
+    }
+
+    fn revoke<'a>(&'a self, chat_jid: &'a str, target: &'a TargetRef) -> ActionFuture<'a> {
+        Box::pin(async move {
+            let chat: Jid = chat_jid.parse().map_err(|_| ())?;
+            let sender: Option<Jid> = target
+                .sender_jid
+                .as_deref()
+                .and_then(|jid| jid.parse().ok());
+            let reference = Self::reference(&chat, sender.as_ref(), target)?;
+            self.client
+                .revoke_message(&reference)
+                .await
+                .map(|_| ())
+                .map_err(|_| ())
+        })
+    }
+
+    fn delete_for_me<'a>(&'a self, chat_jid: &'a str, target: &'a TargetRef) -> ActionFuture<'a> {
+        Box::pin(async move {
+            let chat: Jid = chat_jid.parse().map_err(|_| ())?;
+            let sender: Option<Jid> = target
+                .sender_jid
+                .as_deref()
+                .and_then(|jid| jid.parse().ok());
+            let reference = Self::reference(&chat, sender.as_ref(), target)?;
+            self.client
+                .chat_actions()
+                .delete_message_for_me(&reference, true, Some(target.timestamp))
+                .await
+                .map_err(|_| ())
+        })
+    }
+
     fn group_names(&self) -> NamesFuture<'_> {
         Box::pin(async move {
             // The error can name a group. It stays out of the log.

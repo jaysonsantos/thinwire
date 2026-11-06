@@ -10,7 +10,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use super::inbox::{self, HistoryChat, Inbox, MediaRef, MediaRequest, Mute, WaMessage};
+use super::inbox::{
+    self, HistoryChat, Inbox, MediaRef, MediaRequest, Mute, TargetRef, WaMessage, WaReaction,
+};
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret,
     emit_status,
@@ -92,7 +94,42 @@ pub(super) trait WhatsAppSender: Send + Sync {
     fn profile_picture<'a>(&'a self, _jid: &'a str) -> DownloadFuture<'a> {
         Box::pin(async { Err(()) })
     }
+
+    /// Send text that quotes `quote`. A sender with no quotes sends plain
+    /// text.
+    fn send_reply<'a>(
+        &'a self,
+        chat_jid: &'a str,
+        body: &'a str,
+        _quote: &'a TargetRef,
+    ) -> SendFuture<'a> {
+        self.send_text(chat_jid, body)
+    }
+
+    /// Set the reaction `emoji` of this account on `target`. An empty
+    /// `emoji` removes it. A sender with no client refuses.
+    fn react<'a>(
+        &'a self,
+        _chat_jid: &'a str,
+        _target: &'a TargetRef,
+        _emoji: &'a str,
+    ) -> ActionFuture<'a> {
+        Box::pin(async { Err(()) })
+    }
+
+    /// Delete `target` for every member of the chat (a revoke).
+    fn revoke<'a>(&'a self, _chat_jid: &'a str, _target: &'a TargetRef) -> ActionFuture<'a> {
+        Box::pin(async { Err(()) })
+    }
+
+    /// Delete `target` on the devices of this account only.
+    fn delete_for_me<'a>(&'a self, _chat_jid: &'a str, _target: &'a TargetRef) -> ActionFuture<'a> {
+        Box::pin(async { Err(()) })
+    }
 }
+
+/// Boxed message action: a reaction or a delete. The error has no text.
+pub(super) type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>>;
 
 /// Boxed group list. The error has no text.
 pub(super) type NamesFuture<'a> =
@@ -131,6 +168,8 @@ pub(super) enum LinkEvent {
         push_names: Vec<(String, String)>,
     },
     Messages(Vec<WaMessage>),
+    /// Live reactions to cached messages.
+    Reactions(Vec<WaReaction>),
     /// The phone muted or unmuted a chat (app-state `MuteAction`).
     Mute {
         jid: String,
@@ -655,6 +694,10 @@ impl Session {
                 let rows = state.inbox.apply_messages(messages);
                 if state.announced { rows } else { Vec::new() }
             }
+            LinkEvent::Reactions(reactions) => {
+                let rows = state.inbox.apply_reactions(reactions);
+                if state.announced { rows } else { Vec::new() }
+            }
             LinkEvent::Mute { jid, mute } => {
                 let row = state.inbox.apply_mute(&jid, mute);
                 if state.announced {
@@ -852,7 +895,10 @@ fn status(events: &EventTx, status: AdapterStatus, detail: &str) {
 pub(super) mod fake {
     use std::sync::Mutex;
 
-    use super::{DownloadFuture, MediaRef, NamesFuture, SendFailure, SendFuture, WhatsAppSender};
+    use super::{
+        ActionFuture, DownloadFuture, MediaRef, NamesFuture, SendFailure, SendFuture, TargetRef,
+        WhatsAppSender,
+    };
 
     /// Records sends. Returns `SRV<n>` ids, or the failure in `fail`. A
     /// download returns `media` when set, else it fails.
@@ -866,6 +912,15 @@ pub(super) mod fake {
         pub names: Vec<(String, String)>,
         /// The bytes of each `profile_picture`. `None` has no picture.
         pub picture: Option<Vec<u8>>,
+        /// Each reply, reaction, and delete, as "kind id".
+        pub actions: Mutex<Vec<String>>,
+    }
+
+    impl FakeSender {
+        fn act(&self, action: String) -> ActionFuture<'_> {
+            self.actions.lock().expect("fake lock").push(action);
+            Box::pin(async { Ok(()) })
+        }
     }
 
     impl WhatsAppSender for FakeSender {
@@ -894,6 +949,40 @@ pub(super) mod fake {
 
         fn profile_picture<'a>(&'a self, _jid: &'a str) -> DownloadFuture<'a> {
             Box::pin(async move { self.picture.clone().ok_or(()) })
+        }
+
+        fn send_reply<'a>(
+            &'a self,
+            chat_jid: &'a str,
+            body: &'a str,
+            quote: &'a TargetRef,
+        ) -> SendFuture<'a> {
+            self.actions
+                .lock()
+                .expect("fake lock")
+                .push(format!("reply {}", quote.id));
+            self.send_text(chat_jid, body)
+        }
+
+        fn react<'a>(
+            &'a self,
+            _chat_jid: &'a str,
+            target: &'a TargetRef,
+            emoji: &'a str,
+        ) -> ActionFuture<'a> {
+            self.act(format!("react {} {emoji}", target.id))
+        }
+
+        fn revoke<'a>(&'a self, _chat_jid: &'a str, target: &'a TargetRef) -> ActionFuture<'a> {
+            self.act(format!("revoke {}", target.id))
+        }
+
+        fn delete_for_me<'a>(
+            &'a self,
+            _chat_jid: &'a str,
+            target: &'a TargetRef,
+        ) -> ActionFuture<'a> {
+            self.act(format!("delete_for_me {}", target.id))
         }
     }
 }
