@@ -3,7 +3,7 @@
 //! FFI and network I/O stay on a dedicated receive thread plus tokio tasks.
 //! Credential values are read from the vault and never logged.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -141,6 +141,34 @@ pub(super) enum TdlibCommand {
     },
 }
 
+impl TdlibCommand {
+    /// The name of the command for a log line. It has no user data.
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Step(_) => "step",
+            Self::LoadChats => "load_chats",
+            Self::OpenChat(_) => "open_chat",
+            Self::SendText { .. } => "send_text",
+            Self::DeleteMessage { .. } => "delete_message",
+            Self::React { .. } => "react",
+            Self::EditMessage { .. } => "edit_message",
+            Self::Resend { .. } => "resend",
+            Self::LoadOlder { .. } => "load_older",
+            Self::OpenTopic { .. } => "open_topic",
+            Self::LoadOlderTopic { .. } => "load_older_topic",
+            Self::SendTopicText { .. } => "send_topic_text",
+            Self::ViewChat { .. } => "view_chat",
+            Self::ViewTopic { .. } => "view_topic",
+            Self::Close { .. } => "close",
+            Self::DownloadFile { .. } => "download_file",
+            Self::DownloadVoice { .. } => "download_voice",
+            Self::DownloadVideo { .. } => "download_video",
+            Self::DownloadDocument { .. } => "download_document",
+            Self::SendMedia { .. } => "send_media",
+        }
+    }
+}
+
 /// How often a waiter checks that closing workers have exited.
 const WORKER_POLL: Duration = Duration::from_millis(50);
 
@@ -185,9 +213,9 @@ struct LiveInbox {
     /// that leaves the list drops its rows here too, because the core drops
     /// them with the conversation.
     topics: HashMap<(i64, i32), ChatTopic>,
-    /// Main-list forums whose topic list loaded. A failed load stays out,
-    /// so the next chat-list pass tries again.
-    topic_lists: HashSet<i64>,
+    /// Main-list forums whose topic list loaded, and the wait of each failed
+    /// list before the next try.
+    topic_lists: inbox::TopicLists,
     /// Same fact, published by `view_chat` before this worker dequeues
     /// `ViewChat`. History `viewMessages` reads this, not `open_chat`.
     viewed: inbox::ViewedChat,
@@ -844,7 +872,7 @@ fn spawn_tdlib_worker(
             open_chat: None,
             open_topic: None,
             topics: HashMap::new(),
-            topic_lists: HashSet::new(),
+            topic_lists: inbox::TopicLists::default(),
             viewed: view.viewed,
             unviewed: Arc::new(Mutex::new(HashMap::new())),
             downloads: HashMap::new(),
@@ -864,6 +892,8 @@ fn spawn_tdlib_worker(
                     if live.closing.is_set() && !matches!(command, TdlibCommand::Close { .. }) {
                         continue;
                     }
+                    let kind = command.kind();
+                    let started = Instant::now();
                     match command {
                         TdlibCommand::Close { cancel } => {
                             if live.close_requested {
@@ -1009,8 +1039,15 @@ fn spawn_tdlib_worker(
                             message_id,
                             body,
                         } => {
-                            edit_message(client_id, &conversation_id, &message_id, &body, &events)
-                                .await;
+                            edit_message(
+                                client_id,
+                                &conversation_id,
+                                &message_id,
+                                &body,
+                                live.linked(),
+                                &events,
+                            )
+                            .await;
                         }
                         TdlibCommand::React {
                             conversation_id,
@@ -1098,11 +1135,14 @@ fn spawn_tdlib_worker(
                             .await;
                         }
                     }
+                    note_slow_step("command", kind, started);
                 }
                 update = update_rx.recv() => {
                     let Some(update) = update else {
                         break;
                     };
+                    let kind = update_kind(&update);
+                    let started = Instant::now();
                     let closed = apply_update(
                         client_id,
                         update,
@@ -1113,6 +1153,7 @@ fn spawn_tdlib_worker(
                         &requested_view,
                     )
                     .await;
+                    note_slow_step("update", kind, started);
                     if closed {
                         break;
                     }
@@ -1131,6 +1172,37 @@ fn spawn_tdlib_worker(
     });
 
     cmd_tx
+}
+
+/// A worker step that takes this long or longer is logged. The worker
+/// handles one command or one update at a time, so a slow step holds every
+/// later update: a sent message stays on "Sending…" and an edit waits.
+const SLOW_STEP: Duration = Duration::from_secs(1);
+
+/// Log a worker step that took [`SLOW_STEP`] or more. The line has the kind
+/// of the step and the time only: no chat, no message, and no text.
+fn note_slow_step(step: &'static str, kind: &'static str, started: Instant) {
+    let took = started.elapsed();
+    if took >= SLOW_STEP {
+        let ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(step, kind, ms, "telegram worker step was slow");
+    }
+}
+
+/// The name of an update for a log line. The kinds with a handler that waits
+/// for TDLib have their own name. Every other kind is "other": its time is
+/// the topic list pass after it.
+fn update_kind(update: &tdlib_rs::enums::Update) -> &'static str {
+    use tdlib_rs::enums::Update;
+    match update {
+        Update::AuthorizationState(_) => "authorization_state",
+        Update::User(_) => "user",
+        Update::NewMessage(_) => "new_message",
+        Update::ForumTopicInfo(_) => "forum_topic_info",
+        Update::ForumTopic(_) => "forum_topic",
+        Update::File(_) => "file",
+        _ => "other",
+    }
 }
 
 /// Wait until every closing worker exited. `false` after [`RETIRE_TIMEOUT`].
@@ -1890,31 +1962,13 @@ async fn apply_chat_update(
             );
         }
         tdlib_rs::enums::Update::MessageContent(update) => {
-            if !emit {
-                return;
-            }
-            let mapped = super::media_map::map_content(&update.new_content);
-            let conversation_id = inbox::conversation_id(update.chat_id);
-            let message_id = inbox::message_id(update.chat_id, update.message_id);
-            emit_message_media(
-                events,
-                ProtocolId::Telegram,
-                conversation_id.clone(),
-                message_id.clone(),
-                mapped.text.clone(),
-                mapped.links,
-                mapped.photo,
-                mapped.audio,
-                mapped.video,
-                mapped.file,
-            );
-            if mapped.scan {
-                schedule_text_entities(
+            if emit {
+                emit_content(
                     client_id,
-                    events.clone(),
-                    conversation_id,
-                    message_id,
-                    mapped.text,
+                    events,
+                    update.chat_id,
+                    update.message_id,
+                    &update.new_content,
                 );
             }
         }
@@ -2509,10 +2563,12 @@ async fn open_chat(client_id: i32, conversation_id: &str, live: &mut LiveInbox, 
         AdapterStatus::Ready,
         "Loading recent messages.",
     );
-    if live.directory.has_topics(chat_id)
-        && load_forum_topics(client_id, chat_id, live, events).await
-    {
-        live.topic_lists.insert(chat_id);
+    if live.directory.has_topics(chat_id) {
+        if load_forum_topics(client_id, chat_id, live, events).await {
+            live.topic_lists.loaded(chat_id);
+        } else {
+            live.topic_lists.failed(chat_id, Instant::now());
+        }
     }
     load_history(client_id, chat_id, live, events).await;
     emit_history_loaded(events, ProtocolId::Telegram, conversation_id);
@@ -2572,15 +2628,13 @@ async fn load_due_forum_topics(client_id: i32, live: &mut LiveInbox, events: &Ev
     if !live.linked() {
         return;
     }
-    let listed: HashSet<i64> = live.directory.listed_topic_chats().into_iter().collect();
-    live.topic_lists.retain(|id| listed.contains(id));
-    let due: Vec<i64> = listed
-        .into_iter()
-        .filter(|id| !live.topic_lists.contains(id))
-        .collect();
-    for chat_id in due {
+    let listed = live.directory.listed_topic_chats();
+    // A failed list waits before the next try: this pass runs after each update.
+    for chat_id in live.topic_lists.due(&listed, Instant::now()) {
         if load_forum_topics(client_id, chat_id, live, events).await {
-            live.topic_lists.insert(chat_id);
+            live.topic_lists.loaded(chat_id);
+        } else {
+            live.topic_lists.failed(chat_id, Instant::now());
         }
     }
 }
@@ -3114,15 +3168,53 @@ async fn delete_message(
     }
 }
 
-/// Put `body` in the place of the text of one own message. TDLib sends
-/// `updateMessageContent` and `updateMessageEdited`, and these updates change
-/// the row. A message that Telegram does not let this account edit, for
-/// example one older than the edit limit, gets `CommandFailed`.
+/// The new content of one message: its text, links, and media. A text with
+/// no entities is scanned for links later.
+fn emit_content(
+    client_id: i32,
+    events: &EventTx,
+    chat_id: i64,
+    message_id: i64,
+    content: &tdlib_rs::enums::MessageContent,
+) {
+    let mapped = super::media_map::map_content(content);
+    let conversation_id = inbox::conversation_id(chat_id);
+    let message_id = inbox::message_id(chat_id, message_id);
+    emit_message_media(
+        events,
+        ProtocolId::Telegram,
+        conversation_id.clone(),
+        message_id.clone(),
+        mapped.text.clone(),
+        mapped.links,
+        mapped.photo,
+        mapped.audio,
+        mapped.video,
+        mapped.file,
+    );
+    if mapped.scan {
+        schedule_text_entities(
+            client_id,
+            events.clone(),
+            conversation_id,
+            message_id,
+            mapped.text,
+        );
+    }
+}
+
+/// Put `body` in the place of the text of one own message. The reply of
+/// `editMessageText` is the edited message, and the row changes from it at
+/// once. `updateMessageContent` and `updateMessageEdited` come in the update
+/// queue and change the row again with the same text. A message that
+/// Telegram does not let this account edit, for example one older than the
+/// edit limit, gets `CommandFailed`.
 async fn edit_message(
     client_id: i32,
     conversation_id: &str,
     message_id: &str,
     body: &str,
+    emit: bool,
     events: &EventTx,
 ) {
     let Some((chat_id, id)) = inbox::parse_message_id(message_id) else {
@@ -3163,11 +3255,22 @@ async fn edit_message(
             link_preview_options: None,
             clear_draft: false,
         });
-    if let Err(error) =
-        tdlib_rs::functions::edit_message_text(chat_id, id, content, client_id).await
-    {
-        log_tdlib_error("editMessageText", &error);
-        failed("Telegram did not save the edit.");
+    match tdlib_rs::functions::edit_message_text(chat_id, id, content, client_id).await {
+        Ok(tdlib_rs::enums::Message::Message(edited)) => {
+            if emit {
+                emit_content(client_id, events, chat_id, edited.id, &edited.content);
+                emit_message_edited(
+                    events,
+                    ProtocolId::Telegram,
+                    inbox::conversation_id(chat_id),
+                    inbox::message_id(chat_id, edited.id),
+                );
+            }
+        }
+        Err(error) => {
+            log_tdlib_error("editMessageText", &error);
+            failed("Telegram did not save the edit.");
+        }
     }
 }
 
@@ -4053,7 +4156,7 @@ mod tests {
             open_chat: Some(42),
             open_topic: None,
             topics: HashMap::new(),
-            topic_lists: HashSet::new(),
+            topic_lists: inbox::TopicLists::default(),
             viewed: runtime.viewed.clone(),
             unviewed: Arc::new(Mutex::new(HashMap::new())),
             downloads: HashMap::new(),

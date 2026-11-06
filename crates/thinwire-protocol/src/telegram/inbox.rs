@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::adapter::{ChatMessage, ChatTopic, Conversation, Delivery, MessageTopic, ProtocolId};
 
@@ -26,6 +27,12 @@ pub(super) const TOPIC_PAGE_LIMIT: i32 = 100;
 /// Most pages of forum topics one load will ask for. Twenty pages is 2000
 /// topics. A stuck offset stops sooner.
 pub(super) const TOPIC_PAGE_CAP: u32 = 20;
+
+/// The wait after the first failed load of a topic list.
+pub(super) const TOPIC_RETRY_FIRST: Duration = Duration::from_secs(30);
+
+/// The longest wait before a failed topic list loads again.
+pub(super) const TOPIC_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
 
 /// TDLib uses 404 when `loadChats` has already reached the end of the list.
 pub(super) const END_OF_CHAT_LIST: i32 = 404;
@@ -598,11 +605,79 @@ pub(super) fn cache_topic(topics: &mut HashMap<(i64, i32), ChatTopic>, row: &Cha
 /// account end clears it.
 pub(super) fn forget_chat_topics(
     topics: &mut HashMap<(i64, i32), ChatTopic>,
-    topic_lists: &mut HashSet<i64>,
+    topic_lists: &mut TopicLists,
     chat_id: i64,
 ) {
     topics.retain(|(id, _), _| *id != chat_id);
-    topic_lists.remove(&chat_id);
+    topic_lists.forget(chat_id);
+}
+
+/// The topic lists of the main-list forums: the lists that loaded, and the
+/// time when a failed list can load again.
+///
+/// The worker asks for the due lists after each update. A failed load waits
+/// [`TOPIC_RETRY_FIRST`], and each failure after it doubles the wait up to
+/// [`TOPIC_RETRY_MAX`]. With no wait, a forum that always fails costs one
+/// server round trip for each update, and all later updates wait for it: a
+/// sent message stays on "Sending…" and an edit does not show.
+#[derive(Debug, Default)]
+pub(super) struct TopicLists {
+    loaded: HashSet<i64>,
+    retry: HashMap<i64, TopicRetry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TopicRetry {
+    at: Instant,
+    wait: Duration,
+}
+
+impl TopicLists {
+    /// The chats of `listed` that have no list and no wait, in the order of
+    /// `listed`. A chat that is not in `listed` is forgotten first.
+    pub(super) fn due(&mut self, listed: &[i64], now: Instant) -> Vec<i64> {
+        let keep: HashSet<i64> = listed.iter().copied().collect();
+        self.loaded.retain(|id| keep.contains(id));
+        self.retry.retain(|id, _| keep.contains(id));
+        listed
+            .iter()
+            .copied()
+            .filter(|id| {
+                !self.loaded.contains(id) && self.retry.get(id).is_none_or(|retry| retry.at <= now)
+            })
+            .collect()
+    }
+
+    /// The list of `chat_id` loaded. No later pass asks for it.
+    pub(super) fn loaded(&mut self, chat_id: i64) {
+        self.retry.remove(&chat_id);
+        self.loaded.insert(chat_id);
+    }
+
+    /// The load of `chat_id` failed at `now`. It is due again after the wait.
+    pub(super) fn failed(&mut self, chat_id: i64, now: Instant) {
+        let wait = self.retry.get(&chat_id).map_or(TOPIC_RETRY_FIRST, |retry| {
+            retry.wait.saturating_mul(2).min(TOPIC_RETRY_MAX)
+        });
+        self.retry.insert(
+            chat_id,
+            TopicRetry {
+                at: now + wait,
+                wait,
+            },
+        );
+    }
+
+    /// The chat left the list. When it comes back, its list loads again.
+    pub(super) fn forget(&mut self, chat_id: i64) {
+        self.loaded.remove(&chat_id);
+        self.retry.remove(&chat_id);
+    }
+
+    #[cfg(test)]
+    fn is_loaded(&self, chat_id: i64) -> bool {
+        self.loaded.contains(&chat_id)
+    }
 }
 
 /// The chat the user looks at, shared by the UI thread and the TDLib worker.
@@ -1203,13 +1278,55 @@ mod tests {
         );
     }
 
+    /// A forum whose topic list fails waits before the next try, so the
+    /// updates after it do not each wait for a server round trip.
+    #[test]
+    fn a_failed_topic_list_waits_longer_each_time() {
+        let mut lists = TopicLists::default();
+        let start = Instant::now();
+        assert_eq!(lists.due(&[3, 5], start), vec![3, 5]);
+        lists.loaded(3);
+        lists.failed(5, start);
+        assert!(
+            lists.due(&[3, 5], start).is_empty(),
+            "a loaded list and a new failure are not due"
+        );
+        let first = start + TOPIC_RETRY_FIRST;
+        assert_eq!(lists.due(&[3, 5], first), vec![5]);
+        lists.failed(5, first);
+        assert!(
+            lists.due(&[3, 5], first + TOPIC_RETRY_FIRST).is_empty(),
+            "the second wait is twice as long"
+        );
+        assert_eq!(lists.due(&[3, 5], first + TOPIC_RETRY_FIRST * 2), vec![5]);
+        for _ in 0..20 {
+            lists.failed(5, start);
+        }
+        assert!(
+            lists
+                .due(&[5], start + TOPIC_RETRY_MAX - Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(
+            lists.due(&[5], start + TOPIC_RETRY_MAX),
+            vec![5],
+            "the wait stops at the longest wait"
+        );
+        lists.loaded(5);
+        assert_eq!(
+            lists.due(&[3, 5], start),
+            vec![3],
+            "chat 3 left the list in the last pass, so its list loads again"
+        );
+    }
+
     /// The core drops a chat's topics when the conversation leaves. The
     /// worker cache must drop them too, or the next message never fetches
     /// the row.
     #[test]
     fn a_removed_chat_drops_its_cached_topics() {
         let mut topics = HashMap::new();
-        let mut lists = HashSet::new();
+        let mut lists = TopicLists::default();
         let row = |chat: i64, id: i64, name: &str| ChatTopic {
             protocol: ProtocolId::Telegram,
             conversation_id: conversation_id(chat),
@@ -1225,15 +1342,15 @@ mod tests {
         assert!(cache_topic(&mut topics, &row(9, 1, "General")));
         assert!(cache_topic(&mut topics, &row(9, 4, "Trail")));
         assert!(cache_topic(&mut topics, &row(8, 2, "Other")));
-        lists.insert(9);
-        lists.insert(8);
+        lists.loaded(9);
+        lists.loaded(8);
         forget_chat_topics(&mut topics, &mut lists, 9);
         assert!(
             topics.keys().all(|(chat, _)| *chat != 9),
             "chat 9 left the cache"
         );
-        assert!(!lists.contains(&9));
-        assert!(lists.contains(&8));
+        assert!(!lists.is_loaded(9));
+        assert!(lists.is_loaded(8));
         assert_eq!(topics.len(), 1);
         let again = row(9, 4, "Trail");
         assert!(

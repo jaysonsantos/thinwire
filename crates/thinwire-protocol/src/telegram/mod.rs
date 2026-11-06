@@ -1081,6 +1081,26 @@ mod tests {
             "an edit asks Telegram first if the message can change"
         );
         assert!(edit.contains("emit_command_failed"));
+        let reply = edit
+            .find("Ok(tdlib_rs::enums::Message::Message(edited))")
+            .expect("an edit reads the reply of editMessageText");
+        assert!(
+            reply < edit.find("emit_content(").expect("content")
+                && reply < edit.find("emit_message_edited(").expect("edited"),
+            "the row changes from the reply, not only from the update queue"
+        );
+        assert!(updates.contains("emit_content("));
+        let due = fn_body(src, "async fn load_due_forum_topics");
+        assert!(
+            due.contains("topic_lists.due(") && due.contains("topic_lists.failed("),
+            "a failed topic list waits, so each update does not ask the server again"
+        );
+        let worker = fn_body(src, "fn spawn_tdlib_worker");
+        assert_eq!(
+            worker.matches("note_slow_step(").count(),
+            2,
+            "both worker steps log a slow step"
+        );
         assert!(updates.contains("set_preview(update.chat_id, \"\", 0)"));
         let open = fn_body(src, "async fn open_chat");
         assert!(open.contains("load_history"));
