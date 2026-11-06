@@ -1,5 +1,6 @@
 [default]
-extend-ignore-re = ["api_id", "api_hash"]
+# An SSH host key fingerprint is base64, not words.
+extend-ignore-re = ["api_id", "api_hash", "SHA256:[A-Za-z0-9+/]{43}"]
 
 [default.extend-words]
 tdlib = "tdlib"
