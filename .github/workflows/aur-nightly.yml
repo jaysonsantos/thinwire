@@ -1,0 +1,41 @@
+# Once a day, point the AUR package thinwire-nightly-bin at the newest
+# `nightly` pre-release (scripts/aur-nightly.sh). The first version of the
+# package is pushed by hand after a review; this job only updates it.
+#
+# AUR_SSH_PRIVATE_KEY is the SSH key of the AUR account. It is step env on
+# the update step only. Never add it to ci.yml or a pull_request workflow.
+name: AUR nightly
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aur-nightly
+  cancel-in-progress: false
+
+jobs:
+  aur:
+    name: aur-nightly
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    container:
+      image: archlinux:base-devel@sha256:2de80105abb49f813a85393c6758a4334deb6bcec4a2411bd2f059c0bee6ee4c
+    steps:
+      - name: Install the tools
+        run: pacman -Syu --noconfirm --needed git openssh pacman-contrib
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Update the AUR package
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: scripts/aur-nightly.sh
