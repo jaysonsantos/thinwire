@@ -191,6 +191,7 @@ shots! {
     status_error => StatusError,
     status_notice => StatusNotice,
     several_protocols => SeveralProtocols,
+    collapsed_rail => CollapsedRail,
     muted_inbox => MutedInbox,
     muted_here => MutedHere,
     muted_by_protocol => MutedByProtocol,

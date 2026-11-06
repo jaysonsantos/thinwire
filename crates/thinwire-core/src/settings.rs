@@ -101,6 +101,8 @@ pub struct Settings {
     notifications: bool,
     /// Show the sender and the message text in a notification. Default on.
     notification_preview: bool,
+    /// The account sidebar shows only the account icons. Default off.
+    rail_collapsed: bool,
     path: PathBuf,
     persist_pending: bool,
     persist_epoch: u64,
@@ -129,6 +131,9 @@ pub struct Settings {
 
 /// Settings key of the accounts after account 0.
 const ACCOUNTS_KEY: &str = "accounts";
+
+/// Settings key of the collapsed account sidebar.
+const RAIL_COLLAPSED_KEY: &str = "rail_collapsed";
 
 /// Settings key of the WhatsApp helper path.
 const WHATSAPP_HELPER_KEY: &str = "whatsapp_helper";
@@ -167,6 +172,7 @@ impl Settings {
             theme,
             notifications: read_bool(&path, "notifications").unwrap_or(true),
             notification_preview: read_bool(&path, "notification_preview").unwrap_or(true),
+            rail_collapsed: read_bool(&path, RAIL_COLLAPSED_KEY).unwrap_or(false),
             path,
             persist_pending: false,
             persist_epoch: 0,
@@ -190,6 +196,7 @@ impl Settings {
             theme: ThemeMode::System,
             notifications: true,
             notification_preview: true,
+            rail_collapsed: false,
             path: PathBuf::new(),
             persist_pending: false,
             persist_epoch: 0,
@@ -315,6 +322,20 @@ impl Settings {
         }
     }
 
+    /// The account sidebar shows only the account icons.
+    #[must_use]
+    pub const fn rail_collapsed(&self) -> bool {
+        self.rail_collapsed
+    }
+
+    /// Collapse or expand the account sidebar. Disk persist is queued.
+    pub fn set_rail_collapsed(&mut self, collapsed: bool) {
+        if self.rail_collapsed != collapsed {
+            self.rail_collapsed = collapsed;
+            self.persist_pending = true;
+        }
+    }
+
     /// The chats muted in thinwire.
     #[must_use]
     pub const fn chat_mutes(&self) -> &ChatMutes {
@@ -380,6 +401,9 @@ impl Settings {
             self.notifications,
             self.notification_preview,
         );
+        if self.rail_collapsed {
+            text.push_str(&format!("{RAIL_COLLAPSED_KEY} = true\n"));
+        }
         if self.signal_notice_version != 0 {
             text.push_str(&format!(
                 "{SIGNAL_NOTICE_VERSION_KEY} = {}\n",
@@ -738,6 +762,25 @@ mod tests {
             Settings::load_from(path).notifications(),
             "a bad value is on"
         );
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_persists_and_defaults_off() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert!(!settings.rail_collapsed());
+        settings.set_rail_collapsed(true);
+        settings.persist_now().expect("save");
+        assert!(Settings::load_from(path.clone()).rail_collapsed());
+        settings.set_rail_collapsed(false);
+        settings.persist_now().expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.contains(RAIL_COLLAPSED_KEY),
+            "the default writes no key"
+        );
+        assert!(!Settings::load_from(path).rail_collapsed());
+        assert!(!Settings::in_memory().rail_collapsed());
     }
 
     #[test]

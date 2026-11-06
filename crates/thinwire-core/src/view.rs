@@ -54,6 +54,12 @@ impl View<'_> {
         self.settings.notifications()
     }
 
+    /// The account sidebar shows only the account icons.
+    #[must_use]
+    pub fn rail_collapsed(&self) -> bool {
+        self.settings.rail_collapsed()
+    }
+
     /// Settings switch: notifications show the sender and the text (#32).
     #[must_use]
     pub fn notification_preview(&self) -> bool {

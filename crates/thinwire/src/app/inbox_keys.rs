@@ -120,6 +120,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             | Intent::CancelEdit
             | Intent::CancelReply) => state.message_intents.push(intent),
             Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
+            Intent::SetRailCollapsed(collapsed) => state.settings.set_rail_collapsed(collapsed),
             Intent::AddAttachments {
                 protocol,
                 conversation_id,
@@ -994,6 +995,31 @@ fn a_right_click_opens_the_message_menu_and_delete_asks() {
         harness.query_by_label("Also delete for everyone").is_none(),
         "the question closed"
     );
+}
+
+/// The chevron collapses the sidebar to the account tiles. A tile still
+/// opens its account, and the other chevron opens the full sidebar again.
+#[test]
+fn the_sidebar_collapses_to_account_icons() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    harness.get_by_label("Collapse sidebar").click();
+    harness.run();
+    harness.run();
+    assert!(harness.state().settings.rail_collapsed());
+    assert!(harness.query_by_label("Collapse sidebar").is_none());
+    assert!(harness.query_by_label("thinwire").is_none(), "no name");
+    harness.get_by_label("Add account");
+    harness.get_by_label("Settings");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Telegram")
+        .click();
+    // The account loads its chats again, so a spinner keeps the frame busy.
+    harness.run_steps(2);
+    harness.get_by_label("Expand sidebar").click();
+    harness.run_steps(2);
+    assert!(!harness.state().settings.rail_collapsed());
+    harness.get_by_label("Collapse sidebar");
 }
 
 /// Edit shows only for an own text message, and it asks the core to edit

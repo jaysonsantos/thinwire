@@ -94,6 +94,20 @@ pub(crate) fn chevron_left(painter: &egui::Painter, center: Pos2, size: f32, col
     );
 }
 
+/// A chevron that points right: open the column on the left again.
+pub(crate) fn chevron_right(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let stroke = Stroke::new(2.0, color);
+    let unit = size / 16.0;
+    painter.line_segment(
+        [at(center, unit, -2.5, -6.0), at(center, unit, 3.5, 0.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [at(center, unit, 3.5, 0.0), at(center, unit, -2.5, 6.0)],
+        stroke,
+    );
+}
+
 /// A hash sign: one topic of a forum.
 pub(crate) fn hash(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     let stroke = Stroke::new(1.6, color);

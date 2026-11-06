@@ -107,6 +107,8 @@ pub enum Scenario {
     /// Telegram and Slack at once. Slack comes from its demo adapter, so the
     /// default build shows it.
     SeveralProtocols,
+    /// Telegram and Slack with the account sidebar collapsed to its icons.
+    CollapsedRail,
     /// Muted chats in the inbox (#153): one muted in thinwire, one muted in
     /// Telegram. A chat with no mute is open: its header shows Mute.
     MutedInbox,
@@ -133,7 +135,7 @@ pub enum Scenario {
 
 impl Scenario {
     /// Every scenario, in a fixed order.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::FirstRun,
         Self::EmptyInbox,
         Self::LongChat,
@@ -150,6 +152,7 @@ impl Scenario {
         Self::StatusError,
         Self::StatusNotice,
         Self::SeveralProtocols,
+        Self::CollapsedRail,
         Self::MutedInbox,
         Self::MutedHere,
         Self::MutedByProtocol,
@@ -182,6 +185,7 @@ impl Scenario {
             Self::StatusError => "status_error",
             Self::StatusNotice => "status_notice",
             Self::SeveralProtocols => "several_protocols",
+            Self::CollapsedRail => "collapsed_rail",
             Self::MutedInbox => "muted_inbox",
             Self::MutedHere => "muted_here",
             Self::MutedByProtocol => "muted_by_protocol",
@@ -292,10 +296,13 @@ impl Scenario {
                 protocol: ProtocolId::Telegram,
                 text: "Older chats load in the background.".into(),
             }),
-            Self::SeveralProtocols => {
+            Self::SeveralProtocols | Self::CollapsedRail => {
                 setup.scripts.push(slack_linked());
                 setup.visible.push(ProtocolId::Slack);
                 setup.intents.push(select(ADA));
+                if self == Self::CollapsedRail {
+                    setup.intents.push(Intent::SetRailCollapsed(true));
+                }
             }
             Self::MutedInbox | Self::MutedHere | Self::MutedByProtocol => {
                 telegram = telegram_linked(muted_rows());
@@ -949,6 +956,10 @@ mod tests {
                 }
                 Scenario::LongChat | Scenario::SeveralProtocols => {
                     assert_eq!(view.selected_messages().len(), PAGE, "{name}");
+                }
+                Scenario::CollapsedRail => {
+                    assert_eq!(view.selected_messages().len(), PAGE, "{name}");
+                    assert!(view.rail_collapsed(), "{name}");
                 }
                 Scenario::LongChatLoadingOlder => {
                     assert_eq!(view.older_state(), OlderState::Loading, "{name}");

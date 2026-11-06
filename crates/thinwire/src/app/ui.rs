@@ -52,6 +52,10 @@ pub(crate) fn keychain_notice(persistence: Persistence) -> Option<&'static str> 
 /// Width the account sidebar opens at, and when the window is narrow.
 const RAIL_WIDTH: f32 = 216.0;
 const RAIL_WIDTH_NARROW: f32 = 188.0;
+/// Width of the collapsed account sidebar: one protocol tile and its inset.
+const RAIL_WIDTH_COLLAPSED: f32 = TILE + theme::ROW_INSET.x * 2.0 + space::S * 2.0;
+/// Side of the brand mark, and of the button that collapses the sidebar.
+const BRAND_MARK: f32 = 26.0;
 /// Width the chat list opens at, and when the window is narrow.
 const LIST_WIDTH: f32 = 312.0;
 const LIST_WIDTH_NARROW: f32 = 256.0;
@@ -666,6 +670,10 @@ pub(super) fn status_strip_visible(snapshot: &Snapshot, notice: Option<&'static 
 /// Left sidebar: the mark, one row per account, then the foot with Add
 /// account and Settings. The chat list is the next column.
 fn account_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    if snapshot.rail_collapsed() {
+        collapsed_rail(ui, snapshot, out);
+        return;
+    }
     let palette = theme::palette(ui);
     egui::Panel::left("accounts")
         .resizable(true)
@@ -679,7 +687,7 @@ fn account_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         .frame(theme::rail_frame(palette))
         .show(ui, |ui| {
             rail_footer(ui, snapshot, out);
-            brand(ui);
+            brand(ui, out);
             egui::ScrollArea::vertical()
                 .id_salt("accounts-scroll")
                 .auto_shrink([false, false])
@@ -690,29 +698,232 @@ fn account_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
         });
 }
 
-/// The mark and the name at the top of the sidebar.
-fn brand(ui: &mut egui::Ui) {
+/// The mark and the name at the top of the sidebar, and the button that
+/// collapses the sidebar.
+fn brand(ui: &mut egui::Ui, out: &mut Vec<Intent>) {
     let palette = theme::palette(ui);
     ui.horizontal(|ui| {
         ui.add_space(theme::ROW_INSET.x);
-        let (mark, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
-        ui.painter()
-            .rect_filled(mark, egui::CornerRadius::same(8), palette.accent);
-        ui.painter().text(
-            mark.center(),
-            egui::Align2::CENTER_CENTER,
-            "t",
-            egui::FontId::new(size::BODY, theme::semibold()),
-            palette.on_accent,
-        );
+        brand_mark(ui);
         ui.add_space(space::XS);
         ui.label(
             RichText::new("thinwire")
                 .text_style(egui::TextStyle::Heading)
                 .color(palette.text),
         );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if rail_toggle(ui, false).clicked() {
+                out.push(Intent::SetRailCollapsed(true));
+            }
+        });
     });
     ui.add_space(space::S);
+}
+
+/// The "t" mark of thinwire.
+fn brand_mark(ui: &mut egui::Ui) {
+    let palette = theme::palette(ui);
+    let (mark, _) =
+        ui.allocate_exact_size(egui::vec2(BRAND_MARK, BRAND_MARK), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(mark, egui::CornerRadius::same(8), palette.accent);
+    ui.painter().text(
+        mark.center(),
+        egui::Align2::CENTER_CENTER,
+        "t",
+        egui::FontId::new(size::BODY, theme::semibold()),
+        palette.on_accent,
+    );
+}
+
+/// The quiet chevron that collapses the sidebar, or expands it again.
+fn rail_toggle(ui: &mut egui::Ui, collapsed: bool) -> egui::Response {
+    let (label, icon): (&str, Icon) = if collapsed {
+        ("Expand sidebar", icons::chevron_right)
+    } else {
+        ("Collapse sidebar", icons::chevron_left)
+    };
+    let palette = theme::palette(ui);
+    let icon_id = egui::IdSalt::new("rail-toggle-icon");
+    let shown = egui::Button::new(egui::Atom::custom(
+        icon_id,
+        egui::vec2(RAIL_ICON, RAIL_ICON),
+    ))
+    .frame_when_inactive(false)
+    .corner_radius(egui::CornerRadius::same(radius::ROW))
+    .min_size(egui::vec2(BRAND_MARK, BRAND_MARK))
+    .atom_ui(ui);
+    if let Some(rect) = shown.rect(icon_id) {
+        icon(ui.painter(), rect.center(), RAIL_ICON, palette.text3);
+    }
+    let enabled = ui.is_enabled();
+    let response = shown.response;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+    response.on_hover_text(label)
+}
+
+/// The collapsed account sidebar: the mark, one tile for each account with
+/// its state dot and its unread count, and the icons of Add account and
+/// Settings. A tooltip names each one.
+fn collapsed_rail(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    let palette = theme::palette(ui);
+    egui::Panel::left("accounts-collapsed")
+        .resizable(false)
+        .exact_size(RAIL_WIDTH_COLLAPSED)
+        .show_separator_line(false)
+        .frame(theme::rail_frame(palette))
+        .show(ui, |ui| {
+            collapsed_footer(ui, snapshot, out);
+            ui.vertical_centered(|ui| {
+                brand_mark(ui);
+                ui.add_space(space::XS);
+                if rail_toggle(ui, true).clicked() {
+                    out.push(Intent::SetRailCollapsed(false));
+                }
+            });
+            ui.add_space(space::S);
+            egui::ScrollArea::vertical()
+                .id_salt("accounts-scroll-collapsed")
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = ROW_GAP;
+                    let mut clicked = None;
+                    for account in snapshot.accounts.iter() {
+                        if !snapshot.shows_in_switcher(account.caps.id) {
+                            continue;
+                        }
+                        let unread = snapshot.account_row_unread(account);
+                        let selected = snapshot.account_row_selected(account);
+                        if account_icon(ui, snapshot, account, selected, unread) {
+                            match account.signal_retained {
+                                Some(slot) => out.push(Intent::SelectRetainedSignal(slot)),
+                                None => clicked = Some(account.caps.id),
+                            }
+                        }
+                    }
+                    if let Some(protocol) = clicked {
+                        out.push(Intent::SelectProtocol(protocol));
+                    }
+                });
+        });
+}
+
+/// The foot of the collapsed sidebar: Add account and Settings as icons.
+/// Add Slack workspace needs the full sidebar.
+fn collapsed_footer(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    egui::Panel::bottom("accounts-footer-collapsed")
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(egui::Frame::new().inner_margin(egui::Margin {
+            top: space::S as i8,
+            ..egui::Margin::ZERO
+        }))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = ROW_GAP;
+            let add = rail_icon_button(ui, "Add account", icons::plus);
+            egui::Popup::menu(&add)
+                .align(egui::RectAlign::TOP_START)
+                .gap(space::XS)
+                .show(|ui| add_account_menu(ui, snapshot, out));
+            let settings = rail_icon_button(ui, "Settings", icons::gear);
+            egui::Popup::menu(&settings)
+                .align(egui::RectAlign::TOP_START)
+                .gap(space::XS)
+                .show(|ui| settings_menu(ui, snapshot, out));
+        });
+}
+
+/// A full-width button of the collapsed sidebar with only its icon. The
+/// label is its tooltip and its name for a screen reader.
+fn rail_icon_button(ui: &mut egui::Ui, label: &str, icon: Icon) -> egui::Response {
+    let palette = theme::palette(ui);
+    let icon_id = egui::IdSalt::new(("rail-icon", label));
+    let shown = egui::Button::new(egui::Atom::custom(
+        icon_id,
+        egui::vec2(RAIL_ICON, RAIL_ICON),
+    ))
+    .frame_when_inactive(false)
+    .corner_radius(egui::CornerRadius::same(radius::ROW))
+    .min_size(egui::vec2(ui.available_width(), theme::MIN_TARGET + 4.0))
+    .atom_ui(ui);
+    if let Some(rect) = shown.rect(icon_id) {
+        icon(ui.painter(), rect.center(), RAIL_ICON, palette.text2);
+    }
+    let enabled = ui.is_enabled();
+    let response = shown.response;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, label));
+    response.on_hover_text(label)
+}
+
+/// One account of the collapsed sidebar: the protocol tile, the state dot,
+/// and the unread count on the corner of the tile. The tooltip has the name
+/// and the state line. `true` when a click selects the account.
+fn account_icon(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    account: &AccountRow,
+    selected: bool,
+    unread: u32,
+) -> bool {
+    let caps = account.caps;
+    let palette = theme::palette(ui);
+    // A store that could not be read stays in the list and takes no click.
+    let enabled = !account.history_unreadable();
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), TILE + theme::ROW_INSET.y * 2.0),
+        egui::Sense::hover(),
+    );
+    let id = ui
+        .scope_id()
+        .with(("account-icon", caps.id, account.signal_retained));
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let mut response = ui.interact(rect, id, sense);
+    if enabled {
+        response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    let fill = row_backdrop(ui, id, rect, palette.rail, selected, response.hovered());
+    let tile = egui::Rect::from_center_size(rect.center(), egui::vec2(TILE, TILE));
+    // The state line is in the tooltip only, so a problem colors the dot.
+    let dot = match account.status {
+        AdapterStatus::Ready => palette.ok,
+        AdapterStatus::Error | AdapterStatus::Refused => palette.warn,
+        _ => palette.text3,
+    };
+    paint_protocol_tile(ui, tile, caps.id, Some((fill, dot)));
+    let badge = badge_text(unread);
+    if let Some(text) = &badge {
+        corner_badge(ui, tile, rect.right(), text, fill);
+    }
+    let mut tip = format!("{} · {}", caps.id.label(), chip_label(snapshot, account));
+    if let Some(text) = &badge {
+        tip.push_str(&format!(" · {text} unread"));
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Button, enabled, selected, caps.id.label())
+    });
+    let response = response.on_hover_text(tip);
+    enabled && response.clicked()
+}
+
+/// The unread count on the top right corner of a tile, with a ring in the
+/// row fill. It stays left of `right`.
+fn corner_badge(ui: &egui::Ui, tile: egui::Rect, right: f32, text: &str, ring: egui::Color32) {
+    let palette = theme::palette(ui);
+    let galley = badge_galley(ui, text, palette.on_badge);
+    let size = egui::vec2(badge_width(galley.size().x), galley.size().y + space::XS);
+    let max_x = (tile.right() + size.x * 0.5).min(right - 1.0);
+    let rect =
+        egui::Rect::from_min_size(egui::pos2(max_x - size.x, tile.top() - size.y * 0.25), size);
+    let corner = egui::CornerRadius::same(radius::PILL);
+    ui.painter().rect_filled(rect.expand(2.0), corner, ring);
+    ui.painter().rect_filled(rect, corner, palette.badge);
+    let pos = rect.center() - galley.size() * 0.5;
+    ui.painter().galley(pos, galley, palette.on_badge);
 }
 
 fn account_rows(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {

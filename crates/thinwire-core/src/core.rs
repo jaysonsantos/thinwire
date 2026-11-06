@@ -980,6 +980,7 @@ impl Core {
                     self.notify.hide_previews();
                 }
             }
+            Intent::SetRailCollapsed(collapsed) => self.settings.set_rail_collapsed(collapsed),
             Intent::SetChatMute {
                 protocol,
                 conversation_id,

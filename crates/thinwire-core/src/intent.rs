@@ -113,6 +113,9 @@ pub enum Intent {
     SetNotifications(bool),
     /// Settings: show the sender and the text in notifications (#32).
     SetNotificationPreview(bool),
+    /// Collapse the account sidebar to its icons, or expand it. Disk I/O
+    /// runs off the caller thread.
+    SetRailCollapsed(bool),
     /// Mute or unmute one chat in thinwire (#153). A protocol mute wins:
     /// an unmute here never unmutes it. Disk I/O runs off the caller thread.
     SetChatMute {
