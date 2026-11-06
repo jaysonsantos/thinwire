@@ -126,6 +126,13 @@ pub(super) trait WhatsAppSender: Send + Sync {
     fn delete_for_me<'a>(&'a self, _chat_jid: &'a str, _target: &'a TargetRef) -> ActionFuture<'a> {
         Box::pin(async { Err(()) })
     }
+
+    /// The subject of one group that has no stored name. `Ok(None)` when
+    /// the group has no subject. The default does not ask.
+    #[allow(dead_code)]
+    fn group_subject<'a>(&'a self, _jid: &'a str) -> SubjectFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Boxed message action: a reaction or a delete. The error has no text.
@@ -134,6 +141,11 @@ pub(super) type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> +
 /// Boxed group list. The error has no text.
 pub(super) type NamesFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, ()>> + Send + 'a>>;
+
+/// The subject of one group. `Ok(None)` is a group with no subject.
+#[allow(dead_code)]
+pub(super) type SubjectFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<String>, ()>> + Send + 'a>>;
 
 /// Chat pictures that one run fetches: the newest chats only. A lookup for
 /// every chat at each start is a load that WhatsApp can see.
@@ -896,8 +908,8 @@ pub(super) mod fake {
     use std::sync::Mutex;
 
     use super::{
-        ActionFuture, DownloadFuture, MediaRef, NamesFuture, SendFailure, SendFuture, TargetRef,
-        WhatsAppSender,
+        ActionFuture, DownloadFuture, MediaRef, NamesFuture, SendFailure, SendFuture,
+        SubjectFuture, TargetRef, WhatsAppSender,
     };
 
     /// Records sends. Returns `SRV<n>` ids, or the failure in `fail`. A
@@ -908,8 +920,13 @@ pub(super) mod fake {
         pub fail: Option<SendFailure>,
         pub media: Option<Vec<u8>>,
         pub downloads: Mutex<u32>,
-        /// The group subjects of `group_names`.
+        /// The group subjects of `group_names` (the participating list).
         pub names: Vec<(String, String)>,
+        /// The subject `group_subject` returns for one group, and the
+        /// groups it was asked for.
+        #[allow(dead_code)]
+        pub subjects: Vec<(String, String)>,
+        pub subject_asks: Mutex<Vec<String>>,
         /// The bytes of each `profile_picture`. `None` has no picture.
         pub picture: Option<Vec<u8>>,
         /// Each reply, reaction, and delete, as "kind id".
@@ -945,6 +962,20 @@ pub(super) mod fake {
 
         fn group_names(&self) -> NamesFuture<'_> {
             Box::pin(async move { Ok(self.names.clone()) })
+        }
+
+        fn group_subject<'a>(&'a self, jid: &'a str) -> SubjectFuture<'a> {
+            Box::pin(async move {
+                self.subject_asks
+                    .lock()
+                    .expect("fake lock")
+                    .push(jid.to_string());
+                Ok(self
+                    .subjects
+                    .iter()
+                    .find(|(id, _)| id == jid)
+                    .map(|(_, name)| name.clone()))
+            })
         }
 
         fn profile_picture<'a>(&'a self, _jid: &'a str) -> DownloadFuture<'a> {
@@ -993,8 +1024,11 @@ mod tests {
 
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+    use std::sync::Arc;
+
     use super::*;
     use crate::whatsapp::inbox::tests::message;
+    use crate::whatsapp::inbox::{HistoryChat, Mute};
     use thinwire_protocol::Conversation;
 
     const CHAT: &str = "111@s.whatsapp.net";
@@ -1176,6 +1210,98 @@ mod tests {
         }
         assert!(named, "the group got its subject");
         assert_eq!(pictures, 1, "one picture for the one chat, one time");
+    }
+
+    /// A group with no stored name is asked for its subject, and the title
+    /// changes when that subject arrives. A group that already has a name
+    /// is not asked. A group that appears later with no name is asked too.
+    #[tokio::test]
+    async fn a_group_with_no_stored_name_gets_its_subject() {
+        const UNNAMED: &str = "120363000000000001@g.us";
+        const NAMED: &str = "120363000000000002@g.us";
+        const LATER: &str = "120363000000000003@g.us";
+        let session = Session::default();
+        session.begin(1);
+        let (tx, mut rx) = unbounded_channel();
+        let sender = Arc::new(fake::FakeSender {
+            subjects: vec![
+                (UNNAMED.into(), "School run".into()),
+                (NAMED.into(), "Should not replace".into()),
+                (LATER.into(), "Parents".into()),
+            ],
+            ..Default::default()
+        });
+        assert!(session.attach_sender(1, sender.clone()));
+        let chat = |jid: &str, name: Option<&str>, body: &str| HistoryChat {
+            jid: jid.into(),
+            name: name.map(str::to_string),
+            unread: 0,
+            timestamp: 10,
+            messages: vec![message(jid, "m1", body, 10)],
+            mute: Mute::Off,
+        };
+        session.apply(
+            LinkEvent::History {
+                chats: vec![
+                    chat(UNNAMED, None, "Guten Morgen"),
+                    chat(NAMED, Some("Family"), "hi"),
+                ],
+                push_names: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        session.apply(LinkEvent::Connected, 1, &tx);
+        let mut saw_school = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !saw_school {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(AdapterEvent::ConversationUpsert { conversation }))
+                    if conversation.title == "School run" =>
+                {
+                    saw_school = true;
+                }
+                Ok(Some(AdapterEvent::ConversationUpsert { conversation }))
+                    if conversation.id == inbox::conversation_id(NAMED) =>
+                {
+                    assert_eq!(conversation.title, "Family");
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+        assert!(
+            saw_school,
+            "the unnamed group gets the subject from metadata"
+        );
+        let asks = sender.subject_asks.lock().expect("fake lock").clone();
+        assert_eq!(
+            asks,
+            vec![UNNAMED.to_string()],
+            "a named group is left alone"
+        );
+        session.apply(
+            LinkEvent::Messages(vec![message(LATER, "m2", "hello", 11)]),
+            1,
+            &tx,
+        );
+        let mut saw_parents = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !saw_parents {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(AdapterEvent::ConversationUpsert { conversation }))
+                    if conversation.title == "Parents" =>
+                {
+                    saw_parents = true;
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+        assert!(saw_parents, "a group that appears with no name is fetched");
+        let asks = sender.subject_asks.lock().expect("fake lock").clone();
+        assert!(asks.contains(&LATER.to_string()));
+        assert!(!asks.contains(&NAMED.to_string()));
     }
 
     /// #168 item 12: the session tells the inbox about each connection. A

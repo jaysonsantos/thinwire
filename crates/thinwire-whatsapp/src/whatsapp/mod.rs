@@ -2678,6 +2678,50 @@ mod tests {
         ));
     }
 
+    /// The shell shows "Start of chat" when `more` is false. One cached
+    /// message is the recent window. It is not proof the phone has nothing
+    /// older.
+    #[test]
+    fn a_short_cached_window_is_not_the_start_of_the_chat() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut adapter = with_sender(Arc::new(FakeSender::default()));
+        adapter.session.apply(
+            LinkEvent::History {
+                chats: vec![inbox::HistoryChat {
+                    mute: Default::default(),
+                    jid: CHAT.into(),
+                    name: None,
+                    unread: 0,
+                    timestamp: 10,
+                    messages: vec![message(CHAT, "only", "Guten Morgen", 10)],
+                }],
+                push_names: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        adapter.session.apply(LinkEvent::Connected, 1, &tx);
+        drain(&mut rx);
+        adapter
+            .handle(
+                AdapterCommand::LoadOlderMessages {
+                    protocol: ProtocolId::WhatsApp,
+                    conversation_id: "whatsapp:111@s.whatsapp.net".into(),
+                    before_message_id: "only".into(),
+                    store_cursor: None,
+                },
+                &tx,
+            )
+            .expect("never an adapter error");
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AdapterEvent::OlderHistoryLoaded { more: false, .. })),
+            "more == false is Start of chat; a cached window is not that: {events:?}"
+        );
+    }
+
     /// ADR 0010 rule 7: ViewChat marks the viewed chat read, and leaving it
     /// lets new messages count again.
     #[test]
