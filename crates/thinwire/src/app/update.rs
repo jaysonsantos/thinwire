@@ -1379,33 +1379,53 @@ fn worker(
     let mut ledger = load_ledger(&ledger_file);
     settle_startup(&stamp, &phase, &shutdown, &wake, &mut ledger, &ledger_file);
     while let Ok(command) = commands.recv() {
-        let current = lock_phase(&phase).clone();
-        match apply_command(&current, command, &mut ledger) {
-            Step::Stay => {}
-            Step::Quiet => {
-                let _ = store_ledger(&ledger_file, &ledger);
-                set_phase(&phase, Phase::Quiet, &wake);
-            }
-            Step::Check => {
-                set_phase(&phase, Phase::Checking, &wake);
-                publish_check(&stamp, &phase, &mut ledger, &ledger_file, &wake);
-            }
-            Step::Fetch(offer) => {
-                set_phase(&phase, Phase::Fetching(offer.clone()), &wake);
-                match install_offer(&offer) {
-                    Ok(()) => {
-                        shutdown.store(true, Ordering::SeqCst);
-                        set_phase(&phase, Phase::Handoff(offer), &wake);
-                    }
-                    Err(error) => set_phase(
-                        &phase,
-                        Phase::Failed {
-                            error,
-                            retry: Some(offer),
-                        },
-                        &wake,
-                    ),
+        worker_command(
+            &stamp,
+            &phase,
+            command,
+            &mut ledger,
+            &ledger_file,
+            &shutdown,
+            &wake,
+        );
+    }
+}
+
+fn worker_command(
+    stamp: &BuildStamp,
+    phase: &Mutex<Phase>,
+    command: Command,
+    ledger: &mut Ledger,
+    ledger_file: &Path,
+    shutdown: &AtomicBool,
+    wake: &impl Fn(),
+) {
+    let current = lock_phase(phase).clone();
+    match apply_command(&current, command, ledger) {
+        Step::Stay => {}
+        Step::Quiet => {
+            let _ = store_ledger(ledger_file, ledger);
+            set_phase(phase, Phase::Quiet, wake);
+        }
+        Step::Check => {
+            set_phase(phase, Phase::Checking, wake);
+            publish_check(stamp, phase, ledger, ledger_file, wake);
+        }
+        Step::Fetch(offer) => {
+            set_phase(phase, Phase::Fetching(offer.clone()), wake);
+            match install_offer(&offer) {
+                Ok(()) => {
+                    shutdown.store(true, Ordering::SeqCst);
+                    set_phase(phase, Phase::Handoff(offer), wake);
                 }
+                Err(error) => set_phase(
+                    phase,
+                    Phase::Failed {
+                        error,
+                        retry: Some(offer),
+                    },
+                    wake,
+                ),
             }
         }
     }
@@ -3112,6 +3132,71 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         drop(commands);
+        worker_thread.join().expect("worker");
+    }
+
+    fn quiet_within(phase: &Mutex<Phase>, what: &str) {
+        let started = Instant::now();
+        loop {
+            let quiet = match phase.try_lock() {
+                Ok(guard) => matches!(*guard, Phase::Quiet),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    matches!(*poisoned.into_inner(), Phase::Quiet)
+                }
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            };
+            if quiet {
+                return;
+            }
+            if started.elapsed() >= Duration::from_secs(2) {
+                panic!("{what} did not reach quiet");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn later_and_dismiss_reach_quiet() {
+        let scratch = Scratch::new("commands");
+        let ledger_file = scratch.0.join("ledger.json");
+        let phase = Arc::new(Mutex::new(Phase::Offer(offer())));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stamp = stamp_of("0c07a9c");
+        let phase_worker = Arc::clone(&phase);
+        let ledger_worker = ledger_file.clone();
+        let (send, incoming) = std::sync::mpsc::channel();
+        let worker_thread = std::thread::spawn(move || {
+            let mut ledger = Ledger {
+                swap_error: Some(swap_text()),
+                ..Ledger::default()
+            };
+            while let Ok(command) = incoming.recv() {
+                worker_command(
+                    &stamp,
+                    &phase_worker,
+                    command,
+                    &mut ledger,
+                    &ledger_worker,
+                    &shutdown,
+                    &|| {},
+                );
+            }
+        });
+        send.send(Command::Later).expect("later");
+        quiet_within(&phase, "later");
+        let saved = load_ledger(&ledger_file);
+        assert_eq!(saved.deferred_rev, Some(277));
+        assert_eq!(saved.swap_error, Some(swap_text()));
+        *phase.lock().unwrap_or_else(PoisonError::into_inner) = Phase::Failed {
+            error: check_text(),
+            retry: None,
+        };
+        send.send(Command::Dismiss).expect("dismiss");
+        quiet_within(&phase, "dismiss");
+        let saved = load_ledger(&ledger_file);
+        assert!(saved.swap_error.is_none());
+        assert_eq!(saved.deferred_rev, Some(277));
+        drop(send);
         worker_thread.join().expect("worker");
     }
 }
