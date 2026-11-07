@@ -1686,7 +1686,9 @@ fn fetch_offer() -> Result<Offer, PlainError> {
 fn download_archive(name: &str) -> Result<Vec<u8>, PlainError> {
     #[cfg(windows)]
     {
-        http_get(&feed_url(name), MAX_ARCHIVE_BYTES).map_err(|_| bad_payload())
+        // A transport failure is not a checksum miss. `stage_verified` is the
+        // only place that returns `bad_payload` for the archive bytes.
+        http_get(&feed_url(name), MAX_ARCHIVE_BYTES)
     }
     #[cfg(not(windows))]
     {
@@ -1896,15 +1898,32 @@ fn swap_files(
             Ok(SwapEnd::Installed)
         }
         Err(error) => {
-            clear_incoming(&journal.install_dir);
-            let _ = std::fs::remove_file(journal_file);
-            let _ = std::fs::remove_dir_all(&journal.staging_dir);
+            release_failed_swap(&journal.install_dir, journal_file, &journal.staging_dir);
             let mut ledger = load_ledger(ledger_file);
             ledger.swap_error = Some(error.clone());
             let _ = store_ledger(ledger_file, &ledger);
             Err(error)
         }
     }
+}
+
+/// Drop the side files when every live name is still a file. A missing
+/// live name keeps the journal, `.incoming`, and `.old`, because deleting
+/// `.incoming` there can remove the only remaining copy.
+fn release_failed_swap(install_dir: &Path, journal_file: &Path, staging_dir: &Path) {
+    let _ = retreat_all(install_dir);
+    if EXES
+        .iter()
+        .any(|name| !live_path(install_dir, name).is_file())
+    {
+        return;
+    }
+    clear_incoming(install_dir);
+    for name in EXES {
+        let _ = std::fs::remove_file(old_path(install_dir, name));
+    }
+    let _ = std::fs::remove_file(journal_file);
+    let _ = std::fs::remove_dir_all(staging_dir);
 }
 
 fn copy_notices(journal: &Journal) {
@@ -1974,13 +1993,19 @@ fn spawn_apply(staging: &Path, journal: &Path) -> Result<(), PlainError> {
 }
 
 fn spawn_normal(install: &Path) -> Result<(), PlainError> {
-    std::process::Command::new(install.join(EXES[0]))
+    let mut command = std::process::Command::new(install.join(EXES[0]));
+    command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(|_| swap_rolled_back())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // The relaunch is the GUI. A new console window is not the app the
+        // user just closed.
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command.spawn().map(|_| ()).map_err(|_| swap_rolled_back())
 }
 
 fn install_dir() -> Option<PathBuf> {
@@ -3049,6 +3074,37 @@ mod tests {
             std::fs::read(broken.install.join(EXES[0])).expect("live"),
             b"old-thinwire.exe"
         );
+        assert!(!old_path(&broken.install, EXES[0]).exists());
+    }
+
+    #[test]
+    fn a_missing_live_name_keeps_the_journal_and_the_incoming_file() {
+        let layout = Layout::new("missing-live");
+        let helper = EXES[1];
+        std::fs::rename(
+            layout.install.join(helper),
+            old_path(&layout.install, helper),
+        )
+        .expect("aside");
+        std::fs::write(incoming_path(&layout.install, helper), b"new-helper").expect("incoming");
+        std::fs::create_dir(layout.install.join(helper)).expect("block the live name");
+        std::fs::create_dir_all(layout.journal.parent().expect("dir")).expect("dir");
+        write_journal(&layout.journal, &layout.record()).expect("journal");
+        let ledger_file = layout.install.join("ledger.json");
+        assert_eq!(
+            swap_files(&layout.record(), &ledger_file, &layout.journal).unwrap_err(),
+            swap_text()
+        );
+        assert!(
+            layout.journal.is_file(),
+            "the next start can retry the swap"
+        );
+        assert_eq!(
+            std::fs::read(incoming_path(&layout.install, helper)).expect("incoming"),
+            b"new-helper"
+        );
+        assert!(old_path(&layout.install, helper).is_file());
+        assert_eq!(load_ledger(&ledger_file).swap_error, Some(swap_text()));
     }
 
     #[test]
