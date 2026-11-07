@@ -1604,4 +1604,64 @@ TeamIdentifier=89SP4VB8Y7
         assert_eq!(fs::read(macos.join("thinwire")).expect("app bytes"), b"app");
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn the_publish_script_signature_verifies() {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/sign-update.sh");
+        let dir = scratch("sign");
+        let pem = dir.join("fixture.pem");
+        let public = dir.join("pub.txt");
+        let message = dir.join("appcast.xml");
+        fs::write(&message, b"<rss>fixture</rss>\n").expect("message");
+        let generated = std::process::Command::new("openssl")
+            .args(["genpkey", "-algorithm", "ED25519", "-out"])
+            .arg(&pem)
+            .status()
+            .expect("openssl");
+        assert!(generated.success());
+        let derived = std::process::Command::new("openssl")
+            .args(["pkey", "-in"])
+            .arg(&pem)
+            .args(["-pubout", "-outform", "DER"])
+            .output()
+            .expect("public key");
+        assert!(derived.status.success());
+        let raw = derived.stdout[derived.stdout.len() - 32..].to_vec();
+        fs::write(&public, format!("{}\n", STANDARD.encode(&raw))).expect("public file");
+        let pem_text = fs::read_to_string(&pem).expect("pem");
+        let signed = std::process::Command::new(&script)
+            .arg(&message)
+            .env("THINWIRE_UPDATE_KEY", &pem_text)
+            .env("THINWIRE_UPDATE_PUBLIC_KEY_FILE", &public)
+            .output()
+            .expect("sign-update");
+        let err = String::from_utf8_lossy(&signed.stderr);
+        assert!(
+            !err.contains("PRIVATE KEY"),
+            "sign-update wrote a private key"
+        );
+        assert!(signed.status.success(), "sign-update failed");
+        let sig_text = String::from_utf8(signed.stdout).expect("utf8");
+        let sig_bytes = STANDARD.decode(sig_text.trim()).expect("base64");
+        let signature: [u8; 64] = sig_bytes.try_into().expect("64 bytes");
+        let key_bytes: [u8; 32] = raw.as_slice().try_into().expect("32 bytes");
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).expect("key");
+        verify_detached(&fs::read(&message).expect("message"), &signature, &key)
+            .expect("signature");
+
+        fs::write(&public, "not-the-key\n").expect("wrong public");
+        let refused = std::process::Command::new(&script)
+            .arg(&message)
+            .env("THINWIRE_UPDATE_KEY", &pem_text)
+            .env("THINWIRE_UPDATE_PUBLIC_KEY_FILE", &public)
+            .output()
+            .expect("sign-update");
+        let refused_err = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            !refused_err.contains("PRIVATE KEY"),
+            "sign-update wrote a private key"
+        );
+        assert!(!refused.status.success());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
