@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Print major.minor.patch.r<count>.g<7 hex> for one commit.
-# The count is the same number publish-nightly.sh puts in the archive name.
 # A shallow repository would count too few commits, so this refuses one.
 set -euo pipefail
 

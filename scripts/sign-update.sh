@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Sign one file with the ed25519 PEM in THINWIRE_UPDATE_KEY.
-# Write the 64 byte signature as base64 on stdout.
-# Refuse when that key's public half disagrees with update-public-key.txt.
 set -euo pipefail
 set +x
 

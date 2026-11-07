@@ -1,5 +1,3 @@
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
-
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -13,10 +11,8 @@ use quick_xml::events::Event as XmlEvent;
 
 use super::{Action, BAD_SIGNATURE, CHECK_FAILED, PlainError};
 
-/// The updater. One value, one writer.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum Update {
-    /// This process will not check. `cargo run`, Linux, Windows, ad-hoc, bad `BUILD_ID`.
     Dormant,
     Checking {
         our: BuildId,
@@ -43,10 +39,7 @@ pub(super) enum Update {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum QuietKind {
     Current,
-    /// The user chose Later for `skipped`. A feed event in this state is ignored.
-    Later {
-        skipped: BuildId,
-    },
+    Later { skipped: BuildId },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,26 +55,15 @@ pub(super) enum Event {
     Action(Action),
     Feed(Result<Feed, PlainError>),
     Downloaded(Result<ArchiveFile, PlainError>),
-    /// Probe and spawn finished. `Err` means the running bundle was not touched.
     Armed(Result<(), PlainError>),
 }
 
 #[derive(Debug)]
 pub(super) enum Effect {
     None,
-    FetchFeed {
-        our: BuildId,
-        purpose: FeedPurpose,
-    },
-    Download {
-        offer: Offer,
-    },
-    /// `codesign` the extracted bundle, probe the parent directory, spawn the child.
-    /// One effect so a second event cannot spawn a second child.
-    VerifyAndArm {
-        offer: Offer,
-        archive: ArchiveFile,
-    },
+    FetchFeed { our: BuildId, purpose: FeedPurpose },
+    Download { offer: Offer },
+    VerifyAndArm { offer: Offer, archive: ArchiveFile },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,8 +72,6 @@ pub(super) enum FeedPurpose {
     BeforeInstall,
 }
 
-/// Workspace semver, commit count, and the 7 character sha, in that order.
-/// `newer` reads only `commit_count`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct BuildId {
     semver: Semver,
@@ -106,14 +86,10 @@ pub(super) struct Semver {
     patch: u16,
 }
 
-/// Seven lowercase hex characters. Not a path and not a semver.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Sha7([u8; 7]);
 
 impl BuildId {
-    /// Accept `0.1.0.r812.gabc1234` with an optional trailing newline.
-    /// Reject a nightly string in the semver slot, an uppercase sha, a leading
-    /// zero on the count, and any extra field.
     pub(super) fn parse(line: &str) -> Result<Self, ParseError> {
         let line = strip_one_newline(line)?;
         let mut parts = line.split('.');
@@ -208,13 +184,11 @@ where
     text.parse().map_err(|_| ParseError)
 }
 
-/// True only when the feed commit count is greater. Semver and sha do not order builds.
 #[must_use]
 pub(super) fn newer(feed: &BuildId, ours: &BuildId) -> bool {
     feed.commit_count > ours.commit_count
 }
 
-/// Plain notes, at most 280 characters, no control characters other than newline.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Notes(String);
 
@@ -245,7 +219,6 @@ impl Notes {
     }
 }
 
-/// One verified appcast item. The parser drops the XML after this exists.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Offer {
     build: BuildId,
@@ -254,10 +227,12 @@ pub(super) struct Offer {
 }
 
 impl Offer {
+    #[cfg(target_os = "macos")]
     pub(super) fn build(&self) -> &BuildId {
         &self.build
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn enclosure(&self) -> &Enclosure {
         &self.enclosure
     }
@@ -270,7 +245,6 @@ impl Offer {
     }
 }
 
-/// HTTPS nightly URL for this exact build id. Other hosts never construct it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Enclosure {
     url: NightlyUrl,
@@ -279,26 +253,41 @@ pub(super) struct Enclosure {
 }
 
 impl Enclosure {
+    #[cfg(target_os = "macos")]
     pub(super) fn url(&self) -> &str {
-        &self.url.0
+        self.url.as_str()
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn length(&self) -> u64 {
         self.length
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn signature(&self) -> &[u8; 64] {
         &self.signature
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(super) struct NightlyUrl(String);
+pub(super) struct NightlyUrl {
+    url: String,
+}
 
-/// 512 MiB. The enclosure `length` and the download both stop here.
+impl NightlyUrl {
+    fn for_build(build: &BuildId) -> Self {
+        Self {
+            url: nightly_url(build),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.url
+    }
+}
+
 pub(super) const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
 
-/// The appcast after the detached signature has already been checked.
 #[derive(Clone, Debug)]
 pub(super) struct Feed {
     best: Option<Offer>,
@@ -318,7 +307,6 @@ pub(super) enum Decision {
     Available(Offer),
 }
 
-/// Bytes on disk inside the staging directory. Not yet a bundle.
 #[derive(Debug)]
 pub(super) struct ArchiveFile {
     path: PathBuf,
@@ -337,8 +325,6 @@ impl ArchiveFile {
 pub(super) const MAX_APPCAST: usize = 1024 * 1024;
 pub(super) const MAX_EXTRACT: u64 = 1024 * 1024 * 1024;
 
-/// Verify `signature` over the exact appcast bytes, then parse.
-/// A bad signature is [`BAD_SIGNATURE`] and does not fall through to an older item.
 pub(super) fn open_feed(
     appcast: &[u8],
     signature: &[u8; 64],
@@ -534,8 +520,8 @@ fn offer_from(draft: &Draft) -> Option<Offer> {
     if length == 0 || length > MAX_DOWNLOAD {
         return None;
     }
-    let url = draft.url.trim();
-    if url != nightly_url(&build) {
+    let url = NightlyUrl::for_build(&build);
+    if draft.url.trim() != url.as_str() {
         return None;
     }
     let signature = decode_signature(draft.signature.trim())?;
@@ -543,7 +529,7 @@ fn offer_from(draft: &Draft) -> Option<Offer> {
         build,
         notes: Notes::from_feed(&draft.description),
         enclosure: Enclosure {
-            url: NightlyUrl(url.to_string()),
+            url,
             length,
             signature,
         },
@@ -565,8 +551,6 @@ fn consider(best: &mut Option<Offer>, offer: Offer) {
     }
 }
 
-/// `step` ignores an action or a feed result the current state did not ask for.
-/// A second Install while `Installing` returns the same state and [`Effect::None`].
 pub(super) fn step(state: Update, event: Event) -> (Update, Effect) {
     match (state, event) {
         (Update::Checking { our }, Event::Feed(Ok(feed))) => match feed.decide(&our) {
@@ -712,26 +696,18 @@ pub(super) fn step(state: Update, event: Event) -> (Update, Effect) {
     }
 }
 
-/// Rename outcome. `New` means `dest` is the incoming bundle. `Old` means the
-/// previous bundle was put back at `dest`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Swapped {
-    New,
-    Old,
+    Installed,
+    RolledBack,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SwapError {
-    /// The parent directory rejected the rename. `dest` is unchanged when this
-    /// is returned before the first move.
     NotWritable,
-    /// Neither `dest` nor `previous` exists, so there is nothing to open.
     Missing,
 }
 
-/// Finish a swap from whatever of the four directories already exist.
-/// Safe to call again. The second call leaves the new bundle at `dest` and
-/// removes `previous` when `dest` is already in place.
 pub(super) fn converge(
     staged: &Path,
     fresh: &Path,
@@ -752,21 +728,21 @@ pub(super) fn converge(
     }
     if fresh_here && !dest_here {
         place(fresh, dest)?;
-        return Ok(Swapped::New);
+        return Ok(Swapped::Installed);
     }
     if !fresh_here && !staged_here && !dest_here && previous_here {
         place(previous, dest)?;
-        return Ok(Swapped::Old);
+        return Ok(Swapped::RolledBack);
     }
     if !fresh_here && !staged_here && dest_here {
         if previous_here {
             remove_path(previous)?;
         }
-        return Ok(Swapped::New);
+        return Ok(Swapped::Installed);
     }
     if staged_here && !dest_here && !fresh_here {
         place(staged, dest)?;
-        return Ok(Swapped::New);
+        return Ok(Swapped::Installed);
     }
     Err(SwapError::Missing)
 }
@@ -780,7 +756,7 @@ fn finish_replace(fresh: &Path, dest: &Path, previous: &Path) -> Result<Swapped,
         let _ = place(previous, dest);
         return Err(error);
     }
-    Ok(Swapped::New)
+    Ok(Swapped::Installed)
 }
 
 fn place(from: &Path, to: &Path) -> Result<(), SwapError> {
@@ -1121,7 +1097,7 @@ mod tests {
             build: build.clone(),
             notes: Notes::from_feed("notes"),
             enclosure: Enclosure {
-                url: NightlyUrl(nightly_url(&build)),
+                url: NightlyUrl::for_build(&build),
                 length: 10,
                 signature: [1; 64],
             },
@@ -1270,7 +1246,10 @@ mod tests {
         );
         assert_eq!(offer.enclosure.length, 44);
         assert_eq!(offer.enclosure.signature, winner_sig);
-        assert_eq!(offer.enclosure.url.0, nightly_url(&low_semver_high_count));
+        assert_eq!(
+            offer.enclosure.url.as_str(),
+            nightly_url(&low_semver_high_count)
+        );
 
         let same = id("0.1.0.r20.g4444444");
         assert!(matches!(feed.decide(&same), Decision::Current));
@@ -1280,6 +1259,109 @@ mod tests {
                 assert_eq!(offer.build.display(), "0.1.0.r20.g4444444")
             }
             Decision::Current => panic!("a greater count is an offer"),
+        }
+    }
+
+    #[test]
+    fn install_fetches_the_feed_again_before_downloading() {
+        let our = id("0.1.0.r1.g0000001");
+        let (_, effect) = step(
+            Update::Offer {
+                our: our.clone(),
+                offer: sample_offer(2, "0000002"),
+            },
+            Event::Action(Action::Install),
+        );
+        match effect {
+            Effect::FetchFeed { our: got, purpose } => {
+                assert_eq!(got, our);
+                assert_eq!(purpose, FeedPurpose::BeforeInstall);
+            }
+            _ => panic!("install rechecks the feed"),
+        }
+    }
+
+    #[test]
+    fn a_bad_download_does_not_arm() {
+        let (next, effect) = step(
+            Update::Installing {
+                our: id("0.1.0.r1.g0000001"),
+                offer: sample_offer(2, "0000002"),
+                phase: InstallPhase::Fetching,
+            },
+            Event::Downloaded(Err(CHECK_FAILED)),
+        );
+        assert!(matches!(effect, Effect::None));
+        assert!(matches!(
+            next,
+            Update::Failed {
+                error: CHECK_FAILED,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_downloaded_archive_is_what_gets_verified() {
+        let archive = ArchiveFile::new(PathBuf::from("/tmp/thinwire-update.tar.gz"));
+        let offer = sample_offer(2, "0000002");
+        let (next, effect) = step(
+            Update::Installing {
+                our: id("0.1.0.r1.g0000001"),
+                offer: offer.clone(),
+                phase: InstallPhase::Fetching,
+            },
+            Event::Downloaded(Ok(archive)),
+        );
+        match effect {
+            Effect::VerifyAndArm {
+                offer: got,
+                archive,
+            } => {
+                assert_eq!(got.build, offer.build);
+                assert_eq!(archive.path(), Path::new("/tmp/thinwire-update.tar.gz"));
+            }
+            _ => panic!("a download continues to verify"),
+        }
+        assert!(matches!(
+            next,
+            Update::Installing {
+                phase: InstallPhase::Verifying,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_armed_install_asks_the_window_to_quit() {
+        let (next, effect) = step(
+            Update::Installing {
+                our: id("0.1.0.r1.g0000001"),
+                offer: sample_offer(2, "0000002"),
+                phase: InstallPhase::Verifying,
+            },
+            Event::Armed(Ok(())),
+        );
+        assert!(matches!(effect, Effect::None));
+        assert_eq!(project(&next), super::super::Prompt::QuitToInstall);
+    }
+
+    #[test]
+    fn the_same_build_on_recheck_is_the_download() {
+        let offer = sample_offer(2, "0000002");
+        let (_, effect) = step(
+            Update::Installing {
+                our: id("0.1.0.r1.g0000001"),
+                offer: offer.clone(),
+                phase: InstallPhase::Recheck,
+            },
+            Event::Feed(Ok(Feed {
+                best: Some(offer.clone()),
+            })),
+        );
+        match effect {
+            Effect::Download { offer: got } => assert_eq!(got.build, offer.build),
+            _ => panic!("the same build downloads"),
         }
     }
 
@@ -1392,7 +1474,7 @@ mod tests {
         write_bundle(&dest, "old");
         assert_eq!(
             converge(&staged, &fresh, &dest, &previous).expect("first swap"),
-            Swapped::New
+            Swapped::Installed
         );
         assert_eq!(read_marker(&dest), "new");
         assert_eq!(read_marker(&previous), "old");
@@ -1400,7 +1482,7 @@ mod tests {
         assert!(!fresh.exists());
         assert_eq!(
             converge(&staged, &fresh, &dest, &previous).expect("second swap"),
-            Swapped::New
+            Swapped::Installed
         );
         assert!(!previous.exists());
         assert_eq!(read_marker(&dest), "new");
@@ -1420,7 +1502,7 @@ mod tests {
         write_bundle(&previous, "old");
         assert_eq!(
             converge(&staged, &fresh, &dest, &previous).expect("resume"),
-            Swapped::New
+            Swapped::Installed
         );
         assert_eq!(read_marker(&dest), "new");
         assert!(!fresh.exists());
@@ -1442,7 +1524,7 @@ mod tests {
         fs::create_dir_all(fresh.join("Contents")).expect("partial fresh");
         assert_eq!(
             converge(&staged, &fresh, &dest, &previous).expect("recover"),
-            Swapped::New
+            Swapped::Installed
         );
         assert_eq!(read_marker(&dest), "new");
         assert!(!fresh.exists());

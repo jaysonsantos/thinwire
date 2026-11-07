@@ -1,6 +1,3 @@
-//! The update modal. Same layer as the delete question: a login screen does
-//! not cover it.
-
 use eframe::egui::{self, RichText};
 use thinwire::update::{Action, PlainError, Prompt, Updates};
 
@@ -10,7 +7,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, updates: &Updates) {
     match updates.prompt() {
         Prompt::Quiet => {}
         Prompt::Installing | Prompt::QuitToInstall => installing(ui),
-        Prompt::Offer(offer) => offer_modal(ui, updates, &offer.version, &offer.notes),
+        Prompt::Offer(offer) => offer_modal(ui, updates, offer.version(), offer.notes()),
         Prompt::Failed(error) => failed(ui, updates, error),
     }
 }

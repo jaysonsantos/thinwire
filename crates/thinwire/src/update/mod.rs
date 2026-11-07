@@ -1,7 +1,6 @@
-//! macOS update check. The frame reads a [`Prompt`] and sends an [`Action`].
-
 #[cfg(target_os = "macos")]
 mod host;
+#[cfg(any(test, target_os = "macos"))]
 mod machine;
 
 use std::ffi::{OsStr, OsString};
@@ -10,58 +9,69 @@ use std::io::{self, IsTerminal, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
+#[cfg(any(test, target_os = "macos"))]
 use machine::Update;
 #[cfg(target_os = "macos")]
 use machine::{Effect, Event, step};
 
-/// What the frame may draw. No URL, path, signature, or feed type is in here.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Prompt {
     Quiet,
     Offer(OfferView),
     Installing,
-    /// `Installing` reached `Armed`. `logic` sends `ViewportCommand::Close`.
     QuitToInstall,
     Failed(PlainError),
 }
 
-/// Version line and notes for the modal. Built only by [`project`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct OfferView {
-    pub version: String,
-    pub notes: String,
+    version: String,
+    notes: String,
 }
 
-/// A sentence the modal may show. The UI does not format errors itself.
+impl OfferView {
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    #[must_use]
+    pub fn notes(&self) -> &str {
+        &self.notes
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PlainError {
     pub text: &'static str,
     pub retry: bool,
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(super) const CHECK_FAILED: PlainError = PlainError {
     text: "Couldn't check for updates.",
     retry: true,
 };
 
+#[cfg(any(test, target_os = "macos"))]
 pub(super) const BAD_SIGNATURE: PlainError = PlainError {
     text: "This download isn't a signed Thinwire update.",
     retry: true,
 };
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 pub(super) const SWAP_FAILED: PlainError = PlainError {
     text: "Couldn't install the update. Thinwire is unchanged.",
     retry: true,
 };
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 pub(super) const MOVE_TO_APPLICATIONS: PlainError = PlainError {
     text: "Move Thinwire.app to the Applications folder and open it from there.",
     retry: false,
 };
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 pub(super) const NOT_WRITABLE: PlainError = PlainError {
     text: "Thinwire couldn't replace the app in its folder. Move it somewhere you can write to, then try again.",
     retry: true,
@@ -75,18 +85,12 @@ pub enum Action {
     Retry,
 }
 
-/// Handle the frame holds. The worker owns the [`Update`] machine.
-///
-/// `prompt` copies the last snapshot. `act` sends and returns. Neither waits
-/// on the network, the disk, or `Core`.
 pub struct Updates {
     prompt: Arc<Mutex<Prompt>>,
     tx: Option<mpsc::SyncSender<Action>>,
 }
 
 impl Updates {
-    /// Spawn `thinwire-update` on macOS. On Linux and Windows the handle stays
-    /// `Quiet` and no thread starts.
     #[must_use]
     pub fn start(wake: egui::Context) -> Self {
         #[cfg(target_os = "macos")]
@@ -118,16 +122,11 @@ impl Updates {
     }
 }
 
-/// Set when `main` sees `--apply-update`. Fields stay private so the frame
-/// cannot build a job and skip the feed.
 pub struct ApplyJob {
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     staged: PathBuf,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     dest: PathBuf,
 }
 
-/// `None` unless argv is `--apply-update`, two absolute paths, and nothing else.
 #[must_use]
 pub fn apply_from_args() -> Option<ApplyJob> {
     apply_from(std::env::args_os())
@@ -157,15 +156,11 @@ fn is_app_path(path: &Path) -> bool {
             .any(|component| matches!(component, Component::ParentDir))
 }
 
-/// Wait until the parent dies, then [`machine::converge`], then open `dest`
-/// when it exists. Does not return. Does not take `instance.lock`.
-///
-/// A terminal stdin exits before any rename. Off macOS the flag exits
-/// before any rename, so a Linux or Windows launch cannot move a bundle.
 pub fn apply_and_relaunch(job: ApplyJob) -> ! {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = job;
+        let ApplyJob { staged, dest } = job;
+        let _kept = (staged, dest);
         std::process::exit(1);
     }
     #[cfg(target_os = "macos")]
@@ -328,7 +323,7 @@ fn run_effects(
     }
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 fn publish(slot: &Mutex<Prompt>, state: &Update, wake: &egui::Context) {
     let next = project(state);
     match slot.lock() {
@@ -340,7 +335,7 @@ fn publish(slot: &Mutex<Prompt>, state: &Update, wake: &egui::Context) {
     wake.request_repaint();
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(test, target_os = "macos"))]
 fn project(state: &Update) -> Prompt {
     match state {
         Update::Dormant | Update::Checking { .. } | Update::Quiet { .. } => Prompt::Quiet,

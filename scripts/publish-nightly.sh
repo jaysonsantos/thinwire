@@ -13,10 +13,6 @@
 # archive stays on the release for KEEP_DAYS days before this script deletes it.
 #
 # Needs: DIST (the downloaded artifacts), SHA, GITHUB_REPOSITORY, GH_TOKEN.
-# THINWIRE_UPDATE_KEY signs appcast.xml and the macOS tar. Without it the
-# archives still upload, then this script exits 1 and does not upload an
-# unsigned appcast. appcast.xml and appcast.ed25519 stay on the tag the way
-# VERSION does. The macOS tar's BUILD_ID must match the version string.
 set -euo pipefail
 
 TAG=nightly
@@ -29,17 +25,10 @@ repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY names the repository}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(dirname "$script_dir")" || exit 1
 
-workspace_version=$(awk '
-  $0 == "[workspace.package]" { in_pkg = 1; next }
-  in_pkg && /^\[/ { exit }
-  in_pkg && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
-' Cargo.toml)
-if [[ ! "$workspace_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "::error::No workspace version in Cargo.toml. Got: ${workspace_version}"
-  exit 1
-fi
-count=$(git rev-list --count "$sha")
-version="${workspace_version}.r${count}.g${sha:0:7}"
+version=$("$script_dir/build-id.sh" "$sha")
+semver=${version%%.r*}
+count=${version#*.r}
+count=${count%%.g*}
 
 # A run of an older commit never replaces a newer nightly.
 current=$(curl -fsSL "https://github.com/${repo}/releases/download/${TAG}/VERSION" 2>/dev/null || true)
@@ -74,11 +63,10 @@ xml_escape() {
 
 write_appcast() {
   local mac_tar="$1"
-  local subject clean description semver url length tar_sig
+  local subject clean description url length tar_sig
   subject=$(git log -1 --format=%s "$sha")
   clean=$(printf '%s' "$subject" | tr -d '\000-\010\013\014\016-\037')
   description=$(xml_escape "${clean} This is a build from main, not a release.")
-  semver=$workspace_version
   url="https://github.com/${repo}/releases/download/${TAG}/thinwire-macos-arm64-${version}.tar.gz"
   length=$(wc -c <"$mac_tar" | tr -d ' ')
   set +x

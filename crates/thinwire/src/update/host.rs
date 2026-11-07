@@ -13,6 +13,7 @@ use super::machine::{
 };
 use super::{BAD_SIGNATURE, CHECK_FAILED, NOT_WRITABLE, PlainError, SWAP_FAILED};
 
+const NIGHTLY_ARCH: &str = "aarch64";
 const APPCAST_URL: &str =
     "https://github.com/jaysonsantos/thinwire/releases/download/nightly/appcast.xml";
 const APPCAST_SIG_URL: &str =
@@ -25,8 +26,7 @@ pub(super) enum Gate {
 }
 
 pub(super) fn gate() -> Gate {
-    // The nightly archive is the arm64 app.
-    if std::env::consts::ARCH != "aarch64" {
+    if std::env::consts::ARCH != NIGHTLY_ARCH {
         return Gate::NotClient;
     }
     let Ok(exe) = std::env::current_exe() else {

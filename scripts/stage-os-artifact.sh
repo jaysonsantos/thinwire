@@ -76,8 +76,6 @@ copy_app_notice third_party/webbrowser/LICENSE-APACHE webbrowser-LICENSE-APACHE.
 # SQLCipher and OpenSSL are linked into the release helpers (issue #291).
 copy_app_notice third_party/sqlcipher/LICENSE sqlcipher-LICENSE.txt
 copy_app_notice third_party/openssl/LICENSE-APACHE openssl-LICENSE-APACHE.txt
-# The macOS update check. ed25519-dalek, tar, quick-xml, base64, and flate2
-# are in the app. ureq is macOS-only.
 copy_app_notice third_party/ed25519-dalek/LICENSE ed25519-dalek-LICENSE-BSD-3-Clause.txt
 copy_app_notice third_party/tar/LICENSE-MIT tar-LICENSE-MIT.txt
 copy_app_notice third_party/tar/LICENSE-APACHE tar-LICENSE-APACHE.txt
@@ -651,8 +649,7 @@ sign_nested_machos() {
   rm -f "$list"
 }
 
-# BUILD_ID is inside the signature, so this runs after the identity is known
-# and before codesign. A shallow count would stamp r1 into a stapled app.
+# A shallow count would stamp r1 into a stapled app.
 write_build_id() {
   local app="$1"
   if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then

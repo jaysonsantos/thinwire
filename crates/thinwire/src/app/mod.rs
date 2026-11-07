@@ -400,7 +400,6 @@ pub struct ThinwireApp {
     watchdog: bool,
     /// OS notifications on their own thread (#32).
     notifier: Notifier,
-    /// macOS update check. Quiet on Linux and Windows.
     updates: thinwire::update::Updates,
     /// Chats of clicked notifications. The notifier thread fills it.
     clicks: Arc<Mutex<Vec<NotifyKey>>>,
