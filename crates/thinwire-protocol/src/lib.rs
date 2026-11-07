@@ -69,7 +69,7 @@ pub use signal::{
     SIGNAL_RETAINED_RESET, SIGNAL_RETAINED_SETTLED, SIGNAL_RETAINED_UNREADABLE, SignalAdapter,
     signal_helper_adapter, signal_helper_adapter_for, signal_retained_chat,
     signal_retained_chat_id, signal_retained_slot, signal_retained_unreadable_detail,
-    signal_retained_unreadable_slot,
+    signal_retained_unreadable_slot, signal_store_millis,
 };
 pub use slack::{
     DEDUP_FRESH_SECS, MemorySlackVault, SLACK_CONVERSATION_PREFIX, SLACK_OAUTH_CALLBACK_PATH,

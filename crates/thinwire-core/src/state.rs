@@ -7511,7 +7511,18 @@ fn sort_conversations(list: &mut [Conversation]) {
 fn sort_messages(list: &mut [ChatMessage]) {
     // Send time first: some protocols (WhatsApp) use ids with no order.
     // Numeric ids rank the rest when the time is unknown (zero).
-    list.sort_by_key(|row| (row.sent_at, message_rank(&row.id)));
+    list.sort_by_key(|row| (row.sent_at, rank_within_second(row)));
+}
+
+fn rank_within_second(message: &ChatMessage) -> i64 {
+    if message.protocol.is(ProtocolKind::Signal)
+        && let Some(millis) = thinwire_protocol::signal_store_millis(&message.id)
+        && let Ok(rank) = i64::try_from(millis)
+    {
+        rank
+    } else {
+        message_rank(&message.id)
+    }
 }
 
 fn message_rank(id: &str) -> i64 {
@@ -13775,6 +13786,174 @@ mod tests {
             )),
             "the helper is asked for the older page"
         );
+    }
+
+    #[test]
+    fn a_retained_signal_chat_loads_every_same_second_page() {
+        use thinwire_protocol::signal_retained_chat_id;
+
+        let base = 1_700_000_000_000u64;
+        assert_eq!(
+            base / 1_000,
+            (base + 5) / 1_000,
+            "every row shares one Unix second"
+        );
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        let id = signal_retained_chat_id(1, "ada");
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, &id, false),
+        });
+        let row = |millis: u64, body: &str| ChatMessage {
+            protocol: ProtocolId::Signal,
+            conversation_id: id.clone(),
+            id: format!("{millis}:ada"),
+            sender: "Ada".into(),
+            body: body.into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: i64::try_from(millis / 1_000).expect("seconds"),
+            arrival: thinwire_protocol::Arrival::History,
+            topic: None,
+            links: Vec::new(),
+            photo: None,
+            audio: None,
+            video: None,
+            file: None,
+            reactions: Vec::new(),
+            reply_to: None,
+            edited: false,
+        };
+        let pages = [
+            [(base + 4, "e"), (base + 5, "f")],
+            [(base + 2, "c"), (base + 3, "d")],
+            [(base, "a"), (base + 1, "b")],
+        ];
+        for (millis, body) in pages[0] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: row(millis, body),
+            });
+        }
+        snapshot.selected_protocol = ProtocolId::Signal;
+        snapshot.selected_signal_retained = Some(1);
+        snapshot.selected_conversation = Some(id.clone());
+        snapshot.compose = "hello".into();
+        assert!(!snapshot.can_send(), "a retained chat cannot send");
+        let now = Instant::now();
+        let asked = |snapshot: &mut Snapshot| {
+            snapshot.load_older_at(now);
+            let commands = snapshot.take_commands();
+            assert!(
+                commands.iter().all(|command| !matches!(
+                    command,
+                    AdapterCommand::SendText { .. }
+                        | AdapterCommand::SendMedia { .. }
+                        | AdapterCommand::SendTopicText { .. }
+                        | AdapterCommand::ResendMessage { .. }
+                )),
+                "paging does not send: {commands:?}"
+            );
+            commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    AdapterCommand::LoadOlderMessages {
+                        before_message_id, ..
+                    } => Some(before_message_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(asked(&mut snapshot), vec![format!("{}:ada", base + 4)]);
+        for (millis, body) in pages[1] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: row(millis, body),
+            });
+        }
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: id.clone(),
+            before_message_id: format!("{}:ada", base + 4),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: None,
+        });
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+        assert_eq!(asked(&mut snapshot), vec![format!("{}:ada", base + 2)]);
+        for (millis, body) in pages[2] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: row(millis, body),
+            });
+        }
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: id,
+            before_message_id: format!("{}:ada", base + 2),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: None,
+        });
+        let bodies: Vec<_> = snapshot
+            .selected_messages()
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect();
+        assert_eq!(bodies, ["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+        assert!(
+            asked(&mut snapshot).is_empty(),
+            "the start of the chat asks for nothing"
+        );
+        assert!(!snapshot.can_send(), "a retained chat cannot send");
+    }
+
+    #[test]
+    fn telegram_rows_in_one_second_keep_message_id_order() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        let chat_id = "telegram:1";
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Telegram, chat_id, true),
+        });
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some(chat_id.into());
+        for (message_id, body) in [("telegram:1:50", "later"), ("telegram:1:40", "earlier")] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: ChatMessage {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id: chat_id.into(),
+                    id: message_id.into(),
+                    sender: "Ada".into(),
+                    body: body.into(),
+                    outbound: false,
+                    delivery: Delivery::Sent,
+                    sent_at: 1_700_000_000,
+                    arrival: thinwire_protocol::Arrival::History,
+                    topic: None,
+                    links: Vec::new(),
+                    photo: None,
+                    audio: None,
+                    video: None,
+                    file: None,
+                    reactions: Vec::new(),
+                    reply_to: None,
+                    edited: false,
+                },
+            });
+        }
+        let ids: Vec<_> = snapshot
+            .selected_messages()
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect();
+        assert_eq!(ids, ["telegram:1:40", "telegram:1:50"]);
     }
 
     /// A slot that the next publish does not send is removed.
