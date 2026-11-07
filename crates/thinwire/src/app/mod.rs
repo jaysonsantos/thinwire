@@ -28,6 +28,8 @@ mod ui;
 mod ui_snapshots;
 #[cfg(test)]
 mod ui_tests;
+#[cfg_attr(not(test), allow(dead_code))]
+mod update;
 #[cfg(feature = "video")]
 mod video;
 #[cfg(feature = "whatsapp-web")]
