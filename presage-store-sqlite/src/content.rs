@@ -40,7 +40,7 @@ impl ContentsStore for SqliteStore {
         Box<dyn Iterator<Item = Result<StickerPack, Self::ContentsStoreError>> + Send + Sync>;
 
     async fn clear_profiles(&mut self) -> Result<(), Self::ContentsStoreError> {
-        let mut transaction = self.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.begin_write().await.into_protocol_error()?;
         query!("DELETE FROM profiles")
             .execute(&mut *transaction)
             .await?;
@@ -55,7 +55,7 @@ impl ContentsStore for SqliteStore {
     }
 
     async fn clear_contents(&mut self) -> Result<(), Self::ContentsStoreError> {
-        let mut transaction = self.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.begin_write().await.into_protocol_error()?;
         query!("DELETE FROM thread_messages")
             .execute(&mut *transaction)
             .await?;
@@ -82,7 +82,7 @@ impl ContentsStore for SqliteStore {
     }
 
     async fn clear_messages(&mut self) -> Result<(), Self::ContentsStoreError> {
-        let mut transaction = self.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.begin_write().await.into_protocol_error()?;
         query!("DELETE FROM thread_messages")
             .execute(&mut *transaction)
             .await?;
@@ -111,7 +111,7 @@ impl ContentsStore for SqliteStore {
         thread: &Thread,
         Content { metadata, body }: Content,
     ) -> Result<(), Self::ContentsStoreError> {
-        let mut tx = self.db.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         let thread_id = match thread {
             Thread::Contact(service_id) => {
@@ -287,7 +287,7 @@ impl ContentsStore for SqliteStore {
     }
 
     async fn clear_contacts(&mut self) -> Result<(), Self::ContentsStoreError> {
-        let mut transaction = self.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.begin_write().await.into_protocol_error()?;
         query!("DELETE FROM contacts")
             .execute(&mut *transaction)
             .await?;
@@ -303,7 +303,7 @@ impl ContentsStore for SqliteStore {
         let avatar_bytes = contact.avatar.as_ref().map(|a| a.reader.to_vec());
         let phone_number = contact.phone_number.as_ref().map(|p| p.to_string());
 
-        let mut tx = self.db.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         query!(
             "INSERT OR REPLACE INTO contacts
@@ -407,11 +407,14 @@ impl ContentsStore for SqliteStore {
     }
 
     async fn clear_groups(&mut self) -> Result<(), Self::ContentsStoreError> {
-        let mut transaction = self.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.begin_write().await.into_protocol_error()?;
         query!("DELETE FROM groups")
             .execute(&mut *transaction)
             .await?;
         query!("DELETE FROM group_avatars")
+            .execute(&mut *transaction)
+            .await?;
+        query!("DELETE FROM left_groups")
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await.into_protocol_error()?;
@@ -425,6 +428,7 @@ impl ContentsStore for SqliteStore {
     ) -> Result<(), Self::ContentsStoreError> {
         let g = SqlGroup::from_group(&master_key, group.into());
         let master_key = g.master_key.as_ref();
+        let mut transaction = self.begin_write().await?;
         query!(
             "INSERT OR REPLACE INTO groups VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             master_key,
@@ -439,9 +443,41 @@ impl ContentsStore for SqliteStore {
             g.requesting_members,
             g.disappearing_messages_timer,
         )
+        .execute(&mut *transaction)
+        .await?;
+        query!("DELETE FROM left_groups WHERE master_key = ?", master_key)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn mark_group_left(
+        &self,
+        master_key: GroupMasterKeyBytes,
+    ) -> Result<(), Self::ContentsStoreError> {
+        let master_key = master_key.as_slice();
+        query!(
+            "INSERT OR IGNORE INTO left_groups (master_key) VALUES (?)",
+            master_key
+        )
         .execute(&self.db)
         .await?;
         Ok(())
+    }
+
+    async fn is_group_left(
+        &self,
+        master_key: GroupMasterKeyBytes,
+    ) -> Result<bool, Self::ContentsStoreError> {
+        let master_key = master_key.as_slice();
+        let left = query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM left_groups WHERE master_key = ?)",
+            master_key
+        )
+        .fetch_one(&self.db)
+        .await?;
+        Ok(left != 0)
     }
 
     async fn groups(&self) -> Result<Self::GroupsIter, Self::ContentsStoreError> {
@@ -763,6 +799,34 @@ mod test {
 
         assert!(store.upsert_profile_key(&uuid, key).await?);
         assert!(store.upsert_profile_key(&uuid, key).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saving_a_left_group_clears_the_mark() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let master_key = [1u8; 32];
+
+        assert!(!store.is_group_left(master_key).await?);
+        store.mark_group_left(master_key).await?;
+        store.mark_group_left(master_key).await?;
+        assert!(store.is_group_left(master_key).await?);
+
+        let group = Group {
+            title: "group".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 1,
+            members: vec![],
+            pending_members: vec![],
+            requesting_members: vec![],
+            invite_link_password: vec![],
+            description: None,
+        };
+        store.save_group(master_key, group).await?;
+        assert!(!store.is_group_left(master_key).await?);
 
         Ok(())
     }

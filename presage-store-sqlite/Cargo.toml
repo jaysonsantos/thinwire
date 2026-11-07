@@ -9,7 +9,7 @@ default = ["libsqlite3-sys/bundled-sqlcipher"]
 cdsi = ["presage/cdsi", "libsqlite3-sys/bundled-sqlcipher-custom-crypto"]
 
 [dependencies]
-presage = { git = "https://github.com/whisperfish/presage", rev = "291c7ee10d2fd3ae04cea48e586ad55bdb89cd23", default-features = false }
+presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", default-features = false }
 
 async-trait = "0.1.83"
 bytes = "1.9.0"
