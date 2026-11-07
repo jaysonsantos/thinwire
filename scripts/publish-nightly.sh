@@ -34,6 +34,8 @@ count=${count%%.g*}
 # The API, not the download URL: the download URL of VERSION is cached.
 version_id=$(gh api "repos/${repo}/releases/tags/${TAG}" --jq '.assets[] | select(.name == "VERSION") | .id' 2>/dev/null || true)
 current=""
+# A failed download stops the run on purpose. If the script guessed "no
+# nightly", it could replace a newer nightly with an older one.
 if [[ -n "$version_id" ]]; then
   current=$(gh api -H "Accept: application/octet-stream" "repos/${repo}/releases/assets/${version_id}")
 fi

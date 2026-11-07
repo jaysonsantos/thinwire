@@ -12,8 +12,8 @@
 # script reads these two files through the API, which is never stale.
 #
 # Needs: AUR_SSH_PRIVATE_KEY (the key of the AUR account, push only),
-# GH_TOKEN (read access to the release), GITHUB_REPOSITORY. Runs as root in the container: makepkg runs as an
-# unprivileged user, because it refuses root.
+# GH_TOKEN (read access to the release), GITHUB_REPOSITORY. Runs as root in
+# the container: makepkg runs as an unprivileged user, because it refuses root.
 set -euo pipefail
 
 PKGNAME=thinwire-nightly-bin
@@ -30,18 +30,25 @@ api="https://api.github.com/repos/${repo}"
 github_api() {
   curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN reads the release}" "$@"
 }
-release=$(github_api -H "Accept: application/vnd.github+json" "${api}/releases/tags/nightly")
-# Print one asset of the nightly release, read through the API.
-release_asset() {
-  local asset_id
-  asset_id=$(jq -er --arg name "$1" '.assets[] | select(.name == $name) | .id' <<<"$release") || return 1
-  github_api -H "Accept: application/octet-stream" "${api}/releases/assets/${asset_id}"
-}
-
-if ! version=$(release_asset VERSION); then
-  echo "::error::The nightly release of ${repo} has no VERSION file yet."
+if ! release=$(github_api -H "Accept: application/vnd.github+json" "${api}/releases/tags/nightly"); then
+  echo "::error::Could not read the nightly release of ${repo}. It does not exist, or the API failed."
   exit 1
 fi
+# Print one asset of the nightly release, read through the API. Each failure
+# gets its own message: a missing asset is not an API error.
+release_asset() {
+  local asset_id
+  if ! asset_id=$(jq -er --arg name "$1" '.assets[] | select(.name == $name) | .id' <<<"$release"); then
+    echo "::error::The nightly release of ${repo} has no $1 file yet." >&2
+    return 1
+  fi
+  if ! github_api -H "Accept: application/octet-stream" "${api}/releases/assets/${asset_id}"; then
+    echo "::error::Could not download $1 of the nightly release of ${repo}." >&2
+    return 1
+  fi
+}
+
+version=$(release_asset VERSION)
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.r[0-9]+\.g[0-9a-f]{7}$ ]]; then
   echo "::error::The nightly VERSION is not a version: ${version}"
   exit 1
