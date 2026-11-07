@@ -103,7 +103,9 @@ ed25519-dalek = "2"
 base64 = "0.22"
 quick-xml = "0.38"
 tar = "0.4"
-flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.1.11", default-features = false, features = [
+  "rust_backend",
+] }
 
 # Linux: the settings portal reports reduce-motion and sends SettingChanged.
 [target.'cfg(target_os = "linux")'.dependencies]
