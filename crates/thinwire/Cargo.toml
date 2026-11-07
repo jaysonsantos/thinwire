@@ -99,6 +99,11 @@ tracing-subscriber.workspace = true
 # Features `signal-local` and `whatsapp-web` only. No new crate: `qrcode`
 # is already on the Signal feature (ADR 0013 license list is unchanged).
 qrcode = { version = "0.14", optional = true, default-features = false }
+# Nightly appcast. The signature check and the XML parse are pure, so the
+# Linux tests run them. The download client stays macOS-only.
+ed25519-dalek = "2"
+base64 = "0.22"
+quick-xml = "0.38"
 
 # Linux: the settings portal reports reduce-motion and sends SettingChanged.
 [target.'cfg(target_os = "linux")'.dependencies]
