@@ -73,6 +73,18 @@ copy_app_notice third_party/widestring/LICENSE-MIT widestring-LICENSE-MIT.txt
 copy_app_notice third_party/widestring/LICENSE-APACHE widestring-LICENSE-APACHE.txt
 copy_app_notice third_party/webbrowser/LICENSE-MIT webbrowser-LICENSE-MIT.txt
 copy_app_notice third_party/webbrowser/LICENSE-APACHE webbrowser-LICENSE-APACHE.txt
+# The Windows nightly check. sha2, tar, and flate2 also hash and unpack
+# in the Linux tests. ureq and native-tls are the Windows download.
+copy_app_notice third_party/sha2/LICENSE-MIT sha2-LICENSE-MIT.txt
+copy_app_notice third_party/sha2/LICENSE-APACHE sha2-LICENSE-APACHE.txt
+copy_app_notice third_party/tar/LICENSE-MIT tar-LICENSE-MIT.txt
+copy_app_notice third_party/tar/LICENSE-APACHE tar-LICENSE-APACHE.txt
+copy_app_notice third_party/flate2/LICENSE-MIT flate2-LICENSE-MIT.txt
+copy_app_notice third_party/flate2/LICENSE-APACHE flate2-LICENSE-APACHE.txt
+copy_app_notice third_party/ureq/LICENSE-MIT ureq-LICENSE-MIT.txt
+copy_app_notice third_party/ureq/LICENSE-APACHE ureq-LICENSE-APACHE.txt
+copy_app_notice third_party/native-tls/LICENSE-MIT native-tls-LICENSE-MIT.txt
+copy_app_notice third_party/native-tls/LICENSE-APACHE native-tls-LICENSE-APACHE.txt
 # SQLCipher and OpenSSL are linked into the release helpers (issue #291).
 copy_app_notice third_party/sqlcipher/LICENSE sqlcipher-LICENSE.txt
 copy_app_notice third_party/openssl/LICENSE-APACHE openssl-LICENSE-APACHE.txt
@@ -729,7 +741,17 @@ EOF
     widestring-LICENSE-MIT.txt \
     widestring-LICENSE-APACHE.txt \
     webbrowser-LICENSE-MIT.txt \
-    webbrowser-LICENSE-APACHE.txt
+    webbrowser-LICENSE-APACHE.txt \
+    sha2-LICENSE-MIT.txt \
+    sha2-LICENSE-APACHE.txt \
+    tar-LICENSE-MIT.txt \
+    tar-LICENSE-APACHE.txt \
+    flate2-LICENSE-MIT.txt \
+    flate2-LICENSE-APACHE.txt \
+    ureq-LICENSE-MIT.txt \
+    ureq-LICENSE-APACHE.txt \
+    native-tls-LICENSE-MIT.txt \
+    native-tls-LICENSE-APACHE.txt
   do
     if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${notice}" ]]; then
       echo "::error::Thinwire.app Resources are missing the image notice ${notice}."
@@ -904,6 +926,16 @@ with tarfile.open(archive, "r:gz") as tf:
         "widestring-LICENSE-APACHE.txt",
         "webbrowser-LICENSE-MIT.txt",
         "webbrowser-LICENSE-APACHE.txt",
+        "sha2-LICENSE-MIT.txt",
+        "sha2-LICENSE-APACHE.txt",
+        "tar-LICENSE-MIT.txt",
+        "tar-LICENSE-APACHE.txt",
+        "flate2-LICENSE-MIT.txt",
+        "flate2-LICENSE-APACHE.txt",
+        "ureq-LICENSE-MIT.txt",
+        "ureq-LICENSE-APACHE.txt",
+        "native-tls-LICENSE-MIT.txt",
+        "native-tls-LICENSE-APACHE.txt",
         "sqlcipher-LICENSE.txt",
         "openssl-LICENSE-APACHE.txt",
     ):
