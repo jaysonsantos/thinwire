@@ -7,6 +7,10 @@
 //! directory.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Seven lowercase hex characters. The `g` suffix of `VERSION`, and the
 /// first seven characters of the commit this binary was compiled from.
@@ -168,9 +172,11 @@ const OFFICIAL_REPOSITORY: &str = "jaysonsantos/thinwire";
 
 const MAIN_REF: &str = "refs/heads/main";
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const FEED_PREFIX: &str = "https://github.com/jaysonsantos/thinwire/releases/download/nightly/";
 
 /// The feed hosts a redirect may land on. The `Location` target is not logged.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const FEED_HOSTS: [&str; 2] = ["github.com", "release-assets.githubusercontent.com"];
 
 /// The live `r277` archive is 48,729,593 bytes.
@@ -178,6 +184,18 @@ const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The live unpacked executables are about 124 MiB.
 const MAX_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
+
+const APPLY_ARG: &str = "--thinwire-apply";
+
+/// From the apply child starting until it gives up on `instance.lock`.
+const APPLY_WAIT: Duration = Duration::from_secs(15);
+
+/// `VERSION` and `SHA256SUMS` are a few lines. A larger body is not the feed.
+#[cfg(windows)]
+const TEXT_CAP: u64 = 64 * 1024;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Identity of this binary. Callers only build it with [`Launch::compile_time`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -298,12 +316,14 @@ fn archive_name(version: &NightlyVersion) -> String {
     format!("thinwire-windows-x86_64-{}.tar.gz", version.token)
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn feed_url(name: &str) -> String {
     format!("{FEED_PREFIX}{name}")
 }
 
 /// The line whose name is the Windows archive. Zero matches or two matches
 /// is an error. A filename in the file is not a URL.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn parse_sums(text: &str, version: &NightlyVersion) -> Result<[u8; 32], PlainError> {
     let want = archive_name(version);
     let mut found = None;
@@ -327,6 +347,7 @@ fn parse_sums(text: &str, version: &NightlyVersion) -> Result<[u8; 32], PlainErr
     found.ok_or_else(check_failed)
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn split_sum_line(line: &str) -> Option<(&str, &str)> {
     let mut parts = line.split_whitespace();
     let hash = parts.next()?;
@@ -341,6 +362,7 @@ fn split_sum_line(line: &str) -> Option<(&str, &str)> {
     Some((hash, name))
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn parse_hex32(text: &str) -> Option<[u8; 32]> {
     if text.len() != 64 {
         return None;
@@ -355,6 +377,7 @@ fn parse_hex32(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -451,6 +474,7 @@ fn journal_action(stamp: Option<&BuildStamp>, journal: &Journal) -> JournalActio
 
 /// HTTPS, and the host is one of [`FEED_HOSTS`]. At most five hops is the
 /// caller's limit. The target is not logged: its query is a signature.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn redirect_allowed(next: &str) -> bool {
     let Ok(url) = url::Url::parse(next) else {
         return false;
@@ -1215,6 +1239,766 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// The window sends these. It never writes [`Phase`].
+#[derive(Debug)]
+enum Command {
+    Install,
+    Later,
+    Dismiss,
+    Again,
+}
+
+#[derive(Debug)]
+enum Step {
+    Stay,
+    Quiet,
+    Check,
+    Fetch(Offer),
+}
+
+#[derive(Debug)]
+enum SwapEnd {
+    Installed,
+    Idle,
+}
+
+#[derive(Debug)]
+enum Argv {
+    Normal,
+    /// The flag was present. `None` means the path was missing or extra
+    /// arguments followed it, so the install directory is left alone.
+    Apply(Option<PathBuf>),
+}
+
+/// The UI thread's handle. The worker owns every write to [`Phase`].
+pub(crate) struct Updates {
+    phase: Arc<Mutex<Phase>>,
+    commands: Sender<Command>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Updates {
+    /// No thread when `launch` has no stamp. `wake` only repaints.
+    pub(crate) fn spawn(launch: Launch, wake: impl Fn() + Send + Sync + 'static) -> Self {
+        let phase = Arc::new(Mutex::new(Phase::Quiet));
+        let (commands, incoming) = std::sync::mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        if let Some(stamp) = launch.stamp {
+            let phase_worker = Arc::clone(&phase);
+            let shutdown_worker = Arc::clone(&shutdown);
+            if std::thread::Builder::new()
+                .name("thinwire-update".to_owned())
+                .spawn(move || worker(stamp, phase_worker, incoming, shutdown_worker, wake))
+                .is_err()
+            {
+                tracing::warn!("the update check did not start");
+            }
+        }
+        Self {
+            phase,
+            commands,
+            shutdown,
+        }
+    }
+
+    /// One `true`. A later `Close` would hit `CloseGate::Waiting` and cancel.
+    pub(crate) fn take_shutdown(&self) -> bool {
+        self.shutdown.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn consume_escape(&self, ctx: &egui::Context) {
+        let pressed = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if !pressed {
+            return;
+        }
+        let phase = lock_phase(&self.phase).clone();
+        let command = match &phase {
+            Phase::Offer(_) => Some(Command::Later),
+            Phase::Failed { .. } => Some(Command::Dismiss),
+            Phase::Fetching(_) | Phase::Handoff(_) => None,
+            Phase::Quiet | Phase::Checking => return,
+        };
+        let _ = ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if let Some(command) = command {
+            let _ = self.commands.send(command);
+        }
+    }
+
+    pub(crate) fn draw(&self, ctx: &egui::Context) {
+        let phase = lock_phase(&self.phase).clone();
+        match snapshot(&phase) {
+            Snapshot::Quiet => {}
+            Snapshot::Offer { .. } => {
+                if let Phase::Offer(offer) = &phase {
+                    draw_offer(ctx, offer, &self.commands);
+                }
+            }
+            Snapshot::Busy { .. } => match &phase {
+                Phase::Fetching(offer) | Phase::Handoff(offer) => draw_busy(ctx, offer),
+                Phase::Quiet | Phase::Checking | Phase::Offer(_) | Phase::Failed { .. } => {}
+            },
+            Snapshot::Failed(error) => {
+                let retry_download = matches!(phase, Phase::Failed { retry: Some(_), .. });
+                draw_failed(ctx, &error, retry_download, &self.commands);
+            }
+        }
+    }
+}
+
+fn lock_phase(phase: &Mutex<Phase>) -> std::sync::MutexGuard<'_, Phase> {
+    phase.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn set_phase(phase: &Mutex<Phase>, next: Phase, wake: &impl Fn()) {
+    *lock_phase(phase) = next;
+    wake();
+}
+
+fn draw_offer(ctx: &egui::Context, offer: &Offer, commands: &Sender<Command>) {
+    let mut install = false;
+    let mut later = false;
+    let modal = egui::Modal::new(prompt_id()).show(ctx, |ui| {
+        ui.set_width(320.0);
+        ui.label(egui::RichText::new(&offer.version.token).strong());
+        ui.add_space(super::theme::space::S);
+        ui.label(notes());
+        ui.add_space(super::theme::space::M);
+        ui.horizontal(|ui| {
+            if ui.button("Install").clicked() {
+                install = true;
+            }
+            if ui.button("Later").clicked() {
+                later = true;
+            }
+        });
+    });
+    if install {
+        let _ = commands.send(Command::Install);
+    } else if later || modal.should_close() {
+        let _ = commands.send(Command::Later);
+    }
+}
+
+fn draw_busy(ctx: &egui::Context, offer: &Offer) {
+    egui::Modal::new(prompt_id()).show(ctx, |ui| {
+        ui.set_width(320.0);
+        ui.label(egui::RichText::new(&offer.version.token).strong());
+        ui.add_space(super::theme::space::S);
+        ui.label("Installing…");
+    });
+}
+
+fn draw_failed(
+    ctx: &egui::Context,
+    error: &PlainError,
+    retry_download: bool,
+    commands: &Sender<Command>,
+) {
+    let mut again = false;
+    let mut dismiss = false;
+    let modal = egui::Modal::new(prompt_id()).show(ctx, |ui| {
+        let palette = super::theme::palette(ui);
+        ui.set_width(360.0);
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.label(
+            egui::RichText::new(format!("What happened: {}", error.happened))
+                .strong()
+                .color(palette.error),
+        );
+        ui.label(egui::RichText::new(format!("Why: {}", error.why)).color(palette.text2));
+        ui.label(egui::RichText::new(format!("What to do: {}", error.next)).color(palette.text2));
+        ui.add_space(super::theme::space::M);
+        ui.horizontal(|ui| {
+            if ui.button("Try again").clicked() {
+                again = true;
+            }
+            if ui.button("Dismiss").clicked() {
+                dismiss = true;
+            }
+        });
+    });
+    if again {
+        let command = if retry_download {
+            Command::Install
+        } else {
+            Command::Again
+        };
+        let _ = commands.send(command);
+    } else if dismiss || modal.should_close() {
+        let _ = commands.send(Command::Dismiss);
+    }
+}
+
+fn prompt_id() -> egui::Id {
+    egui::Id::unique("thinwire-update")
+}
+
+fn worker(
+    stamp: BuildStamp,
+    phase: Arc<Mutex<Phase>>,
+    commands: Receiver<Command>,
+    shutdown: Arc<AtomicBool>,
+    wake: impl Fn(),
+) {
+    let Some(ledger_file) = ledger_file() else {
+        set_phase(
+            &phase,
+            Phase::Failed {
+                error: check_failed(),
+                retry: None,
+            },
+            &wake,
+        );
+        return;
+    };
+    let mut ledger = load_ledger(&ledger_file);
+    settle_startup(&stamp, &phase, &shutdown, &wake, &mut ledger, &ledger_file);
+    while let Ok(command) = commands.recv() {
+        match apply_command(&lock_phase(&phase).clone(), command, &mut ledger) {
+            Step::Stay => {}
+            Step::Quiet => {
+                let _ = store_ledger(&ledger_file, &ledger);
+                set_phase(&phase, Phase::Quiet, &wake);
+            }
+            Step::Check => {
+                set_phase(&phase, Phase::Checking, &wake);
+                publish_check(&stamp, &phase, &mut ledger, &ledger_file, &wake);
+            }
+            Step::Fetch(offer) => {
+                set_phase(&phase, Phase::Fetching(offer.clone()), &wake);
+                match install_offer(&offer) {
+                    Ok(()) => {
+                        shutdown.store(true, Ordering::SeqCst);
+                        set_phase(&phase, Phase::Handoff(offer), &wake);
+                    }
+                    Err(error) => set_phase(
+                        &phase,
+                        Phase::Failed {
+                            error,
+                            retry: Some(offer),
+                        },
+                        &wake,
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn apply_command(phase: &Phase, command: Command, ledger: &mut Ledger) -> Step {
+    match (phase, command) {
+        (Phase::Offer(offer), Command::Install)
+        | (
+            Phase::Failed {
+                retry: Some(offer), ..
+            },
+            Command::Install,
+        ) => Step::Fetch(offer.clone()),
+        (Phase::Offer(offer), Command::Later) => {
+            ledger.deferred_rev = Some(offer.version.rev);
+            Step::Quiet
+        }
+        (Phase::Failed { .. }, Command::Dismiss) => {
+            ledger.swap_error = None;
+            Step::Quiet
+        }
+        (Phase::Failed { retry: None, .. }, Command::Again) => Step::Check,
+        _ => Step::Stay,
+    }
+}
+
+fn settle_startup(
+    stamp: &BuildStamp,
+    phase: &Mutex<Phase>,
+    shutdown: &AtomicBool,
+    wake: &impl Fn(),
+    ledger: &mut Ledger,
+    ledger_file: &Path,
+) {
+    let Some(journal_file) = journal_file() else {
+        publish_check(stamp, phase, ledger, ledger_file, wake);
+        return;
+    };
+    if !journal_file.is_file() {
+        if let Some(install) = install_dir() {
+            clear_incoming(&install);
+        }
+        publish_check(stamp, phase, ledger, ledger_file, wake);
+        return;
+    }
+    let Ok(journal) = read_journal(&journal_file) else {
+        let _ = std::fs::remove_file(&journal_file);
+        publish_check(stamp, phase, ledger, ledger_file, wake);
+        return;
+    };
+    match journal_action(Some(stamp), &journal) {
+        JournalAction::Cleanup => {
+            cleanup_swap(&journal, &journal_file, ledger_file);
+            set_phase(phase, Phase::Quiet, wake);
+        }
+        JournalAction::Resume => {
+            if journal.staging_dir.join(EXES[0]).is_file() {
+                match spawn_apply(&journal.staging_dir, &journal_file) {
+                    Ok(()) => {
+                        shutdown.store(true, Ordering::SeqCst);
+                        set_phase(phase, Phase::Handoff(offer_for_resume(&journal)), wake);
+                    }
+                    Err(error) => {
+                        clear_incoming(&journal.install_dir);
+                        let _ = std::fs::remove_file(&journal_file);
+                        set_phase(phase, Phase::Failed { error, retry: None }, wake);
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_file(&journal_file);
+                set_phase(
+                    phase,
+                    Phase::Failed {
+                        error: swap_rolled_back(),
+                        retry: None,
+                    },
+                    wake,
+                );
+            }
+        }
+    }
+}
+
+fn offer_for_resume(journal: &Journal) -> Offer {
+    // The digest was checked before the journal existed. The card shows the token.
+    Offer {
+        version: journal.target.clone(),
+        archive_sha256: [0; 32],
+    }
+}
+
+fn cleanup_swap(journal: &Journal, journal_file: &Path, ledger_file: &Path) {
+    let mut ledger = load_ledger(ledger_file);
+    ledger.proven = Some(Proven {
+        sha7: journal.target.sha7,
+        rev: journal.target.rev,
+    });
+    ledger.swap_error = None;
+    if ledger.deferred_rev == Some(journal.target.rev) {
+        ledger.deferred_rev = None;
+    }
+    let _ = store_ledger(ledger_file, &ledger);
+    for name in EXES {
+        let _ = std::fs::remove_file(old_path(&journal.install_dir, name));
+        let _ = std::fs::remove_file(incoming_path(&journal.install_dir, name));
+        let _ = std::fs::remove_file(incoming_part(&journal.install_dir, name));
+    }
+    let _ = std::fs::remove_file(journal_file);
+    let _ = std::fs::remove_dir_all(&journal.staging_dir);
+}
+
+fn publish_check(
+    stamp: &BuildStamp,
+    phase: &Mutex<Phase>,
+    ledger: &mut Ledger,
+    ledger_file: &Path,
+    wake: &impl Fn(),
+) {
+    let swap = ledger.swap_error.clone();
+    match fetch_offer() {
+        Err(error) => {
+            set_phase(
+                phase,
+                Phase::Failed {
+                    error: swap.unwrap_or(error),
+                    retry: None,
+                },
+                wake,
+            );
+        }
+        Ok(offer) => match decide(Some(stamp), &offer.version, ledger) {
+            Decide::Current => {
+                record_current(ledger, &offer.version);
+                let _ = store_ledger(ledger_file, ledger);
+                if let Some(error) = swap {
+                    set_phase(phase, Phase::Failed { error, retry: None }, wake);
+                } else {
+                    set_phase(phase, Phase::Quiet, wake);
+                }
+            }
+            Decide::Quiet => {
+                if let Some(error) = swap {
+                    set_phase(phase, Phase::Failed { error, retry: None }, wake);
+                } else {
+                    set_phase(phase, Phase::Quiet, wake);
+                }
+            }
+            Decide::Offer => {
+                if let Some(error) = swap {
+                    set_phase(phase, Phase::Failed { error, retry: None }, wake);
+                } else {
+                    set_phase(phase, Phase::Offer(offer), wake);
+                }
+            }
+        },
+    }
+}
+
+fn record_current(ledger: &mut Ledger, nightly: &NightlyVersion) {
+    ledger.proven = Some(Proven {
+        sha7: nightly.sha7,
+        rev: nightly.rev,
+    });
+    if ledger.deferred_rev == Some(nightly.rev) {
+        ledger.deferred_rev = None;
+    }
+}
+
+fn install_offer(offer: &Offer) -> Result<(), PlainError> {
+    let install = install_dir().ok_or_else(bad_payload)?;
+    let root = update_root().ok_or_else(bad_payload)?;
+    let staging = root.join("staging");
+    let journal_path = root.join("journal.json");
+    let bytes = download_archive(&archive_name(&offer.version))?;
+    let journal = Journal {
+        target: offer.version.clone(),
+        install_dir: install.clone(),
+        staging_dir: staging.clone(),
+    };
+    stage_verified(&bytes, &offer.archive_sha256, &journal_path, &journal)?;
+    if let Err(error) = spawn_apply(&staging, &journal_path) {
+        clear_incoming(&install);
+        let _ = std::fs::remove_file(&journal_path);
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn fetch_offer() -> Result<Offer, PlainError> {
+    #[cfg(windows)]
+    {
+        fetch_offer_windows()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(check_failed())
+    }
+}
+
+fn download_archive(name: &str) -> Result<Vec<u8>, PlainError> {
+    #[cfg(windows)]
+    {
+        http_get(&feed_url(name), MAX_ARCHIVE_BYTES).map_err(|_| bad_payload())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        Err(bad_payload())
+    }
+}
+
+#[cfg(windows)]
+fn fetch_offer_windows() -> Result<Offer, PlainError> {
+    let version = parse_version(&String::from_utf8_lossy(&http_get(
+        &feed_url("VERSION"),
+        TEXT_CAP,
+    )?))?;
+    let sums = String::from_utf8_lossy(&http_get(&feed_url("SHA256SUMS"), TEXT_CAP)?).into_owned();
+    let archive_sha256 = parse_sums(&sums, &version)?;
+    Ok(Offer {
+        version,
+        archive_sha256,
+    })
+}
+
+#[cfg(windows)]
+fn http_get(start: &str, max_body: u64) -> Result<Vec<u8>, PlainError> {
+    let agent = ureq::Agent::config_builder()
+        .https_only(true)
+        .max_redirects(0)
+        .timeout_global(Some(Duration::from_secs(60)))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .build()
+        .new_agent();
+    let mut url = start.to_owned();
+    let mut redirects = 0u32;
+    loop {
+        let response = agent.get(&url).call().map_err(|_| check_failed())?;
+        let status = response.status().as_u16();
+        tracing::info!(url = start, status, "nightly feed");
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            if redirects == 5 {
+                return Err(check_failed());
+            }
+            redirects += 1;
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(check_failed)?;
+            let next = resolve_redirect(&url, location)?;
+            if !redirect_allowed(&next) {
+                return Err(check_failed());
+            }
+            url = next;
+            continue;
+        }
+        if status != 200 {
+            return Err(check_failed());
+        }
+        return read_body(response, max_body);
+    }
+}
+
+#[cfg(windows)]
+fn read_body(
+    mut response: ureq::http::Response<ureq::Body>,
+    max_body: u64,
+) -> Result<Vec<u8>, PlainError> {
+    use std::io::Read;
+    let mut reader = response.body_mut().as_reader();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buf).map_err(|_| check_failed())?;
+        if read == 0 {
+            break;
+        }
+        if out.len() as u64 + read as u64 > max_body {
+            return Err(check_failed());
+        }
+        out.extend_from_slice(&buf[..read]);
+    }
+    Ok(out)
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn resolve_redirect(current: &str, location: &str) -> Result<String, PlainError> {
+    let base = url::Url::parse(current).map_err(|_| check_failed())?;
+    base.join(location)
+        .map(|next| next.to_string())
+        .map_err(|_| check_failed())
+}
+
+/// `true` when this process is the apply child and has finished or refused.
+/// A normal start returns `false`.
+pub(crate) fn apply_if_requested() -> bool {
+    match classify_argv(std::env::args().skip(1)) {
+        Argv::Normal => false,
+        Argv::Apply(None) => true,
+        Argv::Apply(Some(path)) => {
+            apply_from(&path);
+            true
+        }
+    }
+}
+
+fn classify_argv(args: impl IntoIterator<Item = String>) -> Argv {
+    let mut args = args.into_iter();
+    if args.next().as_deref() != Some(APPLY_ARG) {
+        return Argv::Normal;
+    }
+    let path = args.next().map(PathBuf::from);
+    if args.next().is_some() {
+        return Argv::Apply(None);
+    }
+    Argv::Apply(path)
+}
+
+fn apply_from(given: &Path) {
+    let Some(root) = update_root() else {
+        return;
+    };
+    let Some(_apply_lock) = wait_file_lock(&root.join("apply.lock"), APPLY_WAIT + APPLY_WAIT)
+    else {
+        return;
+    };
+    let expected = root.join("journal.json");
+    let (Ok(given), Ok(expected_canon)) = (given.canonicalize(), expected.canonicalize()) else {
+        return;
+    };
+    if given != expected_canon {
+        return;
+    }
+    let Ok(journal) = read_journal(&expected) else {
+        let _ = std::fs::remove_file(&expected);
+        return;
+    };
+    let Some(instance_path) = thinwire_core::instance::InstanceLock::default_path() else {
+        abandon_before_rename(&journal, &expected);
+        return;
+    };
+    let Ok(_instance) = wait_instance(&instance_path) else {
+        abandon_before_rename(&journal, &expected);
+        return;
+    };
+    let ledger = ledger_file().unwrap_or_else(|| root.join("ledger.json"));
+    match swap_files(&journal, &ledger, &expected) {
+        Ok(SwapEnd::Installed) => {
+            drop(_instance);
+            let _ = spawn_normal(&journal.install_dir);
+            for name in EXES {
+                let _ = std::fs::remove_file(old_path(&journal.install_dir, name));
+            }
+            let _ = std::fs::remove_dir_all(&journal.staging_dir);
+        }
+        Ok(SwapEnd::Idle) => {
+            drop(_instance);
+            let _ = spawn_normal(&journal.install_dir);
+        }
+        Err(_) => {
+            drop(_instance);
+            let _ = spawn_normal(&journal.install_dir);
+        }
+    }
+}
+
+fn abandon_before_rename(journal: &Journal, journal_file: &Path) {
+    clear_incoming(&journal.install_dir);
+    let _ = std::fs::remove_file(journal_file);
+    let _ = std::fs::remove_dir_all(&journal.staging_dir);
+    if let Some(ledger_file) = ledger_file() {
+        let mut ledger = load_ledger(&ledger_file);
+        ledger.swap_error = Some(swap_rolled_back());
+        let _ = store_ledger(&ledger_file, &ledger);
+    }
+}
+
+fn swap_files(
+    journal: &Journal,
+    ledger_file: &Path,
+    journal_file: &Path,
+) -> Result<SwapEnd, PlainError> {
+    match commit_all(&journal.install_dir) {
+        Ok(()) => {
+            let idle = EXES
+                .iter()
+                .all(|name| observe(&journal.install_dir, name) == Slot::Idle);
+            if idle {
+                let _ = std::fs::remove_file(journal_file);
+                let _ = std::fs::remove_dir_all(&journal.staging_dir);
+                return Ok(SwapEnd::Idle);
+            }
+            copy_notices(journal);
+            let mut ledger = load_ledger(ledger_file);
+            ledger.proven = Some(Proven {
+                sha7: journal.target.sha7,
+                rev: journal.target.rev,
+            });
+            ledger.swap_error = None;
+            if ledger.deferred_rev == Some(journal.target.rev) {
+                ledger.deferred_rev = None;
+            }
+            let _ = store_ledger(ledger_file, &ledger);
+            let _ = std::fs::remove_file(journal_file);
+            Ok(SwapEnd::Installed)
+        }
+        Err(error) => {
+            clear_incoming(&journal.install_dir);
+            let _ = std::fs::remove_file(journal_file);
+            let _ = std::fs::remove_dir_all(&journal.staging_dir);
+            let mut ledger = load_ledger(ledger_file);
+            ledger.swap_error = Some(error.clone());
+            let _ = store_ledger(ledger_file, &ledger);
+            Err(error)
+        }
+    }
+}
+
+fn copy_notices(journal: &Journal) {
+    let license = journal.staging_dir.join("LICENSE");
+    if license.is_file() && std::fs::copy(&license, journal.install_dir.join("LICENSE")).is_err() {
+        tracing::warn!("the new executables are in place and LICENSE was not copied");
+    }
+    let from = journal.staging_dir.join("THIRD_PARTY_NOTICES");
+    if from.is_dir() && copy_tree(&from, &journal.install_dir.join("THIRD_PARTY_NOTICES")).is_err()
+    {
+        tracing::warn!("the new executables are in place and the notices were not copied");
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "link"));
+        }
+        let dest = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &dest)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn wait_instance(path: &Path) -> Result<thinwire_core::instance::InstanceLock, ()> {
+    wait_file_lock(path, APPLY_WAIT).ok_or(())
+}
+
+fn wait_file_lock(path: &Path, limit: Duration) -> Option<thinwire_core::instance::InstanceLock> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match thinwire_core::instance::InstanceLock::try_acquire(path) {
+            Ok(lock) => return Some(lock),
+            Err(thinwire_core::instance::LockError::Held) if Instant::now() < deadline => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(thinwire_core::instance::RETRY_STEP.min(left));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn spawn_apply(staging: &Path, journal: &Path) -> Result<(), PlainError> {
+    let mut command = std::process::Command::new(staging.join(EXES[0]));
+    command
+        .arg(APPLY_ARG)
+        .arg(journal)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    // Waiting would deadlock: the child blocks on the instance lock this
+    // process still holds, and this process would be waiting for the child.
+    command.spawn().map(|_| ()).map_err(|_| bad_payload())
+}
+
+fn spawn_normal(install: &Path) -> Result<(), PlainError> {
+    std::process::Command::new(install.join(EXES[0]))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| swap_rolled_back())
+}
+
+fn install_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
+
+fn update_root() -> Option<PathBuf> {
+    dirs::data_dir().map(|root| root.join("thinwire").join("update"))
+}
+
+fn ledger_file() -> Option<PathBuf> {
+    update_root().map(|root| root.join("ledger.json"))
+}
+
+fn journal_file() -> Option<PathBuf> {
+    update_root().map(|root| root.join("journal.json"))
 }
 
 #[cfg(test)]
@@ -2098,5 +2882,199 @@ mod tests {
         );
         assert!(incoming_path(&layout.install, EXES[0]).is_file());
         assert!(old_path(&layout.install, EXES[0]).is_file());
+    }
+
+    #[test]
+    fn later_records_the_revision_and_try_again_retries_the_right_step() {
+        let mut ledger = Ledger::default();
+        let offered = Phase::Offer(offer());
+        assert!(matches!(
+            apply_command(&offered, Command::Install, &mut ledger),
+            Step::Fetch(_)
+        ));
+        assert!(matches!(
+            apply_command(&offered, Command::Later, &mut ledger),
+            Step::Quiet
+        ));
+        assert_eq!(ledger.deferred_rev, Some(277));
+        let failed_check = Phase::Failed {
+            error: check_text(),
+            retry: None,
+        };
+        assert!(matches!(
+            apply_command(&failed_check, Command::Again, &mut ledger),
+            Step::Check
+        ));
+        ledger.swap_error = Some(swap_text());
+        assert!(matches!(
+            apply_command(&failed_check, Command::Dismiss, &mut ledger),
+            Step::Quiet
+        ));
+        assert!(ledger.swap_error.is_none());
+        let failed_download = Phase::Failed {
+            error: payload_text(),
+            retry: Some(offer()),
+        };
+        assert!(matches!(
+            apply_command(&failed_download, Command::Install, &mut ledger),
+            Step::Fetch(_)
+        ));
+        assert!(matches!(
+            apply_command(&Phase::Fetching(offer()), Command::Install, &mut ledger),
+            Step::Stay
+        ));
+        assert!(matches!(
+            apply_command(&Phase::Handoff(offer()), Command::Install, &mut ledger),
+            Step::Stay
+        ));
+    }
+
+    #[test]
+    fn argv_without_the_apply_flag_is_a_normal_start() {
+        assert!(matches!(classify_argv(std::iter::empty()), Argv::Normal));
+        assert!(matches!(classify_argv(["--help".to_owned()]), Argv::Normal));
+        assert!(matches!(
+            classify_argv([APPLY_ARG.to_owned()]),
+            Argv::Apply(None)
+        ));
+        assert!(matches!(
+            classify_argv([
+                APPLY_ARG.to_owned(),
+                "journal.json".to_owned(),
+                "extra".to_owned(),
+            ]),
+            Argv::Apply(None)
+        ));
+        match classify_argv([APPLY_ARG.to_owned(), "/tmp/journal.json".to_owned()]) {
+            Argv::Apply(Some(path)) => assert_eq!(path, PathBuf::from("/tmp/journal.json")),
+            other => panic!("expected the journal path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_prompt_is_after_the_shell_and_escape_is_before_it() {
+        let app = include_str!("mod.rs");
+        let ui = &app[app.find("fn ui(&mut self").expect("ui")..];
+        let ui = &ui[..ui.find("\n    fn on_exit(").expect("on_exit")];
+        let escape = ui.find("consume_escape(").expect("escape");
+        let draw = ui.find("ui::draw(").expect("draw");
+        let prompt = ui.find("self.updates.draw(").expect("prompt");
+        assert!(escape < draw && draw < prompt);
+        let logic = &app[app.find("fn logic(").expect("logic")..];
+        let logic = &logic[..logic.find("\n    }\n").expect("end")];
+        let shutdown = logic.find("take_shutdown(").expect("shutdown");
+        let close = logic.find("self.handle_close(").expect("close");
+        assert!(shutdown < close);
+        let main = include_str!("../main.rs");
+        let main_fn = &main[main.find("fn main()").expect("main")..];
+        let apply = main_fn.find("apply_if_requested()").expect("apply");
+        let first = main_fn.find("startup::first_try(").expect("first");
+        assert!(apply < first);
+    }
+
+    #[test]
+    fn a_build_without_a_stamp_does_not_start_the_worker() {
+        let updates = Updates::spawn(Launch { stamp: None }, || {});
+        assert!(matches!(*lock_phase(&updates.phase), Phase::Quiet));
+        assert!(!updates.take_shutdown());
+        updates.shutdown.store(true, Ordering::SeqCst);
+        assert!(updates.take_shutdown());
+        assert!(!updates.take_shutdown());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn this_build_does_not_open_a_socket_for_the_feed() {
+        assert_eq!(fetch_offer().unwrap_err(), check_text());
+        assert_eq!(download_archive("VERSION").unwrap_err(), payload_text());
+    }
+
+    #[test]
+    fn a_relative_redirect_stays_on_the_feed_host() {
+        let next = resolve_redirect(
+            "https://github.com/jaysonsantos/thinwire/releases/download/nightly/VERSION",
+            "SHA256SUMS",
+        )
+        .expect("relative");
+        assert!(redirect_allowed(&next), "{next}");
+        assert!(next.ends_with("/SHA256SUMS"));
+        let refused = resolve_redirect(
+            "https://github.com/jaysonsantos/thinwire/releases/download/nightly/VERSION",
+            "https://example.com/VERSION",
+        )
+        .expect("absolute");
+        assert!(!redirect_allowed(&refused));
+    }
+
+    #[test]
+    fn swap_replaces_the_exes_and_a_broken_slot_restores_the_ledger_error() {
+        let layout = Layout::new("swap");
+        let (bytes, digest) = good_archive();
+        stage_verified(&bytes, &digest, &layout.journal, &layout.record()).expect("stage");
+        let ledger_file = layout.install.join("ledger.json");
+        assert!(matches!(
+            swap_files(&layout.record(), &ledger_file, &layout.journal).expect("swap"),
+            SwapEnd::Installed
+        ));
+        for exe in EXES {
+            assert_eq!(
+                std::fs::read(layout.install.join(exe)).expect("live"),
+                format!("new-{exe}").into_bytes()
+            );
+            assert!(old_path(&layout.install, exe).is_file());
+            assert!(!incoming_path(&layout.install, exe).exists());
+        }
+        assert_eq!(
+            std::fs::read(layout.install.join("LICENSE")).expect("license"),
+            b"mit\n"
+        );
+        assert!(!layout.journal.exists());
+        let ledger = load_ledger(&ledger_file);
+        assert_eq!(ledger.proven.expect("proven").rev, 277);
+        assert!(ledger.swap_error.is_none());
+
+        let broken = Layout::new("swap-broken");
+        std::fs::write(incoming_path(&broken.install, EXES[0]), b"new").expect("in");
+        std::fs::write(old_path(&broken.install, EXES[0]), b"older").expect("old");
+        std::fs::create_dir_all(broken.journal.parent().expect("dir")).expect("dir");
+        std::fs::write(&broken.journal, b"{}").expect("journal");
+        let broken_ledger = broken.install.join("ledger.json");
+        assert_eq!(
+            swap_files(&broken.record(), &broken_ledger, &broken.journal).unwrap_err(),
+            swap_text()
+        );
+        assert_eq!(load_ledger(&broken_ledger).swap_error, Some(swap_text()));
+        assert!(!broken.journal.exists());
+        assert_eq!(
+            std::fs::read(broken.install.join(EXES[0])).expect("live"),
+            b"old-thinwire.exe"
+        );
+    }
+
+    #[test]
+    fn cleanup_after_our_own_sha_drops_the_old_names_and_records_proven() {
+        let layout = Layout::new("cleanup");
+        std::fs::create_dir_all(&layout.staging).expect("staging");
+        std::fs::write(old_path(&layout.install, EXES[0]), b"previous").expect("old");
+        std::fs::write(incoming_path(&layout.install, EXES[0]), b"partial").expect("in");
+        let ledger_file = layout.install.join("ledger.json");
+        let mut ledger = Ledger {
+            deferred_rev: Some(277),
+            swap_error: Some(swap_text()),
+            ..Ledger::default()
+        };
+        store_ledger(&ledger_file, &ledger).expect("ledger");
+        cleanup_swap(&layout.record(), &layout.journal, &ledger_file);
+        assert_eq!(
+            std::fs::read(layout.install.join(EXES[0])).expect("live"),
+            b"old-thinwire.exe"
+        );
+        assert!(!old_path(&layout.install, EXES[0]).exists());
+        assert!(!incoming_path(&layout.install, EXES[0]).exists());
+        assert!(!layout.staging.exists());
+        ledger = load_ledger(&ledger_file);
+        assert_eq!(ledger.proven.expect("proven").sha7.as_str(), "0c07a9c");
+        assert!(ledger.deferred_rev.is_none());
+        assert!(ledger.swap_error.is_none());
     }
 }

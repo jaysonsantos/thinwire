@@ -6,6 +6,14 @@ use tracing_subscriber::prelude::*;
 fn main() -> eframe::Result<()> {
     init_tracing();
 
+    // The staged executable renames the install and exits. It must not
+    // take the instance lock or answer `show`: the copy that is still
+    // closing holds the lock, and a show reply would make this process
+    // quit before the rename.
+    if app::update::apply_if_requested() {
+        return Ok(());
+    }
+
     // One thinwire at a time. Taken before the window, the core, and any
     // protocol start. A copy that is still closing gets time to quit. A
     // copy that is running brings its window forward, and this process

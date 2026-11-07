@@ -117,8 +117,11 @@ zbus = { version = "5", default-features = false, features = [
 
 # Windows: "Show animations" and its change event. Same windows-rs as
 # thinwire-notify. WinRT only: the workspace forbids unsafe.
+# The nightly check uses the OS TLS stack (`native-tls` is SChannel here).
+# It is not a dependency of the Linux or macOS build.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Foundation", "UI_ViewManagement"] }
+ureq = { version = "3.4", default-features = false, features = ["native-tls"] }
 
 # The Dock icon goes while the app closes in the background. Same versions
 # as eframe's AppKit bindings in Cargo.lock: no second copy.

@@ -28,8 +28,7 @@ mod ui;
 mod ui_snapshots;
 #[cfg(test)]
 mod ui_tests;
-#[cfg_attr(not(test), allow(dead_code))]
-mod update;
+pub(crate) mod update;
 #[cfg(feature = "video")]
 mod video;
 #[cfg(feature = "whatsapp-web")]
@@ -405,6 +404,8 @@ pub struct ThinwireApp {
     clicks: Arc<Mutex<Vec<NotifyKey>>>,
     last_focus: Option<bool>,
     last_unread: Option<u32>,
+    /// Windows nightly check. The worker is the only writer.
+    updates: update::Updates,
 }
 
 impl ThinwireApp {
@@ -425,6 +426,12 @@ impl ThinwireApp {
             lock(&clicked).push(key);
             wake.request_repaint();
         });
+        // The instance lock is already held: `first_try` or the wait window
+        // took it before this app was built.
+        let ctx_wake = ctx.clone();
+        let updates = update::Updates::spawn(update::Launch::compile_time(), move || {
+            ctx_wake.request_repaint();
+        });
         Self {
             core,
             runtime: Some(runtime),
@@ -438,6 +445,7 @@ impl ThinwireApp {
             clicks,
             last_focus: None,
             last_unread: None,
+            updates,
         }
     }
 
@@ -656,6 +664,9 @@ impl eframe::App for ThinwireApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_focus(ctx);
         self.core.pump();
+        if self.updates.take_shutdown() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.handle_close(ctx, frame);
         self.raise_for_show(ctx, frame);
         if theme_mode::follow_os_live(ctx, self.core.view().theme(), &mut self.last_os_theme) {
@@ -667,6 +678,7 @@ impl eframe::App for ThinwireApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.updates.consume_escape(ui.ctx());
         let view = self.core.view();
         self.player.sync(view.selected_messages());
         let mut hints = ui::Hints::from_view(&view);
@@ -687,6 +699,7 @@ impl eframe::App for ThinwireApp {
         }
         self.notifier.send(self.core.take_notify());
         self.update_title(ui.ctx());
+        self.updates.draw(ui.ctx());
     }
 
     /// Safety net for an exit that skipped the close gate. The window is gone,
