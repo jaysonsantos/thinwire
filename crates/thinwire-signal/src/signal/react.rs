@@ -18,8 +18,8 @@ const BOOK_MESSAGES: usize = 4096;
 /// The sent time and the author of a row id. `None` as the author is this
 /// account: the caller puts in its own ACI.
 pub(crate) fn target_of(message_id: &str) -> Option<(u64, Option<&str>)> {
-    let (millis, author) = message_id.split_once(':')?;
-    let millis = millis.parse().ok()?;
+    let millis = thinwire_protocol::signal_store_millis(message_id)?;
+    let author = message_id.split_once(':')?.1;
     if author.is_empty() {
         return None;
     }

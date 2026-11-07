@@ -2804,7 +2804,7 @@ async fn read_retained_older_page(
     let slot = signal_retained_slot(conversation_id).ok_or(())?;
     let chat_id = signal_retained_chat(conversation_id).ok_or(())?;
     let before = store_cursor
-        .or_else(|| message_millis(before_message_id))
+        .or_else(|| thinwire_protocol::signal_store_millis(before_message_id))
         .ok_or(())?;
     let before_id = store_cursor.is_none().then_some(before_message_id);
     let dir = retained_dir_for_slot(session_dir, slot).ok_or(())?;
@@ -2906,7 +2906,8 @@ async fn load_older_page(
     rows: &mut HashMap<String, Conversation>,
 ) {
     let loaded = async {
-        let before = store_cursor.or_else(|| message_millis(before_message_id))?;
+        let before =
+            store_cursor.or_else(|| thinwire_protocol::signal_store_millis(before_message_id))?;
         let before_id = store_cursor.is_none().then_some(before_message_id);
         let thread = thread_of(conversation_id, session.group_key(conversation_id).await)?;
         let url = history_store_url()?;
@@ -3528,10 +3529,6 @@ fn contact_id(service_id: &ServiceId) -> String {
 
 fn signal_message_id(sent_millis: u64, sender: &str) -> String {
     format!("{sent_millis}:{sender}")
-}
-
-fn message_millis(id: &str) -> Option<u64> {
-    id.split(':').next()?.parse().ok()
 }
 
 fn visible_title(name: &str, id: &str) -> String {
@@ -8854,7 +8851,10 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let left_id = message_id(&left);
         let right_id = message_id(&right);
         assert_ne!(left_id, right_id);
-        assert_eq!(message_millis(&left_id), message_millis(&right_id));
+        assert_eq!(
+            thinwire_protocol::signal_store_millis(&left_id),
+            thinwire_protocol::signal_store_millis(&right_id)
+        );
         assert!(left_id.contains(&first.to_string()));
         assert!(right_id.contains(&second.to_string()));
     }
@@ -9005,7 +9005,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
                 assert!(!seen.contains(id), "{id} returned twice");
             }
             let oldest = page.first().expect("oldest").clone();
-            before = message_millis(&oldest).expect("cursor millis");
+            before = thinwire_protocol::signal_store_millis(&oldest).expect("cursor millis");
             before_id = Some(oldest);
             seen.extend(page);
             if seen.len() == rows.len() {
