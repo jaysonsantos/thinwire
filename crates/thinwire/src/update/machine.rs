@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use base64::Engine;
@@ -250,6 +254,14 @@ pub(super) struct Offer {
 }
 
 impl Offer {
+    pub(super) fn build(&self) -> &BuildId {
+        &self.build
+    }
+
+    pub(super) fn enclosure(&self) -> &Enclosure {
+        &self.enclosure
+    }
+
     pub(super) fn view(&self) -> super::OfferView {
         super::OfferView {
             version: self.build.display(),
@@ -264,6 +276,20 @@ pub(super) struct Enclosure {
     url: NightlyUrl,
     length: u64,
     signature: [u8; 64],
+}
+
+impl Enclosure {
+    pub(super) fn url(&self) -> &str {
+        &self.url.0
+    }
+
+    pub(super) fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub(super) fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -294,12 +320,22 @@ pub(super) enum Decision {
 
 /// Bytes on disk inside the staging directory. Not yet a bundle.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(super) struct ArchiveFile {
     path: PathBuf,
 }
 
-const MAX_APPCAST: usize = 1024 * 1024;
+impl ArchiveFile {
+    pub(super) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub(super) const MAX_APPCAST: usize = 1024 * 1024;
+pub(super) const MAX_EXTRACT: u64 = 1024 * 1024 * 1024;
 
 /// Verify `signature` over the exact appcast bytes, then parse.
 /// A bad signature is [`BAD_SIGNATURE`] and does not fall through to an older item.
@@ -363,10 +399,10 @@ fn parse_appcast(appcast: &[u8]) -> Result<Feed, PlainError> {
             }
             XmlEvent::Empty(element) => {
                 let name = local_name(element.name().as_ref());
-                if name == b"enclosure" {
-                    if let Some(draft) = draft.as_mut() {
-                        read_enclosure(&element, draft)?;
-                    }
+                if name == b"enclosure"
+                    && let Some(draft) = draft.as_mut()
+                {
+                    read_enclosure(&element, draft)?;
                 }
             }
             XmlEvent::Text(text) => {
@@ -384,10 +420,10 @@ fn parse_appcast(appcast: &[u8]) -> Result<Feed, PlainError> {
             XmlEvent::End(element) => {
                 let name = local_name(element.name().as_ref());
                 if name == b"item" {
-                    if let Some(draft) = draft.take() {
-                        if let Some(offer) = offer_from(&draft) {
-                            consider(&mut best, offer);
-                        }
+                    if let Some(draft) = draft.take()
+                        && let Some(offer) = offer_from(&draft)
+                    {
+                        consider(&mut best, offer);
                     }
                     capture = Capture::None;
                 } else if capture_of(&name) == capture {
@@ -514,8 +550,8 @@ fn offer_from(draft: &Draft) -> Option<Offer> {
     })
 }
 
-fn decode_signature(text: &str) -> Option<[u8; 64]> {
-    let bytes = STANDARD.decode(text).ok()?;
+pub(super) fn decode_signature(text: &str) -> Option<[u8; 64]> {
+    let bytes = STANDARD.decode(text.trim()).ok()?;
     bytes.try_into().ok()
 }
 
@@ -675,6 +711,358 @@ pub(super) fn step(state: Update, event: Event) -> (Update, Effect) {
         (state, _) => (state, Effect::None),
     }
 }
+
+/// Rename outcome. `New` means `dest` is the incoming bundle. `Old` means the
+/// previous bundle was put back at `dest`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Swapped {
+    New,
+    Old,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SwapError {
+    /// The parent directory rejected the rename. `dest` is unchanged when this
+    /// is returned before the first move.
+    NotWritable,
+    /// Neither `dest` nor `previous` exists, so there is nothing to open.
+    Missing,
+}
+
+/// Finish a swap from whatever of the four directories already exist.
+/// Safe to call again. The second call leaves the new bundle at `dest` and
+/// removes `previous` when `dest` is already in place.
+pub(super) fn converge(
+    staged: &Path,
+    fresh: &Path,
+    dest: &Path,
+    previous: &Path,
+) -> Result<Swapped, SwapError> {
+    let staged_here = real_dir(staged);
+    let fresh_here = real_dir(fresh);
+    let dest_here = real_dir(dest);
+    let previous_here = real_dir(previous);
+
+    if staged_here && dest_here {
+        place(staged, fresh)?;
+        return finish_replace(fresh, dest, previous);
+    }
+    if fresh_here && dest_here {
+        return finish_replace(fresh, dest, previous);
+    }
+    if fresh_here && !dest_here {
+        place(fresh, dest)?;
+        return Ok(Swapped::New);
+    }
+    if !fresh_here && !staged_here && !dest_here && previous_here {
+        place(previous, dest)?;
+        return Ok(Swapped::Old);
+    }
+    if !fresh_here && !staged_here && dest_here {
+        if previous_here {
+            remove_path(previous)?;
+        }
+        return Ok(Swapped::New);
+    }
+    if staged_here && !dest_here && !fresh_here {
+        place(staged, dest)?;
+        return Ok(Swapped::New);
+    }
+    Err(SwapError::Missing)
+}
+
+fn finish_replace(fresh: &Path, dest: &Path, previous: &Path) -> Result<Swapped, SwapError> {
+    if real_dir(previous) {
+        remove_path(previous)?;
+    }
+    place(dest, previous)?;
+    if let Err(error) = place(fresh, dest) {
+        let _ = place(previous, dest);
+        return Err(error);
+    }
+    Ok(Swapped::New)
+}
+
+fn place(from: &Path, to: &Path) -> Result<(), SwapError> {
+    let marker = ready_marker(to);
+    if path_exists(to) {
+        if marker.is_file() {
+            if path_exists(from) {
+                remove_path(from)?;
+            }
+            let _ = fs::remove_file(&marker);
+            return Ok(());
+        }
+        if path_exists(from) {
+            remove_path(to)?;
+        } else {
+            return Ok(());
+        }
+    }
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            copy_tree(from, to).map_err(|_| SwapError::NotWritable)?;
+            write_marker(&marker)?;
+            remove_path(from)?;
+            let _ = fs::remove_file(&marker);
+            Ok(())
+        }
+        Err(_) => Err(SwapError::NotWritable),
+    }
+}
+
+fn ready_marker(to: &Path) -> PathBuf {
+    let mut name = to.file_name().unwrap_or_default().to_os_string();
+    name.push(".ready");
+    match to.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
+    }
+}
+
+fn real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+}
+
+fn path_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn remove_path(path: &Path) -> Result<(), SwapError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(SwapError::NotWritable),
+    };
+    let result = if meta.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.map_err(|_| SwapError::NotWritable)
+}
+
+fn write_marker(path: &Path) -> Result<(), SwapError> {
+    let mut file = File::create(path).map_err(|_| SwapError::NotWritable)?;
+    file.write_all(b"ready")
+        .map_err(|_| SwapError::NotWritable)?;
+    file.sync_all().map_err(|_| SwapError::NotWritable)?;
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(from)?;
+    if meta.file_type().is_symlink() {
+        return copy_symlink(from, to);
+    }
+    if meta.is_dir() {
+        fs::create_dir(to)?;
+        fs::set_permissions(to, meta.permissions())?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    fs::copy(from, to)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(from: &Path, to: &Path) -> io::Result<()> {
+    let target = fs::read_link(from)?;
+    std::os::unix::fs::symlink(target, to)
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "symlink copy"))
+}
+
+const REDIRECT_HOSTS: &[&str] = &[
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+];
+
+pub(super) const MAX_REDIRECTS: u32 = 3;
+
+pub(super) fn follow_redirect(
+    current: &str,
+    location: &str,
+    hops_already: u32,
+) -> Result<String, PlainError> {
+    if hops_already >= MAX_REDIRECTS {
+        return Err(CHECK_FAILED);
+    }
+    let base = url::Url::parse(current).map_err(|_| CHECK_FAILED)?;
+    let next = base.join(location).map_err(|_| CHECK_FAILED)?;
+    if next.scheme() != "https" || next.port().is_some() {
+        return Err(CHECK_FAILED);
+    }
+    if !next.username().is_empty() || next.password().is_some() {
+        return Err(CHECK_FAILED);
+    }
+    let host = next.host_str().unwrap_or("");
+    if !REDIRECT_HOSTS.contains(&host) {
+        return Err(CHECK_FAILED);
+    }
+    Ok(next.to_string())
+}
+
+pub(super) fn developer_id_text(text: &str) -> bool {
+    let mut team = false;
+    let mut identifier = false;
+    let mut authority = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "TeamIdentifier=89SP4VB8Y7" {
+            team = true;
+        }
+        if line == "Identifier=dev.jaysonsantos.thinwire" {
+            identifier = true;
+        }
+        if line.starts_with("Authority=Developer ID Application:") {
+            authority = true;
+        }
+    }
+    team && identifier && authority
+}
+
+pub(super) fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<PathBuf, PlainError> {
+    let bundle = dest_dir.join("Thinwire.app");
+    if path_exists(&bundle) {
+        remove_path(&bundle).map_err(|_| CHECK_FAILED)?;
+    }
+    fs::create_dir_all(dest_dir).map_err(|_| CHECK_FAILED)?;
+    let extracted = extract_members(archive, dest_dir);
+    if extracted.is_err() {
+        let _ = remove_path(&bundle);
+    }
+    extracted?;
+    if !real_dir(&bundle) {
+        let _ = remove_path(&bundle);
+        return Err(BAD_SIGNATURE);
+    }
+    Ok(bundle)
+}
+
+fn extract_members(archive: &Path, dest_dir: &Path) -> Result<(), PlainError> {
+    let file = File::open(archive).map_err(|_| BAD_SIGNATURE)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let bundle = dest_dir.join("Thinwire.app");
+    let mut written = 0u64;
+    let entries = tar.entries().map_err(|_| BAD_SIGNATURE)?;
+    for entry in entries {
+        let mut entry = entry.map_err(|_| BAD_SIGNATURE)?;
+        let path = entry.path().map_err(|_| BAD_SIGNATURE)?.into_owned();
+        let rel = safe_member(&path)?;
+        let out = dest_dir.join(&rel);
+        if !out.starts_with(dest_dir) {
+            return Err(BAD_SIGNATURE);
+        }
+        match entry.header().entry_type() {
+            tar::EntryType::Directory => {
+                fs::create_dir_all(&out).map_err(|_| CHECK_FAILED)?;
+            }
+            tar::EntryType::Regular => {
+                if let Some(parent) = out.parent() {
+                    fs::create_dir_all(parent).map_err(|_| CHECK_FAILED)?;
+                }
+                let declared = entry.size();
+                if declared > MAX_EXTRACT || written.saturating_add(declared) > MAX_EXTRACT {
+                    return Err(BAD_SIGNATURE);
+                }
+                let mut file = File::create(&out).map_err(|_| CHECK_FAILED)?;
+                let copied = io::copy(&mut entry, &mut file).map_err(|_| BAD_SIGNATURE)?;
+                written = written.saturating_add(copied);
+                if written > MAX_EXTRACT || copied != declared {
+                    return Err(BAD_SIGNATURE);
+                }
+                set_mode(&out, entry.header().mode().unwrap_or(0o644));
+            }
+            tar::EntryType::Symlink => {
+                let target = entry
+                    .link_name()
+                    .map_err(|_| BAD_SIGNATURE)?
+                    .ok_or(BAD_SIGNATURE)?;
+                if !link_stays_inside(&bundle, &rel, &target) {
+                    return Err(BAD_SIGNATURE);
+                }
+                if let Some(parent) = out.parent() {
+                    fs::create_dir_all(parent).map_err(|_| CHECK_FAILED)?;
+                }
+                symlink_at(&target, &out)?;
+            }
+            _ => return Err(BAD_SIGNATURE),
+        }
+    }
+    Ok(())
+}
+
+fn safe_member(name: &Path) -> Result<PathBuf, PlainError> {
+    let mut out = PathBuf::new();
+    for component in name.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            _ => return Err(BAD_SIGNATURE),
+        }
+    }
+    match out.components().next() {
+        Some(Component::Normal(part)) if part == "Thinwire.app" => Ok(out),
+        _ => Err(BAD_SIGNATURE),
+    }
+}
+
+fn link_stays_inside(bundle: &Path, link_rel: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return false;
+    }
+    let Some(bundle_parent) = bundle.parent() else {
+        return false;
+    };
+    let Some(link_dir) = bundle_parent.join(link_rel).parent().map(Path::to_path_buf) else {
+        return false;
+    };
+    let mut resolved = link_dir;
+    for component in target.components() {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return false;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    resolved.starts_with(bundle)
+}
+
+#[cfg(unix)]
+fn symlink_at(target: &Path, out: &Path) -> Result<(), PlainError> {
+    std::os::unix::fs::symlink(target, out).map_err(|_| BAD_SIGNATURE)
+}
+
+#[cfg(not(unix))]
+fn symlink_at(_target: &Path, _out: &Path) -> Result<(), PlainError> {
+    Err(BAD_SIGNATURE)
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777));
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
 
 #[cfg(test)]
 mod tests {
@@ -966,5 +1354,254 @@ mod tests {
             }
         );
         assert_eq!(project(&next), super::super::Prompt::Failed(CHECK_FAILED));
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "thinwire-update-{label}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn write_bundle(path: &Path, marker: &str) {
+        let file = path.join("Contents/Resources/BUILD_ID");
+        fs::create_dir_all(file.parent().expect("resources")).expect("resources");
+        fs::write(file, marker).expect("marker");
+    }
+
+    fn read_marker(path: &Path) -> String {
+        fs::read_to_string(path.join("Contents/Resources/BUILD_ID")).expect("marker")
+    }
+
+    #[test]
+    fn converge_twice_leaves_the_new_bundle_at_dest() {
+        let root = scratch("twice");
+        let staged = root.join("staging/build/Thinwire.app");
+        let parent = root.join("Applications");
+        fs::create_dir_all(&parent).expect("parent");
+        let dest = parent.join("Thinwire.app");
+        let fresh = parent.join("Thinwire.app.new");
+        let previous = parent.join("Thinwire.app.previous");
+        write_bundle(&staged, "new");
+        write_bundle(&dest, "old");
+        assert_eq!(
+            converge(&staged, &fresh, &dest, &previous).expect("first swap"),
+            Swapped::New
+        );
+        assert_eq!(read_marker(&dest), "new");
+        assert_eq!(read_marker(&previous), "old");
+        assert!(!staged.exists());
+        assert!(!fresh.exists());
+        assert_eq!(
+            converge(&staged, &fresh, &dest, &previous).expect("second swap"),
+            Swapped::New
+        );
+        assert!(!previous.exists());
+        assert_eq!(read_marker(&dest), "new");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn converge_resumes_when_only_fresh_and_previous_exist() {
+        let root = scratch("resume");
+        let staged = root.join("staging/Thinwire.app");
+        let parent = root.join("Applications");
+        fs::create_dir_all(&parent).expect("parent");
+        let dest = parent.join("Thinwire.app");
+        let fresh = parent.join("Thinwire.app.new");
+        let previous = parent.join("Thinwire.app.previous");
+        write_bundle(&fresh, "new");
+        write_bundle(&previous, "old");
+        assert_eq!(
+            converge(&staged, &fresh, &dest, &previous).expect("resume"),
+            Swapped::New
+        );
+        assert_eq!(read_marker(&dest), "new");
+        assert!(!fresh.exists());
+        assert_eq!(read_marker(&previous), "old");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn converge_replaces_a_partial_fresh_directory() {
+        let root = scratch("partial");
+        let staged = root.join("staging/Thinwire.app");
+        let parent = root.join("Applications");
+        fs::create_dir_all(&parent).expect("parent");
+        let dest = parent.join("Thinwire.app");
+        let fresh = parent.join("Thinwire.app.new");
+        let previous = parent.join("Thinwire.app.previous");
+        write_bundle(&staged, "new");
+        write_bundle(&dest, "old");
+        fs::create_dir_all(fresh.join("Contents")).expect("partial fresh");
+        assert_eq!(
+            converge(&staged, &fresh, &dest, &previous).expect("recover"),
+            Swapped::New
+        );
+        assert_eq!(read_marker(&dest), "new");
+        assert!(!fresh.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_redirect_stays_on_the_asset_hosts() {
+        let start = "https://github.com/jaysonsantos/thinwire/releases/download/nightly/thinwire-macos-arm64-0.1.0.r2.gabc1234.tar.gz";
+        let next = follow_redirect(
+            start,
+            "https://release-assets.githubusercontent.com/a/b?token=1",
+            0,
+        )
+        .expect("asset host");
+        assert!(next.starts_with("https://release-assets.githubusercontent.com/"));
+        assert!(follow_redirect(start, "https://evil.example/x", 0).is_err());
+        assert!(follow_redirect(start, "http://objects.githubusercontent.com/x", 0).is_err());
+        assert!(follow_redirect(start, "https://objects.githubusercontent.com/x", 3).is_err());
+        assert!(follow_redirect(start, "https://github.com/other", 0).is_err());
+        assert!(
+            follow_redirect(&next, "https://github-releases.githubusercontent.com/z", 1).is_ok()
+        );
+    }
+
+    #[test]
+    fn developer_id_text_requires_team_identifier_and_authority() {
+        let good = "\
+Identifier=dev.jaysonsantos.thinwire
+Authority=Developer ID Application: Example (89SP4VB8Y7)
+TeamIdentifier=89SP4VB8Y7
+";
+        assert!(developer_id_text(good));
+        assert!(!developer_id_text(
+            "Identifier=dev.jaysonsantos.thinwire\nSignature=adhoc\n"
+        ));
+        assert!(!developer_id_text(
+            "Identifier=dev.jaysonsantos.thinwire.extra\nAuthority=Developer ID Application: Example (89SP4VB8Y7)\nTeamIdentifier=89SP4VB8Y7\n"
+        ));
+        assert!(!developer_id_text(
+            "Identifier=dev.jaysonsantos.thinwire\nAuthority=Developer ID Application: Example (89SP4VB8Y7)\nTeamIdentifier=AAAAAAAAAA\n"
+        ));
+    }
+
+    fn gzip_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw);
+            for (name, bytes) in entries {
+                let mut header = tar::Header::new_gnu();
+                if bytes.is_empty() && name.ends_with('/') {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_size(0);
+                } else {
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_size(bytes.len() as u64);
+                    header.set_mode(0o755);
+                }
+                header.set_path(name).expect("path");
+                header.set_cksum();
+                builder.append(&header, *bytes).expect("entry");
+            }
+            builder.finish().expect("tar");
+        }
+        let mut encoded = Vec::new();
+        {
+            let mut gz = flate2::write::GzEncoder::new(&mut encoded, flate2::Compression::fast());
+            gz.write_all(&raw).expect("gzip");
+            gz.finish().expect("gzip finish");
+        }
+        encoded
+    }
+
+    fn gzip_bytes(raw: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut gz = flate2::write::GzEncoder::new(&mut encoded, flate2::Compression::fast());
+        gz.write_all(raw).expect("gzip");
+        gz.finish().expect("gzip finish");
+        encoded
+    }
+
+    /// A ustar member the `tar` builder refuses to write, so the test can hand
+    /// the extractor a path with `..`.
+    fn raw_ustar(name: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut header = vec![0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        let size = format!("{:011o}\0", bytes.len());
+        header[124..136].copy_from_slice(size.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[156] = b'0';
+        header[257..262].copy_from_slice(b"ustar");
+        header[263..265].copy_from_slice(b"00");
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let cksum = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(cksum.as_bytes());
+        header.extend_from_slice(bytes);
+        let pad = (512 - (bytes.len() % 512)) % 512;
+        header.extend(std::iter::repeat_n(0, pad));
+        header
+    }
+
+    #[test]
+    fn a_tar_that_escapes_is_not_extracted() {
+        let root = scratch("escape");
+        let archive = root.join("bad.tar.gz");
+        let mut raw = raw_ustar("Thinwire.app/../../outside.txt", b"nope");
+        raw.extend_from_slice(&[0u8; 1024]);
+        fs::write(&archive, gzip_bytes(&raw)).expect("archive");
+        let dest = root.join("out");
+        assert_eq!(
+            extract_archive(&archive, &dest).expect_err("escape"),
+            BAD_SIGNATURE
+        );
+        assert!(!root.join("outside.txt").exists());
+        assert!(!dest.join("outside.txt").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_link_that_leaves_the_bundle_is_rejected() {
+        let bundle = Path::new("/Applications/Thinwire.app");
+        let link = Path::new("Thinwire.app/Contents/MacOS/helper");
+        assert!(!link_stays_inside(bundle, link, Path::new("/tmp/evil")));
+        assert!(!link_stays_inside(
+            bundle,
+            link,
+            Path::new("../../../outside")
+        ));
+        assert!(link_stays_inside(bundle, link, Path::new("thinwire")));
+        assert!(safe_member(Path::new("/etc/passwd")).is_err());
+        assert!(safe_member(Path::new("Thinwire.app/Contents/MacOS/thinwire")).is_ok());
+    }
+
+    #[test]
+    fn a_bundle_tar_keeps_both_helpers() {
+        let root = scratch("helpers");
+        let archive = root.join("app.tar.gz");
+        let bytes = gzip_tar(&[
+            ("Thinwire.app/", b""),
+            ("Thinwire.app/Contents/", b""),
+            ("Thinwire.app/Contents/MacOS/", b""),
+            ("Thinwire.app/Contents/MacOS/thinwire", b"app"),
+            (
+                "Thinwire.app/Contents/MacOS/thinwire-whatsapp-helper",
+                b"wa",
+            ),
+            ("Thinwire.app/Contents/MacOS/thinwire-signal-helper", b"sg"),
+        ]);
+        fs::write(&archive, bytes).expect("archive");
+        let dest = root.join("out");
+        let bundle = extract_archive(&archive, &dest).expect("bundle");
+        let macos = bundle.join("Contents/MacOS");
+        assert!(macos.join("thinwire-whatsapp-helper").is_file());
+        assert!(macos.join("thinwire-signal-helper").is_file());
+        assert_eq!(fs::read(macos.join("thinwire")).expect("app bytes"), b"app");
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -5,6 +5,9 @@ use tracing_subscriber::prelude::*;
 
 fn main() -> eframe::Result<()> {
     init_tracing();
+    if let Some(job) = thinwire::update::apply_from_args() {
+        thinwire::update::apply_and_relaunch(job);
+    }
 
     // One thinwire at a time. Taken before the window, the core, and any
     // protocol start. A copy that is still closing gets time to quit. A
