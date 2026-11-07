@@ -866,6 +866,72 @@ const REDIRECT_HOSTS: &[&str] = &[
 
 pub(super) const MAX_REDIRECTS: u32 = 3;
 
+// region: feed assets
+
+/// The prefix of the API URL of one asset of this repository. The id follows.
+const ASSET_API_PREFIX: &str =
+    "https://api.github.com/repos/jaysonsantos/thinwire/releases/assets/";
+/// The release JSON lists every asset of the last days: about 2 KiB each.
+pub(super) const MAX_RELEASE_JSON: usize = 1024 * 1024;
+const APPCAST_NAME: &str = "appcast.xml";
+const APPCAST_SIG_NAME: &str = "appcast.ed25519";
+
+#[derive(serde::Deserialize)]
+struct ReleaseJson {
+    assets: Vec<AssetJson>,
+}
+
+#[derive(serde::Deserialize)]
+struct AssetJson {
+    name: String,
+    url: String,
+    updated_at: String,
+}
+
+/// The API URLs of the feed and of its signature in one release snapshot.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct FeedAssets {
+    pub(super) appcast: String,
+    pub(super) signature: String,
+}
+
+/// Find the feed and its signature in the release JSON. Each URL must be the
+/// API URL of an asset of this repository. The publisher uploads the feed
+/// first and the signature second, so a signature older than the feed means
+/// that the upload is not complete yet: that is a failed check, not a bad
+/// signature.
+pub(super) fn feed_assets(json: &[u8]) -> Result<FeedAssets, PlainError> {
+    if json.len() > MAX_RELEASE_JSON {
+        return Err(CHECK_FAILED);
+    }
+    let release: ReleaseJson = serde_json::from_slice(json).map_err(|_| CHECK_FAILED)?;
+    let find = |name: &str| {
+        release
+            .assets
+            .iter()
+            .find(|asset| asset.name == name)
+            .filter(|asset| asset_api_url(&asset.url))
+            .ok_or(CHECK_FAILED)
+    };
+    let appcast = find(APPCAST_NAME)?;
+    let signature = find(APPCAST_SIG_NAME)?;
+    // Both times are RFC 3339 in UTC from the same API, so the text order is the time order.
+    if signature.updated_at < appcast.updated_at {
+        return Err(CHECK_FAILED);
+    }
+    Ok(FeedAssets {
+        appcast: appcast.url.clone(),
+        signature: signature.url.clone(),
+    })
+}
+
+fn asset_api_url(url: &str) -> bool {
+    url.strip_prefix(ASSET_API_PREFIX)
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+// endregion: feed assets
+
 pub(super) fn follow_redirect(
     current: &str,
     location: &str,
@@ -1552,6 +1618,55 @@ mod tests {
         assert!(follow_redirect(start, "https://github.com/other", 0).is_err());
         assert!(
             follow_redirect(&next, "https://github-releases.githubusercontent.com/z", 1).is_ok()
+        );
+    }
+
+    fn release_json(appcast_time: &str, signature_time: &str) -> String {
+        format!(
+            r#"{{"tag_name":"nightly","assets":[
+                {{"name":"VERSION","url":"{ASSET_API_PREFIX}1","updated_at":"2026-11-07T20:40:43Z"}},
+                {{"name":"appcast.xml","url":"{ASSET_API_PREFIX}22","updated_at":"{appcast_time}"}},
+                {{"name":"appcast.ed25519","url":"{ASSET_API_PREFIX}333","updated_at":"{signature_time}"}}
+            ]}}"#
+        )
+    }
+
+    #[test]
+    fn feed_assets_reads_both_api_urls_from_one_release() {
+        let json = release_json("2026-11-07T20:40:41Z", "2026-11-07T20:40:42Z");
+        assert_eq!(
+            feed_assets(json.as_bytes()),
+            Ok(FeedAssets {
+                appcast: format!("{ASSET_API_PREFIX}22"),
+                signature: format!("{ASSET_API_PREFIX}333"),
+            })
+        );
+    }
+
+    #[test]
+    fn feed_assets_fails_the_check_while_the_signature_is_older_than_the_feed() {
+        let json = release_json("2026-11-07T20:40:42Z", "2026-11-06T09:00:00Z");
+        assert_eq!(feed_assets(json.as_bytes()), Err(CHECK_FAILED));
+    }
+
+    #[test]
+    fn feed_assets_rejects_a_missing_asset_or_a_foreign_url() {
+        let missing = r#"{"assets":[{"name":"appcast.xml","url":"https://api.github.com/repos/jaysonsantos/thinwire/releases/assets/2","updated_at":"2026-11-07T20:40:42Z"}]}"#;
+        assert_eq!(feed_assets(missing.as_bytes()), Err(CHECK_FAILED));
+        let json = release_json("2026-11-07T20:40:41Z", "2026-11-07T20:40:42Z");
+        for foreign in [
+            "https://evil.example/repos/jaysonsantos/thinwire/releases/assets/",
+            "https://api.github.com/repos/someone/thinwire/releases/assets/",
+        ] {
+            let json = json.replace(ASSET_API_PREFIX, foreign);
+            assert_eq!(feed_assets(json.as_bytes()), Err(CHECK_FAILED), "{foreign}");
+        }
+        let not_an_id = json.replace("assets/22", "assets/22/../../x");
+        assert_eq!(feed_assets(not_an_id.as_bytes()), Err(CHECK_FAILED));
+        assert_eq!(feed_assets(b"not json"), Err(CHECK_FAILED));
+        assert_eq!(
+            feed_assets(&vec![b' '; MAX_RELEASE_JSON + 1]),
+            Err(CHECK_FAILED)
         );
     }
 
