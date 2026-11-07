@@ -166,6 +166,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::Retry { message_id } => state.snapshot.retry_send(&message_id),
             Intent::MoveInbox { delta } => state.snapshot.move_inbox_selection(delta),
             Intent::FocusInbox { id } => state.snapshot.focus_inbox_row(id),
+            Intent::SetSearch(text) => state.snapshot.set_search(text.into_inner()),
             Intent::SetChatMute {
                 protocol,
                 conversation_id,
@@ -989,7 +990,7 @@ fn a_right_click_opens_the_message_menu_and_delete_asks() {
     ));
 
     harness
-        .get_by_role_and_label(egui::accesskit::Role::Pane, "My own line")
+        .get_by_role_and_label(egui::accesskit::Role::Pane, "My own line (sent)")
         .click_secondary();
     harness.run();
     harness.get_by_label("Reply");
@@ -1070,7 +1071,7 @@ fn the_message_menu_offers_edit_for_an_own_text() {
     harness.run();
 
     harness
-        .get_by_role_and_label(egui::accesskit::Role::Pane, "My own line")
+        .get_by_role_and_label(egui::accesskit::Role::Pane, "My own line (edited, sent)")
         .click_secondary();
     harness.run();
     harness.get_by_label("Edit").click();
@@ -1139,6 +1140,89 @@ fn selected_messages_forward_through_the_chat_picker() {
     );
     assert!(harness.query_by_label("Forward 2 messages").is_none());
     assert!(harness.query_by_label("2 selected").is_none());
+}
+
+/// The name of a node as a Linux screen reader reads it: AT-SPI takes the
+/// name of a `Label` from its value.
+fn atspi_name(node: &egui_kittest::Node<'_>) -> Option<String> {
+    if node.accesskit_node().role() == egui::accesskit::Role::Label {
+        node.accesskit_node().value()
+    } else {
+        node.accesskit_node().label()
+    }
+}
+
+/// Each text field has a name, not only a placeholder. A screen reader and
+/// an automation tool find the search field by its name and set its text
+/// with the AccessKit SetValue action.
+#[test]
+fn text_fields_have_names_and_take_a_set_value() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    let search = harness.get_by_role_and_label(egui::accesskit::Role::TextInput, "Search chats");
+    assert_eq!(atspi_name(&search).as_deref(), Some("Search chats"));
+    search.set_text_value_accesskit("bo");
+    harness.run();
+    assert_eq!(harness.state_mut().snapshot.search, "bo");
+
+    let compose =
+        harness.get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Message");
+    assert_eq!(atspi_name(&compose).as_deref(), Some("Message"));
+}
+
+/// A chat row is one click target. Its title, time, and preview are plain
+/// text, so a click on them goes to the row.
+#[test]
+fn a_chat_row_is_one_click_target() {
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    let clickable: Vec<String> = harness
+        .query_all(By::new().predicate(|node| {
+            node.data().supports_action(egui::accesskit::Action::Click)
+                && node.label().is_some_and(|label| label.contains("Ada"))
+        }))
+        .filter_map(|node| node.accesskit_node().label())
+        .collect();
+    assert_eq!(clickable, ["Ada"], "only the row takes the click");
+    let preview = harness.get_by_role_and_label(egui::accesskit::Role::Label, "seen from Ada");
+    assert!(
+        !preview
+            .accesskit_node()
+            .data()
+            .supports_action(egui::accesskit::Action::Click)
+    );
+}
+
+/// The name of a bubble says, in words, what its painted marks say: edited,
+/// and the delivery of an own message. A message of another person has no
+/// delivery word.
+#[test]
+fn a_bubble_name_has_the_status_in_words() {
+    let mut state = InboxUi::ready();
+    let theirs = chat_message("telegram:1:7", "Their words", 1_790_299_000);
+    let mut read = outgoing_row(8, "Read words", Delivery::Read);
+    read.edited = true;
+    for message in [
+        theirs,
+        read,
+        outgoing_row(9, "Pending words", Delivery::Pending),
+        outgoing_row(10, "Failed words", Delivery::Failed),
+    ] {
+        state
+            .snapshot
+            .apply(AdapterEvent::MessageReceived { message });
+    }
+    let mut harness = harness(state);
+    harness.run();
+    for name in [
+        "Their words",
+        "Read words (edited, read)",
+        "Pending words (sending)",
+        "Failed words (not sent)",
+    ] {
+        let pane = harness.get_by_role_and_label(egui::accesskit::Role::Pane, name);
+        assert_eq!(atspi_name(&pane).as_deref(), Some(name));
+    }
 }
 
 #[test]
@@ -1283,7 +1367,7 @@ fn outgoing_telegram_marks_follow_send_read_and_failure() {
         });
     harness.run();
     assert!(harness.query_by_label("Sending…").is_none());
-    assert_mark(&harness, "Sent", "✓");
+    assert_mark(&harness, "Sent");
     assert_eq!(label_count(&harness, "outbox-line"), 1);
 
     harness
@@ -1295,7 +1379,7 @@ fn outgoing_telegram_marks_follow_send_read_and_failure() {
             last_read_message_id: server,
         });
     harness.run();
-    assert_mark(&harness, "Read", "✓✓");
+    assert_mark(&harness, "Read");
     assert!(access_name_count(&harness, "Sent") == 0);
     assert_eq!(label_count(&harness, "outbox-line"), 1);
 
@@ -1354,7 +1438,9 @@ fn access_name_count(harness: &Harness<'_, InboxUi>, name: &str) -> usize {
         .count()
 }
 
-fn assert_mark(harness: &Harness<'_, InboxUi>, name: &str, glyph: &str) {
+/// The delivery mark reads as the word `name`, also on Linux, where AT-SPI
+/// takes the name of a label from its value. The painted glyph is not a word.
+fn assert_mark(harness: &Harness<'_, InboxUi>, name: &str) {
     let nodes: Vec<_> = harness
         .query_all(By::new().predicate({
             let name = name.to_owned();
@@ -1364,8 +1450,8 @@ fn assert_mark(harness: &Harness<'_, InboxUi>, name: &str, glyph: &str) {
     assert_eq!(nodes.len(), 1, "{name}");
     assert_eq!(
         nodes[0].accesskit_node().value().as_deref(),
-        Some(glyph),
-        "{name}"
+        Some(name),
+        "AT-SPI reads the value of {name}"
     );
 }
 

@@ -1,5 +1,6 @@
 //! eframe application: draws the core view and sends user intents to the core.
 
+mod a11y;
 mod attach;
 mod audio;
 mod auth;

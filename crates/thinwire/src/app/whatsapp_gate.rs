@@ -106,11 +106,16 @@ fn pair_screen(ui: &mut egui::Ui, snapshot: &Snapshot, out: &mut Vec<Intent>) {
     );
     ui.add_space(8.0);
     ui.label("Optional phone for a pair code (digits). Leave blank for a QR payload only.");
-    if let Some(value) = edited(ui, &snapshot.whatsapp_phone, |text| {
-        egui::TextEdit::singleline(text)
-            .hint_text("15551234567")
-            .desired_width(240.0)
-    }) {
+    if let Some(value) = edited(
+        ui,
+        &snapshot.whatsapp_phone,
+        "Phone number for a pair code",
+        |text| {
+            egui::TextEdit::singleline(text)
+                .hint_text("15551234567")
+                .desired_width(240.0)
+        },
+    ) {
         out.push(Intent::WhatsApp(WhatsAppIntent::SetPhone(SecretText::new(
             value,
         ))));

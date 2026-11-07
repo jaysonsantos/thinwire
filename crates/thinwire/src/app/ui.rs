@@ -201,15 +201,19 @@ pub(crate) fn draw(
     super::forward::picker(ui.ctx(), snapshot, out);
 }
 
-/// Single-line or multiline text bound to a core value. A change becomes an intent.
+/// Single-line or multiline text bound to a core value. A change becomes an
+/// intent. `name` is the accessible name of the field: a placeholder is not
+/// a name.
 pub(crate) fn edited(
     ui: &mut egui::Ui,
     current: &str,
+    name: &str,
     edit: impl FnOnce(&mut String) -> egui::TextEdit<'_>,
 ) -> Option<String> {
     let mut text = current.to_owned();
-    let changed = ui.add(edit(&mut text)).changed();
-    changed.then_some(text)
+    let response = ui.add(edit(&mut text));
+    super::a11y::name(ui.ctx(), response.id, name);
+    response.changed().then_some(text)
 }
 
 /// Side of the busy spinner in the chat list header.
@@ -293,6 +297,7 @@ fn search_field(ui: &mut egui::Ui, search: &str) -> Option<String> {
             egui::vec2(SEARCH_ICON, SEARCH_ICON),
         ))
         .show(ui);
+    super::a11y::name(ui.ctx(), output.response.id, "Search chats");
     let rect = output.response.rect;
     let center = egui::pos2(
         rect.min.x + f32::from(margin.left) + SEARCH_ICON * 0.5,
@@ -1993,6 +1998,9 @@ fn inbox_row(
             .id_salt(("inbox-row", id)),
     );
     child.spacing_mut().item_spacing.x = space::M;
+    // A selectable label takes the click, and it is one more click target
+    // in the screen-reader tree. Plain labels leave one target: the row.
+    child.style_mut().interaction.selectable_labels = false;
     let (avatar_rect, avatar_response) = child.allocate_exact_size(
         egui::vec2(super::photos::AVATAR_SIDE, super::photos::AVATAR_SIDE),
         egui::Sense::hover(),
@@ -2532,6 +2540,7 @@ fn thread(
             actions,
             editable: thinwire_core::state::can_edit(message),
             forwardable: actions.forward && thinwire_core::state::can_forward(message),
+            edited: message.edited,
             selecting,
             selected: selection.contains(&message.id),
             delivery: message.delivery,
@@ -3004,6 +3013,8 @@ struct Bubble<'a> {
     editable: bool,
     /// Forward can send this message to another chat.
     forwardable: bool,
+    /// The text changed after the send.
+    edited: bool,
     /// The thread is in selection mode: a click selects the message.
     selecting: bool,
     /// The message is in the selection to forward.
@@ -3754,13 +3765,11 @@ fn hide_from_accesskit(ui: &egui::Ui, id: egui::Id) {
     });
 }
 
-/// A check mark. The painted glyph stays `glyph`. A screen reader reads `access`.
+/// A check mark. The painted glyph stays `glyph`. A screen reader reads
+/// `access`, also on Linux, where AT-SPI reads a label from its value.
 fn delivery_mark(ui: &mut egui::Ui, glyph: &str, access: &str, color: egui::Color32) {
     let response = ui.label(RichText::new(glyph).small().color(color));
-    let access = access.to_owned();
-    ui.ctx().accesskit_node_builder(response.id, |node| {
-        node.set_label(access);
-    });
+    super::a11y::name_label(ui.ctx(), response.id, access);
 }
 
 /// "Sending…" beside the time of an outgoing message that the server has not
@@ -3893,6 +3902,10 @@ fn bubble_access_label(message: &Bubble<'_>) -> String {
     } else {
         body.to_owned()
     };
+    let status = bubble_status(message);
+    if !status.is_empty() {
+        label.push_str(&format!(" ({})", status.join(", ")));
+    }
     if !message.reactions.is_empty() {
         let list: Vec<String> = message
             .reactions
@@ -3903,6 +3916,25 @@ fn bubble_access_label(message: &Bubble<'_>) -> String {
         label.push_str(&list.join(", "));
     }
     label
+}
+
+/// The words that the bubble name adds after the text: "edited", and the
+/// delivery of an own message. The painted marks (✓, ✓✓) are not words.
+fn bubble_status(message: &Bubble<'_>) -> Vec<&'static str> {
+    let mut words = Vec::new();
+    // In a group, the time in the name already has "edited".
+    if message.edited && !message.group {
+        words.push("edited");
+    }
+    if message.outbound {
+        words.push(match message.delivery {
+            Delivery::Pending => "sending",
+            Delivery::Sent => "sent",
+            Delivery::Read => "read",
+            Delivery::Failed => "not sent",
+        });
+    }
+    words
 }
 
 /// [`radius::BUBBLE`] on every corner. The last bubble of a run uses
@@ -4058,7 +4090,12 @@ fn compose(
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         let hint = snapshot.compose_hint();
-                        if let Some(text) = edited(ui, &snapshot.compose, |text| {
+                        let name = if snapshot.edit_target().is_some() {
+                            "Edit message"
+                        } else {
+                            "Message"
+                        };
+                        if let Some(text) = edited(ui, &snapshot.compose, name, |text| {
                             egui::TextEdit::multiline(text)
                                 .id(compose_id)
                                 .frame(field)

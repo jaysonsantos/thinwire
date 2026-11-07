@@ -111,10 +111,7 @@ pub(crate) fn picker(ctx: &egui::Context, snapshot: &View<'_>, out: &mut Vec<Int
                 .hint_text("Search chats")
                 .desired_width(f32::INFINITY),
         );
-        // A screen reader names the field, not only its placeholder.
-        ui.ctx().accesskit_node_builder(field.id, |node| {
-            node.set_label("Search chats");
-        });
+        super::a11y::name(ui.ctx(), field.id, "Search chats");
         if ui.memory(|memory| memory.focused().is_none()) {
             field.request_focus();
         }

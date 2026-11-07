@@ -196,13 +196,25 @@ fn field(
     let ring = motion::toggle(ui.ctx(), id.with("ring"), focused, motion::STATE);
     let frame = theme::field_frame(palette, ring, margin);
     let width = ui.available_width();
-    let changed = edited(ui, current, |text| {
+    let changed = edited(ui, current, field_name(auth_field), |text| {
         edit(text).id(id).frame(frame).desired_width(width)
     });
     if focus {
         ui.memory_mut(|memory| memory.request_focus(id));
     }
     changed
+}
+
+/// The accessible name of a login field. The placeholder is an example
+/// value, not a name.
+const fn field_name(auth_field: AuthField) -> &'static str {
+    match auth_field {
+        AuthField::ApiId => "API ID",
+        AuthField::ApiHash => "API hash",
+        AuthField::Phone => "Phone number",
+        AuthField::Code => "Login code",
+        AuthField::Password => "Telegram password",
+    }
 }
 
 /// Send a login field value to the core as a [`SecretText`].
