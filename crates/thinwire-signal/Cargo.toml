@@ -28,6 +28,7 @@ signal-local = [
   "dep:sqlx",
   "dep:rusqlite",
   "dep:thinwire-core",
+  "dep:aws-lc-sys",
   "thinwire-protocol/session-cipher",
   "thinwire-protocol/photo-resize",
 ]
@@ -43,10 +44,10 @@ tokio = { workspace = true, features = ["fs", "io-std"] }
 tracing.workspace = true
 # The log of the helper program.
 tracing-subscriber.workspace = true
-presage = { git = "https://github.com/whisperfish/presage", rev = "291c7ee10d2fd3ae04cea48e586ad55bdb89cd23", optional = true, default-features = false }
+presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", optional = true, default-features = false }
 # Default features of this crate build SQLCipher. This edge stays off so the
 # helper picks the SQLCipher build below, not a second SQLite.
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "291c7ee10d2fd3ae04cea48e586ad55bdb89cd23", optional = true, default-features = false }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", optional = true, default-features = false }
 # Bundled SQLCipher and vendored OpenSSL. The helper does not need a system
 # libsqlite or libssl. The key lives in the OS keychain, not in this file.
 libsqlite3-sys = { version = "0.39", optional = true, default-features = false, features = [
@@ -66,6 +67,12 @@ sqlx = { version = "0.9.0", optional = true, default-features = false, features 
   "sqlite",
   "uuid",
 ] }
+
+# libsignal-service uses reqwest 0.13, and its rustls uses aws-lc-rs. On
+# Windows, aws-lc-sys needs the NASM assembler, and the CI runners have none.
+# This feature builds with the NASM objects that the aws-lc-sys crate ships.
+[target.'cfg(windows)'.dependencies]
+aws-lc-sys = { version = "0.47", optional = true, features = ["prebuilt-nasm"] }
 
 [dev-dependencies]
 chrono.workspace = true

@@ -2032,10 +2032,16 @@ async fn run_linked(
                         // device removal.
                         match receive.on_item(item.is_none(), session.is_current(token)) {
                             StreamPoll::Continue => {
-                                if matches!(item, Some(Received::Contacts)) {
+                                let storage_sync = matches!(
+                                    &item,
+                                    Some(Received::Content(content)) if asks_storage_sync(content)
+                                );
+                                if matches!(item, Some(Received::Contacts)) || storage_sync {
                                     // The phone sends its contacts after a new
-                                    // link, and presage saved them. The chat
-                                    // list shows them now, not after a restart.
+                                    // link, and it asks for a storage sync when
+                                    // its group list changes. Presage saved them.
+                                    // The chat list shows them now, not after a
+                                    // restart.
                                     refresh_chat_list(
                                         &manager,
                                         session.as_ref(),
@@ -2810,7 +2816,8 @@ async fn read_retained_older_page(
     let dir = retained_dir_for_slot(session_dir, slot).ok_or(())?;
     let url = path_url(&sqlite_store_path(&dir))?;
     let store = open_retained_store(&url).await?;
-    let read = async {
+    // The error type is named: aws-lc-rs adds more `From<()>` impls.
+    let read: Result<_, ()> = async {
         let thread = thread_for_retained_chat(&store, chat_id).await.ok_or(())?;
         let names = retained_contact_names(&store).await;
         let titles = retained_group_titles(&store).await;
@@ -3588,6 +3595,20 @@ fn clear_viewed(
 
 fn remember_row(rows: &mut HashMap<String, Conversation>, conversation: &Conversation) {
     rows.insert(conversation.id.clone(), conversation.clone());
+}
+
+/// The phone asks the linked devices to read the storage service again.
+/// Presage then saves the groups that the storage service lists.
+fn asks_storage_sync(content: &Content) -> bool {
+    use presage::libsignal_service::proto::sync_message::Content as SyncContent;
+    use presage::libsignal_service::proto::sync_message::fetch_latest::Type;
+    match &content.body {
+        ContentBody::SynchronizeMessage(sync) => matches!(
+            sync.content.as_ref(),
+            Some(SyncContent::FetchLatest(fetch)) if fetch.r#type() == Type::StorageManifest
+        ),
+        _ => false,
+    }
 }
 
 /// The text and the attachments of a transcript of a message that this
@@ -4481,8 +4502,8 @@ mod tests {
     fn a_contacts_sync_refreshes_the_chat_list() {
         let src = include_str!("live.rs");
         let at = src
-            .find("matches!(item, Some(Received::Contacts))")
-            .expect("the receive loop reads the contacts sync");
+            .find("matches!(item, Some(Received::Contacts)) || storage_sync")
+            .expect("the receive loop reads the contacts and the storage sync");
         let after = &src[at..];
         let refresh = after.find("refresh_chat_list(").expect("refresh");
         let loaded = after.find("emit_chat_list_loaded(").expect("list loaded");
@@ -4497,6 +4518,30 @@ mod tests {
             job.find("refresh_chat_list(") < job.find("Some(WorkerJob::Viewed"),
             "the refresh job uses the same code"
         );
+    }
+
+    /// Only a storage manifest fetch asks for a new group list.
+    #[test]
+    fn a_storage_manifest_fetch_asks_for_a_storage_sync() {
+        use presage::libsignal_service::proto::SyncMessage;
+        use presage::libsignal_service::proto::sync_message::fetch_latest::Type;
+        use presage::libsignal_service::proto::sync_message::{
+            Content as SyncContent, FetchLatest,
+        };
+
+        let fetch = |kind: Type| {
+            let mut content = envelope_at(Uuid::nil(), "x", 1);
+            content.body = ContentBody::SynchronizeMessage(SyncMessage {
+                content: Some(SyncContent::FetchLatest(FetchLatest {
+                    r#type: Some(kind.into()),
+                })),
+                ..SyncMessage::default()
+            });
+            content
+        };
+        assert!(asks_storage_sync(&fetch(Type::StorageManifest)));
+        assert!(!asks_storage_sync(&fetch(Type::LocalProfile)));
+        assert!(!asks_storage_sync(&envelope_at(Uuid::nil(), "hello", 1)));
     }
 
     fn envelope_at(sender: Uuid, body: &str, millis: i64) -> Content {
