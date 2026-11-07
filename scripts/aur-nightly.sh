@@ -7,8 +7,12 @@
 # checksums, and .SRCINFO. It does nothing when the AUR already has the
 # newest version.
 #
+# VERSION and SHA256SUMS keep their names from one nightly to the next, and
+# the download URL of a release asset is cached for many minutes. So the
+# script reads these two files through the API, which is never stale.
+#
 # Needs: AUR_SSH_PRIVATE_KEY (the key of the AUR account, push only),
-# GITHUB_REPOSITORY. Runs as root in the container: makepkg runs as an
+# GH_TOKEN (read access to the release), GITHUB_REPOSITORY. Runs as root in the container: makepkg runs as an
 # unprivileged user, because it refuses root.
 set -euo pipefail
 
@@ -22,7 +26,19 @@ repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY names the repository}"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 
-if ! version=$(curl -fsSL "https://github.com/${repo}/releases/download/nightly/VERSION"); then
+api="https://api.github.com/repos/${repo}"
+github_api() {
+  curl -fsSL -H "Authorization: Bearer ${GH_TOKEN:?GH_TOKEN reads the release}" "$@"
+}
+release=$(github_api -H "Accept: application/vnd.github+json" "${api}/releases/tags/nightly")
+# Print one asset of the nightly release, read through the API.
+release_asset() {
+  local asset_id
+  asset_id=$(jq -er --arg name "$1" '.assets[] | select(.name == $name) | .id' <<<"$release") || return 1
+  github_api -H "Accept: application/octet-stream" "${api}/releases/assets/${asset_id}"
+}
+
+if ! version=$(release_asset VERSION); then
   echo "::error::The nightly release of ${repo} has no VERSION file yet."
   exit 1
 fi
@@ -46,18 +62,20 @@ fi
 sed -i -e "s/^pkgver=.*/pkgver=${version}/" -e 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
 id -u "$BUILD_USER" >/dev/null 2>&1 || useradd --create-home "$BUILD_USER"
 chown -R "$BUILD_USER" "$work"
-env -u AUR_SSH_PRIVATE_KEY runuser -u "$BUILD_USER" -- updpkgsums
-env -u AUR_SSH_PRIVATE_KEY runuser -u "$BUILD_USER" -- sh -c 'makepkg --printsrcinfo > .SRCINFO'
+env -u AUR_SSH_PRIVATE_KEY -u GH_TOKEN runuser -u "$BUILD_USER" -- updpkgsums
+env -u AUR_SSH_PRIVATE_KEY -u GH_TOKEN runuser -u "$BUILD_USER" -- sh -c 'makepkg --printsrcinfo > .SRCINFO'
 
 # The checksum of the archive must match the SHA256SUMS of the release.
 linux_archive="thinwire-linux-x86_64-${version}.tar.gz"
-expected=$(curl -fsSL "https://github.com/${repo}/releases/download/nightly/SHA256SUMS" |
+expected=$(release_asset SHA256SUMS |
   awk -v name="$linux_archive" '$2 == name { print $1 }')
 if [[ -z "$expected" ]] || ! grep -q "$expected" .SRCINFO; then
   echo "::error::The checksum of ${linux_archive} in .SRCINFO does not match SHA256SUMS of the release."
   exit 1
 fi
 
+# ssh reads ~/.ssh from the home of the passwd entry (/root), not from $HOME
+# (/github/home in a GitHub container). So every file goes to ssh by its path.
 mkdir -p ~/.ssh
 chmod 700 ~/.ssh
 known_hosts=~/.ssh/known_hosts
@@ -75,6 +93,6 @@ git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 git add PKGBUILD .SRCINFO
 git commit --quiet -m "Update to ${version}"
-GIT_SSH_COMMAND="ssh -i ${key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
+GIT_SSH_COMMAND="ssh -i ${key_file} -o IdentitiesOnly=yes -o UserKnownHostsFile=${known_hosts} -o StrictHostKeyChecking=yes" \
   git push "ssh://aur@${AUR_HOST}/${PKGNAME}.git" HEAD:master
 echo "Pushed ${PKGNAME} ${version} to the AUR."
