@@ -851,7 +851,7 @@ fn spawn_tdlib_worker(
         // Register before the first request, so no update for this client is lost.
         let mut update_rx = dispatcher.register(client_id);
 
-        if tdlib_rs::functions::set_log_verbosity_level(1, client_id)
+        if tdlib_rs::functions::set_log_verbosity_level(TDLIB_LOG_LEVEL, client_id)
             .await
             .is_err()
         {
@@ -1178,6 +1178,10 @@ fn spawn_tdlib_worker(
 /// handles one command or one update at a time, so a slow step holds every
 /// later update: a sent message stays on "Sending…" and an edit waits.
 const SLOW_STEP: Duration = Duration::from_secs(1);
+
+/// TDLib's own log writes fatal errors only. Its error lines can print a
+/// whole message with its text, and no log may hold message text.
+const TDLIB_LOG_LEVEL: i32 = 0;
 
 /// Log a worker step that took [`SLOW_STEP`] or more. The line has the kind
 /// of the step and the time only: no chat, no message, and no text.

@@ -1288,8 +1288,12 @@ mod tests {
             .find("dispatcher.register(client_id)")
             .expect("register");
         let first_request = worker
-            .find("set_log_verbosity_level")
+            .find("set_log_verbosity_level(TDLIB_LOG_LEVEL")
             .expect("first request");
+        assert!(
+            src.contains("const TDLIB_LOG_LEVEL: i32 = 0;"),
+            "TDLib logs fatal errors only: its error lines can hold message text"
+        );
         assert!(
             register < first_request,
             "register before the first request"
