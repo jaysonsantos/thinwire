@@ -3044,4 +3044,73 @@ mod tests {
         assert!(ledger.deferred_rev.is_none());
         assert!(ledger.swap_error.is_none());
     }
+
+    #[test]
+    fn dismiss_reaches_quiet_without_deadlocking_the_phase_lock() {
+        let ledger_path = ledger_file().expect("data dir");
+        let saved = std::fs::read(&ledger_path).ok();
+        struct Restore {
+            path: PathBuf,
+            saved: Option<Vec<u8>>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.saved {
+                    Some(bytes) => {
+                        let _ = std::fs::write(&self.path, bytes);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+        let _restore = Restore {
+            path: ledger_path,
+            saved,
+        };
+
+        let phase = Arc::new(Mutex::new(Phase::Quiet));
+        let (commands, incoming) = std::sync::mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let phase_worker = Arc::clone(&phase);
+        let worker_thread = std::thread::spawn(move || {
+            worker(stamp_of("0c07a9c"), phase_worker, incoming, shutdown, || {});
+        });
+
+        let seen = |phase: &Mutex<Phase>| phase.try_lock().ok().map(|guard| guard.clone());
+        let label = |phase: &Mutex<Phase>| match seen(phase) {
+            Some(Phase::Quiet) => "quiet",
+            Some(Phase::Checking) => "checking",
+            Some(Phase::Offer(_)) => "offer",
+            Some(Phase::Fetching(_)) => "fetching",
+            Some(Phase::Handoff(_)) => "handoff",
+            Some(Phase::Failed { retry: None, .. }) => "failed",
+            Some(Phase::Failed { retry: Some(_), .. }) => "failed-retry",
+            None => "locked",
+        };
+        let started = Instant::now();
+        loop {
+            if matches!(seen(&phase), Some(Phase::Failed { retry: None, .. })) {
+                break;
+            }
+            if started.elapsed() >= Duration::from_secs(2) {
+                panic!("the check did not fail, phase {}", label(&phase));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        commands.send(Command::Dismiss).expect("send dismiss");
+        let acted = Instant::now();
+        loop {
+            if matches!(seen(&phase), Some(Phase::Quiet)) {
+                break;
+            }
+            if acted.elapsed() >= Duration::from_secs(2) {
+                panic!("dismiss left the phase locked, phase {}", label(&phase));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(commands);
+        worker_thread.join().expect("worker");
+    }
 }
