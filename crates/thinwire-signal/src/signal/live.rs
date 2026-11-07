@@ -2810,7 +2810,7 @@ async fn read_retained_older_page(
     let slot = signal_retained_slot(conversation_id).ok_or(())?;
     let chat_id = signal_retained_chat(conversation_id).ok_or(())?;
     let before = store_cursor
-        .or_else(|| message_millis(before_message_id))
+        .or_else(|| thinwire_protocol::signal_store_millis(before_message_id))
         .ok_or(())?;
     let before_id = store_cursor.is_none().then_some(before_message_id);
     let dir = retained_dir_for_slot(session_dir, slot).ok_or(())?;
@@ -2913,7 +2913,8 @@ async fn load_older_page(
     rows: &mut HashMap<String, Conversation>,
 ) {
     let loaded = async {
-        let before = store_cursor.or_else(|| message_millis(before_message_id))?;
+        let before =
+            store_cursor.or_else(|| thinwire_protocol::signal_store_millis(before_message_id))?;
         let before_id = store_cursor.is_none().then_some(before_message_id);
         let thread = thread_of(conversation_id, session.group_key(conversation_id).await)?;
         let url = history_store_url()?;
@@ -3535,10 +3536,6 @@ fn contact_id(service_id: &ServiceId) -> String {
 
 fn signal_message_id(sent_millis: u64, sender: &str) -> String {
     format!("{sent_millis}:{sender}")
-}
-
-fn message_millis(id: &str) -> Option<u64> {
-    id.split(':').next()?.parse().ok()
 }
 
 fn visible_title(name: &str, id: &str) -> String {
@@ -6677,6 +6674,165 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retained_chat_loads_every_page_until_the_store_ends() {
+        let dir = temp_session_dir("retained-every-page");
+        let aci = Uuid::parse_str("dddddddd-dddd-4ddd-8ddd-dddddddddddd").expect("aci");
+        let contact = named_contact(42, "Ada");
+        let aside = dir.join(RETAINED_DIR).join(aci.to_string());
+        std::fs::create_dir_all(&aside).expect("dir");
+        let path = sqlite_store_path(&aside);
+        let url = path.to_str().expect("path").to_string();
+        let mut store = open_signal_store(&url).await.expect("store");
+        let count = HISTORY_PAGE * 3;
+        assert_eq!(count, 150, "three pages of readable rows");
+        let thread = Thread::Contact(ServiceId::Aci(contact.uuid.into()));
+        store.save_contact(&contact).await.expect("contact");
+        let mut expected = Vec::with_capacity(count);
+        for n in 1..=count {
+            let body = format!("m-{n:03}");
+            expected.push(body.clone());
+            store
+                .save_message(
+                    &thread,
+                    envelope_at(
+                        contact.uuid,
+                        &body,
+                        1_700_000_000_000 + i64::try_from(n).expect("n"),
+                    ),
+                )
+                .await
+                .expect("history");
+        }
+        store.close().await;
+        let slot_path = aside.join(RETAINED_SLOT_FILE);
+        std::fs::write(&slot_path, "1\n").expect("slot");
+        let slot_bytes = std::fs::read(&slot_path).expect("slot");
+        let kept = retained_kept_rows(&path).await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(publish_retained_accounts(&dir, &tx).await);
+        drop(tx);
+        let events = collect_events(&mut rx).await;
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                AdapterEvent::SendRejected { .. } | AdapterEvent::SendAccepted { .. }
+            )),
+            "publish does not send"
+        );
+        let chat_id = signal_retained_chat_id(1, &contact.uuid.to_string());
+        let mut snapshot = thinwire_core::state::Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        for event in events {
+            snapshot.apply(event);
+        }
+        snapshot.select_retained_signal(1);
+        snapshot.selected_protocol = ProtocolId::Signal;
+        snapshot.selected_conversation = Some(chat_id.clone());
+        snapshot.compose = "hello".into();
+        assert!(!snapshot.can_send(), "a retained chat cannot send");
+        assert_eq!(
+            snapshot.selected_messages().len(),
+            HISTORY_PAGE,
+            "the first publish is one page"
+        );
+        assert_eq!(
+            snapshot
+                .selected_messages()
+                .first()
+                .map(|message| message.body.as_str()),
+            Some(expected[count - HISTORY_PAGE].as_str()),
+            "the open page starts at its oldest row"
+        );
+
+        let mut asked = Vec::new();
+        let mut more_flags = Vec::new();
+        for _ in 0..4 {
+            if snapshot.older_state() == thinwire_core::state::OlderState::StartOfChat {
+                break;
+            }
+            let before = snapshot
+                .selected_messages()
+                .first()
+                .map(|message| message.id.clone())
+                .expect("the open chat has a row");
+            assert!(!asked.contains(&before), "an older page repeated {before}");
+            asked.push(before.clone());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            load_retained_older_page(&dir, &tx, &chat_id, &before, None).await;
+            drop(tx);
+            let page = collect_events(&mut rx).await;
+            let mut saw_loaded = false;
+            for event in &page {
+                match event {
+                    AdapterEvent::OlderHistoryLoaded {
+                        before_message_id,
+                        more,
+                        store_cursor,
+                        note,
+                        ..
+                    } => {
+                        assert_eq!(before_message_id, &before);
+                        assert!(
+                            store_cursor.is_none(),
+                            "a readable page has no store cursor"
+                        );
+                        assert!(note.is_none(), "a readable page loaded");
+                        more_flags.push(*more);
+                        saw_loaded = true;
+                    }
+                    AdapterEvent::SendAccepted { .. } | AdapterEvent::SendRejected { .. } => {
+                        panic!("paging sent: {event:?}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_loaded, "the page ended: {page:?}");
+            for event in page {
+                snapshot.apply(event);
+            }
+        }
+        assert_eq!(
+            snapshot.older_state(),
+            thinwire_core::state::OlderState::StartOfChat,
+            "asked {asked:?}, more {more_flags:?}"
+        );
+        assert!(
+            matches!(more_flags.last(), Some(false))
+                && more_flags.iter().rev().skip(1).all(|more| *more),
+            "more is false only on the last page: {more_flags:?}"
+        );
+        let shown: Vec<String> = snapshot
+            .selected_messages()
+            .iter()
+            .map(|message| message.body.clone())
+            .collect();
+        assert_eq!(shown, expected);
+        assert!(!snapshot.can_send(), "a retained chat cannot send");
+        let commands = snapshot.take_commands();
+        assert!(
+            commands.iter().all(|command| !matches!(
+                command,
+                thinwire_protocol::AdapterCommand::SendText { .. }
+                    | thinwire_protocol::AdapterCommand::SendMedia { .. }
+                    | thinwire_protocol::AdapterCommand::SendTopicText { .. }
+                    | thinwire_protocol::AdapterCommand::ResendMessage { .. }
+            )),
+            "paging does not send: {commands:?}"
+        );
+        assert_eq!(
+            retained_kept_rows(&path).await,
+            kept,
+            "paging keeps the stored rows"
+        );
+        assert_eq!(std::fs::read(&slot_path).expect("slot"), slot_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A retained directory with no `session.sqlite` is not an account.
     /// The publish does not create the file, and it does not emit a row.
     #[tokio::test(flavor = "current_thread")]
@@ -8899,7 +9055,10 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let left_id = message_id(&left);
         let right_id = message_id(&right);
         assert_ne!(left_id, right_id);
-        assert_eq!(message_millis(&left_id), message_millis(&right_id));
+        assert_eq!(
+            thinwire_protocol::signal_store_millis(&left_id),
+            thinwire_protocol::signal_store_millis(&right_id)
+        );
         assert!(left_id.contains(&first.to_string()));
         assert!(right_id.contains(&second.to_string()));
     }
@@ -9050,7 +9209,7 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
                 assert!(!seen.contains(id), "{id} returned twice");
             }
             let oldest = page.first().expect("oldest").clone();
-            before = message_millis(&oldest).expect("cursor millis");
+            before = thinwire_protocol::signal_store_millis(&oldest).expect("cursor millis");
             before_id = Some(oldest);
             seen.extend(page);
             if seen.len() == rows.len() {
