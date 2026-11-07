@@ -58,16 +58,22 @@ if [[ -z "$expected" ]] || ! grep -q "$expected" .SRCINFO; then
   exit 1
 fi
 
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-known_hosts=~/.ssh/known_hosts
+# OpenSSH expands ~ from the passwd home, not from $HOME.
+ssh_home=$(getent passwd "$(id -u)" | awk -F: '{ print $6 }')
+if [[ -z "$ssh_home" ]]; then
+  echo "::error::The passwd home is empty."
+  exit 1
+fi
+mkdir -p "${ssh_home}/.ssh"
+chmod 700 "${ssh_home}/.ssh"
+known_hosts="${ssh_home}/.ssh/known_hosts"
 ssh-keyscan -t ed25519 "$AUR_HOST" 2>/dev/null >"$known_hosts.new"
 if [[ "$(ssh-keygen -lf "$known_hosts.new" | awk '{ print $2 }')" != "$AUR_HOST_KEY_SHA256" ]]; then
   echo "::error::The host key of ${AUR_HOST} does not match the fingerprint on the AUR home page."
   exit 1
 fi
 mv "$known_hosts.new" "$known_hosts"
-key_file=~/.ssh/aur
+key_file="${ssh_home}/.ssh/aur"
 (umask 077 && printf '%s\n' "${AUR_SSH_PRIVATE_KEY:?AUR_SSH_PRIVATE_KEY is the AUR push key}" >"$key_file")
 
 git config --global --add safe.directory "$work/pkg"
@@ -75,6 +81,6 @@ git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 git add PKGBUILD .SRCINFO
 git commit --quiet -m "Update to ${version}"
-GIT_SSH_COMMAND="ssh -i ${key_file} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
+GIT_SSH_COMMAND=$(printf 'ssh -i %q -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%q' "$key_file" "$known_hosts") \
   git push "ssh://aur@${AUR_HOST}/${PKGNAME}.git" HEAD:master
 echo "Pushed ${PKGNAME} ${version} to the AUR."
