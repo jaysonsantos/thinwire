@@ -5,6 +5,7 @@ mod host;
 mod machine;
 
 use std::ffi::{OsStr, OsString};
+#[cfg(target_os = "macos")]
 use std::io::{self, IsTerminal, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -120,7 +121,9 @@ impl Updates {
 /// Set when `main` sees `--apply-update`. Fields stay private so the frame
 /// cannot build a job and skip the feed.
 pub struct ApplyJob {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     staged: PathBuf,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     dest: PathBuf,
 }
 
@@ -157,43 +160,53 @@ fn is_app_path(path: &Path) -> bool {
 /// Wait until the parent dies, then [`machine::converge`], then open `dest`
 /// when it exists. Does not return. Does not take `instance.lock`.
 ///
-/// A terminal stdin exits before any rename.
+/// A terminal stdin exits before any rename. Off macOS the flag exits
+/// before any rename, so a Linux or Windows launch cannot move a bundle.
 pub fn apply_and_relaunch(job: ApplyJob) -> ! {
-    if io::stdin().is_terminal() {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = job;
         std::process::exit(1);
     }
-    let mut stdin = io::stdin().lock();
-    let mut buf = [0u8; 256];
-    loop {
-        match stdin.read(&mut buf) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => std::process::exit(1),
+    #[cfg(target_os = "macos")]
+    {
+        if io::stdin().is_terminal() {
+            std::process::exit(1);
         }
-    }
-    #[cfg(target_os = "macos")]
-    if host::require_developer_id(&job.staged).is_err() {
-        open_bundle(&job.dest);
-        std::process::exit(1);
-    }
-    #[cfg(target_os = "macos")]
-    clear_quarantine(&job.staged);
-
-    let Some(parent) = job.dest.parent().map(Path::to_path_buf) else {
-        std::process::exit(1);
-    };
-    let fresh = parent.join("Thinwire.app.new");
-    let previous = parent.join("Thinwire.app.previous");
-    settle(&job.staged, &fresh, &job.dest, &previous);
-    if real_dir(&job.dest) {
+        let mut stdin = io::stdin().lock();
+        let mut buf = [0u8; 256];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => std::process::exit(1),
+            }
+        }
         #[cfg(target_os = "macos")]
-        open_bundle(&job.dest);
-        std::process::exit(0);
+        if host::require_developer_id(&job.staged).is_err() {
+            open_bundle(&job.dest);
+            std::process::exit(1);
+        }
+        #[cfg(target_os = "macos")]
+        clear_quarantine(&job.staged);
+
+        let Some(parent) = job.dest.parent().map(Path::to_path_buf) else {
+            std::process::exit(1);
+        };
+        let fresh = parent.join("Thinwire.app.new");
+        let previous = parent.join("Thinwire.app.previous");
+        settle(&job.staged, &fresh, &job.dest, &previous);
+        if real_dir(&job.dest) {
+            #[cfg(target_os = "macos")]
+            open_bundle(&job.dest);
+            std::process::exit(0);
+        }
+        std::process::exit(1);
     }
-    std::process::exit(1);
 }
 
+#[cfg(target_os = "macos")]
 fn settle(staged: &Path, fresh: &Path, dest: &Path, previous: &Path) {
     for _ in 0..4 {
         let before = present(staged, fresh, dest, previous);
@@ -211,10 +224,12 @@ fn settle(staged: &Path, fresh: &Path, dest: &Path, previous: &Path) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn present(staged: &Path, fresh: &Path, dest: &Path, previous: &Path) -> [bool; 4] {
     [staged, fresh, dest, previous].map(real_dir)
 }
 
+#[cfg(target_os = "macos")]
 fn real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|meta| meta.is_dir())
