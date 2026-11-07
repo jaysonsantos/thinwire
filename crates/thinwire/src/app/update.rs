@@ -1,19 +1,9 @@
-//! A Windows build compiled on `main` of this repository can replace itself
-//! from the `nightly` pre-release.
-//!
-//! The worker thread is the only writer of [`Phase`]. The window sends
-//! commands. [`Ledger`] and [`Journal`] are the only records on disk. The
-//! progress of each executable is not stored: [`observe`] reads the install
-//! directory.
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-/// Seven lowercase hex characters. The `g` suffix of `VERSION`, and the
-/// first seven characters of the commit this binary was compiled from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Sha7([u8; 7]);
 
@@ -38,8 +28,6 @@ impl Sha7 {
     }
 }
 
-/// A parsed `VERSION` line. `rev` is the only order key. `token` is the
-/// line, without one trailing newline, and is what the prompt shows.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct NightlyVersion {
     token: String,
@@ -47,33 +35,25 @@ struct NightlyVersion {
     sha7: Sha7,
 }
 
-/// What Install downloads. The archive name is built from `version.token`.
-/// It is not taken from a line of `SHA256SUMS`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Offer {
     version: NightlyVersion,
     archive_sha256: [u8; 32],
 }
 
-/// The in-app update. The worker is the only writer.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Phase {
     Quiet,
     Checking,
     Offer(Offer),
-    /// The archive is being hashed, unpacked, and copied beside the live
-    /// names. Those names are not renamed yet.
     Fetching(Offer),
-    /// The journal is on disk and the staged executable has been spawned.
     Handoff(Offer),
     Failed {
         error: PlainError,
-        /// `Some` retries the download. `None` retries the check.
         retry: Option<Offer>,
     },
 }
 
-/// What the window draws. `Checking` is [`Snapshot::Quiet`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Snapshot {
     Quiet,
@@ -87,7 +67,6 @@ enum Snapshot {
     Failed(PlainError),
 }
 
-/// Three lines: what happened, why, and what to do.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct PlainError {
     happened: String,
@@ -95,7 +74,6 @@ struct PlainError {
     next: String,
 }
 
-/// `%APPDATA%/thinwire/update/ledger.json`. `settings.toml` is not opened.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 struct Ledger {
     proven: Option<Proven>,
@@ -109,8 +87,6 @@ struct Proven {
     rev: u32,
 }
 
-/// Durable handoff. The install directory is the parent of the running
-/// app at Install time, not the parent of the staged copy.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Journal {
     target: NightlyVersion,
@@ -118,48 +94,35 @@ struct Journal {
     staging_dir: PathBuf,
 }
 
-/// One executable in the install directory, read from the files that are there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Slot {
-    /// Live name and `.incoming`. No `.old`.
     Ready,
-    /// `.old` and `.incoming`. The live name is missing.
     Aside,
-    /// Live name and `.old`. No `.incoming`.
     Committed,
-    /// Only the live name.
     Idle,
-    /// Any other combination. Do not invent a repair.
     Broken,
 }
 
-/// A tar member after one leading `./` is removed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Member<'a> {
     Exe(usize),
     License,
-    /// `""` is the directory itself. Any other value is a path under it.
     Notices(&'a str),
 }
 
-/// What [`decide`] tells the worker to do with one feed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Decide {
     Quiet,
-    /// This build is the published tip. The caller records [`Ledger::proven`].
     Current,
     Offer,
 }
 
-/// What a normal start does with a journal the previous process left behind.
-/// The apply process does not use this. It always swaps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JournalAction {
     Cleanup,
     Resume,
 }
 
-/// Swap order, and the only executables an archive may contain.
 const EXES: [&str; 3] = [
     "thinwire.exe",
     "thinwire-whatsapp-helper.exe",
@@ -175,43 +138,33 @@ const MAIN_REF: &str = "refs/heads/main";
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const FEED_PREFIX: &str = "https://github.com/jaysonsantos/thinwire/releases/download/nightly/";
 
-/// The feed hosts a redirect may land on. The `Location` target is not logged.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const FEED_HOSTS: [&str; 2] = ["github.com", "release-assets.githubusercontent.com"];
 
-/// The live `r277` archive is 48,729,593 bytes.
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 
-/// The live unpacked executables are about 124 MiB.
 const MAX_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 
 const APPLY_ARG: &str = "--thinwire-apply";
 
-/// From the apply child starting until it gives up on `instance.lock`.
 const APPLY_WAIT: Duration = Duration::from_secs(15);
 
-/// `VERSION` and `SHA256SUMS` are a few lines. A larger body is not the feed.
 #[cfg(windows)]
 const TEXT_CAP: u64 = 64 * 1024;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Identity of this binary. Callers only build it with [`Launch::compile_time`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct BuildStamp {
     sha7: Sha7,
 }
 
-/// Opaque to the window. A dev build, a fork, a pull request, and Linux or
-/// macOS have no stamp, and the worker does not start.
 pub(crate) struct Launch {
     stamp: Option<BuildStamp>,
 }
 
 impl Launch {
-    /// `GITHUB_SHA`, `GITHUB_REPOSITORY`, and `GITHUB_REF` are read with
-    /// `option_env`. A value exported in the shell after compile does not count.
     pub(crate) fn compile_time() -> Self {
         Self {
             stamp: stamp_from(
@@ -277,7 +230,6 @@ fn notes() -> &'static str {
     NOTES
 }
 
-/// `VERSION` matches the AUR script after one trailing `\n` is removed.
 fn parse_version(text: &str) -> Result<NightlyVersion, PlainError> {
     let text = text.strip_suffix('\n').unwrap_or(text);
     let Some((head, sha)) = text.rsplit_once(".g") else {
@@ -321,8 +273,6 @@ fn feed_url(name: &str) -> String {
     format!("{FEED_PREFIX}{name}")
 }
 
-/// The line whose name is the Windows archive. Zero matches or two matches
-/// is an error. A filename in the file is not a URL.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn parse_sums(text: &str, version: &NightlyVersion) -> Result<[u8; 32], PlainError> {
     let want = archive_name(version);
@@ -387,9 +337,6 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// One leading `./` is removed. `\` , a leading `/`, a drive prefix, and a
-/// component that is empty, `.`, or `..` are rejected. The live archive
-/// stores `./thinwire.exe`.
 fn normalize_member(name: &str) -> Result<Option<Member<'_>>, PlainError> {
     if name.contains('\\') || name.contains(':') {
         return Err(bad_payload());
@@ -472,8 +419,6 @@ fn journal_action(stamp: Option<&BuildStamp>, journal: &Journal) -> JournalActio
     }
 }
 
-/// HTTPS, and the host is one of [`FEED_HOSTS`]. At most five hops is the
-/// caller's limit. The target is not logged: its query is a signature.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn redirect_allowed(next: &str) -> bool {
     let Ok(url) = url::Url::parse(next) else {
@@ -514,8 +459,6 @@ fn observe(install_dir: &Path, name: &str) -> Slot {
     }
 }
 
-/// One step toward [`Slot::Committed`]. `Idle` and [`Slot::Broken`] fail
-/// and leave the directory as it was.
 fn advance(install_dir: &Path, name: &str) -> Result<Slot, PlainError> {
     match observe(install_dir, name) {
         Slot::Committed => Ok(Slot::Committed),
@@ -538,8 +481,6 @@ fn advance(install_dir: &Path, name: &str) -> Result<Slot, PlainError> {
     }
 }
 
-/// One step toward [`Slot::Idle`]. A crash between the two renames is the
-/// slot [`observe`] reports on the next call.
 fn retreat(install_dir: &Path, name: &str) -> Result<Slot, PlainError> {
     match observe(install_dir, name) {
         Slot::Idle => Ok(Slot::Idle),
@@ -549,7 +490,6 @@ fn retreat(install_dir: &Path, name: &str) -> Result<Slot, PlainError> {
         }
         Slot::Aside => {
             rename_file(&old_path(install_dir, name), &live_path(install_dir, name))?;
-            // Incoming is still there, so this step stops at Ready.
             expect_slot(install_dir, name, Slot::Ready)
         }
         Slot::Committed => {
@@ -574,8 +514,6 @@ fn expect_slot(install_dir: &Path, name: &str, want: Slot) -> Result<Slot, Plain
 }
 
 fn rename_file(from: &Path, to: &Path) -> Result<(), PlainError> {
-    // A destination that is already there is not the slot we observed.
-    // Replacing it would hide that, and on Windows a rename does not replace.
     if to.exists() {
         return Err(swap_rolled_back());
     }
@@ -602,8 +540,6 @@ fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Hash, unpack, and copy `.incoming`. The live names stay. A bad digest or
-/// a bad member deletes the staging directory and any `.incoming` just written.
 fn stage_verified(
     bytes: &[u8],
     expected: &[u8; 32],
@@ -745,7 +681,6 @@ fn copy_incoming(staging: &Path, install: &Path) -> Result<(), PlainError> {
         let dest = incoming_path(install, name);
         let _ = std::fs::remove_file(&part);
         std::fs::copy(&src, &part).map_err(|_| bad_payload())?;
-        // The part name is not a slot. A crash while copying must not look Ready.
         if dest.exists() {
             let _ = std::fs::remove_file(&part);
             return Err(bad_payload());
@@ -769,8 +704,6 @@ fn clear_incoming(install: &Path) {
     }
 }
 
-/// Drive every executable to [`Slot::Committed`], reading the directory
-/// before each step. All [`Slot::Idle`] means nothing was staged.
 fn commit_all(install_dir: &Path) -> Result<(), PlainError> {
     let slots: Vec<Slot> = EXES.iter().map(|name| observe(install_dir, name)).collect();
     if slots.iter().all(|slot| *slot == Slot::Idle) {
@@ -792,7 +725,6 @@ fn commit_all(install_dir: &Path) -> Result<(), PlainError> {
     Ok(())
 }
 
-/// Drive every executable to [`Slot::Idle`]. [`Slot::Broken`] stops the walk.
 fn retreat_all(install_dir: &Path) -> Result<(), PlainError> {
     for name in EXES {
         finish_one(install_dir, name, Slot::Idle)?;
@@ -1215,9 +1147,6 @@ fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
     }
-    // Windows rename does not replace an existing file. The temp file is
-    // already durable, so removing the previous record and renaming is the
-    // crash window, and a missing record is read as empty.
     if std::fs::rename(&temp, path).is_err() {
         let _ = std::fs::remove_file(path);
         if let Err(error) = std::fs::rename(&temp, path) {
@@ -1241,7 +1170,6 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The window sends these. It never writes [`Phase`].
 #[derive(Debug)]
 enum Command {
     Install,
@@ -1267,12 +1195,9 @@ enum SwapEnd {
 #[derive(Debug)]
 enum Argv {
     Normal,
-    /// The flag was present. `None` means the path was missing or extra
-    /// arguments followed it, so the install directory is left alone.
     Apply(Option<PathBuf>),
 }
 
-/// The UI thread's handle. The worker owns every write to [`Phase`].
 pub(crate) struct Updates {
     phase: Arc<Mutex<Phase>>,
     commands: Sender<Command>,
@@ -1280,7 +1205,6 @@ pub(crate) struct Updates {
 }
 
 impl Updates {
-    /// No thread when `launch` has no stamp. `wake` only repaints.
     pub(crate) fn spawn(launch: Launch, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let phase = Arc::new(Mutex::new(Phase::Quiet));
         let (commands, incoming) = std::sync::mpsc::channel();
@@ -1303,7 +1227,6 @@ impl Updates {
         }
     }
 
-    /// One `true`. A later `Close` would hit `CloseGate::Waiting` and cancel.
     pub(crate) fn take_shutdown(&self) -> bool {
         self.shutdown.swap(false, Ordering::SeqCst)
     }
@@ -1567,7 +1490,6 @@ fn settle_startup(
 }
 
 fn offer_for_resume(journal: &Journal) -> Offer {
-    // The digest was checked before the journal existed. The card shows the token.
     Offer {
         version: journal.target.clone(),
         archive_sha256: [0; 32],
@@ -1686,8 +1608,6 @@ fn fetch_offer() -> Result<Offer, PlainError> {
 fn download_archive(name: &str) -> Result<Vec<u8>, PlainError> {
     #[cfg(windows)]
     {
-        // A transport failure is not a checksum miss. `stage_verified` is the
-        // only place that returns `bad_payload` for the archive bytes.
         http_get(&feed_url(name), MAX_ARCHIVE_BYTES)
     }
     #[cfg(not(windows))]
@@ -1729,6 +1649,7 @@ fn http_get(start: &str, max_body: u64) -> Result<Vec<u8>, PlainError> {
     loop {
         let response = agent.get(&url).call().map_err(|_| check_failed())?;
         let status = response.status().as_u16();
+        // The target is not logged: its query is a signature.
         tracing::info!(url = start, status, "nightly feed");
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             if redirects == 5 {
@@ -1784,8 +1705,6 @@ fn resolve_redirect(current: &str, location: &str) -> Result<String, PlainError>
         .map_err(|_| check_failed())
 }
 
-/// `true` when this process is the apply child and has finished or refused.
-/// A normal start returns `false`.
 pub(crate) fn apply_if_requested() -> bool {
     match classify_argv(std::env::args().skip(1)) {
         Argv::Normal => false,
@@ -1907,9 +1826,6 @@ fn swap_files(
     }
 }
 
-/// Drop the side files when every live name is still a file. A missing
-/// live name keeps the journal, `.incoming`, and `.old`, because deleting
-/// `.incoming` there can remove the only remaining copy.
 fn release_failed_swap(install_dir: &Path, journal_file: &Path, staging_dir: &Path) {
     let _ = retreat_all(install_dir);
     if EXES
@@ -1987,8 +1903,6 @@ fn spawn_apply(staging: &Path, journal: &Path) -> Result<(), PlainError> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    // Waiting would deadlock: the child blocks on the instance lock this
-    // process still holds, and this process would be waiting for the child.
     command.spawn().map(|_| ()).map_err(|_| bad_payload())
 }
 
@@ -2001,8 +1915,6 @@ fn spawn_normal(install: &Path) -> Result<(), PlainError> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // The relaunch is the GUI. A new console window is not the app the
-        // user just closed.
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command.spawn().map(|_| ()).map_err(|_| swap_rolled_back())
@@ -2192,7 +2104,6 @@ mod tests {
             ..Ledger::default()
         };
         assert_eq!(decide(Some(&ours), &nightly, &deferred), Decide::Quiet);
-        // The same sha is the tip even when that revision was deferred.
         assert_eq!(decide(Some(&tip), &nightly, &deferred), Decide::Current);
 
         let proven = Ledger {

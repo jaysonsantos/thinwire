@@ -404,7 +404,6 @@ pub struct ThinwireApp {
     clicks: Arc<Mutex<Vec<NotifyKey>>>,
     last_focus: Option<bool>,
     last_unread: Option<u32>,
-    /// Windows nightly check. The worker is the only writer.
     updates: update::Updates,
 }
 
@@ -426,8 +425,6 @@ impl ThinwireApp {
             lock(&clicked).push(key);
             wake.request_repaint();
         });
-        // The instance lock is already held: `first_try` or the wait window
-        // took it before this app was built.
         let ctx_wake = ctx.clone();
         let updates = update::Updates::spawn(update::Launch::compile_time(), move || {
             ctx_wake.request_repaint();

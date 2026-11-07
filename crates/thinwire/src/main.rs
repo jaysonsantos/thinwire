@@ -6,10 +6,6 @@ use tracing_subscriber::prelude::*;
 fn main() -> eframe::Result<()> {
     init_tracing();
 
-    // The staged executable renames the install and exits. It must not
-    // take the instance lock or answer `show`: the copy that is still
-    // closing holds the lock, and a show reply would make this process
-    // quit before the rename.
     if app::update::apply_if_requested() {
         return Ok(());
     }
