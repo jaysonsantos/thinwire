@@ -100,18 +100,20 @@ windows-native-keyring-store = { version = "1", default-features = false }
 #
 # rusqlite 0.41 requires libsqlite3-sys ^0.39. diesel 2.3.14 stops before
 # 0.39, sqlx-sqlite 0.9.0 stops before 0.38, and presage-store-sqlite at
-# 291c7ee pins 0.36.0. libsqlite3-sys sets `links = "sqlite3"`, so one
+# 4b81740 pins 0.36.0. libsqlite3-sys sets `links = "sqlite3"`, so one
 # version has to satisfy all of them. The revision is those sources with the
 # bound moved to 0.39. The presage crate also names the same presage git
 # revision instead of a path. Remove the patch when crates.io and presage
 # allow 0.39 on their own.
 #
 # Both revisions are pinned. Keep those commits: the build fetches them by
-# revision, and a missing commit fails the fetch.
+# revision, and a missing commit fails the fetch. The sqlite revision is on
+# branch `patch/sqlite-0-39-presage-4b81740`. Its parent 5a48941 is the same
+# patch for presage 291c7ee.
 [patch.crates-io]
 tdlib-rs = { git = "https://github.com/jaysonsantos/thinwire", rev = "63582844ec64e072013ae6c7b7569b6b8648e4cc" }
-sqlx-sqlite = { git = "https://github.com/jaysonsantos/thinwire", rev = "5a4894173e84e772927fe2274222db688bec03d3" }
-diesel = { git = "https://github.com/jaysonsantos/thinwire", rev = "5a4894173e84e772927fe2274222db688bec03d3" }
+sqlx-sqlite = { git = "https://github.com/jaysonsantos/thinwire", rev = "cdcc1cea3ebb6d51bd95dbcabc0ce1e7ec0872d4" }
+diesel = { git = "https://github.com/jaysonsantos/thinwire", rev = "cdcc1cea3ebb6d51bd95dbcabc0ce1e7ec0872d4" }
 
 [patch."https://github.com/whisperfish/presage"]
-presage-store-sqlite = { git = "https://github.com/jaysonsantos/thinwire", rev = "5a4894173e84e772927fe2274222db688bec03d3" }
+presage-store-sqlite = { git = "https://github.com/jaysonsantos/thinwire", rev = "cdcc1cea3ebb6d51bd95dbcabc0ce1e7ec0872d4" }
