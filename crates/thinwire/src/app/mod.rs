@@ -29,6 +29,7 @@ mod ui_snapshots;
 #[cfg(test)]
 mod ui_tests;
 pub(crate) mod update;
+mod update_prompt;
 #[cfg(feature = "video")]
 mod video;
 #[cfg(feature = "whatsapp-web")]
@@ -400,6 +401,7 @@ pub struct ThinwireApp {
     watchdog: bool,
     /// OS notifications on their own thread (#32).
     notifier: Notifier,
+    macos_updates: thinwire::update::Updates,
     /// Chats of clicked notifications. The notifier thread fills it.
     clicks: Arc<Mutex<Vec<NotifyKey>>>,
     last_focus: Option<bool>,
@@ -429,6 +431,7 @@ impl ThinwireApp {
         let updates = update::Updates::spawn(update::Launch::compile_time(), move || {
             ctx_wake.request_repaint();
         });
+        let macos_updates = thinwire::update::Updates::start(ctx.clone());
         Self {
             core,
             runtime: Some(runtime),
@@ -439,6 +442,7 @@ impl ThinwireApp {
             close_gate: CloseGate::Open,
             watchdog: false,
             notifier,
+            macos_updates,
             clicks,
             last_focus: None,
             last_unread: None,
@@ -671,6 +675,9 @@ impl eframe::App for ThinwireApp {
         }
         // Some platforms send no theme event. logic() still runs when the
         // window is hidden after a repaint request.
+        if self.macos_updates.prompt() == thinwire::update::Prompt::QuitToInstall {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         ctx.request_repaint_after(IDLE_REPAINT);
     }
 
@@ -697,6 +704,7 @@ impl eframe::App for ThinwireApp {
         self.notifier.send(self.core.take_notify());
         self.update_title(ui.ctx());
         self.updates.draw(ui.ctx());
+        update_prompt::draw(ui, &self.macos_updates);
     }
 
     /// Safety net for an exit that skipped the close gate. The window is gone,

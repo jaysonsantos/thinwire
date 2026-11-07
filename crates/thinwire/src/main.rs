@@ -5,6 +5,9 @@ use tracing_subscriber::prelude::*;
 
 fn main() -> eframe::Result<()> {
     init_tracing();
+    if let Some(job) = thinwire::update::apply_from_args() {
+        thinwire::update::apply_and_relaunch(job);
+    }
 
     if app::update::apply_if_requested() {
         return Ok(());

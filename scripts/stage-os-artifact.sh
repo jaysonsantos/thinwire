@@ -88,6 +88,10 @@ copy_app_notice third_party/native-tls/LICENSE-APACHE native-tls-LICENSE-APACHE.
 # SQLCipher and OpenSSL are linked into the release helpers (issue #291).
 copy_app_notice third_party/sqlcipher/LICENSE sqlcipher-LICENSE.txt
 copy_app_notice third_party/openssl/LICENSE-APACHE openssl-LICENSE-APACHE.txt
+copy_app_notice third_party/ed25519-dalek/LICENSE ed25519-dalek-LICENSE-BSD-3-Clause.txt
+copy_app_notice third_party/quick-xml/LICENSE-MIT.md quick-xml-LICENSE-MIT.txt
+copy_app_notice third_party/base64/LICENSE-MIT base64-LICENSE-MIT.txt
+copy_app_notice third_party/base64/LICENSE-APACHE base64-LICENSE-APACHE.txt
 
 copy_llvm_notice() {
   local lib="$1"
@@ -651,11 +655,29 @@ sign_nested_machos() {
   rm -f "$list"
 }
 
+# A shallow count would stamp r1 into a stapled app.
+write_build_id() {
+  local app="$1"
+  if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+    git fetch --unshallow
+  fi
+  if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+    echo "::error::The checkout is still shallow. Refusing to write BUILD_ID."
+    exit 1
+  fi
+  local id
+  id="$("$script_dir/build-id.sh")"
+  printf '%s\n' "$id" >"$app/Contents/Resources/BUILD_ID"
+}
+
 sign_macos_app() {
   local app="$1"
   if [[ -n "${MACOS_SIGNING_P12:-}" ]]; then
     echo "macOS signing: stable identity"
     import_macos_signing_identity
+    if [[ "$sign_use_hardened_runtime" -eq 1 ]]; then
+      write_build_id "$app"
+    fi
     sign_nested_machos "$app" identity
     sign_with_identity "$app" "$app/Contents/MacOS/thinwire"
   else
@@ -764,6 +786,17 @@ EOF
   do
     if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${notice}" ]]; then
       echo "::error::Thinwire.app Resources are missing the cipher notice ${notice}."
+      exit 1
+    fi
+  done
+  for notice in \
+    ed25519-dalek-LICENSE-BSD-3-Clause.txt \
+    quick-xml-LICENSE-MIT.txt \
+    base64-LICENSE-MIT.txt \
+    base64-LICENSE-APACHE.txt
+  do
+    if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${notice}" ]]; then
+      echo "::error::Thinwire.app Resources are missing the update notice ${notice}."
       exit 1
     fi
   done
@@ -938,6 +971,10 @@ with tarfile.open(archive, "r:gz") as tf:
         "native-tls-LICENSE-APACHE.txt",
         "sqlcipher-LICENSE.txt",
         "openssl-LICENSE-APACHE.txt",
+        "ed25519-dalek-LICENSE-BSD-3-Clause.txt",
+        "quick-xml-LICENSE-MIT.txt",
+        "base64-LICENSE-MIT.txt",
+        "base64-LICENSE-APACHE.txt",
     ):
         if not any(name.endswith(f"THIRD_PARTY_NOTICES/{notice}") for name in names):
             raise SystemExit(f"{archive} is missing the notice {notice}")

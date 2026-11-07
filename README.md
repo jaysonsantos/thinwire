@@ -300,6 +300,12 @@ Pushes to `main` upload OS artifacts for Linux, macOS, and Windows (`telegram-td
 
 A Windows build compiled on `main` of this repository checks the `nightly` pre-release. `scripts/publish-nightly.sh` publishes `VERSION`, `SHA256SUMS`, and `thinwire-windows-x86_64-<VERSION>.tar.gz` on the pre-release tag `nightly`. The app checks the SHA-256 of the tar.gz before it installs. The bytes are not a release. An unsigned build can make Windows SmartScreen show "Windows protected your PC" on a first launch. More info, then Run anyway, is how you get past that screen.
 
+A `Thinwire.app` from the main artifact checks for a newer build on its own. The check reads `appcast.xml` and `appcast.ed25519` from the rolling `nightly` pre-release at `https://github.com/jaysonsantos/thinwire/releases/download/nightly/`. That tag stays a pre-release and is never the latest release. `scripts/publish-nightly.sh` writes the appcast when it publishes the archives. It signs the appcast and the macOS tar.gz with the ed25519 key in the GitHub secret `THINWIRE_UPDATE_KEY`. The secret is not in this repo. The matching public key is committed at `crates/thinwire/update-public-key.txt`. The appcast names one build. The versioned tar.gz still expires after 3 days. The two appcast files stay on the tag.
+
+The prompt shows the build id, short notes, Install, and Later. Install replaces the whole `Thinwire.app`, helpers included, and reopens it. Chats, session files, and the keychain stay where they are.
+
+Gatekeeper accepts a quarantined main artifact, because that app is notarized and stapled. An ad-hoc build, including `scripts/local-build.sh` and the `notify-os` bundle, can still show "Thinwire" Not Opened. Click Done. Do not click Move to Trash. Then open System Settings > Privacy & Security and click Open Anyway. The command `xattr -dr com.apple.quarantine Thinwire.app` clears quarantine for that ad-hoc copy. The in-app check does not run for an ad-hoc build, for `cargo run`, or for a main build from before `BUILD_ID` existed. Install one current main artifact by hand. After that, the app can update itself. If macOS has opened the app from App Translocation, the prompt asks you to move `Thinwire.app` to the Applications folder and open it from there. If `Thinwire.app` is missing after an install, open `Thinwire.app.new` or `Thinwire.app.previous` in the same folder, and rename the one you opened back to `Thinwire.app`.
+
 ## Design rules
 
 - MIT public repo under `jaysonsantos/thinwire`
