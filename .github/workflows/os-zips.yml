@@ -226,4 +226,5 @@ jobs:
           DIST: dist
           SHA: ${{ github.sha }}
           GH_TOKEN: ${{ github.token }}
+          THINWIRE_UPDATE_KEY: ${{ secrets.THINWIRE_UPDATE_KEY }}
         run: scripts/publish-nightly.sh
