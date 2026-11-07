@@ -737,6 +737,10 @@ pub struct Snapshot {
     /// The own message that the compose field edits. Enter saves the edit,
     /// and Esc puts the draft of the thread back.
     editing: Option<EditTarget>,
+    /// The messages of one thread that the user selected to forward.
+    selection: Option<MessageSelection>,
+    /// The open forward picker: the messages it forwards and its search.
+    forwarding: Option<ForwardDraft>,
     /// Photos and videos attached to a thread and not sent yet, in order.
     attachments: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<OutgoingFile>>,
     /// Why the last attach skipped files. The tray shows it until the next
@@ -854,6 +858,54 @@ pub struct Snapshot {
 /// The longest emoji a reaction may name, in bytes. A family or a flag with
 /// skin tones fits.
 const MAX_EMOJI_BYTES: usize = 32;
+
+/// The messages of one thread that the user selected, in the order of
+/// selection. The ids hold no message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessageSelection {
+    protocol: ProtocolId,
+    conversation_id: String,
+    topic: Option<MessageTopic>,
+    message_ids: Vec<String>,
+}
+
+/// What the forward picker forwards, and the text of its chat search.
+#[derive(Clone, PartialEq, Eq)]
+struct ForwardDraft {
+    protocol: ProtocolId,
+    conversation_id: String,
+    message_ids: Vec<String>,
+    query: String,
+}
+
+impl std::fmt::Debug for ForwardDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForwardDraft")
+            .field("protocol", &self.protocol)
+            .field("conversation_id", &self.conversation_id)
+            .field("message_ids", &self.message_ids)
+            .field("query_len", &self.query.len())
+            .finish()
+    }
+}
+
+/// The forward picker as a frontend draws it.
+#[derive(Debug)]
+pub struct ForwardPicker<'a> {
+    /// How many messages the picker forwards.
+    pub count: usize,
+    /// The search text.
+    pub query: &'a str,
+    /// The chats of the same account that match the search, in inbox order.
+    pub targets: Vec<&'a Conversation>,
+}
+
+/// A message can be forwarded when the server has it: not a send that
+/// waits or failed.
+#[must_use]
+pub const fn can_forward(message: &ChatMessage) -> bool {
+    !matches!(message.delivery, Delivery::Pending | Delivery::Failed)
+}
 
 /// The own message that the compose field of one thread edits.
 #[derive(Clone, PartialEq, Eq)]
@@ -1074,6 +1126,8 @@ impl Snapshot {
             drafts: HashMap::new(),
             replying: None,
             editing: None,
+            selection: None,
+            forwarding: None,
             attachments: HashMap::new(),
             attachment_note: None,
             rejected_bodies: HashMap::new(),
@@ -2700,6 +2754,183 @@ impl Snapshot {
             self.compose = target.draft;
         }
     }
+
+    // region: forward
+
+    /// The selected messages of the open thread, in the order of selection.
+    /// Empty when the selection is of another thread.
+    #[must_use]
+    pub fn selected_for_forward(&self) -> &[String] {
+        match &self.selection {
+            Some(selection)
+                if self.is_selected_thread(
+                    selection.protocol,
+                    &selection.conversation_id,
+                    selection.topic,
+                ) =>
+            {
+                &selection.message_ids
+            }
+            _ => &[],
+        }
+    }
+
+    /// The open thread is in selection mode: a click on a message selects it.
+    #[must_use]
+    pub fn selecting(&self) -> bool {
+        !self.selected_for_forward().is_empty()
+    }
+
+    /// A message of the open thread that can be forwarded on `protocol`.
+    fn forwardable(&self, protocol: ProtocolId, conversation_id: &str, message_id: &str) -> bool {
+        self.message_actions(protocol).forward
+            && self.is_selected_thread(protocol, conversation_id, self.selected_topic)
+            && self
+                .selected_messages()
+                .iter()
+                .any(|row| row.id == message_id && can_forward(row))
+    }
+
+    /// Add or remove one message of the open thread in the selection. A
+    /// selection of another thread ends.
+    pub fn toggle_selection(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: &str,
+    ) {
+        if !self.forwardable(protocol, conversation_id, message_id) {
+            return;
+        }
+        let topic = self.selected_topic;
+        let same_thread = self.selection.as_ref().is_some_and(|selection| {
+            selection.protocol == protocol
+                && selection.conversation_id == conversation_id
+                && selection.topic == topic
+        });
+        if !same_thread {
+            self.selection = Some(MessageSelection {
+                protocol,
+                conversation_id: conversation_id.to_owned(),
+                topic,
+                message_ids: Vec::new(),
+            });
+        }
+        let Some(selection) = self.selection.as_mut() else {
+            return;
+        };
+        if let Some(at) = selection.message_ids.iter().position(|id| id == message_id) {
+            selection.message_ids.remove(at);
+        } else {
+            selection.message_ids.push(message_id.to_owned());
+        }
+        if selection.message_ids.is_empty() {
+            self.selection = None;
+        }
+    }
+
+    /// End the selection mode.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Open the forward picker for one message, or for the selection of the
+    /// open thread when `message_id` is `None`.
+    pub fn open_forward(
+        &mut self,
+        protocol: ProtocolId,
+        conversation_id: &str,
+        message_id: Option<&str>,
+    ) {
+        let message_ids: Vec<String> = match message_id {
+            Some(id) => vec![id.to_owned()],
+            None => self.selected_for_forward().to_vec(),
+        };
+        if message_ids.is_empty()
+            || !message_ids
+                .iter()
+                .all(|id| self.forwardable(protocol, conversation_id, id))
+        {
+            return;
+        }
+        self.forwarding = Some(ForwardDraft {
+            protocol,
+            conversation_id: conversation_id.to_owned(),
+            message_ids,
+            query: String::new(),
+        });
+    }
+
+    /// The search text of the forward picker.
+    pub fn set_forward_query(&mut self, query: String) {
+        if let Some(draft) = self.forwarding.as_mut() {
+            draft.query = query;
+        }
+    }
+
+    /// Close the forward picker. The selection stays.
+    pub fn cancel_forward(&mut self) {
+        self.forwarding = None;
+    }
+
+    /// The forward picker, when it is open.
+    #[must_use]
+    pub fn forward_picker(&self) -> Option<ForwardPicker<'_>> {
+        let draft = self.forwarding.as_ref()?;
+        let query = draft.query.trim().to_lowercase();
+        let targets = self
+            .conversations
+            .get(&draft.protocol)
+            .into_iter()
+            .flatten()
+            .filter(|row| self.chat_in_open_account(&row.id))
+            .filter(|row| {
+                query.is_empty()
+                    || row.title.to_lowercase().contains(&query)
+                    || row.participant.to_lowercase().contains(&query)
+            })
+            .collect();
+        Some(ForwardPicker {
+            count: draft.message_ids.len(),
+            query: &draft.query,
+            targets,
+        })
+    }
+
+    /// Forward the messages of the picker to `target`, a chat of the same
+    /// account. The picker and the selection close.
+    pub fn forward_to(&mut self, target: &str) {
+        let Some(draft) = self.forwarding.as_ref() else {
+            return;
+        };
+        let known = self
+            .conversations
+            .get(&draft.protocol)
+            .into_iter()
+            .flatten()
+            .any(|row| row.id == target && self.chat_in_open_account(&row.id));
+        if !known {
+            return;
+        }
+        let Some(draft) = self.forwarding.take() else {
+            return;
+        };
+        let count = draft.message_ids.len();
+        self.selection = None;
+        self.push(AdapterCommand::ForwardMessages {
+            protocol: draft.protocol,
+            from_conversation_id: draft.conversation_id,
+            message_ids: draft.message_ids,
+            to_conversation_id: target.to_owned(),
+        });
+        self.status_text = if count == 1 {
+            "Forwarding the message…".into()
+        } else {
+            format!("Forwarding {count} messages…")
+        };
+    }
+
+    // endregion: forward
 
     /// Enter while the compose field edits a message: ask the adapter to
     /// save the new text. An empty text keeps the edit open. The same text
@@ -9582,6 +9813,159 @@ mod tests {
         assert!(can_edit(&message));
         message.body = " ".into();
         assert!(!can_edit(&message), "no text");
+    }
+
+    /// A Telegram chat "Ada" with messages 5, 6, and 7, and a second chat
+    /// "Bob" to forward to.
+    fn forward_chat() -> Snapshot {
+        let mut snapshot = telegram_chat_with_rows(&[(5, false), (6, true), (7, false)]);
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(2, "Bob", 0),
+        });
+        snapshot.take_commands();
+        snapshot
+    }
+
+    fn forward_command(snapshot: &mut Snapshot) -> Option<(Vec<String>, String)> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .find_map(|command| match command {
+                AdapterCommand::ForwardMessages {
+                    protocol: ProtocolId::Telegram,
+                    from_conversation_id,
+                    message_ids,
+                    to_conversation_id,
+                } if from_conversation_id == "telegram:1" => {
+                    Some((message_ids, to_conversation_id))
+                }
+                _ => None,
+            })
+    }
+
+    /// Select toggles messages of the open thread. Forward sends all of them
+    /// to the chosen chat in one command, and the picker and the selection
+    /// close.
+    #[test]
+    fn selected_messages_forward_in_one_command() {
+        let mut snapshot = forward_chat();
+        let (tg, chat) = (ProtocolId::Telegram, "telegram:1");
+        assert!(!snapshot.selecting());
+        snapshot.toggle_selection(tg, chat, "telegram:1:7");
+        snapshot.toggle_selection(tg, chat, "telegram:1:5");
+        snapshot.toggle_selection(tg, chat, "telegram:1:6");
+        snapshot.toggle_selection(tg, chat, "telegram:1:6");
+        snapshot.toggle_selection(tg, chat, "telegram:1:9");
+        assert!(snapshot.selecting());
+        assert_eq!(
+            snapshot.selected_for_forward(),
+            ["telegram:1:7", "telegram:1:5"],
+            "a second click removes; an unknown id is not added"
+        );
+
+        snapshot.open_forward(tg, chat, None);
+        let picker = snapshot.forward_picker().expect("picker");
+        assert_eq!(picker.count, 2);
+        let titles: Vec<&str> = picker
+            .targets
+            .iter()
+            .map(|row| row.title.as_str())
+            .collect();
+        assert!(
+            titles.contains(&"Ada") && titles.contains(&"Bob"),
+            "{titles:?}"
+        );
+        snapshot.set_forward_query("bo".into());
+        let picker = snapshot.forward_picker().expect("picker");
+        let titles: Vec<&str> = picker
+            .targets
+            .iter()
+            .map(|row| row.title.as_str())
+            .collect();
+        assert_eq!(titles, ["Bob"]);
+
+        snapshot.forward_to("telegram:404");
+        assert!(
+            snapshot.forward_picker().is_some(),
+            "not a chat of the account"
+        );
+        assert_eq!(forward_command(&mut snapshot), None);
+
+        snapshot.forward_to("telegram:2");
+        assert_eq!(
+            forward_command(&mut snapshot),
+            Some((
+                vec!["telegram:1:7".to_string(), "telegram:1:5".to_string()],
+                "telegram:2".to_string()
+            ))
+        );
+        assert!(snapshot.forward_picker().is_none());
+        assert!(!snapshot.selecting());
+        assert_eq!(snapshot.status_text, "Forwarding 2 messages…");
+    }
+
+    /// Forward from the menu takes one message and keeps the selection.
+    /// Cancel closes the picker with no command.
+    #[test]
+    fn one_message_forwards_from_the_menu() {
+        let mut snapshot = forward_chat();
+        let (tg, chat) = (ProtocolId::Telegram, "telegram:1");
+        snapshot.toggle_selection(tg, chat, "telegram:1:5");
+        snapshot.open_forward(tg, chat, Some("telegram:1:6"));
+        assert_eq!(
+            snapshot.forward_picker().map(|picker| picker.count),
+            Some(1)
+        );
+        snapshot.cancel_forward();
+        assert!(snapshot.forward_picker().is_none());
+        assert_eq!(snapshot.selected_for_forward(), ["telegram:1:5"]);
+        assert_eq!(forward_command(&mut snapshot), None);
+
+        snapshot.open_forward(tg, chat, Some("telegram:1:6"));
+        snapshot.forward_to("telegram:2");
+        assert_eq!(
+            forward_command(&mut snapshot),
+            Some((vec!["telegram:1:6".to_string()], "telegram:2".to_string()))
+        );
+        assert_eq!(snapshot.status_text, "Forwarding the message…");
+    }
+
+    /// No forward for a send that waits or failed, for a protocol with no
+    /// forward, or for a selection of another chat.
+    #[test]
+    fn forward_needs_a_sent_message_of_the_open_thread() {
+        let mut snapshot = forward_chat();
+        let (tg, chat) = (ProtocolId::Telegram, "telegram:1");
+        if let Some(row) = snapshot
+            .messages
+            .values_mut()
+            .flat_map(|rows| rows.iter_mut())
+            .find(|row| row.id == "telegram:1:6")
+        {
+            row.delivery = Delivery::Pending;
+        }
+        snapshot.toggle_selection(tg, chat, "telegram:1:6");
+        snapshot.open_forward(tg, chat, Some("telegram:1:6"));
+        assert!(!snapshot.selecting(), "a send that waits");
+        assert!(snapshot.forward_picker().is_none());
+
+        snapshot.toggle_selection(tg, chat, "telegram:1:5");
+        snapshot.select_conversation("telegram:2".into());
+        assert!(!snapshot.selecting(), "the selection is of another chat");
+        snapshot.open_forward(tg, "telegram:2", None);
+        assert!(snapshot.forward_picker().is_none());
+        snapshot.select_conversation("telegram:1".into());
+        assert_eq!(snapshot.selected_for_forward(), ["telegram:1:5"]);
+        snapshot.clear_selection();
+        assert!(!snapshot.selecting());
+
+        for row in &mut snapshot.accounts {
+            row.caps.message_actions = thinwire_protocol::MessageActions::NONE;
+        }
+        snapshot.toggle_selection(tg, chat, "telegram:1:5");
+        snapshot.open_forward(tg, chat, Some("telegram:1:5"));
+        assert!(!snapshot.selecting());
+        assert!(snapshot.forward_picker().is_none(), "no forward action");
     }
 
     /// Play on a clip with no file asks for its download once. The path

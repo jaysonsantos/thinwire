@@ -152,6 +152,8 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
         delete_for_everyone: true,
         one_reaction: true,
         edit: false,
+        // The helper has no forward yet (#534).
+        forward: false,
     },
 };
 

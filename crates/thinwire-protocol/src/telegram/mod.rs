@@ -551,6 +551,19 @@ impl ProtocolAdapter for TelegramAdapter {
                     body,
                 },
             ),
+            AdapterCommand::ForwardMessages {
+                protocol: ProtocolId::Telegram,
+                from_conversation_id,
+                message_ids,
+                to_conversation_id,
+            } => self.dispatch_live(
+                events,
+                LiveCall::ForwardMessages {
+                    from_conversation_id,
+                    message_ids,
+                    to_conversation_id,
+                },
+            ),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -649,6 +662,11 @@ enum LiveCall {
         conversation_id: String,
         message_id: String,
         body: String,
+    },
+    ForwardMessages {
+        from_conversation_id: String,
+        message_ids: Vec<String>,
+        to_conversation_id: String,
     },
     Resend {
         conversation_id: String,
@@ -848,6 +866,22 @@ impl TelegramAdapter {
                             conversation_id,
                             message_id,
                             body,
+                        },
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::ForwardMessages {
+                    from_conversation_id,
+                    message_ids,
+                    to_conversation_id,
+                } => {
+                    self.tdlib.enqueue_message_action(
+                        tdlib::TdlibCommand::ForwardMessages {
+                            from_conversation_id,
+                            message_ids,
+                            to_conversation_id,
                         },
                         secrets,
                         source,
@@ -1556,6 +1590,20 @@ mod tests {
             .find("emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request)")
             .expect("acceptance names the send");
         assert!(pending < accepted, "the pending row comes first");
+    }
+
+    /// Forward sends the ids in increasing order, at most 100 for each
+    /// request, and counts what TDLib forwarded.
+    #[test]
+    fn forward_sends_ordered_batches_and_counts_the_result() {
+        let body = fn_body(include_str!("tdlib.rs"), "async fn forward_messages");
+        let ids = body
+            .find("forward_ids(from_chat, message_ids)")
+            .expect("ids");
+        let batch = body.find("ids.chunks(FORWARD_BATCH)").expect("batches");
+        let call = body.find("functions::forward_messages(").expect("call");
+        assert!(ids < batch && batch < call);
+        assert!(body.contains("forward_notice(forwarded, ids.len())"));
     }
 
     #[test]

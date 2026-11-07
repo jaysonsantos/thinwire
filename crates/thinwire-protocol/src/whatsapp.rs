@@ -57,6 +57,8 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     // The helper has no edit yet (#519).
     message_actions: crate::MessageActions {
         edit: false,
+        // The helper has no forward yet (#533).
+        forward: false,
         ..crate::MessageActions::ALL
     },
 };

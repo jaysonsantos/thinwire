@@ -170,7 +170,9 @@ pub(crate) fn command_to_wire(
         | AdapterCommand::DownloadVideo { .. }
         | AdapterCommand::DownloadDocument { .. }
         // A helper has no edit yet (#519, #520).
-        | AdapterCommand::EditMessage { .. } => return None,
+        | AdapterCommand::EditMessage { .. }
+        // A helper has no forward yet (#533, #534).
+        | AdapterCommand::ForwardMessages { .. } => return None,
     })
 }
 

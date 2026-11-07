@@ -198,6 +198,7 @@ pub(crate) fn draw(
     super::photos::overlay(ui, snapshot.selected_messages());
     player.video_overlay(ui, snapshot.selected_messages());
     super::message_menu::delete_dialog(ui.ctx(), out);
+    super::forward::picker(ui.ctx(), snapshot, out);
 }
 
 /// Single-line or multiline text bound to a core value. A change becomes an intent.
@@ -2269,6 +2270,7 @@ fn center_panel(
                 || player.take_video_escape()
                 || super::photos::take_escape(ui.ctx())
                 || super::links::take_escape(ui.ctx())
+                || super::forward::take_escape(snapshot, out)
                 || (snapshot.edit_target().is_some() && {
                     out.push(Intent::CancelEdit);
                     true
@@ -2506,6 +2508,8 @@ fn thread(
         ViewNow::Fixed(now) => thread_rows(snapshot.selected_messages(), is_group, &now),
     };
     let actions = snapshot.message_actions(snapshot.selected_protocol);
+    let selection = snapshot.selected_for_forward();
+    let selecting = !selection.is_empty();
     let thread = snapshot.selected_messages();
     let replied = |id: &str| thread.iter().find(|message| message.id == id);
     let messages: Vec<Bubble<'_>> = thread
@@ -2527,6 +2531,9 @@ fn thread(
             reply: message.reply_to.as_deref().map(replied),
             actions,
             editable: thinwire_core::state::can_edit(message),
+            forwardable: actions.forward && thinwire_core::state::can_forward(message),
+            selecting,
+            selected: selection.contains(&message.id),
             delivery: message.delivery,
             group: is_group,
             layout,
@@ -2546,6 +2553,7 @@ fn thread(
         compose_reserve(row_height, compose_rows, ui.spacing().item_spacing.y)
             + super::attach::tray_height(ui, snapshot)
             + super::message_menu::reply_bar_height(ui, snapshot)
+            + super::forward::selection_bar_height(ui, snapshot)
     };
 
     let state = snapshot.thread_state();
@@ -2994,6 +3002,12 @@ struct Bubble<'a> {
     actions: thinwire_protocol::MessageActions,
     /// Edit can change this message.
     editable: bool,
+    /// Forward can send this message to another chat.
+    forwardable: bool,
+    /// The thread is in selection mode: a click selects the message.
+    selecting: bool,
+    /// The message is in the selection to forward.
+    selected: bool,
     delivery: Delivery,
     /// Group chat. The AccessKit name keeps the sender on every row.
     group: bool,
@@ -3679,10 +3693,58 @@ fn bubble(
             outbound: message.outbound,
             reactions: message.reactions,
             editable: message.editable,
+            forwardable: message.forwardable,
         };
         super::message_menu::attach(&frame, &target, message.actions, out);
         super::message_menu::reactions(ui, &target, message.actions, out);
+        if message.selecting && message.forwardable {
+            select_on_click(ui, &frame, message, out);
+        }
+        if message.selected {
+            ui.painter().rect_stroke(
+                frame.rect.expand(SELECTED_RING_GAP),
+                bubble_radius(message.outbound, message.layout.run_end),
+                egui::Stroke::new(SELECTED_RING, palette.accent),
+                egui::StrokeKind::Outside,
+            );
+        }
     });
+}
+
+/// The width of the ring around a selected bubble.
+const SELECTED_RING: f32 = 2.0;
+
+/// The gap between a selected bubble and its ring.
+const SELECTED_RING_GAP: f32 = 2.0;
+
+/// In selection mode, a click on the bubble adds or removes it. The click
+/// area is on top of the bubble, so a link or a photo does not take it.
+fn select_on_click(
+    ui: &mut egui::Ui,
+    frame: &egui::Response,
+    message: &Bubble<'_>,
+    out: &mut Vec<Intent>,
+) {
+    let pick = ui.interact(
+        frame.rect,
+        frame.id.with("forward-select"),
+        egui::Sense::click(),
+    );
+    pick.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::Role::CheckBox,
+            true,
+            message.selected,
+            format!("Select: {}", bubble_access_label(message)),
+        )
+    });
+    if pick.clicked() {
+        out.push(Intent::SelectMessage {
+            protocol: message.protocol,
+            conversation_id: message.conversation_id.to_owned(),
+            message_id: message.id.to_owned(),
+        });
+    }
 }
 
 /// Drop a painted widget from the screen-reader tree.
@@ -3976,6 +4038,7 @@ fn compose(
         .fill(palette.bg)
         .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::M as i8))
         .show(ui, |ui| {
+            super::forward::selection_bar(ui, snapshot, out);
             super::message_menu::reply_bar(ui, snapshot, out);
             if let Some(thread) = chat.as_ref() {
                 super::attach::tray(ui, snapshot, thread, out);

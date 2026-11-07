@@ -120,6 +120,24 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             | Intent::CancelEdit
             | Intent::CancelReply) => state.message_intents.push(intent),
             Intent::SelectProtocol(protocol) => state.snapshot.select_protocol(protocol),
+            Intent::SelectMessage {
+                protocol,
+                conversation_id,
+                message_id,
+            } => state
+                .snapshot
+                .toggle_selection(protocol, &conversation_id, &message_id),
+            Intent::ClearSelection => state.snapshot.clear_selection(),
+            Intent::OpenForward {
+                protocol,
+                conversation_id,
+                message_id,
+            } => state
+                .snapshot
+                .open_forward(protocol, &conversation_id, message_id.as_deref()),
+            Intent::SetForwardQuery(query) => state.snapshot.set_forward_query(query.into_inner()),
+            Intent::ForwardTo { conversation_id } => state.snapshot.forward_to(&conversation_id),
+            Intent::CancelForward => state.snapshot.cancel_forward(),
             Intent::SetRailCollapsed(collapsed) => state.settings.set_rail_collapsed(collapsed),
             Intent::AddAttachments {
                 protocol,
@@ -1067,6 +1085,60 @@ fn the_message_menu_offers_edit_for_an_own_text() {
                 message_id: "telegram:1:9".into(),
             })
     );
+}
+
+/// Select from the menu starts the selection. A click on another bubble
+/// adds it. Forward opens the chat picker, and a chat in it forwards both
+/// messages in one command.
+#[test]
+fn selected_messages_forward_through_the_chat_picker() {
+    let mut state = InboxUi::ready();
+    for message in [
+        chat_message("telegram:1:8", "First line", 1_790_299_000),
+        chat_message("telegram:1:9", "Second line", 1_790_300_000),
+    ] {
+        state
+            .snapshot
+            .apply(AdapterEvent::MessageReceived { message });
+    }
+    let mut harness = harness(state);
+    harness.run();
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Pane, "First line")
+        .click_secondary();
+    harness.run();
+    assert!(harness.query_by_label("Forward…").is_some());
+    harness.get_by_label("Select").click();
+    harness.run();
+    assert!(harness.query_by_label("1 selected").is_some());
+
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::CheckBox, "Select: Second line")
+        .click();
+    harness.run();
+    assert!(harness.query_by_label("2 selected").is_some());
+
+    harness.get_by_label("Forward…").click();
+    harness.run();
+    assert!(harness.query_by_label("Forward 2 messages").is_some());
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "Forward to Bob")
+        .click();
+    harness.run();
+
+    let commands = harness.state_mut().snapshot.take_commands();
+    assert!(
+        commands.contains(&thinwire_protocol::AdapterCommand::ForwardMessages {
+            protocol: ProtocolId::Telegram,
+            from_conversation_id: "telegram:1".into(),
+            message_ids: vec!["telegram:1:8".into(), "telegram:1:9".into()],
+            to_conversation_id: "telegram:2".into(),
+        }),
+        "{commands:?}"
+    );
+    assert!(harness.query_by_label("Forward 2 messages").is_none());
+    assert!(harness.query_by_label("2 selected").is_none());
 }
 
 #[test]

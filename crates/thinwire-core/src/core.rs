@@ -1050,6 +1050,24 @@ impl Core {
                 .state
                 .begin_edit(protocol, &conversation_id, &message_id),
             Intent::CancelEdit => self.state.cancel_edit(),
+            Intent::SelectMessage {
+                protocol,
+                conversation_id,
+                message_id,
+            } => self
+                .state
+                .toggle_selection(protocol, &conversation_id, &message_id),
+            Intent::ClearSelection => self.state.clear_selection(),
+            Intent::OpenForward {
+                protocol,
+                conversation_id,
+                message_id,
+            } => self
+                .state
+                .open_forward(protocol, &conversation_id, message_id.as_deref()),
+            Intent::SetForwardQuery(query) => self.state.set_forward_query(query.into_inner()),
+            Intent::ForwardTo { conversation_id } => self.state.forward_to(&conversation_id),
+            Intent::CancelForward => self.state.cancel_forward(),
             Intent::DeleteMessage {
                 protocol,
                 conversation_id,

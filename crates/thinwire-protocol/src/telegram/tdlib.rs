@@ -68,6 +68,12 @@ pub(super) enum TdlibCommand {
         message_id: String,
         body: String,
     },
+    /// Forward messages of one chat, with their media, to another chat.
+    ForwardMessages {
+        from_conversation_id: String,
+        message_ids: Vec<String>,
+        to_conversation_id: String,
+    },
     Resend {
         conversation_id: String,
         message_id: String,
@@ -152,6 +158,7 @@ impl TdlibCommand {
             Self::DeleteMessage { .. } => "delete_message",
             Self::React { .. } => "react",
             Self::EditMessage { .. } => "edit_message",
+            Self::ForwardMessages { .. } => "forward_messages",
             Self::Resend { .. } => "resend",
             Self::LoadOlder { .. } => "load_older",
             Self::OpenTopic { .. } => "open_topic",
@@ -1045,6 +1052,20 @@ fn spawn_tdlib_worker(
                                 &message_id,
                                 &body,
                                 live.linked(),
+                                &events,
+                            )
+                            .await;
+                        }
+                        TdlibCommand::ForwardMessages {
+                            from_conversation_id,
+                            message_ids,
+                            to_conversation_id,
+                        } => {
+                            forward_messages(
+                                client_id,
+                                &from_conversation_id,
+                                &message_ids,
+                                &to_conversation_id,
                                 &events,
                             )
                             .await;
@@ -3234,6 +3255,91 @@ fn emit_content(
 /// queue and change the row again with the same text. A message that
 /// Telegram does not let this account edit, for example one older than the
 /// edit limit, gets `CommandFailed`.
+/// Most messages in one `forwardMessages` request (TDLib limit).
+const FORWARD_BATCH: usize = 100;
+
+/// The TDLib ids of `message_ids` that are messages of `from_chat`, in a
+/// strictly increasing order, as `forwardMessages` needs them.
+fn forward_ids(from_chat: i64, message_ids: &[String]) -> Vec<i64> {
+    let mut ids: Vec<i64> = message_ids
+        .iter()
+        .filter_map(|id| inbox::parse_message_id(id))
+        .filter(|(chat, _)| *chat == from_chat)
+        .map(|(_, id)| id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// The notice after a forward. `None`: nothing was forwarded.
+fn forward_notice(forwarded: usize, total: usize) -> Option<String> {
+    match forwarded {
+        0 => None,
+        1 if total == 1 => Some("Message forwarded.".into()),
+        n if n == total => Some(format!("{n} messages forwarded.")),
+        n => Some(format!(
+            "{n} of {total} messages forwarded. Telegram does not let you forward the others."
+        )),
+    }
+}
+
+/// Forward messages of one chat to another chat, with their media. TDLib
+/// returns null for a message that it cannot forward (for example, from a
+/// chat with protected content). The new messages come as updates.
+async fn forward_messages(
+    client_id: i32,
+    from_conversation_id: &str,
+    message_ids: &[String],
+    to_conversation_id: &str,
+    events: &EventTx,
+) {
+    let failed = |detail: &str| {
+        crate::adapter::emit_command_failed(
+            events,
+            ProtocolId::Telegram,
+            Some(from_conversation_id.to_string()),
+            detail,
+        );
+    };
+    let (Some(from_chat), Some(to_chat)) = (
+        inbox::parse_telegram_chat_id(from_conversation_id),
+        inbox::parse_telegram_chat_id(to_conversation_id),
+    ) else {
+        failed("Telegram did not forward the messages.");
+        return;
+    };
+    let ids = forward_ids(from_chat, message_ids);
+    if ids.is_empty() {
+        failed("Select a message to forward.");
+        return;
+    }
+    let mut forwarded = 0;
+    for batch in ids.chunks(FORWARD_BATCH) {
+        match tdlib_rs::functions::forward_messages(
+            to_chat,
+            None,
+            from_chat,
+            batch.to_vec(),
+            None,
+            false,
+            false,
+            client_id,
+        )
+        .await
+        {
+            Ok(tdlib_rs::enums::Messages::Messages(result)) => {
+                forwarded += result.messages.iter().flatten().count();
+            }
+            Err(error) => log_tdlib_error("forwardMessages", &error),
+        }
+    }
+    match forward_notice(forwarded, ids.len()) {
+        Some(text) => crate::adapter::emit_notice(events, ProtocolId::Telegram, text),
+        None => failed("Telegram did not forward the messages."),
+    }
+}
+
 async fn edit_message(
     client_id: i32,
     conversation_id: &str,
@@ -3728,6 +3834,40 @@ fn ensure_dir(path: &std::path::Path) {
 mod tests {
     use super::*;
     use crate::telegram::inbox::{ChatDirectory, ChatEffect, ChatMute, ChatSeed, MuteScope};
+
+    #[test]
+    fn forward_ids_are_of_the_source_chat_and_strictly_increasing() {
+        let ids = [
+            "telegram:7:30".to_string(),
+            "telegram:7:10".to_string(),
+            "telegram:8:20".to_string(),
+            "telegram:7:30".to_string(),
+            "not-an-id".to_string(),
+        ];
+        assert_eq!(forward_ids(7, &ids), vec![10, 30]);
+        assert!(forward_ids(9, &ids).is_empty());
+        let many: Vec<String> = (1..=250).map(|id| format!("telegram:7:{id}")).collect();
+        let batches: Vec<usize> = forward_ids(7, &many)
+            .chunks(FORWARD_BATCH)
+            .map(<[i64]>::len)
+            .collect();
+        assert_eq!(batches, vec![100, 100, 50], "TDLib takes 100 at most");
+    }
+
+    #[test]
+    fn the_forward_notice_counts_what_telegram_forwarded() {
+        assert_eq!(forward_notice(0, 3), None);
+        assert_eq!(forward_notice(1, 1).as_deref(), Some("Message forwarded."));
+        assert_eq!(
+            forward_notice(3, 3).as_deref(),
+            Some("3 messages forwarded.")
+        );
+        let partial = forward_notice(2, 3).expect("notice");
+        assert!(
+            partial.starts_with("2 of 3 messages forwarded."),
+            "{partial}"
+        );
+    }
 
     /// A stand-in for the TDLib client. It records `viewMessages` and answers
     /// with unread 0, which is the `updateChatReadInbox` that follows a view.

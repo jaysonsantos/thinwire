@@ -280,6 +280,9 @@ pub struct MessageActions {
     pub one_reaction: bool,
     /// `EditMessage` changes the text of an own text message.
     pub edit: bool,
+    /// `ForwardMessages` sends one or more messages, with their media, to
+    /// another chat of the same account.
+    pub forward: bool,
 }
 
 impl MessageActions {
@@ -291,6 +294,7 @@ impl MessageActions {
         delete_for_everyone: false,
         one_reaction: false,
         edit: false,
+        forward: false,
     };
 
     /// Every action, with one reaction for each person, as Telegram (with
@@ -302,6 +306,7 @@ impl MessageActions {
         delete_for_everyone: true,
         one_reaction: true,
         edit: true,
+        forward: true,
     };
 }
 
@@ -744,6 +749,16 @@ pub enum AdapterCommand {
         message_id: String,
         body: String,
     },
+    /// Forward the messages `message_ids` of `from_conversation_id`, with
+    /// their media, to `to_conversation_id` of the same account. The new
+    /// messages come as `Message` events of that chat. The adapter answers
+    /// with `Notice`, or with `CommandFailed` when nothing was forwarded.
+    ForwardMessages {
+        protocol: ProtocolId,
+        from_conversation_id: String,
+        message_ids: Vec<String>,
+        to_conversation_id: String,
+    },
     /// Download one video file for the in-app player (ADR 0015). The file
     /// stays on disk. The adapter reports a path.
     DownloadVideo {
@@ -786,6 +801,7 @@ impl AdapterCommand {
             | Self::DownloadDocument { protocol, .. }
             | Self::DeleteMessage { protocol, .. }
             | Self::EditMessage { protocol, .. }
+            | Self::ForwardMessages { protocol, .. }
             | Self::React { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
@@ -854,6 +870,7 @@ impl AdapterCommand {
             | Self::DownloadDocument { protocol, .. }
             | Self::DeleteMessage { protocol, .. }
             | Self::EditMessage { protocol, .. }
+            | Self::ForwardMessages { protocol, .. }
             | Self::React { protocol, .. } => {
                 *protocol = account;
                 true

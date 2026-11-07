@@ -207,6 +207,30 @@ pub enum Intent {
     },
     /// End the edit with no change. The draft of the thread comes back.
     CancelEdit,
+    /// Add or remove one message of the open thread in the selection to
+    /// forward. Only a protocol with `MessageActions::forward`.
+    SelectMessage {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+    },
+    /// End the selection mode.
+    ClearSelection,
+    /// Open the forward picker for one message, or for the selection of the
+    /// open thread when `message_id` is `None`.
+    OpenForward {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: Option<String>,
+    },
+    /// The search text of the forward picker. `SecretText` keeps the typed
+    /// text out of `Debug`.
+    SetForwardQuery(SecretText),
+    /// Forward to this chat of the same account. The picker and the
+    /// selection close.
+    ForwardTo { conversation_id: String },
+    /// Close the forward picker. The selection stays.
+    CancelForward,
     /// Telegram login and account actions.
     Telegram(TelegramIntent),
     /// Experimental WhatsApp pairing. Only a `whatsapp-web` build acts on it.

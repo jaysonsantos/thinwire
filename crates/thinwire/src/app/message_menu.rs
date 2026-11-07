@@ -1,6 +1,7 @@
 //! The menu of one message: a right click on its bubble. It offers only what
 //! the protocol of the message allows (`MessageActions`): reply, an emoji
-//! reaction, copy, edit, and delete. The reactions of a message show under
+//! reaction, copy, edit, forward, select (to forward more than one), and
+//! delete. The reactions of a message show under
 //! its bubble, and a reply shows the message it answers.
 
 use eframe::egui::{self, RichText};
@@ -28,6 +29,8 @@ pub(crate) struct Target<'a> {
     pub(crate) reactions: &'a [Reaction],
     /// An own text message that the server has (`state::can_edit`).
     pub(crate) editable: bool,
+    /// A message that the server has (`state::can_forward`).
+    pub(crate) forwardable: bool,
 }
 
 impl Target<'_> {
@@ -108,6 +111,24 @@ fn menu(ui: &mut egui::Ui, target: &Target<'_>, actions: MessageActions, out: &m
         });
         ui.memory_mut(|memory| memory.request_focus(egui::Id::unique("thread-compose")));
         ui.close();
+    }
+    if actions.forward && target.forwardable {
+        if ui.button("Forward…").clicked() {
+            out.push(Intent::OpenForward {
+                protocol: target.protocol,
+                conversation_id: target.conversation_id.to_owned(),
+                message_id: Some(target.message_id.to_owned()),
+            });
+            ui.close();
+        }
+        if ui.button("Select").clicked() {
+            out.push(Intent::SelectMessage {
+                protocol: target.protocol,
+                conversation_id: target.conversation_id.to_owned(),
+                message_id: target.message_id.to_owned(),
+            });
+            ui.close();
+        }
     }
     let (me, everyone) = delete_choices(actions, target.outbound);
     if (me || everyone) && ui.button("Delete…").clicked() {
