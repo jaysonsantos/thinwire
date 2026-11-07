@@ -58,7 +58,6 @@ if [[ -z "$expected" ]] || ! grep -q "$expected" .SRCINFO; then
   exit 1
 fi
 
-# OpenSSH expands ~ from the passwd home, not from $HOME.
 ssh_home=$(getent passwd "$(id -u)" | awk -F: '{ print $6 }')
 if [[ -z "$ssh_home" ]]; then
   echo "::error::The passwd home is empty."
