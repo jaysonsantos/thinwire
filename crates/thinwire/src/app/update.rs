@@ -752,17 +752,19 @@ fn finish_one(install_dir: &Path, name: &str, goal: Slot) -> Result<(), PlainErr
 }
 
 fn write_journal(path: &Path, journal: &Journal) -> Result<(), PlainError> {
-    let install = path_text(&journal.install_dir)?;
-    let staging = path_text(&journal.staging_dir)?;
-    let body = format!(
-        "{{\n  \"token\": {},\n  \"rev\": {},\n  \"sha7\": {},\n  \"install_dir\": {},\n  \"staging_dir\": {}\n}}\n",
-        json_string(&journal.target.token),
-        journal.target.rev,
-        json_string(journal.target.sha7.as_str()),
-        json_string(&install),
-        json_string(&staging),
-    );
+    let body = journal_text(journal)?;
     replace_file(path, &body).map_err(|_| bad_payload())
+}
+
+fn journal_text(journal: &Journal) -> Result<String, PlainError> {
+    let file = JournalFile {
+        token: journal.target.token.clone(),
+        rev: journal.target.rev,
+        sha7: journal.target.sha7.as_str().to_owned(),
+        install_dir: path_text(&journal.install_dir)?,
+        staging_dir: path_text(&journal.staging_dir)?,
+    };
+    file_text(&file)
 }
 
 fn read_journal(path: &Path) -> Result<Journal, PlainError> {
@@ -771,44 +773,13 @@ fn read_journal(path: &Path) -> Result<Journal, PlainError> {
 }
 
 fn parse_journal(text: &str) -> Result<Journal, PlainError> {
-    let mut scan = Scan { text, at: 0 };
-    let mut token = None;
-    let mut rev = None;
-    let mut sha = None;
-    let mut install = None;
-    let mut staging = None;
-    scan.eat('{')?;
-    loop {
-        if scan.peek() == Some('}') {
-            scan.eat('}')?;
-            break;
-        }
-        let key = scan.string()?;
-        scan.eat(':')?;
-        match key.as_str() {
-            "token" => token = Some(scan.string()?),
-            "rev" => rev = Some(scan.u32()?),
-            "sha7" => sha = Some(scan.string()?),
-            "install_dir" => install = Some(scan.string()?),
-            "staging_dir" => staging = Some(scan.string()?),
-            _ => return Err(bad_payload()),
-        }
-        if scan.peek() == Some(',') {
-            scan.eat(',')?;
-            continue;
-        }
-        scan.eat('}')?;
-        break;
-    }
-    scan.finish()?;
-    let version = parse_version(&token.ok_or_else(bad_payload)?).map_err(|_| bad_payload())?;
-    if version.rev != rev.ok_or_else(bad_payload)?
-        || version.sha7.as_str() != sha.as_deref().unwrap_or("")
-    {
+    let file: JournalFile = serde_json::from_str(text).map_err(|_| bad_payload())?;
+    let version = parse_version(&file.token).map_err(|_| bad_payload())?;
+    if version.rev != file.rev || version.sha7.as_str() != file.sha7 {
         return Err(bad_payload());
     }
-    let install_dir = PathBuf::from(install.ok_or_else(bad_payload)?);
-    let staging_dir = PathBuf::from(staging.ok_or_else(bad_payload)?);
+    let install_dir = PathBuf::from(file.install_dir);
+    let staging_dir = PathBuf::from(file.staging_dir);
     if !install_dir.is_absolute() || !staging_dir.is_absolute() {
         return Err(bad_payload());
     }
@@ -827,158 +798,44 @@ fn load_ledger(path: &Path) -> Ledger {
 }
 
 fn store_ledger(path: &Path, ledger: &Ledger) -> Result<(), PlainError> {
-    let proven = match &ledger.proven {
-        Some(proven) => format!(
-            "{{\"sha7\": {}, \"rev\": {}}}",
-            json_string(proven.sha7.as_str()),
-            proven.rev
-        ),
-        None => "null".to_owned(),
-    };
-    let deferred = match ledger.deferred_rev {
-        Some(rev) => rev.to_string(),
-        None => "null".to_owned(),
-    };
-    let swap = match &ledger.swap_error {
-        Some(error) => format!(
-            "{{\"happened\": {}, \"why\": {}, \"next\": {}}}",
-            json_string(&error.happened),
-            json_string(&error.why),
-            json_string(&error.next)
-        ),
-        None => "null".to_owned(),
-    };
-    let body = format!(
-        "{{\n  \"proven\": {proven},\n  \"deferred_rev\": {deferred},\n  \"swap_error\": {swap}\n}}\n"
-    );
+    let body = ledger_text(ledger)?;
     replace_file(path, &body).map_err(|_| bad_payload())
 }
 
+fn ledger_text(ledger: &Ledger) -> Result<String, PlainError> {
+    let file = LedgerFile {
+        proven: ledger.proven.as_ref().map(|proven| ProvenFile {
+            sha7: proven.sha7.as_str().to_owned(),
+            rev: proven.rev,
+        }),
+        deferred_rev: ledger.deferred_rev,
+        swap_error: ledger.swap_error.as_ref().map(|error| ErrorFile {
+            happened: error.happened.clone(),
+            why: error.why.clone(),
+            next: error.next.clone(),
+        }),
+    };
+    file_text(&file)
+}
+
 fn parse_ledger(text: &str) -> Result<Ledger, PlainError> {
-    let mut scan = Scan { text, at: 0 };
-    let mut proven = None;
-    let mut deferred = None;
-    let mut swap = None;
-    let mut seen_proven = false;
-    let mut seen_deferred = false;
-    let mut seen_swap = false;
-    scan.eat('{')?;
-    loop {
-        if scan.peek() == Some('}') {
-            scan.eat('}')?;
-            break;
-        }
-        let key = scan.string()?;
-        scan.eat(':')?;
-        match key.as_str() {
-            "proven" => {
-                proven = parse_proven(&mut scan)?;
-                seen_proven = true;
-            }
-            "deferred_rev" => {
-                deferred = parse_optional_u32(&mut scan)?;
-                seen_deferred = true;
-            }
-            "swap_error" => {
-                swap = parse_swap_error(&mut scan)?;
-                seen_swap = true;
-            }
-            _ => return Err(bad_payload()),
-        }
-        if scan.peek() == Some(',') {
-            scan.eat(',')?;
-            continue;
-        }
-        scan.eat('}')?;
-        break;
-    }
-    scan.finish()?;
-    if !seen_proven || !seen_deferred || !seen_swap {
-        return Err(bad_payload());
-    }
+    let file: LedgerFile = serde_json::from_str(text).map_err(|_| bad_payload())?;
+    let proven = match file.proven {
+        Some(proven) => Some(Proven {
+            sha7: Sha7::parse(&proven.sha7).ok_or_else(bad_payload)?,
+            rev: proven.rev,
+        }),
+        None => None,
+    };
     Ok(Ledger {
         proven,
-        deferred_rev: deferred,
-        swap_error: swap,
+        deferred_rev: file.deferred_rev,
+        swap_error: file.swap_error.map(|error| PlainError {
+            happened: error.happened,
+            why: error.why,
+            next: error.next,
+        }),
     })
-}
-
-fn parse_proven(scan: &mut Scan<'_>) -> Result<Option<Proven>, PlainError> {
-    if scan.peek() == Some('n') {
-        scan.null()?;
-        return Ok(None);
-    }
-    scan.eat('{')?;
-    let mut sha = None;
-    let mut rev = None;
-    loop {
-        if scan.peek() == Some('}') {
-            scan.eat('}')?;
-            break;
-        }
-        let key = scan.string()?;
-        scan.eat(':')?;
-        match key.as_str() {
-            "sha7" => sha = Some(scan.string()?),
-            "rev" => rev = Some(scan.u32()?),
-            _ => return Err(bad_payload()),
-        }
-        if scan.peek() == Some(',') {
-            scan.eat(',')?;
-            continue;
-        }
-        scan.eat('}')?;
-        break;
-    }
-    let sha7 = Sha7::parse(&sha.ok_or_else(bad_payload)?).ok_or_else(bad_payload)?;
-    Ok(Some(Proven {
-        sha7,
-        rev: rev.ok_or_else(bad_payload)?,
-    }))
-}
-
-fn parse_optional_u32(scan: &mut Scan<'_>) -> Result<Option<u32>, PlainError> {
-    if scan.peek() == Some('n') {
-        scan.null()?;
-        return Ok(None);
-    }
-    Ok(Some(scan.u32()?))
-}
-
-fn parse_swap_error(scan: &mut Scan<'_>) -> Result<Option<PlainError>, PlainError> {
-    if scan.peek() == Some('n') {
-        scan.null()?;
-        return Ok(None);
-    }
-    scan.eat('{')?;
-    let mut happened = None;
-    let mut why = None;
-    let mut next = None;
-    loop {
-        if scan.peek() == Some('}') {
-            scan.eat('}')?;
-            break;
-        }
-        let key = scan.string()?;
-        scan.eat(':')?;
-        match key.as_str() {
-            "happened" => happened = Some(scan.string()?),
-            "why" => why = Some(scan.string()?),
-            "next" => next = Some(scan.string()?),
-            _ => return Err(bad_payload()),
-        }
-        if scan.peek() == Some(',') {
-            scan.eat(',')?;
-            continue;
-        }
-        scan.eat('}')?;
-        break;
-    }
-    Ok(Some(PlainError {
-        happened: happened.ok_or_else(bad_payload)?,
-        why: why.ok_or_else(bad_payload)?,
-        next: next.ok_or_else(bad_payload)?,
-    }))
 }
 
 fn path_text(path: &Path) -> Result<String, PlainError> {
@@ -988,138 +845,43 @@ fn path_text(path: &Path) -> Result<String, PlainError> {
         .ok_or_else(bad_payload)
 }
 
-fn json_string(text: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other if other.is_control() => {
-                out.push_str(&format!("\\u{:04x}", u32::from(other)));
-            }
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
+fn file_text(value: &impl serde::Serialize) -> Result<String, PlainError> {
+    let mut text = serde_json::to_string_pretty(value).map_err(|_| bad_payload())?;
+    text.push('\n');
+    Ok(text)
 }
 
-struct Scan<'a> {
-    text: &'a str,
-    at: usize,
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalFile {
+    token: String,
+    rev: u32,
+    sha7: String,
+    install_dir: String,
+    staging_dir: String,
 }
 
-impl Scan<'_> {
-    fn skip(&mut self) {
-        while self
-            .text
-            .get(self.at..)
-            .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_whitespace()))
-        {
-            self.at += 1;
-        }
-    }
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerFile {
+    proven: Option<ProvenFile>,
+    deferred_rev: Option<u32>,
+    swap_error: Option<ErrorFile>,
+}
 
-    fn peek(&mut self) -> Option<char> {
-        self.skip();
-        self.text[self.at..].chars().next()
-    }
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvenFile {
+    sha7: String,
+    rev: u32,
+}
 
-    fn eat(&mut self, expected: char) -> Result<(), PlainError> {
-        self.skip();
-        match self.text[self.at..].chars().next() {
-            Some(ch) if ch == expected => {
-                self.at += ch.len_utf8();
-                Ok(())
-            }
-            _ => Err(bad_payload()),
-        }
-    }
-
-    fn string(&mut self) -> Result<String, PlainError> {
-        self.eat('"')?;
-        let bytes = self.text.as_bytes();
-        let mut out = String::new();
-        loop {
-            if self.at >= bytes.len() {
-                return Err(bad_payload());
-            }
-            match bytes[self.at] {
-                b'"' => {
-                    self.at += 1;
-                    return Ok(out);
-                }
-                b'\\' => {
-                    self.at += 1;
-                    let esc = *bytes.get(self.at).ok_or_else(bad_payload)?;
-                    self.at += 1;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hex = bytes.get(self.at..self.at + 4).ok_or_else(bad_payload)?;
-                            let hex = std::str::from_utf8(hex).map_err(|_| bad_payload())?;
-                            let code = u32::from_str_radix(hex, 16).map_err(|_| bad_payload())?;
-                            out.push(char::from_u32(code).ok_or_else(bad_payload)?);
-                            self.at += 4;
-                        }
-                        _ => return Err(bad_payload()),
-                    }
-                }
-                byte if byte < 0x20 => return Err(bad_payload()),
-                _ => {
-                    let ch = self.text[self.at..]
-                        .chars()
-                        .next()
-                        .ok_or_else(bad_payload)?;
-                    out.push(ch);
-                    self.at += ch.len_utf8();
-                }
-            }
-        }
-    }
-
-    fn u32(&mut self) -> Result<u32, PlainError> {
-        self.skip();
-        let start = self.at;
-        while self
-            .text
-            .get(self.at..)
-            .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_digit()))
-        {
-            self.at += 1;
-        }
-        if start == self.at {
-            return Err(bad_payload());
-        }
-        self.text[start..self.at].parse().map_err(|_| bad_payload())
-    }
-
-    fn null(&mut self) -> Result<(), PlainError> {
-        self.skip();
-        if self.text[self.at..].starts_with("null") {
-            self.at += 4;
-            Ok(())
-        } else {
-            Err(bad_payload())
-        }
-    }
-
-    fn finish(&mut self) -> Result<(), PlainError> {
-        self.skip();
-        if self.at == self.text.len() {
-            Ok(())
-        } else {
-            Err(bad_payload())
-        }
-    }
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorFile {
+    happened: String,
+    why: String,
+    next: String,
 }
 
 fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
@@ -2822,6 +2584,18 @@ mod tests {
         };
         store_ledger(&path, &ledger).expect("store");
         assert_eq!(load_ledger(&path), ledger);
+        std::fs::write(
+            &path,
+            r#"{"proven":null,"deferred_rev":12,"swap_error":null}"#,
+        )
+        .expect("old ledger");
+        assert_eq!(load_ledger(&path).deferred_rev, Some(12));
+        std::fs::write(
+            &path,
+            r#"{"proven":null,"deferred_rev":null,"swap_error":null,"extra":1}"#,
+        )
+        .expect("unknown key");
+        assert_eq!(load_ledger(&path), Ledger::default());
     }
 
     #[test]

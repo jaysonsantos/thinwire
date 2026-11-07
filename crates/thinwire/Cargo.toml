@@ -96,6 +96,8 @@ tar = "0.4"
 flate2 = { version = "1.1", default-features = false, features = [
   "rust_backend",
 ] }
+serde.workspace = true
+serde_json.workspace = true
 thinwire-core.workspace = true
 thinwire-notify.workspace = true
 thinwire-protocol.workspace = true
