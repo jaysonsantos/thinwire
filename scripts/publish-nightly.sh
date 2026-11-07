@@ -43,8 +43,8 @@ version="${workspace_version}.r${count}.g${sha:0:7}"
 
 # A run of an older commit never replaces a newer nightly.
 current=$(curl -fsSL "https://github.com/${repo}/releases/download/${TAG}/VERSION" 2>/dev/null || true)
-if [[ "$current" =~ \.r([0-9]+)\.g ]] && ((BASH_REMATCH[1] >= count)); then
-  echo "The nightly is ${current}, which is not older than ${version}. Nothing to publish."
+if [[ "$current" =~ \.r([0-9]+)\.g ]] && ((BASH_REMATCH[1] > count)); then
+  echo "The nightly is ${current}, which is newer than ${version}. Nothing to publish."
   exit 0
 fi
 
