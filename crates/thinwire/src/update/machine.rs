@@ -1663,6 +1663,69 @@ TeamIdentifier=89SP4VB8Y7
     }
 
     #[test]
+    fn a_staging_script_tar_extracts() {
+        let root = scratch("stage-tar");
+        let dist = root.join("dist");
+        let macos = dist.join("Thinwire.app/Contents/MacOS");
+        fs::create_dir_all(&macos).expect("macos");
+        fs::create_dir_all(dist.join("Thinwire.app/Contents/Resources")).expect("resources");
+        fs::write(macos.join("thinwire"), b"app").expect("app");
+        fs::write(macos.join("thinwire-whatsapp-helper"), b"wa").expect("wa");
+        fs::write(macos.join("thinwire-signal-helper"), b"sg").expect("sg");
+        let archive = root.join("thinwire-macos-arm64.tar.gz");
+        let packed = std::process::Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .args(["-czf"])
+            .arg(&archive)
+            .args(["-C"])
+            .arg(&dist)
+            .arg(".")
+            .status()
+            .expect("tar");
+        assert!(packed.success(), "tar failed");
+        let listed = std::process::Command::new("tar")
+            .args(["-tzf"])
+            .arg(&archive)
+            .output()
+            .expect("tar list");
+        let names = String::from_utf8(listed.stdout).expect("utf8");
+        assert_eq!(names.lines().next(), Some("./"), "{names}");
+        let dest = root.join("out");
+        let bundle = extract_archive(&archive, &dest).expect("bundle");
+        let extracted = bundle.join("Contents/MacOS");
+        assert_eq!(fs::read(extracted.join("thinwire")).expect("app bytes"), b"app");
+        assert!(extracted.join("thinwire-whatsapp-helper").is_file());
+        assert!(extracted.join("thinwire-signal-helper").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_dot_slash_file_outside_the_bundle_is_rejected() {
+        let root = scratch("dot-outside");
+        let dist = root.join("dist");
+        fs::create_dir_all(&dist).expect("dist");
+        fs::write(dist.join("notes.txt"), b"nope").expect("notes");
+        let archive = root.join("notes.tar.gz");
+        let packed = std::process::Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .args(["-czf"])
+            .arg(&archive)
+            .args(["-C"])
+            .arg(&dist)
+            .arg(".")
+            .status()
+            .expect("tar");
+        assert!(packed.success(), "tar failed");
+        let dest = root.join("out");
+        assert_eq!(
+            extract_archive(&archive, &dest).expect_err("outside"),
+            BAD_SIGNATURE
+        );
+        assert!(!dest.join("notes.txt").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_bundle_tar_keeps_both_helpers() {
         let root = scratch("helpers");
         let archive = root.join("app.tar.gz");
@@ -1685,6 +1748,28 @@ TeamIdentifier=89SP4VB8Y7
         assert!(macos.join("thinwire-signal-helper").is_file());
         assert_eq!(fs::read(macos.join("thinwire")).expect("app bytes"), b"app");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn xml_escape_keeps_literal_entities() {
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/publish-nightly.sh");
+        let program = r#"
+shopt -s patsub_replacement
+fn=$(sed -n '/^xml_escape()/,/^}/p' "$1")
+eval "$fn"
+xml_escape 'x < 2 & y'
+"#;
+        let escaped = std::process::Command::new("bash")
+            .args(["-c", program, "bash"])
+            .arg(&script)
+            .output()
+            .expect("bash");
+        assert!(escaped.status.success(), "xml_escape failed");
+        assert_eq!(
+            String::from_utf8(escaped.stdout).expect("utf8"),
+            "x &lt; 2 &amp; y"
+        );
     }
 
     #[test]
