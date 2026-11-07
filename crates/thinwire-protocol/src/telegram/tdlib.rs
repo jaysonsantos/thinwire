@@ -3703,22 +3703,11 @@ fn generate_db_key() -> String {
 /// persists, each process uses its own private throwaway folder
 /// (see [`data_dir::this_process_session_dir`]).
 fn tdlib_data_dir(persists: bool, folder_name: &str) -> std::io::Result<PathBuf> {
-    Ok(if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
-        PathBuf::from(dir)
-    } else if !persists {
-        data_dir::this_process_session_dir()?
+    if persists || std::env::var_os("THINWIRE_TDLIB_DIR").is_some() {
+        Ok(data_dir::persistent_dir(folder_name))
     } else {
-        let mut base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|home| PathBuf::from(home).join(".local").join("share"))
-            })
-            .unwrap_or_else(std::env::temp_dir);
-        base.push("thinwire");
-        base.push(folder_name);
-        base
-    })
+        data_dir::this_process_session_dir()
+    }
 }
 
 /// Create the folder, readable by this user only.

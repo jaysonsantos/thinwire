@@ -131,6 +131,9 @@ struct Inner {
     flush_in_flight: bool,
     phase: AttachPhase,
     os_backend: Option<OsBackend>,
+    /// The attach worker found a TDLib database in the folder of this
+    /// account. The start resume uses it when the session marker is gone.
+    tdlib_database: bool,
     discord_hydrate: DiscordHydrate,
     slack_hydrate: SlackHydrate,
     /// Demo store (#120): report `Saved`, so the demo screens show no
@@ -171,6 +174,7 @@ impl SecretStore {
                 flush_in_flight: false,
                 phase,
                 os_backend: None,
+                tdlib_database: false,
                 discord_hydrate: if phase == AttachPhase::MemoryOnly {
                     DiscordHydrate::Settled { notify: false }
                 } else {
@@ -280,6 +284,14 @@ impl SecretStore {
     #[must_use]
     pub fn attach_settled(&self) -> bool {
         matches!(self.phase(), AttachPhase::Ready | AttachPhase::MemoryOnly)
+    }
+
+    /// UI thread: the folder of this account held a TDLib database when the
+    /// OS keychain attached. The worker checked the disk, so this reads
+    /// memory only.
+    #[must_use]
+    pub fn tdlib_database_found(&self) -> bool {
+        self.lock().is_ok_and(|inner| inner.tdlib_database)
     }
 
     /// UI thread: the keychain opened, but a read failed. The UI offers Try
@@ -491,6 +503,14 @@ impl SecretStore {
         };
         match probed {
             Ok(backend) => {
+                // Before Ready: a reader that sees Ready also sees this.
+                let found = thinwire_protocol::telegram_database_exists(&tdlib_folder(
+                    Some(backend),
+                    self.scope,
+                ));
+                if let Ok(mut inner) = self.lock() {
+                    inner.tdlib_database = found;
+                }
                 self.store_probed_secrets(
                     backend,
                     read_os_snapshot(self.scope),
@@ -938,19 +958,22 @@ impl TelegramSecretVault for SecretStore {
     }
 
     fn tdlib_folder_name(&self) -> std::borrow::Cow<'static, str> {
-        let keyutils = self
-            .lock()
-            .is_ok_and(|inner| inner.os_backend == Some(OsBackend::KernelKeyring));
-        let base = if keyutils {
-            TDLIB_KEYUTILS_FOLDER
-        } else {
-            TDLIB_FOLDER
-        };
-        if self.scope == 0 {
-            base.into()
-        } else {
-            format!("{base}-{}", self.scope).into()
-        }
+        let backend = self.lock().ok().and_then(|inner| inner.os_backend);
+        tdlib_folder(backend, self.scope)
+    }
+}
+
+/// The TDLib folder name of account `scope` with keychain `backend`.
+fn tdlib_folder(backend: Option<OsBackend>, scope: u8) -> std::borrow::Cow<'static, str> {
+    let base = if backend == Some(OsBackend::KernelKeyring) {
+        TDLIB_KEYUTILS_FOLDER
+    } else {
+        TDLIB_FOLDER
+    };
+    if scope == 0 {
+        base.into()
+    } else {
+        format!("{base}-{scope}").into()
     }
 }
 
@@ -1301,6 +1324,12 @@ impl SecretStore {
             .map(|(key, value)| (*key, (*value).to_string()))
             .collect();
         let _ = self.finish_ready(values, None);
+    }
+
+    pub fn set_tdlib_database_for_test(&self, found: bool) {
+        if let Ok(mut inner) = self.lock() {
+            inner.tdlib_database = found;
+        }
     }
 
     pub fn set_backend_for_test(&self, backend: OsBackend) {

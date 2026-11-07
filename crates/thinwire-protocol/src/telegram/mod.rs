@@ -29,6 +29,7 @@ use engine::TelegramAuthEngine;
 pub use credentials::{
     TelegramApiOrigin, TelegramApiSource, resolve_telegram_api, telegram_api_available,
 };
+pub use data_dir::has_database as telegram_database_exists;
 pub use inbox::parse_telegram_chat_id;
 
 #[cfg(test)]
@@ -1561,8 +1562,13 @@ mod tests {
             params.contains("tdlib_data_dir(secrets.persists(), &secrets.tdlib_folder_name())")
         );
         let dir = fn_body(src, "fn tdlib_data_dir");
-        assert!(dir.contains("base.push(folder_name)"));
-        assert!(!dir.contains("base.push(\"tdlib\")"));
+        assert!(dir.contains("data_dir::persistent_dir(folder_name)"));
+        // The resume check reads the same folder as the worker.
+        let shared = fn_body(include_str!("data_dir.rs"), "fn persistent_dir");
+        assert!(shared.contains("base.push(folder_name)"));
+        assert!(!shared.contains("base.push(\"tdlib\")"));
+        let check = fn_body(include_str!("data_dir.rs"), "fn has_database");
+        assert!(check.contains("persistent_dir(folder_name)"));
         assert_eq!(
             TelegramSecretVault::tdlib_folder_name(&MemorySecretVault::new()),
             crate::secrets::TDLIB_FOLDER

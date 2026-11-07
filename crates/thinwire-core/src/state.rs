@@ -265,6 +265,12 @@ pub fn auth_user_error(reason: Option<TelegramAuthError>) -> UserError {
 /// Copy on the phone step after the old Telegram data folder was moved aside.
 /// Names the folder once; old folders are kept, never deleted.
 #[must_use]
+/// The keychain lost the session marker, but TDLib can still hold the
+/// session: the TDLib folder has a database and the keychain has its key.
+fn unmarked_database(store: &SecretStore) -> bool {
+    store.tdlib_database_found() && store.get(SecretKey::DbEncryption).ok().flatten().is_some()
+}
+
 pub fn data_reset_notice(moved_to: &str) -> String {
     format!(
         "Telegram data on this device could not be opened. It was moved to \"{moved_to}\" in the thinwire data folder and kept. Sign in again."
@@ -324,6 +330,9 @@ fn older_wait(tries: u32) -> Duration {
 
 /// Center panel copy while a saved session reconnects.
 pub const RESUME_CONNECTING: &str = "Connecting to Telegram…";
+
+/// Status line before any sign-in.
+const SIGN_IN_PROMPT: &str = "Sign in with Telegram to get started.";
 
 /// Longest text of the phone field that a pairing start takes. A phone
 /// number has 15 digits at most (E.164). This bound leaves room for "+",
@@ -639,6 +648,9 @@ pub struct Snapshot {
     pub code_via: Option<TelegramCodeVia>,
     pub telegram_authorized: bool,
     resume: Resume,
+    /// The resume has no session marker: only a TDLib database and its key.
+    /// A login step from TDLib then closes the client with no screen.
+    resume_unmarked: bool,
     /// When the UI first saw the keychain read still running.
     keychain_wait_started: Option<Instant>,
     /// The last keychain read failed. Copied from the store each frame.
@@ -1015,7 +1027,7 @@ impl Snapshot {
             telegram_code: String::new(),
             telegram_2fa: String::new(),
             error: None,
-            status_text: "Sign in with Telegram to get started.".into(),
+            status_text: SIGN_IN_PROMPT.into(),
             ready_status: None,
             failure_status: None,
             telegram_send_unconfirmed: Vec::new(),
@@ -1028,6 +1040,7 @@ impl Snapshot {
             code_via: None,
             telegram_authorized: false,
             resume: Resume::Waiting,
+            resume_unmarked: false,
             keychain_wait_started: None,
             keychain_failed: false,
             keychain_retry: false,
@@ -1978,7 +1991,7 @@ impl Snapshot {
             return;
         }
         let saved = store.get(SecretKey::Session).ok().flatten().is_some();
-        if !saved || !self.has_api_credentials(store) {
+        if !(saved || unmarked_database(store)) || !self.has_api_credentials(store) {
             return;
         }
         self.pending.push(
@@ -2162,8 +2175,9 @@ impl Snapshot {
             return;
         }
         let saved_session = store.get(SecretKey::Session).ok().flatten().is_some();
+        let unmarked = !saved_session && unmarked_database(store);
         if !live
-            || !saved_session
+            || !(saved_session || unmarked)
             || self.auth != AuthScreen::Idle
             || self.telegram_authorized
             || !self.has_api_credentials(store)
@@ -2172,6 +2186,7 @@ impl Snapshot {
             return;
         }
         self.resume = Resume::Connecting;
+        self.resume_unmarked = unmarked;
         self.queue_telegram_step(TelegramAuthStep::ApiCredentials);
         self.status_text = RESUME_CONNECTING.into();
     }
@@ -4611,11 +4626,28 @@ impl Snapshot {
             self.auth_rejection = None;
         }
         let resuming = std::mem::replace(&mut self.resume, Resume::Settled) == Resume::Connecting;
+        let unmarked = std::mem::take(&mut self.resume_unmarked) && resuming;
         self.auth_notice = None;
         if phase == TelegramAuthPhase::NeedPhone {
             // TDLib is back at the phone step: an old code or password is stale.
             self.telegram_code.clear();
             self.telegram_2fa.clear();
+        }
+        let login_step = matches!(
+            phase,
+            TelegramAuthPhase::NeedPhone
+                | TelegramAuthPhase::NeedCode
+                | TelegramAuthPhase::NeedTwoFactor
+        );
+        if unmarked && self.data_reset.is_none() && login_step {
+            // The database holds no session, only a login that did not end.
+            // Close it with no screen and no "session ended" notice: the
+            // user did not start a login now.
+            self.status_text = SIGN_IN_PROMPT.into();
+            self.push(AdapterCommand::Disconnect {
+                protocol: self.telegram_login_account,
+            });
+            return;
         }
         match phase {
             TelegramAuthPhase::NeedPhone if self.data_reset.is_some() => {
@@ -8800,6 +8832,98 @@ mod tests {
         snapshot.telegram_phone = "+15551234567".into();
         submit_and_apply(&mut snapshot, &store, TelegramAuthPhase::NeedCode);
         assert_eq!(snapshot.auth_notice, None);
+    }
+
+    /// The keychain lost the session marker, but the TDLib database and its
+    /// key are there. The app resumes with no click.
+    fn unmarked_store() -> SecretStore {
+        let store = SecretStore::memory();
+        seed_override(&store);
+        store
+            .set(SecretKey::DbEncryption, "db-key")
+            .expect("database key");
+        store.set_tdlib_database_for_test(true);
+        store
+    }
+
+    #[test]
+    fn a_tdlib_database_without_the_marker_resumes() {
+        let store = unmarked_store();
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&store, true);
+        assert_eq!(
+            snapshot.center_view(),
+            CenterView::Resuming { connecting: true }
+        );
+        assert_eq!(resume_commands(&mut snapshot), 1);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::Ready,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::Idle);
+        assert_eq!(snapshot.auth_notice, None);
+    }
+
+    #[test]
+    fn a_database_without_its_key_or_a_key_without_a_database_does_not_resume() {
+        let no_key = SecretStore::memory();
+        seed_override(&no_key);
+        no_key.set_tdlib_database_for_test(true);
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&no_key, true);
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+        assert_eq!(resume_commands(&mut snapshot), 0);
+
+        let no_database = unmarked_store();
+        no_database.set_tdlib_database_for_test(false);
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&no_database, true);
+        assert_eq!(snapshot.center_view(), CenterView::FirstRun);
+        assert_eq!(resume_commands(&mut snapshot), 0);
+    }
+
+    /// A database with no session (a login that did not end) closes with no
+    /// screen, no "session ended" notice, and keeps the mutes.
+    #[test]
+    fn an_unfinished_login_in_the_database_closes_with_no_screen() {
+        for phase in [
+            TelegramAuthPhase::NeedPhone,
+            TelegramAuthPhase::NeedCode,
+            TelegramAuthPhase::NeedTwoFactor,
+        ] {
+            let store = unmarked_store();
+            let mut snapshot = Snapshot::new();
+            snapshot.try_resume(&store, true);
+            snapshot.take_commands();
+            snapshot.apply(AdapterEvent::TelegramAuth { phase });
+            assert_eq!(snapshot.auth, AuthScreen::Idle, "{phase:?}");
+            assert_eq!(snapshot.center_view(), CenterView::FirstRun, "{phase:?}");
+            assert_eq!(snapshot.auth_notice, None, "{phase:?}");
+            assert_eq!(snapshot.status_text, SIGN_IN_PROMPT, "{phase:?}");
+            assert!(snapshot.ended_accounts.is_empty(), "{phase:?}");
+            let commands = snapshot.take_commands();
+            assert!(
+                commands.iter().any(|command| matches!(
+                    command,
+                    AdapterCommand::Disconnect {
+                        protocol: ProtocolId::Telegram
+                    }
+                )),
+                "{phase:?}: {commands:?}"
+            );
+        }
+
+        // A marked session that ends still shows the phone step.
+        let store = unmarked_store();
+        store
+            .set(SecretKey::Session, "tdlib-ready")
+            .expect("marker");
+        let mut snapshot = Snapshot::new();
+        snapshot.try_resume(&store, true);
+        snapshot.apply(AdapterEvent::TelegramAuth {
+            phase: TelegramAuthPhase::NeedPhone,
+        });
+        assert_eq!(snapshot.auth, AuthScreen::TelegramPhone);
+        assert_eq!(snapshot.auth_notice.as_deref(), Some(SESSION_ENDED_NOTICE));
     }
 
     #[test]
@@ -19423,6 +19547,22 @@ mod account_flow_tests {
         seed_override(&empty);
         snapshot.resume_account(second, &empty);
         assert!(snapshot.take_commands().is_empty(), "no saved session");
+
+        // No marker, but the TDLib database of the account and its key.
+        let unmarked = SecretStore::memory_for_account(1);
+        seed_override(&unmarked);
+        unmarked
+            .set(SecretKey::DbEncryption, "db-key")
+            .expect("database key");
+        snapshot.resume_account(second, &unmarked);
+        assert!(snapshot.take_commands().is_empty(), "no database found");
+        unmarked.set_tdlib_database_for_test(true);
+        snapshot.resume_account(second, &unmarked);
+        assert_eq!(
+            snapshot.take_commands().len(),
+            usize::from(tdlib_compiled()),
+            "the database resumes the account"
+        );
     }
 }
 

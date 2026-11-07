@@ -19,6 +19,9 @@ const STALE_MARK: &str = "stale";
 /// Most tries to find a free stale name in one second.
 const STALE_NAME_TRIES: u32 = 100;
 
+/// The file that TDLib writes first in its database folder.
+const BINLOG_FILE: &str = "td.binlog";
+
 /// Name start of a throwaway session folder.
 const SESSION_PREFIX: &str = "thinwire-tdlib-session-";
 
@@ -107,6 +110,34 @@ fn verify_private(path: &Path) -> io::Result<()> {
 
 /// True when the folder exists and holds any entry.
 #[must_use]
+/// The TDLib folder of a keychain that persists. `THINWIRE_TDLIB_DIR` wins.
+/// Else it is `<user data folder>/thinwire/<folder_name>`.
+pub(super) fn persistent_dir(folder_name: &str) -> PathBuf {
+    if let Some(dir) = std::env::var_os("THINWIRE_TDLIB_DIR") {
+        return PathBuf::from(dir);
+    }
+    let mut base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.push("thinwire");
+    base.push(folder_name);
+    base
+}
+
+/// `true` when the TDLib folder `folder_name` holds a database. The caller
+/// does file I/O: call it off the UI thread.
+#[must_use]
+pub fn has_database(folder_name: &str) -> bool {
+    has_binlog(&persistent_dir(folder_name))
+}
+
+fn has_binlog(dir: &Path) -> bool {
+    dir.join(BINLOG_FILE).is_file()
+}
+
 pub(super) fn has_data(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
 }
@@ -195,6 +226,18 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("scratch root");
         root
+    }
+
+    #[test]
+    fn a_folder_with_a_binlog_holds_a_database() {
+        let root = scratch("binlog");
+        let dir = root.join("tdlib");
+        assert!(!has_binlog(&dir), "no folder");
+        std::fs::create_dir_all(dir.join("photos")).expect("folder");
+        assert!(!has_binlog(&dir), "media only is not a database");
+        std::fs::write(dir.join(BINLOG_FILE), b"log").expect("binlog");
+        assert!(has_binlog(&dir));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

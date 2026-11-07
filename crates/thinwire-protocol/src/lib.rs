@@ -91,7 +91,7 @@ pub use store_protect::{
 };
 pub use telegram::{
     TelegramAdapter, TelegramApiOrigin, TelegramApiSource, parse_telegram_chat_id,
-    resolve_telegram_api, telegram_api_available,
+    resolve_telegram_api, telegram_api_available, telegram_database_exists,
 };
 pub use whatsapp::{
     WHATSAPP_HELPER_PROGRAM, WHATSAPP_QR_EXHAUSTED, WhatsAppAdapter, WhatsAppPhoneVault,
