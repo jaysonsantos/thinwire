@@ -2032,6 +2032,26 @@ async fn run_linked(
                         // device removal.
                         match receive.on_item(item.is_none(), session.is_current(token)) {
                             StreamPoll::Continue => {
+                                if matches!(item, Some(Received::Contacts)) {
+                                    // The phone sends its contacts after a new
+                                    // link, and presage saved them. The chat
+                                    // list shows them now, not after a restart.
+                                    refresh_chat_list(
+                                        &manager,
+                                        session.as_ref(),
+                                        &events,
+                                        &mut rows,
+                                        &unread,
+                                        &mut known,
+                                        &mut group_titles,
+                                        &mut names,
+                                    )
+                                    .await;
+                                    thinwire_protocol::emit_chat_list_loaded(
+                                        &events,
+                                        ProtocolId::Signal,
+                                    );
+                                }
                                 if let Some(Received::Content(content)) = item {
                                     if let Ok(Thread::Group(key)) = Thread::try_from(content.as_ref())
                                     {
@@ -2156,14 +2176,17 @@ async fn run_linked(
                 }
             }
             Some(WorkerJob::Refresh) => {
-                match publish_chats(&manager, session.as_ref(), &events, &mut rows, &unread).await {
-                    Ok((next_known, next_titles)) => {
-                        known = next_known;
-                        group_titles = next_titles;
-                        names = contact_names(&manager).await;
-                    }
-                    Err(()) => fail(&events, SYNC_FAILED),
-                }
+                refresh_chat_list(
+                    &manager,
+                    session.as_ref(),
+                    &events,
+                    &mut rows,
+                    &unread,
+                    &mut known,
+                    &mut group_titles,
+                    &mut names,
+                )
+                .await;
                 if let Some(viewed) = session.viewed() {
                     start_photo_downloads(&manager, &session, token, &events, &viewed);
                 }
@@ -2294,6 +2317,29 @@ async fn contact_names(manager: &Manager<SqliteStore, Registered>) -> HashMap<St
         }
     }
     names
+}
+
+/// Publish the chat list from the store again. The Refresh job and a
+/// contacts sync from the phone use it.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_chat_list(
+    manager: &Manager<SqliteStore, Registered>,
+    session: &Session,
+    events: &EventTx,
+    rows: &mut HashMap<String, Conversation>,
+    unread: &HashMap<String, u32>,
+    known: &mut HashSet<String>,
+    group_titles: &mut HashMap<String, String>,
+    names: &mut HashMap<String, String>,
+) {
+    match publish_chats(manager, session, events, rows, unread).await {
+        Ok((next_known, next_titles)) => {
+            *known = next_known;
+            *group_titles = next_titles;
+            *names = contact_names(manager).await;
+        }
+        Err(()) => fail(events, SYNC_FAILED),
+    }
 }
 
 async fn publish_chats(
@@ -4431,6 +4477,30 @@ mod tests {
     use presage::libsignal_service::protocol::ServiceId;
 
     use super::*;
+
+    /// After a new link, the phone sends its contacts. The chat list shows
+    /// them at once, not at the next start.
+    #[test]
+    fn a_contacts_sync_refreshes_the_chat_list() {
+        let src = include_str!("live.rs");
+        let at = src
+            .find("matches!(item, Some(Received::Contacts))")
+            .expect("the receive loop reads the contacts sync");
+        let after = &src[at..];
+        let refresh = after.find("refresh_chat_list(").expect("refresh");
+        let loaded = after.find("emit_chat_list_loaded(").expect("list loaded");
+        let content = after
+            .find("Some(Received::Content(content))")
+            .expect("content");
+        assert!(refresh < loaded && loaded < content);
+        let job = &src[src
+            .find("Some(WorkerJob::Refresh) =>")
+            .expect("refresh job")..];
+        assert!(
+            job.find("refresh_chat_list(") < job.find("Some(WorkerJob::Viewed"),
+            "the refresh job uses the same code"
+        );
+    }
 
     fn envelope_at(sender: Uuid, body: &str, millis: i64) -> Content {
         Content::from_body(
