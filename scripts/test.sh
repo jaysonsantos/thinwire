@@ -11,3 +11,4 @@ scripts/check-release-tree.sh
 scripts/check-agpl-deps.sh
 scripts/check-local-only-features.sh
 scripts/check-unsafe.sh
+scripts/test-aur-nightly.sh
