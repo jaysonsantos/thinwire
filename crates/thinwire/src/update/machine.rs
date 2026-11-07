@@ -936,7 +936,9 @@ fn extract_members(archive: &Path, dest_dir: &Path) -> Result<(), PlainError> {
     for entry in entries {
         let mut entry = entry.map_err(|_| BAD_SIGNATURE)?;
         let path = entry.path().map_err(|_| BAD_SIGNATURE)?.into_owned();
-        let rel = safe_member(&path)?;
+        let Some(rel) = safe_member(&path)? else {
+            continue;
+        };
         let out = dest_dir.join(&rel);
         if !out.starts_with(dest_dir) {
             return Err(BAD_SIGNATURE);
@@ -980,7 +982,7 @@ fn extract_members(archive: &Path, dest_dir: &Path) -> Result<(), PlainError> {
     Ok(())
 }
 
-fn safe_member(name: &Path) -> Result<PathBuf, PlainError> {
+fn safe_member(name: &Path) -> Result<Option<PathBuf>, PlainError> {
     let mut out = PathBuf::new();
     for component in name.components() {
         match component {
@@ -989,8 +991,11 @@ fn safe_member(name: &Path) -> Result<PathBuf, PlainError> {
             _ => return Err(BAD_SIGNATURE),
         }
     }
+    if out.as_os_str().is_empty() {
+        return Ok(None);
+    }
     match out.components().next() {
-        Some(Component::Normal(part)) if part == "Thinwire.app" => Ok(out),
+        Some(Component::Normal(part)) if part == "Thinwire.app" => Ok(Some(out)),
         _ => Err(BAD_SIGNATURE),
     }
 }
@@ -1693,7 +1698,10 @@ TeamIdentifier=89SP4VB8Y7
         let dest = root.join("out");
         let bundle = extract_archive(&archive, &dest).expect("bundle");
         let extracted = bundle.join("Contents/MacOS");
-        assert_eq!(fs::read(extracted.join("thinwire")).expect("app bytes"), b"app");
+        assert_eq!(
+            fs::read(extracted.join("thinwire")).expect("app bytes"),
+            b"app"
+        );
         assert!(extracted.join("thinwire-whatsapp-helper").is_file());
         assert!(extracted.join("thinwire-signal-helper").is_file());
         let _ = fs::remove_dir_all(&root);
