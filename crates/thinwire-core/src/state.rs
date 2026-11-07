@@ -7510,13 +7510,11 @@ fn sort_conversations(list: &mut [Conversation]) {
 
 fn sort_messages(list: &mut [ChatMessage]) {
     // Send time first: some protocols (WhatsApp) use ids with no order.
-    // A Signal tie uses the store millisecond already in the id, because
-    // rows in one Unix second would otherwise keep the previous page first.
     // Numeric ids rank the rest when the time is unknown (zero).
-    list.sort_by_key(|row| (row.sent_at, message_order(row)));
+    list.sort_by_key(|row| (row.sent_at, rank_within_second(row)));
 }
 
-fn message_order(message: &ChatMessage) -> i64 {
+fn rank_within_second(message: &ChatMessage) -> i64 {
     if message.protocol.is(ProtocolKind::Signal)
         && let Some(millis) = thinwire_protocol::signal_store_millis(&message.id)
         && let Ok(rank) = i64::try_from(millis)
@@ -13790,8 +13788,6 @@ mod tests {
         );
     }
 
-    /// A retained Signal chat whose rows share one Unix second loads each
-    /// older page, then stops. Sending stays off.
     #[test]
     fn a_retained_signal_chat_loads_every_same_second_page() {
         use thinwire_protocol::signal_retained_chat_id;
@@ -13915,7 +13911,6 @@ mod tests {
         assert!(!snapshot.can_send(), "a retained chat cannot send");
     }
 
-    /// Telegram rows sent in one second stay in message id order.
     #[test]
     fn telegram_rows_in_one_second_keep_message_id_order() {
         let mut snapshot = Snapshot::new();

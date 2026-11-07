@@ -6629,8 +6629,6 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Three pages in one Unix second load until the store has no older row.
-    /// The read does not send, and it does not change the stored rows.
     #[tokio::test(flavor = "current_thread")]
     async fn a_retained_chat_loads_every_page_until_the_store_ends() {
         let dir = temp_session_dir("retained-every-page");
