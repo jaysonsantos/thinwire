@@ -173,6 +173,12 @@ const FEED_PREFIX: &str = "https://github.com/jaysonsantos/thinwire/releases/dow
 /// The feed hosts a redirect may land on. The `Location` target is not logged.
 const FEED_HOSTS: [&str; 2] = ["github.com", "release-assets.githubusercontent.com"];
 
+/// The live `r277` archive is 48,729,593 bytes.
+const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// The live unpacked executables are about 124 MiB.
+const MAX_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Identity of this binary. Callers only build it with [`Launch::compile_time`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct BuildStamp {
@@ -554,6 +560,661 @@ fn rename_file(from: &Path, to: &Path) -> Result<(), PlainError> {
 
 fn remove_file(path: &Path) -> Result<(), PlainError> {
     std::fs::remove_file(path).map_err(|_| swap_rolled_back())
+}
+
+fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for (left, right) in left.iter().zip(right.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Hash, unpack, and copy `.incoming`. The live names stay. A bad digest or
+/// a bad member deletes the staging directory and any `.incoming` just written.
+fn stage_verified(
+    bytes: &[u8],
+    expected: &[u8; 32],
+    journal_path: &Path,
+    journal: &Journal,
+) -> Result<(), PlainError> {
+    let install = &journal.install_dir;
+    let staging = &journal.staging_dir;
+    if bytes.len() as u64 > MAX_ARCHIVE_BYTES || !constant_time_eq(&sha256_bytes(bytes), expected) {
+        let _ = std::fs::remove_dir_all(staging);
+        clear_incoming(install);
+        return Err(bad_payload());
+    }
+    if let Err(error) = extract_archive(bytes, staging) {
+        clear_incoming(install);
+        return Err(error);
+    }
+    if let Err(error) = copy_incoming(staging, install) {
+        clear_incoming(install);
+        let _ = std::fs::remove_dir_all(staging);
+        let _ = std::fs::remove_file(journal_path);
+        return Err(error);
+    }
+    if let Err(error) = write_journal(journal_path, journal) {
+        clear_incoming(install);
+        let _ = std::fs::remove_dir_all(staging);
+        let _ = std::fs::remove_file(journal_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn extract_archive(bytes: &[u8], staging: &Path) -> Result<(), PlainError> {
+    if staging.exists() {
+        std::fs::remove_dir_all(staging).map_err(|_| bad_payload())?;
+    }
+    ensure_dir(staging).map_err(|_| bad_payload())?;
+    let extracted = unpack_archive(bytes, staging);
+    if extracted.is_err() {
+        let _ = std::fs::remove_dir_all(staging);
+    }
+    extracted
+}
+
+fn unpack_archive(bytes: &[u8], staging: &Path) -> Result<(), PlainError> {
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    let mut unpacked = 0u64;
+    let mut seen = [false; EXES.len()];
+    let entries = archive.entries().map_err(|_| bad_payload())?;
+    for entry in entries {
+        let mut entry = entry.map_err(|_| bad_payload())?;
+        let kind = entry.header().entry_type();
+        if kind.is_gnu_longname()
+            || kind.is_gnu_longlink()
+            || kind.is_pax_global_extensions()
+            || kind.is_pax_local_extensions()
+        {
+            continue;
+        }
+        if kind.is_symlink() || kind.is_hard_link() || kind.is_gnu_sparse() {
+            return Err(bad_payload());
+        }
+        let name = entry
+            .path()
+            .map_err(|_| bad_payload())?
+            .to_str()
+            .ok_or_else(bad_payload)?
+            .to_owned();
+        let Some(member) = normalize_member(&name)? else {
+            continue;
+        };
+        if kind.is_dir() {
+            let Member::Notices(relative) = member else {
+                return Err(bad_payload());
+            };
+            ensure_dir(&notices_path(staging, relative)).map_err(|_| bad_payload())?;
+            continue;
+        }
+        if !kind.is_file() {
+            return Err(bad_payload());
+        }
+        let size = entry.size();
+        if size == 0 && matches!(member, Member::Exe(_)) {
+            return Err(bad_payload());
+        }
+        unpacked = unpacked.saturating_add(size);
+        if unpacked > MAX_UNPACKED_BYTES {
+            return Err(bad_payload());
+        }
+        let dest = member_path(staging, member)?;
+        if dest.exists() {
+            return Err(bad_payload());
+        }
+        if let Some(parent) = dest.parent() {
+            ensure_dir(parent).map_err(|_| bad_payload())?;
+        }
+        let mut file = std::fs::File::create(&dest).map_err(|_| bad_payload())?;
+        let copied = std::io::copy(&mut entry, &mut file).map_err(|_| bad_payload())?;
+        if copied != size {
+            return Err(bad_payload());
+        }
+        if let Member::Exe(index) = member {
+            seen[index] = true;
+        }
+    }
+    if seen != [true, true, true] {
+        return Err(bad_payload());
+    }
+    Ok(())
+}
+
+fn member_path(staging: &Path, member: Member<'_>) -> Result<PathBuf, PlainError> {
+    let dest = match member {
+        Member::Exe(index) => staging.join(EXES[index]),
+        Member::License => staging.join("LICENSE"),
+        Member::Notices(relative) => notices_path(staging, relative),
+    };
+    if dest.starts_with(staging) {
+        Ok(dest)
+    } else {
+        Err(bad_payload())
+    }
+}
+
+fn notices_path(staging: &Path, relative: &str) -> PathBuf {
+    let root = staging.join("THIRD_PARTY_NOTICES");
+    if relative.is_empty() {
+        root
+    } else {
+        root.join(relative)
+    }
+}
+
+fn copy_incoming(staging: &Path, install: &Path) -> Result<(), PlainError> {
+    for name in EXES {
+        let src = staging.join(name);
+        let part = incoming_part(install, name);
+        let dest = incoming_path(install, name);
+        let _ = std::fs::remove_file(&part);
+        std::fs::copy(&src, &part).map_err(|_| bad_payload())?;
+        // The part name is not a slot. A crash while copying must not look Ready.
+        if dest.exists() {
+            let _ = std::fs::remove_file(&part);
+            return Err(bad_payload());
+        }
+        if std::fs::rename(&part, &dest).is_err() {
+            let _ = std::fs::remove_file(&part);
+            return Err(bad_payload());
+        }
+    }
+    Ok(())
+}
+
+fn incoming_part(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}.incoming.part"))
+}
+
+fn clear_incoming(install: &Path) {
+    for name in EXES {
+        let _ = std::fs::remove_file(incoming_path(install, name));
+        let _ = std::fs::remove_file(incoming_part(install, name));
+    }
+}
+
+/// Drive every executable to [`Slot::Committed`], reading the directory
+/// before each step. All [`Slot::Idle`] means nothing was staged.
+fn commit_all(install_dir: &Path) -> Result<(), PlainError> {
+    let slots: Vec<Slot> = EXES.iter().map(|name| observe(install_dir, name)).collect();
+    if slots.iter().all(|slot| *slot == Slot::Idle) {
+        return Ok(());
+    }
+    if slots
+        .iter()
+        .any(|slot| *slot == Slot::Idle || *slot == Slot::Broken)
+    {
+        let _ = retreat_all(install_dir);
+        return Err(swap_rolled_back());
+    }
+    for name in EXES {
+        if let Err(error) = finish_one(install_dir, name, Slot::Committed) {
+            let _ = retreat_all(install_dir);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Drive every executable to [`Slot::Idle`]. [`Slot::Broken`] stops the walk.
+fn retreat_all(install_dir: &Path) -> Result<(), PlainError> {
+    for name in EXES {
+        finish_one(install_dir, name, Slot::Idle)?;
+    }
+    Ok(())
+}
+
+fn finish_one(install_dir: &Path, name: &str, goal: Slot) -> Result<(), PlainError> {
+    for _ in 0..4 {
+        let slot = observe(install_dir, name);
+        if slot == goal {
+            return Ok(());
+        }
+        match (goal, slot) {
+            (Slot::Committed, Slot::Ready | Slot::Aside) => {
+                advance(install_dir, name)?;
+            }
+            (Slot::Idle, Slot::Ready | Slot::Aside | Slot::Committed) => {
+                retreat(install_dir, name)?;
+            }
+            _ => return Err(swap_rolled_back()),
+        }
+    }
+    Err(swap_rolled_back())
+}
+
+fn write_journal(path: &Path, journal: &Journal) -> Result<(), PlainError> {
+    let install = path_text(&journal.install_dir)?;
+    let staging = path_text(&journal.staging_dir)?;
+    let body = format!(
+        "{{\n  \"token\": {},\n  \"rev\": {},\n  \"sha7\": {},\n  \"install_dir\": {},\n  \"staging_dir\": {}\n}}\n",
+        json_string(&journal.target.token),
+        journal.target.rev,
+        json_string(journal.target.sha7.as_str()),
+        json_string(&install),
+        json_string(&staging),
+    );
+    replace_file(path, &body).map_err(|_| bad_payload())
+}
+
+fn read_journal(path: &Path) -> Result<Journal, PlainError> {
+    let text = std::fs::read_to_string(path).map_err(|_| bad_payload())?;
+    parse_journal(&text)
+}
+
+fn parse_journal(text: &str) -> Result<Journal, PlainError> {
+    let mut scan = Scan { text, at: 0 };
+    let mut token = None;
+    let mut rev = None;
+    let mut sha = None;
+    let mut install = None;
+    let mut staging = None;
+    scan.eat('{')?;
+    loop {
+        if scan.peek() == Some('}') {
+            scan.eat('}')?;
+            break;
+        }
+        let key = scan.string()?;
+        scan.eat(':')?;
+        match key.as_str() {
+            "token" => token = Some(scan.string()?),
+            "rev" => rev = Some(scan.u32()?),
+            "sha7" => sha = Some(scan.string()?),
+            "install_dir" => install = Some(scan.string()?),
+            "staging_dir" => staging = Some(scan.string()?),
+            _ => return Err(bad_payload()),
+        }
+        if scan.peek() == Some(',') {
+            scan.eat(',')?;
+            continue;
+        }
+        scan.eat('}')?;
+        break;
+    }
+    scan.finish()?;
+    let version = parse_version(&token.ok_or_else(bad_payload)?).map_err(|_| bad_payload())?;
+    if version.rev != rev.ok_or_else(bad_payload)?
+        || version.sha7.as_str() != sha.as_deref().unwrap_or("")
+    {
+        return Err(bad_payload());
+    }
+    let install_dir = PathBuf::from(install.ok_or_else(bad_payload)?);
+    let staging_dir = PathBuf::from(staging.ok_or_else(bad_payload)?);
+    if !install_dir.is_absolute() || !staging_dir.is_absolute() {
+        return Err(bad_payload());
+    }
+    Ok(Journal {
+        target: version,
+        install_dir,
+        staging_dir,
+    })
+}
+
+fn load_ledger(path: &Path) -> Ledger {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ledger::default();
+    };
+    parse_ledger(&text).unwrap_or_default()
+}
+
+fn store_ledger(path: &Path, ledger: &Ledger) -> Result<(), PlainError> {
+    let proven = match &ledger.proven {
+        Some(proven) => format!(
+            "{{\"sha7\": {}, \"rev\": {}}}",
+            json_string(proven.sha7.as_str()),
+            proven.rev
+        ),
+        None => "null".to_owned(),
+    };
+    let deferred = match ledger.deferred_rev {
+        Some(rev) => rev.to_string(),
+        None => "null".to_owned(),
+    };
+    let swap = match &ledger.swap_error {
+        Some(error) => format!(
+            "{{\"happened\": {}, \"why\": {}, \"next\": {}}}",
+            json_string(&error.happened),
+            json_string(&error.why),
+            json_string(&error.next)
+        ),
+        None => "null".to_owned(),
+    };
+    let body = format!(
+        "{{\n  \"proven\": {proven},\n  \"deferred_rev\": {deferred},\n  \"swap_error\": {swap}\n}}\n"
+    );
+    replace_file(path, &body).map_err(|_| bad_payload())
+}
+
+fn parse_ledger(text: &str) -> Result<Ledger, PlainError> {
+    let mut scan = Scan { text, at: 0 };
+    let mut proven = None;
+    let mut deferred = None;
+    let mut swap = None;
+    let mut seen_proven = false;
+    let mut seen_deferred = false;
+    let mut seen_swap = false;
+    scan.eat('{')?;
+    loop {
+        if scan.peek() == Some('}') {
+            scan.eat('}')?;
+            break;
+        }
+        let key = scan.string()?;
+        scan.eat(':')?;
+        match key.as_str() {
+            "proven" => {
+                proven = parse_proven(&mut scan)?;
+                seen_proven = true;
+            }
+            "deferred_rev" => {
+                deferred = parse_optional_u32(&mut scan)?;
+                seen_deferred = true;
+            }
+            "swap_error" => {
+                swap = parse_swap_error(&mut scan)?;
+                seen_swap = true;
+            }
+            _ => return Err(bad_payload()),
+        }
+        if scan.peek() == Some(',') {
+            scan.eat(',')?;
+            continue;
+        }
+        scan.eat('}')?;
+        break;
+    }
+    scan.finish()?;
+    if !seen_proven || !seen_deferred || !seen_swap {
+        return Err(bad_payload());
+    }
+    Ok(Ledger {
+        proven,
+        deferred_rev: deferred,
+        swap_error: swap,
+    })
+}
+
+fn parse_proven(scan: &mut Scan<'_>) -> Result<Option<Proven>, PlainError> {
+    if scan.peek() == Some('n') {
+        scan.null()?;
+        return Ok(None);
+    }
+    scan.eat('{')?;
+    let mut sha = None;
+    let mut rev = None;
+    loop {
+        if scan.peek() == Some('}') {
+            scan.eat('}')?;
+            break;
+        }
+        let key = scan.string()?;
+        scan.eat(':')?;
+        match key.as_str() {
+            "sha7" => sha = Some(scan.string()?),
+            "rev" => rev = Some(scan.u32()?),
+            _ => return Err(bad_payload()),
+        }
+        if scan.peek() == Some(',') {
+            scan.eat(',')?;
+            continue;
+        }
+        scan.eat('}')?;
+        break;
+    }
+    let sha7 = Sha7::parse(&sha.ok_or_else(bad_payload)?).ok_or_else(bad_payload)?;
+    Ok(Some(Proven {
+        sha7,
+        rev: rev.ok_or_else(bad_payload)?,
+    }))
+}
+
+fn parse_optional_u32(scan: &mut Scan<'_>) -> Result<Option<u32>, PlainError> {
+    if scan.peek() == Some('n') {
+        scan.null()?;
+        return Ok(None);
+    }
+    Ok(Some(scan.u32()?))
+}
+
+fn parse_swap_error(scan: &mut Scan<'_>) -> Result<Option<PlainError>, PlainError> {
+    if scan.peek() == Some('n') {
+        scan.null()?;
+        return Ok(None);
+    }
+    scan.eat('{')?;
+    let mut happened = None;
+    let mut why = None;
+    let mut next = None;
+    loop {
+        if scan.peek() == Some('}') {
+            scan.eat('}')?;
+            break;
+        }
+        let key = scan.string()?;
+        scan.eat(':')?;
+        match key.as_str() {
+            "happened" => happened = Some(scan.string()?),
+            "why" => why = Some(scan.string()?),
+            "next" => next = Some(scan.string()?),
+            _ => return Err(bad_payload()),
+        }
+        if scan.peek() == Some(',') {
+            scan.eat(',')?;
+            continue;
+        }
+        scan.eat('}')?;
+        break;
+    }
+    Ok(Some(PlainError {
+        happened: happened.ok_or_else(bad_payload)?,
+        why: why.ok_or_else(bad_payload)?,
+        next: next.ok_or_else(bad_payload)?,
+    }))
+}
+
+fn path_text(path: &Path) -> Result<String, PlainError> {
+    path.to_str()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(bad_payload)
+}
+
+fn json_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if other.is_control() => {
+                out.push_str(&format!("\\u{:04x}", u32::from(other)));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+struct Scan<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl Scan<'_> {
+    fn skip(&mut self) {
+        while self
+            .text
+            .get(self.at..)
+            .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_whitespace()))
+        {
+            self.at += 1;
+        }
+    }
+
+    fn peek(&mut self) -> Option<char> {
+        self.skip();
+        self.text[self.at..].chars().next()
+    }
+
+    fn eat(&mut self, expected: char) -> Result<(), PlainError> {
+        self.skip();
+        match self.text[self.at..].chars().next() {
+            Some(ch) if ch == expected => {
+                self.at += ch.len_utf8();
+                Ok(())
+            }
+            _ => Err(bad_payload()),
+        }
+    }
+
+    fn string(&mut self) -> Result<String, PlainError> {
+        self.eat('"')?;
+        let bytes = self.text.as_bytes();
+        let mut out = String::new();
+        loop {
+            if self.at >= bytes.len() {
+                return Err(bad_payload());
+            }
+            match bytes[self.at] {
+                b'"' => {
+                    self.at += 1;
+                    return Ok(out);
+                }
+                b'\\' => {
+                    self.at += 1;
+                    let esc = *bytes.get(self.at).ok_or_else(bad_payload)?;
+                    self.at += 1;
+                    match esc {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let hex = bytes.get(self.at..self.at + 4).ok_or_else(bad_payload)?;
+                            let hex = std::str::from_utf8(hex).map_err(|_| bad_payload())?;
+                            let code = u32::from_str_radix(hex, 16).map_err(|_| bad_payload())?;
+                            out.push(char::from_u32(code).ok_or_else(bad_payload)?);
+                            self.at += 4;
+                        }
+                        _ => return Err(bad_payload()),
+                    }
+                }
+                byte if byte < 0x20 => return Err(bad_payload()),
+                _ => {
+                    let ch = self.text[self.at..]
+                        .chars()
+                        .next()
+                        .ok_or_else(bad_payload)?;
+                    out.push(ch);
+                    self.at += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn u32(&mut self) -> Result<u32, PlainError> {
+        self.skip();
+        let start = self.at;
+        while self
+            .text
+            .get(self.at..)
+            .is_some_and(|rest| rest.starts_with(|ch: char| ch.is_ascii_digit()))
+        {
+            self.at += 1;
+        }
+        if start == self.at {
+            return Err(bad_payload());
+        }
+        self.text[start..self.at].parse().map_err(|_| bad_payload())
+    }
+
+    fn null(&mut self) -> Result<(), PlainError> {
+        self.skip();
+        if self.text[self.at..].starts_with("null") {
+            self.at += 4;
+            Ok(())
+        } else {
+            Err(bad_payload())
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), PlainError> {
+        self.skip();
+        if self.at == self.text.len() {
+            Ok(())
+        } else {
+            Err(bad_payload())
+        }
+    }
+}
+
+fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the file has no directory",
+        )
+    })?;
+    ensure_dir(parent)?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("update"),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&temp);
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+    }
+    // Windows rename does not replace an existing file. The temp file is
+    // already durable, so removing the previous record and renaming is the
+    // crash window, and a missing record is read as empty.
+    if std::fs::rename(&temp, path).is_err() {
+        let _ = std::fs::remove_file(path);
+        if let Err(error) = std::fs::rename(&temp, path) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1101,5 +1762,341 @@ mod tests {
             }),
             Snapshot::Failed(error)
         );
+    }
+
+    struct Layout {
+        _scratch: Scratch,
+        install: PathBuf,
+        staging: PathBuf,
+        journal: PathBuf,
+    }
+
+    impl Layout {
+        fn new(name: &str) -> Self {
+            let scratch = Scratch::new(name);
+            let install = scratch.0.join("install");
+            let staging = scratch.0.join("staging");
+            let journal = scratch.0.join("update").join("journal.json");
+            std::fs::create_dir_all(&install).expect("install");
+            for exe in EXES {
+                std::fs::write(install.join(exe), format!("old-{exe}")).expect("live");
+            }
+            Self {
+                _scratch: scratch,
+                install,
+                staging,
+                journal,
+            }
+        }
+
+        fn record(&self) -> Journal {
+            Journal {
+                target: version(),
+                install_dir: self.install.clone(),
+                staging_dir: self.staging.clone(),
+            }
+        }
+
+        fn scratch_has(&self, name: &str) -> bool {
+            self._scratch.0.join(name).exists()
+        }
+    }
+
+    fn good_archive() -> (Vec<u8>, [u8; 32]) {
+        let mut raw = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut raw);
+            for exe in EXES {
+                let bytes = format!("new-{exe}");
+                let mut header = tar::Header::new_gnu();
+                header.set_mode(0o755);
+                header.set_size(bytes.len() as u64);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("./{exe}"), bytes.as_bytes())
+                    .expect("member");
+            }
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(4);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "./LICENSE", &b"mit\n"[..])
+                .expect("license");
+            let mut dir = tar::Header::new_gnu();
+            dir.set_entry_type(tar::EntryType::Directory);
+            dir.set_size(0);
+            dir.set_mode(0o755);
+            dir.set_cksum();
+            builder
+                .append_data(&mut dir, "./THIRD_PARTY_NOTICES", std::io::empty())
+                .expect("notices dir");
+            let mut notice = tar::Header::new_gnu();
+            notice.set_mode(0o644);
+            notice.set_size(3);
+            notice.set_cksum();
+            builder
+                .append_data(&mut notice, "./THIRD_PARTY_NOTICES/note.txt", &b"ok\n"[..])
+                .expect("notice");
+            builder.finish().expect("tar");
+        }
+        let mut gz = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::fast());
+            enc.write_all(&raw).expect("gzip");
+            enc.finish().expect("gzip end");
+        }
+        let digest = sha256_bytes(&gz);
+        (gz, digest)
+    }
+
+    fn ustar_header(name: &str, size: u64) -> [u8; 512] {
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000755\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        let size_field = format!("{size:011o}\0");
+        header[124..136].copy_from_slice(size_field.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        for byte in &mut header[148..156] {
+            *byte = b' ';
+        }
+        let sum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let checksum = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+        header
+    }
+
+    #[test]
+    fn a_wrong_digest_does_not_leave_incoming() {
+        let layout = Layout::new("digest");
+        let (bytes, digest) = good_archive();
+        let mut wrong = digest;
+        wrong[31] ^= 0xff;
+        assert_eq!(wrong[..31], digest[..31], "only the last byte differs");
+        let error = stage_verified(&bytes, &wrong, &layout.journal, &layout.record()).unwrap_err();
+        assert_eq!(error, payload_text());
+        for exe in EXES {
+            assert_eq!(
+                std::fs::read(layout.install.join(exe)).expect("live"),
+                format!("old-{exe}").into_bytes()
+            );
+            assert!(!incoming_path(&layout.install, exe).exists());
+            assert!(!incoming_part(&layout.install, exe).exists());
+        }
+        assert!(!layout.staging.exists());
+        assert!(!layout.journal.exists());
+    }
+
+    #[test]
+    fn a_hostile_member_does_not_replace_the_installed_exes() {
+        let layout = Layout::new("hostile");
+        let body = b"pwn\n";
+        let mut raw = ustar_header("../thinwire.exe", body.len() as u64).to_vec();
+        raw.extend_from_slice(body);
+        raw.extend(std::iter::repeat_n(0u8, 512 - body.len()));
+        let mut bytes = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(&mut bytes, flate2::Compression::fast());
+            enc.write_all(&raw).expect("gzip");
+            enc.finish().expect("gzip end");
+        }
+        let digest = sha256_bytes(&bytes);
+        assert_eq!(
+            stage_verified(&bytes, &digest, &layout.journal, &layout.record()).unwrap_err(),
+            payload_text()
+        );
+        assert_eq!(
+            std::fs::read(layout.install.join("thinwire.exe")).expect("live"),
+            b"old-thinwire.exe"
+        );
+        assert!(!layout.scratch_has("thinwire.exe"));
+        assert!(!incoming_path(&layout.install, "thinwire.exe").exists());
+        assert!(!layout.staging.exists());
+    }
+
+    #[test]
+    fn a_verified_archive_stages_incoming_and_the_journal_without_touching_live_exes() {
+        let layout = Layout::new("stage");
+        let (bytes, digest) = good_archive();
+        stage_verified(&bytes, &digest, &layout.journal, &layout.record()).expect("stage");
+        for exe in EXES {
+            assert_eq!(
+                std::fs::read(layout.install.join(exe)).expect("live"),
+                format!("old-{exe}").into_bytes()
+            );
+            assert_eq!(
+                std::fs::read(incoming_path(&layout.install, exe)).expect("incoming"),
+                format!("new-{exe}").into_bytes()
+            );
+        }
+        assert_eq!(
+            std::fs::read(layout.staging.join("LICENSE")).expect("license"),
+            b"mit\n"
+        );
+        assert_eq!(
+            std::fs::read(layout.staging.join("THIRD_PARTY_NOTICES").join("note.txt"))
+                .expect("note"),
+            b"ok\n"
+        );
+        let journal = read_journal(&layout.journal).expect("journal");
+        assert_eq!(journal.target.token, TOKEN);
+        assert_eq!(journal.install_dir, layout.install);
+        assert_eq!(journal.staging_dir, layout.staging);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(layout.journal.parent().expect("dir"))
+                .expect("dir")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "the update directory is private: {mode:o}");
+        }
+    }
+
+    #[test]
+    fn commit_swaps_the_bytes_and_retreat_puts_them_back() {
+        let layout = Layout::new("commit");
+        let (bytes, digest) = good_archive();
+        stage_verified(&bytes, &digest, &layout.journal, &layout.record()).expect("stage");
+        commit_all(&layout.install).expect("commit");
+        for exe in EXES {
+            assert_eq!(observe(&layout.install, exe), Slot::Committed);
+            assert_eq!(
+                std::fs::read(layout.install.join(exe)).expect("live"),
+                format!("new-{exe}").into_bytes()
+            );
+            assert_eq!(
+                std::fs::read(old_path(&layout.install, exe)).expect("old"),
+                format!("old-{exe}").into_bytes()
+            );
+            assert!(!incoming_path(&layout.install, exe).exists());
+        }
+        retreat_all(&layout.install).expect("retreat");
+        for exe in EXES {
+            assert_eq!(observe(&layout.install, exe), Slot::Idle);
+            assert_eq!(
+                std::fs::read(layout.install.join(exe)).expect("restored"),
+                format!("old-{exe}").into_bytes()
+            );
+            assert!(!incoming_path(&layout.install, exe).exists());
+            assert!(!old_path(&layout.install, exe).exists());
+        }
+    }
+
+    #[test]
+    fn a_failed_incoming_copy_leaves_the_live_exes() {
+        let layout = Layout::new("copy");
+        std::fs::create_dir(incoming_path(&layout.install, EXES[2])).expect("block");
+        let (bytes, digest) = good_archive();
+        assert_eq!(
+            stage_verified(&bytes, &digest, &layout.journal, &layout.record()).unwrap_err(),
+            payload_text()
+        );
+        for exe in EXES {
+            assert_eq!(
+                std::fs::read(layout.install.join(exe)).expect("live"),
+                format!("old-{exe}").into_bytes()
+            );
+        }
+        assert!(!incoming_path(&layout.install, EXES[0]).exists());
+        assert!(!incoming_path(&layout.install, EXES[1]).exists());
+        assert!(!layout.journal.exists());
+        assert!(!layout.staging.exists());
+    }
+
+    #[test]
+    fn an_unpacked_member_over_the_cap_is_refused() {
+        let layout = Layout::new("cap");
+        let header = ustar_header("./thinwire.exe", MAX_UNPACKED_BYTES + 1);
+        let mut raw = header.to_vec();
+        raw.extend_from_slice(&[0u8; 512]);
+        let mut bytes = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(&mut bytes, flate2::Compression::fast());
+            enc.write_all(&raw).expect("gzip");
+            enc.finish().expect("gzip end");
+        }
+        assert!(
+            bytes.len() < 1024,
+            "the cap test does not send a giant file"
+        );
+        let digest = sha256_bytes(&bytes);
+        assert_eq!(
+            stage_verified(&bytes, &digest, &layout.journal, &layout.record()).unwrap_err(),
+            payload_text()
+        );
+        assert_eq!(
+            std::fs::read(layout.install.join("thinwire.exe")).expect("live"),
+            b"old-thinwire.exe"
+        );
+        assert!(!layout.staging.exists());
+        assert!(!incoming_path(&layout.install, "thinwire.exe").exists());
+    }
+
+    #[test]
+    fn the_journal_keeps_a_backslash_and_a_quote_in_the_path() {
+        let layout = Layout::new("json");
+        let journal = Journal {
+            target: version(),
+            install_dir: layout.install.join("quote\"and\\slash"),
+            staging_dir: layout.staging.clone(),
+        };
+        std::fs::create_dir_all(&journal.install_dir).expect("dir");
+        write_journal(&layout.journal, &journal).expect("write");
+        assert_eq!(read_journal(&layout.journal).expect("read"), journal);
+        assert!(
+            std::fs::read_to_string(&layout.journal)
+                .expect("text")
+                .contains("quote\\\"and\\\\slash")
+        );
+    }
+
+    #[test]
+    fn a_corrupt_ledger_is_empty_and_a_good_one_roundtrips() {
+        let scratch = Scratch::new("ledger");
+        let path = scratch.0.join("ledger.json");
+        assert_eq!(load_ledger(&path), Ledger::default());
+        std::fs::write(&path, b"{not json").expect("corrupt");
+        assert_eq!(load_ledger(&path), Ledger::default());
+        let ledger = Ledger {
+            proven: Some(Proven {
+                sha7: Sha7::parse("0c07a9c").expect("sha"),
+                rev: 277,
+            }),
+            deferred_rev: Some(12),
+            swap_error: Some(swap_text()),
+        };
+        store_ledger(&path, &ledger).expect("store");
+        assert_eq!(load_ledger(&path), ledger);
+    }
+
+    #[test]
+    fn commit_of_an_idle_folder_does_nothing_and_a_broken_slot_rolls_back() {
+        let layout = Layout::new("idle");
+        commit_all(&layout.install).expect("nothing staged");
+        for exe in EXES {
+            assert_eq!(
+                std::fs::read(layout.install.join(exe)).expect("live"),
+                format!("old-{exe}").into_bytes()
+            );
+        }
+        std::fs::write(incoming_path(&layout.install, EXES[0]), b"new").expect("incoming");
+        std::fs::write(old_path(&layout.install, EXES[0]), b"older").expect("old");
+        assert_eq!(observe(&layout.install, EXES[0]), Slot::Broken);
+        assert_eq!(commit_all(&layout.install).unwrap_err(), swap_text());
+        assert_eq!(
+            std::fs::read(layout.install.join(EXES[0])).expect("live"),
+            b"old-thinwire.exe"
+        );
+        assert!(incoming_path(&layout.install, EXES[0]).is_file());
+        assert!(old_path(&layout.install, EXES[0]).is_file());
     }
 }

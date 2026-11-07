@@ -88,6 +88,14 @@ url = "2"
 arboard = "3.6"
 # The cache folder for pasted images.
 dirs.workspace = true
+# SHA-256 of a nightly archive, and the tar a Windows build unpacks.
+# `rust_backend` keeps flate2 on the Rust inflater. Linux tests hash and
+# extract with no C zlib and no network.
+sha2 = "0.11"
+tar = "0.4"
+flate2 = { version = "1.1", default-features = false, features = [
+  "rust_backend",
+] }
 thinwire-core.workspace = true
 thinwire-notify.workspace = true
 thinwire-protocol.workspace = true
