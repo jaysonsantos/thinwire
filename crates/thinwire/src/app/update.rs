@@ -1379,7 +1379,8 @@ fn worker(
     let mut ledger = load_ledger(&ledger_file);
     settle_startup(&stamp, &phase, &shutdown, &wake, &mut ledger, &ledger_file);
     while let Ok(command) = commands.recv() {
-        match apply_command(&lock_phase(&phase).clone(), command, &mut ledger) {
+        let current = lock_phase(&phase).clone();
+        match apply_command(&current, command, &mut ledger) {
             Step::Stay => {}
             Step::Quiet => {
                 let _ = store_ledger(&ledger_file, &ledger);
