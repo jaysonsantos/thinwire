@@ -1155,12 +1155,9 @@ fn replace_file_with(
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
     }
-    if rename(&temp, path).is_err() {
-        let _ = std::fs::remove_file(path);
-        if let Err(error) = rename(&temp, path) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(error);
-        }
+    if let Err(error) = rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
     }
     Ok(())
 }
