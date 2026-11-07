@@ -1123,6 +1123,14 @@ impl Scan<'_> {
 }
 
 fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
+    replace_file_with(path, text, |from, to| std::fs::rename(from, to))
+}
+
+fn replace_file_with(
+    path: &Path,
+    text: &str,
+    rename: fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1147,9 +1155,9 @@ fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
     }
-    if std::fs::rename(&temp, path).is_err() {
+    if rename(&temp, path).is_err() {
         let _ = std::fs::remove_file(path);
-        if let Err(error) = std::fs::rename(&temp, path) {
+        if let Err(error) = rename(&temp, path) {
             let _ = std::fs::remove_file(&temp);
             return Err(error);
         }
@@ -3153,6 +3161,38 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn replace_file_replaces_the_previous_text() {
+        let scratch = Scratch::new("replace-ok");
+        let path = scratch.0.join("ledger.json");
+        std::fs::write(&path, b"previous").expect("old");
+        replace_file(&path, "next").expect("replace");
+        assert_eq!(std::fs::read(&path).expect("new"), b"next");
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&scratch.0).expect("dir") {
+            names.push(entry.expect("entry").file_name());
+        }
+        assert_eq!(names, [std::ffi::OsString::from("ledger.json")]);
+    }
+
+    #[test]
+    fn a_failed_replace_keeps_the_previous_file() {
+        let scratch = Scratch::new("replace-fail");
+        let path = scratch.0.join("ledger.json");
+        std::fs::write(&path, b"previous").expect("old");
+        let error = replace_file_with(&path, "next", |_temp, _dest| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "busy",
+            ))
+        });
+        assert!(error.is_err(), "a failed swap returns the error");
+        assert_eq!(
+            std::fs::read(&path).expect("the old file stays"),
+            b"previous"
+        );
     }
 
     #[test]
