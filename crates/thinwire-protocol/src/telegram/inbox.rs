@@ -21,6 +21,13 @@ pub(super) const HISTORY_LIMIT: i32 = 40;
 /// Page size for older messages (scroll up in a chat).
 pub(super) const OLDER_PAGE_LIMIT: i32 = 50;
 
+/// A newest page with fewer messages than [`HISTORY_LIMIT`]. TDLib can
+/// answer the first call with only its cached last message, so the worker
+/// asks again.
+pub(super) fn short_newest_page(len: usize) -> bool {
+    len < usize::try_from(HISTORY_LIMIT).unwrap_or(usize::MAX)
+}
+
 /// Page size passed to TDLib `getForumTopics`. The server allows at most 100.
 pub(super) const TOPIC_PAGE_LIMIT: i32 = 100;
 

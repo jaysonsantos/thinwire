@@ -1473,18 +1473,19 @@ fn live_read_while_linked(
     if !live.linked() {
         return None;
     }
-    live_read_in_topic(update, live.open_chat, live.open_topic)
+    live_read_in_topic(update, &live.directory, live.open_chat, live.open_topic)
 }
 
 /// A live incoming message in the open chat, with no topic open.
 /// Tests keep this two-argument form. The worker uses [`live_read_in_topic`].
 #[cfg(test)]
 fn live_read_of(update: &tdlib_rs::enums::Update, open_chat: Option<i64>) -> Option<(i64, i64)> {
-    live_read_in_topic(update, open_chat, None)
+    live_read_in_topic(update, &ChatDirectory::default(), open_chat, None)
 }
 
 fn live_read_in_topic(
     update: &tdlib_rs::enums::Update,
+    directory: &ChatDirectory,
     open_chat: Option<i64>,
     open_topic: Option<MessageTopic>,
 ) -> Option<(i64, i64)> {
@@ -1495,7 +1496,7 @@ fn live_read_in_topic(
     if message.is_outgoing {
         return None;
     }
-    let message_topic = message.topic_id.as_ref().and_then(app_topic);
+    let message_topic = chat_topic(directory, message.chat_id, message.topic_id.as_ref());
     if message_topic != open_topic {
         return None;
     }
@@ -1882,7 +1883,7 @@ async fn apply_chat_update(
                 // so a mute and the "Group › Topic" title are known. The core
                 // waits when that row is not applied yet.
                 if let Some(MessageTopic::Forum(id)) =
-                    update.message.topic_id.as_ref().and_then(app_topic)
+                    chat_topic(&live.directory, chat_id, update.message.topic_id.as_ref())
                     && let Ok(forum_topic_id) = i32::try_from(id)
                     && !live.topics.contains_key(&(chat_id, forum_topic_id))
                 {
@@ -2159,7 +2160,7 @@ fn typing_event(
     AdapterEvent::Typing {
         protocol: ProtocolId::Telegram,
         conversation_id: inbox::conversation_id(update.chat_id),
-        topic: update.topic_id.as_ref().and_then(app_topic),
+        topic: chat_topic(directory, update.chat_id, update.topic_id.as_ref()),
         sender_id,
         sender,
         typing: matches!(update.action, tdlib_rs::enums::ChatAction::Typing),
@@ -2210,6 +2211,22 @@ fn app_topic(topic: &tdlib_rs::enums::MessageTopic) -> Option<MessageTopic> {
         tdlib_rs::enums::MessageTopic::DirectMessages(_)
         | tdlib_rs::enums::MessageTopic::SavedMessages(_) => None,
     }
+}
+
+/// The app topic of a message or a chat action in `chat_id`. TDLib gives
+/// each message of a supergroup with no topics a `messageTopicThread`: the
+/// reply thread of that message. The app shows such a chat as one thread,
+/// so only a chat with a topic list (a forum, or a bot chat with topics)
+/// keeps the topic.
+fn chat_topic(
+    directory: &ChatDirectory,
+    chat_id: i64,
+    topic: Option<&tdlib_rs::enums::MessageTopic>,
+) -> Option<MessageTopic> {
+    if !directory.has_topics(chat_id) {
+        return None;
+    }
+    topic.and_then(app_topic)
 }
 
 fn td_topic(topic: MessageTopic) -> Option<tdlib_rs::enums::MessageTopic> {
@@ -2353,7 +2370,7 @@ fn emit_mapped_message_as(
                 message.id,
                 live.directory.last_read_outbox(message.chat_id),
             ),
-            topic: message.topic_id.as_ref().and_then(app_topic),
+            topic: chat_topic(&live.directory, message.chat_id, message.topic_id.as_ref()),
         },
         &live.names,
         live.directory.title(message.chat_id),
@@ -2964,8 +2981,32 @@ async fn load_topic_history(
     }
 }
 
-async fn load_history(client_id: i32, chat_id: i64, live: &mut LiveInbox, events: &EventTx) {
-    match tdlib_rs::functions::get_chat_history(
+/// The newest page of a chat, newest first. TDLib often answers the first
+/// call with only the last message, from its local cache. A short page asks
+/// one more time, and the longer page wins.
+async fn newest_page(
+    client_id: i32,
+    chat_id: i64,
+) -> Result<Vec<tdlib_rs::types::Message>, tdlib_rs::types::Error> {
+    let first = newest_page_once(client_id, chat_id).await?;
+    if !inbox::short_newest_page(first.len()) {
+        return Ok(first);
+    }
+    match newest_page_once(client_id, chat_id).await {
+        Ok(second) if second.len() > first.len() => Ok(second),
+        Ok(_) => Ok(first),
+        Err(error) => {
+            log_tdlib_error("getChatHistory (again)", &error);
+            Ok(first)
+        }
+    }
+}
+
+async fn newest_page_once(
+    client_id: i32,
+    chat_id: i64,
+) -> Result<Vec<tdlib_rs::types::Message>, tdlib_rs::types::Error> {
+    let tdlib_rs::enums::Messages::Messages(batch) = tdlib_rs::functions::get_chat_history(
         chat_id,
         0,
         0,
@@ -2973,10 +3014,13 @@ async fn load_history(client_id: i32, chat_id: i64, live: &mut LiveInbox, events
         false,
         client_id,
     )
-    .await
-    {
-        Ok(tdlib_rs::enums::Messages::Messages(batch)) => {
-            let messages: Vec<_> = batch.messages.into_iter().flatten().collect();
+    .await?;
+    Ok(batch.messages.into_iter().flatten().collect())
+}
+
+async fn load_history(client_id: i32, chat_id: i64, live: &mut LiveInbox, events: &EventTx) {
+    match newest_page(client_id, chat_id).await {
+        Ok(messages) => {
             let message_ids: Vec<i64> = messages.iter().map(|message| message.id).collect();
             for message in inbox::chronological(messages) {
                 emit_mapped_message(
@@ -4421,6 +4465,87 @@ mod tests {
         assert!(live_read_while_linked(&live, &update).is_none());
     }
 
+    fn directory_of(chat_id: i64, has_topics: bool) -> ChatDirectory {
+        let mut directory = ChatDirectory::new();
+        directory.upsert(
+            chat_id,
+            ChatSeed {
+                title: "Webmasters",
+                order: 1,
+                unread: 0,
+                preview: "",
+                participant: "",
+                last_at: 1,
+                is_group: true,
+                scope: MuteScope::Group,
+                mute: ChatMute::default(),
+                has_topics,
+                peer: None,
+                photo_file_id: None,
+                accent: 0,
+                last_read_outbox: 0,
+            },
+        );
+        directory
+    }
+
+    /// TDLib gives each message of a supergroup with no topics a
+    /// `messageTopicThread`. That chat shows as one thread, so the message
+    /// has no app topic. A chat with topics keeps each topic.
+    #[test]
+    fn only_a_chat_with_topics_keeps_the_topic_of_a_message() {
+        use tdlib_rs::enums::MessageTopic as TdTopic;
+        use tdlib_rs::types::{MessageTopicForum, MessageTopicThread};
+        let thread = TdTopic::Thread(MessageTopicThread {
+            message_thread_id: 77,
+        });
+        let forum = TdTopic::Forum(MessageTopicForum { forum_topic_id: 3 });
+        let plain = directory_of(42, false);
+        assert_eq!(chat_topic(&plain, 42, Some(&thread)), None);
+        assert_eq!(chat_topic(&plain, 42, Some(&forum)), None);
+        assert_eq!(chat_topic(&ChatDirectory::new(), 42, Some(&thread)), None);
+        let topics = directory_of(42, true);
+        assert_eq!(
+            chat_topic(&topics, 42, Some(&thread)),
+            Some(MessageTopic::Thread(77))
+        );
+        assert_eq!(
+            chat_topic(&topics, 42, Some(&forum)),
+            Some(MessageTopic::Forum(3))
+        );
+        assert_eq!(chat_topic(&topics, 42, None), None);
+    }
+
+    /// A live message of a supergroup with no topics comes with its reply
+    /// thread. The open chat still marks it read.
+    #[test]
+    fn a_live_thread_message_of_a_chat_with_no_topics_is_marked_viewed() {
+        use tdlib_rs::enums::{MessageTopic as TdTopic, Update};
+        use tdlib_rs::types::MessageTopicThread;
+        let mut update = live_message(42, 99, false);
+        if let Update::NewMessage(new) = &mut update {
+            new.message.topic_id = Some(TdTopic::Thread(MessageTopicThread {
+                message_thread_id: 99,
+            }));
+        }
+        let plain = directory_of(42, false);
+        assert_eq!(
+            live_read_in_topic(&update, &plain, Some(42), None),
+            Some((42, 99))
+        );
+        let topics = directory_of(42, true);
+        assert_eq!(live_read_in_topic(&update, &topics, Some(42), None), None);
+    }
+
+    #[test]
+    fn a_short_newest_page_asks_again() {
+        assert!(inbox::short_newest_page(0));
+        assert!(inbox::short_newest_page(1));
+        let full = usize::try_from(inbox::HISTORY_LIMIT).expect("limit");
+        assert!(inbox::short_newest_page(full - 1));
+        assert!(!inbox::short_newest_page(full));
+    }
+
     #[test]
     fn live_read_of_marks_an_incoming_message_in_the_open_chat() {
         let incoming = live_message(42, 99, false);
@@ -4482,7 +4607,7 @@ mod tests {
         use tdlib_rs::types::{MessageSenderChat, MessageSenderUser, MessageTopicForum};
         let mut names = NameBook::new();
         names.remember_user(7, "Ada", "Lovelace");
-        let directory = ChatDirectory::new();
+        let directory = directory_of(42, true);
         let user = MessageSender::User(MessageSenderUser { user_id: 7 });
         let forum = TdTopic::Forum(MessageTopicForum { forum_topic_id: 3 });
 
