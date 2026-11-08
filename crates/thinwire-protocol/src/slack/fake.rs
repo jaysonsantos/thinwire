@@ -8,13 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
 
 use super::api::{
     FileRead, SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel,
     SlackChannelKind, SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream,
     SlackHistoryPage, SlackInbound, SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
 };
-use super::audio::FilesHostUrl;
+use super::audio::{FilesHostUrl, IncomingFile};
 use super::credentials::SlackApiSource;
 use super::install::SlackInstalledWorkspace;
 use super::loopback::tests::get;
@@ -26,6 +27,7 @@ use crate::adapter::{
     AccountState, AdapterCommand, AdapterEvent, AdapterStatus, ChatMessage, Conversation,
     ProtocolAdapter, ProtocolId,
 };
+use crate::media::VoiceStop;
 
 const BOT_TOKEN: &str = "xoxb-fake-bot-token";
 const APP_TOKEN: &str = "xapp-fake-app-token";
@@ -57,6 +59,9 @@ struct ApiState {
     /// Scripted `read_file` answers, first in is first out.
     file_script: VecDeque<(u16, Vec<u8>)>,
     file_calls: u32,
+    /// The first `read_file` sends this, then waits on `file_hold`.
+    file_started: Option<oneshot::Sender<()>>,
+    file_hold: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Default)]
@@ -284,11 +289,22 @@ impl SlackWebApi for FakeApi {
     async fn read_file(&self, token: &SlackBotToken, url: &FilesHostUrl) -> Result<FileRead, ()> {
         Self::check_token(token);
         let _ = url;
-        self.with(|state| {
+        let (started, hold, queued) = self.with(|state| {
             state.file_calls += 1;
-            let (status, body) = state.file_script.pop_front().unwrap_or((404, Vec::new()));
-            Ok(FileRead { status, body })
-        })
+            (
+                state.file_started.take(),
+                state.file_hold.take(),
+                state.file_script.pop_front(),
+            )
+        });
+        if let Some(started) = started {
+            let _ = started.send(());
+        }
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
+        let (status, body) = queued.unwrap_or((404, Vec::new()));
+        Ok(FileRead { status, body })
     }
 }
 
@@ -3161,4 +3177,207 @@ async fn the_workspace_inbox_follows_the_adapter_contract() {
     })
     .await;
     kit.run_all().await;
+}
+
+const AUDIO_URL: &str = "https://files.slack.com/files-pri/T1/F9/download/song.mp3";
+
+fn seed_audio(api: &FakeApi, ts: &str) {
+    api.with(|state| {
+        let mut row = post("C1", ts, "U1", "");
+        row.files.push(IncomingFile {
+            mimetype: "audio/mpeg".into(),
+            filetype: "mp3".into(),
+            name: "song.mp3".into(),
+            url: FilesHostUrl::parse(AUDIO_URL),
+        });
+        state
+            .history
+            .entry("C1".into())
+            .or_default()
+            .posts
+            .insert(0, row);
+    });
+}
+
+async fn shown_audio(h: &mut Harness) -> i32 {
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    let message = h.message("[audio]").await;
+    message.audio.expect("clip").file_id()
+}
+
+fn quiet(seen: &[AdapterEvent]) -> bool {
+    seen.iter().all(|event| {
+        !matches!(
+            event,
+            AdapterEvent::CommandFailed { .. } | AdapterEvent::Notice { .. }
+        )
+    })
+}
+
+#[tokio::test]
+async fn a_scripted_audio_file_is_ready_for_the_player() {
+    let api = FakeApi::workspace();
+    seed_audio(&api, "1700000009.000900");
+    api.with(|state| {
+        state.file_script.push_back((200, b"ID3-slack".to_vec()));
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    let file_id = shown_audio(&mut h).await;
+    h.send(AdapterCommand::DownloadVoice {
+        protocol: ProtocolId::Slack,
+        file_id,
+    });
+    let event = h
+        .until("voice ready", |event| {
+            matches!(event, AdapterEvent::VoiceReady { file_id: seen, .. } if *seen == file_id)
+        })
+        .await;
+    let AdapterEvent::VoiceReady { path, .. } = event else {
+        unreachable!("voice ready");
+    };
+    let stored = std::fs::read(path.as_path()).expect("stored audio");
+    assert_eq!(stored, b"ID3-slack");
+    assert!(quiet(&h.seen));
+    assert_eq!(h.api.with(|state| state.file_calls), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_missing_file_scope_stops_without_another_error() {
+    let (logs, _guard) = capture_debug();
+    let api = FakeApi::workspace();
+    seed_audio(&api, "1700000010.000900");
+    api.with(|state| {
+        state.file_script.push_back((403, b"nope".to_vec()));
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    let file_id = shown_audio(&mut h).await;
+    tracing::callsite::rebuild_interest_cache();
+    h.send(AdapterCommand::DownloadVoice {
+        protocol: ProtocolId::Slack,
+        file_id,
+    });
+    let event = h
+        .until("voice failed", |event| {
+            matches!(event, AdapterEvent::VoiceFailed { file_id: seen, .. } if *seen == file_id)
+        })
+        .await;
+    assert!(matches!(
+        event,
+        AdapterEvent::VoiceFailed {
+            stop: VoiceStop::SlackFilesUnread,
+            ..
+        }
+    ));
+    let shown = format!("{event:?}");
+    assert!(!shown.contains(BOT_TOKEN));
+    assert!(!shown.contains(AUDIO_URL));
+    assert!(!shown.contains("files.slack.com"));
+    assert!(quiet(&h.seen));
+    let locked = logs.lock().expect("logs");
+    let text = String::from_utf8_lossy(&locked);
+    assert!(text.contains("a slack audio file did not download"));
+    assert!(!text.contains(BOT_TOKEN));
+    assert!(!text.contains("files.slack.com"));
+}
+
+#[tokio::test]
+async fn an_unknown_voice_handle_is_unplayable() {
+    let mut h = Harness::new(FakeApi::workspace(), installed_vault(), true);
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.send(AdapterCommand::DownloadVoice {
+        protocol: ProtocolId::Slack,
+        file_id: 42,
+    });
+    let event = h
+        .until("missing clip", |event| {
+            matches!(event, AdapterEvent::VoiceFailed { file_id: 42, .. })
+        })
+        .await;
+    assert!(matches!(
+        event,
+        AdapterEvent::VoiceFailed {
+            stop: VoiceStop::Unplayable,
+            ..
+        }
+    ));
+    assert!(quiet(&h.seen));
+    assert_eq!(h.api.with(|state| state.file_calls), 0);
+}
+
+#[tokio::test]
+async fn a_second_download_waits_for_the_first() {
+    let api = FakeApi::workspace();
+    seed_audio(&api, "1700000011.000900");
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    api.with(|state| {
+        state.file_script.push_back((200, b"ID3-once".to_vec()));
+        state.file_started = Some(started_tx);
+        state.file_hold = Some(release_rx);
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    let file_id = shown_audio(&mut h).await;
+    h.send(AdapterCommand::DownloadVoice {
+        protocol: ProtocolId::Slack,
+        file_id,
+    });
+    tokio::time::timeout(Duration::from_secs(2), started_rx)
+        .await
+        .expect("download started")
+        .expect("started signal");
+    h.send(AdapterCommand::DownloadVoice {
+        protocol: ProtocolId::Slack,
+        file_id,
+    });
+    h.send(AdapterCommand::DownloadVoice {
+        protocol: ProtocolId::Slack,
+        file_id: 0,
+    });
+    h.until("unknown handle", |event| {
+        matches!(event, AdapterEvent::VoiceFailed { file_id: 0, .. })
+    })
+    .await;
+    assert_eq!(h.api.with(|state| state.file_calls), 1);
+    release_tx.send(()).expect("release");
+    h.until(
+        "voice ready",
+        |event| matches!(event, AdapterEvent::VoiceReady { file_id: seen, .. } if *seen == file_id),
+    )
+    .await;
+    assert_eq!(h.api.with(|state| state.file_calls), 1);
+}
+
+fn capture_debug() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    #[derive(Clone)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Buf(std::sync::Arc::clone(&bytes));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (bytes, guard)
 }

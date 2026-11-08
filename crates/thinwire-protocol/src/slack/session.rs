@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,7 @@ use super::api::{
     SlackCodeExchange, SlackEventSource, SlackEventStream, SlackHistoryPage, SlackInbound,
     SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
 };
+use super::audio::{self, FetchClass, FilesHostUrl};
 use super::credentials::{SlackApiSource, resolve_slack_app_token, resolve_slack_client};
 use super::install::{
     SLACK_OAUTH_LOOPBACK_PORT, SlackCallbackError, authorize_url, new_oauth_state,
@@ -27,13 +29,14 @@ use super::loopback::SlackLoopback;
 use super::secrets::{SlackSecretKey, SlackSecretVault};
 use super::{CAPABILITIES, SLACK_CONVERSATION_PREFIX};
 use crate::adapter::{
-    AccountState, AdapterCommand, AdapterError, AdapterStatus, ChatMessage, Conversation, Delivery,
-    EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId, emit_account,
-    emit_chat_list_loaded, emit_command_failed, emit_conversation, emit_conversation_removed,
-    emit_flush_secrets, emit_history_loaded, emit_message, emit_message_body,
-    emit_messages_removed, emit_notice, emit_older_history_loaded, emit_send_accepted,
-    emit_send_rejected, emit_status, emit_stopped,
+    AccountState, AdapterCommand, AdapterError, AdapterEvent, AdapterStatus, ChatMessage,
+    Conversation, Delivery, EventTx, ProtocolAdapter, ProtocolCapabilities, ProtocolId,
+    emit_account, emit_chat_list_loaded, emit_command_failed, emit_conversation,
+    emit_conversation_removed, emit_flush_secrets, emit_history_loaded, emit_message,
+    emit_message_body, emit_messages_removed, emit_notice, emit_older_history_loaded,
+    emit_send_accepted, emit_send_rejected, emit_status, emit_stopped,
 };
+use crate::media::{AudioPath, VoiceStop};
 
 /// Messages loaded when a channel opens. Also the cap on the per-channel
 /// `shown` display cache.
@@ -131,6 +134,34 @@ enum Job {
         attempt: u64,
         result: Result<SlackInstallGrant, InstallFailure>,
     },
+    ClipDone {
+        file_id: i32,
+        done: ClipResult,
+    },
+}
+
+enum ClipResult {
+    Ready(AudioPath),
+    Failed(VoiceStop),
+}
+
+/// A cancelled download still reports a miss, so the spinner stops.
+struct ClipFinish {
+    jobs: UnboundedSender<Job>,
+    file_id: i32,
+    sent: bool,
+}
+
+impl Drop for ClipFinish {
+    fn drop(&mut self) {
+        if self.sent {
+            return;
+        }
+        let _ = self.jobs.send(Job::ClipDone {
+            file_id: self.file_id,
+            done: ClipResult::Failed(VoiceStop::Unplayable),
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -199,6 +230,10 @@ where
             return;
         };
         let (jobs_tx, jobs_rx) = unbounded_channel();
+        let voice = voice_folder();
+        if let Some(dir) = &voice {
+            clear_voice_dir(dir);
+        }
         let resume = deps.vault.get_secret(SlackSecretKey::BotToken).is_some();
         if !resume {
             emit_status(
@@ -209,7 +244,7 @@ where
             );
             emit_account(&events, ProtocolId::Slack, AccountState::Unlinked);
         }
-        let session = Session::new(deps, events, jobs_tx.clone());
+        let session = Session::new(deps, events, jobs_tx.clone(), voice);
         tokio::spawn(session.run(jobs_rx));
         if resume {
             let _ = jobs_tx.send(Job::Command(AdapterCommand::Connect {
@@ -305,6 +340,14 @@ where
     deduped: HashMap<String, Vec<Deduped>>,
     /// Wall time of the last walk of every channel in `deduped`.
     dedup_swept_at: Option<i64>,
+    /// Playable file address for a handle. The download task is the only reader.
+    clips: HashMap<i32, FilesHostUrl>,
+    /// A handle whose GET is already running.
+    inflight: HashSet<i32>,
+    /// Folder of `{handle}.audio`. One folder in a real run. Each test session
+    /// gets its own, because a start clears the folder and the suite runs
+    /// sessions in parallel.
+    voice_dir: Option<PathBuf>,
 }
 
 impl<A, S, B> Session<A, S, B>
@@ -313,7 +356,12 @@ where
     S: SlackEventSource,
     B: SlackBrowser,
 {
-    fn new(deps: SlackDeps<A, S, B>, events: EventTx, jobs: UnboundedSender<Job>) -> Self {
+    fn new(
+        deps: SlackDeps<A, S, B>,
+        events: EventTx,
+        jobs: UnboundedSender<Job>,
+        voice_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             deps,
             events,
@@ -327,6 +375,9 @@ where
             shown: HashMap::new(),
             deduped: HashMap::new(),
             dedup_swept_at: None,
+            clips: HashMap::new(),
+            inflight: HashSet::new(),
+            voice_dir,
         }
     }
 
@@ -347,6 +398,7 @@ where
                 }
                 Job::Inbound(SlackInbound::Revoked) => self.revoked().await,
                 Job::Installed { attempt, result } => self.installed(attempt, result).await,
+                Job::ClipDone { file_id, done } => self.clip_done(file_id, done),
             }
         }
         self.stop_live().await;
@@ -417,6 +469,10 @@ where
                 self.stop_live().await;
                 emit_stopped(&self.events, ProtocolId::Slack);
             }
+            AdapterCommand::DownloadVoice {
+                protocol: ProtocolId::Slack,
+                file_id,
+            } => self.download_voice(file_id),
             _ => self.status(
                 AdapterStatus::Error,
                 "command is not handled by the Slack workspace app",
@@ -695,6 +751,11 @@ where
     /// The bot token no longer works. Stop Socket Mode and drop the install.
     async fn end_access(&mut self) {
         self.stop_live().await;
+        self.clips.clear();
+        self.inflight.clear();
+        if let Some(dir) = &self.voice_dir {
+            clear_voice_dir(dir);
+        }
         self.deps.vault.set_secret(SlackSecretKey::BotToken, "");
         self.deps.vault.set_secret(SlackSecretKey::TeamId, "");
         self.deps.vault.set_secret(SlackSecretKey::AppId, "");
@@ -928,7 +989,10 @@ where
             .posts
             .iter()
             .max_by_key(|post| ts_rank(&post.ts))
-            .map(|post| (ts_rank(&post.ts), ts_order(&post.ts), post.text.clone()));
+            .map(|post| {
+                let body = audio::present(&post.text, &post.channel, &post.ts, &post.files).body;
+                (ts_rank(&post.ts), ts_order(&post.ts), body)
+            });
         // Ignored subtypes count toward Slack's raw limit, so a short
         // displayable page is not the latest window. Drop only the posts
         // that page covers, before `remember` can evict them without
@@ -1613,12 +1677,18 @@ where
             (Some(user), _) => self.user_name(token, user).await,
             (None, _) => "Slack".into(),
         };
+        let shown = audio::present(&post.text, &post.channel, &post.ts, &post.files);
+        let audio = shown.clip.and_then(|clip| {
+            let audio = crate::MessageAudio::new(0, clip.handle, None);
+            self.clips.insert(clip.handle, clip.url);
+            audio
+        });
         Some(ChatMessage {
             protocol: ProtocolId::Slack,
             conversation_id: conversation_id(&post.channel),
             id: message_id_of(&post.channel, &post.ts),
             sender,
-            body: post.text,
+            body: shown.body,
             outbound,
             delivery: Delivery::Sent,
             sent_at: ts_order(&post.ts),
@@ -1626,7 +1696,7 @@ where
             topic: None,
             links: Vec::new(),
             photo: None,
-            audio: None,
+            audio,
             video: None,
             file: None,
             reactions: Vec::new(),
@@ -1634,6 +1704,117 @@ where
             edited: false,
         })
     }
+
+    fn download_voice(&mut self, file_id: i32) {
+        if self.inflight.contains(&file_id) {
+            return;
+        }
+        let Some(url) = self.clips.get(&file_id).cloned() else {
+            self.voice_stop(file_id, VoiceStop::Unplayable);
+            return;
+        };
+        let Some(token) = self.live.as_ref().map(|live| live.token.clone()) else {
+            self.voice_stop(file_id, VoiceStop::Unplayable);
+            return;
+        };
+        let Some(dir) = self.voice_dir.clone() else {
+            self.voice_stop(file_id, VoiceStop::Unplayable);
+            return;
+        };
+        self.inflight.insert(file_id);
+        let api = Arc::clone(&self.deps.api);
+        let jobs = self.jobs.clone();
+        tokio::spawn(async move {
+            let mut finish = ClipFinish {
+                jobs: jobs.clone(),
+                file_id,
+                sent: false,
+            };
+            let done = fetch_clip(api.as_ref(), &token, &url, &dir, file_id).await;
+            if jobs.send(Job::ClipDone { file_id, done }).is_ok() {
+                finish.sent = true;
+            }
+        });
+    }
+
+    fn clip_done(&mut self, file_id: i32, done: ClipResult) {
+        self.inflight.remove(&file_id);
+        match done {
+            ClipResult::Ready(path) => {
+                let _ = self.events.send(AdapterEvent::VoiceReady {
+                    protocol: ProtocolId::Slack,
+                    file_id,
+                    path,
+                });
+            }
+            ClipResult::Failed(stop) => {
+                tracing::debug!("a slack audio file did not download");
+                self.voice_stop(file_id, stop);
+            }
+        }
+    }
+
+    fn voice_stop(&self, file_id: i32, stop: VoiceStop) {
+        let _ = self.events.send(AdapterEvent::VoiceFailed {
+            protocol: ProtocolId::Slack,
+            file_id,
+            stop,
+        });
+    }
+}
+
+async fn fetch_clip(
+    api: &impl SlackWebApi,
+    token: &SlackBotToken,
+    url: &FilesHostUrl,
+    dir: &std::path::Path,
+    file_id: i32,
+) -> ClipResult {
+    let read = match api.read_file(token, url).await {
+        Ok(read) => read,
+        Err(()) => return ClipResult::Failed(VoiceStop::Unplayable),
+    };
+    match audio::classify(read.status, &read.body) {
+        FetchClass::Audio(bytes) => {
+            let dir = dir.to_path_buf();
+            match tokio::task::spawn_blocking(move || {
+                crate::voice_files::store(&dir, file_id, &bytes).map_err(|_| ())
+            })
+            .await
+            {
+                Ok(Ok(path)) => ClipResult::Ready(path),
+                _ => ClipResult::Failed(VoiceStop::Unplayable),
+            }
+        }
+        FetchClass::FilesUnread => ClipResult::Failed(VoiceStop::SlackFilesUnread),
+        FetchClass::Miss => ClipResult::Failed(VoiceStop::Unplayable),
+    }
+}
+
+/// The player folder. A real run uses one cache folder for every Slack
+/// account. A test uses a fresh directory under the process id: `start`
+/// clears the folder, and the suite runs more than one session at once.
+fn voice_folder() -> Option<PathBuf> {
+    if cfg!(test) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        return Some(
+            std::env::temp_dir()
+                .join("thinwire-slack-voice-tests")
+                .join(std::process::id().to_string())
+                .join(n.to_string()),
+        );
+    }
+    dirs::cache_dir().map(|dir| dir.join("thinwire").join("slack").join("voice"))
+}
+
+fn clear_voice_dir(dir: &std::path::Path) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let dir = dir.to_path_buf();
+    runtime.spawn_blocking(move || crate::voice_files::clear(&dir));
 }
 
 struct Shown {
