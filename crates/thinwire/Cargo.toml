@@ -99,6 +99,13 @@ tracing-subscriber.workspace = true
 # Features `signal-local` and `whatsapp-web` only. No new crate: `qrcode`
 # is already on the Signal feature (ADR 0013 license list is unchanged).
 qrcode = { version = "0.14", optional = true, default-features = false }
+ed25519-dalek = "3"
+base64 = "0.22"
+quick-xml = "0.38"
+tar = "0.4"
+flate2 = { version = "1.1.11", default-features = false, features = [
+  "rust_backend",
+] }
 
 # Linux: the settings portal reports reduce-motion and sends SettingChanged.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -125,6 +132,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSRunningApplication",
   "NSWorkspace",
 ] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
 # A zone with daylight saving time for the layout tests (#122).

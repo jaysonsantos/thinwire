@@ -60,6 +60,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     pages_history: true,
     sends_media: true,
     message_actions: crate::MessageActions::ALL,
+    typing: true,
 };
 
 /// Official Telegram path. Default builds report TDLib unavailable.
@@ -564,6 +565,19 @@ impl ProtocolAdapter for TelegramAdapter {
                     to_conversation_id,
                 },
             ),
+            AdapterCommand::SetTyping {
+                protocol: ProtocolId::Telegram,
+                conversation_id,
+                topic,
+                typing,
+            } => self.dispatch_live(
+                events,
+                LiveCall::SetTyping {
+                    conversation_id,
+                    topic,
+                    typing,
+                },
+            ),
             AdapterCommand::SendMedia {
                 protocol: ProtocolId::Telegram,
                 conversation_id,
@@ -667,6 +681,11 @@ enum LiveCall {
         from_conversation_id: String,
         message_ids: Vec<String>,
         to_conversation_id: String,
+    },
+    SetTyping {
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        typing: bool,
     },
     Resend {
         conversation_id: String,
@@ -882,6 +901,22 @@ impl TelegramAdapter {
                             from_conversation_id,
                             message_ids,
                             to_conversation_id,
+                        },
+                        secrets,
+                        source,
+                        events,
+                    );
+                }
+                LiveCall::SetTyping {
+                    conversation_id,
+                    topic,
+                    typing,
+                } => {
+                    self.tdlib.enqueue_message_action(
+                        tdlib::TdlibCommand::SetTyping {
+                            conversation_id,
+                            topic,
+                            typing,
                         },
                         secrets,
                         source,
@@ -1590,6 +1625,23 @@ mod tests {
             .find("emit_send_accepted(events, ProtocolId::Telegram, conversation_id, request)")
             .expect("acceptance names the send");
         assert!(pending < accepted, "the pending row comes first");
+    }
+
+    /// A typing state does not wait in the worker loop: a round trip there
+    /// stalls every later update. A client that is not linked sends none.
+    #[test]
+    fn typing_goes_out_off_the_worker_loop_and_only_when_linked() {
+        let src = include_str!("tdlib.rs");
+        let start = src.find("TdlibCommand::SetTyping {").expect("worker arm");
+        let arm = &src[start..start + 700];
+        let linked = arm.find("live.linked()").expect("linked check");
+        let spawn = arm
+            .find("tokio::spawn(send_typing(client_id, chat_id, topic, typing))")
+            .expect("spawned send");
+        assert!(linked < spawn);
+        let body = fn_body(src, "async fn send_typing");
+        assert!(body.contains("ChatAction::Typing") && body.contains("ChatAction::Cancel"));
+        assert!(body.contains("functions::send_chat_action("));
     }
 
     /// Forward sends the ids in increasing order, at most 100 for each

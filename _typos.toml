@@ -17,3 +17,5 @@ prek = "prek"
 Aci = "Aci"
 # whatsapp-rust field of the device phone number (`Device::pn`).
 pn = "pn"
+# Crate name. The checker splits the digit and reads flate as flat.
+flate = "flate"

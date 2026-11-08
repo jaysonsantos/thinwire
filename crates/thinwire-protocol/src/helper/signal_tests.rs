@@ -61,6 +61,7 @@ const fn caps(protocol: ProtocolId) -> ProtocolCapabilities {
         pages_history: true,
         sends_media: true,
         message_actions: crate::MessageActions::NONE,
+        typing: false,
     }
 }
 

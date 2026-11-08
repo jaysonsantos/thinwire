@@ -613,8 +613,8 @@ impl Core {
 
     /// Apply the adapter events that arrived and run time-based checks.
     /// Returns true when the state changed: an event was applied, a send
-    /// with no answer expired, or a forum notice that waited for its topic
-    /// row was released.
+    /// with no answer expired, a forum notice that waited for its topic
+    /// row was released, or a person stopped typing.
     ///
     /// Frontend thread only. See [`Core`] "Threads".
     pub fn pump(&mut self) -> bool {
@@ -625,6 +625,7 @@ impl Core {
         let keychain_ready = self.secrets.attach_settled() && !self.secrets.read_failed();
         self.state.note_app_keychain_ready(keychain_ready);
         let expired = self.state.expire_sends();
+        let typing = self.state.expire_typing(Instant::now());
         let mut applied = false;
         while let Ok(event) = self.events.try_recv() {
             self.events_read += 1;
@@ -672,7 +673,7 @@ impl Core {
         self.state.sync_timeout_hint();
         self.sync_notifications();
         self.flush();
-        applied || expired || released
+        applied || expired || released || typing
     }
 
     /// Notifications for the frontend to show or remove, oldest first
@@ -892,9 +893,14 @@ impl Core {
                 conversation_id,
                 topic,
                 text,
-            } => self
-                .state
-                .set_draft(protocol, &conversation_id, topic, text.into_inner()),
+            } => {
+                self.state
+                    .set_draft(protocol, &conversation_id, topic, text.into_inner());
+                if self.settings.send_typing() {
+                    self.state
+                        .send_typing(protocol, &conversation_id, topic, Instant::now());
+                }
+            }
             Intent::AddAttachments {
                 protocol,
                 conversation_id,
@@ -981,6 +987,12 @@ impl Core {
                 }
             }
             Intent::SetRailCollapsed(collapsed) => self.settings.set_rail_collapsed(collapsed),
+            Intent::SetSendTyping(on) => {
+                self.settings.set_send_typing(on);
+                if !on {
+                    self.state.stop_typing(Instant::now());
+                }
+            }
             Intent::SetChatMute {
                 protocol,
                 conversation_id,
@@ -4312,6 +4324,50 @@ mod tests {
             "for Ada only",
             "chat 1 keeps its draft"
         );
+    }
+
+    /// The typing switch (#510): on, a draft of the open chat sends
+    /// "typing". Off sends a stop at once, and later drafts send nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_typing_switch_turns_the_typing_state_off() {
+        use crate::state::test_support::ready_with_chats;
+
+        let mut core = memory_core();
+        core.state = ready_with_chats(&core.secrets);
+        let (probe, mut sent) = unbounded_channel();
+        core.commands = HostSender::for_test(probe);
+        core.dispatch(Intent::SelectConversation {
+            id: "telegram:1".into(),
+        });
+        let draft = |text: &str| Intent::SetDraft {
+            protocol: ProtocolId::Telegram,
+            conversation_id: "telegram:1".into(),
+            text: text.into(),
+            topic: None,
+        };
+        let mut typing = move || {
+            let mut states = Vec::new();
+            while let Ok(command) = sent.try_recv() {
+                if let AdapterCommand::SetTyping {
+                    conversation_id,
+                    typing,
+                    ..
+                } = command
+                {
+                    states.push((conversation_id, typing));
+                }
+            }
+            states
+        };
+        assert!(core.view().send_typing());
+        core.dispatch(draft("H"));
+        assert_eq!(typing(), [("telegram:1".to_string(), true)]);
+        core.dispatch(Intent::SetSendTyping(false));
+        assert!(!core.view().send_typing());
+        assert_eq!(typing(), [("telegram:1".to_string(), false)]);
+        core.dispatch(draft("Hi"));
+        core.dispatch(draft(""));
+        assert_eq!(typing(), []);
     }
 
     /// PR #48 review (P1): a send named for chat A after a click on chat B

@@ -32,6 +32,7 @@ pub mod signal_notice;
 pub mod state;
 mod store_key;
 mod theme;
+mod typing;
 mod view;
 
 pub use crate::clock::{Clock, ViewNow};

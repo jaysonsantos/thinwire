@@ -741,6 +741,8 @@ pub struct Snapshot {
     selection: Option<MessageSelection>,
     /// The open forward picker: the messages it forwards and its search.
     forwarding: Option<ForwardDraft>,
+    /// The typing state of this account, and who types in each chat (#510).
+    typing: crate::typing::Typing,
     /// Photos and videos attached to a thread and not sent yet, in order.
     attachments: HashMap<(ProtocolId, String, Option<MessageTopic>), Vec<OutgoingFile>>,
     /// Why the last attach skipped files. The tray shows it until the next
@@ -1128,6 +1130,7 @@ impl Snapshot {
             editing: None,
             selection: None,
             forwarding: None,
+            typing: crate::typing::Typing::default(),
             attachments: HashMap::new(),
             attachment_note: None,
             rejected_bodies: HashMap::new(),
@@ -1555,6 +1558,14 @@ impl Snapshot {
                 self.remove_conversation(protocol, &id);
             }
             AdapterEvent::MessageReceived { message } => {
+                if message.arrival == thinwire_protocol::Arrival::Live && !message.outbound {
+                    let thread = (
+                        message.protocol,
+                        message.conversation_id.clone(),
+                        message.topic,
+                    );
+                    self.typing.message_from(&thread, &message.sender);
+                }
                 let before =
                     self.delivery_of(message.protocol, &message.conversation_id, &message.id);
                 self.note_delivery(before, &message);
@@ -1590,6 +1601,22 @@ impl Snapshot {
                 conversation_id,
                 message_id,
             } => self.mark_edited(protocol, &conversation_id, &message_id),
+            AdapterEvent::Typing {
+                protocol,
+                conversation_id,
+                topic,
+                sender_id,
+                sender,
+                typing,
+            } => {
+                let _ = self.typing.note(
+                    (protocol, conversation_id, topic),
+                    sender_id,
+                    sender,
+                    typing,
+                    Instant::now(),
+                );
+            }
             AdapterEvent::MessageMedia {
                 protocol,
                 conversation_id,
@@ -2520,6 +2547,82 @@ impl Snapshot {
         } else {
             self.drafts.insert((protocol, chat.to_owned(), topic), text);
         }
+    }
+
+    /// The draft of the open thread changed: tell its chat that this
+    /// account types, or that it stopped (#510). Nothing goes out for
+    /// another thread, for an edit, for a protocol with no typing, or for a
+    /// chat that this account cannot write in.
+    pub fn send_typing(
+        &mut self,
+        protocol: ProtocolId,
+        chat: &str,
+        topic: Option<MessageTopic>,
+        now: Instant,
+    ) {
+        if !self.is_selected_thread(protocol, chat, topic)
+            || self.editing.is_some()
+            || !self.can_type(protocol)
+        {
+            return;
+        }
+        let empty = self.compose.trim().is_empty();
+        let thread = (protocol, chat.to_owned(), topic);
+        if let Some(typing) = self.typing.draft_changed(thread, empty, now) {
+            self.push(AdapterCommand::SetTyping {
+                protocol,
+                conversation_id: chat.to_owned(),
+                topic,
+                typing,
+            });
+        }
+    }
+
+    /// End the typing state of this account: the user turned it off.
+    pub fn stop_typing(&mut self, now: Instant) {
+        if let Some((protocol, conversation_id, topic)) = self.typing.stop(now) {
+            self.push(AdapterCommand::SetTyping {
+                protocol,
+                conversation_id,
+                topic,
+                typing: false,
+            });
+        }
+    }
+
+    /// Drop the people with no typing event for some seconds. `true` when
+    /// a name went away.
+    pub fn expire_typing(&mut self, now: Instant) -> bool {
+        self.typing.expire(now)
+    }
+
+    /// The open thread can get a typing state: the linked account of
+    /// `protocol` has typing, and the chat and topic take messages.
+    fn can_type(&self, protocol: ProtocolId) -> bool {
+        let typing = self
+            .accounts
+            .iter()
+            .any(|row| row.caps.id == protocol && row.linked() && row.caps.typing);
+        let topic_open = self.selected_topic_row().is_none_or(|topic| !topic.closed);
+        let retained = self
+            .selected_conversation
+            .as_deref()
+            .is_some_and(|id| thinwire_protocol::signal_retained_slot(id).is_some());
+        typing
+            && topic_open
+            && !retained
+            && self
+                .selected_conversation_row()
+                .is_some_and(|row| row.writable)
+    }
+
+    /// Who types in the open thread, as one line: "Ada is typing…". `None`
+    /// when nobody types.
+    #[must_use]
+    pub fn typing_line(&self) -> Option<String> {
+        let chat = self.selected_conversation.clone()?;
+        let thread = (self.selected_protocol, chat, self.selected_topic);
+        crate::typing::typing_line(&self.typing.names(&thread))
     }
 
     /// Add photos and videos to the tray of one thread. Another file is
@@ -4614,6 +4717,8 @@ impl Snapshot {
         };
         self.error = None;
         self.attachment_note = None;
+        self.typing
+            .message_sent(&(protocol, conversation_id.clone(), self.selected_topic));
         if !files.is_empty() {
             // The files stay in the tray until the adapter accepts them.
             self.push(AdapterCommand::SendMedia {
@@ -5963,6 +6068,7 @@ impl Snapshot {
         self.rejected_bodies
             .retain(|(owner, _), _| *owner != protocol);
         self.drafts.retain(|(owner, _, _), _| *owner != protocol);
+        self.typing.forget(protocol);
         // The files of an ended session do not go to a new one.
         self.attachments
             .retain(|(owner, _, _), _| *owner != protocol);
@@ -7511,7 +7617,18 @@ fn sort_conversations(list: &mut [Conversation]) {
 fn sort_messages(list: &mut [ChatMessage]) {
     // Send time first: some protocols (WhatsApp) use ids with no order.
     // Numeric ids rank the rest when the time is unknown (zero).
-    list.sort_by_key(|row| (row.sent_at, message_rank(&row.id)));
+    list.sort_by_key(|row| (row.sent_at, rank_within_second(row)));
+}
+
+fn rank_within_second(message: &ChatMessage) -> i64 {
+    if message.protocol.is(ProtocolKind::Signal)
+        && let Some(millis) = thinwire_protocol::signal_store_millis(&message.id)
+        && let Ok(rank) = i64::try_from(millis)
+    {
+        rank
+    } else {
+        message_rank(&message.id)
+    }
 }
 
 fn message_rank(id: &str) -> i64 {
@@ -9813,6 +9930,154 @@ mod tests {
         assert!(can_edit(&message));
         message.body = " ".into();
         assert!(!can_edit(&message), "no text");
+    }
+
+    fn typing_commands(snapshot: &mut Snapshot) -> Vec<(String, Option<MessageTopic>, bool)> {
+        snapshot
+            .take_commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                AdapterCommand::SetTyping {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id,
+                    topic,
+                    typing,
+                } => Some((conversation_id, topic, typing)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The draft of the open chat sends "typing" at most one time each 5 s,
+    /// and a draft that becomes empty sends a stop. A send sends no stop,
+    /// and the next change sends "typing" again (#510).
+    #[test]
+    fn the_draft_of_the_open_chat_sends_the_typing_state() {
+        let mut snapshot = telegram_chat_with_rows(&[(5, false)]);
+        let (tg, chat) = (ProtocolId::Telegram, "telegram:1");
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let write = |snapshot: &mut Snapshot, text: &str, at: Instant| {
+            snapshot.set_draft(tg, chat, None, text.into());
+            snapshot.send_typing(tg, chat, None, at);
+        };
+        let typing = |on: bool| vec![(chat.to_string(), None, on)];
+
+        write(&mut snapshot, "H", at(0));
+        write(&mut snapshot, "Hi", at(1));
+        assert_eq!(typing_commands(&mut snapshot), typing(true));
+        write(&mut snapshot, "Hi!", at(5));
+        assert_eq!(typing_commands(&mut snapshot), typing(true));
+        write(&mut snapshot, " ", at(6));
+        assert_eq!(typing_commands(&mut snapshot), typing(false));
+        write(&mut snapshot, "", at(6));
+        assert_eq!(typing_commands(&mut snapshot), []);
+
+        write(&mut snapshot, "Hello", at(7));
+        assert_eq!(typing_commands(&mut snapshot), typing(true));
+        snapshot.send_compose();
+        assert_eq!(typing_commands(&mut snapshot), [], "a send sends no stop");
+        write(&mut snapshot, "Hello again", at(8));
+        assert_eq!(typing_commands(&mut snapshot), typing(true));
+
+        snapshot.stop_typing(at(9));
+        assert_eq!(typing_commands(&mut snapshot), typing(false));
+        snapshot.stop_typing(at(9));
+        assert_eq!(typing_commands(&mut snapshot), []);
+    }
+
+    /// No typing state for a draft of another chat, for an edit, or for a
+    /// chat that this account cannot write in.
+    #[test]
+    fn typing_needs_the_open_writable_chat_and_no_edit() {
+        let mut snapshot = telegram_chat_with_rows(&[(5, true)]);
+        let tg = ProtocolId::Telegram;
+        let start = Instant::now();
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(2, "Bob", 0),
+        });
+        snapshot.set_draft(tg, "telegram:2", None, "Hi".into());
+        snapshot.send_typing(tg, "telegram:2", None, start);
+        assert_eq!(typing_commands(&mut snapshot), [], "another chat");
+
+        snapshot.begin_edit(tg, "telegram:1", "telegram:1:5");
+        assert!(snapshot.edit_target().is_some());
+        snapshot.set_draft(tg, "telegram:1", None, "Hi there".into());
+        snapshot.send_typing(tg, "telegram:1", None, start);
+        assert_eq!(typing_commands(&mut snapshot), [], "an edit");
+        snapshot.cancel_edit();
+
+        let mut read_only = test_support::telegram_chat(1, "Ada", 1);
+        read_only.writable = false;
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: read_only,
+        });
+        snapshot.set_draft(tg, "telegram:1", None, "Hi".into());
+        snapshot.send_typing(tg, "telegram:1", None, start);
+        assert_eq!(typing_commands(&mut snapshot), [], "read-only");
+    }
+
+    fn typing_event(chat: &str, topic: Option<MessageTopic>, who: &str, on: bool) -> AdapterEvent {
+        AdapterEvent::Typing {
+            protocol: ProtocolId::Telegram,
+            conversation_id: chat.into(),
+            topic,
+            sender_id: format!("user:{who}"),
+            sender: who.into(),
+            typing: on,
+        }
+    }
+
+    /// A person who types shows over the open thread until a stop, or 6 s
+    /// with no event. A person of another chat or topic does not show. The
+    /// end of the session forgets every typing state.
+    #[test]
+    fn a_person_who_types_shows_over_the_open_thread() {
+        let mut snapshot = telegram_chat_with_rows(&[(5, false)]);
+        let forum = Some(MessageTopic::Forum(3));
+        snapshot.apply(typing_event("telegram:2", None, "Bob", true));
+        snapshot.apply(typing_event("telegram:1", forum, "Cy", true));
+        assert_eq!(snapshot.typing_line(), None);
+        snapshot.apply(typing_event("telegram:1", None, "Ada", true));
+        assert_eq!(snapshot.typing_line().as_deref(), Some("Ada is typing…"));
+        snapshot.apply(typing_event("telegram:1", None, "Di", true));
+        assert_eq!(
+            snapshot.typing_line().as_deref(),
+            Some("Ada and Di are typing…")
+        );
+        snapshot.apply(typing_event("telegram:1", None, "Ada", false));
+        assert_eq!(snapshot.typing_line().as_deref(), Some("Di is typing…"));
+
+        let mut message = telegram_text(1, 6, "Hello");
+        message.sender = "Di".into();
+        message.arrival = thinwire_protocol::Arrival::Live;
+        snapshot.apply(typing_event("telegram:1", None, "Ada", true));
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        assert_eq!(
+            snapshot.typing_line().as_deref(),
+            Some("Ada is typing…"),
+            "the message of Di ends the typing of Di"
+        );
+
+        let now = Instant::now();
+        assert!(!snapshot.expire_typing(now));
+        assert!(snapshot.expire_typing(now + Duration::from_secs(7)));
+        assert_eq!(snapshot.typing_line(), None);
+
+        snapshot.apply(typing_event("telegram:1", None, "Ada", true));
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Unlinked,
+        });
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: test_support::telegram_chat(1, "Ada", 1),
+        });
+        snapshot.select_conversation("telegram:1".into());
+        assert_eq!(snapshot.typing_line(), None);
     }
 
     /// A Telegram chat "Ada" with messages 5, 6, and 7, and a second chat
@@ -13775,6 +14040,174 @@ mod tests {
             )),
             "the helper is asked for the older page"
         );
+    }
+
+    #[test]
+    fn a_retained_signal_chat_loads_every_same_second_page() {
+        use thinwire_protocol::signal_retained_chat_id;
+
+        let base = 1_700_000_000_000u64;
+        assert_eq!(
+            base / 1_000,
+            (base + 5) / 1_000,
+            "every row shares one Unix second"
+        );
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Signal,
+            state: AccountState::Linked,
+        });
+        let id = signal_retained_chat_id(1, "ada");
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Signal, &id, false),
+        });
+        let row = |millis: u64, body: &str| ChatMessage {
+            protocol: ProtocolId::Signal,
+            conversation_id: id.clone(),
+            id: format!("{millis}:ada"),
+            sender: "Ada".into(),
+            body: body.into(),
+            outbound: false,
+            delivery: Delivery::Sent,
+            sent_at: i64::try_from(millis / 1_000).expect("seconds"),
+            arrival: thinwire_protocol::Arrival::History,
+            topic: None,
+            links: Vec::new(),
+            photo: None,
+            audio: None,
+            video: None,
+            file: None,
+            reactions: Vec::new(),
+            reply_to: None,
+            edited: false,
+        };
+        let pages = [
+            [(base + 4, "e"), (base + 5, "f")],
+            [(base + 2, "c"), (base + 3, "d")],
+            [(base, "a"), (base + 1, "b")],
+        ];
+        for (millis, body) in pages[0] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: row(millis, body),
+            });
+        }
+        snapshot.selected_protocol = ProtocolId::Signal;
+        snapshot.selected_signal_retained = Some(1);
+        snapshot.selected_conversation = Some(id.clone());
+        snapshot.compose = "hello".into();
+        assert!(!snapshot.can_send(), "a retained chat cannot send");
+        let now = Instant::now();
+        let asked = |snapshot: &mut Snapshot| {
+            snapshot.load_older_at(now);
+            let commands = snapshot.take_commands();
+            assert!(
+                commands.iter().all(|command| !matches!(
+                    command,
+                    AdapterCommand::SendText { .. }
+                        | AdapterCommand::SendMedia { .. }
+                        | AdapterCommand::SendTopicText { .. }
+                        | AdapterCommand::ResendMessage { .. }
+                )),
+                "paging does not send: {commands:?}"
+            );
+            commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    AdapterCommand::LoadOlderMessages {
+                        before_message_id, ..
+                    } => Some(before_message_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(asked(&mut snapshot), vec![format!("{}:ada", base + 4)]);
+        for (millis, body) in pages[1] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: row(millis, body),
+            });
+        }
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: id.clone(),
+            before_message_id: format!("{}:ada", base + 4),
+            more: true,
+            note: None,
+            topic: None,
+            store_cursor: None,
+        });
+        assert_eq!(snapshot.older_state(), OlderState::Idle);
+        assert_eq!(asked(&mut snapshot), vec![format!("{}:ada", base + 2)]);
+        for (millis, body) in pages[2] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: row(millis, body),
+            });
+        }
+        snapshot.apply(AdapterEvent::OlderHistoryLoaded {
+            protocol: ProtocolId::Signal,
+            conversation_id: id,
+            before_message_id: format!("{}:ada", base + 2),
+            more: false,
+            note: None,
+            topic: None,
+            store_cursor: None,
+        });
+        let bodies: Vec<_> = snapshot
+            .selected_messages()
+            .iter()
+            .map(|message| message.body.as_str())
+            .collect();
+        assert_eq!(bodies, ["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(snapshot.older_state(), OlderState::StartOfChat);
+        assert!(
+            asked(&mut snapshot).is_empty(),
+            "the start of the chat asks for nothing"
+        );
+        assert!(!snapshot.can_send(), "a retained chat cannot send");
+    }
+
+    #[test]
+    fn telegram_rows_in_one_second_keep_message_id_order() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        let chat_id = "telegram:1";
+        snapshot.apply(AdapterEvent::ConversationUpsert {
+            conversation: chat(ProtocolId::Telegram, chat_id, true),
+        });
+        snapshot.selected_protocol = ProtocolId::Telegram;
+        snapshot.selected_conversation = Some(chat_id.into());
+        for (message_id, body) in [("telegram:1:50", "later"), ("telegram:1:40", "earlier")] {
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: ChatMessage {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id: chat_id.into(),
+                    id: message_id.into(),
+                    sender: "Ada".into(),
+                    body: body.into(),
+                    outbound: false,
+                    delivery: Delivery::Sent,
+                    sent_at: 1_700_000_000,
+                    arrival: thinwire_protocol::Arrival::History,
+                    topic: None,
+                    links: Vec::new(),
+                    photo: None,
+                    audio: None,
+                    video: None,
+                    file: None,
+                    reactions: Vec::new(),
+                    reply_to: None,
+                    edited: false,
+                },
+            });
+        }
+        let ids: Vec<_> = snapshot
+            .selected_messages()
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect();
+        assert_eq!(ids, ["telegram:1:40", "telegram:1:50"]);
     }
 
     /// A slot that the next publish does not send is removed.

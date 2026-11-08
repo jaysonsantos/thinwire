@@ -29,7 +29,7 @@ jobs:
       image: archlinux:base-devel@sha256:2de80105abb49f813a85393c6758a4334deb6bcec4a2411bd2f059c0bee6ee4c
     steps:
       - name: Install the tools
-        run: pacman -Syu --noconfirm --needed git openssh pacman-contrib
+        run: pacman -Syu --noconfirm --needed git jq openssh pacman-contrib
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,4 +38,5 @@ jobs:
       - name: Update the AUR package
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: scripts/aur-nightly.sh

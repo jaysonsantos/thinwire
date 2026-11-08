@@ -172,7 +172,9 @@ pub(crate) fn command_to_wire(
         // A helper has no edit yet (#519, #520).
         | AdapterCommand::EditMessage { .. }
         // A helper has no forward yet (#533, #534).
-        | AdapterCommand::ForwardMessages { .. } => return None,
+        | AdapterCommand::ForwardMessages { .. }
+        // A helper sends no typing state yet (#524, #525).
+        | AdapterCommand::SetTyping { .. } => return None,
     })
 }
 

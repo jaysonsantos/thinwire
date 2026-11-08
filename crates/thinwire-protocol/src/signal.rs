@@ -28,6 +28,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     pages_history: true,
     sends_media: true,
     message_actions: crate::MessageActions::NONE,
+    typing: false,
 };
 
 /// File name of the Signal helper program, without `.exe`.
@@ -132,6 +133,20 @@ pub fn signal_retained_slot(conversation_id: &str) -> Option<u32> {
     slot.parse().ok().filter(|slot| *slot > 0)
 }
 
+/// Store millisecond of a Signal message id `{millis}:{sender}`.
+///
+/// `None` when the text before the first colon is missing, empty, or not
+/// a base-10 integer. A leading `+` is `None`. The sender may contain
+/// colons, as in `{millis}:pni:{uuid}`.
+#[must_use]
+pub fn signal_store_millis(message_id: &str) -> Option<u64> {
+    let millis = message_id.split_once(':')?.0;
+    if millis.is_empty() || !millis.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    millis.parse().ok()
+}
+
 /// The capabilities of the client in the helper. The account row shows them
 /// also while no helper runs.
 const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
@@ -155,6 +170,8 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
         // The helper has no forward yet (#534).
         forward: false,
     },
+    // The helper has no typing yet (#525).
+    typing: false,
 };
 
 /// The Signal adapter of a `signal-local` build: it runs the AGPL client in
@@ -366,5 +383,21 @@ mod tests {
                 .contains("reliable"),
             "the unreadable line must not call Signal reliable"
         );
+    }
+
+    #[test]
+    fn a_signal_store_millis_reads_the_text_before_the_colon() {
+        assert_eq!(
+            signal_store_millis("1700000000123:ada"),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(
+            signal_store_millis("1700000000123:pni:uuid"),
+            Some(1_700_000_000_123)
+        );
+        assert_eq!(signal_store_millis("retained:1:ada"), None);
+        assert_eq!(signal_store_millis(""), None);
+        assert_eq!(signal_store_millis("+1:ada"), None);
+        assert_eq!(signal_store_millis("telegram:1:50"), None);
     }
 }
