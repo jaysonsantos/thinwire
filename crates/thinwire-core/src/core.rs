@@ -4573,10 +4573,9 @@ mod tests {
     }
 
     /// A thread with no subscriber of its own can rebuild the callsite cache
-    /// and store "never" for every line. This is the process fallback. It
-    /// records nothing, and it answers "sometimes", so the capturing thread
-    /// still decides. `set_global_default` sticks for the process. A later
-    /// call fails, and the first subscriber stays.
+    /// and store "never" for every line. The capturing thread still decides.
+    /// `set_global_default` sticks for the process. A later call fails, and
+    /// the first subscriber stays.
     fn keep_callsite_interest() {
         struct Fallback;
 
