@@ -19,14 +19,9 @@ use super::Backend;
 const OPUS_MAX_FRAME: usize = 5760;
 const OPUS_RATE: u32 = 48_000;
 const END_POLL: Duration = Duration::from_millis(50);
-/// PCM kept for one note. 48 kHz `f32` mono is 11.52 MB a minute, so half an
-/// hour is about 346 MB. A decode past this is refused.
 const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DECODED_SAMPLES: usize = MAX_DECODED_BYTES / std::mem::size_of::<f32>();
-/// Samples between command checks. 960 is one 20 ms frame at 48 kHz.
-/// Symphonia yields one sample at a time, and a check on each one would
-/// take the channel lock that often.
-const SYMPHONIA_POLL_SAMPLES: usize = 960;
+const DECODE_POLL_SAMPLES: usize = 960;
 
 pub(crate) enum Cmd {
     Play { path: AudioPath, generation: u64 },
@@ -348,7 +343,7 @@ where
         }
         data.push(sample);
         since += 1;
-        if since == SYMPHONIA_POLL_SAMPLES {
+        if since == DECODE_POLL_SAMPLES {
             since = 0;
             if matches!(pace(), Pace::Halt) {
                 return Decoded::Cut;
@@ -521,9 +516,6 @@ mod tests {
         ));
     }
 
-    /// Signal voice notes are AAC, in M4A or in ADTS. Audio files can be
-    /// MP3. Each one decodes through the path that the player uses. The
-    /// samples are 0.4 s of a 440 Hz tone, made with ffmpeg.
     #[test]
     fn aac_and_mp3_files_decode_for_the_player() {
         let dir = std::env::temp_dir()
