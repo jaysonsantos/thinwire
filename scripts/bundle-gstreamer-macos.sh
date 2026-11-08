@@ -7,9 +7,10 @@
 # nothing when Contents/MacOS/thinwire does not link libgstreamer, so a build
 # with no `video` feature stages as before.
 #
-# The runtime goes to Contents/Frameworks/GStreamer: the libraries in lib/,
-# the plugins in lib/gstreamer-1.0/. The app scans that plugin folder at
-# start (crates/thinwire/src/app/video/player.rs). Only the plugins in
+# The libraries go to Contents/Frameworks and the plugins to Contents/PlugIns,
+# with no subfolder: codesign reads a folder in these places as a nested
+# bundle. The app scans Contents/PlugIns at start
+# (crates/thinwire/src/app/video/player.rs). Only the plugins in
 # `plugins` below are copied, with the libraries that they need. All of them
 # are LGPL GStreamer parts or permissive libraries. No plugin of
 # gst-plugins-ugly, no GPL plugin, and no x264 is copied. Each library is
@@ -22,8 +23,9 @@ gst_root="${2:-/Library/Frameworks/GStreamer.framework/Versions/1.0}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 binary="$app/Contents/MacOS/thinwire"
-dest="$app/Contents/Frameworks/GStreamer"
-rpath="@executable_path/../Frameworks/GStreamer/lib"
+frameworks="$app/Contents/Frameworks"
+plugin_dir="$app/Contents/PlugIns"
+rpath="@executable_path/../Frameworks"
 
 # playbin with an appsink, MP4 and WebM, H.264, H.265 and AAC through
 # VideoToolbox and AudioToolbox (applemedia), Opus, VP8 and VP9.
@@ -58,7 +60,15 @@ if [[ ! -f "$gst_root/lib/libgstreamer-1.0.0.dylib" ]]; then
 fi
 
 arch="$(uname -m)"
-mkdir -p "$dest/lib/gstreamer-1.0"
+mkdir -p "$frameworks" "$plugin_dir"
+
+# The place in the bundle of a file of <GStreamer root>/lib.
+bundle_path() {
+  case "$1" in
+    gstreamer-1.0/*) printf '%s\n' "$plugin_dir/${1#gstreamer-1.0/}" ;;
+    *) printf '%s\n' "$frameworks/$1" ;;
+  esac
+}
 
 # The @rpath/ names that a Mach-O file links, one for each line.
 rpath_deps() {
@@ -111,7 +121,8 @@ while ((${#queue[@]} > 0)); do
     echo "::error::GStreamer file ${rel} is missing in ${gst_root}/lib."
     exit 1
   fi
-  copy_thin "$src" "$dest/lib/$rel"
+  dst="$(bundle_path "$rel")"
+  copy_thin "$src" "$dst"
   copied+="${rel}"$'\n'
   count=$((count + 1))
   while IFS= read -r dep; do
@@ -122,7 +133,16 @@ while ((${#queue[@]} > 0)); do
     if ! was_copied "$dep"; then
       queue+=("$dep")
     fi
-  done < <(rpath_deps "$dest/lib/$rel")
+  done < <(rpath_deps "$dst")
+  # Remove each rpath of the framework, then add the one folder of the
+  # libraries in the bundle.
+  while IFS= read -r entry; do
+    install_name_tool -delete_rpath "$entry" "$dst"
+  done < <(rpaths_of "$dst")
+  case "$rel" in
+    gstreamer-1.0/*) install_name_tool -add_rpath "@loader_path/../Frameworks" "$dst" ;;
+    *) install_name_tool -add_rpath "@loader_path" "$dst" ;;
+  esac
 done
 
 # The app finds the libraries in the bundle only. Remove a build path.
@@ -138,11 +158,6 @@ fi
 # Each copied file links only the bundle and the system.
 status=0
 while IFS= read -r -d '' file; do
-  while IFS= read -r entry; do
-    if [[ "$entry" != @* ]]; then
-      install_name_tool -delete_rpath "$entry" "$file"
-    fi
-  done < <(rpaths_of "$file")
   while IFS= read -r line; do
     case "$line" in
       @rpath/* | /usr/lib/* | /System/*) ;;
@@ -153,12 +168,12 @@ while IFS= read -r -d '' file; do
     esac
   done < <(otool -L "$file" | awk 'NR > 1 { print $1 }')
   while IFS= read -r dep; do
-    if [[ ! -f "$dest/lib/$dep" && ! -f "$dest/lib/gstreamer-1.0/$dep" ]]; then
+    if [[ ! -f "$frameworks/$dep" && ! -f "$plugin_dir/$dep" ]]; then
       echo "::error::${file#"$app"/} links @rpath/${dep}, which is not in the bundle."
       status=1
     fi
   done < <(rpath_deps "$file")
-done < <(find "$dest" -type f -name '*.dylib' -print0)
+done < <(find "$frameworks" "$plugin_dir" -type f -name '*.dylib' -print0)
 if [[ "$status" -ne 0 ]]; then
   exit 1
 fi
@@ -169,4 +184,4 @@ for notice in "$repo_root"/third_party/gstreamer/*; do
   cp "$notice" "$notices/gstreamer-$(basename "$notice")"
 done
 
-echo "GStreamer: bundled ${count} files ($(du -sh "$dest" | cut -f1)) from ${gst_root}"
+echo "GStreamer: bundled ${count} files ($(du -csh "$frameworks" "$plugin_dir" | tail -1 | cut -f1)) from ${gst_root}"

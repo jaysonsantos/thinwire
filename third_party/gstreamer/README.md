@@ -1,12 +1,12 @@
 # GStreamer runtime in Thinwire.app
 
-The macOS app plays videos with GStreamer (ADR `0015`). `scripts/bundle-gstreamer-macos.sh` copies a small part of the official GStreamer 1.28.8 framework into `Thinwire.app/Contents/Frameworks/GStreamer`. The app links these libraries dynamically. You can replace each library with a compatible build of the same version.
+The macOS app plays videos with GStreamer (ADR `0015`). `scripts/bundle-gstreamer-macos.sh` copies a small part of the official GStreamer 1.28.8 framework into `Thinwire.app`: the libraries into `Contents/Frameworks` and the plugins into `Contents/PlugIns`. The app links these libraries dynamically. You can replace each library with a compatible build of the same version.
 
 ## Parts and licenses
 
 | Part | Files | License | Text |
 | --- | --- | --- | --- |
-| GStreamer core, base, good, and bad (libraries and plugins) | `libgst*.dylib`, `gstreamer-1.0/libgst*.dylib` | LGPL-2.1-or-later | `LGPL-2.1.txt` |
+| GStreamer core, base, good, and bad (libraries and plugins) | `Frameworks/libgst*.dylib`, `PlugIns/libgst*.dylib` | LGPL-2.1-or-later | `LGPL-2.1.txt` |
 | GLib, GObject, GModule, GIO | `libglib-2.0`, `libgobject-2.0`, `libgmodule-2.0`, `libgio-2.0` | LGPL-2.1-or-later | `LGPL-2.1.txt` |
 | gettext runtime | `libintl` | LGPL-2.1-or-later | `LGPL-2.1.txt` |
 | ORC | `liborc-0.4` | BSD-2-Clause | `orc-COPYING.txt` |

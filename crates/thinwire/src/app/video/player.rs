@@ -202,7 +202,7 @@ fn bundle_plugin_dir(exe: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// The plugin folder in `Contents`, as `scripts/stage-os-artifact.sh` makes it.
-const BUNDLE_PLUGIN_DIR: &str = "Frameworks/GStreamer/lib/gstreamer-1.0";
+const BUNDLE_PLUGIN_DIR: &str = "PlugIns";
 
 /// Start GStreamer one time. A local build that runs outside its Nix
 /// shell does not see the shell plugins, and `playbin` is in one of them.
@@ -277,13 +277,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_bundle_plugin_folder_is_in_the_framework_of_the_app() {
+    fn the_bundle_plugin_folder_is_the_plugins_folder_of_the_app() {
         let exe = Path::new("/Applications/Thinwire.app/Contents/MacOS/thinwire");
         assert_eq!(
             bundle_plugin_dir(exe).as_deref(),
-            Some(Path::new(
-                "/Applications/Thinwire.app/Contents/Frameworks/GStreamer/lib/gstreamer-1.0"
-            ))
+            Some(Path::new("/Applications/Thinwire.app/Contents/PlugIns"))
         );
         assert_eq!(bundle_plugin_dir(Path::new("thinwire")), None);
     }
