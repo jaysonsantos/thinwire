@@ -20,6 +20,7 @@ pub const WORKSPACE_BOT_SCOPES: &[&str] = &[
     "channels:history",
     "channels:read",
     "chat:write",
+    "files:read",
     "groups:history",
     "groups:read",
     "im:history",
@@ -263,6 +264,7 @@ mod tests {
         assert!(url.contains("state=state-test"));
         assert!(url.contains("scope="));
         assert!(url.contains("chat%3Awrite"));
+        assert!(url.contains("files%3Aread"));
         assert!(url.contains("redirect_uri="));
         assert!(url.contains("127.0.0.1"));
         assert!(url.contains("8976"));

@@ -2094,6 +2094,7 @@ mod tests {
             username: None,
             text: "x".into(),
             client_msg_id: Some("client-1".into()),
+            files: Vec::new(),
         };
         assert!(same_post("1700000001.000100", Some("client-1"), &post));
         assert!(same_post("1700000001.000200", None, &post));

@@ -1,7 +1,7 @@
 //! In-process Slack fakes and inbox tests. No network except the loopback
 //! OAuth redirect, which the test drives like a browser would.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,10 +10,11 @@ use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::api::{
-    SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
-    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackHistoryPage,
-    SlackInbound, SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
+    FileRead, SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel,
+    SlackChannelKind, SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream,
+    SlackHistoryPage, SlackInbound, SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
 };
+use super::audio::FilesHostUrl;
 use super::credentials::SlackApiSource;
 use super::install::SlackInstalledWorkspace;
 use super::loopback::tests::get;
@@ -53,6 +54,9 @@ struct ApiState {
     users: HashMap<String, String>,
     posted: Vec<(String, String)>,
     next_ts: u64,
+    /// Scripted `read_file` answers, first in is first out.
+    file_script: VecDeque<(u16, Vec<u8>)>,
+    file_calls: u32,
 }
 
 #[derive(Default)]
@@ -125,6 +129,7 @@ fn post(channel: &str, ts: &str, user: &str, text: &str) -> SlackPost {
         username: None,
         text: text.into(),
         client_msg_id: None,
+        files: Vec::new(),
     }
 }
 
@@ -273,6 +278,16 @@ impl SlackWebApi for FakeApi {
                 .get(user)
                 .cloned()
                 .ok_or_else(|| SlackApiError::api("user_not_found"))
+        })
+    }
+
+    async fn read_file(&self, token: &SlackBotToken, url: &FilesHostUrl) -> Result<FileRead, ()> {
+        Self::check_token(token);
+        let _ = url;
+        self.with(|state| {
+            state.file_calls += 1;
+            let (status, body) = state.file_script.pop_front().unwrap_or((404, Vec::new()));
+            Ok(FileRead { status, body })
         })
     }
 }

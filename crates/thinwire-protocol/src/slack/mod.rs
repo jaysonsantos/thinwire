@@ -8,6 +8,7 @@
 //! every build so default CI runs its tests against fakes.
 
 mod api;
+mod audio;
 mod credentials;
 #[cfg(test)]
 mod fake;
