@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::num::NonZero;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ const END_POLL: Duration = Duration::from_millis(50);
 /// hour is about 346 MB. A decode past this is refused.
 const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DECODED_SAMPLES: usize = MAX_DECODED_BYTES / std::mem::size_of::<f32>();
+const DECODE_POLL_SAMPLES: usize = 960;
 
 pub(crate) enum Cmd {
     Play { path: AudioPath, generation: u64 },
@@ -48,6 +49,64 @@ enum Wire {
     Play { path: AudioPath, generation: u64 },
     Stop,
     Shutdown,
+}
+
+struct WireRx {
+    rx: Receiver<Wire>,
+    held: Option<Wire>,
+}
+
+#[must_use = "Halt has taken a command into WireRx; return Cut or skip append"]
+enum Pace {
+    Go,
+    Halt,
+}
+
+enum Recv {
+    Cmd(Wire),
+    Timeout,
+    Dead,
+}
+
+impl WireRx {
+    fn new(rx: Receiver<Wire>) -> Self {
+        Self { rx, held: None }
+    }
+
+    fn poll(&mut self) -> Pace {
+        if self.held.is_some() {
+            return Pace::Halt;
+        }
+        match self.rx.try_recv() {
+            Ok(cmd) => {
+                self.held = Some(cmd);
+                Pace::Halt
+            }
+            Err(TryRecvError::Empty) => Pace::Go,
+            Err(TryRecvError::Disconnected) => {
+                self.held = Some(Wire::Shutdown);
+                Pace::Halt
+            }
+        }
+    }
+
+    fn recv(&mut self) -> Result<Wire, ()> {
+        if let Some(cmd) = self.held.take() {
+            return Ok(cmd);
+        }
+        self.rx.recv().map_err(|_| ())
+    }
+
+    fn recv_timeout(&mut self, wait: Duration) -> Recv {
+        if let Some(cmd) = self.held.take() {
+            return Recv::Cmd(cmd);
+        }
+        match self.rx.recv_timeout(wait) {
+            Ok(cmd) => Recv::Cmd(cmd),
+            Err(RecvTimeoutError::Timeout) => Recv::Timeout,
+            Err(RecvTimeoutError::Disconnected) => Recv::Dead,
+        }
+    }
 }
 
 pub(crate) struct Engine {
@@ -131,6 +190,7 @@ struct Output {
 }
 
 fn worker(rx: Receiver<Wire>, done: Sender<Done>) {
+    let mut cmds = WireRx::new(rx);
     let mut output = Output {
         player: None,
         sink: None,
@@ -138,23 +198,20 @@ fn worker(rx: Receiver<Wire>, done: Sender<Done>) {
     };
     loop {
         let incoming = if output.owes_end.is_some() {
-            match rx.recv_timeout(END_POLL) {
-                Ok(cmd) => Some(cmd),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
+            cmds.recv_timeout(END_POLL)
         } else {
-            match rx.recv() {
-                Ok(cmd) => Some(cmd),
-                Err(_) => break,
+            match cmds.recv() {
+                Ok(cmd) => Recv::Cmd(cmd),
+                Err(()) => Recv::Dead,
             }
         };
-        if let Some(cmd) = incoming {
-            match cmd {
-                Wire::Play { path, generation } => play(&mut output, &path, generation, &done),
-                Wire::Stop => stop(&mut output),
-                Wire::Shutdown => break,
+        match incoming {
+            Recv::Cmd(Wire::Play { path, generation }) => {
+                play(&mut output, &path, generation, &done, &mut cmds);
             }
+            Recv::Cmd(Wire::Stop) => stop(&mut output),
+            Recv::Cmd(Wire::Shutdown) | Recv::Dead => break,
+            Recv::Timeout => {}
         }
         if let Some(generation) = output.owes_end
             && output.player.as_ref().is_some_and(Sink::empty)
@@ -166,27 +223,48 @@ fn worker(rx: Receiver<Wire>, done: Sender<Done>) {
     }
 }
 
-fn play(output: &mut Output, path: &AudioPath, generation: u64, done: &Sender<Done>) {
+fn play(
+    output: &mut Output,
+    path: &AudioPath,
+    generation: u64,
+    done: &Sender<Done>,
+    cmds: &mut WireRx,
+) {
     stop(output);
-    let buffer = match read_voice(path) {
-        Ok(buffer) => buffer,
-        Err(()) => {
-            let _ = done.send(Done::Rejected { generation });
-            return;
-        }
-    };
-    if ensure_sink(output).is_err() {
-        tracing::warn!("voice output is unavailable");
-        let _ = done.send(Done::Rejected { generation });
+    if matches!(cmds.poll(), Pace::Halt) {
         return;
     }
-    let player = {
-        let sink = output.sink.as_ref().expect("sink");
-        Sink::connect_new(sink.mixer())
-    };
-    player.append(buffer);
-    output.player = Some(player);
-    output.owes_end = Some(generation);
+    match read_voice(path, || cmds.poll()) {
+        Decoded::Cut => {}
+        Decoded::Rejected => reject(cmds, done, generation),
+        Decoded::Buffer(buffer) => {
+            if matches!(cmds.poll(), Pace::Halt) {
+                return;
+            }
+            if ensure_sink(output).is_err() {
+                tracing::warn!("voice output is unavailable");
+                reject(cmds, done, generation);
+                return;
+            }
+            if matches!(cmds.poll(), Pace::Halt) {
+                return;
+            }
+            let player = {
+                let sink = output.sink.as_ref().expect("sink");
+                Sink::connect_new(sink.mixer())
+            };
+            player.append(buffer);
+            output.player = Some(player);
+            output.owes_end = Some(generation);
+        }
+    }
+}
+
+fn reject(cmds: &mut WireRx, done: &Sender<Done>, generation: u64) {
+    if matches!(cmds.poll(), Pace::Halt) {
+        return;
+    }
+    let _ = done.send(Done::Rejected { generation });
 }
 
 fn stop(output: &mut Output) {
@@ -207,64 +285,90 @@ fn ensure_sink(output: &mut Output) -> Result<(), ()> {
     }
 }
 
-fn read_voice(path: &AudioPath) -> Result<SamplesBuffer, ()> {
-    let file = match File::open(path.as_path()) {
-        Ok(file) => file,
-        Err(_) => {
-            tracing::warn!("voice file could not be read");
-            return Err(());
-        }
-    };
-    match voice_buffer(file) {
-        VoiceDecode::Opus(buffer) => return Ok(buffer),
-        VoiceDecode::Rejected => {
-            tracing::warn!("voice note is too large to play");
-            return Err(());
-        }
-        VoiceDecode::TryVorbis => {}
+fn read_voice(path: &AudioPath, mut pace: impl FnMut() -> Pace) -> Decoded {
+    if matches!(pace(), Pace::Halt) {
+        return Decoded::Cut;
     }
     let file = match File::open(path.as_path()) {
         Ok(file) => file,
         Err(_) => {
             tracing::warn!("voice file could not be read");
-            return Err(());
+            return Decoded::Rejected;
         }
     };
-    match Decoder::try_from(file)
-        .ok()
-        .and_then(|decoder| samples_from_decoder(decoder).ok())
-    {
-        Some(buffer) => Ok(buffer),
-        None => {
-            tracing::warn!("voice file could not be decoded");
-            Err(())
+    match voice_buffer(file, &mut pace) {
+        VoiceDecode::Cut => return Decoded::Cut,
+        VoiceDecode::Rejected => {
+            tracing::warn!("voice note is too large to play");
+            return Decoded::Rejected;
         }
+        VoiceDecode::Opus(buffer) => return Decoded::Buffer(buffer),
+        VoiceDecode::TryVorbis => {}
+    }
+    if matches!(pace(), Pace::Halt) {
+        return Decoded::Cut;
+    }
+    let file = match File::open(path.as_path()) {
+        Ok(file) => file,
+        Err(_) => {
+            tracing::warn!("voice file could not be read");
+            return Decoded::Rejected;
+        }
+    };
+    let decoder = match Decoder::try_from(file) {
+        Ok(decoder) => decoder,
+        Err(_) => {
+            tracing::warn!("voice file could not be decoded");
+            return Decoded::Rejected;
+        }
+    };
+    match samples_from_decoder(decoder, &mut pace) {
+        Decoded::Rejected => {
+            tracing::warn!("voice file could not be decoded");
+            Decoded::Rejected
+        }
+        decoded => decoded,
     }
 }
 
-fn samples_from_decoder<R>(decoder: Decoder<R>) -> Result<SamplesBuffer, ()>
+fn samples_from_decoder<R>(decoder: Decoder<R>, mut pace: impl FnMut() -> Pace) -> Decoded
 where
     R: Read + Seek + Send + 'static,
 {
     let channels = decoder.channels();
     let rate = decoder.sample_rate();
     let mut data = Vec::new();
+    let mut since = 0usize;
     for sample in decoder {
         if data.len() >= MAX_DECODED_SAMPLES {
-            return Err(());
+            return Decoded::Rejected;
         }
         data.push(sample);
+        since += 1;
+        if since == DECODE_POLL_SAMPLES {
+            since = 0;
+            if matches!(pace(), Pace::Halt) {
+                return Decoded::Cut;
+            }
+        }
     }
     if data.is_empty() || !data.len().is_multiple_of(channels.get() as usize) {
-        return Err(());
+        return Decoded::Rejected;
     }
-    Ok(SamplesBuffer::new(channels, rate, data))
+    Decoded::Buffer(SamplesBuffer::new(channels, rate, data))
+}
+
+enum Decoded {
+    Buffer(SamplesBuffer),
+    Rejected,
+    Cut,
 }
 
 enum VoiceDecode {
     Opus(SamplesBuffer),
     TryVorbis,
     Rejected,
+    Cut,
 }
 
 struct OpusHead {
@@ -272,11 +376,15 @@ struct OpusHead {
     pre_skip: u16,
 }
 
-fn voice_buffer(reader: impl Read + Seek) -> VoiceDecode {
-    decode_opus(reader, MAX_DECODED_SAMPLES)
+fn voice_buffer(reader: impl Read + Seek, pace: &mut impl FnMut() -> Pace) -> VoiceDecode {
+    decode_opus(reader, MAX_DECODED_SAMPLES, pace)
 }
 
-fn decode_opus(reader: impl Read + Seek, max_samples: usize) -> VoiceDecode {
+fn decode_opus(
+    reader: impl Read + Seek,
+    max_samples: usize,
+    mut pace: impl FnMut() -> Pace,
+) -> VoiceDecode {
     let mut reader = ogg::PacketReader::new(reader);
     let head = match reader.read_packet() {
         Ok(Some(packet)) => packet,
@@ -301,6 +409,9 @@ fn decode_opus(reader: impl Read + Seek, max_samples: usize) -> VoiceDecode {
     let mut produced = 0usize;
     let mut checked_tags = false;
     loop {
+        if matches!(pace(), Pace::Halt) {
+            return VoiceDecode::Cut;
+        }
         let packet = match reader.read_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
@@ -366,17 +477,24 @@ mod tests {
 
     use thinwire_protocol::AudioPath;
 
-    use super::{MAX_DECODED_SAMPLES, VoiceDecode, decode_opus, read_voice, voice_buffer};
+    use super::super::Backend;
+    use super::{
+        Decoded, MAX_DECODED_SAMPLES, Pace, VoiceDecode, decode_opus, read_voice, voice_buffer,
+    };
 
     #[test]
     fn bytes_that_are_not_ogg_opus_are_refused() {
         let junk = Cursor::new(b"not a voice note".to_vec());
-        assert!(matches!(voice_buffer(junk), VoiceDecode::TryVorbis));
+        assert!(matches!(
+            voice_buffer(junk, &mut || Pace::Go),
+            VoiceDecode::TryVorbis
+        ));
     }
 
     #[test]
     fn an_ogg_opus_page_decodes_without_opening_a_device() {
-        let VoiceDecode::Opus(buffer) = voice_buffer(Cursor::new(ogg_opus(1))) else {
+        let VoiceDecode::Opus(buffer) = voice_buffer(Cursor::new(ogg_opus(1)), &mut || Pace::Go)
+        else {
             panic!("opus");
         };
         assert_eq!(buffer.channels().get(), 1);
@@ -387,13 +505,15 @@ mod tests {
     #[test]
     fn a_note_past_the_decode_cap_is_refused() {
         let bytes = ogg_opus(4);
-        let VoiceDecode::Opus(buffer) = decode_opus(Cursor::new(bytes.clone()), usize::MAX) else {
+        let VoiceDecode::Opus(buffer) =
+            decode_opus(Cursor::new(bytes.clone()), usize::MAX, || Pace::Go)
+        else {
             panic!("opus");
         };
         let count = buffer.into_iter().count();
         assert!(count > 1);
         assert!(matches!(
-            decode_opus(Cursor::new(bytes), count - 1),
+            decode_opus(Cursor::new(bytes), count - 1, || Pace::Go),
             VoiceDecode::Rejected
         ));
     }
@@ -415,11 +535,102 @@ mod tests {
             let path = dir.join(name);
             std::fs::write(&path, bytes).expect("write");
             let audio = AudioPath::new(path.to_string_lossy().into_owned()).expect("path");
-            let buffer = read_voice(&audio).unwrap_or_else(|()| panic!("{name} decodes"));
+            let Decoded::Buffer(buffer) = read_voice(&audio, || Pace::Go) else {
+                panic!("{name} decodes");
+            };
             assert_eq!(buffer.channels().get(), 1, "{name}");
             assert!(buffer.into_iter().count() > 1_000, "{name} has samples");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_play_and_shutdown_do_not_wait_for_the_rest_of_a_long_decode() {
+        let (bytes, decode) = long_enough_opus();
+        let dir = std::env::temp_dir()
+            .join("thinwire-engine-tests")
+            .join(format!("abort-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let long_path = dir.join("long.ogg");
+        std::fs::write(&long_path, &bytes).expect("write");
+        let long = AudioPath::new(long_path.to_string_lossy().into_owned()).expect("path");
+        let missing =
+            AudioPath::new(dir.join("missing.ogg").to_string_lossy().into_owned()).expect("path");
+        let mut late = Vec::new();
+
+        shutdown_during_decode(&long, decode, &mut late, "shutdown", |_| {});
+        shutdown_during_decode(&long, decode, &mut late, "stop", |engine| {
+            engine.send(super::Cmd::Stop);
+        });
+        shutdown_during_decode(&long, decode, &mut late, "play", |engine| {
+            engine.send(super::Cmd::Play {
+                path: missing,
+                generation: 2,
+            });
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(late.is_empty(), "{}", late.join("\n"));
+    }
+
+    fn shutdown_during_decode(
+        long: &AudioPath,
+        decode: std::time::Duration,
+        late: &mut Vec<String>,
+        what: &str,
+        then: impl FnOnce(&mut super::Engine),
+    ) {
+        let mut engine = super::Engine::new();
+        engine.send(super::Cmd::Play {
+            path: long.clone(),
+            generation: 1,
+        });
+        std::thread::sleep(decode / 5);
+        then(&mut engine);
+        let started = std::time::Instant::now();
+        engine.shutdown();
+        note_if_late(late, started.elapsed(), decode, what);
+        while let Some(done) = engine.take_done() {
+            if done.generation() == 1 {
+                late.push(format!("{what} reported generation 1"));
+            }
+        }
+    }
+
+    fn note_if_late(
+        late: &mut Vec<String>,
+        waited: std::time::Duration,
+        decode: std::time::Duration,
+        what: &str,
+    ) {
+        let limit = decode / 4;
+        if waited >= limit {
+            late.push(format!(
+                "{what} waited {waited:?} for a note whose decode takes {decode:?}"
+            ));
+        }
+    }
+
+    fn long_enough_opus() -> (Vec<u8>, std::time::Duration) {
+        let mut frames = 16_000usize;
+        loop {
+            let bytes = ogg_opus(frames);
+            let started = std::time::Instant::now();
+            let decoded = decode_opus(Cursor::new(bytes.clone()), usize::MAX, || Pace::Go);
+            let decode = started.elapsed();
+            assert!(
+                matches!(decoded, VoiceDecode::Opus(_)),
+                "the baseline note must decode"
+            );
+            if decode >= std::time::Duration::from_millis(500) {
+                return (bytes, decode);
+            }
+            frames = frames.saturating_mul(2);
+            assert!(
+                frames <= 1_024_000,
+                "could not build a decode long enough to measure"
+            );
+        }
     }
 
     #[test]
