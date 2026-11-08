@@ -8,16 +8,23 @@ use base64::Engine;
 use ed25519_dalek::VerifyingKey;
 
 use super::machine::{
-    self, ArchiveFile, BuildId, Feed, MAX_APPCAST, MAX_DOWNLOAD, Offer, developer_id_text,
-    follow_redirect,
+    self, ArchiveFile, BuildId, Feed, MAX_APPCAST, MAX_DOWNLOAD, MAX_RELEASE_JSON, Offer,
+    developer_id_text, follow_redirect,
 };
 use super::{BAD_SIGNATURE, CHECK_FAILED, NOT_WRITABLE, PlainError, SWAP_FAILED};
 
 const NIGHTLY_ARCH: &str = "aarch64";
-const APPCAST_URL: &str =
-    "https://github.com/jaysonsantos/thinwire/releases/download/nightly/appcast.xml";
-const APPCAST_SIG_URL: &str =
-    "https://github.com/jaysonsantos/thinwire/releases/download/nightly/appcast.ed25519";
+/// The nightly release, read through the REST API. The download URL of a
+/// release asset is cached for many minutes, and `appcast.xml` and
+/// `appcast.ed25519` keep their names on every nightly. Through the download
+/// URL, a new feed can come with an old signature. The API is never stale.
+const RELEASE_API_URL: &str =
+    "https://api.github.com/repos/jaysonsantos/thinwire/releases/tags/nightly";
+const GITHUB_JSON: &str = "application/vnd.github+json";
+const ASSET_BYTES: &str = "application/octet-stream";
+/// The GitHub API refuses a request without a User-Agent.
+const USER_AGENT: &str = concat!("thinwire/", env!("CARGO_PKG_VERSION"));
+const FEED_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) enum Gate {
     NotClient,
@@ -49,14 +56,33 @@ pub(super) fn gate() -> Gate {
 }
 
 pub(super) fn fetch_feed(_our: &BuildId) -> Result<Feed, PlainError> {
-    let appcast = match https_bytes(APPCAST_URL, MAX_APPCAST as u64, Duration::from_secs(30)) {
+    let assets = match https_bytes(
+        RELEASE_API_URL,
+        GITHUB_JSON,
+        MAX_RELEASE_JSON as u64,
+        FEED_TIMEOUT,
+    )
+    .and_then(|json| machine::feed_assets(&json))
+    {
+        Ok(assets) => assets,
+        Err(error) => {
+            log_kind("check_failed");
+            return Err(error);
+        }
+    };
+    let appcast = match https_bytes(
+        &assets.appcast,
+        ASSET_BYTES,
+        MAX_APPCAST as u64,
+        FEED_TIMEOUT,
+    ) {
         Ok(bytes) => bytes,
         Err(error) => {
             log_kind("check_failed");
             return Err(error);
         }
     };
-    let signature_text = match https_bytes(APPCAST_SIG_URL, 1024, Duration::from_secs(30)) {
+    let signature_text = match https_bytes(&assets.signature, ASSET_BYTES, 1024, FEED_TIMEOUT) {
         Ok(bytes) => bytes,
         Err(error) => {
             log_kind("check_failed");
@@ -293,8 +319,13 @@ fn agent(total: Duration) -> ureq::Agent {
         .build()
 }
 
-fn https_bytes(start: &str, cap: u64, total: Duration) -> Result<Vec<u8>, PlainError> {
-    let response = fetch(start, total)?;
+fn https_bytes(
+    start: &str,
+    accept: &str,
+    cap: u64,
+    total: Duration,
+) -> Result<Vec<u8>, PlainError> {
+    let response = fetch(start, accept, total)?;
     if let Some(header) = response.header("content-length") {
         let len: u64 = header.trim().parse().map_err(|_| CHECK_FAILED)?;
         if len > cap {
@@ -317,7 +348,7 @@ fn stream_to(start: &str, declared: u64, dest: &Path) -> Result<u64, PlainError>
     if declared == 0 || declared > MAX_DOWNLOAD {
         return Err(CHECK_FAILED);
     }
-    let response = fetch(start, Duration::from_secs(15 * 60))?;
+    let response = fetch(start, ASSET_BYTES, Duration::from_secs(15 * 60))?;
     if let Some(header) = response.header("content-length") {
         let len: u64 = header.trim().parse().map_err(|_| CHECK_FAILED)?;
         if len != declared {
@@ -343,7 +374,7 @@ fn stream_to(start: &str, declared: u64, dest: &Path) -> Result<u64, PlainError>
     Ok(written)
 }
 
-fn fetch(start: &str, total: Duration) -> Result<ureq::Response, PlainError> {
+fn fetch(start: &str, accept: &str, total: Duration) -> Result<ureq::Response, PlainError> {
     if !start.starts_with("https://") {
         return Err(CHECK_FAILED);
     }
@@ -351,7 +382,12 @@ fn fetch(start: &str, total: Duration) -> Result<ureq::Response, PlainError> {
     let mut current = start.to_string();
     let mut hops = 0u32;
     loop {
-        let response = agent.get(&current).call().map_err(|_| CHECK_FAILED)?;
+        let response = agent
+            .get(&current)
+            .set("accept", accept)
+            .set("user-agent", USER_AGENT)
+            .call()
+            .map_err(|_| CHECK_FAILED)?;
         let status = response.status();
         if (300..400).contains(&status) {
             let location = response.header("location").ok_or(CHECK_FAILED)?.to_string();

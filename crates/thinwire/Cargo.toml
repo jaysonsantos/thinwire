@@ -100,6 +100,10 @@ tracing-subscriber.workspace = true
 # is already on the Signal feature (ADR 0013 license list is unchanged).
 qrcode = { version = "0.14", optional = true, default-features = false }
 ed25519-dalek = "3"
+# The update check reads the release JSON of the GitHub API. thinwire-ipc
+# already links both crates, so the app gets no new crate.
+serde.workspace = true
+serde_json.workspace = true
 base64 = "0.22"
 quick-xml = "0.38"
 tar = "0.4"

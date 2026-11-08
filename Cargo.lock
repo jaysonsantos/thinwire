@@ -7921,6 +7921,8 @@ dependencies = [
  "qrcode",
  "quick-xml 0.38.4",
  "rodio",
+ "serde",
+ "serde_json",
  "tar",
  "thinwire-core",
  "thinwire-notify",
