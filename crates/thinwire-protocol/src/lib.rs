@@ -140,6 +140,48 @@ pub(crate) fn registry(
     adapters
 }
 
+/// A thread with no subscriber of its own can rebuild the callsite cache
+/// and store "never" for every line. This is the process fallback. It
+/// records nothing, and it answers "sometimes", so the capturing thread
+/// still decides. `set_global_default` sticks for the process. A later
+/// call fails, and the first subscriber stays.
+#[cfg(test)]
+fn keep_callsite_interest() {
+    struct Fallback;
+
+    impl tracing::Subscriber for Fallback {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+    }
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(Fallback);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
