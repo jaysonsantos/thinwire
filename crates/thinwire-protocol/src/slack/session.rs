@@ -146,7 +146,6 @@ enum ClipResult {
     Failed(VoiceStop),
 }
 
-/// A cancelled download still reports a miss, so the spinner stops.
 struct ClipFinish {
     jobs: UnboundedSender<Job>,
     file_id: i32,
@@ -339,16 +338,9 @@ where
     deduped: HashMap<String, Vec<Deduped>>,
     /// Wall time of the last walk of every channel in `deduped`.
     dedup_swept_at: Option<i64>,
-    /// Playable file address for a handle. The download task is the only reader.
     clips: HashMap<i32, FilesHostUrl>,
-    /// A handle whose GET is already running.
     inflight: HashSet<i32>,
-    /// Folder of `{handle}.audio`. One folder in a real run. Each test session
-    /// gets its own, because a start clears the folder and the suite runs
-    /// sessions in parallel.
     voice_dir: Option<PathBuf>,
-    /// Completes after the start clear finishes. The session reads no job
-    /// before that, so a download cannot write a file the clear then deletes.
     voice_clear: Option<oneshot::Receiver<()>>,
 }
 
@@ -1793,14 +1785,11 @@ async fn fetch_clip(
                 _ => ClipResult::Failed(VoiceStop::Unplayable),
             }
         }
-        FetchClass::FilesUnread => ClipResult::Failed(VoiceStop::SlackFilesUnread),
+        FetchClass::FilesUnread => ClipResult::Failed(VoiceStop::SlackFilesDenied),
         FetchClass::Miss => ClipResult::Failed(VoiceStop::Unplayable),
     }
 }
 
-/// The player folder. A real run uses one cache folder for every Slack
-/// account. A test uses a fresh directory under the process id: `start`
-/// clears the folder, and the suite runs more than one session at once.
 fn voice_folder() -> Option<PathBuf> {
     if cfg!(test) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1816,8 +1805,6 @@ fn voice_folder() -> Option<PathBuf> {
     dirs::cache_dir().map(|dir| dir.join("thinwire").join("slack").join("voice"))
 }
 
-/// Clear `dir` on a blocking thread. The receiver completes when that
-/// delete has finished. Outside a runtime the delete runs here.
 fn begin_voice_clear(dir: &std::path::Path) -> oneshot::Receiver<()> {
     let dir = dir.to_path_buf();
     let (tx, rx) = oneshot::channel();

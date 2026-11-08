@@ -1,25 +1,13 @@
-//! Which Slack file can play, and what a download body means.
-//!
-//! The session passes plain files, then a status and a body. This module
-//! does not call Slack and does not see a token.
-
 use std::fmt;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
 use crate::voice_files::VOICE_MAX_BYTES;
 
-/// `https` address on `files.slack.com`. The string stays private.
 #[derive(Clone, PartialEq, Eq)]
 pub struct FilesHostUrl(String);
 
 impl FilesHostUrl {
-    /// `https` and host `files.slack.com`, with an optional numeric port.
-    ///
-    /// A host that only contains that name is a different site. Userinfo,
-    /// whitespace, a backslash, or `%` in the host is rejected, so the bot
-    /// token is not sent there.
-    // The production caller is the feature-gated GET. A default build has none.
-    #[cfg_attr(not(feature = "slack-oauth"), allow(dead_code))]
+    #[cfg(any(test, feature = "slack-oauth"))]
     pub(super) fn parse(raw: &str) -> Option<Self> {
         if raw.chars().any(char::is_whitespace) || raw.contains('\\') {
             return None;
@@ -43,9 +31,7 @@ impl FilesHostUrl {
             .then(|| Self(raw.to_string()))
     }
 
-    /// The GET target. Only the download task reads it.
-    // Same caller as `parse`.
-    #[cfg_attr(not(feature = "slack-oauth"), allow(dead_code))]
+    #[cfg(any(test, feature = "slack-oauth"))]
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
@@ -63,7 +49,6 @@ impl fmt::Display for FilesHostUrl {
     }
 }
 
-/// One Slack file after the library type is gone.
 #[derive(Clone, PartialEq, Eq)]
 pub struct IncomingFile {
     pub mimetype: String,
@@ -82,21 +67,18 @@ impl fmt::Debug for IncomingFile {
     }
 }
 
-/// The one file the player asks for.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Clip {
     pub handle: i32,
     pub url: FilesHostUrl,
 }
 
-/// Body to show, and the clip when the first playable file has an address.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Shown {
     pub body: String,
     pub clip: Option<Clip>,
 }
 
-/// What the download body is. `Debug` prints a length, not the bytes.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum FetchClass {
     Audio(Vec<u8>),
@@ -124,8 +106,6 @@ pub(super) fn handle(channel: &str, ts: &str) -> i32 {
     i32::try_from(low).unwrap_or(1).max(1)
 }
 
-/// The first playable file is the only one. A clip exists only when that
-/// file already holds a `files.slack.com` address.
 pub(super) fn present(text: &str, channel: &str, ts: &str, files: &[IncomingFile]) -> Shown {
     let candidate = files.iter().find(|file| is_candidate(file));
     let clip = candidate.and_then(|file| {
@@ -151,11 +131,6 @@ pub(super) fn present(text: &str, channel: &str, ts: &str, files: &[IncomingFile
     Shown { body, clip }
 }
 
-/// `FilesUnread` for a 403 or a short `missing_scope` body. `Audio` for a
-/// short 200 body. Everything else is a miss.
-///
-/// A body past 4096 bytes is not a scope error just because it contains the
-/// word. An audio file can.
 pub(super) fn classify(status: u16, body: &[u8]) -> FetchClass {
     if files_unread(status, body) {
         FetchClass::FilesUnread

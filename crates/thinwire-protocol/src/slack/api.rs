@@ -209,11 +209,9 @@ pub struct SlackPost {
     pub text: String,
     /// Sender id Slack uses to collapse a redelivery of the same post.
     pub client_msg_id: Option<String>,
-    /// Empty for a text post. Order is Slack's order.
     pub(super) files: Vec<super::audio::IncomingFile>,
 }
 
-/// One file download. No address, no token, and no header map.
 pub struct FileRead {
     pub status: u16,
     pub body: Vec<u8>,

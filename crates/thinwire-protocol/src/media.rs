@@ -98,14 +98,11 @@ impl fmt::Debug for AudioPath {
     }
 }
 
-/// Why a voice note stopped waiting. The painter owns the sentence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VoiceStop {
     /// Missing bytes, a bad host, a network error, or a container the player rejected.
     Unplayable,
-    /// This Slack token cannot read files. The person removes the thinwire app
-    /// in Slack, then adds the workspace again.
-    SlackFilesUnread,
+    SlackFilesDenied,
 }
 
 /// One voice note or audio file the user can play. `file_id` names the
@@ -1026,8 +1023,8 @@ mod tests {
         let debug = format!("{audio:?}");
         assert!(!debug.contains("hidden-voice"));
         assert!(debug.contains("AudioPath"));
-        audio.mark_stopped(VoiceStop::SlackFilesUnread);
-        assert_eq!(audio.stop(), Some(VoiceStop::SlackFilesUnread));
+        audio.mark_stopped(VoiceStop::SlackFilesDenied);
+        assert_eq!(audio.stop(), Some(VoiceStop::SlackFilesDenied));
         assert!(audio.file().is_some());
         audio.clear_failed();
         assert!(!audio.failed());

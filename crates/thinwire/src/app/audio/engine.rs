@@ -12,6 +12,7 @@ use rodio::buffer::SamplesBuffer;
 use rodio::source::Source;
 use rodio::{Decoder, DeviceSinkBuilder, Player as Sink};
 use thinwire_protocol::AudioPath;
+use thinwire_protocol::voice_files::VOICE_MAX_BYTES;
 
 use super::Backend;
 
@@ -217,8 +218,6 @@ fn read_voice(path: &AudioPath) -> Result<SamplesBuffer, ()> {
         }
         VoiceDecode::TryVorbis => {}
     }
-    // rodio does not demux WebM. Once the EBML magic matched, a bad note is
-    // refused here so the Vorbis decoder never reads it.
     let file = open_voice(path)?;
     match decode_webm_opus(file, MAX_DECODED_SAMPLES) {
         VoiceDecode::Opus(buffer) => return Ok(buffer),
@@ -367,9 +366,6 @@ fn opus_head(data: &[u8]) -> Result<OpusHead, ()> {
     Ok(OpusHead { channels, pre_skip })
 }
 
-/// Largest WebM this player reads. A Slack download stops at the same size.
-const WEBM_MAX_BYTES: usize = 16 * 1024 * 1024;
-
 const EBML_ID: u64 = 0x1A45_DFA3;
 const SEGMENT_ID: u64 = 0x1853_8067;
 const TRACKS_ID: u64 = 0x1654_AE6B;
@@ -393,10 +389,10 @@ fn decode_webm_opus(mut reader: impl Read + Seek, max_samples: usize) -> VoiceDe
     }
     let mut data = Vec::new();
     if reader
-        .take((WEBM_MAX_BYTES as u64).saturating_add(1))
+        .take((VOICE_MAX_BYTES as u64).saturating_add(1))
         .read_to_end(&mut data)
         .is_err()
-        || data.len() > WEBM_MAX_BYTES
+        || data.len() > VOICE_MAX_BYTES
     {
         return VoiceDecode::Rejected;
     }
@@ -515,7 +511,6 @@ fn walk_track_entry(body: &[u8], note: &mut WebmNote) -> Result<(), ()> {
     Ok(())
 }
 
-/// `stop_at_segment` is set when the cluster size is unknown.
 fn walk_cluster(
     data: &[u8],
     start: usize,

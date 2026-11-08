@@ -439,7 +439,7 @@ const SLACK_FILES_LINE: &str = "Slack did not grant file access. Remove the thin
 
 fn retry_line(audio: &MessageAudio) -> &'static str {
     match audio.stop() {
-        Some(VoiceStop::SlackFilesUnread) => SLACK_FILES_LINE,
+        Some(VoiceStop::SlackFilesDenied) => SLACK_FILES_LINE,
         _ => "Couldn't play this voice message.",
     }
 }
@@ -993,7 +993,7 @@ mod tests {
         let mut audio = MessageAudio::telegram(1, 3, None).expect("note");
         audio.mark_failed();
         assert_eq!(retry_line(&audio), "Couldn't play this voice message.");
-        audio.mark_stopped(VoiceStop::SlackFilesUnread);
+        audio.mark_stopped(VoiceStop::SlackFilesDenied);
         assert_eq!(
             retry_line(&audio),
             "Slack did not grant file access. Remove the thinwire app in Slack, then add the workspace again."

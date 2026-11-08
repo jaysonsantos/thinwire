@@ -1055,14 +1055,12 @@ mod tests {
         ));
     }
 
-    /// A Slack file-access stop stays in the app. The wire line still carries
-    /// only the handle, and the app reads that line as unplayable.
     #[test]
     fn a_voice_stop_does_not_cross_the_pipe() {
         let event = AdapterEvent::VoiceFailed {
             protocol: ProtocolId::Signal,
             file_id: 9,
-            stop: crate::media::VoiceStop::SlackFilesUnread,
+            stop: crate::media::VoiceStop::SlackFilesDenied,
         };
         let wire = event_to_wire(ProtocolId::Signal, event).expect("crosses");
         let line = thinwire_ipc::encode(&thinwire_ipc::HelperLine::Event {

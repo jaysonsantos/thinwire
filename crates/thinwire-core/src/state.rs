@@ -6649,9 +6649,6 @@ impl Snapshot {
         }
     }
 
-    /// A refresh may omit a path the adapter has not reported yet. Keep the
-    /// path and the stop already stored for the same file id. `mark_failed`
-    /// would turn a Slack file-access stop into a generic one.
     fn keep_voice_file(incoming: &mut Option<MessageAudio>, stored: Option<&MessageAudio>) {
         let Some(stored) = stored else {
             return;
@@ -10481,7 +10478,7 @@ mod tests {
         snapshot.apply(AdapterEvent::VoiceFailed {
             protocol: ProtocolId::Telegram,
             file_id: 7,
-            stop: VoiceStop::SlackFilesUnread,
+            stop: VoiceStop::SlackFilesDenied,
         });
         let stop_of = |snapshot: &Snapshot| {
             snapshot
@@ -10492,9 +10489,9 @@ mod tests {
                 .and_then(|row| row.audio.as_ref())
                 .and_then(|audio| audio.stop())
         };
-        assert_eq!(stop_of(&snapshot), Some(VoiceStop::SlackFilesUnread));
+        assert_eq!(stop_of(&snapshot), Some(VoiceStop::SlackFilesDenied));
         snapshot.apply(AdapterEvent::MessageReceived { message });
-        assert_eq!(stop_of(&snapshot), Some(VoiceStop::SlackFilesUnread));
+        assert_eq!(stop_of(&snapshot), Some(VoiceStop::SlackFilesDenied));
     }
 
     #[test]

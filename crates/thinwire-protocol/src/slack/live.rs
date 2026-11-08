@@ -37,10 +37,8 @@ const CHANNEL_PAGE: u16 = 200;
 /// Placeholder body for a message with no text (files, blocks only).
 const NO_TEXT: &str = "(no text)";
 
-/// The longest wait for a file GET, including the body.
 const FILE_WAIT: Duration = Duration::from_secs(60);
 
-/// Bytes kept from a non-200 body. A scope error is a short JSON object.
 const ERROR_BODY_MAX: usize = 4096;
 
 /// `conversations.info` body. Slack's `ok` field is ignored.
@@ -442,9 +440,6 @@ impl SlackWebApi for MorphismWebApi {
     }
 
     async fn read_file(&self, token: &SlackBotToken, url: &FilesHostUrl) -> Result<FileRead, ()> {
-        // slack-morphism logs the request URI. A raw client keeps the address,
-        // and the bot token, out of the log. No redirect policy: a 3xx must
-        // not send the token to Location.
         let uri: hyper::Uri = url.as_str().parse().map_err(|_| ())?;
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_provider_and_native_roots(rustls::crypto::ring::default_provider())
@@ -504,9 +499,6 @@ fn incoming(file: &SlackFile) -> IncomingFile {
     }
 }
 
-/// Read at most `cap` bytes. A 200 body past the cap is an error, so a
-/// truncated file is not stored. Any other status returns the short prefix
-/// and still reports its status.
 async fn read_capped(
     mut body: hyper::body::Incoming,
     cap: usize,

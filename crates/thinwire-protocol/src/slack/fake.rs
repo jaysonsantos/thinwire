@@ -56,10 +56,8 @@ struct ApiState {
     users: HashMap<String, String>,
     posted: Vec<(String, String)>,
     next_ts: u64,
-    /// Scripted `read_file` answers, first in is first out.
     file_script: VecDeque<(u16, Vec<u8>)>,
     file_calls: u32,
-    /// The first `read_file` sends this, then waits on `file_hold`.
     file_started: Option<oneshot::Sender<()>>,
     file_hold: Option<oneshot::Receiver<()>>,
 }
@@ -3269,7 +3267,7 @@ async fn a_missing_file_scope_stops_without_another_error() {
     assert!(matches!(
         event,
         AdapterEvent::VoiceFailed {
-            stop: VoiceStop::SlackFilesUnread,
+            stop: VoiceStop::SlackFilesDenied,
             ..
         }
     ));
