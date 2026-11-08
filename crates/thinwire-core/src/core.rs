@@ -4572,6 +4572,51 @@ mod tests {
         assert!(core.view().error.is_none());
     }
 
+    /// A thread with no subscriber of its own can rebuild the callsite cache
+    /// and store "never" for every line. This subscriber is the global one
+    /// the bare thread asks. `sometimes` keeps that rebuild from storing
+    /// "never", and each event then asks the subscriber on the thread that
+    /// logs. `always` would skip that check and leave the line enabled on
+    /// every thread.
+    ///
+    /// Keep this copy in sync with the other `keep_callsite_interest` copies.
+    fn keep_callsite_interest() {
+        struct Fallback;
+
+        impl tracing::Subscriber for Fallback {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, _: &tracing::Event<'_>) {}
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+        }
+
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Intentional. The first caller wins, and a later call fails.
+            let _ = tracing::subscriber::set_global_default(Fallback);
+        });
+    }
+
     /// Log lines of this thread while the guard lives. Plain text, no ANSI.
     fn capture_logs() -> (
         std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -4591,6 +4636,7 @@ mod tests {
                 Ok(())
             }
         }
+        keep_callsite_interest();
         let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let writer = Buf(std::sync::Arc::clone(&bytes));
         let subscriber = tracing_subscriber::fmt()
@@ -4751,6 +4797,50 @@ mod tests {
             .unwrap_or_else(|| panic!("no unconfirmed line: {exit}"));
         assert!(line.contains(&shown("telegram:1")), "{line}");
         assert!(!exit.contains("secret"), "never the text: {exit}");
+    }
+
+    #[test]
+    fn a_captured_line_stays_when_another_thread_rebuilds_interest() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let rebuilds = Arc::new(AtomicUsize::new(0));
+        let flag = Arc::clone(&stop);
+        let rebuilds_in_hammer = Arc::clone(&rebuilds);
+        let hammer = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                tracing::callsite::rebuild_interest_cache();
+                rebuilds_in_hammer.fetch_add(1, Ordering::Release);
+            }
+        });
+        let mut missed = 0;
+        {
+            let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
+            while rebuilds.load(Ordering::Acquire) == 0 {
+                if hammer.is_finished() {
+                    panic!("the hammer ended before it rebuilt interest");
+                }
+                std::thread::yield_now();
+            }
+            for _ in 0..16 {
+                let (bytes, _guard) = capture_logs();
+                fresh_interest();
+                tracing::info!("send in flight at close");
+                if !logged(&bytes).contains("send in flight at close") {
+                    missed += 1;
+                }
+            }
+        }
+        hammer.join().expect("hammer");
+        assert_eq!(missed, 0, "hidden lines: {missed}");
     }
 
     /// Sends "hello" through a core with no adapter answers. Returns the
