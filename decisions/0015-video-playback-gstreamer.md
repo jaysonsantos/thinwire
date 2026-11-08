@@ -34,7 +34,7 @@ The owner preferred GStreamer and accepted FFmpeg.
 
 ## Packaging on macOS (2026-11-08)
 
-- The macOS zip has the `video` feature. `scripts/install-gstreamer-macos.sh` installs the official GStreamer 1.28.8 framework on the runner. The script pins the SHA-256 of each package.
+- The macOS zip has the `video` feature. `scripts/install-gstreamer-macos.sh` installs the runtime package of the official GStreamer 1.28.8 framework on the runner. The script pins its SHA-256, and it writes small pkg-config files for the build.
 - `scripts/bundle-gstreamer-macos.sh` copies 18 plugins and the libraries that they need into `Thinwire.app/Contents/Frameworks/GStreamer`. It thins each file to arm64. The runtime adds about 30 MB to the app. The decoders are `applemedia` (VideoToolbox and AudioToolbox), Opus, and libvpx. The app does not ship FFmpeg or a GPL plugin.
 - The app scans the plugin folder of the bundle at start. It does not use `gst-plugin-scanner`: GStreamer loads the plugins in the app process.
 - The stage step signs each copied file with the signature of the app before notarization.

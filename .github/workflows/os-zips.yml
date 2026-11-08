@@ -126,7 +126,9 @@ jobs:
       - name: Install GStreamer
         if: runner.os == 'macOS'
         shell: bash
-        run: scripts/install-gstreamer-macos.sh
+        env:
+          GSTREAMER_PC: ${{ runner.temp }}/gstreamer-pkgconfig
+        run: scripts/install-gstreamer-macos.sh "$GSTREAMER_PC"
 
       # scripts/check-release-tree.sh reads the feature list of this line.
       - name: Build release binary
@@ -143,7 +145,7 @@ jobs:
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          PKG_CONFIG_PATH: /Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig
+          PKG_CONFIG_PATH: ${{ runner.temp }}/gstreamer-pkgconfig
         run: cargo build --release -p thinwire --features telegram-tdlib,whatsapp-web,signal-local,discord-bot,video
 
       # Each AGPL helper is its own program. It gets no publisher secret.
