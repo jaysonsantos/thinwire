@@ -24,3 +24,9 @@ pub(crate) fn name_label(ctx: &egui::Context, id: egui::Id, word: &str) {
         node.set_value(word);
     });
 }
+
+/// Make the node `id` a polite live region: a screen reader reads a change
+/// of its text when the user does not type or read.
+pub(crate) fn live(ctx: &egui::Context, id: egui::Id) {
+    ctx.accesskit_node_builder(id, |node| node.set_live(egui::accesskit::Live::Polite));
+}

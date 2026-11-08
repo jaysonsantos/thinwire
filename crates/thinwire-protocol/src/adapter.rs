@@ -260,6 +260,8 @@ pub struct ProtocolCapabilities {
     pub sends_media: bool,
     /// What the message menu offers for this protocol.
     pub message_actions: MessageActions,
+    /// The adapter answers `SetTyping` and sends `Typing` events (#510).
+    pub typing: bool,
 }
 
 /// What a user can do with one message, by protocol. The message menu shows
@@ -771,6 +773,16 @@ pub enum AdapterCommand {
         protocol: ProtocolId,
         file_id: i32,
     },
+    /// Tell the other members of a chat, or of one topic, that this account
+    /// types (`typing: true`) or stopped (`typing: false`). The protocol ends
+    /// the typing state by itself after some seconds, and when a message of
+    /// this account arrives. No answer comes back (#510).
+    SetTyping {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        typing: bool,
+    },
 }
 
 impl AdapterCommand {
@@ -802,6 +814,7 @@ impl AdapterCommand {
             | Self::DeleteMessage { protocol, .. }
             | Self::EditMessage { protocol, .. }
             | Self::ForwardMessages { protocol, .. }
+            | Self::SetTyping { protocol, .. }
             | Self::React { protocol, .. } => protocol,
             Self::ToAccount { account, .. } => account,
             Self::ConnectDiscord { .. } => ProtocolId::Discord,
@@ -871,6 +884,7 @@ impl AdapterCommand {
             | Self::DeleteMessage { protocol, .. }
             | Self::EditMessage { protocol, .. }
             | Self::ForwardMessages { protocol, .. }
+            | Self::SetTyping { protocol, .. }
             | Self::React { protocol, .. } => {
                 *protocol = account;
                 true
@@ -1146,6 +1160,18 @@ pub enum AdapterEvent {
     ChatListLoaded {
         protocol: ProtocolId,
     },
+    /// A person started (`typing: true`) or stopped typing in a chat, or in
+    /// one topic of a chat. `sender_id` tells one person from another.
+    /// `sender` is the name to show. The core shows the person as typing
+    /// for some seconds after the last event (#510).
+    Typing {
+        protocol: ProtocolId,
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        sender_id: String,
+        sender: String,
+        typing: bool,
+    },
     /// A request for older messages ended. The older messages came before this
     /// event as `MessageReceived`. `more == false` means the start of the chat
     /// (or no more can load now): the UI stops asking.
@@ -1268,6 +1294,7 @@ impl AdapterEvent {
             | Self::MessageDelivery { protocol, .. }
             | Self::OutboxRead { protocol, .. }
             | Self::ChatListLoaded { protocol }
+            | Self::Typing { protocol, .. }
             | Self::OlderHistoryLoaded { protocol, .. }
             | Self::HistoryLoaded { protocol, .. }
             | Self::Helper { protocol, .. } => {
@@ -1345,6 +1372,7 @@ impl AdapterEvent {
             | Self::MessageDelivery { protocol, .. }
             | Self::OutboxRead { protocol, .. }
             | Self::ChatListLoaded { protocol }
+            | Self::Typing { protocol, .. }
             | Self::HistoryLoaded { protocol, .. }
             | Self::OlderHistoryLoaded { protocol, .. } => Some(*protocol),
             _ => None,

@@ -92,6 +92,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     pages_history: true,
     sends_media: false,
     message_actions: crate::MessageActions::NONE,
+    typing: false,
 };
 
 /// Official Slack path. Workspace install UI is out of scope for this spike.

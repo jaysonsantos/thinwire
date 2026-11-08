@@ -139,6 +139,7 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::ForwardTo { conversation_id } => state.snapshot.forward_to(&conversation_id),
             Intent::CancelForward => state.snapshot.cancel_forward(),
             Intent::SetRailCollapsed(collapsed) => state.settings.set_rail_collapsed(collapsed),
+            Intent::SetSendTyping(on) => state.settings.set_send_typing(on),
             Intent::AddAttachments {
                 protocol,
                 conversation_id,
@@ -1140,6 +1141,47 @@ fn selected_messages_forward_through_the_chat_picker() {
     );
     assert!(harness.query_by_label("Forward 2 messages").is_none());
     assert!(harness.query_by_label("2 selected").is_none());
+}
+
+/// A person who types in the open chat shows over the compose field. A
+/// screen reader reads the line when it changes. Settings turns off the
+/// typing state of the user (#510).
+#[test]
+fn a_person_who_types_shows_over_the_compose_field() {
+    let mut state = InboxUi::ready();
+    assert_eq!(
+        state.snapshot.selected_conversation.as_deref(),
+        Some("telegram:1")
+    );
+    for (chat, who, name) in [
+        ("telegram:1", "user:7", "Ada"),
+        ("telegram:2", "user:8", "Bob"),
+    ] {
+        state.snapshot.apply(AdapterEvent::Typing {
+            protocol: ProtocolId::Telegram,
+            conversation_id: chat.into(),
+            topic: None,
+            sender_id: who.into(),
+            sender: name.into(),
+            typing: true,
+        });
+    }
+    let mut harness = harness(state);
+    harness.run();
+    let line = harness.get_by_label("Ada is typing…");
+    assert_eq!(atspi_name(&line).as_deref(), Some("Ada is typing…"));
+    assert_eq!(line.accesskit_node().live(), egui::accesskit::Live::Polite);
+    assert!(
+        harness.query_by_label("Bob is typing…").is_none(),
+        "another chat"
+    );
+
+    assert!(harness.state().settings.send_typing());
+    harness.get_by_label("Settings").click();
+    harness.run();
+    harness.get_by_label("Show others when I type").click();
+    harness.run();
+    assert!(!harness.state().settings.send_typing());
 }
 
 /// The name of a node as a Linux screen reader reads it: AT-SPI takes the

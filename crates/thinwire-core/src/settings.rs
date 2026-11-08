@@ -103,6 +103,8 @@ pub struct Settings {
     notification_preview: bool,
     /// The account sidebar shows only the account icons. Default off.
     rail_collapsed: bool,
+    /// Tell the other people of a chat when the user types (#510). Default on.
+    send_typing: bool,
     path: PathBuf,
     persist_pending: bool,
     persist_epoch: u64,
@@ -134,6 +136,9 @@ const ACCOUNTS_KEY: &str = "accounts";
 
 /// Settings key of the collapsed account sidebar.
 const RAIL_COLLAPSED_KEY: &str = "rail_collapsed";
+
+/// Settings key of the outgoing typing state.
+const SEND_TYPING_KEY: &str = "send_typing";
 
 /// Settings key of the WhatsApp helper path.
 const WHATSAPP_HELPER_KEY: &str = "whatsapp_helper";
@@ -173,6 +178,7 @@ impl Settings {
             notifications: read_bool(&path, "notifications").unwrap_or(true),
             notification_preview: read_bool(&path, "notification_preview").unwrap_or(true),
             rail_collapsed: read_bool(&path, RAIL_COLLAPSED_KEY).unwrap_or(false),
+            send_typing: read_bool(&path, SEND_TYPING_KEY).unwrap_or(true),
             path,
             persist_pending: false,
             persist_epoch: 0,
@@ -197,6 +203,7 @@ impl Settings {
             notifications: true,
             notification_preview: true,
             rail_collapsed: false,
+            send_typing: true,
             path: PathBuf::new(),
             persist_pending: false,
             persist_epoch: 0,
@@ -322,6 +329,20 @@ impl Settings {
         }
     }
 
+    /// The other people of a chat see when the user types.
+    #[must_use]
+    pub const fn send_typing(&self) -> bool {
+        self.send_typing
+    }
+
+    /// Send the typing state, or stop. Disk persist is queued.
+    pub fn set_send_typing(&mut self, on: bool) {
+        if self.send_typing != on {
+            self.send_typing = on;
+            self.persist_pending = true;
+        }
+    }
+
     /// The account sidebar shows only the account icons.
     #[must_use]
     pub const fn rail_collapsed(&self) -> bool {
@@ -403,6 +424,9 @@ impl Settings {
         );
         if self.rail_collapsed {
             text.push_str(&format!("{RAIL_COLLAPSED_KEY} = true\n"));
+        }
+        if !self.send_typing {
+            text.push_str(&format!("{SEND_TYPING_KEY} = false\n"));
         }
         if self.signal_notice_version != 0 {
             text.push_str(&format!(
@@ -762,6 +786,22 @@ mod tests {
             Settings::load_from(path).notifications(),
             "a bad value is on"
         );
+    }
+
+    #[test]
+    fn the_typing_switch_persists_and_defaults_on() {
+        let path = temp_settings_path();
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.send_typing());
+        settings.set_send_typing(false);
+        settings.persist_now().expect("save");
+        assert!(!Settings::load_from(path.clone()).send_typing());
+        settings.set_send_typing(true);
+        settings.persist_now().expect("save");
+        let text = fs::read_to_string(&path).expect("read");
+        assert!(!text.contains(SEND_TYPING_KEY), "the default writes no key");
+        assert!(Settings::load_from(path).send_typing());
+        assert!(Settings::in_memory().send_typing());
     }
 
     #[test]
