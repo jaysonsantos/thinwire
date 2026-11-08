@@ -2313,16 +2313,66 @@ async fn link_new(
 }
 
 async fn contact_names(manager: &Manager<SqliteStore, Registered>) -> HashMap<String, String> {
+    person_names(manager.store()).await
+}
+
+/// The known name of each contact of `store`: the contact name, else the
+/// stored profile name, else the phone number (see
+/// [`super::names::person_title`]). A contact with none of them is not in
+/// the map, so the caller shows the short fallback.
+async fn person_names(store: &SqliteStore) -> HashMap<String, String> {
     let mut names = HashMap::new();
-    let Ok(contacts) = manager.store().contacts().await else {
+    let Ok(contacts) = store.contacts().await else {
         return names;
     };
     for contact in contacts.flatten() {
-        if !contact.name.is_empty() {
-            names.insert(contact.uuid.to_string(), contact.name);
+        if let Some(name) = known_person_name(store, &contact).await {
+            names.insert(contact.uuid.to_string(), name);
         }
     }
     names
+}
+
+async fn known_person_name(store: &SqliteStore, contact: &Contact) -> Option<String> {
+    let id = contact.uuid.to_string();
+    let profile = if contact.name.trim().is_empty() {
+        stored_profile_name(store, contact).await
+    } else {
+        None
+    };
+    let phone = contact.phone_number.as_ref().map(ToString::to_string);
+    let title =
+        super::names::person_title(&contact.name, profile.as_deref(), phone.as_deref(), &id);
+    (title != super::names::unknown_person(&id)).then_some(title)
+}
+
+/// The profile key of a contact: the one on the contact, else the one that
+/// presage stored from a message of that person.
+async fn contact_profile_key(
+    store: &SqliteStore,
+    contact: &Contact,
+) -> Option<presage::libsignal_service::zkgroup::profiles::ProfileKey> {
+    use presage::libsignal_service::zkgroup::profiles::ProfileKey;
+    if let Ok(key) = <[u8; 32]>::try_from(contact.profile_key.as_slice()) {
+        return Some(ProfileKey::create(key));
+    }
+    store
+        .profile_key(&ServiceId::Aci(contact.uuid.into()))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The profile name that presage keeps in the store. No network.
+async fn stored_profile_name(store: &SqliteStore, contact: &Contact) -> Option<String> {
+    let key = contact_profile_key(store, contact).await?;
+    let profile = store.profile(contact.uuid, key).await.ok().flatten()?;
+    profile_name_of(&profile)
+}
+
+fn profile_name_of(profile: &presage::libsignal_service::Profile) -> Option<String> {
+    let name = profile.name.as_ref()?;
+    super::names::profile_display_name(&name.given_name, name.family_name.as_deref())
 }
 
 /// Publish the chat list from the store again. The Refresh job and a
@@ -2362,7 +2412,7 @@ async fn publish_chats(
     let history_url = history_store_url();
     let contacts = manager.store().contacts().await.map_err(|_| ())?;
     for contact in contacts.flatten() {
-        let conversation = conversation_from_contact(&contact);
+        let conversation = conversation_from_contact(&contact, &names);
         let chat_id = conversation.id.clone();
         known.insert(chat_id.clone());
         emit_refreshed_row(events, rows, unread, conversation);
@@ -2654,14 +2704,8 @@ async fn publish_one_retained(
     let url = path_url(&sqlite_store_path(dir))?;
     let store = open_retained_store(&url).await?;
     let contacts = store.contacts().await.map_err(|_| ())?;
-    let mut names = HashMap::new();
-    let mut contact_list = Vec::new();
-    for contact in contacts.flatten() {
-        if !contact.name.is_empty() {
-            names.insert(contact.uuid.to_string(), contact.name.clone());
-        }
-        contact_list.push(contact);
-    }
+    let contact_list: Vec<Contact> = contacts.flatten().collect();
+    let names = person_names(&store).await;
     let groups = store.groups().await.map_err(|_| ())?;
     let group_list: Vec<_> = groups.flatten().collect();
     if contact_list.is_empty() && group_list.is_empty() {
@@ -2676,7 +2720,7 @@ async fn publish_one_retained(
     let mut rows = HashMap::new();
     let unread = HashMap::new();
     for contact in &contact_list {
-        let mut conversation = conversation_from_contact(contact);
+        let mut conversation = conversation_from_contact(contact, &names);
         mark_retained_conversation(slot, &mut conversation);
         let chat_id = conversation.id.clone();
         emit_refreshed_row(events, &mut rows, &unread, conversation);
@@ -2851,16 +2895,7 @@ async fn thread_for_retained_chat(store: &SqliteStore, chat_id: &str) -> Option<
 }
 
 async fn retained_contact_names(store: &SqliteStore) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    let Ok(contacts) = store.contacts().await else {
-        return names;
-    };
-    for contact in contacts.flatten() {
-        if !contact.name.is_empty() {
-            names.insert(contact.uuid.to_string(), contact.name);
-        }
-    }
-    names
+    person_names(store).await
 }
 
 async fn retained_group_titles(store: &SqliteStore) -> HashMap<String, String> {
@@ -3539,8 +3574,8 @@ fn signal_message_id(sent_millis: u64, sender: &str) -> String {
 }
 
 fn visible_title(name: &str, id: &str) -> String {
-    if name.is_empty() {
-        id.to_string()
+    if name.trim().is_empty() {
+        super::names::unknown_person(id)
     } else {
         name.to_string()
     }
@@ -3680,12 +3715,17 @@ async fn remember_group_title(
     titles.insert(id, title);
 }
 
-fn conversation_from_contact(contact: &Contact) -> Conversation {
+fn conversation_from_contact(contact: &Contact, names: &HashMap<String, String>) -> Conversation {
     let id = contact.uuid.to_string();
+    let title = names
+        .get(&id)
+        .filter(|name| !name.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| visible_title(&contact.name, &id));
     Conversation {
         protocol: ProtocolId::Signal,
         id: id.clone(),
-        title: visible_title(&contact.name, &id),
+        title,
         participant: id,
         preview: String::new(),
         unread: 0,
@@ -4325,6 +4365,37 @@ async fn avatar_plan(store: &SqliteStore) -> AvatarPlan {
     }
 }
 
+/// The contacts of the first [`AVATAR_CHATS`] chats that have no contact
+/// name and no stored profile name, but have a profile key. The helper asks
+/// Signal for their profile one time for each link.
+async fn profile_name_plan(store: &SqliteStore) -> Vec<(Uuid, [u8; 32])> {
+    let mut plan = Vec::new();
+    let Ok(contacts) = store.contacts().await else {
+        return plan;
+    };
+    let mut people: Vec<Contact> = contacts.flatten().collect();
+    people.sort_by_key(|contact| contact.inbox_position);
+    for contact in people.into_iter().take(AVATAR_CHATS) {
+        if !contact.name.trim().is_empty() {
+            continue;
+        }
+        let Some(key) = contact_profile_key(store, &contact).await else {
+            continue;
+        };
+        if store
+            .profile(contact.uuid, key)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            continue;
+        }
+        plan.push((contact.uuid, key.bytes));
+    }
+    plan
+}
+
 fn start_avatar_fetches(
     manager: &Manager<SqliteStore, Registered>,
     session: &Arc<Session>,
@@ -4339,6 +4410,26 @@ fn start_avatar_fetches(
     // `retrieve_group_avatar` is not `Send` (presage uses a thread-local rng).
     // The Signal worker runs on a `LocalSet`, so this task stays on it.
     tokio::task::spawn_local(async move {
+        // Names first: a chat with no name is harder to find than one with
+        // no picture. Presage keeps each fetched profile in the store, and
+        // the refresh reads it from there.
+        let mut named = false;
+        for (uuid, key) in profile_name_plan(manager.store()).await {
+            if !session.is_current(token) {
+                return;
+            }
+            let _permit = Arc::clone(&session.downloads).acquire_owned().await.ok();
+            let mut lookup = manager.clone();
+            if let Ok(profile) = lookup
+                .retrieve_profile_by_uuid(uuid, ProfileKey::create(key))
+                .await
+            {
+                named |= profile_name_of(&profile).is_some();
+            }
+        }
+        if named && session.is_current(token) {
+            session.request_refresh();
+        }
         let plan = avatar_plan(manager.store()).await;
         for (id, bytes) in plan.ready {
             if !session.is_current(token) {
@@ -9331,9 +9422,9 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
     }
 
     #[test]
-    fn an_unnamed_contact_uses_its_id_as_the_title() {
-        assert_eq!(visible_title("", "abc"), "abc");
-        assert_eq!(visible_title("Ada", "abc"), "Ada");
+    fn an_unnamed_contact_does_not_use_its_id_as_the_title() {
+        assert_eq!(visible_title("", "abcd-ef"), "Signal user abcd");
+        assert_eq!(visible_title("Ada", "abcd-ef"), "Ada");
     }
 
     #[test]
@@ -9692,6 +9783,93 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
     }
 
     #[tokio::test]
+    async fn a_contact_with_no_name_gets_its_profile_name_or_phone() {
+        use presage::libsignal_service::Profile;
+        use presage::libsignal_service::prelude::phonenumber;
+        use presage::libsignal_service::profile_name::ProfileName;
+        use presage::libsignal_service::zkgroup::profiles::ProfileKey;
+
+        let dir = temp_session_dir("person-names");
+        let (mut store, _, _pool) = open_session_db(&dir).await;
+        let named = named_contact(0x1111, "Ada");
+        let profiled = named_contact(0x2222, "");
+        let mut keyed_only = named_contact(0x3333, "");
+        keyed_only.profile_key.clear();
+        let mut phoned = named_contact(0x4444, "");
+        phoned.profile_key.clear();
+        phoned.phone_number = Some(phonenumber::parse(None, "+4915112345678").expect("phone"));
+        let mut unknown = named_contact(0x5555, "");
+        unknown.profile_key.clear();
+        let mut unfetched = named_contact(0x6666, "");
+        unfetched.profile_key = vec![6; 32];
+        for contact in [
+            &named,
+            &profiled,
+            &keyed_only,
+            &phoned,
+            &unknown,
+            &unfetched,
+        ] {
+            store.save_contact(contact).await.expect("contact");
+        }
+        let profile = |given: &str, family: Option<&str>| Profile {
+            name: Some(ProfileName {
+                given_name: given.to_string(),
+                family_name: family.map(str::to_string),
+            }),
+            about: None,
+            about_emoji: None,
+            avatar: None,
+            unrestricted_unidentified_access: false,
+        };
+        store
+            .save_profile(
+                profiled.uuid,
+                ProfileKey::create([1; 32]),
+                profile("Bea", Some("Lima")),
+            )
+            .await
+            .expect("profile");
+        // A key that presage stored from a message, not on the contact.
+        store
+            .save_profile(
+                keyed_only.uuid,
+                ProfileKey::create([3; 32]),
+                profile("Cid", None),
+            )
+            .await
+            .expect("message key profile");
+
+        let names = person_names(&store).await;
+        let title = |contact: &Contact| conversation_from_contact(contact, &names).title;
+        assert_eq!(title(&named), "Ada");
+        assert_eq!(title(&profiled), "Bea Lima");
+        assert_eq!(title(&keyed_only), "Cid");
+        assert_eq!(title(&phoned), "+4915112345678");
+        assert_eq!(title(&unknown), "Signal user 0000");
+        for contact in [&named, &profiled, &keyed_only, &phoned, &unknown] {
+            assert!(
+                !title(contact).contains(&contact.uuid.to_string()),
+                "the raw id never shows"
+            );
+        }
+        assert_eq!(
+            super::super::group::sender_name(&profiled.uuid.to_string(), &names),
+            "Bea Lima",
+            "a group sender uses the same name"
+        );
+
+        let plan = profile_name_plan(&store).await;
+        let planned: Vec<Uuid> = plan.iter().map(|(uuid, _)| *uuid).collect();
+        assert_eq!(
+            planned,
+            vec![unfetched.uuid],
+            "only a nameless contact with a key and no stored profile is fetched"
+        );
+        assert_eq!(plan[0].1, [6; 32]);
+    }
+
+    #[tokio::test]
     async fn a_person_and_a_group_with_a_picture_show_it() {
         let dir = temp_session_dir("avatars");
         let (mut store, _, pool) = open_session_db(&dir).await;
@@ -9780,8 +9958,8 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         );
 
         let mut rows = [
-            conversation_from_contact(&person),
-            conversation_from_contact(&blank),
+            conversation_from_contact(&person, &HashMap::new()),
+            conversation_from_contact(&blank, &HashMap::new()),
             conversation_from_group(&cached_key, &cached),
         ];
         for (id, bytes) in [

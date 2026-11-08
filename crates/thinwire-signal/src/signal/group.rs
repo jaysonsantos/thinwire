@@ -25,14 +25,15 @@ pub(crate) fn group_chat(master_key: &[u8], title: &str) -> GroupChat {
     }
 }
 
-/// Contact profile name when the store has one. Otherwise the sender uuid.
+/// The name of the sender from `names` (see [`super::names::person_title`]).
+/// A sender that is not in `names` gets the short fallback, not the uuid.
 #[must_use]
 pub(crate) fn sender_name(uuid: &str, names: &HashMap<String, String>) -> String {
     names
         .get(uuid)
         .filter(|name| !name.is_empty())
         .cloned()
-        .unwrap_or_else(|| uuid.to_string())
+        .unwrap_or_else(|| super::names::unknown_person(uuid))
 }
 
 const GROUP_PREFIX: &str = "signal:group:";
@@ -397,7 +398,7 @@ mod tests {
         );
         assert_eq!(
             sender_name("22222222-2222-2222-2222-222222222222", &names),
-            "22222222-2222-2222-2222-222222222222"
+            "Signal user 2222"
         );
     }
 }

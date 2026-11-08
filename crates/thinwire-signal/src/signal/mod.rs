@@ -10,6 +10,7 @@
 mod device;
 mod group;
 mod message;
+mod names;
 mod path;
 pub use path::{
     SessionLock, SessionLockError, clear_voice_files, lock_session, set_account, set_session_dir,
