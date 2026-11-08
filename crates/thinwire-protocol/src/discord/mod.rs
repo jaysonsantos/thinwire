@@ -4212,6 +4212,7 @@ mod tests {
                 Ok(())
             }
         }
+        crate::keep_callsite_interest();
         let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let writer = Buf(std::sync::Arc::clone(&bytes));
         let subscriber = tracing_subscriber::fmt()

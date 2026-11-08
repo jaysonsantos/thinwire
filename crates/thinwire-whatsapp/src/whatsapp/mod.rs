@@ -2389,6 +2389,51 @@ mod tests {
         );
     }
 
+    /// A thread with no subscriber of its own can rebuild the callsite cache
+    /// and store "never" for every line. This subscriber is the global one
+    /// the bare thread asks. `sometimes` keeps that rebuild from storing
+    /// "never", and each event then asks the subscriber on the thread that
+    /// logs. `always` would skip that check and leave the line enabled on
+    /// every thread.
+    ///
+    /// Keep this copy in sync with the other `keep_callsite_interest` copies.
+    fn keep_callsite_interest() {
+        struct Fallback;
+
+        impl tracing::Subscriber for Fallback {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, _: &tracing::Event<'_>) {}
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+        }
+
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Intentional. The first caller wins, and a later call fails.
+            let _ = tracing::subscriber::set_global_default(Fallback);
+        });
+    }
+
     /// Log lines of this thread while the guard lives. Plain text, no ANSI.
     fn capture_logs() -> (
         std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -2408,6 +2453,7 @@ mod tests {
                 Ok(())
             }
         }
+        keep_callsite_interest();
         let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let writer = Buf(std::sync::Arc::clone(&bytes));
         let subscriber = tracing_subscriber::fmt()
