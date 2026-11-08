@@ -366,6 +366,7 @@ mod tests {
 
     use thinwire_protocol::AudioPath;
 
+    use super::super::Backend;
     use super::{MAX_DECODED_SAMPLES, VoiceDecode, decode_opus, read_voice, voice_buffer};
 
     #[test]
@@ -420,6 +421,119 @@ mod tests {
             assert!(buffer.into_iter().count() > 1_000, "{name} has samples");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_play_and_shutdown_do_not_wait_for_the_rest_of_a_long_decode() {
+        let (bytes, decode) = long_enough_opus();
+        let dir = std::env::temp_dir()
+            .join("thinwire-engine-tests")
+            .join(format!("abort-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let long_path = dir.join("long.ogg");
+        let short_path = dir.join("short.ogg");
+        std::fs::write(&long_path, &bytes).expect("write");
+        std::fs::write(&short_path, ogg_opus(1)).expect("write");
+        let long = AudioPath::new(long_path.to_string_lossy().into_owned()).expect("path");
+        let short = AudioPath::new(short_path.to_string_lossy().into_owned()).expect("path");
+        let mut late = Vec::new();
+
+        let mut engine = super::Engine::new();
+        engine.send(super::Cmd::Play {
+            path: long.clone(),
+            generation: 1,
+        });
+        let started = std::time::Instant::now();
+        engine.shutdown();
+        note_if_late(&mut late, started.elapsed(), decode, "shutdown");
+
+        let mut engine = super::Engine::new();
+        engine.send(super::Cmd::Play {
+            path: long.clone(),
+            generation: 1,
+        });
+        engine.send(super::Cmd::Stop);
+        engine.send(super::Cmd::Play {
+            path: short.clone(),
+            generation: 2,
+        });
+        let started = std::time::Instant::now();
+        let done = wait_generation(&mut engine, 2);
+        note_if_late(&mut late, started.elapsed(), decode, "stop");
+        engine.shutdown();
+        if done.is_none() {
+            late.push("stop never finished the next note".to_string());
+        }
+
+        let mut engine = super::Engine::new();
+        engine.send(super::Cmd::Play {
+            path: long,
+            generation: 1,
+        });
+        engine.send(super::Cmd::Play {
+            path: short,
+            generation: 2,
+        });
+        let started = std::time::Instant::now();
+        let done = wait_generation(&mut engine, 2);
+        note_if_late(&mut late, started.elapsed(), decode, "play");
+        engine.shutdown();
+        if done.is_none() {
+            late.push("play never finished the next note".to_string());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(late.is_empty(), "{}", late.join("\n"));
+    }
+
+    fn note_if_late(
+        late: &mut Vec<String>,
+        waited: std::time::Duration,
+        decode: std::time::Duration,
+        what: &str,
+    ) {
+        let limit = decode / 4;
+        if waited >= limit {
+            late.push(format!(
+                "{what} waited {waited:?} for a note whose decode takes {decode:?}"
+            ));
+        }
+    }
+
+    fn long_enough_opus() -> (Vec<u8>, std::time::Duration) {
+        let mut frames = 16_000usize;
+        loop {
+            let bytes = ogg_opus(frames);
+            let started = std::time::Instant::now();
+            let decoded = decode_opus(Cursor::new(bytes.clone()), usize::MAX);
+            let decode = started.elapsed();
+            assert!(
+                matches!(decoded, VoiceDecode::Opus(_)),
+                "the baseline note must decode"
+            );
+            if decode >= std::time::Duration::from_millis(150) {
+                return (bytes, decode);
+            }
+            frames = frames.saturating_mul(2);
+            assert!(
+                frames <= 128_000,
+                "could not build a decode long enough to measure"
+            );
+        }
+    }
+
+    fn wait_generation(engine: &mut super::Engine, generation: u64) -> Option<super::Done> {
+        let limit = std::time::Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        while started.elapsed() < limit {
+            while let Some(done) = engine.take_done() {
+                if done.generation() == generation {
+                    return Some(done);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        None
     }
 
     #[test]
