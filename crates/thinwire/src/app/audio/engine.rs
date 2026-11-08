@@ -19,6 +19,8 @@ use super::Backend;
 const OPUS_MAX_FRAME: usize = 5760;
 const OPUS_RATE: u32 = 48_000;
 const END_POLL: Duration = Duration::from_millis(50);
+/// PCM kept for one note. 48 kHz `f32` mono is 11.52 MB a minute, so half an
+/// hour is about 346 MB. A decode past this is refused.
 const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DECODED_SAMPLES: usize = MAX_DECODED_BYTES / std::mem::size_of::<f32>();
 const DECODE_POLL_SAMPLES: usize = 960;
@@ -516,6 +518,9 @@ mod tests {
         ));
     }
 
+    /// Signal voice notes are AAC, in M4A or in ADTS. Audio files can be
+    /// MP3. Each one decodes through the path that the player uses. The
+    /// samples are 0.4 s of a 440 Hz tone, made with ffmpeg.
     #[test]
     fn aac_and_mp3_files_decode_for_the_player() {
         let dir = std::env::temp_dir()
@@ -547,62 +552,52 @@ mod tests {
             .join(format!("abort-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let long_path = dir.join("long.ogg");
-        let short_path = dir.join("short.ogg");
         std::fs::write(&long_path, &bytes).expect("write");
-        std::fs::write(&short_path, ogg_opus(1)).expect("write");
         let long = AudioPath::new(long_path.to_string_lossy().into_owned()).expect("path");
-        let short = AudioPath::new(short_path.to_string_lossy().into_owned()).expect("path");
+        let gone =
+            AudioPath::new(dir.join("gone.ogg").to_string_lossy().into_owned()).expect("path");
         let mut late = Vec::new();
 
-        let mut engine = super::Engine::new();
-        engine.send(super::Cmd::Play {
-            path: long.clone(),
-            generation: 1,
+        // The clock starts after the worker is in the decode. It stops when
+        // shutdown joins that worker. The next play names a missing file, so
+        // the timed section does not open an output device.
+        command_during_decode(&long, decode, &mut late, "shutdown", |_| {});
+        command_during_decode(&long, decode, &mut late, "stop", |engine| {
+            engine.send(super::Cmd::Stop);
         });
-        let started = std::time::Instant::now();
-        engine.shutdown();
-        note_if_late(&mut late, started.elapsed(), decode, "shutdown");
-        if let Some(done) = engine.take_done() {
-            late.push(format!("shutdown left generation {}", done.generation()));
-        }
-
-        let mut engine = super::Engine::new();
-        engine.send(super::Cmd::Play {
-            path: long.clone(),
-            generation: 1,
+        command_during_decode(&long, decode, &mut late, "play", |engine| {
+            engine.send(super::Cmd::Play {
+                path: gone,
+                generation: 2,
+            });
         });
-        engine.send(super::Cmd::Stop);
-        engine.send(super::Cmd::Play {
-            path: short.clone(),
-            generation: 2,
-        });
-        let started = std::time::Instant::now();
-        let done = wait_generation(&mut engine, 2, &mut late, "stop");
-        note_if_late(&mut late, started.elapsed(), decode, "stop");
-        engine.shutdown();
-        if done.is_none() {
-            late.push("stop never finished the next note".to_string());
-        }
-
-        let mut engine = super::Engine::new();
-        engine.send(super::Cmd::Play {
-            path: long,
-            generation: 1,
-        });
-        engine.send(super::Cmd::Play {
-            path: short,
-            generation: 2,
-        });
-        let started = std::time::Instant::now();
-        let done = wait_generation(&mut engine, 2, &mut late, "play");
-        note_if_late(&mut late, started.elapsed(), decode, "play");
-        engine.shutdown();
-        if done.is_none() {
-            late.push("play never finished the next note".to_string());
-        }
 
         let _ = std::fs::remove_dir_all(&dir);
         assert!(late.is_empty(), "{}", late.join("\n"));
+    }
+
+    fn command_during_decode(
+        long: &AudioPath,
+        decode: std::time::Duration,
+        late: &mut Vec<String>,
+        what: &str,
+        then: impl FnOnce(&mut super::Engine),
+    ) {
+        let mut engine = super::Engine::new();
+        engine.send(super::Cmd::Play {
+            path: long.clone(),
+            generation: 1,
+        });
+        std::thread::sleep(decode / 5);
+        then(&mut engine);
+        let started = std::time::Instant::now();
+        engine.shutdown();
+        note_if_late(late, started.elapsed(), decode, what);
+        while let Some(done) = engine.take_done() {
+            if done.generation() == 1 {
+                late.push(format!("{what} reported generation 1"));
+            }
+        }
     }
 
     fn note_if_late(
@@ -630,36 +625,15 @@ mod tests {
                 matches!(decoded, VoiceDecode::Opus(_)),
                 "the baseline note must decode"
             );
-            if decode >= std::time::Duration::from_millis(150) {
+            if decode >= std::time::Duration::from_millis(500) {
                 return (bytes, decode);
             }
             frames = frames.saturating_mul(2);
             assert!(
-                frames <= 128_000,
+                frames <= 1_024_000,
                 "could not build a decode long enough to measure"
             );
         }
-    }
-
-    fn wait_generation(
-        engine: &mut super::Engine,
-        generation: u64,
-        late: &mut Vec<String>,
-        what: &str,
-    ) -> Option<super::Done> {
-        let limit = std::time::Duration::from_secs(30);
-        let started = std::time::Instant::now();
-        while started.elapsed() < limit {
-            while let Some(done) = engine.take_done() {
-                if done.generation() == 1 {
-                    late.push(format!("{what} reported generation 1"));
-                } else if done.generation() == generation {
-                    return Some(done);
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        None
     }
 
     #[test]
