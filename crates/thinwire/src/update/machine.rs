@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -56,6 +57,8 @@ pub(super) enum Event {
     Feed(Result<Feed, PlainError>),
     Downloaded(Result<ArchiveFile, PlainError>),
     Armed(Result<(), PlainError>),
+    /// The recheck timer of a running app fired.
+    Recheck,
 }
 
 #[derive(Debug)]
@@ -692,8 +695,51 @@ pub(super) fn step(state: Update, event: Event) -> (Update, Effect) {
         (Update::Failed { our: None, .. }, Event::Action(Action::Dismiss)) => {
             (Update::Dormant, Effect::None)
         }
+        (Update::Quiet { our, .. }, Event::Recheck) => (
+            Update::Checking { our: our.clone() },
+            Effect::FetchFeed {
+                our,
+                purpose: FeedPurpose::Check,
+            },
+        ),
+        (
+            Update::Failed {
+                our: Some(our),
+                error,
+            },
+            Event::Recheck,
+        ) if error == CHECK_FAILED => (
+            Update::Checking { our: our.clone() },
+            Effect::FetchFeed {
+                our,
+                purpose: FeedPurpose::Check,
+            },
+        ),
         (state, _) => (state, Effect::None),
     }
+}
+
+/// The shortest time between two update checks of a running app.
+pub(super) const RECHECK_MIN: Duration = Duration::from_secs(2 * 60 * 60);
+/// The longest time between two update checks of a running app.
+pub(super) const RECHECK_MAX: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// The time to the next update check, from a random number. The result is
+/// in `RECHECK_MIN..=RECHECK_MAX`, so the apps do not all ask at one time.
+#[must_use]
+pub(super) fn recheck_delay(random: u64) -> Duration {
+    let span = RECHECK_MAX.as_secs() - RECHECK_MIN.as_secs();
+    RECHECK_MIN + Duration::from_secs(random % (span + 1))
+}
+
+/// A random number for `recheck_delay`, from the random keys of the
+/// standard library hasher. It needs no other crate.
+#[must_use]
+pub(super) fn recheck_random() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1331,6 +1377,93 @@ mod tests {
             }
             Decision::Current => panic!("a greater count is an offer"),
         }
+    }
+
+    #[test]
+    fn the_recheck_delay_is_two_to_four_hours() {
+        for random in [0, 1, 7_199, 7_200, 7_201, u64::MAX / 3, u64::MAX] {
+            let delay = recheck_delay(random);
+            assert!(delay >= RECHECK_MIN && delay <= RECHECK_MAX, "{delay:?}");
+        }
+        assert_eq!(recheck_delay(0), Duration::from_secs(2 * 60 * 60));
+        assert_eq!(recheck_delay(7_200), Duration::from_secs(4 * 60 * 60));
+        assert!(recheck_delay(recheck_random()) <= RECHECK_MAX);
+    }
+
+    fn assert_rechecks(state: Update, our: &BuildId) {
+        let (next, effect) = step(state, Event::Recheck);
+        assert_eq!(next, Update::Checking { our: our.clone() });
+        match effect {
+            Effect::FetchFeed { our: got, purpose } => {
+                assert_eq!(&got, our);
+                assert_eq!(purpose, FeedPurpose::Check);
+            }
+            _ => panic!("a recheck fetches the feed"),
+        }
+    }
+
+    fn assert_ignores_recheck(state: Update) {
+        let (next, effect) = step(state.clone(), Event::Recheck);
+        assert_eq!(next, state);
+        assert!(matches!(effect, Effect::None));
+    }
+
+    #[test]
+    fn a_quiet_app_checks_again_at_the_recheck() {
+        let our = id("0.1.0.r1.g0000001");
+        assert_rechecks(
+            Update::Quiet {
+                our: our.clone(),
+                kind: QuietKind::Current,
+            },
+            &our,
+        );
+        assert_rechecks(
+            Update::Quiet {
+                our: our.clone(),
+                kind: QuietKind::Later {
+                    skipped: id("0.1.0.r2.g0000002"),
+                },
+            },
+            &our,
+        );
+        assert_rechecks(
+            Update::Failed {
+                our: Some(our.clone()),
+                error: CHECK_FAILED,
+            },
+            &our,
+        );
+    }
+
+    #[test]
+    fn an_offer_or_an_install_ignores_the_recheck() {
+        let our = id("0.1.0.r1.g0000001");
+        assert_ignores_recheck(Update::Dormant);
+        assert_ignores_recheck(Update::Offer {
+            our: our.clone(),
+            offer: sample_offer(2, "0000002"),
+        });
+        for phase in [
+            InstallPhase::Recheck,
+            InstallPhase::Fetching,
+            InstallPhase::Verifying,
+            InstallPhase::Armed,
+        ] {
+            assert_ignores_recheck(Update::Installing {
+                our: our.clone(),
+                offer: sample_offer(2, "0000002"),
+                phase,
+            });
+        }
+        assert_ignores_recheck(Update::Failed {
+            our: Some(our),
+            error: BAD_SIGNATURE,
+        });
+        assert_ignores_recheck(Update::Failed {
+            our: None,
+            error: CHECK_FAILED,
+        });
     }
 
     #[test]

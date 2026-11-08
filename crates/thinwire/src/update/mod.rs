@@ -8,6 +8,8 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 #[cfg(any(test, target_os = "macos"))]
 use machine::Update;
@@ -292,8 +294,22 @@ fn worker(wake: egui::Context, prompt: Arc<Mutex<Prompt>>, rx: mpsc::Receiver<Ac
         let (next, effect) = step(state, event);
         state = run_effects(next, effect, dest.as_deref(), &prompt, &wake);
     }
-    while let Ok(action) = rx.recv() {
-        let (next, effect) = step(state, Event::Action(action));
+    let mut due = Instant::now() + machine::recheck_delay(machine::recheck_random());
+    loop {
+        let event = match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
+            Ok(action) => Event::Action(action),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                due = Instant::now() + machine::recheck_delay(machine::recheck_random());
+                Event::Recheck
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        let before = state.clone();
+        let (next, effect) = step(state, event);
+        if next == before && matches!(effect, Effect::None) {
+            state = next;
+            continue;
+        }
         state = run_effects(next, effect, dest.as_deref(), &prompt, &wake);
     }
 }
