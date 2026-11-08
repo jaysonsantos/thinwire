@@ -2390,9 +2390,13 @@ mod tests {
     }
 
     /// A thread with no subscriber of its own can rebuild the callsite cache
-    /// and store "never" for every line. The capturing thread still decides.
-    /// `set_global_default` sticks for the process. A later call fails, and
-    /// the first subscriber stays.
+    /// and store "never" for every line. This subscriber is the global one
+    /// the bare thread asks. `sometimes` keeps that rebuild from storing
+    /// "never", and each event then asks the subscriber on the thread that
+    /// logs. `always` would skip that check and leave the line enabled on
+    /// every thread.
+    ///
+    /// Keep this copy in sync with the other `keep_callsite_interest` copies.
     fn keep_callsite_interest() {
         struct Fallback;
 
@@ -2425,6 +2429,7 @@ mod tests {
 
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
+            // Intentional. The first caller wins, and a later call fails.
             let _ = tracing::subscriber::set_global_default(Fallback);
         });
     }

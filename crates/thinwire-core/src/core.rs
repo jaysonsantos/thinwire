@@ -4573,9 +4573,13 @@ mod tests {
     }
 
     /// A thread with no subscriber of its own can rebuild the callsite cache
-    /// and store "never" for every line. The capturing thread still decides.
-    /// `set_global_default` sticks for the process. A later call fails, and
-    /// the first subscriber stays.
+    /// and store "never" for every line. This subscriber is the global one
+    /// the bare thread asks. `sometimes` keeps that rebuild from storing
+    /// "never", and each event then asks the subscriber on the thread that
+    /// logs. `always` would skip that check and leave the line enabled on
+    /// every thread.
+    ///
+    /// Keep this copy in sync with the other `keep_callsite_interest` copies.
     fn keep_callsite_interest() {
         struct Fallback;
 
@@ -4608,6 +4612,7 @@ mod tests {
 
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
+            // Intentional. The first caller wins, and a later call fails.
             let _ = tracing::subscriber::set_global_default(Fallback);
         });
     }
@@ -4796,24 +4801,44 @@ mod tests {
 
     #[test]
     fn a_captured_line_stays_when_another_thread_rebuilds_interest() {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = std::sync::Arc::clone(&stop);
-        let hammer = std::thread::spawn(move || {
-            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                tracing::callsite::rebuild_interest_cache();
-            }
-        });
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut missed = 0;
-        for _ in 0..16 {
-            let (bytes, _guard) = capture_logs();
-            fresh_interest();
-            tracing::info!("send in flight at close");
-            if !logged(&bytes).contains("send in flight at close") {
-                missed += 1;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
             }
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let rebuilds = Arc::new(AtomicUsize::new(0));
+        let flag = Arc::clone(&stop);
+        let rebuilds_in_hammer = Arc::clone(&rebuilds);
+        let hammer = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                tracing::callsite::rebuild_interest_cache();
+                rebuilds_in_hammer.fetch_add(1, Ordering::Release);
+            }
+        });
+        let mut missed = 0;
+        {
+            let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
+            while rebuilds.load(Ordering::Acquire) == 0 {
+                if hammer.is_finished() {
+                    panic!("the hammer ended before it rebuilt interest");
+                }
+                std::thread::yield_now();
+            }
+            for _ in 0..16 {
+                let (bytes, _guard) = capture_logs();
+                fresh_interest();
+                tracing::info!("send in flight at close");
+                if !logged(&bytes).contains("send in flight at close") {
+                    missed += 1;
+                }
+            }
+        }
         hammer.join().expect("hammer");
         assert_eq!(missed, 0, "hidden lines: {missed}");
     }
