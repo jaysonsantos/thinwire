@@ -896,10 +896,10 @@ pub(super) struct FeedAssets {
 }
 
 /// Find the feed and its signature in the release JSON. Each URL must be the
-/// API URL of an asset of this repository. The publisher uploads the feed
-/// first and the signature second, so a signature older than the feed means
-/// that the upload is not complete yet: that is a failed check, not a bad
-/// signature.
+/// API URL of an asset of this repository. `scripts/publish-nightly.sh`
+/// uploads the feed in one call and the signature in a later call, so a
+/// signature older than the feed means that the upload is not complete yet:
+/// that is a failed check, not a bad signature.
 pub(super) fn feed_assets(json: &[u8]) -> Result<FeedAssets, PlainError> {
     if json.len() > MAX_RELEASE_JSON {
         return Err(CHECK_FAILED);
