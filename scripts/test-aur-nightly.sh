@@ -36,14 +36,17 @@ for url in "$@"; do
   :
 done
 case "$url" in
-  */nightly/VERSION)
+  */releases/tags/nightly)
+    printf '%s\n' '{"assets":[{"name":"VERSION","id":11},{"name":"SHA256SUMS","id":22}]}'
+    ;;
+  */releases/assets/11)
     printf '%s\n' '0.1.0.r282.gbe00026'
     ;;
-  */nightly/SHA256SUMS)
+  */releases/assets/22)
     printf '%s\n' '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  thinwire-linux-x86_64-0.1.0.r282.gbe00026.tar.gz'
     ;;
   *)
-    printf 'curl: unexpected url\n' >&2
+    printf 'curl: unexpected url %s\n' "$url" >&2
     exit 1
     ;;
 esac
@@ -170,6 +173,7 @@ launch() {
     TMPDIR="${root}/tmp" \
     PATH="${bin}:${original_path}" \
     AUR_SSH_PRIVATE_KEY="$test_key" \
+    GH_TOKEN='test-token-not-secret' \
     GITHUB_REPOSITORY='example/thinwire' \
     PASSWD_HOME="$passwd_home" \
     GIT_PUSH_RECORD="${case_dir}/git-push-record" \
