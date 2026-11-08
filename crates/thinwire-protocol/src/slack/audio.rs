@@ -18,6 +18,8 @@ impl FilesHostUrl {
     /// A host that only contains that name is a different site. Userinfo,
     /// whitespace, a backslash, or `%` in the host is rejected, so the bot
     /// token is not sent there.
+    // The production caller is the feature-gated GET. A default build has none.
+    #[cfg_attr(not(feature = "slack-oauth"), allow(dead_code))]
     pub(super) fn parse(raw: &str) -> Option<Self> {
         if raw.chars().any(char::is_whitespace) || raw.contains('\\') {
             return None;
@@ -42,6 +44,8 @@ impl FilesHostUrl {
     }
 
     /// The GET target. Only the download task reads it.
+    // Same caller as `parse`.
+    #[cfg_attr(not(feature = "slack-oauth"), allow(dead_code))]
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
@@ -115,7 +119,7 @@ impl fmt::Debug for FetchClass {
 /// The voice folder is cleared when the inbox starts, so a hasher change
 /// across a Rust upgrade does not leave a file the next play cannot find.
 pub(super) fn handle(channel: &str, ts: &str) -> i32 {
-    let mixed = BuildHasherDefault::<DefaultHasher>::default().hash_one(&(channel, ts));
+    let mixed = BuildHasherDefault::<DefaultHasher>::default().hash_one((channel, ts));
     let low = u32::try_from(mixed & 0x7fff_ffff).unwrap_or(1);
     i32::try_from(low).unwrap_or(1).max(1)
 }

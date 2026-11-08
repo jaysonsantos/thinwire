@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 
 use super::api::{
@@ -231,9 +232,7 @@ where
         };
         let (jobs_tx, jobs_rx) = unbounded_channel();
         let voice = voice_folder();
-        if let Some(dir) = &voice {
-            clear_voice_dir(dir);
-        }
+        let voice_clear = voice.as_ref().map(|dir| begin_voice_clear(dir));
         let resume = deps.vault.get_secret(SlackSecretKey::BotToken).is_some();
         if !resume {
             emit_status(
@@ -244,7 +243,7 @@ where
             );
             emit_account(&events, ProtocolId::Slack, AccountState::Unlinked);
         }
-        let session = Session::new(deps, events, jobs_tx.clone(), voice);
+        let session = Session::new(deps, events, jobs_tx.clone(), voice, voice_clear);
         tokio::spawn(session.run(jobs_rx));
         if resume {
             let _ = jobs_tx.send(Job::Command(AdapterCommand::Connect {
@@ -348,6 +347,9 @@ where
     /// gets its own, because a start clears the folder and the suite runs
     /// sessions in parallel.
     voice_dir: Option<PathBuf>,
+    /// Completes after the start clear finishes. The session reads no job
+    /// before that, so a download cannot write a file the clear then deletes.
+    voice_clear: Option<oneshot::Receiver<()>>,
 }
 
 impl<A, S, B> Session<A, S, B>
@@ -361,6 +363,7 @@ where
         events: EventTx,
         jobs: UnboundedSender<Job>,
         voice_dir: Option<PathBuf>,
+        voice_clear: Option<oneshot::Receiver<()>>,
     ) -> Self {
         Self {
             deps,
@@ -378,10 +381,14 @@ where
             clips: HashMap::new(),
             inflight: HashSet::new(),
             voice_dir,
+            voice_clear,
         }
     }
 
     async fn run(mut self, mut jobs: UnboundedReceiver<Job>) {
+        if let Some(wait) = self.voice_clear.take() {
+            let _ = wait.await;
+        }
         while let Some(job) = jobs.recv().await {
             // Quiet channels have no post of their own to prune. The full
             // walk is at most once per `DEDUP_SWEEP_SECS`.
@@ -754,7 +761,7 @@ where
         self.clips.clear();
         self.inflight.clear();
         if let Some(dir) = &self.voice_dir {
-            clear_voice_dir(dir);
+            let _ = begin_voice_clear(dir).await;
         }
         self.deps.vault.set_secret(SlackSecretKey::BotToken, "");
         self.deps.vault.set_secret(SlackSecretKey::TeamId, "");
@@ -1809,12 +1816,21 @@ fn voice_folder() -> Option<PathBuf> {
     dirs::cache_dir().map(|dir| dir.join("thinwire").join("slack").join("voice"))
 }
 
-fn clear_voice_dir(dir: &std::path::Path) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
+/// Clear `dir` on a blocking thread. The receiver completes when that
+/// delete has finished. Outside a runtime the delete runs here.
+fn begin_voice_clear(dir: &std::path::Path) -> oneshot::Receiver<()> {
     let dir = dir.to_path_buf();
-    runtime.spawn_blocking(move || crate::voice_files::clear(&dir));
+    let (tx, rx) = oneshot::channel();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        crate::voice_files::clear(&dir);
+        let _ = tx.send(());
+        return rx;
+    };
+    runtime.spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || crate::voice_files::clear(&dir)).await;
+        let _ = tx.send(());
+    });
+    rx
 }
 
 struct Shown {
