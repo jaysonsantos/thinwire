@@ -791,6 +791,7 @@ impl ProtocolAdapter for SignalAdapter {
                     let _ = events.send(AdapterEvent::VoiceFailed {
                         protocol: ProtocolId::Signal,
                         file_id,
+                        stop: thinwire_protocol::VoiceStop::Unplayable,
                     });
                 }
                 Ok(())

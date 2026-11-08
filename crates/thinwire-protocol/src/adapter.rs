@@ -1061,6 +1061,7 @@ pub enum AdapterEvent {
     VoiceFailed {
         protocol: ProtocolId,
         file_id: i32,
+        stop: crate::media::VoiceStop,
     },
     /// The reactions of one message now. An empty list has none.
     MessageReactions {

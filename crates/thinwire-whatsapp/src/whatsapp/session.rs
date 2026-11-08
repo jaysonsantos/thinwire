@@ -519,6 +519,7 @@ impl Session {
             let _ = events.send(AdapterEvent::VoiceFailed {
                 protocol: ProtocolId::WhatsApp,
                 file_id,
+                stop: thinwire_protocol::VoiceStop::Unplayable,
             });
         };
         let mut state = self.lock();

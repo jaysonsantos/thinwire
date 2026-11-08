@@ -2,7 +2,9 @@ mod engine;
 
 use eframe::egui::{self, RichText};
 use thinwire_core::Intent;
-use thinwire_protocol::{AudioPath, ChatMessage, MessageAudio, MessageVideo, ProtocolId};
+use thinwire_protocol::{
+    AudioPath, ChatMessage, MessageAudio, MessageVideo, ProtocolId, VoiceStop,
+};
 
 use super::motion;
 use super::theme;
@@ -433,6 +435,15 @@ fn same_message(message: &ChatMessage, key: &VoiceKey) -> bool {
         && message.id == key.message_id
 }
 
+const SLACK_FILES_LINE: &str = "Slack did not grant file access. Remove the thinwire app in Slack, then add the workspace again.";
+
+fn retry_line(audio: &MessageAudio) -> &'static str {
+    match audio.stop() {
+        Some(VoiceStop::SlackFilesDenied) => SLACK_FILES_LINE,
+        _ => "Couldn't play this voice message.",
+    }
+}
+
 fn paint(ui: &mut egui::Ui, face: Face, audio: &MessageAudio) -> bool {
     let palette = theme::palette(ui);
     match face {
@@ -454,7 +465,7 @@ fn paint(ui: &mut egui::Ui, face: Face, audio: &MessageAudio) -> bool {
         Face::Retry => {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("Couldn't play this voice message.")
+                    RichText::new(retry_line(audio))
                         .small()
                         .color(palette.error),
                 );
@@ -475,11 +486,14 @@ mod tests {
     use std::collections::VecDeque;
 
     use thinwire_core::Intent;
-    use thinwire_protocol::{Arrival, AudioPath, ChatMessage, Delivery, MessageAudio, ProtocolId};
+    use thinwire_protocol::{
+        Arrival, AudioPath, ChatMessage, Delivery, MessageAudio, ProtocolId, VoiceStop,
+    };
 
     use super::engine::{Cmd, Done};
     use super::{
-        Backend, Effect, Input, NoteState, Player, Session, VoiceKey, clock, note_state, step,
+        Backend, Effect, Input, NoteState, Player, Session, VoiceKey, clock, note_state,
+        retry_line, step,
     };
 
     #[derive(Default)]
@@ -972,5 +986,17 @@ mod tests {
         let mut audio = MessageAudio::telegram(1, 3, Some(path())).expect("note");
         audio.mark_failed();
         assert!(matches!(note_state(&audio), NoteState::Local { .. }));
+    }
+
+    #[test]
+    fn a_slack_file_stop_names_the_reinstall() {
+        let mut audio = MessageAudio::telegram(1, 3, None).expect("note");
+        audio.mark_failed();
+        assert_eq!(retry_line(&audio), "Couldn't play this voice message.");
+        audio.mark_stopped(VoiceStop::SlackFilesDenied);
+        assert_eq!(
+            retry_line(&audio),
+            "Slack did not grant file access. Remove the thinwire app in Slack, then add the workspace again."
+        );
     }
 }

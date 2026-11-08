@@ -11,8 +11,8 @@ use thinwire_protocol::{
     Conversation, Delivery, DiscordAdapter, HelperFault, HelperState, HistoryStoreCursor,
     MAX_ATTACHMENTS, MessageAudio, MessageTopic, OutgoingFile, ProtocolCapabilities, ProtocolId,
     StoreAccessReason, TelegramApiSource, TelegramAuthError, TelegramAuthPhase, TelegramAuthStep,
-    TelegramCodeVia, TelegramSecretVault, catalog, ordered_topics, telegram_api_available,
-    topic_mute_id, with_outbox_read,
+    TelegramCodeVia, TelegramSecretVault, VoiceStop, catalog, ordered_topics,
+    telegram_api_available, topic_mute_id, with_outbox_read,
 };
 
 use crate::mutes::{ChatMute, ChatMutes};
@@ -1655,7 +1655,11 @@ impl Snapshot {
                 file_id,
                 path,
             } => self.voice_ready(protocol, file_id, path),
-            AdapterEvent::VoiceFailed { protocol, file_id } => self.voice_failed(protocol, file_id),
+            AdapterEvent::VoiceFailed {
+                protocol,
+                file_id,
+                stop,
+            } => self.voice_failed(protocol, file_id, stop),
             AdapterEvent::VideoReady {
                 protocol,
                 file_id,
@@ -6645,8 +6649,6 @@ impl Snapshot {
         }
     }
 
-    /// A refresh may omit a path TDLib has not reported yet. Keep the path
-    /// and the failed flag already stored for the same file id.
     fn keep_voice_file(incoming: &mut Option<MessageAudio>, stored: Option<&MessageAudio>) {
         let Some(stored) = stored else {
             return;
@@ -6660,10 +6662,9 @@ impl Snapshot {
         if let Some(path) = stored.file().cloned() {
             incoming.set_file(path);
         }
-        if stored.failed() {
-            incoming.mark_failed();
-        } else {
-            incoming.clear_failed();
+        match stored.stop() {
+            Some(stop) => incoming.mark_stopped(stop),
+            None => incoming.clear_failed(),
         }
     }
 
@@ -7008,7 +7009,7 @@ impl Snapshot {
         }
     }
 
-    fn voice_failed(&mut self, protocol: ProtocolId, file_id: i32) {
+    fn voice_failed(&mut self, protocol: ProtocolId, file_id: i32, stop: VoiceStop) {
         for list in self.messages.values_mut() {
             for message in list.iter_mut() {
                 if message.protocol != protocol {
@@ -7018,7 +7019,7 @@ impl Snapshot {
                     continue;
                 };
                 if audio.file_id() == file_id {
-                    audio.mark_failed();
+                    audio.mark_stopped(stop);
                 }
             }
         }
@@ -10460,6 +10461,37 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, AdapterCommand::DownloadVoice { .. }))
         );
+    }
+
+    #[test]
+    fn a_slack_file_stop_stays_when_the_message_is_refreshed() {
+        let mut snapshot = Snapshot::new();
+        snapshot.apply(AdapterEvent::Account {
+            protocol: ProtocolId::Telegram,
+            state: AccountState::Linked,
+        });
+        let mut message = telegram_text(1, 5, "Voice message");
+        message.audio = MessageAudio::telegram(0, 7, None);
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: message.clone(),
+        });
+        snapshot.apply(AdapterEvent::VoiceFailed {
+            protocol: ProtocolId::Telegram,
+            file_id: 7,
+            stop: VoiceStop::SlackFilesDenied,
+        });
+        let stop_of = |snapshot: &Snapshot| {
+            snapshot
+                .messages
+                .values()
+                .flatten()
+                .find(|row| row.id == "telegram:1:5")
+                .and_then(|row| row.audio.as_ref())
+                .and_then(|audio| audio.stop())
+        };
+        assert_eq!(stop_of(&snapshot), Some(VoiceStop::SlackFilesDenied));
+        snapshot.apply(AdapterEvent::MessageReceived { message });
+        assert_eq!(stop_of(&snapshot), Some(VoiceStop::SlackFilesDenied));
     }
 
     #[test]
