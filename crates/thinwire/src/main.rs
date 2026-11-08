@@ -24,7 +24,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(startup.window_size())
-            .with_title("thinwire"),
+            .with_title("thinwire")
+            .with_icon(window_icon()),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -44,6 +45,14 @@ fn main() -> eframe::Result<()> {
             )))
         }),
     )
+}
+
+/// The app icon, 256 px. `scripts/make-icons.sh` makes it from `icon.svg`.
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
+
+/// The window and taskbar icon. A bad PNG gives the default icon, not a crash.
+fn window_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(WINDOW_ICON_PNG).unwrap_or_default()
 }
 
 /// `slack_morphism` logs the one-time Socket Mode URL. Presage and libsignal
@@ -135,5 +144,24 @@ mod tests {
         let output = String::from_utf8(bytes.lock().expect("log buffer").clone()).expect("utf8");
         assert!(!output.contains("sgnl://"), "{output}");
         assert!(output.contains("shell is up"), "{output}");
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    #[test]
+    fn the_window_icon_is_a_square_png() {
+        let icon = eframe::icon_data::from_png_bytes(WINDOW_ICON_PNG).expect("icon PNG decodes");
+        assert_eq!(icon.width, 256);
+        assert_eq!(icon.width, icon.height);
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
+
+    #[test]
+    fn the_macos_bundle_icon_is_an_icns_file() {
+        let icns = include_bytes!("../assets/AppIcon.icns");
+        assert_eq!(&icns[..4], b"icns");
     }
 }

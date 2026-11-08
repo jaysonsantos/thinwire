@@ -99,7 +99,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   out="target/${profile}"
   app="${out}/Thinwire.app"
   rm -rf "$app"
-  mkdir -p "$app/Contents/MacOS"
+  mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+  cp crates/thinwire/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
   for program in thinwire thinwire-whatsapp-helper thinwire-signal-helper; do
     # `/bin/cp -c` clones the file on APFS: no second copy of the bytes.
     # The `cp` of the Nix shell is GNU cp, which has no `-c`.
@@ -122,6 +123,10 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   <string>Thinwire</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
   <key>CFBundleShortVersionString</key>
   <string>${version:-0.0.0}</string>
   <key>CFBundleVersion</key>

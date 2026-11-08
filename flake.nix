@@ -66,6 +66,9 @@
                 pkgs.taplo
                 # Lossless PNG shrink for the UI snapshots (scripts/update-snapshots.sh).
                 pkgs.oxipng
+                # App icon files from the SVG (scripts/make-icons.sh).
+                pkgs.librsvg
+                (pkgs.python3.withPackages (ps: [ ps.pillow ]))
                 pkgs.shellcheck
                 pkgs.nixfmt
                 pkgs.typos

@@ -701,6 +701,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   done
   mv dist/LICENSE "$app/Contents/Resources/LICENSE"
   mv dist/THIRD_PARTY_NOTICES "$app/Contents/Resources/THIRD_PARTY_NOTICES"
+  # The bundle icon: Finder, the Dock, and each notification show it.
+  cp crates/thinwire/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
   cat >"$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -716,6 +718,10 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   <string>Thinwire</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
   <key>CFBundleShortVersionString</key>
   <string>${version}</string>
   <key>CFBundleVersion</key>
@@ -729,6 +735,10 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 </dict>
 </plist>
 EOF
+  if [[ ! -s "$app/Contents/Resources/AppIcon.icns" ]]; then
+    echo "::error::Thinwire.app is missing Contents/Resources/AppIcon.icns. Run scripts/make-icons.sh."
+    exit 1
+  fi
   if [[ ! -s "$app/Contents/MacOS/thinwire" || ! -x "$app/Contents/MacOS/thinwire" ]]; then
     echo "::error::Thinwire.app is missing an executable Contents/MacOS/thinwire."
     exit 1
