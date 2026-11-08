@@ -554,20 +554,17 @@ mod tests {
         let long_path = dir.join("long.ogg");
         std::fs::write(&long_path, &bytes).expect("write");
         let long = AudioPath::new(long_path.to_string_lossy().into_owned()).expect("path");
-        let gone =
-            AudioPath::new(dir.join("gone.ogg").to_string_lossy().into_owned()).expect("path");
+        let missing =
+            AudioPath::new(dir.join("missing.ogg").to_string_lossy().into_owned()).expect("path");
         let mut late = Vec::new();
 
-        // The clock starts after the worker is in the decode. It stops when
-        // shutdown joins that worker. The next play names a missing file, so
-        // the timed section does not open an output device.
-        command_during_decode(&long, decode, &mut late, "shutdown", |_| {});
-        command_during_decode(&long, decode, &mut late, "stop", |engine| {
+        shutdown_during_decode(&long, decode, &mut late, "shutdown", |_| {});
+        shutdown_during_decode(&long, decode, &mut late, "stop", |engine| {
             engine.send(super::Cmd::Stop);
         });
-        command_during_decode(&long, decode, &mut late, "play", |engine| {
+        shutdown_during_decode(&long, decode, &mut late, "play", |engine| {
             engine.send(super::Cmd::Play {
-                path: gone,
+                path: missing,
                 generation: 2,
             });
         });
@@ -576,7 +573,7 @@ mod tests {
         assert!(late.is_empty(), "{}", late.join("\n"));
     }
 
-    fn command_during_decode(
+    fn shutdown_during_decode(
         long: &AudioPath,
         decode: std::time::Duration,
         late: &mut Vec<String>,
