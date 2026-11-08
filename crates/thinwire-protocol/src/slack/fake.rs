@@ -425,6 +425,10 @@ impl Harness {
         self.adapter.start(self.tx.clone());
     }
 
+    fn voice_at(&mut self, dir: std::path::PathBuf) {
+        self.adapter.voice_at(dir);
+    }
+
     fn send(&mut self, command: AdapterCommand) {
         self.adapter.handle(command, &self.tx).expect("queued");
     }
@@ -3349,6 +3353,61 @@ async fn a_second_download_waits_for_the_first() {
     )
     .await;
     assert_eq!(h.api.with(|state| state.file_calls), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_revoked_download_does_not_stay_in_the_player_folder() {
+    let api = FakeApi::workspace();
+    seed_audio(&api, "1700000012.000900");
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    api.with(|state| {
+        state.file_script.push_back((200, b"ID3-revoked".to_vec()));
+        state.file_started = Some(started_tx);
+        state.file_hold = Some(release_rx);
+    });
+    let dir = std::env::temp_dir()
+        .join("thinwire-slack-voice-revoke")
+        .join(std::process::id().to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("voice dir");
+    let vault = installed_vault();
+    vault.set_secret(SlackSecretKey::AppToken, APP_TOKEN);
+    let mut h = Harness::new(api, vault, true);
+    h.voice_at(dir.clone());
+    let file_id = shown_audio(&mut h).await;
+    h.send(AdapterCommand::DownloadVoice {
+        protocol: ProtocolId::Slack,
+        file_id,
+    });
+    tokio::time::timeout(Duration::from_secs(2), started_rx)
+        .await
+        .expect("download started")
+        .expect("started signal");
+    h.socket.push(SlackInbound::Revoked);
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    release_tx.send(()).expect("release");
+    let detail = h.status(AdapterStatus::Error).await;
+    assert!(detail.contains("access ended"));
+    let late = tokio::time::timeout(Duration::from_millis(300), h.rx.recv()).await;
+    if let Ok(Some(event)) = late {
+        assert!(
+            !matches!(event, AdapterEvent::VoiceReady { file_id: seen, .. } if seen == file_id),
+            "a revoked download became ready: {event:?}"
+        );
+        h.seen.push(event);
+    }
+    assert!(!h.seen.iter().any(|event| matches!(
+        event,
+        AdapterEvent::VoiceReady { file_id: seen, .. } if *seen == file_id
+    )));
+    let left = std::fs::read_dir(&dir)
+        .expect("dir")
+        .flatten()
+        .any(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()));
+    assert!(!left, "the revoked download wrote a file back");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn capture_debug() -> (

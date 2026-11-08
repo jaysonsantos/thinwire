@@ -83,7 +83,7 @@ impl AdapterHost {
         let build = accounts.map(|factory| {
             Box::new(move |account: ProtocolId| {
                 let parts = factory(account)?;
-                Some(build_account_adapter(parts, &build_epoch))
+                Some(build_account_adapter(account, parts, &build_epoch))
             }) as Builder
         });
         Self::spawn_inner(
@@ -319,7 +319,11 @@ fn deliver(event: AdapterEvent, current_epoch: u64) -> Option<AdapterEvent> {
 type Builder = Box<dyn Fn(ProtocolId) -> Option<Box<dyn ProtocolAdapter>> + Send>;
 
 /// The adapter of an account other than 0, from its parts.
-fn build_account_adapter(parts: AccountAdapter, epoch: &LoginEpoch) -> Box<dyn ProtocolAdapter> {
+fn build_account_adapter(
+    account: ProtocolId,
+    parts: AccountAdapter,
+    epoch: &LoginEpoch,
+) -> Box<dyn ProtocolAdapter> {
     match parts {
         AccountAdapter::Telegram(vault) => Box::new(super::TelegramAdapter::with_login_epoch(
             vault,
@@ -327,7 +331,7 @@ fn build_account_adapter(parts: AccountAdapter, epoch: &LoginEpoch) -> Box<dyn P
             Arc::clone(epoch),
         )),
         AccountAdapter::Discord(vault) => Box::new(super::DiscordAdapter::new(vault)),
-        AccountAdapter::Slack(vault) => super::slack::registry_adapter(vault),
+        AccountAdapter::Slack(vault) => super::slack::registry_adapter_for(vault, account.slot()),
         AccountAdapter::Ready(adapter) => adapter,
     }
 }

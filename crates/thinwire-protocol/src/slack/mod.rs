@@ -47,23 +47,35 @@ pub use session::{DEDUP_FRESH_SECS, SlackDeps, SlackInbox};
 pub(crate) fn registry_adapter(
     vault: std::sync::Arc<dyn SlackSecretVault>,
 ) -> Box<dyn ProtocolAdapter> {
+    registry_adapter_for(vault, 0)
+}
+
+pub(crate) fn registry_adapter_for(
+    vault: std::sync::Arc<dyn SlackSecretVault>,
+    slot: u8,
+) -> Box<dyn ProtocolAdapter> {
     #[cfg(feature = "slack-oauth")]
     {
         match live::hyper_client() {
             Ok(client) => {
-                return Box::new(SlackInbox::new(SlackDeps::new(
-                    live::MorphismWebApi::new(std::sync::Arc::clone(&client)),
-                    live::MorphismSocket::new(client),
-                    live::SystemBrowser,
-                    vault,
-                    SlackApiSource::from_build(),
-                )));
+                return Box::new(
+                    SlackInbox::new(SlackDeps::new(
+                        live::MorphismWebApi::new(std::sync::Arc::clone(&client)),
+                        live::MorphismSocket::new(client),
+                        live::SystemBrowser,
+                        vault,
+                        SlackApiSource::from_build(),
+                    ))
+                    .for_slot(slot),
+                );
             }
             Err(error) => tracing::warn!(%error, "slack https client did not start"),
         }
     }
     #[cfg(not(feature = "slack-oauth"))]
-    let _ = vault;
+    {
+        let _ = (vault, slot);
+    }
     Box::new(SlackAdapter)
 }
 

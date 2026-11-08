@@ -137,6 +137,7 @@ enum Job {
     },
     ClipDone {
         file_id: i32,
+        epoch: u64,
         done: ClipResult,
     },
 }
@@ -149,6 +150,7 @@ enum ClipResult {
 struct ClipFinish {
     jobs: UnboundedSender<Job>,
     file_id: i32,
+    epoch: u64,
     sent: bool,
 }
 
@@ -159,6 +161,7 @@ impl Drop for ClipFinish {
         }
         let _ = self.jobs.send(Job::ClipDone {
             file_id: self.file_id,
+            epoch: self.epoch,
             done: ClipResult::Failed(VoiceStop::Unplayable),
         });
     }
@@ -180,6 +183,8 @@ where
 {
     deps: Option<SlackDeps<A, S, B>>,
     jobs: Option<UnboundedSender<Job>>,
+    slot: u8,
+    voice_override: Option<PathBuf>,
 }
 
 impl<A, S, B> SlackInbox<A, S, B>
@@ -193,7 +198,20 @@ where
         Self {
             deps: Some(deps),
             jobs: None,
+            slot: 0,
+            voice_override: None,
         }
+    }
+
+    #[must_use]
+    pub fn for_slot(mut self, slot: u8) -> Self {
+        self.slot = slot;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn voice_at(&mut self, dir: PathBuf) {
+        self.voice_override = Some(dir);
     }
 }
 
@@ -230,7 +248,10 @@ where
             return;
         };
         let (jobs_tx, jobs_rx) = unbounded_channel();
-        let voice = voice_folder();
+        let voice = self
+            .voice_override
+            .clone()
+            .or_else(|| voice_folder(self.slot));
         let voice_clear = voice.as_ref().map(|dir| begin_voice_clear(dir));
         let resume = deps.vault.get_secret(SlackSecretKey::BotToken).is_some();
         if !resume {
@@ -340,6 +361,8 @@ where
     dedup_swept_at: Option<i64>,
     clips: HashMap<i32, FilesHostUrl>,
     inflight: HashSet<i32>,
+    downloads: Vec<tokio::task::JoinHandle<()>>,
+    voice_epoch: u64,
     voice_dir: Option<PathBuf>,
     voice_clear: Option<oneshot::Receiver<()>>,
 }
@@ -372,6 +395,8 @@ where
             dedup_swept_at: None,
             clips: HashMap::new(),
             inflight: HashSet::new(),
+            downloads: Vec::new(),
+            voice_epoch: 0,
             voice_dir,
             voice_clear,
         }
@@ -397,7 +422,11 @@ where
                 }
                 Job::Inbound(SlackInbound::Revoked) => self.revoked().await,
                 Job::Installed { attempt, result } => self.installed(attempt, result).await,
-                Job::ClipDone { file_id, done } => self.clip_done(file_id, done),
+                Job::ClipDone {
+                    file_id,
+                    epoch,
+                    done,
+                } => self.clip_done(file_id, epoch, done),
             }
         }
         self.stop_live().await;
@@ -750,6 +779,11 @@ where
     /// The bot token no longer works. Stop Socket Mode and drop the install.
     async fn end_access(&mut self) {
         self.stop_live().await;
+        self.voice_epoch = self.voice_epoch.wrapping_add(1);
+        let pending = std::mem::take(&mut self.downloads);
+        for task in pending {
+            let _ = task.await;
+        }
         self.clips.clear();
         self.inflight.clear();
         if let Some(dir) = &self.voice_dir {
@@ -1723,21 +1757,34 @@ where
         self.inflight.insert(file_id);
         let api = Arc::clone(&self.deps.api);
         let jobs = self.jobs.clone();
-        tokio::spawn(async move {
+        let epoch = self.voice_epoch;
+        self.downloads.retain(|task| !task.is_finished());
+        self.downloads.push(tokio::spawn(async move {
             let mut finish = ClipFinish {
                 jobs: jobs.clone(),
                 file_id,
+                epoch,
                 sent: false,
             };
             let done = fetch_clip(api.as_ref(), &token, &url, &dir, file_id).await;
-            if jobs.send(Job::ClipDone { file_id, done }).is_ok() {
+            if jobs
+                .send(Job::ClipDone {
+                    file_id,
+                    epoch,
+                    done,
+                })
+                .is_ok()
+            {
                 finish.sent = true;
             }
-        });
+        }));
     }
 
-    fn clip_done(&mut self, file_id: i32, done: ClipResult) {
+    fn clip_done(&mut self, file_id: i32, epoch: u64, done: ClipResult) {
         self.inflight.remove(&file_id);
+        if epoch != self.voice_epoch {
+            return;
+        }
         match done {
             ClipResult::Ready(path) => {
                 let _ = self.events.send(AdapterEvent::VoiceReady {
@@ -1790,7 +1837,7 @@ async fn fetch_clip(
     }
 }
 
-fn voice_folder() -> Option<PathBuf> {
+fn voice_folder(slot: u8) -> Option<PathBuf> {
     if cfg!(test) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1802,7 +1849,16 @@ fn voice_folder() -> Option<PathBuf> {
                 .join(n.to_string()),
         );
     }
-    dirs::cache_dir().map(|dir| dir.join("thinwire").join("slack").join("voice"))
+    dirs::cache_dir().map(|dir| voice_cache(&dir, slot))
+}
+
+fn voice_cache(root: &std::path::Path, slot: u8) -> PathBuf {
+    let name = if slot == 0 {
+        "slack".to_owned()
+    } else {
+        format!("slack-{slot}")
+    };
+    root.join("thinwire").join(name).join("voice")
 }
 
 fn begin_voice_clear(dir: &std::path::Path) -> oneshot::Receiver<()> {
@@ -2034,6 +2090,16 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn each_account_keeps_its_own_voice_folder() {
+        let root = std::path::Path::new("/cache");
+        let first = voice_cache(root, 0);
+        let second = voice_cache(root, 1);
+        assert_eq!(first, root.join("thinwire/slack/voice"));
+        assert_eq!(second, root.join("thinwire/slack-1/voice"));
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn ids_round_trip_and_reject_foreign_ids() {
