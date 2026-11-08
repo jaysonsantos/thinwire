@@ -4753,6 +4753,32 @@ mod tests {
         assert!(!exit.contains("secret"), "never the text: {exit}");
     }
 
+    /// A thread with no subscriber can rebuild the callsite cache and store
+    /// "never". The captured line must still show up.
+    #[test]
+    fn a_captured_line_stays_when_another_thread_rebuilds_interest() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let hammer = std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::callsite::rebuild_interest_cache();
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut missed = 0;
+        for _ in 0..16 {
+            let (bytes, _guard) = capture_logs();
+            fresh_interest();
+            tracing::info!("send in flight at close");
+            if !logged(&bytes).contains("send in flight at close") {
+                missed += 1;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        hammer.join().expect("hammer");
+        assert_eq!(missed, 0, "hidden lines: {missed}");
+    }
+
     /// Sends "hello" through a core with no adapter answers. Returns the
     /// core, the adapter event sender, and the request id.
     fn core_with_unanswered_send() -> (Core, tokio::sync::mpsc::UnboundedSender<AdapterEvent>, u64)
