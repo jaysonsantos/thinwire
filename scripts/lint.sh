@@ -8,8 +8,8 @@ cd "$(dirname "$script_dir")"
 # README hero images must stay present (paths under crates/thinwire/tests/snapshots/).
 # Both the light and dark hero snapshots are required.
 required_snaps=(
-  "crates/thinwire/tests/snapshots/several_protocols-light-1100x720.png"
-  "crates/thinwire/tests/snapshots/several_protocols-dark-1100x720.png"
+  "crates/thinwire/tests/snapshots/showcase-light-1100x720.png"
+  "crates/thinwire/tests/snapshots/showcase-dark-1100x720.png"
 )
 mapfile -t readme_snaps < <(grep -oE 'crates/thinwire/tests/snapshots/[^"[:space:]]+\.png' README.md | sort -u)
 missing_required=0

@@ -21,9 +21,9 @@ use thinwire_protocol::demo::{
 };
 use thinwire_protocol::{
     AdapterEvent, AdapterHost, AdapterStatus, ChatMessage, ChatTopic, Conversation, Delivery,
-    ImageBytes, MessageLink, MessagePhoto, MessageTopic, PhotoSize, ProtocolAdapter,
-    ProtocolCapabilities, ProtocolId, TelegramApiSource, TelegramAuthError, TelegramAuthPhase,
-    TelegramAuthStep, WhatsAppPhoneVault, topic_mute_id,
+    ImageBytes, MessageAudio, MessageLink, MessagePhoto, MessageTopic, PhotoSize, ProtocolAdapter,
+    ProtocolCapabilities, ProtocolId, Reaction, TelegramApiSource, TelegramAuthError,
+    TelegramAuthPhase, TelegramAuthStep, WhatsAppPhoneVault, topic_mute_id,
 };
 use tokio::runtime::Handle;
 
@@ -131,11 +131,15 @@ pub enum Scenario {
     PhotoSpoiler,
     /// A photo that did not load.
     PhotoFailed,
+    /// The README picture: several protocols with unread counts, a muted
+    /// chat, and an open group with a reply, reactions, a photo, a voice
+    /// message, a mention, and a link.
+    Showcase,
 }
 
 impl Scenario {
     /// Every scenario, in a fixed order.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::FirstRun,
         Self::EmptyInbox,
         Self::LongChat,
@@ -163,6 +167,7 @@ impl Scenario {
         Self::PhotoWide,
         Self::PhotoSpoiler,
         Self::PhotoFailed,
+        Self::Showcase,
     ];
 
     /// A stable snake_case name, for example for a snapshot file.
@@ -196,6 +201,7 @@ impl Scenario {
             Self::PhotoWide => "photo_wide",
             Self::PhotoSpoiler => "photo_spoiler",
             Self::PhotoFailed => "photo_failed",
+            Self::Showcase => "showcase",
         }
     }
 
@@ -354,6 +360,22 @@ impl Scenario {
                 set_ada_preview(&mut telegram, &preview);
                 telegram.history.insert(ADA.into(), photo_chat(photo));
                 setup.intents.push(select(ADA));
+            }
+            Self::Showcase => {
+                telegram = showcase_telegram();
+                setup.scripts.extend(showcase_others());
+                setup.visible.extend([
+                    ProtocolId::WhatsApp,
+                    ProtocolId::Discord,
+                    ProtocolId::Slack,
+                    ProtocolId::Signal,
+                ]);
+                setup.intents.push(Intent::SetChatMute {
+                    protocol: ProtocolId::Telegram,
+                    conversation_id: MILO.into(),
+                    muted: true,
+                });
+                setup.intents.push(select(BOOK_CLUB));
             }
         }
         setup.scripts.insert(0, telegram);
@@ -872,6 +894,164 @@ fn group_chat() -> Vec<ChatMessage> {
         .collect()
 }
 
+/// Telegram for the showcase: the inbox with unread counts, and the book
+/// club thread with every kind of row.
+fn showcase_telegram() -> DemoScript {
+    let rows = inbox_rows()
+        .into_iter()
+        .map(|row| match row.id.as_str() {
+            ADA => Conversation { unread: 3, ..row },
+            MILO => Conversation {
+                unread: 5,
+                preview: "Photo".into(),
+                ..row
+            },
+            BOOK_CLUB => Conversation {
+                preview: "Nora: Can you book a table?".into(),
+                ..row
+            },
+            _ => row,
+        })
+        .collect();
+    let mut script = telegram_linked(rows);
+    script.history.insert(BOOK_CLUB.into(), showcase_thread());
+    script
+}
+
+/// One linked account with one or two rows for each other protocol, so the
+/// rail shows every protocol with an unread count.
+fn showcase_others() -> Vec<DemoScript> {
+    let unread = |mut row: Conversation, count: u32| {
+        row.unread = count;
+        row
+    };
+    let script = |protocol: ProtocolId, rows: Vec<Conversation>| {
+        DemoScript::linked(caps(protocol), rows, NOW)
+    };
+    vec![
+        script(
+            ProtocolId::WhatsApp,
+            vec![unread(
+                row(
+                    ProtocolId::WhatsApp,
+                    "whatsapp:demo-family",
+                    "Family",
+                    "Dinner on Sunday?",
+                    2,
+                    true,
+                ),
+                4,
+            )],
+        ),
+        script(
+            ProtocolId::Discord,
+            vec![unread(
+                row(
+                    ProtocolId::Discord,
+                    "discord:demo-builds",
+                    "#builds",
+                    "Nightly is green.",
+                    1,
+                    true,
+                ),
+                1,
+            )],
+        ),
+        script(
+            ProtocolId::Slack,
+            vec![unread(
+                row(
+                    ProtocolId::Slack,
+                    SLACK_GENERAL,
+                    "#general",
+                    "Lunch at 12?",
+                    1,
+                    true,
+                ),
+                2,
+            )],
+        ),
+        script(
+            ProtocolId::Signal,
+            vec![unread(
+                row(
+                    ProtocolId::Signal,
+                    "signal:demo-sam",
+                    "Sam Ortiz",
+                    "See you there.",
+                    1,
+                    false,
+                ),
+                1,
+            )],
+        ),
+    ]
+}
+
+/// The book club thread of the showcase, oldest first, over two days.
+fn showcase_thread() -> Vec<ChatMessage> {
+    let question = message(
+        BOOK_CLUB,
+        0,
+        "Nora",
+        "Who has read chapter 4?",
+        NOW - DAY - 3 * HOUR,
+    );
+    let mut photo = message(
+        BOOK_CLUB,
+        1,
+        "Ada",
+        "Our corner for Thursday",
+        NOW - DAY - 2 * HOUR,
+    );
+    photo.photo = Some(MessagePhoto {
+        width: 300,
+        height: 120,
+        mini: None,
+        sizes: vec![PhotoSize {
+            width: 300,
+            height: 120,
+            file_id: Some(2),
+            path: None,
+            bytes: Some(ImageBytes::new(WIDE_PNG.to_vec())),
+        }],
+        has_spoiler: false,
+        is_secret: false,
+        failed: false,
+    });
+    let mut answer = message(
+        BOOK_CLUB,
+        2,
+        "You",
+        "Done. The ending surprised me.",
+        NOW - 3 * HOUR,
+    );
+    answer.reply_to = Some(question.id.clone());
+    answer.reactions = vec![Reaction {
+        emoji: "❤".into(),
+        count: 3,
+        mine: false,
+    }];
+    let mut voice = message(BOOK_CLUB, 3, "Milo", "", NOW - 2 * HOUR);
+    voice.audio = MessageAudio::new(42, 3, None);
+    let body = "@Ada can you book a table? Menu: https://example.com/cafe";
+    let mut ask = message(BOOK_CLUB, 4, "Nora", body, NOW - HOUR);
+    ask.links = vec![
+        MessageLink::mention(0, "@Ada".len(), Some(ADA.into())),
+        MessageLink::web(
+            body.find("https://").unwrap_or(0),
+            body.len(),
+            "https://example.com/cafe",
+        ),
+    ];
+    ask.reactions = vec![Reaction {
+        emoji: "👍".into(),
+        count: 2,
+        mine: true,
+    }];
+    vec![question, photo, answer, voice, ask]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1154,31 @@ mod tests {
                 }
                 Scenario::GroupChat => {
                     assert_eq!(view.selected_messages().len(), 8, "{name}");
+                }
+                Scenario::Showcase => {
+                    let messages = view.selected_messages();
+                    assert_eq!(messages.len(), 5, "{name}");
+                    assert!(messages.iter().any(|row| row.reply_to.is_some()), "{name}");
+                    assert!(messages.iter().any(|row| row.photo.is_some()), "{name}");
+                    assert!(messages.iter().any(|row| row.audio.is_some()), "{name}");
+                    assert!(
+                        messages
+                            .iter()
+                            .any(|row| row.links.iter().any(MessageLink::is_mention)),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        view.chat_mute(ProtocolId::Telegram, MILO),
+                        ChatMute::Here,
+                        "{name}"
+                    );
+                    for protocol in [
+                        ProtocolId::WhatsApp,
+                        ProtocolId::Discord,
+                        ProtocolId::Signal,
+                    ] {
+                        assert!(view.shows_in_switcher(protocol), "{name}");
+                    }
                 }
                 Scenario::FailedSend => {
                     let last = view.selected_messages().last().expect("rows");
