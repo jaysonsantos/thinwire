@@ -29,6 +29,10 @@ struct PendingLink {
 /// `docs.example` or at `evil.example`. The app asks in both cases.
 /// An email label that is the same `mailto` address does not ask.
 /// `www.a.com` and `https://www.a.com` are the same address.
+/// A label with only a host shows only the host. The app does not ask when
+/// the target has the same host and an `http` or `https` scheme. A leading
+/// `www.` does not count. A label with a scheme also needs the same scheme.
+/// A label with a path, a query, or a fragment needs the same address.
 /// A different scheme, host, or path asks.
 #[must_use]
 pub(crate) fn needs_confirm(label: &str, target: &str) -> bool {
@@ -38,7 +42,53 @@ pub(crate) fn needs_confirm(label: &str, target: &str) -> bool {
     if !label_looks_like_url(label) {
         return true;
     }
+    if same_bare_host(label, target) {
+        return false;
+    }
     normalize_url(label) != normalize_url(target)
+}
+
+/// The label is only a host, and `target` opens a page on that host.
+///
+/// The `url` crate reads both sides, so an `@` in the authority, a lookalike
+/// host, or a punycode name cannot pass as the host of the label.
+fn same_bare_host(label: &str, target: &str) -> bool {
+    let label = label.trim();
+    let has_scheme = label.contains("://");
+    let with_scheme = if has_scheme {
+        label.to_string()
+    } else {
+        format!("https://{label}")
+    };
+    let (Ok(shown), Ok(opened)) = (
+        url::Url::parse(&with_scheme),
+        url::Url::parse(target.trim()),
+    ) else {
+        return false;
+    };
+    let bare = matches!(shown.path(), "" | "/")
+        && shown.query().is_none()
+        && shown.fragment().is_none()
+        && shown.username().is_empty()
+        && shown.password().is_none()
+        && shown.port().is_none();
+    if !bare || !matches!(opened.scheme(), "http" | "https") {
+        return false;
+    }
+    if has_scheme && shown.scheme() != opened.scheme() {
+        return false;
+    }
+    if !opened.username().is_empty() || opened.password().is_some() || opened.port().is_some() {
+        return false;
+    }
+    match (shown.host_str(), opened.host_str()) {
+        (Some(shown), Some(opened)) => without_www(shown) == without_www(opened),
+        _ => false,
+    }
+}
+
+fn without_www(host: &str) -> &str {
+    host.strip_prefix("www.").unwrap_or(host)
 }
 
 /// The label is an email address, and `target` is that same `mailto`.
@@ -589,6 +639,51 @@ mod tests {
         assert!(needs_confirm("https://a.com/one", "https://a.com/two"));
         assert!(needs_confirm("www.a.com", "https://b.com"));
         assert!(needs_confirm("https://a.com", "https://a.com@evil.com"));
+    }
+
+    #[test]
+    fn a_bare_host_label_opens_a_page_on_that_host_without_a_question() {
+        let deep = "https://fenixstore.de/Fenix-E12-V30-LED-Taschenlampe";
+        assert!(!needs_confirm("fenixstore.de", deep));
+        assert!(!needs_confirm("FenixStore.de", deep));
+        assert!(!needs_confirm("https://fenixstore.de/", deep));
+        assert!(!needs_confirm("fenixstore.de", "http://fenixstore.de/x"));
+        assert!(!needs_confirm("www.fenixstore.de", deep));
+        assert!(!needs_confirm(
+            "fenixstore.de",
+            "https://www.fenixstore.de/x"
+        ));
+        assert!(needs_confirm(
+            "https://fenixstore.de",
+            "http://fenixstore.de/x"
+        ));
+        assert!(needs_confirm(
+            "fenixstore.de",
+            "https://fenixstore.de.evil.example/x"
+        ));
+        assert!(needs_confirm(
+            "fenixstore.de",
+            "https://evil.example/fenixstore.de"
+        ));
+        assert!(needs_confirm(
+            "fenixstore.de",
+            "https://shop.fenixstore.de/x"
+        ));
+        assert!(needs_confirm(
+            "fenixstore.de",
+            "https://fenixstore.de@evil.example/x"
+        ));
+        assert!(needs_confirm(
+            "fenixstore.de",
+            "https://fenixstore.de:8443/x"
+        ));
+        assert!(needs_confirm("fenixstore.de", "javascript:alert(1)"));
+        assert!(needs_confirm("fenixstore.de", "file:///fenixstore.de"));
+        assert!(needs_confirm("fenixstore.de/a", "https://fenixstore.de/b"));
+        assert!(needs_confirm(
+            "fenixstore.de?x=1",
+            "https://fenixstore.de/b"
+        ));
     }
 
     #[test]
