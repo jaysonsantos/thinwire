@@ -96,6 +96,8 @@ tar = "0.4"
 flate2 = { version = "1.1.11", default-features = false, features = [
   "rust_backend",
 ] }
+# The update check reads the release JSON of the GitHub API. thinwire-ipc
+# already links both crates, so the app gets no new crate.
 serde.workspace = true
 serde_json.workspace = true
 thinwire-core.workspace = true

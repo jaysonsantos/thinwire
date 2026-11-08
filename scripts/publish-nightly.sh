@@ -130,11 +130,21 @@ else
   gh release create "$TAG" --repo "$repo" --target "$sha" --title "Nightly ${version}" --notes "$notes" \
     --prerelease --latest=false
 fi
-upload=("$dist"/thinwire-*.tar.gz "$dist/SHA256SUMS" "$dist/VERSION")
+# One `gh release upload` sends up to 5 files at the same time, so the order of
+# its arguments is not the order of the uploads. Each call below finishes
+# before the next one starts. A reader that sees a file can trust the files
+# of the calls before it:
+#   1. the archives and SHA256SUMS,
+#   2. appcast.xml, which names a macOS archive of call 1,
+#   3. appcast.ed25519: the app takes a signature older than the feed as an
+#      upload that is not complete yet,
+#   4. VERSION, which the AUR job reads first.
+gh release upload "$TAG" --repo "$repo" --clobber "$dist"/thinwire-*.tar.gz "$dist/SHA256SUMS"
 if [[ "$appcast_ok" -eq 1 ]]; then
-  upload+=("$dist/appcast.xml" "$dist/appcast.ed25519")
+  gh release upload "$TAG" --repo "$repo" --clobber "$dist/appcast.xml"
+  gh release upload "$TAG" --repo "$repo" --clobber "$dist/appcast.ed25519"
 fi
-gh release upload "$TAG" --repo "$repo" --clobber "${upload[@]}"
+gh release upload "$TAG" --repo "$repo" --clobber "$dist/VERSION"
 
 cutoff=$(date -u -d "-${KEEP_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
 gh api "repos/${repo}/releases/tags/${TAG}" \
