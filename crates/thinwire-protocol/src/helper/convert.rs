@@ -7,11 +7,12 @@
 use thinwire_ipc::{
     SecretText, WireAccountState, WireArrival, WireAudio, WireCommand, WireConversation,
     WireDelivery, WireEvent, WireFile, WireHistoryCursor, WireHistorySkip, WireMediaKind,
-    WireMessage, WirePhoto, WireProtocol, WireStatus, WireStoreAccess,
+    WireMention, WireMessage, WirePhoto, WireProtocol, WireStatus, WireStoreAccess,
 };
 
 use crate::media::{
-    AudioPath, ImageBytes, MediaKind, MessageAudio, MessagePhoto, OutgoingFile, PhotoSize,
+    AudioPath, ImageBytes, MediaKind, MessageAudio, MessageLink, MessagePhoto, OutgoingFile,
+    PhotoSize,
 };
 
 use crate::ProtocolKind;
@@ -854,8 +855,8 @@ fn conversation_from_wire(protocol: ProtocolId, conversation: WireConversation) 
     }
 }
 
-fn message_to_wire(message: ChatMessage) -> WireMessage {
-    WireMessage {
+fn message_to_wire(message: ChatMessage) -> Box<WireMessage> {
+    Box::new(WireMessage {
         conversation_id: message.conversation_id,
         id: message.id,
         sender: message.sender,
@@ -868,7 +869,46 @@ fn message_to_wire(message: ChatMessage) -> WireMessage {
         audio: message.audio.as_ref().and_then(audio_to_wire),
         reactions: reactions_to_wire(&message.reactions),
         reply_to: message.reply_to.clone(),
-    }
+        mentions: mentions_to_wire(&message.links),
+    })
+}
+
+/// The mentions of a message. A web link does not cross: the app finds
+/// links in the body itself.
+fn mentions_to_wire(links: &[MessageLink]) -> Vec<WireMention> {
+    links
+        .iter()
+        .filter(|link| link.is_mention())
+        .filter_map(|link| {
+            Some(WireMention {
+                start: u32::try_from(link.start).ok()?,
+                end: u32::try_from(link.end).ok()?,
+                conversation_id: link.chat().map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+/// The mentions of a wire message. The app checks each range against the
+/// body, and drops a chat of another protocol.
+fn mentions_from_wire(
+    protocol: ProtocolId,
+    body: &str,
+    mentions: Vec<WireMention>,
+) -> Vec<MessageLink> {
+    let prefix = format!("{}:", protocol.kind().key());
+    let ranges = mentions
+        .into_iter()
+        .filter_map(|mention| {
+            let start = usize::try_from(mention.start).ok()?;
+            let end = usize::try_from(mention.end).ok()?;
+            let chat = mention
+                .conversation_id
+                .filter(|chat| chat.starts_with(&prefix) && chat.len() > prefix.len());
+            Some((start, end, chat))
+        })
+        .collect();
+    crate::media::mention_links(body, ranges)
 }
 
 /// Audio that the helper can download. A file that is already local does
@@ -916,7 +956,9 @@ fn photo_from_wire(photo: WirePhoto) -> Option<MessagePhoto> {
     })
 }
 
-fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage {
+fn message_from_wire(protocol: ProtocolId, message: Box<WireMessage>) -> ChatMessage {
+    let message = *message;
+    let links = mentions_from_wire(protocol, &message.body, message.mentions);
     ChatMessage {
         protocol,
         conversation_id: message.conversation_id,
@@ -928,7 +970,7 @@ fn message_from_wire(protocol: ProtocolId, message: WireMessage) -> ChatMessage 
         sent_at: message.sent_at,
         arrival: arrival_from_wire(message.arrival),
         topic: None,
-        links: Vec::new(),
+        links,
         photo: message.photo.and_then(photo_from_wire),
         audio: message
             .audio
@@ -948,6 +990,53 @@ mod tests {
     use super::*;
 
     const CHAT: &str = "whatsapp:111@s.whatsapp.net";
+
+    /// A mention crosses with its range and chat. A web link stays out.
+    /// The app drops a bad range and a chat of another protocol.
+    #[test]
+    fn a_mention_crosses_and_the_app_checks_it() {
+        let mut sent = message(ProtocolId::WhatsApp);
+        sent.body = "@Ana and @Bo".into();
+        sent.links = vec![
+            MessageLink::mention(0, 4, Some(CHAT.into())),
+            MessageLink::mention(9, 12, None),
+            MessageLink::web(5, 8, "https://a.test"),
+        ];
+        let wire = message_to_wire(sent.clone());
+        assert_eq!(wire.mentions.len(), 2);
+        let back = message_from_wire(ProtocolId::WhatsApp, wire.clone());
+        assert_eq!(back.links, sent.links[..2].to_vec());
+
+        let mut bad = wire;
+        bad.mentions = vec![
+            WireMention {
+                start: 0,
+                end: 4,
+                conversation_id: Some("telegram:1".into()),
+            },
+            WireMention {
+                start: 2,
+                end: 6,
+                conversation_id: None,
+            },
+            WireMention {
+                start: 5,
+                end: 8,
+                conversation_id: None,
+            },
+            WireMention {
+                start: 9,
+                end: 40,
+                conversation_id: None,
+            },
+        ];
+        let back = message_from_wire(ProtocolId::WhatsApp, bad);
+        assert_eq!(
+            back.links,
+            vec![MessageLink::mention(0, 4, None)],
+            "an overlap, a range with no @, and a range past the body are dropped"
+        );
+    }
 
     #[test]
     fn a_read_receipt_crosses_the_pipe_as_sent() {

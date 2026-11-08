@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use thinwire_protocol::{
     AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ImageBytes, MessageAudio,
-    MessagePhoto, PhotoSize, ProtocolId,
+    MessagePhoto, PhotoSize, ProtocolId, mention_links,
 };
 
 /// Prefix on every WhatsApp conversation id. The rest is the chat JID.
@@ -202,6 +202,9 @@ pub(super) struct WaMessage {
     /// The reactions: who reacted ([`ME`] or a JID) and the emoji. Sorted by
     /// who, one entry for each person.
     pub reactions: Vec<(String, String)>,
+    /// The JIDs that the body mentions, from the context info. The body
+    /// has "@" and the user part of each JID.
+    pub mentions: Vec<String>,
 }
 
 /// Who reacted, for a reaction of this account.
@@ -512,6 +515,8 @@ pub(super) struct SavedMessage {
     pub reply_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
 }
 
 /// One saved chat: the row and its messages.
@@ -587,6 +592,7 @@ fn saved_message(message: &WaMessage) -> SavedMessage {
         timestamp: message.timestamp,
         reply_to: message.reply_to.clone(),
         reactions: message.reactions.clone(),
+        mentions: message.mentions.clone(),
     }
 }
 
@@ -630,6 +636,11 @@ pub(super) struct Inbox {
     media: HashMap<(String, String), MediaState>,
     /// Ready images, oldest first, for the [`MEDIA_CACHE`] limit.
     media_ready: VecDeque<(String, String)>,
+    /// The phone JID of each mentioned LID that the device store knows. The
+    /// store keeps them, so this map is not saved.
+    phones: HashMap<String, String>,
+    /// The LIDs already asked for a phone JID.
+    phone_asks: HashSet<String>,
 }
 
 impl Inbox {
@@ -704,6 +715,7 @@ impl Inbox {
                         voice: None,
                         reply_to: message.reply_to,
                         reactions: message.reactions,
+                        mentions: message.mentions,
                     })
                     .collect(),
                 ..ChatRecord::default()
@@ -1229,6 +1241,7 @@ impl Inbox {
             voice: None,
             reactions: Vec::new(),
             reply_to: None,
+            mentions: Vec::new(),
         };
         let record = self.chats.entry(jid.to_string()).or_default();
         record.timestamp = record.timestamp.max(now);
@@ -1362,6 +1375,8 @@ impl Inbox {
     /// a later chunk. Call it before the first event of the connection: a
     /// reconnect can send `History` before `Connected` (Codex r4138502149).
     pub(super) fn new_connection(&mut self) {
+        // The store can know a mapping now that it did not know before.
+        self.phone_asks.clear();
         for record in self.chats.values_mut() {
             record.mute_live = false;
         }
@@ -1415,7 +1430,7 @@ impl Inbox {
         let preview = record
             .messages
             .last()
-            .map(|message| preview(&message.body))
+            .map(|message| preview(&self.with_mentions(&message.body, &message.mentions).0))
             .unwrap_or_default();
         Some(AdapterEvent::ConversationUpsert {
             conversation: Conversation {
@@ -1449,6 +1464,124 @@ impl Inbox {
             return name.clone();
         }
         fallback_label(jid)
+    }
+
+    /// The name of a mentioned JID: the chat name of that person, or a push
+    /// name. A LID also tries its phone JID.
+    fn mention_name(&self, jid: &str) -> Option<String> {
+        let phone = self.phones.get(jid).map(String::as_str);
+        [Some(jid), phone]
+            .into_iter()
+            .flatten()
+            .find_map(|candidate| {
+                self.chats
+                    .get(candidate)
+                    .and_then(|record| record.name.clone())
+                    .or_else(|| self.names.get(candidate).cloned())
+                    .filter(|name| !name.trim().is_empty())
+            })
+    }
+
+    /// The one-to-one chat with a mentioned JID, when the inbox has it.
+    fn mention_chat(&self, jid: &str) -> Option<String> {
+        let phone = self.phones.get(jid).map(String::as_str);
+        [Some(jid), phone]
+            .into_iter()
+            .flatten()
+            .find(|candidate| !is_group(candidate) && self.chats.contains_key(*candidate))
+            .map(conversation_id)
+    }
+
+    /// `body` with "@" and the name for each "@" and user part of a
+    /// mentioned JID, and the byte range and chat of each mention. A
+    /// mention with no known name keeps its text.
+    fn with_mentions(
+        &self,
+        body: &str,
+        mentions: &[String],
+    ) -> (String, Vec<(usize, usize, Option<String>)>) {
+        if mentions.is_empty() || !body.contains('@') {
+            return (body.to_owned(), Vec::new());
+        }
+        // Longest user part first, so "@123" does not take "@1234".
+        let mut users: Vec<(&str, &String)> = mentions
+            .iter()
+            .filter_map(|jid| Some((jid_user(jid)?, jid)))
+            .collect();
+        users.sort_by_key(|(user, _)| std::cmp::Reverse(user.len()));
+        let mut out = String::with_capacity(body.len());
+        let mut ranges = Vec::new();
+        let mut rest = body;
+        while let Some(at) = rest.find('@') {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + 1..];
+            let found = users.iter().find(|(user, _)| {
+                after.starts_with(*user)
+                    && !after[user.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_alphanumeric)
+            });
+            let Some((user, jid)) = found else {
+                out.push('@');
+                rest = after;
+                continue;
+            };
+            let start = out.len();
+            out.push('@');
+            match self.mention_name(jid) {
+                Some(name) => out.push_str(name.trim()),
+                None => out.push_str(user),
+            }
+            ranges.push((start, out.len(), self.mention_chat(jid)));
+            rest = &after[user.len()..];
+        }
+        out.push_str(rest);
+        (out, ranges)
+    }
+
+    /// LIDs that a message mentions and that have no phone JID yet. Each
+    /// LID comes one time. At most `limit` in one call.
+    pub(super) fn take_phone_asks(&mut self, limit: usize) -> Vec<String> {
+        let mut asks = Vec::new();
+        for record in self.chats.values() {
+            for jid in record.messages.iter().flat_map(|message| &message.mentions) {
+                if asks.len() >= limit {
+                    break;
+                }
+                if is_lid(jid)
+                    && !self.phones.contains_key(jid)
+                    && self.phone_asks.insert(jid.clone())
+                {
+                    asks.push(jid.clone());
+                }
+            }
+        }
+        asks
+    }
+
+    /// Phone JIDs found for mentioned LIDs. Returns the rows of the open
+    /// chat that mention one of them, so they show the name now.
+    pub(super) fn apply_phones(&mut self, found: Vec<(String, String)>) -> Vec<AdapterEvent> {
+        let mut changed = HashSet::new();
+        for (lid, phone) in found {
+            if is_lid(&lid) && phone.ends_with(PHONE_SERVER) {
+                self.phones.insert(lid.clone(), phone);
+                changed.insert(lid);
+            }
+        }
+        let Some(open) = self.open.as_deref() else {
+            return Vec::new();
+        };
+        let Some(record) = self.chats.get(open) else {
+            return Vec::new();
+        };
+        record
+            .messages
+            .iter()
+            .filter(|message| message.mentions.iter().any(|jid| changed.contains(jid)))
+            .map(|message| self.history_row(message))
+            .collect()
     }
 
     fn chat_message(&self, message: &WaMessage, arrival: Arrival) -> ChatMessage {
@@ -1497,6 +1630,8 @@ impl Inbox {
         } else {
             message.body.clone()
         };
+        let (body, mentions) = self.with_mentions(&body, &message.mentions);
+        let links = mention_links(&body, mentions);
         ChatMessage {
             protocol: ProtocolId::WhatsApp,
             conversation_id: conversation_id(&message.chat_jid),
@@ -1508,7 +1643,7 @@ impl Inbox {
             sent_at: message.timestamp,
             arrival,
             topic: None,
-            links: Vec::new(),
+            links,
             photo,
             audio: message.voice.as_ref().and_then(|voice| {
                 MessageAudio::new(
@@ -1561,6 +1696,20 @@ fn is_inbox_chat(jid: &str) -> bool {
 
 fn is_group(jid: &str) -> bool {
     jid.ends_with(GROUP_SERVER)
+}
+
+/// The server of a phone JID.
+const PHONE_SERVER: &str = "@s.whatsapp.net";
+
+fn is_lid(jid: &str) -> bool {
+    jid.ends_with("@lid")
+}
+
+/// The user part of a JID, without the device: "123" for "123:4@lid".
+fn jid_user(jid: &str) -> Option<&str> {
+    let user = jid.split('@').next()?;
+    let user = user.split(':').next()?;
+    (!user.is_empty()).then_some(user)
 }
 
 fn fallback_label(jid: &str) -> String {
@@ -1628,6 +1777,133 @@ fn preview(body: &str) -> String {
 pub(super) mod tests {
     use super::*;
 
+    const GROUP: &str = "120363000000000009@g.us";
+    const ANA_LID: &str = "223853863252019@lid";
+    const ANA_PHONE: &str = "5511999990000@s.whatsapp.net";
+    const BRUNO_LID: &str = "22385386325@lid";
+
+    fn mention_message(id: &str, body: &str, mentions: &[&str]) -> WaMessage {
+        WaMessage {
+            sender_jid: Some("99@lid".into()),
+            mentions: mentions.iter().map(|jid| (*jid).to_string()).collect(),
+            ..message(GROUP, id, body, 10)
+        }
+    }
+
+    fn rows_of(events: &[AdapterEvent]) -> Vec<ChatMessage> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AdapterEvent::MessageReceived { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A known name replaces the user part. The range covers "@" and the
+    /// name. A mention with no known name keeps its text and its range.
+    #[test]
+    fn a_mention_shows_the_name_of_the_person() {
+        let mut inbox = Inbox::default();
+        inbox.names.insert(ANA_LID.into(), "Ana".into());
+        let events = inbox.apply_messages(vec![mention_message(
+            "m1",
+            "@223853863252019 hi @22385386325 and @7",
+            &[ANA_LID, BRUNO_LID],
+        )]);
+        let rows = rows_of(&events);
+        assert_eq!(rows[0].body, "@Ana hi @22385386325 and @7");
+        let ranges: Vec<(usize, usize, bool)> = rows[0]
+            .links
+            .iter()
+            .map(|link| (link.start, link.end, link.is_mention()))
+            .collect();
+        assert_eq!(ranges, vec![(0, 4, true), (8, 20, true)]);
+        assert_eq!(rows[0].links[0].chat(), None, "no one-to-one chat yet");
+    }
+
+    /// "@123" does not take the start of "@1234", and a longer number after
+    /// the user part is not a mention.
+    #[test]
+    fn a_mention_matches_the_whole_user_part() {
+        let mut inbox = Inbox::default();
+        inbox.names.insert("123@lid".into(), "Short".into());
+        inbox.names.insert("1234@lid".into(), "Long".into());
+        let (body, ranges) =
+            inbox.with_mentions("@1234 @123 @12345", &["123@lid".into(), "1234@lid".into()]);
+        assert_eq!(body, "@Long @Short @12345");
+        assert_eq!(ranges.len(), 2);
+    }
+
+    /// The phone JID of a LID gives the contact name and the chat. The open
+    /// chat gets its row again, and the preview shows the name.
+    #[test]
+    fn a_phone_for_a_lid_names_the_mention_and_opens_the_chat() {
+        let mut inbox = Inbox::default();
+        let _ = inbox.apply_history(
+            vec![HistoryChat {
+                jid: ANA_PHONE.into(),
+                name: Some("Ana Contact".into()),
+                unread: 0,
+                timestamp: 5,
+                messages: vec![message(ANA_PHONE, "d1", "oi", 5)],
+                mute: Mute::Off,
+            }],
+            Vec::new(),
+        );
+        let _ = inbox.apply_messages(vec![mention_message(
+            "m1",
+            "@223853863252019 hi",
+            &[ANA_LID],
+        )]);
+        let _ = inbox.open_chat(GROUP);
+        assert_eq!(inbox.take_phone_asks(10), vec![ANA_LID.to_string()]);
+        assert!(inbox.take_phone_asks(10).is_empty(), "one ask for each LID");
+        let rows = rows_of(&inbox.apply_phones(vec![(ANA_LID.into(), ANA_PHONE.into())]));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "@Ana Contact hi");
+        assert_eq!(
+            rows[0].links[0].chat(),
+            Some(conversation_id(ANA_PHONE).as_str())
+        );
+        let Some(AdapterEvent::ConversationUpsert { conversation }) = inbox.upsert_event(GROUP)
+        else {
+            panic!("group row");
+        };
+        assert_eq!(conversation.preview, "@Ana Contact hi");
+        // A value that is not a phone JID is not kept.
+        let rows = inbox.apply_phones(vec![(BRUNO_LID.into(), "x@g.us".into())]);
+        assert!(rows.is_empty());
+        inbox.new_connection();
+        assert!(
+            inbox.take_phone_asks(10).is_empty(),
+            "the known LID is not asked again"
+        );
+    }
+
+    /// The mentions stay in the disk cache. A row saved before mentions
+    /// loads with none.
+    #[test]
+    fn the_mentions_of_a_message_survive_the_disk_cache() {
+        let mut inbox = Inbox::default();
+        let _ = inbox.apply_messages(vec![mention_message("m1", "@223853863252019", &[ANA_LID])]);
+        let changes = inbox.changes(&SavedHashes::default());
+        let (jid, _, chat) = changes.chats[0].clone();
+        let mut restored = Inbox::default();
+        let _ = restored.restore(SavedInbox {
+            chats: vec![(jid, chat.clone())],
+            names: Vec::new(),
+        });
+        assert_eq!(restored.take_phone_asks(10), vec![ANA_LID.to_string()]);
+        let mut old: serde_json::Value = serde_json::to_value(&chat).expect("encode");
+        old["messages"][0]
+            .as_object_mut()
+            .expect("message")
+            .remove("mentions");
+        let back: SavedChat = serde_json::from_value(old).expect("an old row loads");
+        assert!(back.messages[0].mentions.is_empty());
+    }
+
     /// A cache file of an older build has no reactions and no replies. It
     /// still reads. Each person counts once, and a new emoji of the same
     /// person takes the place of the old one.
@@ -1666,6 +1942,7 @@ pub(super) mod tests {
             voice: None,
             reactions: Vec::new(),
             reply_to: None,
+            mentions: Vec::new(),
         }
     }
 

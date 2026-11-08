@@ -136,6 +136,12 @@ pub(super) trait WhatsAppSender: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// The phone JID of a LID, from the device store. `None` when the store
+    /// has no mapping or the lookup fails.
+    fn phone_of<'a>(&'a self, _lid: &'a str) -> PhoneFuture<'a> {
+        Box::pin(async { None })
+    }
+
     /// Record the id before [`Self::request_history`]. The history
     /// notification can arrive before that send finishes.
     fn allocate_history_id(&self) -> Option<String> {
@@ -169,9 +175,14 @@ pub(super) type NamesFuture<'a> =
 pub(super) type SubjectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<String>, ()>> + Send + 'a>>;
 
+pub(super) type PhoneFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+
 /// Chat pictures that one run fetches: the newest chats only. A lookup for
 /// every chat at each start is a load that WhatsApp can see.
 const AVATAR_CHATS: usize = 50;
+
+/// The most mentioned LIDs that one pass asks the device store for.
+const PHONE_ASKS: usize = 200;
 
 /// Picture lookups that run at one time.
 const AVATAR_LOOKUPS: usize = 2;
@@ -693,6 +704,60 @@ impl Session {
         }
     }
 
+    /// Ask the device store for the phone JID of each mentioned LID, so a
+    /// mention shows the contact name and opens the one-to-one chat.
+    fn spawn_phone_lookups(&self, state: &mut State, events: &EventTx) {
+        if state.closed {
+            return;
+        }
+        let Some(sender) = state.sender.clone() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let pending = state.inbox.take_phone_asks(PHONE_ASKS);
+        if pending.is_empty() {
+            return;
+        }
+        let generation = state.generation;
+        let session = self.clone();
+        let events = events.clone();
+        runtime.spawn(async move {
+            session
+                .fetch_phones(generation, sender.as_ref(), &pending, &events)
+                .await;
+        });
+    }
+
+    async fn fetch_phones(
+        &self,
+        generation: u64,
+        sender: &dyn WhatsAppSender,
+        pending: &[String],
+        events: &EventTx,
+    ) {
+        let mut found = Vec::new();
+        for lid in pending {
+            if let Some(phone) = sender.phone_of(lid).await {
+                found.push((lid.clone(), phone));
+            }
+        }
+        if found.is_empty() {
+            return;
+        }
+        let mut state = self.lock();
+        if state.closed || state.generation != generation {
+            return;
+        }
+        let rows = state.inbox.apply_phones(found);
+        if state.announced {
+            for row in rows {
+                let _ = events.send(row);
+            }
+        }
+    }
+
     fn spawn_missing_subjects(&self, state: &mut State, events: &EventTx) {
         if !state.subjects_listed || state.closed {
             return;
@@ -991,6 +1056,9 @@ impl Session {
         if history_now || messages_now {
             self.spawn_missing_subjects(&mut state, events);
         }
+        if connected_now || history_now || messages_now {
+            self.spawn_phone_lookups(&mut state, events);
+        }
         if let Some(detail) = stop {
             state.connected = false;
             state.stopped = Some(detail);
@@ -1174,8 +1242,8 @@ pub(super) mod fake {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        ActionFuture, DownloadFuture, HistoryAsk, MediaRef, NamesFuture, SendFailure, SendFuture,
-        SubjectFuture, TargetRef, WhatsAppSender,
+        ActionFuture, DownloadFuture, HistoryAsk, MediaRef, NamesFuture, PhoneFuture, SendFailure,
+        SendFuture, SubjectFuture, TargetRef, WhatsAppSender,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1206,6 +1274,9 @@ pub(super) mod fake {
         pub picture: Option<Vec<u8>>,
         /// Each reply, reaction, and delete, as "kind id".
         pub actions: Mutex<Vec<String>>,
+        /// The phone JID of each LID that the store knows.
+        pub phones: Vec<(String, String)>,
+        pub phone_asks: Mutex<Vec<String>>,
     }
 
     impl FakeSender {
@@ -1250,6 +1321,19 @@ pub(super) mod fake {
                     .iter()
                     .find(|(id, _)| id == jid)
                     .map(|(_, name)| name.clone()))
+            })
+        }
+
+        fn phone_of<'a>(&'a self, lid: &'a str) -> PhoneFuture<'a> {
+            Box::pin(async move {
+                self.phone_asks
+                    .lock()
+                    .expect("fake lock")
+                    .push(lid.to_string());
+                self.phones
+                    .iter()
+                    .find(|(id, _)| id == lid)
+                    .map(|(_, phone)| phone.clone())
             })
         }
 
@@ -1507,6 +1591,65 @@ mod tests {
         }
         assert!(named, "the group got its subject");
         assert_eq!(pictures, 1, "one picture for the one chat, one time");
+    }
+
+    /// A mentioned LID asks the device store for its phone JID. The open
+    /// chat then shows the contact name of the mention.
+    #[tokio::test]
+    async fn a_mentioned_lid_gets_its_phone_from_the_store() {
+        const GROUP: &str = "120363000000000010@g.us";
+        const LID: &str = "223853863252019@lid";
+        const PHONE: &str = "5511999990000@s.whatsapp.net";
+        let session = Session::default();
+        session.begin(1);
+        let (tx, mut rx) = unbounded_channel();
+        let sender = Arc::new(fake::FakeSender {
+            phones: vec![(LID.into(), PHONE.into())],
+            ..Default::default()
+        });
+        assert!(session.attach_sender(1, sender.clone()));
+        session.apply(
+            LinkEvent::History {
+                chats: vec![HistoryChat {
+                    jid: PHONE.into(),
+                    name: Some("Ana".into()),
+                    unread: 0,
+                    timestamp: 5,
+                    messages: vec![message(PHONE, "d1", "oi", 5)],
+                    mute: Mute::Off,
+                }],
+                push_names: Vec::new(),
+                request_id: None,
+                ended: Vec::new(),
+            },
+            1,
+            &tx,
+        );
+        session.apply(LinkEvent::Connected, 1, &tx);
+        let _ = session.with_inbox(|inbox| inbox.view(Some(GROUP)));
+        let mut mention = message(GROUP, "m1", "@223853863252019 hi", 10);
+        mention.mentions = vec![LID.into()];
+        session.apply(LinkEvent::Messages(vec![mention]), 1, &tx);
+        let mut named = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !named {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(AdapterEvent::MessageReceived { message }))
+                    if message.body == "@Ana hi" =>
+                {
+                    assert_eq!(
+                        message.links[0].chat(),
+                        Some(inbox::conversation_id(PHONE).as_str())
+                    );
+                    named = true;
+                }
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+        assert!(named, "the open chat shows the contact name");
+        let asks = sender.phone_asks.lock().expect("fake lock").clone();
+        assert_eq!(asks, vec![LID.to_string()]);
     }
 
     #[tokio::test]

@@ -23,9 +23,9 @@ use crate::SecretText;
 /// [`WireEvent::Avatar`]. Version 6 adds the message menu:
 /// `reply_to` on [`WireCommand::SendText`], [`WireCommand::DeleteMessage`],
 /// [`WireCommand::React`], [`WireMessage::reactions`],
-/// [`WireMessage::reply_to`], and [`WireEvent::Reactions`]. An older peer
-/// cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// [`WireMessage::reply_to`], and [`WireEvent::Reactions`]. Version 7 adds
+/// [`WireMessage::mentions`]. An older peer cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// One unreadable stretch on a history page.
 ///
@@ -354,6 +354,30 @@ pub struct WireMessage {
     /// The id of the message that this one replies to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// The mentions of people in [`Self::body`], in body order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<WireMention>,
+}
+
+/// A mention of a person in a message body. The label is "@" and a name.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireMention {
+    /// First byte of the label in the body.
+    pub start: u32,
+    /// Byte after the last byte of the label.
+    pub end: u32,
+    /// The conversation id of the one-to-one chat with that person, when
+    /// the helper has that chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+}
+
+/// The conversation id can hold a phone number: only the range shows.
+impl fmt::Debug for WireMention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WireMention({}..{})", self.start, self.end)
+    }
 }
 
 /// One emoji on a message, with the number of people who chose it.
@@ -458,13 +482,14 @@ pub enum WireEvent {
     ConversationRemoved {
         id: String,
     },
+    // Boxed: a message is much larger than the other events.
     MessageReceived {
-        message: WireMessage,
+        message: Box<WireMessage>,
     },
     MessageReplaced {
         conversation_id: String,
         old_id: String,
-        message: WireMessage,
+        message: Box<WireMessage>,
     },
     MessageBody {
         conversation_id: String,
@@ -622,7 +647,43 @@ mod tests {
             audio: None,
             reactions: Vec::new(),
             reply_to: None,
+            mentions: Vec::new(),
         }
+    }
+
+    /// A mention crosses with the message. A message with no mention has
+    /// no key for it. `Debug` shows the range only.
+    #[test]
+    fn a_mention_crosses_with_the_message() {
+        let mut with_mention = message();
+        with_mention.body = "@Ana hi".into();
+        with_mention.mentions = vec![WireMention {
+            start: 0,
+            end: 4,
+            conversation_id: Some(CHAT.into()),
+        }];
+        let line = HelperLine::Event {
+            protocol: WireProtocol::WhatsApp,
+            event: WireEvent::MessageReceived {
+                message: Box::new(with_mention),
+            },
+        };
+        let text = serde_json::to_string(&line).expect("encode");
+        assert!(text.contains("\"mentions\""), "{text}");
+        let back: HelperLine = serde_json::from_str(&text).expect("decode");
+        assert_eq!(back, line);
+        let plain = serde_json::to_string(&message()).expect("encode");
+        assert!(!plain.contains("mentions"), "{plain}");
+        let debug = format!(
+            "{:?}",
+            WireMention {
+                start: 0,
+                end: 4,
+                conversation_id: Some(CHAT.into()),
+            }
+        );
+        assert_eq!(debug, "WireMention(0..4)");
+        assert!(!debug.contains(PHONE));
     }
 
     /// Reactions and a reply cross with the message. A message with neither
@@ -638,13 +699,17 @@ mod tests {
         with_menu.reply_to = Some("m0".into());
         let line = HelperLine::Event {
             protocol: WireProtocol::Signal,
-            event: WireEvent::MessageReceived { message: with_menu },
+            event: WireEvent::MessageReceived {
+                message: Box::new(with_menu),
+            },
         };
         let text = encode(&line).expect("encode");
         assert_eq!(decode::<HelperLine>(text.trim_end()).expect("decode"), line);
         let plain = encode(&HelperLine::Event {
             protocol: WireProtocol::Signal,
-            event: WireEvent::MessageReceived { message: message() },
+            event: WireEvent::MessageReceived {
+                message: Box::new(message()),
+            },
         })
         .expect("encode");
         assert!(!plain.contains("reactions") && !plain.contains("reply_to"));
@@ -688,7 +753,7 @@ mod tests {
         let line = HelperLine::Event {
             protocol: WireProtocol::WhatsApp,
             event: WireEvent::MessageReceived {
-                message: with_photo.clone(),
+                message: Box::new(with_photo.clone()),
             },
         };
         let text = encode(&line).expect("encode");
@@ -696,7 +761,9 @@ mod tests {
         assert_eq!(decode::<HelperLine>(text.trim_end()).expect("decode"), line);
         let plain = encode(&HelperLine::Event {
             protocol: WireProtocol::WhatsApp,
-            event: WireEvent::MessageReceived { message: message() },
+            event: WireEvent::MessageReceived {
+                message: Box::new(message()),
+            },
         })
         .expect("encode");
         assert!(!plain.contains("photo"), "{plain}");
@@ -808,7 +875,9 @@ mod tests {
             HelperLine::Ack { id: 9 },
             HelperLine::Event {
                 protocol: WireProtocol::WhatsApp,
-                event: WireEvent::MessageReceived { message: message() },
+                event: WireEvent::MessageReceived {
+                    message: Box::new(message()),
+                },
             },
             HelperLine::Event {
                 protocol: WireProtocol::WhatsApp,
@@ -894,7 +963,9 @@ mod tests {
                 "{:?}",
                 HelperLine::Event {
                     protocol: WireProtocol::WhatsApp,
-                    event: WireEvent::MessageReceived { message: message() },
+                    event: WireEvent::MessageReceived {
+                        message: Box::new(message()),
+                    },
                 }
             ),
             format!("{:?}", message()),

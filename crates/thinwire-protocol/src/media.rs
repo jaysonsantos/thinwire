@@ -8,21 +8,109 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// A link inside a message body.
+/// A link inside a message body: a web address, or a mention of a person.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MessageLink {
     /// First byte of the visible label in the body.
     pub start: usize,
     /// Byte after the last byte of the label.
     pub end: usize,
+    /// What a click opens.
+    pub target: LinkTarget,
+}
+
+/// What a click on a [`MessageLink`] opens.
+#[derive(Clone, PartialEq, Eq)]
+pub enum LinkTarget {
     /// The address to open. An email uses `mailto:`.
-    pub url: String,
+    Url(String),
+    /// A mention of a person. The label is "@" and the name. The value is
+    /// the conversation id of the one-to-one chat with that person, when the
+    /// chat list has that chat. `None` draws the mention with no click.
+    Chat(Option<String>),
+}
+
+impl MessageLink {
+    /// A link to a web address or a `mailto:` address.
+    #[must_use]
+    pub fn web(start: usize, end: usize, url: impl Into<String>) -> Self {
+        Self {
+            start,
+            end,
+            target: LinkTarget::Url(url.into()),
+        }
+    }
+
+    /// A mention of a person, with the chat that a click opens.
+    #[must_use]
+    pub const fn mention(start: usize, end: usize, chat: Option<String>) -> Self {
+        Self {
+            start,
+            end,
+            target: LinkTarget::Chat(chat),
+        }
+    }
+
+    /// The web address, when this link is one.
+    #[must_use]
+    pub fn url(&self) -> Option<&str> {
+        match &self.target {
+            LinkTarget::Url(url) => Some(url),
+            LinkTarget::Chat(_) => None,
+        }
+    }
+
+    /// The chat that a click on this mention opens.
+    #[must_use]
+    pub fn chat(&self) -> Option<&str> {
+        match &self.target {
+            LinkTarget::Chat(chat) => chat.as_deref(),
+            LinkTarget::Url(_) => None,
+        }
+    }
+
+    /// This link is a mention of a person.
+    #[must_use]
+    pub const fn is_mention(&self) -> bool {
+        matches!(self.target, LinkTarget::Chat(_))
+    }
 }
 
 impl fmt::Debug for MessageLink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MessageLink({}..{})", self.start, self.end)
+        let kind = if self.is_mention() {
+            "Mention"
+        } else {
+            "MessageLink"
+        };
+        write!(f, "{kind}({}..{})", self.start, self.end)
     }
+}
+
+/// Mention links for `body` from byte ranges. A range that is empty, out of
+/// order, overlaps the one before, leaves the body, or does not start with
+/// "@" on a char boundary is left out.
+#[must_use]
+pub fn mention_links(
+    body: &str,
+    mentions: Vec<(usize, usize, Option<String>)>,
+) -> Vec<MessageLink> {
+    let mut links = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end, chat) in mentions {
+        let valid = start >= cursor
+            && start < end
+            && end <= body.len()
+            && body.is_char_boundary(start)
+            && body.is_char_boundary(end)
+            && body[start..].starts_with('@');
+        if !valid {
+            continue;
+        }
+        links.push(MessageLink::mention(start, end, chat));
+        cursor = end;
+    }
+    links
 }
 
 /// One encoded image. `Debug` prints the length only.
@@ -669,7 +757,7 @@ pub fn links_in(text: &str, spans: &[TextSpan]) -> Vec<MessageLink> {
         let Some(url) = link_url(label, &span.kind) else {
             continue;
         };
-        links.push(MessageLink { start, end, url });
+        links.push(MessageLink::web(start, end, url));
     }
     links.sort_by_key(|link| (link.start, link.end));
     links
@@ -847,10 +935,10 @@ mod tests {
             ],
         );
         assert_eq!(links.len(), 3);
-        assert_eq!(links[0].url, "https://a.test");
-        assert_eq!(links[1].url, "https://docs.example/guide");
+        assert_eq!(links[0].url(), Some("https://a.test"));
+        assert_eq!(links[1].url(), Some("https://docs.example/guide"));
         assert_eq!(&text[links[1].start..links[1].end], "docs");
-        assert_eq!(links[2].url, "mailto:ada@b.test");
+        assert_eq!(links[2].url(), Some("mailto:ada@b.test"));
     }
 
     #[test]
@@ -938,7 +1026,7 @@ mod tests {
             ],
         );
         assert_eq!(links.len(), 1);
-        assert_eq!(links[0].url, "https://a.test");
+        assert_eq!(links[0].url(), Some("https://a.test"));
         assert_eq!(&text[links[0].start..links[0].end], "https://a.test");
         assert_eq!(
             openable_url(" HTTPS://a.test/x ").as_deref(),
@@ -961,7 +1049,7 @@ mod tests {
             }],
         );
         assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].url, "mailto:ada@b.test");
+        assert_eq!(mail[0].url(), Some("mailto:ada@b.test"));
         assert_eq!(
             openable_url("https://t.me/thinwire").as_deref(),
             Some("https://t.me/thinwire")
@@ -969,12 +1057,37 @@ mod tests {
     }
 
     #[test]
+    fn a_mention_range_must_start_with_at_and_stay_in_the_body() {
+        let body = "@Zoë hi @Bo";
+        let zoe_end = "@Zoë".len();
+        let links = mention_links(
+            body,
+            vec![
+                (0, zoe_end, Some("whatsapp:1@s.whatsapp.net".into())),
+                (0, 2, None),
+                (zoe_end + 4, body.len(), None),
+                (0, 3, None),
+                (zoe_end + 4, body.len() + 1, None),
+            ],
+        );
+        assert_eq!(
+            links,
+            vec![
+                MessageLink::mention(0, zoe_end, Some("whatsapp:1@s.whatsapp.net".into())),
+                MessageLink::mention(zoe_end + 4, body.len(), None),
+            ]
+        );
+        assert!(links[0].is_mention() && links[0].url().is_none());
+        assert_eq!(format!("{:?}", links[0]), format!("Mention(0..{zoe_end})"));
+        assert!(
+            mention_links(body, vec![(2, 4, None)]).is_empty(),
+            "inside a char"
+        );
+    }
+
+    #[test]
     fn debug_hides_urls_paths_and_bytes() {
-        let link = MessageLink {
-            start: 0,
-            end: 3,
-            url: "https://hidden.example/a".into(),
-        };
+        let link = MessageLink::web(0, 3, "https://hidden.example/a");
         let photo = MessagePhoto {
             width: 2,
             height: 2,

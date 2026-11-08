@@ -965,6 +965,7 @@ pub(super) mod tests {
                         timestamp: 9,
                         reactions: Vec::new(),
                         reply_to: None,
+                        mentions: Vec::new(),
                     }],
                 },
             )],

@@ -44,10 +44,10 @@ pub use helper::{HelperAdapter, HelperLauncher, HelperSpec, ProcessLauncher};
 pub use host::{AccountAdapter, AccountFactory, AdapterHost, HostSender};
 pub use log_id::LogChatId;
 pub use media::{
-    AudioPath, ChatAvatar, FILES_PER_MESSAGE, ImageBytes, ImagePath, MAX_ATTACHMENT_BYTES,
-    MAX_ATTACHMENTS, MediaKind, MessageAudio, MessageFile, MessageLink, MessagePhoto, MessageVideo,
-    OutgoingFile, PhotoFile, PhotoSize, TextKind, TextSpan, VoiceStop, links_in, openable_url,
-    utf16_range, with_scheme,
+    AudioPath, ChatAvatar, FILES_PER_MESSAGE, ImageBytes, ImagePath, LinkTarget,
+    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, MediaKind, MessageAudio, MessageFile, MessageLink,
+    MessagePhoto, MessageVideo, OutgoingFile, PhotoFile, PhotoSize, TextKind, TextSpan, VoiceStop,
+    links_in, mention_links, openable_url, utf16_range, with_scheme,
 };
 pub use risk::{
     CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3, CRITIC_RISK_BULLETS, critic_bullets_for,

@@ -3701,6 +3701,7 @@ fn bubble(
                     &galley,
                     message.body,
                     message.links,
+                    out,
                 );
             }
         }

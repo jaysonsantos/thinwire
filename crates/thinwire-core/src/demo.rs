@@ -803,11 +803,11 @@ fn photo_message(kind: PhotoKind) -> ChatMessage {
     };
     let mut row = message(ADA, 2, "Ada", body, NOW - 10 * MINUTE);
     if let Some(start) = body.find("https://") {
-        row.links.push(MessageLink {
+        row.links.push(MessageLink::web(
             start,
-            end: body.len(),
-            url: "https://example.com/trail".into(),
-        });
+            body.len(),
+            "https://example.com/trail",
+        ));
     }
     row.photo = Some(MessagePhoto {
         width,

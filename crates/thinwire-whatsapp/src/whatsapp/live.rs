@@ -30,8 +30,8 @@ use super::path::{
     whatsapp_device_store_path,
 };
 use super::session::{
-    ActionFuture, DownloadFuture, HistoryAsk, LinkEvent, NamesFuture, SendFailure, SendFuture,
-    SubjectFuture, WhatsAppSender,
+    ActionFuture, DownloadFuture, HistoryAsk, LinkEvent, NamesFuture, PhoneFuture, SendFailure,
+    SendFuture, SubjectFuture, WhatsAppSender,
 };
 use thinwire_protocol::RedactedPairingSecret;
 
@@ -293,6 +293,7 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
                         voice: voice_of(&inbound.message),
                         reactions: Vec::new(),
                         reply_to: reply_of(&inbound.message),
+                        mentions: mentions_of(&inbound.message),
                     })
                 })
                 .collect(),
@@ -388,6 +389,11 @@ fn map_history_message(chat_jid: &str, info: &wa::WebMessageInfo) -> Option<WaMe
         voice: info.message.as_option().and_then(voice_of),
         reactions: history_reactions(chat_jid, info),
         reply_to: info.message.as_option().and_then(reply_of),
+        mentions: info
+            .message
+            .as_option()
+            .map(mentions_of)
+            .unwrap_or_default(),
     })
 }
 
@@ -397,6 +403,20 @@ fn reply_of(message: &wa::Message) -> Option<String> {
         .context_info()
         .and_then(|context| context.stanza_id.clone())
         .filter(|id| !id.is_empty())
+}
+
+/// The JIDs that `message` mentions. An empty or repeated JID is left out.
+fn mentions_of(message: &wa::Message) -> Vec<String> {
+    let mut jids: Vec<String> = Vec::new();
+    if let Some(context) = message.context_info() {
+        for jid in &context.mentioned_jid {
+            let jid = jid.trim();
+            if !jid.is_empty() && !jids.iter().any(|known| known == jid) {
+                jids.push(jid.to_owned());
+            }
+        }
+    }
+    jids
 }
 
 /// The reactions that a history row carries.
@@ -755,6 +775,15 @@ impl WhatsAppSender for LiveSender {
             let subject = meta.subject.unwrap_or_default();
             let subject = subject.trim();
             Ok((!subject.is_empty()).then(|| subject.to_string()))
+        })
+    }
+
+    fn phone_of<'a>(&'a self, lid: &'a str) -> PhoneFuture<'a> {
+        Box::pin(async move {
+            let jid: Jid = lid.parse().ok()?;
+            let entry = self.client.get_lid_pn_entry(&jid).await.ok()??;
+            let phone = entry.phone_number.trim();
+            (!phone.is_empty()).then(|| format!("{phone}@s.whatsapp.net"))
         })
     }
 

@@ -5,10 +5,14 @@
 //! [`open_url`] checks the scheme again. A blocked scheme is plain text.
 //! `http` and `https` go through `webbrowser` with its `hardened` feature.
 //! `mailto` goes to the OS handler as one argument.
+//!
+//! A mention of a person has the link color too. A click on it opens the
+//! one-to-one chat with that person, when the chat list has that chat.
 
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Color32, FontId, Stroke, TextFormat};
 
+use thinwire_core::Intent;
 use thinwire_protocol::{MessageLink, openable_url};
 
 /// A link the user has not opened yet, because the label is a different address.
@@ -132,7 +136,7 @@ pub(crate) fn layout_job(
     let mut job = LayoutJob::default();
     let mut cursor = 0usize;
     for span in links {
-        if openable_url(&span.url).is_none() {
+        if !span.is_mention() && span.url().and_then(openable_url).is_none() {
             continue;
         }
         let start = span.start.min(body.len());
@@ -347,6 +351,7 @@ pub(crate) fn interact(
     galley: &egui::Galley,
     body: &str,
     links: &[MessageLink],
+    out: &mut Vec<Intent>,
 ) {
     let Some(pointer) = response.hover_pos().or(response.interact_pointer_pos()) else {
         return;
@@ -355,22 +360,37 @@ pub(crate) fn interact(
     let Some(link) = link_at(links, index) else {
         return;
     };
-    if openable_url(&link.url).is_none() {
+    if link.is_mention() {
+        // A mention with no known chat is only a colored name.
+        let Some(chat) = link.chat() else {
+            return;
+        };
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.clicked() {
+            out.push(Intent::SelectConversation {
+                id: chat.to_owned(),
+            });
+        }
         return;
     }
+    let Some(url) = link.url().filter(|url| openable_url(url).is_some()) else {
+        return;
+    };
     let label = body.get(link.start..link.end).unwrap_or("");
     response
         .clone()
-        .on_hover_text(&link.url)
+        .on_hover_text(url)
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.clicked() {
-        if needs_confirm(label, &link.url) {
-            remember_confirm(ui.ctx(), &link.url);
+        if needs_confirm(label, url) {
+            remember_confirm(ui.ctx(), url);
         } else {
-            open_url(&link.url);
+            open_url(url);
         }
     }
-    let url = link.url.clone();
+    let url = url.to_owned();
     response.clone().context_menu(|ui| {
         if ui.button("Copy link").clicked() {
             ui.ctx().copy_text(url.clone());
@@ -584,11 +604,7 @@ mod tests {
         ] {
             // The blocked address is the visible text, so a selection can copy it.
             let body = url;
-            let links = [MessageLink {
-                start: 0,
-                end: body.len(),
-                url: url.to_string(),
-            }];
+            let links = [MessageLink::web(0, body.len(), url)];
             let job = layout_job(body, &links, text, link, font.clone());
             assert_eq!(job.text, body, "{url}");
             assert_eq!(job.sections.len(), 1, "{url}");
@@ -597,11 +613,7 @@ mod tests {
             assert!(openable_url(url).is_none(), "{url}");
         }
         let body = "https://a.test";
-        let links = [MessageLink {
-            start: 0,
-            end: body.len(),
-            url: body.to_string(),
-        }];
+        let links = [MessageLink::web(0, body.len(), body)];
         let job = layout_job(body, &links, text, link, font);
         assert!(
             job.sections

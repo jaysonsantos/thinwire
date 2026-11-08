@@ -1664,6 +1664,48 @@ fn an_accesskit_selection_reaches_the_bubble() {
     assert_eq!(selection.focus.character_index, 5);
 }
 
+/// A click on a mention opens the one-to-one chat of that person. A
+/// mention with no known chat does nothing.
+#[test]
+fn a_click_on_a_mention_opens_the_chat_of_that_person() {
+    let mut state = InboxUi::ready();
+    let mut known = chat_message("telegram:1:known", "@Bob hello there", 1_790_300_000);
+    known.links = vec![MessageLink::mention(0, 4, Some("telegram:2".into()))];
+    let mut unknown = chat_message("telegram:1:unknown", "@Cy hello there", 1_790_300_100);
+    unknown.links = vec![MessageLink::mention(0, 3, None)];
+    for message in [unknown, known] {
+        state
+            .snapshot
+            .apply(AdapterEvent::MessageReceived { message });
+    }
+    let mut harness = harness(state);
+    harness.run();
+    let run_of = |harness: &Harness<'static, InboxUi>, body: &str| {
+        harness
+            .query_all(By::new().role(egui::accesskit::Role::TextRun))
+            .find(|node| {
+                !node.accesskit_node().is_hidden()
+                    && node.value().is_some_and(|value| value.starts_with(body))
+            })
+            .map(|node| node.rect())
+            .expect("text run")
+    };
+    let cy = run_of(&harness, "@Cy");
+    click_at(&mut harness, egui::pos2(cy.left() + 6.0, cy.center().y));
+    assert_eq!(harness.state().selects, 0, "no chat for this mention");
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:1")
+    );
+    let bob = run_of(&harness, "@Bob");
+    click_at(&mut harness, egui::pos2(bob.left() + 6.0, bob.center().y));
+    assert_eq!(harness.state().selects, 1);
+    assert_eq!(
+        harness.state().snapshot.selected_conversation.as_deref(),
+        Some("telegram:2")
+    );
+}
+
 /// A blocked scheme stays in the bubble as text. The user can select it and copy it.
 #[test]
 fn a_blocked_scheme_stays_selectable_text() {
@@ -1677,11 +1719,7 @@ fn a_blocked_scheme_stays_selectable_text() {
     let mut links = Vec::new();
     let mut offset = 0usize;
     for (index, part) in parts.iter().enumerate() {
-        links.push(MessageLink {
-            start: offset,
-            end: offset + part.len(),
-            url: (*part).to_string(),
-        });
+        links.push(MessageLink::web(offset, offset + part.len(), *part));
         offset += part.len();
         if index + 1 != parts.len() {
             offset += 1;
