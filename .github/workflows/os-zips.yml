@@ -12,10 +12,11 @@
 # in an if: condition, and do not copy them into a pull_request workflow.
 #
 # Each archive holds the MIT app and two AGPL-3.0-only helper programs: the
-# WhatsApp helper and the Signal helper (ADR 0013). The app does not link a
-# helper: it starts each one as a child process. The helper-source job
-# uploads the Corresponding Source of the helpers from the same run, with
-# the same retention as the archives.
+# WhatsApp helper and the Signal helper (ADR 0013). The macOS app also
+# holds a small LGPL GStreamer runtime for in-app video (ADR 0015). The
+# app does not link a helper: it starts each one as a child process. The
+# helper-source job uploads the Corresponding Source of the helpers from
+# the same run, with the same retention as the archives.
 #
 # TELEGRAM_API_ID and TELEGRAM_API_HASH are publisher Telegram app credentials.
 # This main-only workflow reads them from GitHub Actions repository secrets and
@@ -118,12 +119,32 @@ jobs:
             exit 1
           fi
 
+      # In-app video (ADR 0015) on macOS only. The app links GStreamer from
+      # the official framework, and the stage step copies a small part of it
+      # into Thinwire.app. Linux and Windows do not have `video` yet: the
+      # Linux zip must start on a system with no GStreamer.
+      - name: Install GStreamer
+        if: runner.os == 'macOS'
+        shell: bash
+        run: scripts/install-gstreamer-macos.sh
+
       # scripts/check-release-tree.sh reads the feature list of this line.
       - name: Build release binary
+        if: runner.os != 'macOS'
         env:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: cargo build --release -p thinwire --features telegram-tdlib,whatsapp-web,signal-local,discord-bot
+
+      # The same features as the line above, and `video`. `video` adds no
+      # protocol and no AGPL code.
+      - name: Build release binary with video
+        if: runner.os == 'macOS'
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          PKG_CONFIG_PATH: /Library/Frameworks/GStreamer.framework/Versions/1.0/lib/pkgconfig
+        run: cargo build --release -p thinwire --features telegram-tdlib,whatsapp-web,signal-local,discord-bot,video
 
       # Each AGPL helper is its own program. It gets no publisher secret.
       - name: Build the WhatsApp helper

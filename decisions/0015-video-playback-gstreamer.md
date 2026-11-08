@@ -31,3 +31,11 @@ The owner preferred GStreamer and accepted FFmpeg.
 - The macOS and Windows zips must carry the GStreamer runtime, its plugins, and a plugin registry. This adds tens of MB. Each dylib on macOS needs the Developer ID signature before notarization.
 - CI on macOS and Windows needs the GStreamer development files for the release build.
 - If the macOS packaging spike fails, a new ADR replaces this one with FFmpeg before the video UI work starts.
+
+## Packaging on macOS (2026-11-08)
+
+- The macOS zip has the `video` feature. `scripts/install-gstreamer-macos.sh` installs the official GStreamer 1.28.8 framework on the runner. The script pins the SHA-256 of each package.
+- `scripts/bundle-gstreamer-macos.sh` copies 18 plugins and the libraries that they need into `Thinwire.app/Contents/Frameworks/GStreamer`. It thins each file to arm64. The runtime adds about 30 MB to the app. The decoders are `applemedia` (VideoToolbox and AudioToolbox), Opus, and libvpx. The app does not ship FFmpeg or a GPL plugin.
+- The app scans the plugin folder of the bundle at start. It does not use `gst-plugin-scanner`: GStreamer loads the plugins in the app process.
+- The stage step signs each copied file with the signature of the app before notarization.
+- The Linux and Windows zips do not have `video` yet.

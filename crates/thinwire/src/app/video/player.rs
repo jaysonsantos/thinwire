@@ -193,10 +193,22 @@ impl Drop for VideoPlayer {
 /// build has none: it uses the plugins of the system or of its bundle.
 const BUILD_PLUGIN_PATH: Option<&str> = option_env!("GST_PLUGIN_SYSTEM_PATH_1_0");
 
+/// The plugin folder of the GStreamer runtime in `Thinwire.app`, for the
+/// binary at `exe` (`Contents/MacOS/thinwire`).
+/// `scripts/stage-os-artifact.sh` copies the runtime to this place.
+fn bundle_plugin_dir(exe: &Path) -> Option<std::path::PathBuf> {
+    let contents = exe.parent()?.parent()?;
+    Some(contents.join(BUNDLE_PLUGIN_DIR))
+}
+
+/// The plugin folder in `Contents`, as `scripts/stage-os-artifact.sh` makes it.
+const BUNDLE_PLUGIN_DIR: &str = "Frameworks/GStreamer/lib/gstreamer-1.0";
+
 /// Start GStreamer one time. A local build that runs outside its Nix
 /// shell does not see the shell plugins, and `playbin` is in one of them.
 /// So when the environment names no plugin folder, the plugin folders of
-/// the build shell are scanned.
+/// the build shell are scanned. A release `Thinwire.app` carries its own
+/// GStreamer runtime, and its plugin folder is scanned too.
 fn init() -> Result<(), VideoError> {
     static STARTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let started = *STARTED.get_or_init(|| {
@@ -210,9 +222,19 @@ fn init() -> Result<(), VideoError> {
         ]
         .iter()
         .any(|name| std::env::var_os(name).is_some());
-        if !named && let Some(paths) = BUILD_PLUGIN_PATH {
+        if !named {
             let registry = gst::Registry::get();
-            for dir in std::env::split_paths(paths).filter(|dir| dir.is_dir()) {
+            if let Some(paths) = BUILD_PLUGIN_PATH {
+                for dir in std::env::split_paths(paths).filter(|dir| dir.is_dir()) {
+                    registry.scan_path(&dir);
+                }
+            }
+            if let Some(dir) = std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(bundle_plugin_dir)
+                .filter(|dir| dir.is_dir())
+            {
                 registry.scan_path(&dir);
             }
         }
@@ -253,6 +275,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn the_bundle_plugin_folder_is_in_the_framework_of_the_app() {
+        let exe = Path::new("/Applications/Thinwire.app/Contents/MacOS/thinwire");
+        assert_eq!(
+            bundle_plugin_dir(exe).as_deref(),
+            Some(Path::new(
+                "/Applications/Thinwire.app/Contents/Frameworks/GStreamer/lib/gstreamer-1.0"
+            ))
+        );
+        assert_eq!(bundle_plugin_dir(Path::new("thinwire")), None);
+    }
 
     /// The clip is 0.6 s of a 64x36 test picture with a tone: H.264 and
     /// AAC in MP4, made with ffmpeg. It plays to its end with no sound.

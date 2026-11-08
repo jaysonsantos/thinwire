@@ -796,6 +796,9 @@ EOF
       exit 1
     fi
   done
+  # A build with the `video` feature links GStreamer. Copy its runtime into
+  # the app before the signature (ADR 0015). Other builds stay as they are.
+  "${script_dir}/bundle-gstreamer-macos.sh" "$app"
   leftover="$(find dist -mindepth 1 -maxdepth 1 ! -name 'Thinwire.app' -print)"
   if [[ -n "$leftover" ]]; then
     echo "::error::macOS payload must be only Thinwire.app."
