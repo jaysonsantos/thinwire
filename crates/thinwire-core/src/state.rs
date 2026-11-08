@@ -726,6 +726,12 @@ pub struct Snapshot {
     /// A message that reorders the list does not set this.
     scroll_to_selected: bool,
     scroll_to_focused: bool,
+    /// The thread scrolls this message into view once: the message that a
+    /// clicked reply quote answers.
+    scroll_to_message: Option<String>,
+    /// A clicked reply quote whose message is not loaded yet. Older pages
+    /// load until the message arrives or the page budget ends.
+    reply_jump: Option<ReplyJump>,
     /// Inbox row ids last seen by `sync_focused_row`. A list change is a difference here.
     seen_visible_ids: Vec<String>,
     /// Unsent compose text per chat and topic. `compose` holds the open
@@ -1040,6 +1046,17 @@ fn thread_key(
     (protocol, chat.to_owned(), topic)
 }
 
+/// The most older pages that one click on a reply quote loads.
+pub const REPLY_JUMP_PAGES: u8 = 5;
+
+/// A reply quote click that waits for older pages.
+#[derive(Debug, Clone)]
+struct ReplyJump {
+    thread: OlderPageKey,
+    message_id: String,
+    pages_left: u8,
+}
+
 fn older_key(
     protocol: ProtocolId,
     chat: &str,
@@ -1124,6 +1141,8 @@ impl Snapshot {
             history_asked: HashMap::new(),
             scroll_to_selected: false,
             scroll_to_focused: false,
+            scroll_to_message: None,
+            reply_jump: None,
             seen_visible_ids: Vec::new(),
             drafts: HashMap::new(),
             replying: None,
@@ -1523,6 +1542,7 @@ impl Snapshot {
                 } else {
                     self.older_retry.remove(&key);
                 }
+                self.continue_reply_jump();
             }
             AdapterEvent::ChatListLoaded { protocol } => {
                 self.chat_list_loading.remove(&protocol);
@@ -3152,6 +3172,8 @@ impl Snapshot {
         }
         // The edit text never becomes a draft.
         self.cancel_edit();
+        self.reply_jump = None;
+        self.scroll_to_message = None;
         let draft = std::mem::take(&mut self.compose);
         if let Some(old) = self.selected_conversation.clone()
             && !draft.is_empty()
@@ -3975,6 +3997,77 @@ impl Snapshot {
 
     pub fn take_scroll_to_selected(&mut self) -> bool {
         std::mem::take(&mut self.scroll_to_selected)
+    }
+
+    /// Scroll the open thread to the message that a reply answers. When that
+    /// message is not loaded, older pages load first, at most
+    /// [`REPLY_JUMP_PAGES`]. A thread with no older pages does nothing.
+    pub fn jump_to_message(&mut self, message_id: &str) {
+        self.reply_jump = None;
+        if self
+            .selected_messages()
+            .iter()
+            .any(|row| row.id == message_id)
+        {
+            self.scroll_to_message = Some(message_id.to_owned());
+            return;
+        }
+        let Some(chat) = self.selected_conversation.as_deref() else {
+            return;
+        };
+        if !self.pages_older() {
+            return;
+        }
+        self.reply_jump = Some(ReplyJump {
+            thread: older_key(self.selected_protocol, chat, self.selected_topic),
+            message_id: message_id.to_owned(),
+            pages_left: REPLY_JUMP_PAGES,
+        });
+        self.continue_reply_jump();
+    }
+
+    /// Scroll to the waiting reply target when it is loaded. Otherwise load
+    /// the next older page, while pages are left and a page may go out.
+    fn continue_reply_jump(&mut self) {
+        let Some(mut jump) = self.reply_jump.take() else {
+            return;
+        };
+        let Some(chat) = self.selected_conversation.as_deref() else {
+            return;
+        };
+        if jump.thread != older_key(self.selected_protocol, chat, self.selected_topic) {
+            return;
+        }
+        if self
+            .selected_messages()
+            .iter()
+            .any(|row| row.id == jump.message_id)
+        {
+            self.scroll_to_message = Some(jump.message_id);
+            return;
+        }
+        if self.older_loading.contains(&jump.thread) {
+            // A page is on its way. Its answer continues the jump.
+            self.reply_jump = Some(jump);
+            return;
+        }
+        if jump.pages_left == 0 || self.older_anchor_at(Instant::now()).is_none() {
+            return;
+        }
+        jump.pages_left -= 1;
+        self.reply_jump = Some(jump);
+        self.load_older();
+    }
+
+    /// The message that the thread scrolls into view once. Read-only; see
+    /// `take_scroll_to_message`.
+    #[must_use]
+    pub fn wants_scroll_to_message(&self) -> Option<&str> {
+        self.scroll_to_message.as_deref()
+    }
+
+    pub fn take_scroll_to_message(&mut self) -> Option<String> {
+        self.scroll_to_message.take()
     }
 
     /// True once after the keyboard highlight moves. The inbox scrolls that row into view.
@@ -11856,6 +11949,95 @@ mod tests {
             state: AccountState::Unlinked,
         });
         assert_eq!(snapshot.unread_total(&mutes), 0, "no session, no count");
+    }
+
+    /// A click on a reply quote whose message is loaded scrolls to it at
+    /// once, and asks for no page.
+    #[test]
+    fn a_reply_jump_to_a_loaded_message_scrolls_to_it() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.jump_to_message("telegram:1:50");
+        assert_eq!(snapshot.wants_scroll_to_message(), Some("telegram:1:50"));
+        assert!(older_requests(&mut snapshot).is_empty());
+        assert_eq!(
+            snapshot.take_scroll_to_message().as_deref(),
+            Some("telegram:1:50")
+        );
+        assert_eq!(
+            snapshot.wants_scroll_to_message(),
+            None,
+            "one scroll per click"
+        );
+    }
+
+    /// The replied message is not loaded: older pages load until it arrives,
+    /// then the thread scrolls to it.
+    #[test]
+    fn a_reply_jump_loads_older_pages_until_the_message_arrives() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.jump_to_message("telegram:1:30");
+        assert_eq!(older_requests(&mut snapshot), vec!["telegram:1:50"]);
+        assert_eq!(snapshot.wants_scroll_to_message(), None);
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 40, "older", Delivery::Sent),
+        });
+        snapshot.apply(older_loaded(1, 50, true));
+        assert_eq!(
+            older_requests(&mut snapshot),
+            vec!["telegram:1:40"],
+            "the next page goes out by itself"
+        );
+
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 30, "the question", Delivery::Sent),
+        });
+        snapshot.apply(older_loaded(1, 40, true));
+        assert_eq!(snapshot.wants_scroll_to_message(), Some("telegram:1:30"));
+        assert!(older_requests(&mut snapshot).is_empty());
+    }
+
+    /// The replied message never arrives: the jump stops after
+    /// `REPLY_JUMP_PAGES` pages and does not loop.
+    #[test]
+    fn a_reply_jump_stops_after_its_page_budget() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.jump_to_message("telegram:1:1");
+        let mut pages = 0;
+        let mut oldest = 50;
+        while let [anchor] = older_requests(&mut snapshot).as_slice() {
+            assert_eq!(anchor, &format!("telegram:1:{oldest}"));
+            pages += 1;
+            let older = oldest - 2;
+            snapshot.apply(AdapterEvent::MessageReceived {
+                message: outgoing(1, older, "older", Delivery::Sent),
+            });
+            snapshot.apply(older_loaded(1, oldest, true));
+            oldest = older;
+        }
+        assert_eq!(pages, usize::from(REPLY_JUMP_PAGES));
+        assert_eq!(snapshot.wants_scroll_to_message(), None);
+    }
+
+    /// Another chat opens while pages load: the jump ends there.
+    #[test]
+    fn a_reply_jump_ends_when_the_chat_changes() {
+        let store = SecretStore::memory();
+        let mut snapshot = chat_with_recent_page(&store);
+        snapshot.jump_to_message("telegram:1:30");
+        assert_eq!(older_requests(&mut snapshot).len(), 1);
+        snapshot.select_conversation("telegram:2".into());
+        snapshot.select_conversation("telegram:1".into());
+        snapshot.take_commands();
+        snapshot.apply(AdapterEvent::MessageReceived {
+            message: outgoing(1, 30, "the question", Delivery::Sent),
+        });
+        snapshot.apply(older_loaded(1, 50, true));
+        assert_eq!(snapshot.wants_scroll_to_message(), None);
+        assert!(older_requests(&mut snapshot).is_empty());
     }
 
     #[test]

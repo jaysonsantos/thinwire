@@ -33,6 +33,8 @@ struct InboxUi {
     account_intents: Vec<Intent>,
     /// The intents of the message menu.
     message_intents: Vec<Intent>,
+    /// Reply-quote targets that the thread scrolled to, as the app takes them.
+    scrolled_to: Vec<String>,
 }
 
 impl InboxUi {
@@ -71,6 +73,7 @@ impl InboxUi {
             restarts: Vec::new(),
             account_intents: Vec::new(),
             message_intents: Vec::new(),
+            scrolled_to: Vec::new(),
         }
     }
 
@@ -102,6 +105,12 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
         let mut player = super::audio::Player::new();
         ui::draw(ui, &view, &mut state.hints, &mut player, &mut out);
     }
+    if state.apply_hints
+        && state.hints.used_scroll_to_message()
+        && let Some(id) = state.snapshot.take_scroll_to_message()
+    {
+        state.scrolled_to.push(id);
+    }
     for intent in out {
         match intent {
             Intent::SelectConversation { id } => {
@@ -128,6 +137,9 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
                 .snapshot
                 .toggle_selection(protocol, &conversation_id, &message_id),
             Intent::ClearSelection => state.snapshot.clear_selection(),
+            Intent::JumpToMessage { message_id, .. } => {
+                state.snapshot.jump_to_message(&message_id);
+            }
             Intent::OpenForward {
                 protocol,
                 conversation_id,
@@ -954,6 +966,32 @@ fn chat_message(id: &str, body: &str, sent_at: i64) -> ChatMessage {
         reply_to: None,
         edited: false,
     }
+}
+
+/// A click on the quote of a reply asks the thread to scroll to the
+/// message it answers. The next frame uses that request.
+#[test]
+fn a_click_on_a_reply_quote_scrolls_to_the_replied_message() {
+    let mut state = InboxUi::ready();
+    state.apply_hints = true;
+    let question = chat_message("telegram:1:8", "Which series?", 1_790_299_000);
+    let mut answer = chat_message("telegram:1:9", "Visionquest", 1_790_300_000);
+    answer.reply_to = Some("telegram:1:8".into());
+    for message in [question, answer] {
+        state
+            .snapshot
+            .apply(AdapterEvent::MessageReceived { message });
+    }
+    let mut harness = harness(state);
+    harness.run();
+    assert_eq!(harness.state().snapshot.wants_scroll_to_message(), None);
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Link, "Show the replied message")
+        .click();
+    // The glow on the replied bubble repaints for 1.5 s, so run a few frames.
+    harness.run_steps(3);
+    assert_eq!(harness.state().scrolled_to, ["telegram:1:8"]);
+    assert_eq!(harness.state().snapshot.wants_scroll_to_message(), None);
 }
 
 /// A right click on a bubble opens its menu. Delete asks first, with "Also

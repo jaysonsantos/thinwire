@@ -105,14 +105,17 @@ const THREAD_INSET: f32 = space::XL;
 
 /// One-shot hints from the core. A hint counts as used only where its widget
 /// draws, so a hidden widget does not lose it (qa L1).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Hints {
     focus_compose: bool,
     scroll_to_selected: bool,
     scroll_to_focused: bool,
+    /// The message that a clicked reply quote answers.
+    scroll_to_message: Option<String>,
     used_focus_compose: bool,
     used_scroll_to_selected: bool,
     used_scroll_to_focused: bool,
+    used_scroll_to_message: bool,
     /// Snapshot only. See [`Hints::show_open_mute_menus`].
     open_mute_menus: bool,
 }
@@ -124,6 +127,7 @@ impl Hints {
             focus_compose: view.wants_focus_compose(),
             scroll_to_selected: view.wants_scroll_to_selected(),
             scroll_to_focused: view.wants_scroll_to_focused(),
+            scroll_to_message: view.wants_scroll_to_message().map(str::to_owned),
             ..Self::default()
         }
     }
@@ -141,12 +145,12 @@ impl Hints {
     }
 
     /// The focus hint was used this frame. The app clears it in the core.
-    pub(crate) const fn used_focus_compose(self) -> bool {
+    pub(crate) const fn used_focus_compose(&self) -> bool {
         self.used_focus_compose
     }
 
     /// The scroll hint was used this frame. The app clears it in the core.
-    pub(crate) const fn used_scroll_to_selected(self) -> bool {
+    pub(crate) const fn used_scroll_to_selected(&self) -> bool {
         self.used_scroll_to_selected
     }
 
@@ -157,8 +161,19 @@ impl Hints {
     }
 
     /// The keyboard-highlight scroll hint was used this frame.
-    pub(crate) const fn used_scroll_to_focused(self) -> bool {
+    pub(crate) const fn used_scroll_to_focused(&self) -> bool {
         self.used_scroll_to_focused
+    }
+
+    /// Call only where the thread rows draw.
+    pub(crate) fn take_scroll_to_message(&mut self) -> Option<String> {
+        self.used_scroll_to_message = self.scroll_to_message.is_some();
+        self.scroll_to_message.clone()
+    }
+
+    /// The reply-jump scroll hint was used this frame.
+    pub(crate) const fn used_scroll_to_message(&self) -> bool {
+        self.used_scroll_to_message
     }
 
     /// Open the row menu once for each mute state. The app leaves this off.
@@ -2531,6 +2546,11 @@ fn thread(
     let selecting = !selection.is_empty();
     let thread = snapshot.selected_messages();
     let replied = |id: &str| thread.iter().find(|message| message.id == id);
+    let jump_target = if thread.is_empty() {
+        None
+    } else {
+        hints.take_scroll_to_message()
+    };
     let messages: Vec<Bubble<'_>> = thread
         .iter()
         .zip(layout)
@@ -2548,6 +2568,8 @@ fn thread(
             file: message.file.as_ref(),
             reactions: &message.reactions,
             reply: message.reply_to.as_deref().map(replied),
+            reply_id: message.reply_to.as_deref(),
+            jump_here: jump_target.as_deref() == Some(message.id.as_str()),
             actions,
             editable: thinwire_core::state::can_edit(message),
             forwardable: actions.forward && thinwire_core::state::can_forward(message),
@@ -3019,6 +3041,11 @@ struct Bubble<'a> {
     reactions: &'a [thinwire_protocol::Reaction],
     /// A reply: the message it answers, when that message is in the thread.
     reply: Option<Option<&'a thinwire_protocol::ChatMessage>>,
+    /// The id of the message that this one replies to. A click on the quote
+    /// scrolls to it.
+    reply_id: Option<&'a str>,
+    /// A clicked reply quote answers this message: scroll it into view now.
+    jump_here: bool,
     /// What the menu of the message offers.
     actions: thinwire_protocol::MessageActions,
     /// Edit can change this message.
@@ -3541,7 +3568,8 @@ fn bubble(
                         hide_from_accesskit(ui, response.id);
                     }
                     if let Some(replied) = message.reply {
-                        super::message_menu::quote(ui, replied, message.outbound);
+                        let rect = super::message_menu::quote(ui, replied, message.outbound);
+                        reply_jump_target(ui, rect, message, out);
                     }
                     // A tap on the thumbnail of a video plays the video, not
                     // the still picture.
@@ -3724,6 +3752,17 @@ fn bubble(
         if message.selecting && message.forwardable {
             select_on_click(ui, &frame, message, out);
         }
+        if message.jump_here {
+            frame.scroll_to_me(Some(egui::Align::Center));
+            // Read the clock first: `input` and `data_mut` share one lock.
+            let flash = ReplyFlash {
+                message_id: message.id.to_owned(),
+                since: ui.input(|input| input.time),
+            };
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(reply_flash_id(), flash));
+        }
+        reply_flash(ui, &frame, message, palette.accent);
         if message.selected {
             ui.painter().rect_stroke(
                 frame.rect.expand(SELECTED_RING_GAP),
@@ -3733,6 +3772,85 @@ fn bubble(
             );
         }
     });
+}
+
+/// How long a bubble glows after a click on a reply quote scrolls to it.
+const REPLY_FLASH_SECS: f64 = 1.5;
+
+/// The bubble that a reply-quote click scrolled to, and when.
+#[derive(Clone, Debug)]
+struct ReplyFlash {
+    message_id: String,
+    since: f64,
+}
+
+fn reply_flash_id() -> egui::Id {
+    egui::Id::unique("thinwire-reply-flash")
+}
+
+/// A click on the quote of a reply scrolls the thread to the message it
+/// answers. In selection mode, a click selects the bubble instead.
+fn reply_jump_target(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    message: &Bubble<'_>,
+    out: &mut Vec<Intent>,
+) {
+    let Some(reply_id) = message.reply_id else {
+        return;
+    };
+    if message.selecting {
+        return;
+    }
+    let response = ui
+        .interact(
+            rect,
+            egui::Id::unique(("reply-jump", message.id)),
+            egui::Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Link, true, "Show the replied message")
+    });
+    if response.clicked() {
+        out.push(Intent::JumpToMessage {
+            protocol: message.protocol,
+            conversation_id: message.conversation_id.to_owned(),
+            message_id: reply_id.to_owned(),
+        });
+    }
+}
+
+/// A short glow on the bubble that a reply-quote click scrolled to. It fades
+/// out, or stays still for the same time when motion is off.
+fn reply_flash(ui: &egui::Ui, frame: &egui::Response, message: &Bubble<'_>, accent: egui::Color32) {
+    let Some(flash) = ui
+        .ctx()
+        .data(|data| data.get_temp::<ReplyFlash>(reply_flash_id()))
+    else {
+        return;
+    };
+    if flash.message_id != message.id {
+        return;
+    }
+    let elapsed = ui.input(|input| input.time) - flash.since;
+    if elapsed >= REPLY_FLASH_SECS {
+        ui.ctx()
+            .data_mut(|data| data.remove::<ReplyFlash>(reply_flash_id()));
+        return;
+    }
+    let strength = if motion::enabled(ui.ctx()) {
+        (1.0 - elapsed / REPLY_FLASH_SECS) as f32
+    } else {
+        1.0
+    };
+    ui.painter().rect_stroke(
+        frame.rect.expand(SELECTED_RING_GAP),
+        bubble_radius(message.outbound, message.layout.run_end),
+        egui::Stroke::new(SELECTED_RING, accent.gamma_multiply(strength)),
+        egui::StrokeKind::Outside,
+    );
+    ui.ctx().request_repaint();
 }
 
 /// The width of the ring around a selected bubble.

@@ -196,8 +196,13 @@ pub(crate) fn reactions(
     );
 }
 
-/// The message that a reply answers, at the top of its bubble.
-pub(crate) fn quote(ui: &mut egui::Ui, replied: Option<&ChatMessage>, outbound: bool) {
+/// The message that a reply answers, at the top of its bubble. Returns the
+/// area of the quote, so the bubble can make it a click target.
+pub(crate) fn quote(
+    ui: &mut egui::Ui,
+    replied: Option<&ChatMessage>,
+    outbound: bool,
+) -> egui::Rect {
     let palette = theme::palette(ui);
     let (bar, name, text) = if outbound {
         (palette.on_out, palette.on_out, palette.out_meta)
@@ -208,7 +213,7 @@ pub(crate) fn quote(ui: &mut egui::Ui, replied: Option<&ChatMessage>, outbound: 
         Some(message) => (message.sender.as_str(), snippet(&message.body)),
         None => ("", "An older message".to_owned()),
     };
-    lined(ui, bar, |ui| {
+    let rect = lined(ui, bar, |ui| {
         if !sender.is_empty() {
             ui.label(
                 RichText::new(sender)
@@ -220,6 +225,7 @@ pub(crate) fn quote(ui: &mut egui::Ui, replied: Option<&ChatMessage>, outbound: 
         ui.add(egui::Label::new(RichText::new(snippet).small().color(text)).truncate());
     });
     ui.add_space(space::XS);
+    rect
 }
 
 /// The line over the compose field: the message that the next send answers,
@@ -289,7 +295,7 @@ pub(crate) fn reply_bar_height(ui: &egui::Ui, snapshot: &View<'_>) -> f32 {
 }
 
 /// Text in a column with a thin bar on its left.
-fn lined(ui: &mut egui::Ui, bar: egui::Color32, add: impl FnOnce(&mut egui::Ui)) {
+fn lined(ui: &mut egui::Ui, bar: egui::Color32, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
     let response = ui
         .horizontal(|ui| {
             ui.add_space(QUOTE_BAR + space::S);
@@ -302,6 +308,7 @@ fn lined(ui: &mut egui::Ui, bar: egui::Color32, add: impl FnOnce(&mut egui::Ui))
         egui::CornerRadius::same(1),
         bar,
     );
+    rect
 }
 
 /// The first line of `body`, at most [`QUOTE_CHARS`] characters.

@@ -1054,6 +1054,17 @@ impl Core {
                 .state
                 .begin_reply(protocol, &conversation_id, &message_id),
             Intent::CancelReply => self.state.cancel_reply(),
+            Intent::JumpToMessage {
+                protocol,
+                conversation_id,
+                message_id,
+            } => {
+                if self.state.selected_protocol == protocol
+                    && self.state.selected_conversation.as_deref() == Some(conversation_id.as_str())
+                {
+                    self.state.jump_to_message(&message_id);
+                }
+            }
             Intent::EditMessage {
                 protocol,
                 conversation_id,
@@ -1135,6 +1146,13 @@ impl Core {
     /// Frontend thread only. See [`Core`] "Threads".
     pub fn take_scroll_to_selected(&mut self) -> bool {
         self.state.take_scroll_to_selected()
+    }
+
+    /// A reply quote was clicked; scroll its message into view, once.
+    ///
+    /// Frontend thread only. See [`Core`] "Threads".
+    pub fn take_scroll_to_message(&mut self) -> Option<String> {
+        self.state.take_scroll_to_message()
     }
 
     /// The keyboard highlight moved; scroll that row into view, once.

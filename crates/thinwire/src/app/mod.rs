@@ -687,6 +687,9 @@ impl eframe::App for ThinwireApp {
         if hints.used_scroll_to_focused() {
             self.core.take_scroll_to_focused();
         }
+        if hints.used_scroll_to_message() {
+            self.core.take_scroll_to_message();
+        }
         self.notification_intents(ui.ctx());
         for intent in self.intents.drain(..) {
             self.core.dispatch(intent);

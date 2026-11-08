@@ -186,6 +186,13 @@ pub enum Intent {
     },
     /// The next send is a plain message again.
     CancelReply,
+    /// Scroll the open chat to this message: the message that a clicked
+    /// reply quote answers. Older pages load when it is not loaded yet.
+    JumpToMessage {
+        protocol: ProtocolId,
+        conversation_id: String,
+        message_id: String,
+    },
     /// Delete one message of the open chat. `for_everyone` removes an own
     /// message for every member, where the protocol allows it.
     DeleteMessage {
