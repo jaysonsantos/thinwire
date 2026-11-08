@@ -830,6 +830,7 @@ impl ProtocolAdapter for DiscordAdapter {
                     let _ = events.send(crate::AdapterEvent::VoiceFailed {
                         protocol: ProtocolId::Discord,
                         file_id,
+                        stop: crate::media::VoiceStop::Unplayable,
                     });
                 }
                 Ok(())

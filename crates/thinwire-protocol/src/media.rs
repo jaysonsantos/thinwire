@@ -98,6 +98,16 @@ impl fmt::Debug for AudioPath {
     }
 }
 
+/// Why a voice note stopped waiting. The painter owns the sentence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoiceStop {
+    /// Missing bytes, a bad host, a network error, or a container the player rejected.
+    Unplayable,
+    /// This Slack token cannot read files. The person removes the thinwire app
+    /// in Slack, then adds the workspace again.
+    SlackFilesUnread,
+}
+
 /// One voice note or audio file the user can play. `file_id` names the
 /// download for its adapter: a TDLib file, or a handle of a helper or an
 /// in-app adapter for this run.
@@ -106,7 +116,7 @@ pub struct MessageAudio {
     duration_secs: u32,
     file_id: i32,
     file: Option<AudioPath>,
-    failed: bool,
+    stop: Option<VoiceStop>,
 }
 
 impl MessageAudio {
@@ -127,7 +137,7 @@ impl MessageAudio {
             duration_secs,
             file_id,
             file,
-            failed: false,
+            stop: None,
         })
     }
 
@@ -148,21 +158,30 @@ impl MessageAudio {
 
     #[must_use]
     pub fn failed(&self) -> bool {
-        self.failed
+        self.stop.is_some()
     }
 
-    /// Stores `path` and clears `failed`.
+    #[must_use]
+    pub fn stop(&self) -> Option<VoiceStop> {
+        self.stop
+    }
+
+    /// Stores `path` and clears the stop. A finished download is playable.
     pub fn set_file(&mut self, path: AudioPath) {
         self.file = Some(path);
-        self.failed = false;
+        self.stop = None;
     }
 
     pub fn mark_failed(&mut self) {
-        self.failed = true;
+        self.stop = Some(VoiceStop::Unplayable);
+    }
+
+    pub fn mark_stopped(&mut self, stop: VoiceStop) {
+        self.stop = Some(stop);
     }
 
     pub fn clear_failed(&mut self) {
-        self.failed = false;
+        self.stop = None;
     }
 }
 
@@ -172,7 +191,7 @@ impl fmt::Debug for MessageAudio {
             .field("duration_secs", &self.duration_secs)
             .field("file_id", &self.file_id)
             .field("file", &self.file)
-            .field("failed", &self.failed)
+            .field("stop", &self.stop)
             .finish()
     }
 }
@@ -1000,17 +1019,21 @@ mod tests {
         assert!(!audio.failed());
         audio.mark_failed();
         assert!(audio.failed());
+        assert_eq!(audio.stop(), Some(VoiceStop::Unplayable));
         audio.set_file(path);
         assert!(!audio.failed());
         assert!(audio.file().is_some());
         let debug = format!("{audio:?}");
         assert!(!debug.contains("hidden-voice"));
         assert!(debug.contains("AudioPath"));
-        audio.mark_failed();
-        assert!(audio.failed());
+        audio.mark_stopped(VoiceStop::SlackFilesUnread);
+        assert_eq!(audio.stop(), Some(VoiceStop::SlackFilesUnread));
         assert!(audio.file().is_some());
         audio.clear_failed();
         assert!(!audio.failed());
+        audio.mark_failed();
+        audio.set_file(AudioPath::new("/tmp/hidden-voice.ogg").expect("path"));
+        assert!(audio.stop().is_none());
     }
 }
 

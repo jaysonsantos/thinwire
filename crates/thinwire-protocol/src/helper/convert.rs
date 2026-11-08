@@ -426,6 +426,7 @@ pub(crate) fn event_to_wire(protocol: ProtocolId, event: AdapterEvent) -> Option
         AdapterEvent::VoiceFailed {
             protocol: seen,
             file_id,
+            ..
         } if own(seen) => WireEvent::VoiceFailed { file_id },
         // A picture that does not fit one line does not cross.
         AdapterEvent::ChatAvatar {
@@ -635,10 +636,18 @@ pub(crate) fn event_from_wire(protocol: ProtocolId, event: WireEvent) -> Option<
                     file_id,
                     path,
                 },
-                None => AdapterEvent::VoiceFailed { protocol, file_id },
+                None => AdapterEvent::VoiceFailed {
+                    protocol,
+                    file_id,
+                    stop: crate::media::VoiceStop::Unplayable,
+                },
             }
         }
-        WireEvent::VoiceFailed { file_id } => AdapterEvent::VoiceFailed { protocol, file_id },
+        WireEvent::VoiceFailed { file_id } => AdapterEvent::VoiceFailed {
+            protocol,
+            file_id,
+            stop: crate::media::VoiceStop::Unplayable,
+        },
         WireEvent::Avatar {
             conversation_id,
             photo,
@@ -1043,6 +1052,39 @@ mod tests {
         assert!(matches!(
             event_from_wire(ProtocolId::Signal, relative),
             Some(AdapterEvent::VoiceFailed { file_id: 9, .. })
+        ));
+    }
+
+    /// A Slack file-access stop stays in the app. The wire line still carries
+    /// only the handle, and the app reads that line as unplayable.
+    #[test]
+    fn a_voice_stop_does_not_cross_the_pipe() {
+        let event = AdapterEvent::VoiceFailed {
+            protocol: ProtocolId::Signal,
+            file_id: 9,
+            stop: crate::media::VoiceStop::SlackFilesUnread,
+        };
+        let wire = event_to_wire(ProtocolId::Signal, event).expect("crosses");
+        let line = thinwire_ipc::encode(&thinwire_ipc::HelperLine::Event {
+            protocol: thinwire_ipc::WireProtocol::Signal,
+            event: wire.clone(),
+        })
+        .expect("line");
+        let value: serde_json::Value = serde_json::from_str(line.trim_end()).expect("json");
+        let payload = value["event"].as_object().expect("event");
+        assert_eq!(
+            payload.get("name").and_then(|name| name.as_str()),
+            Some("voice_failed")
+        );
+        assert_eq!(payload.get("file_id").and_then(|id| id.as_i64()), Some(9));
+        assert_eq!(payload.len(), 2);
+        assert!(matches!(
+            event_from_wire(ProtocolId::Signal, wire),
+            Some(AdapterEvent::VoiceFailed {
+                file_id: 9,
+                stop: crate::media::VoiceStop::Unplayable,
+                ..
+            })
         ));
     }
 

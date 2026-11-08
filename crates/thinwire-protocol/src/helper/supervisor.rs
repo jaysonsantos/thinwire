@@ -732,6 +732,7 @@ impl Supervisor {
                 let _ = self.events.send(AdapterEvent::VoiceFailed {
                     protocol,
                     file_id: *file_id,
+                    stop: crate::media::VoiceStop::Unplayable,
                 });
             }
             // A start that failed: `launch` reported it.
