@@ -1430,7 +1430,13 @@ impl Inbox {
         let preview = record
             .messages
             .last()
-            .map(|message| preview(&self.with_mentions(&message.body, &message.mentions).0))
+            .map(|message| {
+                preview(
+                    &self
+                        .with_mentions(&message.body, &self.mentions_of(message))
+                        .0,
+                )
+            })
             .unwrap_or_default();
         Some(AdapterEvent::ConversationUpsert {
             conversation: Conversation {
@@ -1492,6 +1498,29 @@ impl Inbox {
             .map(conversation_id)
     }
 
+    /// The JIDs that `message` mentions. A row saved before mentions were
+    /// kept has no list: each "@" and a long run of digits in its body is
+    /// then a mention. A known phone JID with these digits is that person,
+    /// else the digits are a LID.
+    fn mentions_of(&self, message: &WaMessage) -> Vec<String> {
+        if !message.mentions.is_empty() {
+            return message.mentions.clone();
+        }
+        let mut jids: Vec<String> = Vec::new();
+        for user in body_mentions(&message.body) {
+            let phone = format!("{user}{PHONE_SERVER}");
+            let jid = if self.chats.contains_key(&phone) || self.names.contains_key(&phone) {
+                phone
+            } else {
+                format!("{user}@lid")
+            };
+            if !jids.contains(&jid) {
+                jids.push(jid);
+            }
+        }
+        jids
+    }
+
     /// `body` with "@" and the name for each "@" and user part of a
     /// mentioned JID, and the byte range and chat of each mention. A
     /// mention with no known name keeps its text.
@@ -1543,18 +1572,22 @@ impl Inbox {
     /// LIDs that a message mentions and that have no phone JID yet. Each
     /// LID comes one time. At most `limit` in one call.
     pub(super) fn take_phone_asks(&mut self, limit: usize) -> Vec<String> {
+        let mentioned: Vec<String> = self
+            .chats
+            .values()
+            .flat_map(|record| &record.messages)
+            .flat_map(|message| self.mentions_of(message))
+            .collect();
         let mut asks = Vec::new();
-        for record in self.chats.values() {
-            for jid in record.messages.iter().flat_map(|message| &message.mentions) {
-                if asks.len() >= limit {
-                    break;
-                }
-                if is_lid(jid)
-                    && !self.phones.contains_key(jid)
-                    && self.phone_asks.insert(jid.clone())
-                {
-                    asks.push(jid.clone());
-                }
+        for jid in mentioned {
+            if asks.len() >= limit {
+                break;
+            }
+            if is_lid(&jid)
+                && !self.phones.contains_key(&jid)
+                && self.phone_asks.insert(jid.clone())
+            {
+                asks.push(jid);
             }
         }
         asks
@@ -1579,7 +1612,11 @@ impl Inbox {
         record
             .messages
             .iter()
-            .filter(|message| message.mentions.iter().any(|jid| changed.contains(jid)))
+            .filter(|message| {
+                self.mentions_of(message)
+                    .iter()
+                    .any(|jid| changed.contains(jid))
+            })
             .map(|message| self.history_row(message))
             .collect()
     }
@@ -1630,7 +1667,7 @@ impl Inbox {
         } else {
             message.body.clone()
         };
-        let (body, mentions) = self.with_mentions(&body, &message.mentions);
+        let (body, mentions) = self.with_mentions(&body, &self.mentions_of(message));
         let links = mention_links(&body, mentions);
         ChatMessage {
             protocol: ProtocolId::WhatsApp,
@@ -1700,6 +1737,33 @@ fn is_group(jid: &str) -> bool {
 
 /// The server of a phone JID.
 const PHONE_SERVER: &str = "@s.whatsapp.net";
+
+/// The fewest digits of a user part that the body of an old row can mention.
+/// A phone number or a LID is longer.
+const MENTION_DIGITS_MIN: usize = 8;
+
+/// Each "@" in `body` with a run of at least [`MENTION_DIGITS_MIN`] digits,
+/// and no letter or digit after the run: the digits.
+fn body_mentions(body: &str) -> Vec<&str> {
+    let mut users = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find('@') {
+        let after = &rest[at + 1..];
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        let user = &after[..end];
+        let joined = after[end..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric);
+        if user.len() >= MENTION_DIGITS_MIN && !joined {
+            users.push(user);
+        }
+        rest = &after[end..];
+    }
+    users
+}
 
 fn is_lid(jid: &str) -> bool {
     jid.ends_with("@lid")
@@ -1878,6 +1942,53 @@ pub(super) mod tests {
         assert!(
             inbox.take_phone_asks(10).is_empty(),
             "the known LID is not asked again"
+        );
+    }
+
+    /// A row saved before mentions were kept has no mention list. Its
+    /// body still shows the name, also as the quote of a reply: a known
+    /// phone number names the person now, and a LID asks the device store.
+    /// An unknown LID and a short number keep their text.
+    #[test]
+    fn a_row_with_no_mention_list_still_shows_the_name() {
+        let mut inbox = Inbox::default();
+        let _ = inbox.apply_history(
+            vec![HistoryChat {
+                jid: ANA_PHONE.into(),
+                name: Some("Ana Contact".into()),
+                unread: 0,
+                timestamp: 5,
+                messages: vec![message(ANA_PHONE, "d1", "oi", 5)],
+                mute: Mute::Off,
+            }],
+            Vec::new(),
+        );
+        let events = inbox.apply_messages(vec![
+            mention_message(
+                "m1",
+                "@5511999990000 e @223853863252019 e @190838382571528?",
+                &[],
+            ),
+            mention_message("m2", "@123 and a@22385386325x", &[]),
+        ]);
+        let rows = rows_of(&events);
+        assert_eq!(
+            rows[0].body,
+            "@Ana Contact e @223853863252019 e @190838382571528?"
+        );
+        assert_eq!(rows[1].body, "@123 and a@22385386325x");
+        let _ = inbox.open_chat(GROUP);
+        let mut asks = inbox.take_phone_asks(10);
+        asks.sort();
+        assert_eq!(
+            asks,
+            vec!["190838382571528@lid".to_string(), ANA_LID.to_string()]
+        );
+        let rows = rows_of(&inbox.apply_phones(vec![(ANA_LID.into(), ANA_PHONE.into())]));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].body,
+            "@Ana Contact e @Ana Contact e @190838382571528?"
         );
     }
 
