@@ -116,6 +116,10 @@ pub enum Intent {
     /// Collapse the account sidebar to its icons, or expand it. Disk I/O
     /// runs off the caller thread.
     SetRailCollapsed(bool),
+    /// Settings: tell the other people of a chat when the user types
+    /// (#510). Off also stops a typing state that still shows. Disk I/O
+    /// runs off the caller thread.
+    SetSendTyping(bool),
     /// Mute or unmute one chat in thinwire (#153). A protocol mute wins:
     /// an unmute here never unmutes it. Disk I/O runs off the caller thread.
     SetChatMute {

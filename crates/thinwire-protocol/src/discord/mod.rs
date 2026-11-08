@@ -102,6 +102,8 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
         edit: false,
         forward: false,
     },
+    // The bot has no typing yet (#526).
+    typing: false,
 };
 
 /// Builds the bot HTTP backend from an accepted token. Runs on the tokio worker.

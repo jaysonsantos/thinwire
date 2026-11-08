@@ -28,6 +28,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     pages_history: true,
     sends_media: true,
     message_actions: crate::MessageActions::NONE,
+    typing: false,
 };
 
 /// File name of the Signal helper program, without `.exe`.
@@ -169,6 +170,8 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
         // The helper has no forward yet (#534).
         forward: false,
     },
+    // The helper has no typing yet (#525).
+    typing: false,
 };
 
 /// The Signal adapter of a `signal-local` build: it runs the AGPL client in

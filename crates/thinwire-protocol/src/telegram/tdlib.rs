@@ -74,6 +74,12 @@ pub(super) enum TdlibCommand {
         message_ids: Vec<String>,
         to_conversation_id: String,
     },
+    /// Tell the chat, or one topic of it, that this account types or stopped.
+    SetTyping {
+        conversation_id: String,
+        topic: Option<MessageTopic>,
+        typing: bool,
+    },
     Resend {
         conversation_id: String,
         message_id: String,
@@ -159,6 +165,7 @@ impl TdlibCommand {
             Self::React { .. } => "react",
             Self::EditMessage { .. } => "edit_message",
             Self::ForwardMessages { .. } => "forward_messages",
+            Self::SetTyping { .. } => "set_typing",
             Self::Resend { .. } => "resend",
             Self::LoadOlder { .. } => "load_older",
             Self::OpenTopic { .. } => "open_topic",
@@ -1069,6 +1076,20 @@ fn spawn_tdlib_worker(
                                 &events,
                             )
                             .await;
+                        }
+                        TdlibCommand::SetTyping {
+                            conversation_id,
+                            topic,
+                            typing,
+                        } => {
+                            // A round trip here would stall every later
+                            // update. A client that is not linked sends none.
+                            if live.linked()
+                                && let Some((chat_id, topic)) =
+                                    typing_target(&conversation_id, topic)
+                            {
+                                tokio::spawn(send_typing(client_id, chat_id, topic, typing));
+                            }
                         }
                         TdlibCommand::React {
                             conversation_id,
@@ -2073,7 +2094,75 @@ async fn apply_chat_update(
         tdlib_rs::enums::Update::File(update) => {
             note_file(client_id, update.file, live, events).await;
         }
+        tdlib_rs::enums::Update::ChatAction(update) if emit => {
+            let _ = events.send(typing_event(&update, &live.names, &live.directory));
+        }
         _ => {}
+    }
+}
+
+/// The TDLib chat and topic of a `SetTyping`. `None` when the id is not a
+/// Telegram chat, or the topic has no TDLib form: the state then goes to
+/// no chat, not to the whole chat.
+fn typing_target(
+    conversation_id: &str,
+    topic: Option<MessageTopic>,
+) -> Option<(i64, Option<tdlib_rs::enums::MessageTopic>)> {
+    let chat_id = inbox::parse_telegram_chat_id(conversation_id)?;
+    match topic {
+        None => Some((chat_id, None)),
+        Some(topic) => Some((chat_id, Some(td_topic(topic)?))),
+    }
+}
+
+/// `sendChatAction`: Typing, or Cancel to stop. Telegram ends the action by
+/// itself after some seconds.
+async fn send_typing(
+    client_id: i32,
+    chat_id: i64,
+    topic: Option<tdlib_rs::enums::MessageTopic>,
+    typing: bool,
+) {
+    let action = if typing {
+        tdlib_rs::enums::ChatAction::Typing
+    } else {
+        tdlib_rs::enums::ChatAction::Cancel
+    };
+    if let Err(error) =
+        tdlib_rs::functions::send_chat_action(chat_id, topic, Some(action), client_id).await
+    {
+        log_tdlib_error("sendChatAction", &error);
+    }
+}
+
+/// The `Typing` event of a TDLib chat action. Only "typing a message"
+/// counts. Another action (a voice note, a photo upload) or Cancel ends the
+/// typing state of that person.
+fn typing_event(
+    update: &tdlib_rs::types::UpdateChatAction,
+    names: &NameBook,
+    directory: &ChatDirectory,
+) -> AdapterEvent {
+    let (sender_id, sender) = match &update.sender_id {
+        tdlib_rs::enums::MessageSender::User(user) => (
+            format!("user:{}", user.user_id),
+            names.user_label(user.user_id),
+        ),
+        tdlib_rs::enums::MessageSender::Chat(chat) => (
+            format!("chat:{}", chat.chat_id),
+            directory
+                .title(chat.chat_id)
+                .unwrap_or("Telegram chat")
+                .to_owned(),
+        ),
+    };
+    AdapterEvent::Typing {
+        protocol: ProtocolId::Telegram,
+        conversation_id: inbox::conversation_id(update.chat_id),
+        topic: update.topic_id.as_ref().and_then(app_topic),
+        sender_id,
+        sender,
+        typing: matches!(update.action, tdlib_rs::enums::ChatAction::Typing),
     }
 }
 
@@ -4368,5 +4457,101 @@ mod tests {
             }
             other => panic!("ready voice file, got {other:?}"),
         }
+    }
+
+    fn chat_action(
+        sender: tdlib_rs::enums::MessageSender,
+        topic: Option<tdlib_rs::enums::MessageTopic>,
+        action: tdlib_rs::enums::ChatAction,
+    ) -> tdlib_rs::types::UpdateChatAction {
+        tdlib_rs::types::UpdateChatAction {
+            chat_id: 42,
+            topic_id: topic,
+            sender_id: sender,
+            action,
+        }
+    }
+
+    /// Only "typing a message" is typing. Cancel and every other action end
+    /// it. A user takes the name from the name book, a chat its title.
+    #[test]
+    fn a_chat_action_is_a_typing_event_of_its_sender() {
+        use tdlib_rs::enums::{ChatAction, MessageSender, MessageTopic as TdTopic};
+        use tdlib_rs::types::{MessageSenderChat, MessageSenderUser, MessageTopicForum};
+        let mut names = NameBook::new();
+        names.remember_user(7, "Ada", "Lovelace");
+        let directory = ChatDirectory::new();
+        let user = MessageSender::User(MessageSenderUser { user_id: 7 });
+        let forum = TdTopic::Forum(MessageTopicForum { forum_topic_id: 3 });
+
+        let event = typing_event(
+            &chat_action(user.clone(), Some(forum), ChatAction::Typing),
+            &names,
+            &directory,
+        );
+        assert_eq!(
+            event,
+            AdapterEvent::Typing {
+                protocol: ProtocolId::Telegram,
+                conversation_id: "telegram:42".into(),
+                topic: Some(MessageTopic::Forum(3)),
+                sender_id: "user:7".into(),
+                sender: "Ada Lovelace".into(),
+                typing: true,
+            }
+        );
+        for action in [ChatAction::Cancel, ChatAction::RecordingVoiceNote] {
+            let event = typing_event(&chat_action(user.clone(), None, action), &names, &directory);
+            assert!(
+                matches!(
+                    event,
+                    AdapterEvent::Typing {
+                        typing: false,
+                        topic: None,
+                        ..
+                    }
+                ),
+                "{event:?}"
+            );
+        }
+        let chat = MessageSender::Chat(MessageSenderChat { chat_id: 9 });
+        let event = typing_event(
+            &chat_action(chat, None, ChatAction::Typing),
+            &names,
+            &directory,
+        );
+        assert!(
+            matches!(
+                &event,
+                AdapterEvent::Typing { sender_id, sender, typing: true, .. }
+                    if sender_id == "chat:9" && sender == "Telegram chat"
+            ),
+            "{event:?}"
+        );
+    }
+
+    /// A typing state goes to the chat, or to its topic. An id that is not a
+    /// Telegram chat goes nowhere.
+    #[test]
+    fn a_typing_state_names_its_chat_and_topic() {
+        assert!(matches!(
+            typing_target("telegram:42", None),
+            Some((42, None))
+        ));
+        assert!(matches!(
+            typing_target("telegram:42", Some(MessageTopic::Forum(3))),
+            Some((
+                42,
+                Some(tdlib_rs::enums::MessageTopic::Forum(
+                    tdlib_rs::types::MessageTopicForum { forum_topic_id: 3 }
+                ))
+            ))
+        ));
+        assert!(typing_target("discord:42", None).is_none());
+        let too_big = MessageTopic::Forum(i64::from(i32::MAX) + 1);
+        assert!(
+            typing_target("telegram:42", Some(too_big)).is_none(),
+            "never the whole chat in place of the topic"
+        );
     }
 }

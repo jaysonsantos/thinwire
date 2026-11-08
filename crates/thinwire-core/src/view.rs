@@ -60,6 +60,12 @@ impl View<'_> {
         self.settings.rail_collapsed()
     }
 
+    /// Settings switch: the other people of a chat see when the user types.
+    #[must_use]
+    pub fn send_typing(&self) -> bool {
+        self.settings.send_typing()
+    }
+
     /// Settings switch: notifications show the sender and the text (#32).
     #[must_use]
     pub fn notification_preview(&self) -> bool {

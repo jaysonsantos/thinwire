@@ -52,6 +52,7 @@ const CAPS: ProtocolCapabilities = ProtocolCapabilities {
     pages_history: true,
     sends_media: true,
     message_actions: crate::MessageActions::NONE,
+    typing: false,
 };
 
 /// Short waits, so a restart test takes milliseconds.

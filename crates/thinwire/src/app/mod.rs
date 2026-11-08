@@ -23,6 +23,7 @@ pub mod startup;
 mod theme;
 mod theme_mode;
 mod thread_layout;
+mod typing;
 mod ui;
 #[cfg(all(test, feature = "ui-snapshots"))]
 mod ui_snapshots;

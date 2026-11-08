@@ -23,6 +23,7 @@ pub(crate) const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     pages_history: false,
     sends_media: false,
     message_actions: crate::MessageActions::NONE,
+    typing: false,
 };
 
 /// Worker-side fake. Deliberately has no egui/eframe imports.
