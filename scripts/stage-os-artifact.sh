@@ -86,6 +86,8 @@ copy_app_notice third_party/flate2/LICENSE-MIT flate2-LICENSE-MIT.txt
 copy_app_notice third_party/flate2/LICENSE-APACHE flate2-LICENSE-APACHE.txt
 copy_app_notice third_party/ureq/LICENSE-MIT ureq-LICENSE-MIT.txt
 copy_app_notice third_party/ureq/LICENSE-APACHE ureq-LICENSE-APACHE.txt
+copy_app_notice third_party/muda/LICENSE-MIT muda-LICENSE-MIT.txt
+copy_app_notice third_party/muda/LICENSE-APACHE muda-LICENSE-APACHE.txt
 
 copy_llvm_notice() {
   local lib="$1"
@@ -178,6 +180,17 @@ if [[ "$(uname -s)" == "Linux" ]]; then
   fi
   # shellcheck disable=SC2016
   patchelf --set-rpath '$ORIGIN' "$bin"
+fi
+
+# Linux and Windows: the app reads BUILD_ID next to its program. The update
+# check compares it with the newest nightly archive. Only the main-branch
+# OS zips set SOURCE_REF. A shallow count would write r1, so the checkout
+# is made complete first.
+if [[ "$(uname -s)" != "Darwin" && -n "${SOURCE_REF:-}" ]]; then
+  if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+    git fetch --unshallow
+  fi
+  "$script_dir/build-id.sh" >dist/BUILD_ID
 fi
 
 # Temporary keychain used when MACOS_SIGNING_P12 is set. The EXIT trap
@@ -793,7 +806,9 @@ EOF
     flate2-LICENSE-MIT.txt \
     flate2-LICENSE-APACHE.txt \
     ureq-LICENSE-MIT.txt \
-    ureq-LICENSE-APACHE.txt
+    ureq-LICENSE-APACHE.txt \
+    muda-LICENSE-MIT.txt \
+    muda-LICENSE-APACHE.txt
   do
     if [[ ! -f "$app/Contents/Resources/THIRD_PARTY_NOTICES/${notice}" ]]; then
       echo "::error::Thinwire.app Resources are missing the update notice ${notice}."
@@ -825,9 +840,9 @@ fi
 if [[ -f dist/thinwire.exe ]]; then
   leftover="$(find dist -mindepth 1 -maxdepth 1 \
     ! -name 'thinwire.exe' ! -name "${helper_names[0]}.exe" ! -name "${helper_names[1]}.exe" \
-    ! -name 'LICENSE' ! -name 'THIRD_PARTY_NOTICES' -print)"
+    ! -name 'LICENSE' ! -name 'THIRD_PARTY_NOTICES' ! -name 'BUILD_ID' -print)"
   if [[ -n "$leftover" ]]; then
-    echo "::error::Windows payload must be only thinwire.exe, ${helper_names[0]}.exe, ${helper_names[1]}.exe, LICENSE, and THIRD_PARTY_NOTICES."
+    echo "::error::Windows payload must be only thinwire.exe, ${helper_names[0]}.exe, ${helper_names[1]}.exe, LICENSE, THIRD_PARTY_NOTICES, and BUILD_ID."
     printf '%s\n' "$leftover"
     exit 1
   fi

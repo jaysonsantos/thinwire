@@ -11,6 +11,9 @@ mod icons;
 #[cfg(test)]
 mod inbox_keys;
 mod links;
+#[cfg(target_os = "macos")]
+mod macos_menu;
+mod menu_bar;
 mod message_menu;
 mod motion;
 #[cfg(any(feature = "signal-local", feature = "whatsapp-web"))]
@@ -402,6 +405,9 @@ pub struct ThinwireApp {
     /// OS notifications on their own thread (#32).
     notifier: Notifier,
     updates: thinwire::update::Updates,
+    /// The native menu bar. macOS only.
+    #[cfg(target_os = "macos")]
+    native_menu: Option<macos_menu::NativeMenu>,
     /// Chats of clicked notifications. The notifier thread fills it.
     clicks: Arc<Mutex<Vec<NotifyKey>>>,
     last_focus: Option<bool>,
@@ -427,6 +433,11 @@ impl ThinwireApp {
             wake.request_repaint();
         });
         let updates = thinwire::update::Updates::start(ctx.clone());
+        #[cfg(target_os = "macos")]
+        let native_menu = {
+            macos_menu::wake_on_event(ctx);
+            macos_menu::NativeMenu::install(updates.build())
+        };
         Self {
             core,
             runtime: Some(runtime),
@@ -438,6 +449,8 @@ impl ThinwireApp {
             watchdog: false,
             notifier,
             updates,
+            #[cfg(target_os = "macos")]
+            native_menu,
             clicks,
             last_focus: None,
             last_unread: None,
@@ -532,6 +545,38 @@ impl ThinwireApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             // The next pass reads the close: do not wait for the idle tick.
             ctx.request_repaint();
+        }
+    }
+
+    /// Run the commands of the menu bar and the update check of Settings.
+    fn run_menu_commands(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        let commands = macos_menu::take_commands();
+        #[cfg(not(target_os = "macos"))]
+        let commands: Vec<menu_bar::MenuCommand> = Vec::new();
+        let rail_collapsed = self.core.view().rail_collapsed();
+        for command in &commands {
+            match command.effect(rail_collapsed) {
+                menu_bar::MenuEffect::Intent(intent) => self.core.dispatch(intent),
+                menu_bar::MenuEffect::CheckForUpdates => {
+                    self.updates.act(thinwire::update::Action::CheckNow);
+                }
+                menu_bar::MenuEffect::OpenSettings => menu_bar::request_open_settings(ctx),
+                menu_bar::MenuEffect::FocusSearch => menu_bar::request_focus_search(ctx),
+                menu_bar::MenuEffect::OpenUrl(url) => links::open_url(url),
+                menu_bar::MenuEffect::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            }
+        }
+        if menu_bar::take_update_check(ctx) {
+            self.updates.act(thinwire::update::Action::CheckNow);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = &mut self.native_menu {
+            if !commands.is_empty() {
+                menu.invalidate();
+            }
+            let view = self.core.view();
+            menu.sync(view.rail_collapsed(), view.theme());
         }
     }
 
@@ -659,6 +704,7 @@ impl eframe::App for ThinwireApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_focus(ctx);
         self.core.pump();
+        self.run_menu_commands(ctx);
         self.handle_close(ctx, frame);
         self.raise_for_show(ctx, frame);
         if theme_mode::follow_os_live(ctx, self.core.view().theme(), &mut self.last_os_theme) {
@@ -676,6 +722,7 @@ impl eframe::App for ThinwireApp {
         let view = self.core.view();
         self.player.sync(view.selected_messages());
         let mut hints = ui::Hints::from_view(&view);
+        menu_bar::set_about_build(ui.ctx(), self.updates.build());
         ui::draw(ui, &view, &mut hints, &mut self.player, &mut self.intents);
         // Clear a hint only after its widget used it (qa L1).
         if hints.used_focus_compose() {

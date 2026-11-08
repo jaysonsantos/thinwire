@@ -255,6 +255,13 @@ fn raw_public_key(text: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
+/// The build id of the running app, for Settings. `None` outside a bundle.
+pub(super) fn display_build() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let bundle = bundle_from_exe(&exe)?;
+    read_build_id(&bundle).map(|build| build.display())
+}
+
 fn read_build_id(bundle: &Path) -> Option<BuildId> {
     let text = fs::read_to_string(bundle.join("Contents/Resources/BUILD_ID")).ok()?;
     BuildId::parse(&text).ok()

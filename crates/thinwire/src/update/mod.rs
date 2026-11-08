@@ -2,13 +2,15 @@
 mod host;
 #[cfg(any(test, target_os = "macos"))]
 mod machine;
+#[cfg(any(test, not(target_os = "macos")))]
+mod release;
 
 use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "macos")]
 use std::io::{self, IsTerminal, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", not(test)))]
 use std::time::Instant;
 
 #[cfg(any(test, target_os = "macos"))]
@@ -19,7 +21,15 @@ use machine::{Effect, Event, step};
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Prompt {
     Quiet,
+    /// A check that the user asked for runs.
+    Checking,
+    /// A check that the user asked for found no newer build. The text is the
+    /// build id of this app.
+    UpToDate(String),
+    /// macOS: a signed update that the app can install.
     Offer(OfferView),
+    /// Linux and Windows: a newer build on the nightly release page.
+    Available(OfferView),
     Installing,
     QuitToInstall,
     Failed(PlainError),
@@ -49,7 +59,6 @@ pub struct PlainError {
     pub retry: bool,
 }
 
-#[cfg(any(test, target_os = "macos"))]
 pub(super) const CHECK_FAILED: PlainError = PlainError {
     text: "Couldn't check for updates.",
     retry: true,
@@ -60,6 +69,14 @@ pub(super) const BAD_SIGNATURE: PlainError = PlainError {
     text: "This download isn't a signed Thinwire update.",
     retry: true,
 };
+
+pub(super) const NOT_A_CLIENT: PlainError = PlainError {
+    text: "This build can't check for updates. Get Thinwire from the nightly release page.",
+    retry: false,
+};
+
+/// The page that lists every nightly build.
+pub const NIGHTLY_PAGE: &str = "https://github.com/jaysonsantos/thinwire/releases/tag/nightly";
 
 #[cfg(target_os = "macos")]
 pub(super) const SWAP_FAILED: PlainError = PlainError {
@@ -85,11 +102,15 @@ pub enum Action {
     Later,
     Dismiss,
     Retry,
+    /// The user asked for a check now: from the menu or from Settings.
+    CheckNow,
 }
 
 pub struct Updates {
     prompt: Arc<Mutex<Prompt>>,
     tx: Option<mpsc::SyncSender<Action>>,
+    /// The build id of this app, for Settings. `None` in a local build.
+    build: Option<String>,
 }
 
 impl Updates {
@@ -97,15 +118,11 @@ impl Updates {
     pub fn start(wake: egui::Context) -> Self {
         #[cfg(target_os = "macos")]
         {
-            return spawn(wake);
+            spawn(wake)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = wake;
-            Self {
-                prompt: Arc::new(Mutex::new(Prompt::Quiet)),
-                tx: None,
-            }
+            spawn_release_check(wake, release_build_id())
         }
     }
 
@@ -117,11 +134,185 @@ impl Updates {
             .unwrap_or(Prompt::Quiet)
     }
 
+    /// The build id of this app, for example `0.1.0.r298.g0be7e95`.
+    #[must_use]
+    pub fn build(&self) -> Option<&str> {
+        self.build.as_deref()
+    }
+
     pub fn act(&self, action: Action) {
         if let Some(tx) = &self.tx {
             let _ = tx.try_send(action);
+            return;
+        }
+        // No update thread: this build cannot check. A manual check says so.
+        let next = match (self.prompt(), action) {
+            (_, Action::CheckNow) => Prompt::Failed(NOT_A_CLIENT),
+            (Prompt::Failed(_), Action::Dismiss) => Prompt::Quiet,
+            (prompt, _) => prompt,
+        };
+        set_prompt(&self.prompt, next);
+    }
+}
+
+fn set_prompt(slot: &Mutex<Prompt>, next: Prompt) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = next,
+        Err(poisoned) => *poisoned.into_inner() = next,
+    }
+}
+
+/// The next time of an automatic check: 2 to 4 hours from now.
+#[cfg(any(target_os = "macos", not(test)))]
+fn next_recheck() -> Instant {
+    Instant::now() + recheck_delay()
+}
+
+#[cfg(target_os = "macos")]
+fn recheck_delay() -> std::time::Duration {
+    machine::recheck_delay(machine::recheck_random())
+}
+
+#[cfg(all(not(target_os = "macos"), not(test)))]
+fn recheck_delay() -> std::time::Duration {
+    use std::hash::{BuildHasher, Hasher};
+    const MIN: u64 = 2 * 60 * 60;
+    const MAX: u64 = 4 * 60 * 60;
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    std::time::Duration::from_secs(MIN + random % (MAX - MIN + 1))
+}
+
+/// The `BUILD_ID` file next to the program of a Linux or Windows archive.
+#[cfg(not(target_os = "macos"))]
+fn release_build_id() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let text = std::fs::read_to_string(exe.parent()?.join("BUILD_ID")).ok()?;
+    let build = text.trim().to_string();
+    release::build_count(&build).map(|_| build)
+}
+
+/// Linux and Windows: start the check thread when this build has a build
+/// id and the nightly release has an archive for this OS. Else no thread
+/// runs, and a manual check says that this build cannot check.
+#[cfg(not(target_os = "macos"))]
+fn spawn_release_check(wake: egui::Context, build: Option<String>) -> Updates {
+    let prompt = Arc::new(Mutex::new(Prompt::Quiet));
+    let prefix = release::asset_prefix(std::env::consts::OS, std::env::consts::ARCH);
+    let (Some(our), Some(prefix)) = (build.clone(), prefix) else {
+        let _ = wake;
+        return Updates {
+            prompt,
+            tx: None,
+            build,
+        };
+    };
+    #[cfg(test)]
+    {
+        let _ = (wake, our, prefix);
+        Updates {
+            prompt,
+            tx: None,
+            build,
         }
     }
+    #[cfg(not(test))]
+    {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let published = Arc::clone(&prompt);
+        match std::thread::Builder::new()
+            .name("thinwire-update".to_string())
+            .spawn(move || release_worker(&wake, &published, &rx, our, prefix))
+        {
+            Ok(_) => Updates {
+                prompt,
+                tx: Some(tx),
+                build,
+            },
+            Err(_) => {
+                tracing::warn!(target: "thinwire::update", kind = "check_failed");
+                Updates {
+                    prompt,
+                    tx: None,
+                    build,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(test)))]
+fn release_worker(
+    wake: &egui::Context,
+    prompt: &Mutex<Prompt>,
+    rx: &mpsc::Receiver<Action>,
+    our: String,
+    prefix: &'static str,
+) {
+    let mut state = release::start(Some(our));
+    let mut event = release::Event::Recheck;
+    let mut due = next_recheck();
+    loop {
+        let (next, effect) = release::step(state, event);
+        state = next;
+        set_prompt(prompt, release::project(&state));
+        wake.request_repaint();
+        if effect == release::Effect::Fetch {
+            event = release::Event::Release(fetch_newest(prefix));
+            continue;
+        }
+        event = match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
+            Ok(action) => {
+                if action == Action::CheckNow {
+                    due = next_recheck();
+                }
+                release::Event::Action(action)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                due = next_recheck();
+                release::Event::Recheck
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(test)))]
+fn fetch_newest(prefix: &str) -> Result<Option<String>, PlainError> {
+    use std::io::Read;
+    const RELEASE_API_URL: &str =
+        "https://api.github.com/repos/jaysonsantos/thinwire/releases/tags/nightly";
+    let agent = ureq::AgentBuilder::new()
+        .https_only(true)
+        .redirects(0)
+        .try_proxy_from_env(false)
+        .timeout_connect(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let response = agent
+        .get(RELEASE_API_URL)
+        .set("accept", "application/vnd.github+json")
+        .set(
+            "user-agent",
+            concat!("thinwire/", env!("CARGO_PKG_VERSION")),
+        )
+        .call()
+        .map_err(|_| CHECK_FAILED)?;
+    if response.status() != 200 {
+        return Err(CHECK_FAILED);
+    }
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take(release::MAX_RELEASE_JSON as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| CHECK_FAILED)?;
+    let result = release::newest_build(&body, prefix);
+    if result.is_err() {
+        tracing::warn!(target: "thinwire::update", kind = "check_failed");
+    }
+    result
 }
 
 pub struct ApplyJob {
@@ -255,6 +446,7 @@ fn clear_quarantine(bundle: &Path) {
 
 #[cfg(target_os = "macos")]
 fn spawn(wake: egui::Context) -> Updates {
+    let build = host::display_build();
     let prompt = Arc::new(Mutex::new(Prompt::Quiet));
     let (tx, rx) = mpsc::sync_channel(8);
     let published = Arc::clone(&prompt);
@@ -265,10 +457,15 @@ fn spawn(wake: egui::Context) -> Updates {
         Ok(_) => Updates {
             prompt,
             tx: Some(tx),
+            build,
         },
         Err(_) => {
             tracing::warn!(target: "thinwire::update", kind = "check_failed");
-            Updates { prompt, tx: None }
+            Updates {
+                prompt,
+                tx: None,
+                build,
+            }
         }
     }
 }
@@ -294,12 +491,18 @@ fn worker(wake: egui::Context, prompt: Arc<Mutex<Prompt>>, rx: mpsc::Receiver<Ac
         let (next, effect) = step(state, event);
         state = run_effects(next, effect, dest.as_deref(), &prompt, &wake);
     }
-    let mut due = Instant::now() + machine::recheck_delay(machine::recheck_random());
+    let mut due = next_recheck();
     loop {
         let event = match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
-            Ok(action) => Event::Action(action),
+            Ok(action) => {
+                // A manual check starts the 2 to 4 hours again.
+                if action == Action::CheckNow {
+                    due = next_recheck();
+                }
+                Event::Action(action)
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                due = Instant::now() + machine::recheck_delay(machine::recheck_random());
+                due = next_recheck();
                 Event::Recheck
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -341,20 +544,19 @@ fn run_effects(
 
 #[cfg(target_os = "macos")]
 fn publish(slot: &Mutex<Prompt>, state: &Update, wake: &egui::Context) {
-    let next = project(state);
-    match slot.lock() {
-        Ok(mut guard) => *guard = next,
-        Err(poisoned) => {
-            *poisoned.into_inner() = Prompt::Quiet;
-        }
-    }
+    set_prompt(slot, project(state));
     wake.request_repaint();
 }
 
 #[cfg(any(test, target_os = "macos"))]
 fn project(state: &Update) -> Prompt {
     match state {
+        Update::Quiet {
+            our,
+            kind: machine::QuietKind::Confirmed,
+        } => Prompt::UpToDate(our.display()),
         Update::Dormant | Update::Checking { .. } | Update::Quiet { .. } => Prompt::Quiet,
+        Update::CheckingNow { .. } => Prompt::Checking,
         Update::Offer { offer, .. } => Prompt::Offer(offer.view()),
         Update::Installing {
             phase: machine::InstallPhase::Armed,
@@ -382,6 +584,30 @@ mod tests {
         updates.act(Action::Retry);
         assert_eq!(updates.prompt(), Prompt::Quiet);
         assert_eq!(named_threads("thinwire-update"), before);
+    }
+
+    /// A build with no `BUILD_ID` (a local or test build) cannot compare.
+    /// A manual check says so, and Dismiss closes the message. On macOS the
+    /// update thread answers, so this test is for Linux and Windows.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_manual_check_of_a_local_build_says_that_it_cannot_check() {
+        let updates = Updates::start(egui::Context::default());
+        assert_eq!(updates.build(), None);
+        updates.act(Action::CheckNow);
+        assert_eq!(updates.prompt(), Prompt::Failed(super::NOT_A_CLIENT));
+        updates.act(Action::Dismiss);
+        assert_eq!(updates.prompt(), Prompt::Quiet);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_linux_or_windows_build_with_a_build_id_reports_it() {
+        let updates = super::spawn_release_check(
+            egui::Context::default(),
+            Some("0.1.0.r298.g0be7e95".to_string()),
+        );
+        assert_eq!(updates.build(), Some("0.1.0.r298.g0be7e95"));
     }
 
     #[cfg(not(target_os = "macos"))]

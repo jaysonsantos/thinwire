@@ -313,6 +313,9 @@ fn search_field(ui: &mut egui::Ui, search: &str) -> Option<String> {
         ))
         .show(ui);
     super::a11y::name(ui.ctx(), output.response.id, "Search chats");
+    if super::menu_bar::take_focus_search(ui.ctx()) {
+        output.response.request_focus();
+    }
     let rect = output.response.rect;
     let center = egui::pos2(
         rect.min.x + f32::from(margin.left) + SEARCH_ICON * 0.5,
@@ -363,6 +366,7 @@ fn rail_footer(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
                 .show(|ui| add_account_menu(ui, snapshot, out));
             add_slack_workspace(ui, snapshot, out);
             let settings = rail_button(ui, "Settings", icons::gear);
+            open_settings_on_request(ui, &settings);
             egui::Popup::menu(&settings)
                 .align(egui::RectAlign::TOP_START)
                 .gap(space::XS)
@@ -396,6 +400,13 @@ fn add_account_menu(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent
     }
 }
 
+/// The menu bar asked for Settings: open the menu of the Settings button.
+fn open_settings_on_request(ui: &egui::Ui, settings: &egui::Response) {
+    if super::menu_bar::take_open_settings(ui.ctx()) {
+        egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(settings));
+    }
+}
+
 /// What the Settings button opens.
 fn settings_menu(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
     ui.set_min_width(232.0);
@@ -415,6 +426,24 @@ fn settings_menu(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
     notification_control(ui, snapshot, out);
     ui.separator();
     typing_control(ui, snapshot, out);
+    ui.separator();
+    about_control(ui);
+}
+
+/// About Thinwire and Check for Updates. On Linux and Windows this is the
+/// only place for them. On macOS the menu bar has them too.
+fn about_control(ui: &mut egui::Ui) {
+    menu_caption(ui, "About");
+    let build = super::menu_bar::about_build(ui.ctx());
+    ui.label(
+        RichText::new(super::menu_bar::build_text(build.as_deref()))
+            .small()
+            .color(theme::palette(ui).text2),
+    );
+    if ui.button("Check for Updates").clicked() {
+        super::menu_bar::request_update_check(ui.ctx());
+        ui.close();
+    }
 }
 
 /// One caption over a group of settings.
@@ -859,6 +888,7 @@ fn collapsed_footer(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent
                 .gap(space::XS)
                 .show(|ui| add_account_menu(ui, snapshot, out));
             let settings = rail_icon_button(ui, "Settings", icons::gear);
+            open_settings_on_request(ui, &settings);
             egui::Popup::menu(&settings)
                 .align(egui::RectAlign::TOP_START)
                 .gap(space::XS)

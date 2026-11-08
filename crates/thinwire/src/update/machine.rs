@@ -18,6 +18,10 @@ pub(super) enum Update {
     Checking {
         our: BuildId,
     },
+    /// A check that the user asked for. Its result shows, also "up to date".
+    CheckingNow {
+        our: BuildId,
+    },
     Quiet {
         our: BuildId,
         kind: QuietKind,
@@ -40,7 +44,11 @@ pub(super) enum Update {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) enum QuietKind {
     Current,
-    Later { skipped: BuildId },
+    /// A manual check found no newer build. The app says so until dismissed.
+    Confirmed,
+    Later {
+        skipped: BuildId,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -556,6 +564,57 @@ fn consider(best: &mut Option<Offer>, offer: Offer) {
 
 pub(super) fn step(state: Update, event: Event) -> (Update, Effect) {
     match (state, event) {
+        (Update::CheckingNow { our }, Event::Feed(Ok(feed))) => match feed.decide(&our) {
+            Decision::Available(offer) => (Update::Offer { our, offer }, Effect::None),
+            Decision::Current => (
+                Update::Quiet {
+                    our,
+                    kind: QuietKind::Confirmed,
+                },
+                Effect::None,
+            ),
+        },
+        (Update::CheckingNow { our }, Event::Feed(Err(error))) => (
+            Update::Failed {
+                our: Some(our),
+                error,
+            },
+            Effect::None,
+        ),
+        // Hide a manual check: it goes on as an automatic check.
+        (Update::CheckingNow { our }, Event::Action(Action::Dismiss | Action::Later)) => {
+            (Update::Checking { our }, Effect::None)
+        }
+        (
+            Update::Quiet { our, .. } | Update::Failed { our: Some(our), .. },
+            Event::Action(Action::CheckNow),
+        ) => (
+            Update::CheckingNow { our: our.clone() },
+            Effect::FetchFeed {
+                our,
+                purpose: FeedPurpose::Check,
+            },
+        ),
+        (Update::Dormant, Event::Action(Action::CheckNow)) => (
+            Update::Failed {
+                our: None,
+                error: super::NOT_A_CLIENT,
+            },
+            Effect::None,
+        ),
+        (
+            Update::Quiet {
+                our,
+                kind: QuietKind::Confirmed,
+            },
+            Event::Action(Action::Dismiss | Action::Later),
+        ) => (
+            Update::Quiet {
+                our,
+                kind: QuietKind::Current,
+            },
+            Effect::None,
+        ),
         (Update::Checking { our }, Event::Feed(Ok(feed))) => match feed.decide(&our) {
             Decision::Available(offer) => (Update::Offer { our, offer }, Effect::None),
             Decision::Current => (
@@ -1388,6 +1447,85 @@ mod tests {
         assert_eq!(recheck_delay(0), Duration::from_secs(2 * 60 * 60));
         assert_eq!(recheck_delay(7_200), Duration::from_secs(4 * 60 * 60));
         assert!(recheck_delay(recheck_random()) <= RECHECK_MAX);
+    }
+
+    #[test]
+    fn a_manual_check_with_no_newer_build_says_up_to_date() {
+        let our = id("0.1.0.r5.g0000005");
+        let quiet = Update::Quiet {
+            our: our.clone(),
+            kind: QuietKind::Current,
+        };
+        let (next, effect) = step(quiet, Event::Action(Action::CheckNow));
+        assert_eq!(next, Update::CheckingNow { our: our.clone() });
+        assert!(matches!(
+            effect,
+            Effect::FetchFeed {
+                purpose: FeedPurpose::Check,
+                ..
+            }
+        ));
+        let (next, _) = step(next, Event::Feed(Ok(Feed { best: None })));
+        assert_eq!(
+            next,
+            Update::Quiet {
+                our: our.clone(),
+                kind: QuietKind::Confirmed,
+            }
+        );
+        let (next, _) = step(next, Event::Action(Action::Dismiss));
+        assert_eq!(
+            next,
+            Update::Quiet {
+                our,
+                kind: QuietKind::Current,
+            }
+        );
+    }
+
+    #[test]
+    fn a_manual_check_with_a_newer_build_shows_the_offer() {
+        let our = id("0.1.0.r5.g0000005");
+        let offer = sample_offer(9, "abcdef1");
+        let (next, _) = step(
+            Update::Failed {
+                our: Some(our.clone()),
+                error: CHECK_FAILED,
+            },
+            Event::Action(Action::CheckNow),
+        );
+        assert_eq!(next, Update::CheckingNow { our: our.clone() });
+        let (next, _) = step(
+            next,
+            Event::Feed(Ok(Feed {
+                best: Some(offer.clone()),
+            })),
+        );
+        assert_eq!(next, Update::Offer { our, offer });
+    }
+
+    #[test]
+    fn a_manual_check_of_a_build_that_cannot_update_says_so() {
+        let (next, effect) = step(Update::Dormant, Event::Action(Action::CheckNow));
+        assert_eq!(
+            next,
+            Update::Failed {
+                our: None,
+                error: super::super::NOT_A_CLIENT,
+            }
+        );
+        assert!(matches!(effect, Effect::None));
+    }
+
+    #[test]
+    fn hiding_a_manual_check_keeps_it_as_an_automatic_check() {
+        let our = id("0.1.0.r5.g0000005");
+        let (next, effect) = step(
+            Update::CheckingNow { our: our.clone() },
+            Event::Action(Action::Dismiss),
+        );
+        assert_eq!(next, Update::Checking { our });
+        assert!(matches!(effect, Effect::None));
     }
 
     fn assert_rechecks(state: Update, our: &BuildId) {

@@ -105,6 +105,9 @@ ed25519-dalek = "3"
 serde.workspace = true
 serde_json.workspace = true
 base64 = "0.22"
+# The update check reads the nightly release on every OS. Only macOS
+# downloads and installs an update.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 quick-xml = "0.38"
 tar = "0.4"
 flate2 = { version = "1.1.11", default-features = false, features = [
@@ -136,7 +139,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSRunningApplication",
   "NSWorkspace",
 ] }
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# The native menu bar of the app. No GTK: macOS only.
+muda = { version = "0.21", default-features = false }
 
 [dev-dependencies]
 # A zone with daylight saving time for the layout tests (#122).
