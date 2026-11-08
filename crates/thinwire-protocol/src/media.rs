@@ -113,6 +113,109 @@ pub fn mention_links(
     links
 }
 
+/// Web links for the bare addresses in `body`: each `http://`, `https://`,
+/// or `www.` address that starts a word. A link ends at a space. A closing
+/// mark at the end, such as `.` or `)`, stays out of the link when the
+/// address does not open it. A blocked scheme is left out.
+///
+/// The helper protocols send the body with no link ranges, so the app finds
+/// the links in the body.
+#[must_use]
+pub fn web_links(body: &str) -> Vec<MessageLink> {
+    let mut links = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < body.len() {
+        let Some((start, prefix_len)) = next_address(body, cursor) else {
+            break;
+        };
+        let tail = &body[start..];
+        let raw_end = tail
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '<' | '>' | '"'))
+            .map_or(tail.len(), |(index, _)| index);
+        let label = trim_closing_marks(&tail[..raw_end]);
+        let end = start + label.len();
+        if label.len() > prefix_len
+            && let Some(url) = openable_url(label)
+        {
+            links.push(MessageLink::web(start, end, url));
+        }
+        cursor = start + raw_end.max(prefix_len);
+    }
+    links
+}
+
+/// The byte index and the prefix length of the next address in `body` at
+/// or after `from`. An address must start the body or follow a char that is
+/// not a letter, a digit, or `/`.
+fn next_address(body: &str, from: usize) -> Option<(usize, usize)> {
+    const PREFIXES: [&str; 3] = ["https://", "http://", "www."];
+    let mut best: Option<(usize, usize)> = None;
+    for prefix in PREFIXES {
+        let mut search = from;
+        while let Some(found) = find_ignore_case(&body[search..], prefix) {
+            let index = search + found;
+            let boundary = body[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_alphanumeric() && ch != '/' && ch != '.');
+            if boundary {
+                if best.is_none_or(|(at, _)| index < at) {
+                    best = Some((index, prefix.len()));
+                }
+                break;
+            }
+            search = index + prefix.len();
+        }
+    }
+    best
+}
+
+fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// `label` with the closing marks at its end removed. A `)`, `]`, or `}`
+/// stays when the label has more of its opening mark.
+fn trim_closing_marks(mut label: &str) -> &str {
+    loop {
+        let Some(last) = label.chars().next_back() else {
+            return label;
+        };
+        let drop = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '_' => true,
+            ')' => label.matches('(').count() < label.matches(')').count(),
+            ']' => label.matches('[').count() < label.matches(']').count(),
+            '}' => label.matches('{').count() < label.matches('}').count(),
+            _ => false,
+        };
+        if !drop {
+            return label;
+        }
+        label = &label[..label.len() - last.len_utf8()];
+    }
+}
+
+/// `links` and the web links of `body` together, in body order. A web link
+/// that overlaps a link of `links` is left out.
+#[must_use]
+pub fn with_web_links(body: &str, links: Vec<MessageLink>) -> Vec<MessageLink> {
+    let mut all = links;
+    for link in web_links(body) {
+        let overlaps = all
+            .iter()
+            .any(|other| link.start < other.end && other.start < link.end);
+        if !overlaps {
+            all.push(link);
+        }
+    }
+    all.sort_by_key(|link| (link.start, link.end));
+    all
+}
+
 /// One encoded image. `Debug` prints the length only.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ImageBytes(Vec<u8>);
@@ -895,6 +998,63 @@ fn utf16_to_byte(text: &str, units: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn web_labels(body: &str) -> Vec<(&str, String)> {
+        web_links(body)
+            .into_iter()
+            .map(|link| {
+                (
+                    &body[link.start..link.end],
+                    link.url().expect("web link").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_address_in_a_body_is_a_web_link() {
+        assert_eq!(
+            web_labels("watch https://www.youtube.com/watch?v=dQw4w9WgXcQ now"),
+            vec![(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string()
+            )]
+        );
+        assert_eq!(
+            web_labels("(see www.example.com/a_(b)), then HTTP://x.test."),
+            vec![
+                (
+                    "www.example.com/a_(b)",
+                    "https://www.example.com/a_(b)".to_string()
+                ),
+                ("HTTP://x.test", "HTTP://x.test".to_string()),
+            ]
+        );
+        assert_eq!(
+            web_labels("a https://youtu.be/x\nb https://youtu.be/y"),
+            vec![
+                ("https://youtu.be/x", "https://youtu.be/x".to_string()),
+                ("https://youtu.be/y", "https://youtu.be/y".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_word_that_only_looks_like_an_address_is_not_a_link() {
+        assert!(web_labels("nowww.thing and xhttps://a.test and https://").is_empty());
+        assert!(web_labels("no link here").is_empty());
+        assert!(web_labels("é https://").is_empty());
+    }
+
+    #[test]
+    fn a_web_link_that_overlaps_a_mention_is_left_out() {
+        let body = "@https://a.test b https://b.test";
+        let mention = MessageLink::mention(0, 15, None);
+        let links = with_web_links(body, vec![mention.clone()]);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0], mention);
+        assert_eq!(&body[links[1].start..links[1].end], "https://b.test");
+    }
 
     #[test]
     fn utf16_offsets_skip_emoji_and_keep_ascii() {

@@ -47,7 +47,7 @@ pub use media::{
     AudioPath, ChatAvatar, FILES_PER_MESSAGE, ImageBytes, ImagePath, LinkTarget,
     MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, MediaKind, MessageAudio, MessageFile, MessageLink,
     MessagePhoto, MessageVideo, OutgoingFile, PhotoFile, PhotoSize, TextKind, TextSpan, VoiceStop,
-    links_in, mention_links, openable_url, utf16_range, with_scheme,
+    links_in, mention_links, openable_url, utf16_range, web_links, with_scheme, with_web_links,
 };
 pub use risk::{
     CRITIC_BULLET_1, CRITIC_BULLET_2, CRITIC_BULLET_3, CRITIC_RISK_BULLETS, critic_bullets_for,

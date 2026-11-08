@@ -3627,6 +3627,23 @@ fn quote_of(content: &Content) -> Option<String> {
     Some(signal_message_id(quote.id?, quote.author_aci.as_deref()?))
 }
 
+/// The address of the first link preview of a message, when it has one.
+fn preview_url(content: &Content) -> Option<&str> {
+    use presage::libsignal_service::proto::sync_message::Content as SyncContent;
+    let previews = match &content.body {
+        ContentBody::DataMessage(data) => data.preview.as_slice(),
+        ContentBody::SynchronizeMessage(sync) => match sync.content.as_ref() {
+            Some(SyncContent::Sent(sent)) => sent.message.as_ref()?.preview.as_slice(),
+            _ => &[],
+        },
+        _ => &[],
+    };
+    previews
+        .iter()
+        .filter_map(|preview| preview.url.as_deref())
+        .find(|url| !url.trim().is_empty())
+}
+
 fn sent_sync_parts(
     sync: &presage::libsignal_service::proto::SyncMessage,
 ) -> (Option<&str>, &[presage::proto::AttachmentPointer]) {
@@ -3781,12 +3798,13 @@ fn row_and_message(
         }
         _ => (None, &[][..], false),
     };
-    // A message with no text shows the label of its first attachment.
-    let caption = text.filter(|text| !text.is_empty());
+    // A message with no text shows the label of its first attachment. A
+    // message with only a link preview shows the address of the preview.
+    let caption = text.filter(|text| !text.trim().is_empty());
     let label = attachments
         .first()
         .map(|pointer| super::media::label(super::media::kind(pointer)));
-    let body = caption.or(label);
+    let body = caption.or(label).or_else(|| preview_url(content));
     let incoming = match &content.body {
         ContentBody::DataMessage(_) => super::message::Incoming::Data(body),
         ContentBody::SynchronizeMessage(_) if sent => super::message::Incoming::SentSync(body),
@@ -4734,6 +4752,122 @@ mod tests {
             Some(thinwire_protocol::Arrival::History),
             "a stored message never notifies"
         );
+    }
+
+    /// A message with a link preview keeps its text: the preview is not an
+    /// attachment, and the row is not dropped. A live row and a stored row
+    /// show the same text. A message with only a preview shows its address.
+    /// A message that this account sent from the phone shows the same way.
+    #[test]
+    fn a_message_with_a_link_preview_shows_its_text() {
+        use presage::libsignal_service::proto::sync_message::{Content as SyncContent, Sent};
+        use presage::libsignal_service::proto::{Preview, SyncMessage};
+
+        const URL: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+        let preview = || Preview {
+            url: Some(URL.into()),
+            title: Some("A video".into()),
+            image: Some(presage::proto::AttachmentPointer {
+                content_type: Some("image/jpeg".into()),
+                size: Some(1_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let body = format!("watch this {URL}");
+        let with_preview = envelope(
+            Uuid::from_u128(7),
+            DataMessage {
+                body: Some(body.clone()),
+                preview: vec![preview()],
+                ..Default::default()
+            },
+        );
+        let names = HashMap::new();
+        let book = super::super::media::MediaBook::default();
+        for arrival in [
+            thinwire_protocol::Arrival::Live,
+            thinwire_protocol::Arrival::History,
+        ] {
+            let (row, message) =
+                row_and_message(&with_preview, &names, &HashMap::new(), arrival, Some(&book))
+                    .expect("a row");
+            assert_eq!(message.body, body);
+            assert_eq!(row.preview, body);
+            assert!(
+                message.photo.is_none(),
+                "the preview image is not the photo"
+            );
+        }
+        assert!(
+            book.take_jobs("00000000-0000-0000-0000-000000000007")
+                .is_empty()
+        );
+
+        let mut stored = Vec::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        emit_content(
+            &tx,
+            &with_preview,
+            &names,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            None,
+            Some(&book),
+        );
+        while let Ok(event) = rx.try_recv() {
+            stored.push(event);
+        }
+        assert!(
+            stored.iter().any(|event| matches!(
+                event,
+                AdapterEvent::MessageReceived { message } if message.body == body
+            )),
+            "a stored page shows the message"
+        );
+
+        let only_preview = envelope(
+            Uuid::from_u128(7),
+            DataMessage {
+                body: Some(String::new()),
+                preview: vec![preview()],
+                ..Default::default()
+            },
+        );
+        let (_, message) = row_and_message(
+            &only_preview,
+            &names,
+            &HashMap::new(),
+            thinwire_protocol::Arrival::Live,
+            None,
+        )
+        .expect("a row");
+        assert_eq!(message.body, URL);
+
+        let mut sent = envelope(Uuid::nil(), DataMessage::default());
+        sent.body = ContentBody::SynchronizeMessage(SyncMessage {
+            content: Some(SyncContent::Sent(Sent {
+                destination_service_id: Some(Uuid::from_u128(7).to_string()),
+                timestamp: Some(1_700_000_000_000),
+                message: Some(DataMessage {
+                    body: Some(body.clone()),
+                    preview: vec![preview()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..SyncMessage::default()
+        });
+        let (_, message) = row_and_message(
+            &sent,
+            &names,
+            &HashMap::new(),
+            thinwire_protocol::Arrival::Live,
+            None,
+        )
+        .expect("a sent row");
+        assert_eq!(message.body, body);
+        assert!(message.outbound);
     }
 
     /// A message with only an attachment is not dropped: it shows the label

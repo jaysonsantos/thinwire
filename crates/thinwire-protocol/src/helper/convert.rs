@@ -874,7 +874,7 @@ fn message_to_wire(message: ChatMessage) -> Box<WireMessage> {
 }
 
 /// The mentions of a message. A web link does not cross: the app finds
-/// links in the body itself.
+/// the web links in the body itself (`message_from_wire`).
 fn mentions_to_wire(links: &[MessageLink]) -> Vec<WireMention> {
     links
         .iter()
@@ -958,7 +958,10 @@ fn photo_from_wire(photo: WirePhoto) -> Option<MessagePhoto> {
 
 fn message_from_wire(protocol: ProtocolId, message: Box<WireMessage>) -> ChatMessage {
     let message = *message;
-    let links = mentions_from_wire(protocol, &message.body, message.mentions);
+    let mentions = mentions_from_wire(protocol, &message.body, message.mentions);
+    // The helper sends no web link ranges. The app finds the addresses in
+    // the body, so a link in a WhatsApp or Signal message opens.
+    let links = crate::media::with_web_links(&message.body, mentions);
     ChatMessage {
         protocol,
         conversation_id: message.conversation_id,
@@ -1035,6 +1038,24 @@ mod tests {
             back.links,
             vec![MessageLink::mention(0, 4, None)],
             "an overlap, a range with no @, and a range past the body are dropped"
+        );
+    }
+
+    /// A helper sends a body with a bare address and no link range. The
+    /// app finds the address, so a click opens it. A mention keeps its range.
+    #[test]
+    fn the_app_finds_the_web_links_of_a_helper_message() {
+        let mut sent = message(ProtocolId::Signal);
+        sent.body = "@Ana see https://youtu.be/abc123.".into();
+        sent.links = vec![MessageLink::mention(0, 4, None)];
+        let back = message_from_wire(ProtocolId::Signal, message_to_wire(sent.clone()));
+        let start = sent.body.find("https").expect("address");
+        assert_eq!(
+            back.links,
+            vec![
+                MessageLink::mention(0, 4, None),
+                MessageLink::web(start, sent.body.len() - 1, "https://youtu.be/abc123"),
+            ]
         );
     }
 
