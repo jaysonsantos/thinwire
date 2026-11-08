@@ -73,9 +73,9 @@ write_pc glib-2.0 glib-2.0 "$glib_version"
 write_pc gobject-2.0 gobject-2.0 "$glib_version"
 write_pc gio-2.0 gio-2.0 "$glib_version"
 write_pc gstreamer-1.0 gstreamer-1.0 "$version"
-write_pc gstreamer-base-1.0 gstreamer-base-1.0 "$version"
-write_pc gstreamer-app-1.0 gstreamer-app-1.0 "$version"
-write_pc gstreamer-video-1.0 gstreamer-video-1.0 "$version"
+write_pc gstreamer-base-1.0 gstbase-1.0 "$version"
+write_pc gstreamer-app-1.0 gstapp-1.0 "$version"
+write_pc gstreamer-video-1.0 gstvideo-1.0 "$version"
 
 if ! command -v pkg-config >/dev/null 2>&1; then
   brew install pkgconf
