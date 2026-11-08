@@ -4441,6 +4441,7 @@ fn download_voice(
         let _ = events.send(AdapterEvent::VoiceFailed {
             protocol: ProtocolId::Signal,
             file_id,
+            stop: thinwire_protocol::VoiceStop::Unplayable,
         });
     };
     let (Some(pointer), Ok(dir)) = (session.media().voice(file_id), super::path::voice_dir())

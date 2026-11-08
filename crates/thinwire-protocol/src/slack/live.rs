@@ -6,20 +6,27 @@
 //! off in the binary, because the library logs the one-time Socket Mode URL.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Bytes;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use slack_morphism::errors::SlackClientError;
 use slack_morphism::prelude::*;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::api::{
-    SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel, SlackChannelKind,
-    SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream, SlackHistoryPage,
-    SlackInbound, SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi, channel_can_post,
-    history_has_more, history_page_is_authoritative,
+    FileRead, SlackApiError, SlackAppToken, SlackBotToken, SlackBrowser, SlackChannel,
+    SlackChannelKind, SlackChannelPage, SlackCodeExchange, SlackEventSource, SlackEventStream,
+    SlackHistoryPage, SlackInbound, SlackInstallGrant, SlackPost, SlackSocketScope, SlackWebApi,
+    channel_can_post, history_has_more, history_page_is_authoritative,
 };
+use super::audio::{FilesHostUrl, IncomingFile};
 use super::install::SlackInstalledWorkspace;
 use super::morphism::{oauth_v2_access_request, workspace_bot_token};
+use crate::voice_files::VOICE_MAX_BYTES;
 
 /// Retries after Slack sends `Retry-After`. The library retries only when this is set.
 const RATE_LIMIT_RETRIES: usize = 3;
@@ -29,6 +36,10 @@ const CHANNEL_PAGE: u16 = 200;
 
 /// Placeholder body for a message with no text (files, blocks only).
 const NO_TEXT: &str = "(no text)";
+
+const FILE_WAIT: Duration = Duration::from_secs(60);
+
+const ERROR_BODY_MAX: usize = 4096;
 
 /// `conversations.info` body. Slack's `ok` field is ignored.
 #[derive(Debug, Deserialize)]
@@ -345,6 +356,7 @@ impl SlackWebApi for MorphismWebApi {
                 username: message.sender.username,
                 text: body(message.content.text),
                 client_msg_id: client_msg_id(&message.origin),
+                files: plain_files(message.content.files.as_deref()),
             })
             .collect();
         let authoritative = history_page_is_authoritative(posts.len(), limit, has_more);
@@ -404,6 +416,7 @@ impl SlackWebApi for MorphismWebApi {
             username: None,
             text: text.to_string(),
             client_msg_id: None,
+            files: Vec::new(),
         })
     }
 
@@ -425,6 +438,88 @@ impl SlackWebApi for MorphismWebApi {
             .or_else(|| pick(user.name.as_ref()))
             .unwrap_or_else(|| user.id.to_string()))
     }
+
+    async fn read_file(&self, token: &SlackBotToken, url: &FilesHostUrl) -> Result<FileRead, ()> {
+        let uri: hyper::Uri = url.as_str().parse().map_err(|_| ())?;
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_provider_and_native_roots(rustls::crypto::ring::default_provider())
+            .map_err(|_| ())?
+            .https_only()
+            .enable_http1()
+            .build();
+        let client: Client<_, Empty<Bytes>> =
+            Client::builder(TokioExecutor::new()).build(connector);
+        let request = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header(hyper::header::USER_AGENT, "thinwire")
+            .header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer {}", token.reveal()),
+            )
+            .body(Empty::new())
+            .map_err(|_| ())?;
+        tokio::time::timeout(FILE_WAIT, async {
+            let response = client.request(request).await.map_err(|_| ())?;
+            let status = response.status().as_u16();
+            let cap = if status == 200 {
+                VOICE_MAX_BYTES
+            } else {
+                ERROR_BODY_MAX
+            };
+            let body = read_capped(response.into_body(), cap, status == 200).await?;
+            Ok(FileRead { status, body })
+        })
+        .await
+        .map_err(|_| ())?
+    }
+}
+
+fn plain_files(files: Option<&[SlackFile]>) -> Vec<IncomingFile> {
+    files.unwrap_or_default().iter().map(incoming).collect()
+}
+
+fn incoming(file: &SlackFile) -> IncomingFile {
+    IncomingFile {
+        mimetype: file
+            .mimetype
+            .as_ref()
+            .map(|mime| mime.0.clone())
+            .unwrap_or_default(),
+        filetype: file
+            .filetype
+            .as_ref()
+            .map(|kind| kind.0.clone())
+            .unwrap_or_default(),
+        name: file.name.clone().unwrap_or_default(),
+        url: file
+            .url_private
+            .as_ref()
+            .and_then(|url| FilesHostUrl::parse(url.as_str())),
+    }
+}
+
+async fn read_capped(
+    mut body: hyper::body::Incoming,
+    cap: usize,
+    overflow_is_err: bool,
+) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| ())?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if out.len() + data.len() > cap {
+            if overflow_is_err {
+                return Err(());
+            }
+            out.extend_from_slice(&data[..cap - out.len()]);
+            return Ok(out);
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok(out)
 }
 
 fn body(text: Option<String>) -> String {
@@ -627,13 +722,20 @@ async fn on_push(
                 let Some(channel) = message.origin.channel.as_ref() else {
                     return Ok(());
                 };
+                let content = message.content;
+                let files = content
+                    .as_ref()
+                    .and_then(|content| content.files.as_deref())
+                    .map(|files| files.iter().map(incoming).collect())
+                    .unwrap_or_default();
                 SlackInbound::Message(SlackPost {
                     channel: channel.to_string(),
                     ts: message.origin.ts.to_string(),
                     user: message.sender.user.map(|user| user.to_string()),
                     username: message.sender.username,
-                    text: body(message.content.and_then(|content| content.text)),
+                    text: body(content.and_then(|content| content.text)),
                     client_msg_id: client_msg_id(&message.origin),
+                    files,
                 })
             }
         }
@@ -777,5 +879,30 @@ mod tests {
         assert!(unknown.team_id.is_none());
         let blank = session_token("xoxb-test", Some("  "));
         assert!(blank.team_id.is_none());
+    }
+
+    #[test]
+    fn a_file_keeps_only_a_files_slack_com_address() {
+        let foreign: SlackFile = serde_json::from_str(
+            r#"{"id":"F1","name":"audio_message.webm","mimetype":"audio/webm","filetype":"webm","url_private":"https://example.com/secret","url_private_download":"https://files.slack.com/files-pri/T/F/download/audio_message.webm"}"#,
+        )
+        .expect("file");
+        let row = incoming(&foreign);
+        assert!(row.url.is_none());
+        assert_eq!(row.name, "audio_message.webm");
+        let shown = format!("{row:?}");
+        assert!(!shown.contains("example.com"));
+        assert!(!shown.contains("files.slack.com"));
+
+        let hosted: SlackFile = serde_json::from_str(
+            r#"{"id":"F2","name":"song.mp3","mimetype":"audio/mpeg","filetype":"mp3","url_private":"https://files.slack.com/files-pri/T/F/download/song.mp3","url_private_download":"https://example.com/other"}"#,
+        )
+        .expect("file");
+        let row = incoming(&hosted);
+        assert_eq!(
+            row.url.as_ref().map(FilesHostUrl::as_str),
+            Some("https://files.slack.com/files-pri/T/F/download/song.mp3")
+        );
+        assert!(!format!("{row:?}").contains("files.slack.com"));
     }
 }

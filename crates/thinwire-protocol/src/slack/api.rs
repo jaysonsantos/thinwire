@@ -9,6 +9,7 @@ use std::future::Future;
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::audio::FilesHostUrl;
 use super::install::SlackInstalledWorkspace;
 
 /// Workspace bot token (`xoxb-`). `Debug` is redacted.
@@ -208,6 +209,21 @@ pub struct SlackPost {
     pub text: String,
     /// Sender id Slack uses to collapse a redelivery of the same post.
     pub client_msg_id: Option<String>,
+    pub(super) files: Vec<super::audio::IncomingFile>,
+}
+
+pub struct FileRead {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl fmt::Debug for FileRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileRead")
+            .field("status", &self.status)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Recoverable Slack failure. Display never includes tokens or message text.
@@ -305,6 +321,14 @@ pub trait SlackWebApi: Send + Sync + 'static {
         token: &SlackBotToken,
         user: &str,
     ) -> impl Future<Output = Result<String, SlackApiError>> + Send;
+
+    /// GET one `files.slack.com` address. A transport failure is `Err`.
+    /// The status and the body are otherwise returned as Slack sent them.
+    fn read_file<'a>(
+        &'a self,
+        token: &'a SlackBotToken,
+        url: &'a FilesHostUrl,
+    ) -> impl Future<Output = Result<FileRead, ()>> + Send;
 }
 
 /// Live event pushed from Socket Mode into the session actor.

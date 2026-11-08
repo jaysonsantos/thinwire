@@ -1159,6 +1159,7 @@ impl Owner {
             let _ = events.send(AdapterEvent::VoiceFailed {
                 protocol: ProtocolId::Discord,
                 file_id,
+                stop: crate::media::VoiceStop::Unplayable,
             });
         };
         let (Some(url), Ok(dir)) = (self.voices.get(&file_id).cloned(), super::voice_dir()) else {

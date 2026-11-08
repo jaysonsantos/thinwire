@@ -2579,6 +2579,7 @@ fn voice_event(file_id: i32, completed: bool, path: &str) -> AdapterEvent {
         None => AdapterEvent::VoiceFailed {
             protocol: ProtocolId::Telegram,
             file_id,
+            stop: crate::media::VoiceStop::Unplayable,
         },
     }
 }
@@ -4438,6 +4439,7 @@ mod tests {
             AdapterEvent::VoiceFailed {
                 protocol: ProtocolId::Telegram,
                 file_id: 42,
+                ..
             }
         ));
         let waiting = voice_event(42, false, "/tmp/hidden-voice.ogg");
