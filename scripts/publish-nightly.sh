@@ -31,7 +31,14 @@ count=${version#*.r}
 count=${count%%.g*}
 
 # A run of an older commit never replaces a newer nightly.
-current=$(curl -fsSL "https://github.com/${repo}/releases/download/${TAG}/VERSION" 2>/dev/null || true)
+# The API, not the download URL: the download URL of VERSION is cached.
+version_id=$(gh api "repos/${repo}/releases/tags/${TAG}" --jq '.assets[] | select(.name == "VERSION") | .id' 2>/dev/null || true)
+current=""
+# A failed download stops the run on purpose. If the script guessed "no
+# nightly", it could replace a newer nightly with an older one.
+if [[ -n "$version_id" ]]; then
+  current=$(gh api -H "Accept: application/octet-stream" "repos/${repo}/releases/assets/${version_id}")
+fi
 if [[ "$current" =~ \.r([0-9]+)\.g ]] && ((BASH_REMATCH[1] > count)); then
   echo "The nightly is ${current}, which is newer than ${version}. Nothing to publish."
   exit 0

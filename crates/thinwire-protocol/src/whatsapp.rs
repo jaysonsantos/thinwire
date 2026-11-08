@@ -33,6 +33,7 @@ const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     pages_history: false,
     sends_media: false,
     message_actions: crate::MessageActions::NONE,
+    typing: false,
 };
 
 /// File name of the WhatsApp helper program, without `.exe`.
@@ -61,6 +62,8 @@ const HELPER_CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
         forward: false,
         ..crate::MessageActions::ALL
     },
+    // The helper has no typing yet (#524).
+    typing: false,
 };
 
 /// The WhatsApp adapter of a `whatsapp-web` build: it runs the AGPL client

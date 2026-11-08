@@ -398,6 +398,8 @@ fn settings_menu(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
     theme_control(ui, snapshot.theme(), out);
     ui.separator();
     notification_control(ui, snapshot, out);
+    ui.separator();
+    typing_control(ui, snapshot, out);
 }
 
 /// One caption over a group of settings.
@@ -442,6 +444,15 @@ fn notification_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<In
         .changed()
     {
         out.push(Intent::SetNotificationPreview(!hide));
+    }
+}
+
+/// Settings switch for the outgoing typing state (#510).
+fn typing_control(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
+    menu_caption(ui, "Chats");
+    let mut on = snapshot.send_typing();
+    if ui.checkbox(&mut on, "Show others when I type").changed() {
+        out.push(Intent::SetSendTyping(on));
     }
 }
 
@@ -2563,6 +2574,7 @@ fn thread(
             + super::attach::tray_height(ui, snapshot)
             + super::message_menu::reply_bar_height(ui, snapshot)
             + super::forward::selection_bar_height(ui, snapshot)
+            + super::typing::line_height(ui, snapshot)
     };
 
     let state = snapshot.thread_state();
@@ -4070,6 +4082,7 @@ fn compose(
         .fill(palette.bg)
         .inner_margin(egui::Margin::symmetric(THREAD_INSET as i8, space::M as i8))
         .show(ui, |ui| {
+            super::typing::line(ui, snapshot);
             super::forward::selection_bar(ui, snapshot, out);
             super::message_menu::reply_bar(ui, snapshot, out);
             if let Some(thread) = chat.as_ref() {
