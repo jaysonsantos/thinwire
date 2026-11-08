@@ -29,6 +29,7 @@ mod ui;
 mod ui_snapshots;
 #[cfg(test)]
 mod ui_tests;
+pub(crate) mod update;
 mod update_prompt;
 #[cfg(feature = "video")]
 mod video;
@@ -401,11 +402,12 @@ pub struct ThinwireApp {
     watchdog: bool,
     /// OS notifications on their own thread (#32).
     notifier: Notifier,
-    updates: thinwire::update::Updates,
+    macos_updates: thinwire::update::Updates,
     /// Chats of clicked notifications. The notifier thread fills it.
     clicks: Arc<Mutex<Vec<NotifyKey>>>,
     last_focus: Option<bool>,
     last_unread: Option<u32>,
+    updates: update::Updates,
 }
 
 impl ThinwireApp {
@@ -426,7 +428,11 @@ impl ThinwireApp {
             lock(&clicked).push(key);
             wake.request_repaint();
         });
-        let updates = thinwire::update::Updates::start(ctx.clone());
+        let ctx_wake = ctx.clone();
+        let updates = update::Updates::spawn(update::Launch::compile_time(), move || {
+            ctx_wake.request_repaint();
+        });
+        let macos_updates = thinwire::update::Updates::start(ctx.clone());
         Self {
             core,
             runtime: Some(runtime),
@@ -437,10 +443,11 @@ impl ThinwireApp {
             close_gate: CloseGate::Open,
             watchdog: false,
             notifier,
-            updates,
+            macos_updates,
             clicks,
             last_focus: None,
             last_unread: None,
+            updates,
         }
     }
 
@@ -659,6 +666,9 @@ impl eframe::App for ThinwireApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_focus(ctx);
         self.core.pump();
+        if self.updates.take_shutdown() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.handle_close(ctx, frame);
         self.raise_for_show(ctx, frame);
         if theme_mode::follow_os_live(ctx, self.core.view().theme(), &mut self.last_os_theme) {
@@ -666,13 +676,14 @@ impl eframe::App for ThinwireApp {
         }
         // Some platforms send no theme event. logic() still runs when the
         // window is hidden after a repaint request.
-        if self.updates.prompt() == thinwire::update::Prompt::QuitToInstall {
+        if self.macos_updates.prompt() == thinwire::update::Prompt::QuitToInstall {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         ctx.request_repaint_after(IDLE_REPAINT);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.updates.consume_escape(ui.ctx());
         let view = self.core.view();
         self.player.sync(view.selected_messages());
         let mut hints = ui::Hints::from_view(&view);
@@ -693,7 +704,8 @@ impl eframe::App for ThinwireApp {
         }
         self.notifier.send(self.core.take_notify());
         self.update_title(ui.ctx());
-        update_prompt::draw(ui, &self.updates);
+        self.updates.draw(ui.ctx());
+        update_prompt::draw(ui, &self.macos_updates);
     }
 
     /// Safety net for an exit that skipped the close gate. The window is gone,

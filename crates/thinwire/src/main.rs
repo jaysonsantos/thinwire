@@ -9,6 +9,10 @@ fn main() -> eframe::Result<()> {
         thinwire::update::apply_and_relaunch(job);
     }
 
+    if app::update::apply_if_requested() {
+        return Ok(());
+    }
+
     // One thinwire at a time. Taken before the window, the core, and any
     // protocol start. A copy that is still closing gets time to quit. A
     // copy that is running brings its window forward, and this process

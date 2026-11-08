@@ -88,6 +88,18 @@ url = "2"
 arboard = "3.6"
 # The cache folder for pasted images.
 dirs.workspace = true
+# SHA-256 of a nightly archive, and the tar a Windows build unpacks.
+# `rust_backend` keeps flate2 on the Rust inflater. Linux tests hash and
+# extract with no C zlib and no network.
+sha2 = "0.11"
+tar = "0.4"
+flate2 = { version = "1.1.11", default-features = false, features = [
+  "rust_backend",
+] }
+# The update check reads the release JSON of the GitHub API. thinwire-ipc
+# already links both crates, so the app gets no new crate.
+serde.workspace = true
+serde_json.workspace = true
 thinwire-core.workspace = true
 thinwire-notify.workspace = true
 thinwire-protocol.workspace = true
@@ -100,16 +112,8 @@ tracing-subscriber.workspace = true
 # is already on the Signal feature (ADR 0013 license list is unchanged).
 qrcode = { version = "0.14", optional = true, default-features = false }
 ed25519-dalek = "3"
-# The update check reads the release JSON of the GitHub API. thinwire-ipc
-# already links both crates, so the app gets no new crate.
-serde.workspace = true
-serde_json.workspace = true
 base64 = "0.22"
 quick-xml = "0.38"
-tar = "0.4"
-flate2 = { version = "1.1.11", default-features = false, features = [
-  "rust_backend",
-] }
 
 # Linux: the settings portal reports reduce-motion and sends SettingChanged.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -120,8 +124,11 @@ zbus = { version = "5", default-features = false, features = [
 
 # Windows: "Show animations" and its change event. Same windows-rs as
 # thinwire-notify. WinRT only: the workspace forbids unsafe.
+# The nightly check uses the OS TLS stack (`native-tls` is SChannel here).
+# It is not a dependency of the Linux or macOS build.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Foundation", "UI_ViewManagement"] }
+ureq = { version = "3.4", default-features = false, features = ["native-tls"] }
 
 # The Dock icon goes while the app closes in the background. Same versions
 # as eframe's AppKit bindings in Cargo.lock: no second copy.
