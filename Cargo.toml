@@ -38,8 +38,11 @@ todo = "deny"
 # `monochrome_emoji_fonts` (Noto Emoji and emoji-icon-font). The shell
 # keeps that fallback after Inter, which is the coverage 0.36 shipped.
 # `system_fonts` stays off: it would load host fonts and move the layout.
+# `clipboard` must stay on. Without it, egui-winit keeps a copy or a cut
+# inside the app, and no other app can paste it.
 eframe = { version = "0.37", default-features = false, features = [
   "accesskit",
+  "clipboard",
   "default_fonts",
   "glow",
   "links",

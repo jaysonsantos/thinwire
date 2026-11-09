@@ -460,6 +460,21 @@ fn signal_ui_is_feature_gated_and_uses_the_helper() {
     assert!(!names("thinwire-whatsapp"), "no AGPL dependency");
 }
 
+/// A copy or a cut in a text field must reach the OS clipboard. eframe
+/// does that only with its `clipboard` feature, and the workspace turns the
+/// default features of eframe off.
+#[test]
+fn eframe_writes_to_the_os_clipboard() {
+    let manifest = include_str!("../../../../Cargo.toml");
+    let start = manifest.find("\neframe = {").expect("eframe dependency");
+    let entry = &manifest[start..];
+    let entry = &entry[..entry.find("] }").expect("end of the eframe entry")];
+    assert!(
+        entry.contains("\"clipboard\""),
+        "eframe needs the `clipboard` feature"
+    );
+}
+
 #[test]
 fn whatsapp_spike_ui_is_feature_gated() {
     let app = include_str!("mod.rs");
