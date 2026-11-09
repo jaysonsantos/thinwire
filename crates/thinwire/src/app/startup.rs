@@ -387,6 +387,14 @@ impl Shell {
 }
 
 impl eframe::App for Shell {
+    /// eframe calls the hook of this wrapper only, so give it to the main
+    /// app. Without it, the Edit items of the macOS menu bar do nothing.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Stage::Running(app) = &mut self.stage {
+            app.raw_input_hook(ctx, raw_input);
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if motion::follow(ctx, &mut self.last_reduce_motion, self.os_motion.reduced()) {
             ctx.request_repaint();
@@ -509,6 +517,36 @@ mod tests {
                 std::process::id()
             ))
             .join("instance.lock")
+    }
+
+    /// The names of the `fn` items in the `impl` block that starts with `header`.
+    fn impl_fns(source: &str, header: &str) -> Vec<String> {
+        let start = source.find(header).expect("impl block");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("end of impl block");
+        body[..end]
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("fn "))
+            .map(|rest| rest.split('(').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// eframe calls only the methods of `Shell`. Each method of the main
+    /// app must go through it, also one that only one OS compiles, or that
+    /// method never runs (the macOS Edit menu did nothing).
+    #[test]
+    fn the_shell_forwards_each_method_of_the_main_app() {
+        let main_app = impl_fns(include_str!("mod.rs"), "impl eframe::App for ThinwireApp");
+        assert!(main_app.contains(&"raw_input_hook".to_string()));
+        let shell = include_str!("startup.rs");
+        let start = shell.find("impl eframe::App for Shell").expect("shell");
+        let shell = &shell[start..];
+        for name in main_app {
+            assert!(
+                shell.contains(&format!("app.{name}(")),
+                "Shell does not forward `{name}` to the main app"
+            );
+        }
     }
 
     #[test]
