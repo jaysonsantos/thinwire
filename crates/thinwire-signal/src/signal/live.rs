@@ -174,6 +174,8 @@ pub(super) struct Session {
     /// The reactions that this run saw, live and in stored pages, and the
     /// ACI of this account that names its own messages.
     reactions: std::sync::Mutex<(String, super::react::ReactionBook)>,
+    /// The live senders with no name that this run looked up one time.
+    lookups: std::sync::Mutex<super::names::SenderLookups>,
     /// Tests pause the pre-link publish here. Production builds have no pause.
     #[cfg(test)]
     prelink_hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -196,6 +198,7 @@ impl Session {
             media: Arc::default(),
             downloads: Arc::new(tokio::sync::Semaphore::new(MEDIA_DOWNLOADS)),
             reactions: std::sync::Mutex::default(),
+            lookups: std::sync::Mutex::default(),
             #[cfg(test)]
             prelink_hold: std::sync::Mutex::new(None),
         }
@@ -1934,7 +1937,7 @@ async fn run_linked(
             }
         };
     start_avatar_fetches(&manager, &session, token, &events);
-    let mut names = contact_names(&manager).await;
+    let mut names = contact_names(&manager, &session).await;
     // The ACI of this account names its own messages in reactions and quotes.
     let own_aci = manager.registration_data().service_ids.aci.to_string();
     session.set_own_aci(own_aci.clone());
@@ -2004,7 +2007,7 @@ async fn run_linked(
             },
         };
         if relink.on_stream() {
-            names = contact_names(&manager).await;
+            names = contact_names(&manager, &session).await;
             publish_link_ready(&events);
         }
         let mut pending: Option<WorkerJob> = None;
@@ -2081,6 +2084,14 @@ async fn run_linked(
                                         viewed.as_deref(),
                                         &mut rows,
                                         Some(session.media()),
+                                    );
+                                    start_sender_lookup(
+                                        &manager,
+                                        &session,
+                                        token,
+                                        content.as_ref(),
+                                        &own_aci,
+                                        &names,
                                     );
                                     // A photo of the open chat downloads now.
                                     if let Some(viewed) = viewed.as_deref() {
@@ -2312,8 +2323,140 @@ async fn link_new(
     linked.map_err(|_| ())
 }
 
-async fn contact_names(manager: &Manager<SqliteStore, Registered>) -> HashMap<String, String> {
-    person_names(manager.store()).await
+async fn contact_names(
+    manager: &Manager<SqliteStore, Registered>,
+    session: &Session,
+) -> HashMap<String, String> {
+    let mut names = person_names(manager.store()).await;
+    session
+        .lookups
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .fill(&mut names);
+    names
+}
+
+/// The profile of one live sender in the store of the live account.
+struct StoreSenderProfile {
+    manager: Manager<SqliteStore, Registered>,
+    uuid: Uuid,
+    /// The profile key of the message, else the one of the store.
+    key: Option<presage::libsignal_service::zkgroup::profiles::ProfileKey>,
+}
+
+impl super::names::SenderProfile for StoreSenderProfile {
+    async fn stored_name(&mut self) -> Option<String> {
+        let store = self.manager.store();
+        let id = ServiceId::Aci(self.uuid.into());
+        if let Ok(Some(contact)) = store.contact_by_id(&id).await {
+            if !contact.name.trim().is_empty() {
+                return Some(contact.name.trim().to_string());
+            }
+            if self.key.is_none() {
+                self.key = contact_profile_key(store, &contact).await;
+            }
+        }
+        if self.key.is_none() {
+            self.key = store.profile_key(&id).await.ok().flatten();
+        }
+        let key = self.key?;
+        let profile = store.profile(self.uuid, key).await.ok().flatten()?;
+        profile_name_of(&profile)
+    }
+
+    async fn fetch_name(&mut self) -> Option<String> {
+        let key = self.key?;
+        let profile = self
+            .manager
+            .retrieve_profile_by_uuid(self.uuid, key)
+            .await
+            .ok()?;
+        let name = profile_name_of(&profile)?;
+        // The chat list reads a stored profile through the stored key.
+        let mut store = self.manager.store().clone();
+        let _ = store.upsert_profile_key(&self.uuid, key).await;
+        Some(name)
+    }
+}
+
+/// The ACI and the message profile key of an incoming data message from
+/// another person. `None` for an own message or another body.
+fn live_sender(
+    content: &Content,
+    own_aci: &str,
+) -> Option<(
+    Uuid,
+    Option<presage::libsignal_service::zkgroup::profiles::ProfileKey>,
+)> {
+    use presage::libsignal_service::zkgroup::profiles::ProfileKey;
+    let ContentBody::DataMessage(data) = &content.body else {
+        return None;
+    };
+    let ServiceId::Aci(aci) = content.metadata.sender else {
+        return None;
+    };
+    let uuid: Uuid = aci.into();
+    if uuid.to_string() == own_aci {
+        return None;
+    }
+    let key = data
+        .profile_key
+        .as_deref()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(ProfileKey::create);
+    Some((uuid, key))
+}
+
+/// A live message from a person with no name starts one profile lookup
+/// for that person in this run. The lookup runs beside the receive loop.
+/// A found name refreshes the chat list, so the next rows show it. A
+/// failed lookup is not tried again in this run.
+fn start_sender_lookup(
+    manager: &Manager<SqliteStore, Registered>,
+    session: &Arc<Session>,
+    token: u64,
+    content: &Content,
+    own_aci: &str,
+    names: &HashMap<String, String>,
+) {
+    let Some((uuid, key)) = live_sender(content, own_aci) else {
+        return;
+    };
+    let id = uuid.to_string();
+    let claimed = session
+        .lookups
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .claim(&id);
+    if !claimed {
+        return;
+    }
+    let shown = names.get(&id).cloned();
+    let mut profile = StoreSenderProfile {
+        manager: manager.clone(),
+        uuid,
+        key,
+    };
+    let session = Arc::clone(session);
+    // `retrieve_profile_by_uuid` is not `Send`. The Signal worker runs on a
+    // `LocalSet`, so this task stays on it.
+    tokio::task::spawn_local(async move {
+        let _permit = Arc::clone(&session.downloads).acquire_owned().await.ok();
+        if !session.is_current(token) {
+            return;
+        }
+        let Some(name) = super::names::look_up_sender(&mut profile, shown.as_deref()).await else {
+            return;
+        };
+        session
+            .lookups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(id, name);
+        if session.is_current(token) {
+            session.request_refresh();
+        }
+    });
 }
 
 /// The known name of each contact of `store`: the contact name, else the
@@ -2392,10 +2535,32 @@ async fn refresh_chat_list(
         Ok((next_known, next_titles)) => {
             *known = next_known;
             *group_titles = next_titles;
-            *names = contact_names(manager).await;
+            *names = contact_names(manager, session).await;
+            // A one-to-one chat with no contact is not in the store list.
+            // A name that a live lookup found renames its row here.
+            for conversation in renamed_rows(rows, names) {
+                emit_refreshed_row(events, rows, unread, conversation);
+            }
         }
         Err(()) => fail(events, SYNC_FAILED),
     }
+}
+
+/// The one-to-one rows whose known name is not their title, with the name.
+fn renamed_rows(
+    rows: &HashMap<String, Conversation>,
+    names: &HashMap<String, String>,
+) -> Vec<Conversation> {
+    rows.values()
+        .filter(|row| !row.is_group)
+        .filter_map(|row| {
+            let name = names.get(&row.id).filter(|name| !name.trim().is_empty())?;
+            (name != &row.title).then(|| Conversation {
+                title: name.clone(),
+                ..row.clone()
+            })
+        })
+        .collect()
 }
 
 async fn publish_chats(
@@ -2407,7 +2572,7 @@ async fn publish_chats(
 ) -> Result<(HashSet<String>, HashMap<String, String>), ()> {
     let mut known = HashSet::new();
     let mut group_titles = HashMap::new();
-    let names = contact_names(manager).await;
+    let names = contact_names(manager, session).await;
     let history_before = unix_now_millis().map(initial_history_before);
     let history_url = history_store_url();
     let contacts = manager.store().contacts().await.map_err(|_| ())?;
@@ -9644,6 +9809,53 @@ VALUES (?, 'Kept', '', ?, ?, ?)";
         assert!(!more);
         assert!(note.is_none());
         assert!(cursor.is_none());
+    }
+
+    #[test]
+    fn a_live_sender_is_another_person_with_the_message_key() {
+        let person = Uuid::from_u128(0x7777);
+        let own = Uuid::from_u128(0x8888);
+        let keyed = envelope(
+            person,
+            DataMessage {
+                body: Some("hi".into()),
+                profile_key: Some(vec![3; 32]),
+                ..Default::default()
+            },
+        );
+        let (uuid, key) = live_sender(&keyed, &own.to_string()).expect("sender");
+        assert_eq!(uuid, person);
+        assert_eq!(key.map(|key| key.bytes), Some([3; 32]));
+        let unkeyed = envelope(person, DataMessage::default());
+        assert!(
+            live_sender(&unkeyed, &own.to_string())
+                .expect("sender")
+                .1
+                .is_none()
+        );
+        let mine = envelope(own, DataMessage::default());
+        assert!(
+            live_sender(&mine, &own.to_string()).is_none(),
+            "an own message"
+        );
+    }
+
+    #[test]
+    fn a_found_name_renames_a_one_to_one_row() {
+        let id = Uuid::from_u128(0x9999).to_string();
+        let mut group = inbox_row("signal:group:abc", 0);
+        group.is_group = true;
+        let rows = HashMap::from([(id.clone(), inbox_row(&id, 0)), (group.id.clone(), group)]);
+        let names = HashMap::from([
+            (id.clone(), "Ada".to_string()),
+            ("signal:group:abc".to_string(), "Bea".to_string()),
+        ]);
+        let renamed = renamed_rows(&rows, &names);
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(renamed[0].id, id);
+        assert_eq!(renamed[0].title, "Ada");
+        let rows = HashMap::from([(id.clone(), renamed[0].clone())]);
+        assert!(renamed_rows(&rows, &names).is_empty(), "no change, no row");
     }
 
     #[test]

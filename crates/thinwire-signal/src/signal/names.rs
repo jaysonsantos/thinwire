@@ -4,6 +4,8 @@
 //! Order: the contact name of the store, then the Signal profile name, then
 //! the phone number, then a short fallback. The raw ACI never shows.
 
+use std::collections::{HashMap, HashSet};
+
 const UNKNOWN_PERSON: &str = "Signal user";
 /// The number of id characters that the fallback shows, so that two
 /// unknown people do not look the same.
@@ -54,6 +56,71 @@ pub(crate) fn profile_display_name(given: &str, family: Option<&str>) -> Option<
     };
     let joined = joined.trim().to_string();
     (!joined.is_empty()).then_some(joined)
+}
+
+/// The live senders that this run looked up, and the names it found.
+/// `Debug` prints the counts only.
+#[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
+#[derive(Default)]
+pub(crate) struct SenderLookups {
+    tried: HashSet<String>,
+    found: HashMap<String, String>,
+}
+
+#[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
+impl SenderLookups {
+    /// `true` one time for each sender in this run: start one lookup now.
+    /// A failed lookup does not come back here.
+    pub(crate) fn claim(&mut self, sender: &str) -> bool {
+        !sender.is_empty() && self.tried.insert(sender.to_string())
+    }
+
+    /// Keep the name that a lookup found for `sender`.
+    pub(crate) fn record(&mut self, sender: String, name: String) {
+        self.found.insert(sender, name);
+    }
+
+    /// Add the found names to `names`. A name that `names` has stays.
+    pub(crate) fn fill(&self, names: &mut HashMap<String, String>) {
+        for (id, name) in &self.found {
+            names.entry(id.clone()).or_insert_with(|| name.clone());
+        }
+    }
+}
+
+impl std::fmt::Debug for SenderLookups {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SenderLookups")
+            .field("tried", &self.tried.len())
+            .field("found", &self.found.len())
+            .finish()
+    }
+}
+
+/// The profile of one live sender.
+#[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
+pub(crate) trait SenderProfile {
+    /// The contact name or the stored profile name. No network.
+    async fn stored_name(&mut self) -> Option<String>;
+    /// Ask Signal for the profile name.
+    async fn fetch_name(&mut self) -> Option<String>;
+}
+
+/// The new name of a live sender, or `None` when the shown name stays.
+/// `shown` is the name that the rows show now. A stored name does not
+/// ask Signal. Only a sender with no stored name asks Signal, one time.
+#[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
+pub(crate) async fn look_up_sender(
+    profile: &mut impl SenderProfile,
+    shown: Option<&str>,
+) -> Option<String> {
+    if let Some(name) = profile.stored_name().await {
+        return (shown != Some(name.as_str())).then_some(name);
+    }
+    profile
+        .fetch_name()
+        .await
+        .filter(|name| shown != Some(name.as_str()))
 }
 
 #[cfg(test)]
@@ -111,5 +178,122 @@ mod tests {
             Some("Ada")
         );
         assert_eq!(profile_display_name(" ", None), None);
+    }
+
+    /// A fake profile: a stored name, a name that Signal gives, and a count
+    /// of the network fetches.
+    struct FakeProfile {
+        stored: Option<&'static str>,
+        remote: Option<&'static str>,
+        fetches: usize,
+    }
+
+    impl SenderProfile for FakeProfile {
+        async fn stored_name(&mut self) -> Option<String> {
+            self.stored.map(str::to_string)
+        }
+
+        async fn fetch_name(&mut self) -> Option<String> {
+            self.fetches += 1;
+            self.remote.map(str::to_string)
+        }
+    }
+
+    fn fake(stored: Option<&'static str>, remote: Option<&'static str>) -> FakeProfile {
+        FakeProfile {
+            stored,
+            remote,
+            fetches: 0,
+        }
+    }
+
+    /// Run a live message from `sender`: claim, look up, and count the
+    /// refreshes, as the receive loop does.
+    fn on_live_message(
+        lookups: &mut SenderLookups,
+        profile: &mut FakeProfile,
+        sender: &str,
+        shown: Option<&str>,
+        refreshes: &mut usize,
+    ) {
+        if !lookups.claim(sender) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        if let Some(name) = runtime.block_on(look_up_sender(profile, shown)) {
+            lookups.record(sender.to_string(), name);
+            *refreshes += 1;
+        }
+    }
+
+    #[test]
+    fn an_unnamed_live_sender_fetches_one_time() {
+        let mut lookups = SenderLookups::default();
+        let mut profile = fake(None, None);
+        let mut refreshes = 0;
+        on_live_message(&mut lookups, &mut profile, ID, None, &mut refreshes);
+        assert_eq!(profile.fetches, 1, "one fetch");
+        assert_eq!(refreshes, 0, "a failed fetch does not refresh");
+        on_live_message(&mut lookups, &mut profile, ID, None, &mut refreshes);
+        assert_eq!(profile.fetches, 1, "a failed fetch is not tried again");
+    }
+
+    #[test]
+    fn a_named_live_sender_does_not_fetch() {
+        let mut lookups = SenderLookups::default();
+        let mut profile = fake(Some("Ada"), Some("Ada L."));
+        let mut refreshes = 0;
+        on_live_message(&mut lookups, &mut profile, ID, Some("Ada"), &mut refreshes);
+        assert_eq!(profile.fetches, 0);
+        assert_eq!(refreshes, 0, "the shown name stays");
+    }
+
+    #[test]
+    fn a_stored_name_that_the_rows_do_not_show_refreshes_with_no_fetch() {
+        let mut lookups = SenderLookups::default();
+        let mut profile = fake(Some("Ada"), None);
+        let mut refreshes = 0;
+        on_live_message(&mut lookups, &mut profile, ID, None, &mut refreshes);
+        assert_eq!(profile.fetches, 0);
+        assert_eq!(refreshes, 1);
+    }
+
+    #[test]
+    fn a_fetched_name_refreshes_and_fills_the_names() {
+        let mut lookups = SenderLookups::default();
+        let mut profile = fake(None, Some("Ada L."));
+        let mut refreshes = 0;
+        on_live_message(
+            &mut lookups,
+            &mut profile,
+            ID,
+            Some("+4915112345678"),
+            &mut refreshes,
+        );
+        assert_eq!(profile.fetches, 1);
+        assert_eq!(refreshes, 1, "a fetched name refreshes the rows");
+        let mut names = HashMap::from([("other".to_string(), "Bea".to_string())]);
+        lookups.fill(&mut names);
+        assert_eq!(names.get(ID).map(String::as_str), Some("Ada L."));
+        assert_eq!(names.get("other").map(String::as_str), Some("Bea"));
+        assert!(
+            !format!("{lookups:?}").contains("Ada"),
+            "Debug shows no name"
+        );
+        assert!(!format!("{lookups:?}").contains(ID), "Debug shows no id");
+    }
+
+    #[test]
+    fn a_second_message_of_the_same_sender_does_not_fetch_again() {
+        let mut lookups = SenderLookups::default();
+        let mut profile = fake(None, Some("Ada L."));
+        let mut refreshes = 0;
+        on_live_message(&mut lookups, &mut profile, ID, None, &mut refreshes);
+        on_live_message(&mut lookups, &mut profile, ID, None, &mut refreshes);
+        assert_eq!(profile.fetches, 1);
+        assert_eq!(refreshes, 1);
+        assert!(!lookups.claim(""), "an empty id never claims");
     }
 }
