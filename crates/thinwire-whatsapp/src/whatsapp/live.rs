@@ -21,8 +21,8 @@ use whatsapp_rust::{Client, ClientError, Jid, RunCompletionReason};
 
 use super::inbox::TargetRef;
 use super::inbox::{
-    HistoryChat, ME, MEDIA_MAX_BYTES, MediaRef, Mute, PHOTO_LABEL, Sticker, Voice, WaMessage,
-    WaReaction,
+    HistoryChat, ME, MEDIA_MAX_BYTES, MediaRef, Mute, PHOTO_LABEL, Sticker, Voice, WaContact,
+    WaMessage, WaReaction,
 };
 use super::link::{Callbacks, LinkBackend, StartError, Started};
 use super::path::{
@@ -202,6 +202,9 @@ const INBOX_EVENTS: &[EventKind] = &[
     EventKind::TemporaryBan,
     EventKind::HistorySync,
     EventKind::Messages,
+    EventKind::MuteUpdate,
+    EventKind::ContactUpdate,
+    EventKind::ContactRemoved,
 ];
 
 async fn build_bot(
@@ -287,6 +290,11 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
                         from_me: info.source.is_from_me,
                         sender_name: non_empty(info.push_name.as_str()),
                         sender_jid: Some(info.source.sender.to_non_ad().to_string()),
+                        sender_alt: info
+                            .source
+                            .sender_alt
+                            .as_ref()
+                            .map(|jid| jid.to_non_ad().to_string()),
                         body: body_of(&inbound.message)?,
                         timestamp: info.timestamp.timestamp(),
                         sticker: picture_of(&inbound.message),
@@ -298,8 +306,38 @@ fn map_event(event: &Event) -> Option<LinkEvent> {
                 })
                 .collect(),
         ),
+        Event::ContactUpdate(update) => {
+            LinkEvent::Contacts(vec![contact_of(&update.jid, &update.action)])
+        }
+        Event::ContactRemoved(removed) => LinkEvent::Contacts(vec![WaContact {
+            jid: removed.jid.to_non_ad().to_string(),
+            name: None,
+            lid: None,
+            phone: None,
+        }]),
         _ => return None,
     })
+}
+
+/// An address-book contact: its full name, else its first name, and its
+/// LID and phone JID when the action has them.
+fn contact_of(jid: &Jid, action: &wa::sync_action_value::ContactAction) -> WaContact {
+    let jid_of = |value: &Option<String>| {
+        value
+            .as_deref()
+            .and_then(|value| value.parse::<Jid>().ok())
+            .map(|jid| jid.to_non_ad().to_string())
+    };
+    WaContact {
+        jid: jid.to_non_ad().to_string(),
+        name: action
+            .full_name
+            .as_deref()
+            .and_then(non_empty)
+            .or_else(|| action.first_name.as_deref().and_then(non_empty)),
+        lid: jid_of(&action.lid_jid),
+        phone: jid_of(&action.pn_jid),
+    }
 }
 
 fn map_history(sync: &wa::HistorySync) -> LinkEvent {
@@ -380,6 +418,7 @@ fn map_history_message(chat_jid: &str, info: &wa::WebMessageInfo) -> Option<WaMe
         from_me,
         sender_name: info.push_name.as_deref().and_then(non_empty),
         sender_jid,
+        sender_alt: None,
         body: body_of(info.message.as_option()?)?,
         timestamp: info
             .message_timestamp

@@ -189,6 +189,10 @@ pub(super) struct WaMessage {
     pub sender_name: Option<String>,
     /// Sender JID. In a DM this is the chat JID. Used when no name is known.
     pub sender_jid: Option<String>,
+    /// The other JID of the sender: the phone JID of a LID, or the LID of a
+    /// phone JID. Only a live message has it. It is not saved with the row:
+    /// the inbox keeps the pair in its saved phone map.
+    pub sender_alt: Option<String>,
     /// Plain text. Media becomes a short label.
     pub body: String,
     /// Unix seconds.
@@ -209,6 +213,25 @@ pub(super) struct WaMessage {
 
 /// Who reacted, for a reaction of this account.
 pub(super) const ME: &str = "me";
+
+/// One address-book contact from the phone (app-state `ContactAction`).
+/// `name` is `None` when the phone removed the contact or has no name.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct WaContact {
+    pub jid: String,
+    pub name: Option<String>,
+    pub lid: Option<String>,
+    pub phone: Option<String>,
+}
+
+// The fields are user data: Debug shows none of them.
+impl std::fmt::Debug for WaContact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WaContact")
+            .field("has_name", &self.name.is_some())
+            .finish_non_exhaustive()
+    }
+}
 
 /// One reaction from a live message. An empty `emoji` removes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -536,28 +559,44 @@ pub(super) struct SavedChat {
 pub(super) struct SavedInbox {
     pub chats: Vec<(String, SavedChat)>,
     pub names: Vec<(String, String)>,
+    /// Address-book names by JID.
+    pub contacts: Vec<(String, String)>,
+    /// The phone JID of each LID.
+    pub phones: Vec<(String, String)>,
 }
 
+/// A full table of JID pairs and the hash of its rows.
+pub(super) type PairTable = Option<(u64, Vec<(String, String)>)>;
+
 /// What changed since the last save: chats to write, chats to remove, and
-/// the push names when they changed.
+/// the push names, the address-book names, and the phone JIDs when they
+/// changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct InboxChanges {
     pub chats: Vec<(String, u64, SavedChat)>,
     pub removed: Vec<String>,
-    pub names: Option<(u64, Vec<(String, String)>)>,
+    pub names: PairTable,
+    pub contacts: PairTable,
+    pub phones: PairTable,
 }
 
 impl InboxChanges {
     pub(super) fn is_empty(&self) -> bool {
-        self.chats.is_empty() && self.removed.is_empty() && self.names.is_none()
+        self.chats.is_empty()
+            && self.removed.is_empty()
+            && self.names.is_none()
+            && self.contacts.is_none()
+            && self.phones.is_none()
     }
 }
 
-/// Hashes of the chats and the names that the disk holds now.
+/// Hashes of the chats and the name tables that the disk holds now.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct SavedHashes {
     chats: HashMap<String, u64>,
     names: u64,
+    contacts: u64,
+    phones: u64,
 }
 
 impl SavedHashes {
@@ -572,7 +611,29 @@ impl SavedHashes {
         if let Some((hash, _)) = &changes.names {
             self.names = *hash;
         }
+        if let Some((hash, _)) = &changes.contacts {
+            self.contacts = *hash;
+        }
+        if let Some((hash, _)) = &changes.phones {
+            self.phones = *hash;
+        }
     }
+}
+
+/// The rows of `map`, sorted, and their hash.
+fn sorted_pairs(map: &HashMap<String, String>) -> (u64, Vec<(String, String)>) {
+    let mut rows: Vec<(String, String)> = map
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    rows.sort();
+    (hash_of(&rows), rows)
+}
+
+/// The rows of `map` when their hash is not `saved`.
+fn changed_pairs(map: &HashMap<String, String>, saved: u64) -> PairTable {
+    let (hash, rows) = sorted_pairs(map);
+    (hash != saved).then_some((hash, rows))
 }
 
 /// Writes the chat cache. The live client keeps it in an encrypted file
@@ -626,8 +687,11 @@ impl ChatRecord {
 #[derive(Debug, Default)]
 pub(super) struct Inbox {
     chats: HashMap<String, ChatRecord>,
-    /// Push names from history sync, keyed by JID.
+    /// Push names from history sync and from messages, keyed by JID.
     names: HashMap<String, String>,
+    /// Address-book names from the phone (app-state `ContactAction`), keyed
+    /// by JID. A contact with a LID and a phone JID has both keys.
+    contacts: HashMap<String, String>,
     open: Option<String>,
     next_pending: u64,
     /// Chats sent by the chat-list pages so far (newest first).
@@ -636,9 +700,13 @@ pub(super) struct Inbox {
     media: HashMap<(String, String), MediaState>,
     /// Ready images, oldest first, for the [`MEDIA_CACHE`] limit.
     media_ready: VecDeque<(String, String)>,
-    /// The phone JID of each mentioned LID that the device store knows. The
-    /// store keeps them, so this map is not saved.
+    /// The phone JID of each LID that the inbox knows: from the device
+    /// store, from a live message, or from an address-book contact. Saved,
+    /// so a name that the inbox has under one JID names the other JID too
+    /// after a restart.
     phones: HashMap<String, String>,
+    /// The LID of each phone JID in `phones`. Built from `phones`, not saved.
+    lids: HashMap<String, String>,
     /// The LIDs already asked for a phone JID.
     phone_asks: HashSet<String>,
 }
@@ -661,16 +729,9 @@ impl Inbox {
             .filter(|jid| !self.chats.contains_key(*jid))
             .cloned()
             .collect();
-        let mut names: Vec<(String, String)> = self
-            .names
-            .iter()
-            .map(|(jid, name)| (jid.clone(), name.clone()))
-            .collect();
-        names.sort();
-        let hash = hash_of(&names);
-        if hash != saved.names {
-            changes.names = Some((hash, names));
-        }
+        changes.names = changed_pairs(&self.names, saved.names);
+        changes.contacts = changed_pairs(&self.contacts, saved.contacts);
+        changes.phones = changed_pairs(&self.phones, saved.phones);
         changes
     }
 
@@ -681,13 +742,17 @@ impl Inbox {
         for (jid, name) in saved.names {
             self.names.entry(jid).or_insert(name);
         }
-        let mut names: Vec<(String, String)> = self
-            .names
-            .iter()
-            .map(|(jid, name)| (jid.clone(), name.clone()))
-            .collect();
-        names.sort();
-        hashes.names = hash_of(&names);
+        for (jid, name) in saved.contacts {
+            self.contacts.entry(jid).or_insert(name);
+        }
+        for (lid, phone) in saved.phones {
+            if !self.phones.contains_key(&lid) {
+                self.learn_pair(&lid, &phone);
+            }
+        }
+        hashes.names = sorted_pairs(&self.names).0;
+        hashes.contacts = sorted_pairs(&self.contacts).0;
+        hashes.phones = sorted_pairs(&self.phones).0;
         for (jid, chat) in saved.chats {
             if !is_inbox_chat(&jid) || self.chats.contains_key(&jid) {
                 continue;
@@ -709,6 +774,7 @@ impl Inbox {
                         from_me: message.from_me,
                         sender_name: message.sender_name,
                         sender_jid: message.sender_jid,
+                        sender_alt: None,
                         body: message.body,
                         timestamp: message.timestamp,
                         sticker: None,
@@ -1051,8 +1117,10 @@ impl Inbox {
             if !is_inbox_chat(&message.chat_jid) || message.id.is_empty() {
                 continue;
             }
-            remember_name(&mut self.names, &message);
             let jid = message.chat_jid.clone();
+            let title_before = self.chats.get(&jid).map(|record| self.title(&jid, record));
+            remember_name(&mut self.names, &message);
+            let new_pair = self.learn_sender_pair(&message);
             let is_open = self.open.as_deref() == Some(jid.as_str());
             let record = self.chats.entry(jid.clone()).or_default();
             // A live copy carries the server clock (Codex r4132341439).
@@ -1088,8 +1156,22 @@ impl Inbox {
             if is_open {
                 record.mark_read();
             }
-            if mute_ended && let Some(upsert) = self.upsert_event(&jid) {
+            // A new chat, or a name that this message brings, goes to the
+            // shell before the message, so its notification has the name.
+            let title_now = self.chats.get(&jid).map(|record| self.title(&jid, record));
+            let renamed = title_before != title_now;
+            if (mute_ended || renamed)
+                && let Some(upsert) = self.upsert_event(&jid)
+            {
                 events.push(upsert);
+            }
+            // The other chat of the same person can have its name now.
+            if let Some((lid, phone)) = new_pair {
+                events.extend(
+                    self.person_rows(vec![lid, phone])
+                        .into_iter()
+                        .filter(|row| !matches!(row, AdapterEvent::ConversationUpsert { conversation } if conversation.id == conversation_id(&jid))),
+                );
             }
             events.push(AdapterEvent::MessageReceived {
                 message: self.chat_message(&message, arrival),
@@ -1235,6 +1317,7 @@ impl Inbox {
             from_me: true,
             sender_name: None,
             sender_jid: None,
+            sender_alt: None,
             body: body.to_string(),
             timestamp: now,
             sticker: None,
@@ -1463,34 +1546,169 @@ impl Inbox {
     }
 
     fn title(&self, jid: &str, record: &ChatRecord) -> String {
-        if let Some(name) = &record.name {
-            return name.clone();
+        if is_group(jid) {
+            return record
+                .name
+                .clone()
+                .or_else(|| self.names.get(jid).cloned())
+                .unwrap_or_else(|| fallback_label(jid));
         }
-        if let Some(name) = self.names.get(jid) {
-            return name.clone();
-        }
-        fallback_label(jid)
+        self.person_name(jid)
+            .unwrap_or_else(|| self.fallback_label(jid))
     }
 
-    /// The name of a mentioned JID: the chat name of that person, or a push
-    /// name. A LID also tries its phone JID.
-    fn mention_name(&self, jid: &str) -> Option<String> {
-        let phone = self.phones.get(jid).map(String::as_str);
-        [Some(jid), phone]
+    /// The other JID of a person: the phone JID of a LID, or the LID of a
+    /// phone JID, when the inbox knows the pair.
+    fn alt_jid(&self, jid: &str) -> Option<&str> {
+        self.phones
+            .get(jid)
+            .or_else(|| self.lids.get(jid))
+            .map(String::as_str)
+    }
+
+    /// Keep a LID and its phone JID. Returns `true` when the pair is new.
+    fn learn_pair(&mut self, lid: &str, phone: &str) -> bool {
+        if !is_lid(lid) || !phone.ends_with(PHONE_SERVER) {
+            return false;
+        }
+        if self.phones.get(lid).map(String::as_str) == Some(phone) {
+            return false;
+        }
+        if let Some(old) = self.phones.insert(lid.to_owned(), phone.to_owned()) {
+            self.lids.remove(&old);
+        }
+        self.lids.insert(phone.to_owned(), lid.to_owned());
+        true
+    }
+
+    /// Keep the LID and phone JID pair of a live sender. Returns the pair
+    /// when it is new.
+    fn learn_sender_pair(&mut self, message: &WaMessage) -> Option<(String, String)> {
+        let (Some(jid), Some(alt)) = (&message.sender_jid, &message.sender_alt) else {
+            return None;
+        };
+        let (lid, phone) = if is_lid(jid) { (jid, alt) } else { (alt, jid) };
+        self.learn_pair(lid, phone)
+            .then(|| (lid.clone(), phone.clone()))
+    }
+
+    /// The address-book name of a person. Tries the JID, then its other JID.
+    fn contact_name(&self, jid: &str) -> Option<String> {
+        [Some(jid), self.alt_jid(jid)]
             .into_iter()
             .flatten()
-            .find_map(|candidate| {
-                self.chats
-                    .get(candidate)
-                    .and_then(|record| record.name.clone())
-                    .or_else(|| self.names.get(candidate).cloned())
-                    .filter(|name| !name.trim().is_empty())
+            .find_map(|candidate| self.contacts.get(candidate))
+            .filter(|name| !name.trim().is_empty())
+            .cloned()
+    }
+
+    /// The name of a person: an address-book name, then the name of the
+    /// one-to-one chat, then a push name. Each step tries the JID, then its
+    /// other JID (the LID or the phone JID).
+    fn person_name(&self, jid: &str) -> Option<String> {
+        let candidates: Vec<&str> = [Some(jid), self.alt_jid(jid)]
+            .into_iter()
+            .flatten()
+            .filter(|candidate| !is_group(candidate))
+            .collect();
+        let named = |name: Option<&String>| name.filter(|name| !name.trim().is_empty()).cloned();
+        self.contact_name(jid)
+            .or_else(|| {
+                candidates.iter().find_map(|candidate| {
+                    named(
+                        self.chats
+                            .get(*candidate)
+                            .and_then(|record| record.name.as_ref()),
+                    )
+                })
             })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find_map(|candidate| named(self.names.get(*candidate)))
+            })
+    }
+
+    /// The label of a person with no name: the phone number. A LID shows
+    /// its phone number when the inbox knows it.
+    fn fallback_label(&self, jid: &str) -> String {
+        match self.phones.get(jid) {
+            Some(phone) if is_lid(jid) => fallback_label(phone),
+            _ => fallback_label(jid),
+        }
+    }
+
+    /// Address-book contacts from the phone. A contact with a name names
+    /// its JID, its LID, and its phone JID. A contact with no name removes
+    /// these names. Returns the rows whose chat is one of these JIDs.
+    pub(super) fn apply_contacts(&mut self, contacts: Vec<WaContact>) -> Vec<AdapterEvent> {
+        let mut touched: Vec<String> = Vec::new();
+        for contact in contacts {
+            let mut keys: Vec<String> = [Some(contact.jid), contact.lid, contact.phone]
+                .into_iter()
+                .flatten()
+                .map(|jid| jid.trim().to_owned())
+                .filter(|jid| !jid.is_empty() && !is_group(jid))
+                .collect();
+            // A removal names only one JID: the other JID loses its name too.
+            let alts: Vec<String> = keys
+                .iter()
+                .filter_map(|jid| self.alt_jid(jid).map(str::to_owned))
+                .collect();
+            keys.extend(alts);
+            keys.sort();
+            keys.dedup();
+            let lid = keys.iter().find(|jid| is_lid(jid)).cloned();
+            let phone = keys.iter().find(|jid| jid.ends_with(PHONE_SERVER)).cloned();
+            if let (Some(lid), Some(phone)) = (&lid, &phone) {
+                self.learn_pair(lid, phone);
+            }
+            let name = contact
+                .name
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty());
+            for key in &keys {
+                match &name {
+                    Some(name) => {
+                        self.contacts.insert(key.clone(), name.clone());
+                    }
+                    None => {
+                        self.contacts.remove(key);
+                    }
+                }
+            }
+            touched.extend(keys);
+        }
+        self.person_rows(touched)
+    }
+
+    /// The rows of the one-to-one chats of these JIDs and of their other
+    /// JIDs, each one time.
+    fn person_rows(&self, jids: Vec<String>) -> Vec<AdapterEvent> {
+        let mut chats: Vec<String> = jids
+            .iter()
+            .flat_map(|jid| [Some(jid.as_str()), self.alt_jid(jid)])
+            .flatten()
+            .filter(|jid| self.chats.contains_key(*jid))
+            .map(str::to_owned)
+            .collect();
+        chats.sort();
+        chats.dedup();
+        chats
+            .iter()
+            .filter_map(|jid| self.upsert_event(jid))
+            .collect()
+    }
+
+    /// The name of a mentioned JID: an address-book name, the chat name of
+    /// that person, or a push name. A LID also tries its phone JID.
+    fn mention_name(&self, jid: &str) -> Option<String> {
+        self.person_name(jid)
     }
 
     /// The one-to-one chat with a mentioned JID, when the inbox has it.
     fn mention_chat(&self, jid: &str) -> Option<String> {
-        let phone = self.phones.get(jid).map(String::as_str);
+        let phone = self.alt_jid(jid);
         [Some(jid), phone]
             .into_iter()
             .flatten()
@@ -1577,6 +1795,12 @@ impl Inbox {
             .values()
             .flat_map(|record| &record.messages)
             .flat_map(|message| self.mentions_of(message))
+            .chain(
+                self.chats
+                    .keys()
+                    .filter(|jid| is_lid(jid) && self.person_name(jid).is_none())
+                    .cloned(),
+            )
             .collect();
         let mut asks = Vec::new();
         for jid in mentioned {
@@ -1598,43 +1822,51 @@ impl Inbox {
     pub(super) fn apply_phones(&mut self, found: Vec<(String, String)>) -> Vec<AdapterEvent> {
         let mut changed = HashSet::new();
         for (lid, phone) in found {
-            if is_lid(&lid) && phone.ends_with(PHONE_SERVER) {
-                self.phones.insert(lid.clone(), phone);
+            if self.learn_pair(&lid, &phone) {
                 changed.insert(lid);
             }
         }
+        // A LID chat can show the name that the phone JID has now.
+        let mut rows = self.person_rows(changed.iter().cloned().collect());
         let Some(open) = self.open.as_deref() else {
-            return Vec::new();
+            return rows;
         };
         let Some(record) = self.chats.get(open) else {
-            return Vec::new();
+            return rows;
         };
-        record
-            .messages
-            .iter()
-            .filter(|message| {
-                self.mentions_of(message)
-                    .iter()
-                    .any(|jid| changed.contains(jid))
-            })
-            .map(|message| self.history_row(message))
-            .collect()
+        rows.extend(
+            record
+                .messages
+                .iter()
+                .filter(|message| {
+                    self.mentions_of(message)
+                        .iter()
+                        .any(|jid| changed.contains(jid))
+                })
+                .map(|message| self.history_row(message)),
+        );
+        rows
     }
 
     fn chat_message(&self, message: &WaMessage, arrival: Arrival) -> ChatMessage {
         let sender = if message.from_me {
             OUTBOUND_SENDER.to_string()
-        } else if let Some(name) = message.sender_name.as_ref().filter(|name| !name.is_empty()) {
-            name.clone()
         } else {
+            // An address-book name first, then the push name of the message.
             let jid = message
                 .sender_jid
                 .as_deref()
                 .unwrap_or(message.chat_jid.as_str());
-            self.names
-                .get(jid)
-                .cloned()
-                .unwrap_or_else(|| fallback_label(jid))
+            self.contact_name(jid)
+                .or_else(|| {
+                    message
+                        .sender_name
+                        .as_ref()
+                        .filter(|name| !name.trim().is_empty())
+                        .cloned()
+                })
+                .or_else(|| self.person_name(jid))
+                .unwrap_or_else(|| self.fallback_label(jid))
         };
         let failed = self
             .chats
@@ -2003,7 +2235,7 @@ pub(super) mod tests {
         let mut restored = Inbox::default();
         let _ = restored.restore(SavedInbox {
             chats: vec![(jid, chat.clone())],
-            names: Vec::new(),
+            ..SavedInbox::default()
         });
         assert_eq!(restored.take_phone_asks(10), vec![ANA_LID.to_string()]);
         let mut old: serde_json::Value = serde_json::to_value(&chat).expect("encode");
@@ -2047,6 +2279,7 @@ pub(super) mod tests {
             from_me: false,
             sender_name: Some("Ana".into()),
             sender_jid: Some(chat.into()),
+            sender_alt: None,
             body: body.into(),
             timestamp: ts,
             sticker: None,
@@ -2431,6 +2664,138 @@ pub(super) mod tests {
                 "whatsapp:111@s.whatsapp.net",
                 "whatsapp:222@s.whatsapp.net",
             ]
+        );
+    }
+
+    /// A live message: the push name, the sender, and its other JID.
+    fn live_from(chat: &str, id: &str, name: Option<&str>, alt: Option<&str>) -> WaMessage {
+        WaMessage {
+            sender_name: name.map(str::to_owned),
+            sender_alt: alt.map(str::to_owned),
+            ..message(chat, id, "hi", 10)
+        }
+    }
+
+    /// A new chat goes to the shell before its first message, with the push
+    /// name of that message. The notification then has the name.
+    #[test]
+    fn a_new_chat_comes_with_its_name_before_its_message() {
+        let mut inbox = Inbox::default();
+        let events = inbox.apply_messages(vec![live_from(ANA_LID, "m1", Some("Ana"), None)]);
+        assert!(
+            matches!(&events[0], AdapterEvent::ConversationUpsert { conversation } if conversation.title == "Ana"),
+            "{events:?}"
+        );
+        assert!(matches!(&events[1], AdapterEvent::MessageReceived { .. }));
+        // The next message changes no name: the row comes after it only.
+        let events = inbox.apply_messages(vec![live_from(ANA_LID, "m2", Some("Ana"), None)]);
+        assert!(matches!(&events[0], AdapterEvent::MessageReceived { .. }));
+    }
+
+    /// The push name that the inbox has under the phone JID names the LID
+    /// chat of the same person, and the reverse. The live message brings
+    /// the pair.
+    #[test]
+    fn a_lid_chat_takes_the_name_of_its_phone_jid() {
+        let mut inbox = Inbox::default();
+        let _ = inbox.apply_messages(vec![live_from(ANA_PHONE, "p1", Some("Ana"), None)]);
+        let events = inbox.apply_messages(vec![live_from(ANA_LID, "l1", None, Some(ANA_PHONE))]);
+        let rows = upserts(&events);
+        assert_eq!(rows[0].id, conversation_id(ANA_LID));
+        assert_eq!(rows[0].title, "Ana");
+        assert_eq!(rows_of(&events)[0].sender, "Ana");
+
+        let mut inbox = Inbox::default();
+        let _ = inbox.apply_messages(vec![live_from(ANA_LID, "l1", Some("Bia"), None)]);
+        let _ = inbox.apply_messages(vec![WaMessage {
+            sender_name: None,
+            ..message(ANA_PHONE, "p0", "old", 1)
+        }]);
+        let events =
+            inbox.apply_messages(vec![live_from(ANA_LID, "l2", Some("Bia"), Some(ANA_PHONE))]);
+        let phone_row = upserts(&events)
+            .into_iter()
+            .find(|row| row.id == conversation_id(ANA_PHONE))
+            .expect("the phone chat gets its name now");
+        assert_eq!(phone_row.title, "Bia");
+    }
+
+    /// A LID chat with no name shows the phone number when the inbox knows
+    /// it, not the digits of the LID.
+    #[test]
+    fn a_lid_chat_with_no_name_shows_its_phone_number() {
+        let mut inbox = Inbox::default();
+        let events = inbox.apply_messages(vec![live_from(ANA_LID, "l1", None, Some(ANA_PHONE))]);
+        assert_eq!(upserts(&events)[0].title, "+5511999990000");
+    }
+
+    /// An address-book name wins over a push name, for the chat title and
+    /// for a group sender, under the LID and under the phone JID. A removed
+    /// contact gives the push name back.
+    #[test]
+    fn an_address_book_name_names_the_chat_and_the_sender() {
+        let mut inbox = Inbox::default();
+        let _ = inbox.apply_messages(vec![live_from(ANA_PHONE, "p1", Some("Ana"), None)]);
+        let rows = inbox.apply_contacts(vec![WaContact {
+            jid: ANA_PHONE.into(),
+            name: Some("Ana Maria".into()),
+            lid: Some(ANA_LID.into()),
+            phone: None,
+        }]);
+        assert_eq!(upserts(&rows)[0].title, "Ana Maria");
+        let group = inbox.apply_messages(vec![WaMessage {
+            sender_jid: Some(ANA_LID.into()),
+            ..message(GROUP, "g1", "hi all", 11)
+        }]);
+        assert_eq!(rows_of(&group)[0].sender, "Ana Maria");
+
+        let rows = inbox.apply_contacts(vec![WaContact {
+            jid: ANA_LID.into(),
+            name: None,
+            lid: None,
+            phone: None,
+        }]);
+        assert_eq!(upserts(&rows)[0].title, "Ana");
+    }
+
+    /// The push names, the address-book names, and the LID pairs go to the
+    /// disk and come back. A LID chat has its name after a restart.
+    #[test]
+    fn the_names_and_the_pairs_come_back_after_a_restart() {
+        let mut inbox = Inbox::default();
+        let _ = inbox.apply_messages(vec![live_from(ANA_PHONE, "p1", Some("Ana"), None)]);
+        let _ = inbox.apply_messages(vec![live_from(ANA_LID, "l1", None, Some(ANA_PHONE))]);
+        let _ = inbox.apply_contacts(vec![WaContact {
+            jid: "5511888880000@s.whatsapp.net".into(),
+            name: Some("Caio".into()),
+            lid: None,
+            phone: None,
+        }]);
+        let changes = inbox.changes(&SavedHashes::default());
+        let saved = SavedInbox {
+            chats: changes
+                .chats
+                .iter()
+                .map(|(jid, _, chat)| (jid.clone(), chat.clone()))
+                .collect(),
+            names: changes.names.clone().expect("names").1,
+            contacts: changes.contacts.clone().expect("contacts").1,
+            phones: changes.phones.clone().expect("phones").1,
+        };
+        let mut restored = Inbox::default();
+        let hashes = restored.restore(saved);
+        assert!(restored.changes(&hashes).is_empty(), "restored = saved");
+        let page = restored.chat_page();
+        let lid = upserts(&page)
+            .into_iter()
+            .find(|row| row.id == conversation_id(ANA_LID))
+            .expect("lid chat");
+        assert_eq!(lid.title, "Ana");
+        assert_eq!(
+            restored
+                .contact_name("5511888880000@s.whatsapp.net")
+                .as_deref(),
+            Some("Caio")
         );
     }
 

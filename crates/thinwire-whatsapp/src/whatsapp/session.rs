@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use super::inbox::{
-    self, HistoryChat, Inbox, MediaRef, MediaRequest, Mute, TargetRef, WaMessage, WaReaction,
+    self, HistoryChat, Inbox, MediaRef, MediaRequest, Mute, TargetRef, WaContact, WaMessage,
+    WaReaction,
 };
 use thinwire_protocol::{
     AccountState, AdapterEvent, AdapterStatus, EventTx, ProtocolId, RedactedPairingSecret,
@@ -223,6 +224,9 @@ pub(super) enum LinkEvent {
         jid: String,
         mute: Mute,
     },
+    /// The phone saved, changed, or removed address-book contacts
+    /// (app-state `ContactAction`).
+    Contacts(Vec<WaContact>),
 }
 
 /// A connected sender and the link generation it belongs to.
@@ -1041,6 +1045,10 @@ impl Session {
                 } else {
                     Vec::new()
                 }
+            }
+            LinkEvent::Contacts(contacts) => {
+                let rows = state.inbox.apply_contacts(contacts);
+                if state.announced { rows } else { Vec::new() }
             }
         };
         let mut out = out;

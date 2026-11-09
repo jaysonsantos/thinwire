@@ -26,6 +26,8 @@ const CACHE_SIDE_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS chats (jid TEXT PRIMARY KEY NOT NULL, data TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS names (jid TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS contacts (jid TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS phones (lid TEXT PRIMARY KEY NOT NULL, phone TEXT NOT NULL);
 ";
 
 /// Write one chat row, or replace it.
@@ -92,10 +94,16 @@ impl DiskCache {
                 }
             }
         }
-        if let Ok(mut rows) = conn.prepare("SELECT jid, name FROM names")
-            && let Ok(read) = rows.query_map([], pair)
-        {
-            saved.names.extend(read.flatten());
+        for (sql, rows) in [
+            ("SELECT jid, name FROM names", &mut saved.names),
+            ("SELECT jid, name FROM contacts", &mut saved.contacts),
+            ("SELECT lid, phone FROM phones", &mut saved.phones),
+        ] {
+            if let Ok(mut statement) = conn.prepare(sql)
+                && let Ok(read) = statement.query_map([], pair)
+            {
+                rows.extend(read.flatten());
+            }
         }
         saved
     }
@@ -119,14 +127,29 @@ impl InboxStore for DiskCache {
             tx.execute("DELETE FROM chats WHERE jid = ?1", params![jid])
                 .map_err(|_| ())?;
         }
-        if let Some((_, names)) = &changes.names {
-            tx.execute("DELETE FROM names", []).map_err(|_| ())?;
-            for (jid, name) in names {
-                tx.execute(
-                    "INSERT INTO names (jid, name) VALUES (?1, ?2)",
-                    params![jid, name],
-                )
-                .map_err(|_| ())?;
+        for (clear, insert, rows) in [
+            (
+                "DELETE FROM names",
+                "INSERT INTO names (jid, name) VALUES (?1, ?2)",
+                &changes.names,
+            ),
+            (
+                "DELETE FROM contacts",
+                "INSERT INTO contacts (jid, name) VALUES (?1, ?2)",
+                &changes.contacts,
+            ),
+            (
+                "DELETE FROM phones",
+                "INSERT INTO phones (lid, phone) VALUES (?1, ?2)",
+                &changes.phones,
+            ),
+        ] {
+            let Some((_, rows)) = rows else {
+                continue;
+            };
+            tx.execute(clear, []).map_err(|_| ())?;
+            for (key, value) in rows {
+                tx.execute(insert, params![key, value]).map_err(|_| ())?;
             }
         }
         tx.commit().map_err(|_| ())
@@ -216,6 +239,29 @@ mod tests {
 
         let other = DiskCache::beside(&store, [8; 32]);
         assert!(other.load().chats.is_empty(), "another key reads nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The address-book names and the LID pairs go to the file and come
+    /// back.
+    #[test]
+    fn the_cache_keeps_the_contacts_and_the_lid_pairs() {
+        let dir = folder("people");
+        let cache = DiskCache::beside(&dir.join("device.sqlite"), [5; 32]);
+        let mut inbox = Inbox::default();
+        let lid = "223853863252019@lid";
+        let phone = "5511999990000@s.whatsapp.net";
+        let _ = inbox.apply_contacts(vec![crate::whatsapp::inbox::WaContact {
+            jid: phone.into(),
+            name: Some("Ana Maria".into()),
+            lid: Some(lid.into()),
+            phone: None,
+        }]);
+        let changes = inbox.changes(&SavedHashes::default());
+        cache.save(&changes).expect("save");
+        let loaded = cache.load();
+        assert_eq!(loaded.phones, vec![(lid.to_string(), phone.to_string())]);
+        assert_eq!(loaded.contacts.len(), 2, "the LID and the phone JID");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

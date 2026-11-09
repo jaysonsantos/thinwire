@@ -969,7 +969,7 @@ pub(super) mod tests {
                     }],
                 },
             )],
-            names: Vec::new(),
+            ..SavedInbox::default()
         };
         let cache = Arc::new(FakeCache::default());
         let (fake, handle, _session, mut rx) = owner(Fake {
