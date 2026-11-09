@@ -180,6 +180,14 @@ fn draw(ui: &mut egui::Ui, state: &mut InboxUi) {
             Intent::MoveInbox { delta } => state.snapshot.move_inbox_selection(delta),
             Intent::FocusInbox { id } => state.snapshot.focus_inbox_row(id),
             Intent::SetSearch(text) => state.snapshot.set_search(text.into_inner()),
+            Intent::SetDraft {
+                protocol,
+                conversation_id,
+                topic,
+                text,
+            } => state
+                .snapshot
+                .set_draft(protocol, &conversation_id, topic, text.into_inner()),
             Intent::SetChatMute {
                 protocol,
                 conversation_id,
@@ -2232,4 +2240,104 @@ fn a_scrolled_inbox_keeps_the_row_under_the_pointer() {
         Some("telegram:1")
     );
     assert_eq!(harness.state().snapshot.compose, "draft for Ada");
+}
+
+/// The text that the last frame put on the clipboard.
+fn copied(harness: &Harness<'_, InboxUi>) -> Option<String> {
+    harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+}
+
+/// Type in the compose field. It has the focus after a click.
+fn type_in_compose(harness: &mut Harness<'static, InboxUi>, text: &str) {
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Message")
+        .click();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Message")
+        .type_text(text);
+    harness.run();
+    assert_eq!(harness.state().snapshot.compose, text);
+}
+
+/// Run the Edit items of the macOS menu bar in one frame, as the app does
+/// in `raw_input_hook`.
+fn menu_edit(
+    harness: &mut Harness<'static, InboxUi>,
+    commands: &[super::menu_bar::EditCommand],
+    clipboard: &str,
+) {
+    super::menu_bar::push_edit_events(harness.input_mut(), commands, || {
+        super::menu_bar::Clipboard::Text(clipboard.to_owned())
+    });
+    harness.step();
+}
+
+/// The Edit items of the macOS menu bar select, copy, cut, paste, undo,
+/// and redo in the compose field (⌘A, ⌘C, ⌘X, ⌘V, ⌘Z, ⇧⌘Z).
+#[test]
+fn the_edit_menu_selects_copies_cuts_and_pastes_in_the_compose_field() {
+    use super::menu_bar::EditCommand;
+
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    type_in_compose(&mut harness, "hello world");
+
+    menu_edit(
+        &mut harness,
+        &[EditCommand::SelectAll, EditCommand::Copy],
+        "",
+    );
+    assert_eq!(copied(&harness).as_deref(), Some("hello world"));
+    assert_eq!(harness.state().snapshot.compose, "hello world");
+
+    menu_edit(&mut harness, &[EditCommand::Cut], "");
+    assert_eq!(copied(&harness).as_deref(), Some("hello world"));
+    harness.run();
+    assert_eq!(harness.state().snapshot.compose, "");
+
+    menu_edit(&mut harness, &[EditCommand::Paste], "pasted\r\ntext");
+    harness.run();
+    assert_eq!(harness.state().snapshot.compose, "pasted\ntext");
+
+    menu_edit(&mut harness, &[EditCommand::Undo], "");
+    harness.run();
+    assert_eq!(harness.state().snapshot.compose, "");
+    menu_edit(&mut harness, &[EditCommand::Redo], "");
+    harness.run();
+    assert_eq!(harness.state().snapshot.compose, "pasted\ntext");
+}
+
+/// Linux and Windows have no menu bar: egui-winit makes the events of
+/// Ctrl-A, Ctrl-C, Ctrl-X, and Ctrl-V, and the compose field takes them.
+#[test]
+fn ctrl_keys_select_copy_cut_and_paste_in_the_compose_field() {
+    let ctrl = egui::Modifiers::CTRL | egui::Modifiers::COMMAND;
+    let mut harness = harness(InboxUi::ready());
+    harness.run();
+    type_in_compose(&mut harness, "one two");
+
+    harness.key_press_modifiers(ctrl, egui::Key::A);
+    harness.run();
+    harness.event(egui::Event::Copy);
+    harness.step();
+    assert_eq!(copied(&harness).as_deref(), Some("one two"));
+
+    harness.event(egui::Event::Cut);
+    harness.step();
+    assert_eq!(copied(&harness).as_deref(), Some("one two"));
+    harness.run();
+    assert_eq!(harness.state().snapshot.compose, "");
+
+    harness.event(egui::Event::Paste("three".into()));
+    harness.run();
+    assert_eq!(harness.state().snapshot.compose, "three");
 }

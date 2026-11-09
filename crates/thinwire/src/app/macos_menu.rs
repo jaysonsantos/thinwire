@@ -1,9 +1,10 @@
 //! The native menu bar of macOS (`muda`).
 //!
-//! The standard items (About, Services, Hide, Edit, Minimize, ...) are native
+//! The standard items (About, Services, Hide, Minimize, ...) are native
 //! AppKit items. Each other item has the id of a [`MenuCommand`], and
-//! `menu_bar` maps it to an existing intent or app action. Linux and Windows
-//! have no native menu bar.
+//! `menu_bar` maps it to an existing intent or app action. The Edit items
+//! have the id of an [`EditCommand`]: the app gives egui the events of the
+//! key press. Linux and Windows have no native menu bar.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -12,7 +13,7 @@ use muda::{AboutMetadata, CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMe
 use thinwire_core::ThemeMode;
 use thinwire_protocol::ProtocolKind;
 
-use super::menu_bar::MenuCommand;
+use super::menu_bar::{EditCommand, MenuCommand};
 
 /// The menu bar of the app. It must live as long as the app: AppKit keeps
 /// only a weak link to the items.
@@ -32,6 +33,12 @@ fn cmd_shift(code: Code) -> Option<Accelerator> {
 }
 
 fn item(command: MenuCommand, text: &str, accelerator: Option<Accelerator>) -> MenuItem {
+    MenuItem::with_id(command.id(), text, true, accelerator)
+}
+
+/// An Edit item. Not the native AppKit item: that one sends `copy:`, ... to
+/// the winit view, which ignores it (see [`EditCommand`]).
+fn edit_item(command: EditCommand, text: &str, accelerator: Option<Accelerator>) -> MenuItem {
     MenuItem::with_id(command.id(), text, true, accelerator)
 }
 
@@ -90,13 +97,13 @@ impl NativeMenu {
             "Edit",
             true,
             &[
-                &PredefinedMenuItem::undo(None),
-                &PredefinedMenuItem::redo(None),
+                &edit_item(EditCommand::Undo, "Undo", cmd(Code::KeyZ)),
+                &edit_item(EditCommand::Redo, "Redo", cmd_shift(Code::KeyZ)),
                 &PredefinedMenuItem::separator(),
-                &PredefinedMenuItem::cut(None),
-                &PredefinedMenuItem::copy(None),
-                &PredefinedMenuItem::paste(None),
-                &PredefinedMenuItem::select_all(None),
+                &edit_item(EditCommand::Cut, "Cut", cmd(Code::KeyX)),
+                &edit_item(EditCommand::Copy, "Copy", cmd(Code::KeyC)),
+                &edit_item(EditCommand::Paste, "Paste", cmd(Code::KeyV)),
+                &edit_item(EditCommand::SelectAll, "Select All", cmd(Code::KeyA)),
             ],
         )?;
 
@@ -214,12 +221,21 @@ impl NativeMenu {
 /// The menu items that the user chose since the last frame.
 static CHOSEN: Mutex<Vec<MenuCommand>> = Mutex::new(Vec::new());
 
+/// The Edit items that the user chose since the last frame.
+static EDITS: Mutex<Vec<EditCommand>> = Mutex::new(Vec::new());
+
 /// Keep each chosen command for the next frame, and ask for that frame at
 /// once, so an idle window runs the command with no wait.
 pub(crate) fn wake_on_event(ctx: &eframe::egui::Context) {
     let ctx = ctx.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        if let Some(command) = MenuCommand::from_id(event.id().as_ref()) {
+        let id = event.id().as_ref();
+        if let Some(command) = EditCommand::from_id(id) {
+            EDITS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(command);
+        } else if let Some(command) = MenuCommand::from_id(id) {
             CHOSEN
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -232,4 +248,9 @@ pub(crate) fn wake_on_event(ctx: &eframe::egui::Context) {
 /// The commands that the user chose in the menu bar since the last frame.
 pub(crate) fn take_commands() -> Vec<MenuCommand> {
     std::mem::take(&mut *CHOSEN.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// The Edit items that the user chose since the last frame.
+pub(crate) fn take_edits() -> Vec<EditCommand> {
+    std::mem::take(&mut *EDITS.lock().unwrap_or_else(PoisonError::into_inner))
 }

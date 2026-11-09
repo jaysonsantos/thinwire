@@ -9,6 +9,8 @@
 // test them, and use only the Settings requests.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
+use std::sync::Arc;
+
 use eframe::egui;
 use thinwire_core::{Intent, ThemeMode};
 use thinwire_protocol::{ProtocolId, ProtocolKind};
@@ -19,7 +21,8 @@ pub(crate) const PROJECT_PAGE: &str = "https://github.com/jaysonsantos/thinwire"
 pub(crate) const ISSUES_PAGE: &str = "https://github.com/jaysonsantos/thinwire/issues/new";
 
 /// A command of the menu bar that the app runs. The standard commands
-/// (About, Hide, Copy, Minimize, ...) are native and send nothing.
+/// (About, Hide, Minimize, ...) are native and send nothing. The Edit
+/// commands are [`EditCommand`]s.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MenuCommand {
     CheckForUpdates,
@@ -115,6 +118,176 @@ impl MenuCommand {
         }
     }
 }
+
+// region: the Edit menu
+
+/// An item of the Edit menu.
+///
+/// The native Edit items of AppKit send `copy:`, `paste:`, ... to the first
+/// responder. The winit view has no such method, so a native item did
+/// nothing, and its key equivalent (⌘C, ⌘V, ...) did not reach egui. These
+/// items are app items: the app changes each one into the egui events that
+/// egui-winit makes for the same key press.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EditCommand {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+/// What a paste reads from the clipboard.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum Clipboard {
+    Text(String),
+    Image(Arc<egui::ColorImage>),
+    Empty,
+}
+
+const EDIT_UNDO: &str = "thinwire.edit.undo";
+const EDIT_REDO: &str = "thinwire.edit.redo";
+const EDIT_CUT: &str = "thinwire.edit.cut";
+const EDIT_COPY: &str = "thinwire.edit.copy";
+const EDIT_PASTE: &str = "thinwire.edit.paste";
+const EDIT_SELECT_ALL: &str = "thinwire.edit.select-all";
+
+/// The modifiers that egui-winit sets for the ⌘ key on macOS. egui reads
+/// `command`, so the same events also work on Linux and Windows.
+const COMMAND_KEY: egui::Modifiers = egui::Modifiers {
+    alt: false,
+    ctrl: false,
+    shift: false,
+    mac_cmd: true,
+    command: true,
+};
+
+impl EditCommand {
+    /// The id of the menu item of this command.
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Undo => EDIT_UNDO,
+            Self::Redo => EDIT_REDO,
+            Self::Cut => EDIT_CUT,
+            Self::Copy => EDIT_COPY,
+            Self::Paste => EDIT_PASTE,
+            Self::SelectAll => EDIT_SELECT_ALL,
+        }
+    }
+
+    /// The command of a menu item id. `None` for another item.
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        Some(match id {
+            EDIT_UNDO => Self::Undo,
+            EDIT_REDO => Self::Redo,
+            EDIT_CUT => Self::Cut,
+            EDIT_COPY => Self::Copy,
+            EDIT_PASTE => Self::Paste,
+            EDIT_SELECT_ALL => Self::SelectAll,
+            _ => return None,
+        })
+    }
+
+    /// The egui events of this command: the events that egui-winit makes
+    /// for the key press. Only a paste reads the clipboard. Like egui-winit,
+    /// a paste prefers text, and an empty text pastes nothing.
+    pub(crate) fn events(self, clipboard: impl FnOnce() -> Clipboard) -> Vec<egui::Event> {
+        match self {
+            Self::Undo => key_tap(egui::Key::Z, COMMAND_KEY),
+            Self::Redo => key_tap(egui::Key::Z, COMMAND_KEY | egui::Modifiers::SHIFT),
+            Self::Cut => vec![egui::Event::Cut],
+            Self::Copy => vec![egui::Event::Copy],
+            Self::Paste => match clipboard() {
+                Clipboard::Text(text) => {
+                    let text = text.replace("\r\n", "\n");
+                    if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![egui::Event::Paste(text)]
+                    }
+                }
+                Clipboard::Image(image) => vec![egui::Event::PasteImage(image)],
+                Clipboard::Empty => Vec::new(),
+            },
+            Self::SelectAll => key_tap(egui::Key::A, COMMAND_KEY),
+        }
+    }
+
+    /// egui-winit already made the event of this command in `events`: the
+    /// key press reached the window too.
+    fn already_in(self, events: &[egui::Event]) -> bool {
+        events.iter().any(|event| match (self, event) {
+            (Self::Cut, egui::Event::Cut) | (Self::Copy, egui::Event::Copy) => true,
+            (Self::Paste, egui::Event::Paste(_) | egui::Event::PasteImage(_)) => true,
+            (
+                Self::Undo | Self::Redo | Self::SelectAll,
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                },
+            ) if modifiers.command => match self {
+                Self::Undo => *key == egui::Key::Z && !modifiers.shift,
+                Self::Redo => (*key == egui::Key::Z && modifiers.shift) || *key == egui::Key::Y,
+                _ => *key == egui::Key::A,
+            },
+            _ => false,
+        })
+    }
+}
+
+/// A press and a release of `key`.
+fn key_tap(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+    [true, false]
+        .into_iter()
+        .map(|pressed| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        })
+        .collect()
+}
+
+/// Add the events of the chosen Edit items to the input of the next frame.
+/// A command whose event egui-winit already made in this input adds
+/// nothing, so one key press never acts two times.
+pub(crate) fn push_edit_events(
+    input: &mut egui::RawInput,
+    commands: &[EditCommand],
+    mut clipboard: impl FnMut() -> Clipboard,
+) {
+    let from_window = input.events.len();
+    for command in commands {
+        if command.already_in(&input.events[..from_window]) {
+            continue;
+        }
+        let events = command.events(&mut clipboard);
+        input.events.extend(events);
+    }
+}
+
+/// The text or the image on the OS clipboard, as egui-winit reads it.
+pub(crate) fn read_clipboard() -> Clipboard {
+    let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        return Clipboard::Empty;
+    };
+    if let Ok(text) = clipboard.get_text() {
+        return Clipboard::Text(text);
+    }
+    match clipboard.get_image() {
+        Ok(image) => Clipboard::Image(Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+            [image.width, image.height],
+            &image.bytes,
+        ))),
+        Err(_) => Clipboard::Empty,
+    }
+}
+
+// endregion
 
 /// The text of the build line in Settings.
 pub(crate) fn build_text(build: Option<&str>) -> String {
@@ -268,6 +441,139 @@ mod tests {
         assert_eq!(
             MenuCommand::ReportIssue.effect(false),
             MenuEffect::OpenUrl(ISSUES_PAGE)
+        );
+    }
+
+    const EDITS: [EditCommand; 6] = [
+        EditCommand::Undo,
+        EditCommand::Redo,
+        EditCommand::Cut,
+        EditCommand::Copy,
+        EditCommand::Paste,
+        EditCommand::SelectAll,
+    ];
+
+    fn no_clipboard() -> Clipboard {
+        panic!("only a paste reads the clipboard")
+    }
+
+    fn key(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn each_edit_id_reads_back_and_is_no_menu_command() {
+        for command in EDITS {
+            assert_eq!(EditCommand::from_id(command.id()), Some(command));
+            assert_eq!(MenuCommand::from_id(command.id()), None);
+        }
+        for command in every_command() {
+            assert_eq!(EditCommand::from_id(&command.id()), None);
+        }
+    }
+
+    #[test]
+    fn edit_commands_make_the_events_of_their_key_press() {
+        let cmd = egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND;
+        assert_eq!(EditCommand::Cut.events(no_clipboard), [egui::Event::Cut]);
+        assert_eq!(EditCommand::Copy.events(no_clipboard), [egui::Event::Copy]);
+        assert_eq!(
+            EditCommand::SelectAll.events(no_clipboard),
+            [key(egui::Key::A, true, cmd), key(egui::Key::A, false, cmd)]
+        );
+        assert_eq!(
+            EditCommand::Undo.events(no_clipboard),
+            [key(egui::Key::Z, true, cmd), key(egui::Key::Z, false, cmd)]
+        );
+        let shift = cmd | egui::Modifiers::SHIFT;
+        assert_eq!(
+            EditCommand::Redo.events(no_clipboard),
+            [
+                key(egui::Key::Z, true, shift),
+                key(egui::Key::Z, false, shift)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_paste_reads_text_or_an_image_from_the_clipboard() {
+        assert_eq!(
+            EditCommand::Paste.events(|| Clipboard::Text("one\r\ntwo".into())),
+            [egui::Event::Paste("one\ntwo".into())]
+        );
+        assert!(
+            EditCommand::Paste
+                .events(|| Clipboard::Text(String::new()))
+                .is_empty()
+        );
+        assert!(EditCommand::Paste.events(|| Clipboard::Empty).is_empty());
+        let image = Arc::new(egui::ColorImage::filled(
+            [1, 1],
+            egui::Color32::from_rgb(1, 2, 3),
+        ));
+        assert_eq!(
+            EditCommand::Paste.events(|| Clipboard::Image(image.clone())),
+            [egui::Event::PasteImage(image)]
+        );
+    }
+
+    #[test]
+    fn a_key_press_that_reached_the_window_acts_one_time() {
+        let mut input = egui::RawInput {
+            events: vec![
+                egui::Event::Copy,
+                egui::Event::Paste("from the window".into()),
+                key(egui::Key::A, true, egui::Modifiers::COMMAND),
+            ],
+            ..Default::default()
+        };
+        let before = input.events.clone();
+        push_edit_events(
+            &mut input,
+            &[
+                EditCommand::Copy,
+                EditCommand::Paste,
+                EditCommand::SelectAll,
+            ],
+            no_clipboard,
+        );
+        assert_eq!(input.events, before);
+
+        // A release only, as AppKit sends a key up after the menu took the
+        // key down: the menu item still acts.
+        let mut input = egui::RawInput {
+            events: vec![key(egui::Key::A, false, egui::Modifiers::COMMAND)],
+            ..Default::default()
+        };
+        push_edit_events(
+            &mut input,
+            &[EditCommand::SelectAll, EditCommand::Cut],
+            no_clipboard,
+        );
+        assert_eq!(input.events.len(), 4);
+        assert_eq!(input.events[3], egui::Event::Cut);
+    }
+
+    #[test]
+    fn two_menu_pastes_in_one_frame_both_paste() {
+        let mut input = egui::RawInput::default();
+        push_edit_events(
+            &mut input,
+            &[EditCommand::Paste, EditCommand::Paste],
+            || Clipboard::Text("x".into()),
+        );
+        assert_eq!(
+            input.events,
+            [
+                egui::Event::Paste("x".into()),
+                egui::Event::Paste("x".into())
+            ]
         );
     }
 

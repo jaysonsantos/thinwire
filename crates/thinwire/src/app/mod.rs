@@ -701,6 +701,17 @@ fn repaint_on_change(runtime: &tokio::runtime::Runtime, core: &Core, ctx: egui::
 }
 
 impl eframe::App for ThinwireApp {
+    /// The Edit items of the menu bar take ⌘C, ⌘V, ... before the window
+    /// sees the key. Give egui the events of those key presses here, so the
+    /// focused text field reads them in this frame.
+    #[cfg(target_os = "macos")]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let edits = macos_menu::take_edits();
+        if !edits.is_empty() {
+            menu_bar::push_edit_events(raw_input, &edits, menu_bar::read_clipboard);
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_focus(ctx);
         self.core.pump();
