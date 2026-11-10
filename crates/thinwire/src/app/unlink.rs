@@ -3,7 +3,9 @@
 //!
 //! A right click on an account row, or on its tile in the collapsed
 //! sidebar, opens a menu with "Move up" and "Move down". A linked account
-//! also has "Unlink…". The Menu key and Shift+F10 open the same menu for the
+//! also has "Unlink…". An account after account 0 that is not linked has
+//! "Link" and "Remove": the collapsed sidebar has no other place for them.
+//! A drag of a row with Cmd or Ctrl held also moves its account. The Menu key and Shift+F10 open the same menu for the
 //! row that has the keyboard focus. "Unlink…" opens the question. Only
 //! "Unlink" there sends [`Intent::UnlinkAccount`].
 
@@ -31,6 +33,72 @@ fn move_id() -> egui::Id {
     egui::Id::unique("thinwire-account-move")
 }
 
+/// A drag that moves an account, while the mouse button is down.
+#[derive(Clone, Copy, Debug)]
+struct DragAsk {
+    account: ProtocolId,
+    /// The pointer came back to the row after the last move. With no such
+    /// check, a tall neighbor row moves the account two places at one time.
+    armed: bool,
+}
+
+fn drag_id() -> egui::Id {
+    egui::Id::unique("thinwire-account-drag")
+}
+
+/// Link and Remove show for this row: an account after account 0 that is
+/// not linked, and whose helper is there (ADR 0014).
+pub(crate) fn removable(account: &AccountRow) -> bool {
+    account.caps.id.slot() != 0
+        && account.signal_retained.is_none()
+        && !account.linked()
+        && !account.helper_stopped()
+        && !account.helper_missing()
+}
+
+/// Move the account of `row` when the user drags the row with Cmd or Ctrl
+/// held. The account moves one place each time the pointer leaves the row
+/// at its top or at its bottom.
+fn drag(row: &egui::Response, account: ProtocolId) {
+    let ctx = &row.ctx;
+    let (pressed, pos, modifier) = ctx.input(|input| {
+        (
+            input.pointer.primary_pressed(),
+            input.pointer.interact_pos(),
+            input.modifiers.command || input.modifiers.ctrl,
+        )
+    });
+    let Some(pos) = pos else {
+        return;
+    };
+    if pressed && modifier && row.rect.contains(pos) {
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                drag_id(),
+                DragAsk {
+                    account,
+                    armed: true,
+                },
+            );
+        });
+        return;
+    }
+    let Some(mut drag) = ctx.data(|data| data.get_temp::<DragAsk>(drag_id())) else {
+        return;
+    };
+    if drag.account != account {
+        return;
+    }
+    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+    let inside = row.rect.y_range().contains(pos.y);
+    if drag.armed && !inside {
+        let up = pos.y < row.rect.top();
+        ctx.data_mut(|data| data.insert_temp(move_id(), MoveAsk { account, up }));
+    }
+    drag.armed = inside;
+    ctx.data_mut(|data| data.insert_temp(drag_id(), drag));
+}
+
 fn ask_id() -> egui::Id {
     egui::Id::unique("thinwire-unlink-ask")
 }
@@ -50,7 +118,9 @@ pub(crate) fn attach(row: &egui::Response, account: &AccountRow) {
         return;
     }
     let linked = account.linked();
+    let removable = removable(account);
     let id = account.caps.id;
+    drag(row, id);
     // A menu that the keyboard opened has no pointer position: it stays
     // at its row.
     let by_key_id = row.id.with("unlink-menu-by-key");
@@ -69,13 +139,24 @@ pub(crate) fn attach(row: &egui::Response, account: &AccountRow) {
     if opens {
         popup = popup.open_memory(Some(egui::SetOpenCommand::Bool(true)));
     }
-    let shown = popup.show(|ui| menu(ui, id, linked));
+    let shown = popup.show(|ui| menu(ui, id, linked, removable));
     if by_key && !opens && shown.is_none() {
         row.ctx.data_mut(|data| data.remove::<bool>(by_key_id));
     }
 }
 
-fn menu(ui: &mut egui::Ui, account: ProtocolId, linked: bool) {
+/// What a menu item of a row that is not linked asks for.
+#[derive(Clone, Copy, Debug)]
+enum RowAsk {
+    Link(ProtocolId),
+    Remove(ProtocolId),
+}
+
+fn row_ask_id() -> egui::Id {
+    egui::Id::unique("thinwire-account-row-ask")
+}
+
+fn menu(ui: &mut egui::Ui, account: ProtocolId, linked: bool, removable: bool) {
     for (label, up) in [("Move up", true), ("Move down", false)] {
         let item = ui.button(label);
         item.widget_info(|| {
@@ -89,6 +170,27 @@ fn menu(ui: &mut egui::Ui, account: ProtocolId, linked: bool) {
             ui.ctx()
                 .data_mut(|data| data.insert_temp(move_id(), MoveAsk { account, up }));
             ui.close();
+        }
+    }
+    if removable {
+        ui.separator();
+        for (label, ask) in [
+            ("Link", RowAsk::Link(account)),
+            ("Remove", RowAsk::Remove(account)),
+        ] {
+            let item = ui.button(label);
+            item.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::Role::Button,
+                    true,
+                    format!("{label} account: {}", account.label()),
+                )
+            });
+            if item.clicked() {
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(row_ask_id(), ask));
+                ui.close();
+            }
         }
     }
     if !linked {
@@ -124,6 +226,17 @@ pub(crate) fn take_escape(ctx: &egui::Context) -> bool {
 /// The unlink question over the window, when the menu opened it. Cancel
 /// and Esc change nothing.
 pub(crate) fn dialog(ctx: &egui::Context, out: &mut Vec<Intent>) {
+    // A drag ends when the mouse button goes up.
+    if !ctx.input(|input| input.pointer.primary_down()) {
+        ctx.data_mut(|data| data.remove::<DragAsk>(drag_id()));
+    }
+    if let Some(ask) = ctx.data(|data| data.get_temp::<RowAsk>(row_ask_id())) {
+        ctx.data_mut(|data| data.remove::<RowAsk>(row_ask_id()));
+        out.push(match ask {
+            RowAsk::Link(account) => Intent::LinkAccount(account),
+            RowAsk::Remove(account) => Intent::RemoveAccount(account),
+        });
+    }
     let moved = ctx.data(|data| data.get_temp::<MoveAsk>(move_id()));
     if let Some(ask) = moved {
         ctx.data_mut(|data| data.remove::<MoveAsk>(move_id()));

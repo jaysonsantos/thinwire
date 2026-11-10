@@ -1034,12 +1034,7 @@ fn account_rows(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) {
 /// (ADR 0014). Account 0 keeps the links of its own protocol screens.
 fn extra_account_actions(ui: &mut egui::Ui, account: &AccountRow, out: &mut Vec<Intent>) {
     let id = account.caps.id;
-    if id.slot() == 0
-        || account.signal_retained.is_some()
-        || account.linked()
-        || account.helper_stopped()
-        || account.helper_missing()
-    {
+    if !super::unlink::removable(account) {
         return;
     }
     ui.horizontal(|ui| {

@@ -500,6 +500,54 @@ fn a_linked_account_row_unlinks_after_a_question() {
     assert_eq!(harness.state().settings.account_order(), order);
     assert!(row(&harness, "Telegram 2").y < row(&harness, "Telegram").y);
 
+    // A drag with Cmd or Ctrl held moves the account too: one place when
+    // the pointer leaves the row at its bottom.
+    let from = row(&harness, "Telegram 2");
+    let to = row(&harness, "Telegram") + egui::vec2(0.0, 2.0);
+    harness.hover_at(from);
+    harness.event_modifiers(
+        egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::COMMAND,
+        },
+        egui::Modifiers::COMMAND,
+    );
+    harness.run();
+    harness.event_modifiers(egui::Event::PointerMoved(to), egui::Modifiers::COMMAND);
+    harness.run();
+    harness.run();
+    harness.event(egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run();
+    assert!(
+        row(&harness, "Telegram").y < row(&harness, "Telegram 2").y,
+        "the drag moved the account down"
+    );
+    assert_eq!(
+        harness.state().settings.account_order(),
+        harness.state().snapshot.account_order()
+    );
+
+    // The menu of an account that is not linked removes it. The collapsed
+    // sidebar has no Remove button.
+    let pos = row(&harness, "Telegram 2");
+    right_click(&mut harness, pos);
+    harness.get_by_label("Link account: Telegram 2");
+    harness.get_by_label("Remove account: Telegram 2").click();
+    harness.run();
+    harness.run();
+    assert_eq!(
+        harness.state().account_intents,
+        vec![Intent::RemoveAccount(second)]
+    );
+    harness.state_mut().account_intents.clear();
+
     let pos = row(&harness, "Telegram");
     right_click(&mut harness, pos);
     harness.get_by_label("Unlink Telegram").click();
