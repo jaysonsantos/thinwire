@@ -267,7 +267,7 @@ fn paint_protocol_badge(ui: &egui::Ui, avatar: egui::Rect, protocol: ProtocolId,
     let painter = ui.painter();
     painter.circle_filled(center, ring_r, ring);
     painter.circle_filled(center, side * 0.45, fill);
-    super::icons::protocol(painter, center, side * 0.58, protocol, mark);
+    super::icons::protocol(painter, center, side * 0.58, protocol, mark, fill);
 }
 
 /// Up to two initials from `title`. A title with no letters is "?".

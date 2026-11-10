@@ -9,18 +9,10 @@
 use eframe::egui::{self, Color32, Pos2, Shape, Stroke, Vec2};
 use thinwire_protocol::{ProtocolId, ProtocolKind};
 
+use super::motion::mix;
+
 fn at(center: Pos2, unit: f32, x: f32, y: f32) -> Pos2 {
     center + Vec2::new(x, y) * unit
-}
-
-/// A contrasting cut color for details drawn on top of `fill`.
-fn cut_on(fill: Color32) -> Color32 {
-    let luma = u16::from(fill.r()) + u16::from(fill.g()) + u16::from(fill.b());
-    if luma > 400 {
-        Color32::from_rgb(20, 28, 48)
-    } else {
-        Color32::from_white_alpha(230)
-    }
 }
 
 /// A plus: add an account.
@@ -196,145 +188,183 @@ pub(crate) fn bell_off(painter: &egui::Painter, center: Pos2, size: f32, color: 
 }
 
 /// The mark of a protocol, for a tile or a badge. Filled shapes so a 12 px
-/// badge still reads.
+/// badge still reads. `color` is the mark and `cut` is the color behind it:
+/// a detail inside the mark has the `cut` color, so it looks like a hole.
 pub(crate) fn protocol(
     painter: &egui::Painter,
     center: Pos2,
     size: f32,
     protocol: ProtocolId,
     color: Color32,
+    cut: Color32,
 ) {
     // Every account of a protocol has the same mark (ADR 0014).
     match protocol.kind() {
-        ProtocolKind::Telegram => telegram(painter, center, size, color),
-        ProtocolKind::WhatsApp => whatsapp(painter, center, size, color),
-        ProtocolKind::Signal => signal(painter, center, size, color),
-        ProtocolKind::Discord => discord(painter, center, size, color),
+        ProtocolKind::Telegram => telegram(painter, center, size, color, cut),
+        ProtocolKind::WhatsApp => whatsapp(painter, center, size, color, cut),
+        ProtocolKind::Signal => signal(painter, center, size, color, cut),
+        ProtocolKind::Discord => discord(painter, center, size, color, cut),
         ProtocolKind::Slack => slack(painter, center, size, color),
     }
 }
 
+/// A rounded square with a top-to-bottom gradient: the tile behind a
+/// protocol mark.
+///
+/// A mesh has no feathered edge. So a flat rounded square in the middle
+/// color paints first, and the gradient mesh sits half a pixel inside it.
+pub(crate) fn gradient_tile(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    corner: f32,
+    top: Color32,
+    bottom: Color32,
+) {
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(corner.round().clamp(0.0, 255.0) as u8),
+        mix(top, bottom, 0.5),
+    );
+    let inner = rect.shrink(0.5);
+    let radius = (corner - 0.5).max(0.0);
+    let mut mesh = egui::Mesh::default();
+    let shade = |pos: Pos2| mix(top, bottom, (pos.y - inner.top()) / inner.height());
+    mesh.colored_vertex(inner.center(), shade(inner.center()));
+    let corners = [
+        (inner.right_bottom() - Vec2::splat(radius), 0.0),
+        (inner.left_bottom() + Vec2::new(radius, -radius), 90.0),
+        (inner.left_top() + Vec2::splat(radius), 180.0),
+        (inner.right_top() + Vec2::new(-radius, radius), 270.0),
+    ];
+    for (center, start) in corners {
+        for pos in arc(center, radius, start, start + 90.0, CORNER_STEPS) {
+            mesh.colored_vertex(pos, shade(pos));
+        }
+    }
+    let rim = mesh.vertices.len() as u32 - 1;
+    for index in 0..rim {
+        mesh.add_triangle(0, 1 + index, 1 + (index + 1) % rim);
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Line segments in each corner of a gradient tile.
+const CORNER_STEPS: usize = 8;
+
+/// Points on a circle from `from` to `to` degrees. 0 points right and 90
+/// points down, because y grows down on the screen.
+fn arc(center: Pos2, radius: f32, from: f32, to: f32, steps: usize) -> Vec<Pos2> {
+    (0..=steps)
+        .map(|step| {
+            let angle = egui::lerp(from..=to, step as f32 / steps as f32).to_radians();
+            center + Vec2::new(angle.cos(), angle.sin()) * radius
+        })
+        .collect()
+}
+
 /// A paper plane that points up-right: Telegram-like.
 ///
-/// One body triangle plus an opaque fold triangle. Split fills with
-/// feathered edges left hairline seams, and `gamma_multiply` also scaled
-/// alpha so the fold blended with the tile behind it.
-fn telegram(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+/// A wing, a body under it, and a small tail fin. The parts do not overlap
+/// much, and each one is opaque: a part with alpha showed a seam where two
+/// feathered edges met.
+fn telegram(painter: &egui::Painter, center: Pos2, size: f32, color: Color32, cut: Color32) {
     let unit = size / 16.0;
-    let tip = at(center, unit, 6.0, -5.0);
-    let left = at(center, unit, -6.0, 0.5);
-    let bottom = at(center, unit, -2.0, 6.0);
-    let fold = at(center, unit, 0.5, 1.0);
+    let nose = at(center, unit, 6.6, -5.6);
+    let wing = at(center, unit, -6.8, -0.6);
+    let fold = at(center, unit, -1.6, 1.7);
+    let keel = at(center, unit, 2.0, 6.2);
+    let fin = at(center, unit, -1.2, 5.6);
+    let shade = mix(color, cut, 0.3);
     painter.add(Shape::convex_polygon(
-        vec![left, tip, bottom],
+        vec![fold, at(center, unit, 0.4, 3.6), fin],
+        mix(color, cut, 0.5),
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(
+        vec![fold, nose, keel],
+        shade,
+        Stroke::NONE,
+    ));
+    painter.add(Shape::convex_polygon(
+        vec![wing, nose, fold],
         color,
         Stroke::NONE,
     ));
-    painter.add(Shape::convex_polygon(
-        vec![fold, tip, bottom],
-        darken(color, 0.78),
-        Stroke::NONE,
-    ));
 }
 
-/// Keep alpha; scale only the RGB channels.
-fn darken(color: Color32, factor: f32) -> Color32 {
-    let scale = |channel: u8| (f32::from(channel) * factor).round().clamp(0.0, 255.0) as u8;
-    Color32::from_rgba_unmultiplied(
-        scale(color.r()),
-        scale(color.g()),
-        scale(color.b()),
-        color.a(),
-    )
-}
-
-/// A round bubble with a phone handset: WhatsApp-like.
-fn whatsapp(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let unit = size / 16.0;
-    painter.circle_filled(at(center, unit, -0.5, -0.8), 6.2 * unit, color);
-    painter.add(Shape::convex_polygon(
-        vec![
-            at(center, unit, -4.5, 3.5),
-            at(center, unit, -7.0, 7.0),
-            at(center, unit, -1.5, 5.0),
-        ],
-        color,
-        Stroke::NONE,
-    ));
-    // Keep the stroke thick enough that a ~9 px badge still shows a handset.
-    let stroke = Stroke::new((size * 0.16).clamp(1.5, 2.5), cut_on(color));
-    painter.add(Shape::line(
-        vec![
-            at(center, unit, -3.0, -2.4),
-            at(center, unit, -3.8, -0.6),
-            at(center, unit, -3.0, 1.0),
-            at(center, unit, -1.2, 2.4),
-            at(center, unit, 0.8, 2.6),
-            at(center, unit, 2.2, 1.2),
-            at(center, unit, 2.6, -0.4),
-        ],
-        stroke,
-    ));
-}
-
-/// A speech bubble: Signal-like.
-fn signal(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+/// A square speech bubble with a phone handset: WhatsApp-like. The square
+/// body and the tail on the right keep it apart from the brand mark.
+fn whatsapp(painter: &egui::Painter, center: Pos2, size: f32, color: Color32, cut: Color32) {
     let unit = size / 16.0;
     let body =
-        egui::Rect::from_center_size(at(center, unit, 0.0, -1.0), Vec2::new(12.0, 10.0) * unit);
+        egui::Rect::from_center_size(at(center, unit, 0.0, -0.9), Vec2::new(13.0, 11.4) * unit);
     painter.rect_filled(
         body,
-        egui::CornerRadius::same((4.5 * unit).round().clamp(2.0, 255.0) as u8),
+        egui::CornerRadius::same((4.2 * unit).round().clamp(1.0, 255.0) as u8),
         color,
     );
     painter.add(Shape::convex_polygon(
         vec![
-            at(center, unit, -2.5, 3.5),
-            at(center, unit, -5.5, 7.0),
-            at(center, unit, 0.5, 4.0),
+            at(center, unit, 1.6, 4.2),
+            at(center, unit, 6.0, 7.2),
+            at(center, unit, 5.6, 1.6),
         ],
         color,
         Stroke::NONE,
     ));
+    // The handset is one arc with a round end on each side. Keep it thick
+    // enough that a small badge still shows it.
+    let width = (1.4 * unit).max(1.1);
+    let handset = arc(at(center, unit, 1.3, -2.3), 3.8 * unit, 83.0, 186.0, 12);
+    let ends = [handset[0], handset[handset.len() - 1]];
+    painter.add(Shape::line(handset, Stroke::new(width, cut)));
+    for end in ends {
+        painter.circle_filled(end, width * 0.85, cut);
+    }
 }
 
-/// A soft face with two eyes: Discord-like without the brand asset.
+/// Under this size a mark has no fine detail: a badge on an avatar.
+const DETAIL_MIN: f32 = 12.0;
+
+/// A round speech bubble with a ring in it: Signal-like.
+fn signal(painter: &egui::Painter, center: Pos2, size: f32, color: Color32, cut: Color32) {
+    let unit = size / 16.0;
+    let middle = at(center, unit, 0.3, -0.6);
+    painter.circle_filled(middle, 6.5 * unit, color);
+    painter.add(Shape::convex_polygon(
+        vec![
+            at(center, unit, -5.6, 2.2),
+            at(center, unit, -6.8, 6.9),
+            at(center, unit, -2.0, 5.5),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+    if size >= DETAIL_MIN {
+        painter.circle_stroke(middle, 4.0 * unit, Stroke::new(1.1 * unit, cut));
+    }
+}
+
+/// A game controller with two round buttons: Discord-like without the brand
+/// asset.
 ///
-/// Body and legs are separate convex fills. A single concave outline spilled
-/// across the chin notch under `Shape::convex_polygon`.
-fn discord(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+/// The body and the two grips are separate convex fills.
+fn discord(painter: &egui::Painter, center: Pos2, size: f32, color: Color32, cut: Color32) {
     let unit = size / 16.0;
     let body =
-        egui::Rect::from_center_size(at(center, unit, 0.0, -0.5), Vec2::new(13.0, 10.0) * unit);
+        egui::Rect::from_center_size(at(center, unit, 0.0, -0.9), Vec2::new(13.6, 8.0) * unit);
     painter.rect_filled(
         body,
-        egui::CornerRadius::same((5.0 * unit).round().clamp(2.0, 255.0) as u8),
+        egui::CornerRadius::same((3.6 * unit).round().clamp(1.0, 255.0) as u8),
         color,
     );
-    painter.add(Shape::convex_polygon(
-        vec![
-            at(center, unit, -5.0, 3.5),
-            at(center, unit, -3.2, 6.2),
-            at(center, unit, -1.2, 3.5),
-        ],
-        color,
-        Stroke::NONE,
-    ));
-    painter.add(Shape::convex_polygon(
-        vec![
-            at(center, unit, 1.2, 3.5),
-            at(center, unit, 3.2, 6.2),
-            at(center, unit, 5.0, 3.5),
-        ],
-        color,
-        Stroke::NONE,
-    ));
-    let eye = cut_on(color);
-    painter.circle_filled(at(center, unit, -2.4, -0.5), 1.35 * unit, eye);
-    painter.circle_filled(at(center, unit, 2.4, -0.5), 1.35 * unit, eye);
+    for side in [-1.0, 1.0] {
+        painter.circle_filled(at(center, unit, 4.2 * side, 2.3), 3.0 * unit, color);
+        painter.circle_filled(at(center, unit, 2.7 * side, -0.4), 1.45 * unit, cut);
+    }
 }
 
-/// Four rounded bars in a hash: Slack-like.
+/// Four pills in a pinwheel hash: Slack-like.
 fn slack(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     let unit = size / 16.0;
     let corner = (1.4 * unit).round().clamp(1.0, 255.0) as u8;
@@ -345,10 +375,10 @@ fn slack(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
             color,
         );
     };
-    bar(painter, -2.6, -3.4, 3.0, 7.5);
-    bar(painter, 2.6, 3.4, 3.0, 7.5);
-    bar(painter, -3.4, 2.6, 7.5, 3.0);
-    bar(painter, 3.4, -2.6, 7.5, 3.0);
+    bar(painter, -2.5, -3.1, 2.8, 8.0);
+    bar(painter, 2.5, 3.1, 2.8, 8.0);
+    bar(painter, -3.1, 2.5, 8.0, 2.8);
+    bar(painter, 3.1, -2.5, 8.0, 2.8);
 }
 
 #[cfg(test)]
@@ -369,8 +399,29 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let center = ui.max_rect().center();
                 for id in ProtocolId::ALL {
-                    protocol(ui.painter(), center, 24.0, id, Color32::WHITE);
-                    protocol(ui.painter(), center, 12.0, id, Color32::BLACK);
+                    protocol(
+                        ui.painter(),
+                        center,
+                        24.0,
+                        id,
+                        Color32::WHITE,
+                        Color32::BLUE,
+                    );
+                    protocol(
+                        ui.painter(),
+                        center,
+                        9.0,
+                        id,
+                        Color32::BLACK,
+                        Color32::WHITE,
+                    );
+                    gradient_tile(
+                        ui.painter(),
+                        egui::Rect::from_center_size(center, Vec2::splat(36.0)),
+                        10.0,
+                        Color32::RED,
+                        Color32::BLUE,
+                    );
                 }
             });
         });

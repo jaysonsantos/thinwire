@@ -352,16 +352,32 @@ pub(crate) fn field_frame(palette: &Palette, focus: f32, margin: Margin) -> egui
 /// Widest focused field ring.
 pub(crate) const FIELD_RING: f32 = 2.0;
 
-/// Tint for the tile of a protocol in the account sidebar. An index into
-/// [`avatar_ink`], so the pair keeps its 4.5:1 initials contrast.
+/// Colors of the tile of a protocol in the account sidebar: a gradient from
+/// `top` to `bottom` and a white mark. The same in both themes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TileInk {
+    pub top: Color32,
+    pub bottom: Color32,
+    pub mark: Color32,
+}
+
+/// Tile colors of a protocol. Approximate hues that only resemble each
+/// service, not the brand colors. The mark keeps 3:1 on `top`, the lighter
+/// end (WCAG 1.4.11).
 #[must_use]
-pub(crate) const fn protocol_tile(protocol: thinwire_protocol::ProtocolId) -> u8 {
-    match protocol.kind() {
-        ProtocolKind::Telegram => 5,
-        ProtocolKind::WhatsApp => 3,
-        ProtocolKind::Discord => 2,
-        ProtocolKind::Slack => 6,
-        ProtocolKind::Signal => 4,
+pub(crate) const fn protocol_tile(protocol: thinwire_protocol::ProtocolId) -> TileInk {
+    // Every account of a protocol has the same color (ADR 0014).
+    let (top, bottom) = match protocol.kind() {
+        ProtocolKind::Telegram => (0x1E_9C_DA, 0x12_6C_BC),
+        ProtocolKind::WhatsApp => (0x1F_A6_5A, 0x0E_7C_48),
+        ProtocolKind::Discord => (0x8C_6E_F2, 0x5C_40_CE),
+        ProtocolKind::Slack => (0xC6_46_8C, 0x8C_24_66),
+        ProtocolKind::Signal => (0x4C_7E_F4, 0x2A_50_D4),
+    };
+    TileInk {
+        top: hex(top),
+        bottom: hex(bottom),
+        mark: Color32::from_rgb(255, 255, 255),
     }
 }
 
@@ -841,6 +857,17 @@ mod tests {
             for (part, color) in [("title", ink.title), ("reason", ink.reason)] {
                 let ratio = contrast(color, ink.on);
                 assert!(ratio >= TEXT_AA, "{theme} {part}: {ratio:.2} < {TEXT_AA}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_protocol_tile_keeps_its_mark_at_3_to_1() {
+        for protocol in thinwire_protocol::ProtocolId::ALL {
+            let ink = protocol_tile(protocol);
+            for (end, fill) in [("top", ink.top), ("bottom", ink.bottom)] {
+                let ratio = contrast(ink.mark, fill);
+                assert!(ratio >= UI_AA, "{protocol} {end}: {ratio:.2} < {UI_AA}");
             }
         }
     }

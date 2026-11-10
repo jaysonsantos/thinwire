@@ -1300,7 +1300,7 @@ fn unofficial_pill_width(ui: &egui::Ui) -> f32 {
         + space::S * 2.0
 }
 
-/// The protocol tile: a tinted square with the protocol mark. `dot` is the
+/// The protocol tile: a gradient square with the protocol mark. `dot` is the
 /// row fill and the account state: the dot is cut out of the corner in the
 /// row's own fill.
 pub(super) fn paint_protocol_tile(
@@ -1309,16 +1309,17 @@ pub(super) fn paint_protocol_tile(
     protocol: ProtocolId,
     dot: Option<(egui::Color32, egui::Color32)>,
 ) {
-    let ink = theme::avatar_ink(theme::protocol_tile(protocol), ui.visuals().dark_mode);
-    let corner = (tile.width() * 0.28).round().clamp(4.0, 24.0) as u8;
-    ui.painter()
-        .rect_filled(tile, egui::CornerRadius::same(corner), ink.fill);
+    let ink = theme::protocol_tile(protocol);
+    let corner = (tile.width() * 0.28).round().clamp(4.0, 24.0);
+    super::icons::gradient_tile(ui.painter(), tile, corner, ink.top, ink.bottom);
     super::icons::protocol(
         ui.painter(),
         tile.center(),
-        tile.width() * 0.58,
+        tile.width() * 0.6,
         protocol,
-        ink.text,
+        ink.mark,
+        // A hole in the mark shows the middle of the gradient.
+        super::motion::mix(ink.top, ink.bottom, 0.5),
     );
     if let Some((fill, color)) = dot {
         let at = tile.right_bottom() - egui::vec2(3.0, 3.0);
