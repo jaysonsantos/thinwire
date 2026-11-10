@@ -1,8 +1,8 @@
-//! Download one attachment from the Discord CDN for the player.
+//! Download one attachment or sticker from the Discord CDN.
 //!
 //! Only HTTPS addresses on the two Discord CDN hosts are read, and the body
-//! stops at [`VOICE_MAX_BYTES`]. A failure has no URL, no header, and no
-//! body text.
+//! stops at the limit of the caller. A failure has no URL, no header, and
+//! no body text.
 
 use std::time::Duration;
 
@@ -12,9 +12,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
 use super::api::DiscordApiError;
-use crate::voice_files::VOICE_MAX_BYTES;
 
-/// The hosts of Discord attachment files.
+/// The hosts of Discord attachment files and sticker images.
 const CDN_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
 
 /// The longest wait for the answer, and again for the body.
@@ -25,7 +24,8 @@ pub(super) fn is_cdn_url(uri: &hyper::Uri) -> bool {
     uri.scheme_str() == Some("https") && uri.host().is_some_and(|host| CDN_HOSTS.contains(&host))
 }
 
-pub(super) async fn fetch(url: &str) -> Result<Vec<u8>, DiscordApiError> {
+/// Read the file at `url`. A body larger than `max_bytes` is an error.
+pub(super) async fn fetch(url: &str, max_bytes: usize) -> Result<Vec<u8>, DiscordApiError> {
     let uri: hyper::Uri = url.parse().map_err(|_| DiscordApiError::Rejected)?;
     if !is_cdn_url(&uri) {
         return Err(DiscordApiError::Rejected);
@@ -51,7 +51,7 @@ pub(super) async fn fetch(url: &str) -> Result<Vec<u8>, DiscordApiError> {
         404 => return Err(DiscordApiError::NotFound),
         _ => return Err(DiscordApiError::Transport),
     }
-    let body = Limited::new(response.into_body(), VOICE_MAX_BYTES);
+    let body = Limited::new(response.into_body(), max_bytes);
     let collected = tokio::time::timeout(DOWNLOAD_WAIT, body.collect())
         .await
         .map_err(|_| DiscordApiError::Transport)?
@@ -72,6 +72,16 @@ mod tests {
             "https://cdn.discordapp.com/attachments/1/2/voice-message.ogg?ex=1"
         ));
         assert!(ok("https://media.discordapp.net/attachments/1/2/a.mp3"));
+        assert!(ok(
+            "https://cdn.discordapp.com/attachments/1/2/clip.mp4?ex=1"
+        ));
+        assert!(!ok("https://discord.com/attachments/1/2/clip.mp4"));
+        // The sticker address that the adapter builds is on the CDN.
+        let sticker = crate::discord::api::StickerSummary {
+            id: 7,
+            format: crate::discord::api::StickerFormat::Png,
+        };
+        assert!(ok(&sticker.image_url().expect("png")));
         assert!(!ok("http://cdn.discordapp.com/attachments/1/2/a.ogg"));
         assert!(!ok("https://cdn.discordapp.com.example.com/a.ogg"));
         assert!(!ok("https://example.com/a.ogg"));

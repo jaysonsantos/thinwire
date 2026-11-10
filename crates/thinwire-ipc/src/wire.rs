@@ -24,9 +24,11 @@ use crate::SecretText;
 /// `reply_to` on [`WireCommand::SendText`], [`WireCommand::DeleteMessage`],
 /// [`WireCommand::React`], [`WireMessage::reactions`],
 /// [`WireMessage::reply_to`], and [`WireEvent::Reactions`]. Version 7 adds
-/// [`WireMessage::mentions`]. Version 8 adds [`WireCommand::Unlink`]. An
-/// older peer cannot read those lines.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// [`WireMessage::mentions`]. Version 8 adds [`WireCommand::Unlink`].
+/// Version 9 adds [`WireMessage::video`], [`WireCommand::DownloadVideo`],
+/// [`WireEvent::VideoReady`], and [`WireEvent::VideoFailed`]. An older peer
+/// cannot read those lines.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// One unreadable stretch on a history page.
 ///
@@ -186,6 +188,11 @@ pub enum WireCommand {
     DownloadVoice {
         file_id: i32,
     },
+    /// Download the video `file_id` of [`WireMessage::video`]. The helper
+    /// answers [`WireEvent::VideoReady`] or [`WireEvent::VideoFailed`].
+    DownloadVideo {
+        file_id: i32,
+    },
     /// The user accepted the full-screen gate of this protocol in the app.
     AcknowledgeGate,
     /// Start pairing. `phone` is the optional number for a pair code. It is
@@ -219,6 +226,7 @@ impl WireCommand {
             Self::SendMedia { .. } => "send_media",
             Self::ViewChat { .. } => "view_chat",
             Self::DownloadVoice { .. } => "download_voice",
+            Self::DownloadVideo { .. } => "download_video",
             Self::AcknowledgeGate => "acknowledge_gate",
             Self::BeginLink { .. } => "begin_link",
             Self::CancelLink => "cancel_link",
@@ -354,6 +362,11 @@ pub struct WireMessage {
     /// cross with the message: [`WireCommand::DownloadVoice`] asks for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<WireAudio>,
+    /// A video clip of the message. The file does not cross with the
+    /// message: [`WireCommand::DownloadVideo`] asks for it. [`Self::photo`]
+    /// is then the first picture of the clip, when the protocol gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<WireVideo>,
     /// The reactions on the message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<WireReaction>,
@@ -411,6 +424,24 @@ pub struct WireAudio {
     pub duration_secs: u32,
     /// Positive.
     pub file_id: i32,
+}
+
+/// The video of a message. `file_id` is a handle of the helper, not a file
+/// of a protocol server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireVideo {
+    /// Zero when the protocol does not say.
+    pub duration_secs: u32,
+    /// Pixel size. Zero when the protocol does not say.
+    pub width: u32,
+    pub height: u32,
+    /// Positive.
+    pub file_id: i32,
+    /// A video message: a short clip that a person records in the chat. It
+    /// plays in its row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub note: bool,
 }
 
 /// An image of a message, as encoded bytes (WebP, PNG, or JPEG).
@@ -567,6 +598,16 @@ pub enum WireEvent {
     VoiceFailed {
         file_id: i32,
     },
+    /// The video `file_id` is a local file now. The helper keeps the file
+    /// in its own folder. The path is absolute.
+    VideoReady {
+        file_id: i32,
+        path: String,
+    },
+    /// The video `file_id` did not download.
+    VideoFailed {
+        file_id: i32,
+    },
     /// The small picture of the chat `conversation_id`.
     Avatar {
         conversation_id: String,
@@ -617,6 +658,8 @@ impl WireEvent {
             Self::StoreAccess { .. } => "store_access",
             Self::VoiceReady { .. } => "voice_ready",
             Self::VoiceFailed { .. } => "voice_failed",
+            Self::VideoReady { .. } => "video_ready",
+            Self::VideoFailed { .. } => "video_failed",
             Self::Avatar { .. } => "avatar",
             Self::Reactions { .. } => "reactions",
         }
@@ -651,9 +694,90 @@ mod tests {
             arrival: WireArrival::Live,
             photo: None,
             audio: None,
+            video: None,
             reactions: Vec::new(),
             reply_to: None,
             mentions: Vec::new(),
+        }
+    }
+
+    /// The lines of wire version 9. A video crosses as a handle with its
+    /// length and its size. A message with no video has no key for it, and
+    /// a clip that is not a video message has no `note` key. The download
+    /// request and both answers read back. `Debug` shows no path.
+    #[test]
+    fn a_video_and_its_download_lines_survive_the_wire() {
+        const PATH: &str = "/home/ana/video/7.video";
+        let mut with_video = message();
+        with_video.video = Some(WireVideo {
+            duration_secs: 12,
+            width: 640,
+            height: 360,
+            file_id: 7,
+            note: false,
+        });
+        let text = serde_json::to_string(&with_video).expect("encode");
+        assert!(
+            text.contains(r#""video":{"duration_secs":12,"width":640,"height":360,"file_id":7}"#),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<WireMessage>(&text).expect("decode"),
+            with_video
+        );
+        let mut note = with_video.clone();
+        note.video = note.video.map(|video| WireVideo {
+            note: true,
+            ..video
+        });
+        let text = serde_json::to_string(&note).expect("encode");
+        assert!(text.contains(r#""note":true"#), "{text}");
+        assert_eq!(
+            serde_json::from_str::<WireMessage>(&text).expect("decode"),
+            note
+        );
+        let plain = serde_json::to_string(&message()).expect("encode");
+        assert!(!plain.contains("video"), "{plain}");
+
+        let request = AppLine::Request {
+            id: 11,
+            protocol: WireProtocol::Signal,
+            command: WireCommand::DownloadVideo { file_id: 7 },
+        };
+        let encoded = encode(&request).expect("encode");
+        assert_eq!(
+            encoded.trim_end(),
+            r#"{"type":"request","id":11,"protocol":"signal","command":{"name":"download_video","file_id":7}}"#
+        );
+        assert_eq!(
+            decode::<AppLine>(encoded.trim_end()).expect("decode"),
+            request
+        );
+        assert!(!WireCommand::DownloadVideo { file_id: 7 }.wakes_helper());
+        assert!(!WireCommand::DownloadVideo { file_id: 7 }.reads_session_key());
+        for event in [
+            WireEvent::VideoReady {
+                file_id: 7,
+                path: PATH.into(),
+            },
+            WireEvent::VideoFailed { file_id: 7 },
+        ] {
+            let kind = event.kind();
+            let line = HelperLine::Event {
+                protocol: WireProtocol::WhatsApp,
+                event,
+            };
+            let encoded = encode(&line).expect("encode");
+            assert!(encoded.contains(kind), "{encoded}");
+            assert_eq!(
+                decode::<HelperLine>(encoded.trim_end()).expect("decode"),
+                line
+            );
+            let shown = format!("{line:?}");
+            assert!(
+                !shown.contains("ana") && !shown.contains(".video"),
+                "{shown}"
+            );
         }
     }
 

@@ -118,6 +118,8 @@ pub(crate) fn message(id: u64, author_id: u64, author: &str, content: &str) -> M
         stickers: 0,
         audio: None,
         image: None,
+        video: None,
+        sticker: None,
         reactions: Vec::new(),
         reply_to: None,
         edited: false,
@@ -489,15 +491,20 @@ impl DiscordApi for FakeDiscordApi {
         })
     }
 
-    fn download(&self, url: String) -> ApiFuture<'_, Vec<u8>> {
+    fn download(&self, url: String, max_bytes: usize) -> ApiFuture<'_, Vec<u8>> {
         Box::pin(async move {
             self.check_token()?;
             let state = self.state();
-            state
+            let bytes = state
                 .downloads
                 .get(&url)
                 .cloned()
-                .ok_or(DiscordApiError::NotFound)
+                .ok_or(DiscordApiError::NotFound)?;
+            // The live client stops a body that is larger than the limit.
+            if bytes.len() > max_bytes {
+                return Err(DiscordApiError::Transport);
+            }
+            Ok(bytes)
         })
     }
 }

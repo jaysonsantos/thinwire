@@ -214,6 +214,7 @@ pub(crate) fn draw(
     player.video_overlay(ui, snapshot.selected_messages());
     super::message_menu::delete_dialog(ui.ctx(), out);
     super::unlink::dialog(ui.ctx(), out);
+    super::chat_details::dialog(ui.ctx(), snapshot, out);
     super::forward::picker(ui.ctx(), snapshot, out);
 }
 
@@ -2340,6 +2341,7 @@ fn center_panel(
         if escape {
             let closed = super::message_menu::take_escape(ui.ctx())
                 || super::unlink::take_escape(ui.ctx())
+                || super::chat_details::take_escape(ui.ctx())
                 || player.take_video_escape()
                 || super::photos::take_escape(ui.ctx())
                 || super::links::take_escape(ui.ctx())
@@ -2602,7 +2604,7 @@ fn thread(
             outbound: message.outbound,
             person_colors,
             sender: &message.sender,
-            body: &message.body,
+            body: shown_body(message),
             links: &message.links,
             photo: message.photo.as_ref(),
             audio: message.audio.as_ref(),
@@ -3391,8 +3393,23 @@ fn thread_header(ui: &mut egui::Ui, snapshot: &View<'_>, out: &mut Vec<Intent>) 
                         });
                     }
                     let side = super::photos::HEADER_AVATAR_SIDE;
-                    let (avatar, _) =
-                        ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+                    // A click on the picture shows the details of the chat.
+                    let (avatar, details) =
+                        ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+                    details.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::Role::Button, true, "Chat details")
+                    });
+                    if details
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Chat details")
+                        .clicked()
+                    {
+                        super::chat_details::open(
+                            ui.ctx(),
+                            conversation.protocol,
+                            &conversation.id,
+                        );
+                    }
                     super::photos::paint_avatar(
                         ui,
                         avatar,
@@ -3518,6 +3535,28 @@ fn empty_thread(ui: &mut egui::Ui, snapshot: &View<'_>) {
                 .color(palette.text2),
         );
     });
+}
+
+/// The words that a protocol puts in the place of the text of a video with
+/// no caption.
+const CLIP_LABELS: [&str; 6] = [
+    "[video]",
+    "[video message]",
+    "[GIF]",
+    "Video",
+    "Animation",
+    "Video message",
+];
+
+/// The text of a row. A video with no caption has only a label as its text.
+/// When the row draws the player of the clip, the label says nothing new,
+/// so it does not show. A build with no `video` feature draws no player and
+/// keeps the label.
+fn shown_body(message: &thinwire_protocol::ChatMessage) -> &str {
+    let label_only = cfg!(feature = "video")
+        && message.video.is_some()
+        && CLIP_LABELS.contains(&message.body.as_str());
+    if label_only { "" } else { &message.body }
 }
 
 /// Own messages sit on the right on `out`. Others sit on the left on `surface`.

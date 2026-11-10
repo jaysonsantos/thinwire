@@ -336,6 +336,10 @@ enum Msg {
     Voice {
         file_id: i32,
     },
+    /// Download the video of this handle for the player.
+    Video {
+        file_id: i32,
+    },
     /// The page of `conversation_id` older than the message `before`.
     Older {
         conversation_id: String,
@@ -530,6 +534,7 @@ impl Session {
             pending_end: None,
             settle_armed: false,
             voices: HashMap::new(),
+            videos: HashMap::new(),
             images: HashMap::new(),
             image_order: std::collections::VecDeque::new(),
             image_gate: Arc::new(Semaphore::new(IMAGE_DOWNLOADS)),
@@ -714,6 +719,12 @@ impl Session {
     /// `VoiceFailed`. `false`: the owner is gone.
     pub(crate) fn voice(&self, file_id: i32) -> bool {
         self.tx.send(Msg::Voice { file_id }).is_ok()
+    }
+
+    /// Download the video `file_id`. The answer is `VideoReady` or
+    /// `VideoFailed`. `false`: the owner is gone.
+    pub(crate) fn video(&self, file_id: i32) -> bool {
+        self.tx.send(Msg::Video { file_id }).is_ok()
     }
 
     /// Load the page older than the row `before_message_id`. The answer is
@@ -929,6 +940,8 @@ struct Owner {
     settle_armed: bool,
     /// The CDN address of each audio handle of a history row.
     voices: HashMap<i32, String>,
+    /// The CDN address of each video handle of a history row.
+    videos: HashMap<i32, String>,
     /// The photo of each message with an image, by message id.
     images: HashMap<u64, ImageState>,
     /// The message ids of `images`, oldest first. Past [`IMAGE_CACHE`] the
@@ -945,6 +958,12 @@ enum ImageState {
     Failed,
 }
 
+/// `true` for the body of a row that has only an image or only a sticker.
+/// The photo of the row takes the place of this label.
+fn is_picture_label(body: &str) -> bool {
+    body == IMAGE_LABEL || body == super::inbox::STICKER_LABEL
+}
+
 /// Photos that the owner keeps in memory.
 const IMAGE_CACHE: usize = 200;
 
@@ -952,8 +971,8 @@ const IMAGE_CACHE: usize = 200;
 const IMAGE_DOWNLOADS: usize = 4;
 
 impl Owner {
-    /// The rows of one page, oldest first. Each row gets its audio handle
-    /// and its photo.
+    /// The rows of one page, oldest first. Each row gets its audio handle,
+    /// its video handle, and its photo.
     fn page_rows(
         &mut self,
         conversation_id: &str,
@@ -964,6 +983,10 @@ impl Owner {
             if let Some(audio) = &message.audio {
                 self.voices
                     .insert(super::inbox::voice_file_id(message.id), audio.url.clone());
+            }
+            if let Some(video) = &message.video {
+                self.videos
+                    .insert(super::inbox::video_file_id(message.id), video.url.clone());
             }
         }
         let mut rows: Vec<ChatMessage> = messages
@@ -1043,15 +1066,19 @@ impl Owner {
     }
 
     /// Show the photo of a history row from the cache, or start its
-    /// download. The row keeps its label until the photo is here.
+    /// download. The photo is the first image attachment. A row with no
+    /// image attachment shows its sticker, when the sticker is a PNG. The
+    /// row keeps its label until the photo is here.
     fn dress_image(&mut self, message: &MessageSummary, row: &mut ChatMessage) {
-        let Some(image) = &message.image else {
+        let image = message.image.as_ref().map(|image| image.url.clone());
+        let sticker = || message.sticker.and_then(|sticker| sticker.image_url());
+        let Some(url) = image.or_else(sticker) else {
             return;
         };
         match self.images.get(&message.id) {
             Some(ImageState::Ready(photo)) => {
                 row.photo = Some(photo.clone());
-                if message.content.is_empty() && row.body == IMAGE_LABEL {
+                if message.content.is_empty() && is_picture_label(&row.body) {
                     row.body.clear();
                 }
                 return;
@@ -1068,12 +1095,14 @@ impl Owner {
         }
         let api = Arc::clone(&self.api);
         let gate = Arc::clone(&self.image_gate);
-        let url = image.url.clone();
         let message_id = message.id;
         let row = Box::new(row.clone());
         self.spawn(async move {
             let _permit = gate.acquire_owned().await.ok();
-            let photo = match api.download(url).await {
+            let photo = match api
+                .download(url, crate::photo_resize::PHOTO_DOWNLOAD_MAX)
+                .await
+            {
                 Ok(bytes) => tokio::task::spawn_blocking(move || {
                     crate::photo_resize::photo_from_bytes(&bytes)
                 })
@@ -1110,7 +1139,7 @@ impl Owner {
         self.images
             .insert(message_id, ImageState::Ready(photo.clone()));
         row.photo = Some(photo);
-        if row.body == IMAGE_LABEL {
+        if is_picture_label(&row.body) {
             row.body.clear();
         }
         emit_message(&self.events, row);
@@ -1262,7 +1291,7 @@ impl Owner {
         };
         let api = Arc::clone(&self.api);
         tokio::spawn(async move {
-            let stored = match api.download(url).await {
+            let stored = match api.download(url, crate::voice_files::VOICE_MAX_BYTES).await {
                 Ok(bytes) => tokio::task::spawn_blocking(move || {
                     crate::voice_files::store(&dir, file_id, &bytes).map_err(|_| ())
                 })
@@ -1280,6 +1309,47 @@ impl Owner {
                 }
                 Err(()) => {
                     tracing::debug!("a discord audio file did not download");
+                    failed(&events);
+                }
+            }
+        });
+    }
+
+    /// Download the video `file_id` into the folder of the player files.
+    /// The answer is `VideoReady`, or `VideoFailed` when no history row has
+    /// the handle, or when the download or the write failed.
+    fn download_video(&mut self, file_id: i32) {
+        let events = self.events.clone();
+        let failed = move |events: &EventTx| {
+            let _ = events.send(AdapterEvent::VideoFailed {
+                protocol: ProtocolId::Discord,
+                file_id,
+            });
+        };
+        let (Some(url), Ok(dir)) = (self.videos.get(&file_id).cloned(), super::voice_dir()) else {
+            failed(&events);
+            return;
+        };
+        let api = Arc::clone(&self.api);
+        tokio::spawn(async move {
+            let stored = match api.download(url, crate::voice_files::VIDEO_MAX_BYTES).await {
+                Ok(bytes) => tokio::task::spawn_blocking(move || {
+                    crate::voice_files::store_video(&dir, file_id, &bytes).map_err(|_| ())
+                })
+                .await
+                .unwrap_or(Err(())),
+                Err(_) => Err(()),
+            };
+            match stored {
+                Ok(path) => {
+                    let _ = events.send(AdapterEvent::VideoReady {
+                        protocol: ProtocolId::Discord,
+                        file_id,
+                        path,
+                    });
+                }
+                Err(()) => {
+                    tracing::debug!("a discord video file did not download");
                     failed(&events);
                 }
             }
@@ -1357,6 +1427,7 @@ impl Owner {
                 }
             }
             Msg::Voice { file_id } => self.download_voice(file_id),
+            Msg::Video { file_id } => self.download_video(file_id),
             Msg::Older {
                 conversation_id,
                 before_message_id,

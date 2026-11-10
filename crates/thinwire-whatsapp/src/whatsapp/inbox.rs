@@ -5,14 +5,12 @@
 //! message batches into these records on the worker. Default builds test the
 //! same rules with fakes.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::Arc;
 
 use thinwire_protocol::{
     AdapterEvent, Arrival, ChatMessage, Conversation, Delivery, ImageBytes, MessageAudio,
-    MessagePhoto, PhotoSize, ProtocolId, mention_links,
+    MessagePhoto, MessageVideo, PhotoSize, ProtocolId, mention_links,
 };
 
 /// Prefix on every WhatsApp conversation id. The rest is the chat JID.
@@ -57,40 +55,115 @@ pub(super) const PHOTO_LABEL: &str = "[photo]";
 /// its own pixels, so it stays sharp on a high-density screen.
 const STICKER_SIDE: u32 = 160;
 
-/// The download reference of one media file. Only the live client can read
-/// it: it holds the whatsapp-rust message. `Debug` shows no key or path.
-#[derive(Clone)]
-pub(super) struct MediaRef(Arc<dyn Any + Send + Sync>);
+/// The largest sticker file the helper downloads. A larger image than the
+/// pipe takes is made smaller after the download.
+#[cfg_attr(not(feature = "whatsapp-web"), allow(dead_code))]
+pub(super) const STICKER_DOWNLOAD_MAX: u64 = 2 * 1024 * 1024;
+
+/// The largest thumbnail of a video that the helper keeps. WhatsApp sends
+/// a JPEG of some kilobytes.
+#[cfg_attr(not(feature = "whatsapp-web"), allow(dead_code))]
+pub(super) const THUMBNAIL_MAX_BYTES: usize = 64 * 1024;
+
+/// How many times one image downloads in one run. A failed download asks
+/// again when its chat opens again.
+const MEDIA_TRIES: u8 = 3;
+
+/// What a media file is. WhatsApp derives the file keys from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum MediaClass {
+    Sticker,
+    Image,
+    Audio,
+    Video,
+}
+
+/// The download reference of one media file: where the encrypted file is,
+/// its key, and its hashes. The chat cache keeps it, so a row from before a
+/// restart still downloads. `Debug` shows no key or path.
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(super) struct MediaRef {
+    pub class: MediaClass,
+    pub direct_path: String,
+    #[serde(with = "base64_bytes")]
+    pub media_key: Vec<u8>,
+    #[serde(with = "base64_bytes")]
+    pub file_sha256: Vec<u8>,
+    #[serde(with = "base64_bytes")]
+    pub file_enc_sha256: Vec<u8>,
+    /// Zero when the message does not say.
+    pub file_length: u64,
+}
 
 impl MediaRef {
-    #[cfg_attr(not(any(test, feature = "whatsapp-web")), allow(dead_code))]
-    pub(super) fn new(value: impl Any + Send + Sync) -> Self {
-        Self(Arc::new(value))
-    }
-
-    #[cfg_attr(not(feature = "whatsapp-web"), allow(dead_code))]
-    pub(super) fn get<T: Any>(&self) -> Option<&T> {
-        self.0.downcast_ref()
+    /// A reference that no server knows, for a test with a fake download.
+    #[cfg(test)]
+    pub(super) fn fake(class: MediaClass, name: &str) -> Self {
+        Self {
+            class,
+            direct_path: format!("/fake/{name}"),
+            media_key: vec![1; 32],
+            file_sha256: vec![2; 32],
+            file_enc_sha256: vec![3; 32],
+            file_length: 3,
+        }
     }
 }
 
 impl fmt::Debug for MediaRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("MediaRef")
+        write!(f, "MediaRef({:?})", self.class)
     }
 }
 
-impl PartialEq for MediaRef {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+/// Bytes as one base64 string in the chat cache.
+mod base64_bytes {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
+
+    /// The same for bytes that a message can lack.
+    pub(super) mod option {
+        use base64::Engine as _;
+
+        use super::{Deserialize, Deserializer, STANDARD, Serializer};
+
+        // serde gives the field by reference.
+        pub(in super::super) fn serialize<S: Serializer>(
+            bytes: &Option<Vec<u8>>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match bytes {
+                Some(bytes) => serializer.serialize_some(&STANDARD.encode(bytes)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub(in super::super) fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Vec<u8>>, D::Error> {
+            Option::<String>::deserialize(deserializer)?
+                .map(|text| STANDARD.decode(text).map_err(serde::de::Error::custom))
+                .transpose()
+        }
     }
 }
-
-impl Eq for MediaRef {}
 
 /// A sticker on a message. The image downloads after the row shows. Until
 /// then, and when the download fails, the row shows "[sticker]".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct Sticker {
     /// Pixel size from the message. Zero when the message has none.
     pub width: u32,
@@ -131,16 +204,75 @@ impl Sticker {
 
 /// A voice note or an audio file on a message. It downloads when the user
 /// presses Play.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct Voice {
     /// Zero when the message does not say.
     pub seconds: u32,
     pub media: MediaRef,
 }
 
-/// The handle of the audio of one message for `DownloadVoice`. The same
-/// message has the same handle in every run, so a row from before a helper
-/// restart still downloads. Always positive.
+/// A video on a message. It downloads when the user presses Play. The
+/// message has the first picture of the clip as a small JPEG.
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(super) struct Video {
+    /// Zero when the message does not say.
+    pub seconds: u32,
+    /// Pixel size from the message. Zero when the message has none.
+    pub width: u32,
+    pub height: u32,
+    pub media: MediaRef,
+    /// A video message: a round clip that a person records in the chat.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub note: bool,
+    /// The JPEG thumbnail of the message.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "base64_bytes::option"
+    )]
+    pub thumbnail: Option<Vec<u8>>,
+}
+
+// The thumbnail is a picture of the user: `Debug` shows only its size.
+impl fmt::Debug for Video {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Video")
+            .field("seconds", &self.seconds)
+            .field("size", &(self.width, self.height))
+            .field("note", &self.note)
+            .field("thumbnail", &self.thumbnail.as_ref().map(Vec::len))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Video {
+    /// The thumbnail as the photo of the row. It shows at the size of the
+    /// video. `None` when the message has no thumbnail that is an image.
+    fn photo(&self) -> Option<MessagePhoto> {
+        let bytes = self.thumbnail.as_ref()?;
+        let (width, height) = thinwire_protocol::photo_resize::image_size(bytes)?;
+        let (width, height) = if self.width > 0 && self.height > 0 {
+            (self.width, self.height)
+        } else {
+            (width, height)
+        };
+        Some(thinwire_protocol::photo_resize::photo(
+            width,
+            height,
+            bytes.clone(),
+        ))
+    }
+
+    fn clip(&self, file_id: i32) -> Option<MessageVideo> {
+        let clip = MessageVideo::new(self.seconds, self.width, self.height, file_id, None)?;
+        Some(if self.note { clip.into_note() } else { clip })
+    }
+}
+
+/// The handle of the audio of one message for `DownloadVoice`, and of its
+/// video for `DownloadVideo`. The same message has the same handle in every
+/// run, so a row from before a helper restart still downloads. Always
+/// positive.
 pub(super) fn voice_file_id(jid: &str, id: &str) -> i32 {
     let low = u32::try_from(hash_of(&(jid, id)) & 0x7fff_ffff).unwrap_or(1);
     i32::try_from(low).unwrap_or(1).max(1)
@@ -177,9 +309,11 @@ impl fmt::Debug for MediaRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MediaState {
-    Requested,
+    /// The download runs. The number is the count of downloads so far.
+    Requested(u8),
     Ready(ImageBytes),
-    Failed,
+    /// The number is the count of downloads that failed.
+    Failed(u8),
 }
 
 /// One text-like message from history sync or live traffic.
@@ -204,6 +338,8 @@ pub(super) struct WaMessage {
     pub sticker: Option<Sticker>,
     /// The audio of a voice note or an audio message.
     pub voice: Option<Voice>,
+    /// The video of a video message, of a round video message, or of a GIF.
+    pub video: Option<Video>,
     /// The id of the message that this one replies to.
     pub reply_to: Option<String>,
     /// The reactions: who reacted ([`ME`] or a JID) and the emoji. Sorted by
@@ -543,6 +679,15 @@ pub(super) struct SavedMessage {
     pub reactions: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<String>,
+    /// The download references of the media. A row from before a restart
+    /// thus shows its sticker or its photo again, and plays its audio or
+    /// its video.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticker: Option<Sticker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<Voice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<Video>,
 }
 
 /// One saved chat: the row and its messages.
@@ -657,6 +802,9 @@ fn saved_message(message: &WaMessage) -> SavedMessage {
         reply_to: message.reply_to.clone(),
         reactions: message.reactions.clone(),
         mentions: message.mentions.clone(),
+        sticker: message.sticker.clone(),
+        voice: message.voice.clone(),
+        video: message.video.clone(),
     }
 }
 
@@ -780,8 +928,9 @@ impl Inbox {
                         sender_alt: None,
                         body: message.body,
                         timestamp: message.timestamp,
-                        sticker: None,
-                        voice: None,
+                        sticker: message.sticker,
+                        voice: message.voice,
+                        video: message.video,
                         reply_to: message.reply_to,
                         reactions: message.reactions,
                         mentions: message.mentions,
@@ -873,6 +1022,21 @@ impl Inbox {
         })
     }
 
+    /// The video of the message with the handle `file_id`, while the
+    /// message is in the cache.
+    pub(super) fn video_media(&self, file_id: i32) -> Option<MediaRef> {
+        self.chats.iter().find_map(|(jid, record)| {
+            record
+                .messages
+                .iter()
+                .find(|message| {
+                    message.video.is_some() && voice_file_id(jid, &message.id) == file_id
+                })
+                .and_then(|message| message.video.as_ref())
+                .map(|video| video.media.clone())
+        })
+    }
+
     /// The sticker downloads for the rows in `events`. Each sticker asks
     /// one time: a later row of the same message asks again only after its
     /// image left the cache.
@@ -880,6 +1044,10 @@ impl Inbox {
     /// A photo of a history row asks only when `history_photos` is set: the
     /// chat is open, or the user loads an older page. A history sync at a
     /// pairing does not download every photo.
+    ///
+    /// A download that failed asks again only with `history_photos`, and
+    /// [`MEDIA_TRIES`] times at most in one run: the failure can be a
+    /// connection that was down.
     pub(super) fn media_requests(
         &mut self,
         events: &[AdapterEvent],
@@ -907,22 +1075,25 @@ impl Inbox {
                 continue;
             }
             let key = (jid.to_string(), message.id.clone());
-            if self.media.contains_key(&key) {
-                continue;
-            }
+            let tries = match self.media.get(&key) {
+                None => 0,
+                Some(MediaState::Failed(tries)) if history_photos && *tries < MEDIA_TRIES => *tries,
+                Some(_) => continue,
+            };
             out.push(MediaRequest {
                 chat_jid: key.0.clone(),
                 id: key.1.clone(),
                 media: sticker.media.clone(),
             });
-            self.media.insert(key, MediaState::Requested);
+            self.media
+                .insert(key, MediaState::Requested(tries.saturating_add(1)));
         }
         out
     }
 
     /// A sticker download ended. With an image, the row comes again with
     /// it, when the message is still in the cache. A failed download keeps
-    /// the "[sticker]" row and does not ask again.
+    /// the "[sticker]" row.
     pub(super) fn finish_media(
         &mut self,
         jid: &str,
@@ -930,13 +1101,13 @@ impl Inbox {
         bytes: Option<Vec<u8>>,
     ) -> Option<AdapterEvent> {
         let key = (jid.to_string(), id.to_string());
-        if self.media.get(&key) != Some(&MediaState::Requested) {
+        let Some(MediaState::Requested(tries)) = self.media.get(&key).cloned() else {
             // A reset dropped the request. The row is gone or new.
             return None;
-        }
+        };
         let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty() && bytes.len() <= MEDIA_MAX_BYTES)
         else {
-            self.media.insert(key, MediaState::Failed);
+            self.media.insert(key, MediaState::Failed(tries));
             return None;
         };
         self.media
@@ -1341,6 +1512,7 @@ impl Inbox {
             timestamp: now,
             sticker: None,
             voice: None,
+            video: None,
             reactions: Vec::new(),
             reply_to: None,
             mentions: Vec::new(),
@@ -1902,7 +2074,7 @@ impl Inbox {
         };
         // A sticker with its image shows the image and no label. A photo
         // keeps its caption as the body.
-        let photo = message.sticker.as_ref().and_then(|sticker| {
+        let picture = message.sticker.as_ref().and_then(|sticker| {
             match self
                 .media
                 .get(&(message.chat_jid.clone(), message.id.clone()))
@@ -1915,11 +2087,23 @@ impl Inbox {
             .sticker
             .as_ref()
             .is_some_and(|sticker| sticker.photo && message.body != PHOTO_LABEL);
-        let body = if photo.is_some() && !caption {
+        let body = if picture.is_some() && !caption {
             String::new()
         } else {
             message.body.clone()
         };
+        // A video keeps its label or its caption, as a Telegram video does.
+        // Its thumbnail is the photo of the row.
+        let video = message
+            .video
+            .as_ref()
+            .and_then(|video| video.clip(voice_file_id(&message.chat_jid, &message.id)));
+        let photo = picture.or_else(|| {
+            video
+                .as_ref()
+                .and(message.video.as_ref())
+                .and_then(Video::photo)
+        });
         let (body, mentions) = self.with_mentions(&body, &self.mentions_of(message));
         let links = mention_links(&body, mentions);
         ChatMessage {
@@ -1942,7 +2126,7 @@ impl Inbox {
                     None,
                 )
             }),
-            video: None,
+            video,
             file: None,
             reactions: reaction_counts(&message.reactions),
             reply_to: message.reply_to.clone(),
@@ -2319,6 +2503,7 @@ pub(super) mod tests {
             timestamp: ts,
             sticker: None,
             voice: None,
+            video: None,
             reactions: Vec::new(),
             reply_to: None,
             mentions: Vec::new(),
@@ -2330,7 +2515,7 @@ pub(super) mod tests {
             sticker: Some(Sticker {
                 width: 512,
                 height: 256,
-                media: MediaRef::new(id.to_string()),
+                media: MediaRef::fake(MediaClass::Sticker, id),
                 photo: false,
             }),
             ..message(chat, id, "[sticker]", ts)
@@ -2358,7 +2543,7 @@ pub(super) mod tests {
             sticker: Some(Sticker {
                 width: 0,
                 height: 0,
-                media: MediaRef::new(id.to_string()),
+                media: MediaRef::fake(MediaClass::Image, id),
                 photo: true,
             }),
             ..message(chat, id, body, 1)
@@ -2431,8 +2616,127 @@ pub(super) mod tests {
         assert_eq!(preview, "[sticker]");
     }
 
-    /// A failed or too large download keeps the label and does not ask again.
-    /// A text message never asks.
+    pub(in crate::whatsapp) fn video_message(chat: &str, id: &str, note: bool) -> WaMessage {
+        WaMessage {
+            video: Some(Video {
+                seconds: 12,
+                width: 640,
+                height: 360,
+                media: MediaRef::fake(MediaClass::Video, id),
+                note,
+                thumbnail: Some(PIXEL_PNG.to_vec()),
+            }),
+            ..message(chat, id, "[video]", 4)
+        }
+    }
+
+    /// A video row has a handle, its length, its size, and its thumbnail as
+    /// the photo. It keeps its label. A round video message is a note. A
+    /// thumbnail that is not an image gives no photo, and the video stays.
+    #[test]
+    fn a_video_row_has_a_handle_and_its_thumbnail() {
+        let chat = "111@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        let mut bad = video_message(chat, "v3", false);
+        if let Some(video) = bad.video.as_mut() {
+            video.thumbnail = Some(b"not an image".to_vec());
+            video.seconds = 0;
+        }
+        let events = inbox.apply_messages(vec![
+            video_message(chat, "v1", false),
+            video_message(chat, "v2", true),
+            bad,
+        ]);
+        let row = received_id(&events, "v1").expect("video row");
+        assert_eq!(row.body, "[video]");
+        let video = row.video.expect("video");
+        assert_eq!(video.duration_secs(), 12);
+        assert_eq!(video.size(), (640, 360));
+        assert_eq!(video.file_id(), voice_file_id(chat, "v1"));
+        assert!(!video.is_note());
+        assert!(video.file().is_none());
+        let photo = row.photo.expect("the thumbnail");
+        assert_eq!((photo.width, photo.height), (640, 360));
+        assert_eq!(
+            photo.sizes[0].bytes.as_ref().map(ImageBytes::as_slice),
+            Some(PIXEL_PNG.as_slice())
+        );
+        assert!(
+            received_id(&events, "v2")
+                .and_then(|row| row.video)
+                .expect("note")
+                .is_note()
+        );
+        let plain = received_id(&events, "v3").expect("row");
+        assert!(plain.photo.is_none());
+        assert!(plain.video.is_some());
+        // A video is not a sticker: nothing downloads before Play.
+        assert!(inbox.media_requests(&events, true).is_empty());
+        assert!(inbox.video_media(video.file_id()).is_some());
+        assert!(inbox.voice_media(video.file_id()).is_none());
+        assert!(
+            inbox
+                .video_media(video.file_id().wrapping_add(1).max(1))
+                .is_none()
+        );
+        let debug = format!("{:?}", video_message(chat, "v1", false).video);
+        assert!(!debug.contains("/fake/"), "{debug}");
+    }
+
+    /// The chat cache keeps the media references. After a restart, a
+    /// sticker row asks for its image again, and a voice note and a video
+    /// keep their handles. A row of an older cache, with no reference,
+    /// still reads.
+    #[test]
+    fn the_media_of_a_message_survives_the_disk_cache() {
+        let chat = "111@s.whatsapp.net";
+        let mut inbox = Inbox::default();
+        let voice = WaMessage {
+            voice: Some(Voice {
+                seconds: 7,
+                media: MediaRef::fake(MediaClass::Audio, "a1"),
+            }),
+            ..message(chat, "a1", "[voice message]", 2)
+        };
+        let _ = inbox.apply_messages(vec![
+            sticker_message(chat, "s1", 1),
+            voice,
+            video_message(chat, "v1", true),
+        ]);
+        let changes = inbox.changes(&SavedHashes::default());
+        let (_, _, saved) = &changes.chats[0];
+        let json = serde_json::to_string(saved).expect("json");
+        assert!(json.contains("\"media_key\":\"AQEB"), "one base64 string");
+        let loaded: SavedChat = serde_json::from_str(&json).expect("reads back");
+        assert_eq!(&loaded, saved);
+
+        let mut restored = Inbox::default();
+        let hashes = restored.restore(SavedInbox {
+            chats: vec![(chat.to_string(), loaded)],
+            ..SavedInbox::default()
+        });
+        assert!(restored.changes(&hashes).is_empty(), "restored = saved");
+        let opened = restored.open_chat(chat).expect("open");
+        let requests = restored.media_requests(&opened, true);
+        assert_eq!(requests.len(), 1, "the sticker asks for its image");
+        assert_eq!(requests[0].id, "s1");
+        assert_eq!(requests[0].media.class, MediaClass::Sticker);
+        let audio = received_id(&opened, "a1").and_then(|row| row.audio);
+        assert_eq!(audio.expect("audio").file_id(), voice_file_id(chat, "a1"));
+        let video = received_id(&opened, "v1").and_then(|row| row.video);
+        let video = video.expect("video");
+        assert!(video.is_note());
+        assert!(restored.video_media(video.file_id()).is_some());
+        assert!(received_id(&opened, "v1").expect("row").photo.is_some());
+
+        let old = r#"{"id":"m1","from_me":false,"sender_name":null,"sender_jid":null,"body":"[sticker]","timestamp":1}"#;
+        let old: SavedMessage = serde_json::from_str(old).expect("an older row");
+        assert!(old.sticker.is_none() && old.voice.is_none() && old.video.is_none());
+    }
+
+    /// A failed or too large download keeps the label. It asks again when
+    /// the chat opens again, a few times at most. A live row does not ask
+    /// again. A text message never asks.
     #[test]
     fn a_failed_sticker_download_keeps_the_label() {
         let mut inbox = Inbox::default();
@@ -2451,7 +2755,21 @@ pub(super) mod tests {
         );
         let opened = inbox.open_chat(chat).expect("open");
         assert_eq!(received_id(&opened, "s1").expect("row").body, "[sticker]");
-        assert!(inbox.media_requests(&opened, true).is_empty());
+        assert!(
+            inbox.media_requests(&opened, false).is_empty(),
+            "only an open chat asks again"
+        );
+        for _ in 1..MEDIA_TRIES {
+            let again = inbox.media_requests(&opened, true);
+            assert_eq!(again.len(), 2, "an open chat asks again");
+            assert!(inbox.media_requests(&opened, true).is_empty(), "it runs");
+            assert_eq!(inbox.finish_media(chat, "s1", None), None);
+            assert_eq!(inbox.finish_media(chat, "s2", None), None);
+        }
+        assert!(
+            inbox.media_requests(&opened, true).is_empty(),
+            "the last try failed: no more downloads in this run"
+        );
         // A result after a reset is dropped.
         inbox.clear();
         assert_eq!(inbox.finish_media(chat, "s1", Some(vec![1])), None);

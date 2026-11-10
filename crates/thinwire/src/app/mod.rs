@@ -4,6 +4,7 @@ mod a11y;
 mod attach;
 mod audio;
 mod auth;
+mod chat_details;
 mod dock;
 mod files;
 mod forward;

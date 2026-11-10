@@ -26,7 +26,6 @@ use super::api::{
 use super::audio::{FilesHostUrl, IncomingFile};
 use super::install::SlackInstalledWorkspace;
 use super::morphism::{oauth_v2_access_request, workspace_bot_token};
-use crate::voice_files::VOICE_MAX_BYTES;
 
 /// Retries after Slack sends `Retry-After`. The library retries only when this is set.
 const RATE_LIMIT_RETRIES: usize = 3;
@@ -439,7 +438,12 @@ impl SlackWebApi for MorphismWebApi {
             .unwrap_or_else(|| user.id.to_string()))
     }
 
-    async fn read_file(&self, token: &SlackBotToken, url: &FilesHostUrl) -> Result<FileRead, ()> {
+    async fn read_file(
+        &self,
+        token: &SlackBotToken,
+        url: &FilesHostUrl,
+        max_bytes: usize,
+    ) -> Result<FileRead, ()> {
         let uri: hyper::Uri = url.as_str().parse().map_err(|_| ())?;
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_provider_and_native_roots(rustls::crypto::ring::default_provider())
@@ -463,7 +467,7 @@ impl SlackWebApi for MorphismWebApi {
             let response = client.request(request).await.map_err(|_| ())?;
             let status = response.status().as_u16();
             let cap = if status == 200 {
-                VOICE_MAX_BYTES
+                max_bytes
             } else {
                 ERROR_BODY_MAX
             };

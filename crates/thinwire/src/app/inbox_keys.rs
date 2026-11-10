@@ -1403,6 +1403,34 @@ fn a_person_who_types_shows_over_the_compose_field() {
     assert!(!harness.state().settings.person_colors());
 }
 
+/// A click on the picture in the thread header shows the details of the
+/// chat. The box mutes the chat in thinwire. Esc and Close close it.
+#[test]
+fn the_header_picture_opens_the_chat_details() {
+    let mut state = InboxUi::ready();
+    state.snapshot.select_conversation("telegram:1".into());
+    let mut harness = harness(state);
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Mute in thinwire").is_none());
+    harness.get_by_label("Chat details").click();
+    harness.run_steps(3);
+    harness.get_by_label("Person · Telegram");
+    harness.get_by_label("Notifications are on.");
+    harness.get_by_label("Mute in thinwire").click();
+    harness.run_steps(3);
+    harness.run_steps(3);
+    harness.get_by_label("Muted in thinwire.");
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Mute in thinwire").is_none());
+
+    harness.get_by_label("Chat details").click();
+    harness.run_steps(3);
+    harness.get_by_label("Close").click();
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Mute in thinwire").is_none());
+}
+
 /// The name of a node as a Linux screen reader reads it: AT-SPI takes the
 /// name of a `Label` from its value.
 fn atspi_name(node: &egui_kittest::Node<'_>) -> Option<String> {

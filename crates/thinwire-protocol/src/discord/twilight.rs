@@ -171,6 +171,35 @@ fn message_summary(message: Message) -> MessageSummary {
         .map(|attachment| super::api::ImageSummary {
             url: attachment.url.clone(),
         });
+    let side = |value: Option<u64>| {
+        value
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0)
+    };
+    let video = message
+        .attachments
+        .iter()
+        .find(|attachment| {
+            attachment
+                .content_type
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("video/"))
+                && usize::try_from(attachment.size)
+                    .is_ok_and(|size| size <= crate::voice_files::VIDEO_MAX_BYTES)
+        })
+        .map(|attachment| super::api::VideoSummary {
+            url: attachment.url.clone(),
+            duration_secs: whole_seconds(attachment.duration_secs),
+            width: side(attachment.width),
+            height: side(attachment.height),
+        });
+    let sticker = message
+        .sticker_items
+        .first()
+        .map(|sticker| super::api::StickerSummary {
+            id: sticker.id.get(),
+            format: sticker_format(sticker.format_type),
+        });
     for attachment in &message.attachments {
         if attachment
             .content_type
@@ -217,9 +246,24 @@ fn message_summary(message: Message) -> MessageSummary {
         stickers: message.sticker_items.len(),
         audio,
         image,
+        video,
+        sticker,
         reactions,
         reply_to,
         edited: message.edited_timestamp.is_some(),
+    }
+}
+
+fn sticker_format(
+    format: twilight_model::channel::message::sticker::StickerFormatType,
+) -> super::api::StickerFormat {
+    use twilight_model::channel::message::sticker::StickerFormatType;
+    match format {
+        StickerFormatType::Png => super::api::StickerFormat::Png,
+        StickerFormatType::Apng => super::api::StickerFormat::Apng,
+        StickerFormatType::Lottie => super::api::StickerFormat::Lottie,
+        StickerFormatType::Gif => super::api::StickerFormat::Gif,
+        _ => super::api::StickerFormat::Other,
     }
 }
 
@@ -359,8 +403,8 @@ impl DiscordApi for TwilightApi {
         })
     }
 
-    fn download(&self, url: String) -> ApiFuture<'_, Vec<u8>> {
-        Box::pin(async move { super::download::fetch(&url).await })
+    fn download(&self, url: String, max_bytes: usize) -> ApiFuture<'_, Vec<u8>> {
+        Box::pin(async move { super::download::fetch(&url, max_bytes).await })
     }
 
     fn send(

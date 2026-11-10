@@ -745,6 +745,12 @@ impl Supervisor {
                     stop: crate::media::VoiceStop::Unplayable,
                 });
             }
+            WireCommand::DownloadVideo { file_id } => {
+                let _ = self.events.send(AdapterEvent::VideoFailed {
+                    protocol,
+                    file_id: *file_id,
+                });
+            }
             // A start that failed: `launch` reported it.
             WireCommand::AcknowledgeGate | WireCommand::BeginLink { .. } => {}
             // The helper is not running. Do not start it: a start would

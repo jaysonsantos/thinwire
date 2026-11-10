@@ -58,6 +58,8 @@ struct ApiState {
     next_ts: u64,
     file_script: VecDeque<(u16, Vec<u8>)>,
     file_calls: u32,
+    /// The size limit of each file read, in call order.
+    file_caps: Vec<usize>,
     file_started: Option<oneshot::Sender<()>>,
     file_hold: Option<oneshot::Receiver<()>>,
 }
@@ -284,11 +286,17 @@ impl SlackWebApi for FakeApi {
         })
     }
 
-    async fn read_file(&self, token: &SlackBotToken, url: &FilesHostUrl) -> Result<FileRead, ()> {
+    async fn read_file(
+        &self,
+        token: &SlackBotToken,
+        url: &FilesHostUrl,
+        max_bytes: usize,
+    ) -> Result<FileRead, ()> {
         Self::check_token(token);
         let _ = url;
         let (started, hold, queued) = self.with(|state| {
             state.file_calls += 1;
+            state.file_caps.push(max_bytes);
             (
                 state.file_started.take(),
                 state.file_hold.take(),
@@ -302,6 +310,10 @@ impl SlackWebApi for FakeApi {
             let _ = hold.await;
         }
         let (status, body) = queued.unwrap_or((404, Vec::new()));
+        // The live client refuses a file that is larger than the limit.
+        if status == 200 && body.len() > max_bytes {
+            return Err(());
+        }
         Ok(FileRead { status, body })
     }
 }
@@ -3288,6 +3300,118 @@ async fn a_scripted_audio_file_is_ready_for_the_player() {
     assert_eq!(stored, b"ID3-slack");
     assert!(quiet(&h.seen));
     assert_eq!(h.api.with(|state| state.file_calls), 1);
+}
+
+const VIDEO_URL: &str = "https://files.slack.com/files-pri/T1/F8/download/lake.mp4";
+
+fn seed_video(api: &FakeApi, ts: &str, text: &str) {
+    api.with(|state| {
+        let mut row = post("C1", ts, "U1", text);
+        row.files.push(IncomingFile {
+            mimetype: "video/mp4".into(),
+            filetype: "mp4".into(),
+            name: "lake.mp4".into(),
+            url: FilesHostUrl::parse(VIDEO_URL),
+        });
+        state
+            .history
+            .entry("C1".into())
+            .or_default()
+            .posts
+            .insert(0, row);
+    });
+}
+
+async fn shown_video(h: &mut Harness) -> i32 {
+    h.start();
+    h.status(AdapterStatus::Ready).await;
+    h.send(AdapterCommand::OpenChat {
+        protocol: ProtocolId::Slack,
+        conversation_id: "slack:C1".into(),
+    });
+    let message = h.message("[video]").await;
+    assert!(message.audio.is_none(), "a video file is not audio");
+    assert!(message.photo.is_none(), "the Slack model has no thumbnail");
+    let clip = message.video.expect("clip");
+    assert!(!clip.is_note());
+    clip.file_id()
+}
+
+/// A video file of a message is a clip. Play reads it with the bot token
+/// and the video limit, and stores it for the player.
+#[tokio::test]
+async fn a_scripted_video_file_is_ready_for_the_player() {
+    let api = FakeApi::workspace();
+    seed_video(&api, "1700000019.000900", "");
+    api.with(|state| {
+        state.file_script.push_back((200, b"ftyp-slack".to_vec()));
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    let file_id = shown_video(&mut h).await;
+    h.send(AdapterCommand::DownloadVideo {
+        protocol: ProtocolId::Slack,
+        file_id,
+    });
+    let event = h
+        .until("video ready", |event| {
+            matches!(event, AdapterEvent::VideoReady { file_id: seen, .. } if *seen == file_id)
+        })
+        .await;
+    let AdapterEvent::VideoReady { path, .. } = event else {
+        unreachable!("video ready");
+    };
+    assert!(path.as_path().is_absolute());
+    let stored = std::fs::read(path.as_path()).expect("stored video");
+    assert_eq!(stored, b"ftyp-slack");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file = std::fs::metadata(path.as_path()).expect("file");
+        assert_eq!(file.permissions().mode() & 0o777, 0o600);
+    }
+    assert!(quiet(&h.seen));
+    assert_eq!(
+        h.api.with(|state| state.file_caps.clone()),
+        vec![crate::voice_files::VIDEO_MAX_BYTES]
+    );
+}
+
+/// A video that Slack does not give, and a handle with no row, fail. A
+/// failure is `VideoFailed`, not a voice event.
+#[tokio::test]
+async fn a_video_that_does_not_download_fails() {
+    let api = FakeApi::workspace();
+    seed_video(&api, "1700000020.000900", "");
+    api.with(|state| {
+        state.file_script.push_back((403, b"nope".to_vec()));
+    });
+    let mut h = Harness::new(api, installed_vault(), true);
+    let file_id = shown_video(&mut h).await;
+    h.send(AdapterCommand::DownloadVideo {
+        protocol: ProtocolId::Slack,
+        file_id,
+    });
+    h.until("video failed", |event| {
+        matches!(event, AdapterEvent::VideoFailed { file_id: seen, .. } if *seen == file_id)
+    })
+    .await;
+    assert_eq!(h.api.with(|state| state.file_calls), 1);
+    let unknown = file_id.wrapping_add(1).max(1);
+    h.send(AdapterCommand::DownloadVideo {
+        protocol: ProtocolId::Slack,
+        file_id: unknown,
+    });
+    h.until("unknown handle", |event| {
+        matches!(event, AdapterEvent::VideoFailed { file_id: seen, .. } if *seen == unknown)
+    })
+    .await;
+    assert_eq!(h.api.with(|state| state.file_calls), 1, "no read");
+    assert!(
+        h.seen
+            .iter()
+            .all(|event| !matches!(event, AdapterEvent::VoiceFailed { .. })),
+        "a video failure is not a voice failure"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

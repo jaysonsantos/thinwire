@@ -165,6 +165,8 @@ pub(super) enum WorkerJob {
     Viewed(Option<String>),
     /// Download the audio of this handle for the player.
     Voice(i32),
+    /// Download the video of this handle for the player.
+    Video(i32),
     /// Set or remove the reaction of this account on one message.
     React {
         conversation_id: String,
@@ -401,6 +403,11 @@ impl Session {
     /// Queue the download of the audio `file_id`. `false`: no worker runs.
     pub(super) fn request_voice(&self, file_id: i32) -> bool {
         self.enqueue(WorkerJob::Voice(file_id))
+    }
+
+    /// Queue the download of the video `file_id`. `false`: no worker runs.
+    pub(super) fn request_video(&self, file_id: i32) -> bool {
+        self.enqueue(WorkerJob::Video(file_id))
     }
 
     /// Queue a reaction of this account. `false`: no worker runs.
@@ -2324,6 +2331,9 @@ async fn run_linked(
             Some(WorkerJob::Voice(file_id)) => {
                 download_voice(&manager, &session, token, &events, file_id);
             }
+            Some(WorkerJob::Video(file_id)) => {
+                download_video(&manager, &session, token, &events, file_id);
+            }
             Some(WorkerJob::Unlink(done)) => {
                 // Presage sends the delete of this device on the identified
                 // connection. The wait has a bound: the unlink of the user
@@ -3895,6 +3905,20 @@ fn preview_url(content: &Content) -> Option<&str> {
         .find(|url| !url.trim().is_empty())
 }
 
+/// The data message of `content`: of a message to this account, or of a
+/// transcript of a message that this account sent from another device.
+fn data_of(content: &Content) -> Option<&presage::libsignal_service::proto::DataMessage> {
+    use presage::libsignal_service::proto::sync_message::Content as SyncContent;
+    match &content.body {
+        ContentBody::DataMessage(data) => Some(data),
+        ContentBody::SynchronizeMessage(sync) => match sync.content.as_ref() {
+            Some(SyncContent::Sent(sent)) => sent.message.as_ref(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn sent_sync_parts(
     sync: &presage::libsignal_service::proto::SyncMessage,
 ) -> (Option<&str>, &[presage::proto::AttachmentPointer]) {
@@ -4054,12 +4078,22 @@ fn row_and_message(
         }
         _ => (None, &[][..], false),
     };
-    // A message with no text shows the label of its first attachment. A
-    // message with only a link preview shows the address of the preview.
+    // A message with no text shows the label of its first attachment, or of
+    // its sticker. A message with only a link preview shows the address of
+    // the preview.
     let caption = text.filter(|text| !text.trim().is_empty());
+    let data = data_of(content);
+    let sticker = data
+        .and_then(|data| data.sticker.as_ref())
+        .and_then(|sticker| sticker.data.as_ref());
+    // View-once media shows one time on the phone. It does not download
+    // here, and the row keeps the label.
+    let view_once = data.is_some_and(|data| data.is_view_once == Some(true));
+    let has_sticker = data.is_some_and(|data| data.sticker.is_some());
     let label = attachments
         .first()
-        .map(|pointer| super::media::label(super::media::kind(pointer)));
+        .map(|pointer| super::media::label(super::media::kind(pointer)))
+        .or_else(|| has_sticker.then_some(super::media::STICKER_LABEL));
     let body = caption.or(label).or_else(|| preview_url(content));
     let incoming = match &content.body {
         ContentBody::DataMessage(_) => super::message::Incoming::Data(body),
@@ -4120,8 +4154,10 @@ fn row_and_message(
         reply_to: quote_of(content),
         edited: false,
     };
-    if let Some(media) = media {
-        media.dress(&mut message, attachments, caption);
+    if let Some(media) = media
+        && !view_once
+    {
+        media.dress(&mut message, attachments, caption, sticker);
     }
     let conversation = Conversation {
         protocol: ProtocolId::Signal,
@@ -4732,7 +4768,8 @@ fn start_photo_downloads(
             let bytes = manager.get_attachment(&job.pointer).await.ok();
             let photo = match bytes {
                 Some(bytes) => {
-                    tokio::task::spawn_blocking(move || super::media::photo_from_bytes(&bytes))
+                    let decode = job.clone();
+                    tokio::task::spawn_blocking(move || decode.photo(&bytes))
                         .await
                         .ok()
                         .flatten()
@@ -4804,6 +4841,90 @@ fn download_voice(
             }
         }
     });
+}
+
+/// Download the video `file_id` into the video folder. The answer is
+/// `VideoReady`, or `VideoFailed` when no row has the handle, or when the
+/// download or the write failed. A file of an earlier download of this run
+/// answers at once. A second request for a video that downloads now gets
+/// the answer of the first.
+fn download_video(
+    manager: &Manager<SqliteStore, Registered>,
+    session: &Arc<Session>,
+    token: u64,
+    events: &EventTx,
+    file_id: i32,
+) {
+    let failed = move |events: &EventTx| {
+        let _ = events.send(AdapterEvent::VideoFailed {
+            protocol: ProtocolId::Signal,
+            file_id,
+        });
+    };
+    let (Some(pointer), Ok(dir)) = (session.media().video(file_id), super::path::video_dir())
+    else {
+        failed(events);
+        return;
+    };
+    if !session.media().start_video(file_id) {
+        return;
+    }
+    let manager = manager.clone();
+    let session = Arc::clone(session);
+    let events = events.clone();
+    tokio::spawn(async move {
+        let _permit = Arc::clone(&session.downloads).acquire_owned().await.ok();
+        let stored = store_video(&dir, file_id, || async {
+            manager.get_attachment(&pointer).await.map_err(|_| ())
+        })
+        .await;
+        session.media().end_video(file_id);
+        if !session.is_current(token) {
+            return;
+        }
+        match stored {
+            Ok(path) => {
+                let _ = events.send(AdapterEvent::VideoReady {
+                    protocol: ProtocolId::Signal,
+                    file_id,
+                    path,
+                });
+            }
+            Err(()) => {
+                tracing::debug!("a signal video did not download");
+                failed(&events);
+            }
+        }
+    });
+}
+
+/// The file of the video `file_id` in `dir`: the file of an earlier
+/// download, else the bytes of `fetch`, written as a private file.
+async fn store_video<Fetch, Fetched>(
+    dir: &Path,
+    file_id: i32,
+    fetch: Fetch,
+) -> Result<thinwire_protocol::AudioPath, ()>
+where
+    Fetch: FnOnce() -> Fetched,
+    Fetched: Future<Output = Result<Vec<u8>, ()>>,
+{
+    let folder = dir.to_path_buf();
+    let known = tokio::task::spawn_blocking(move || {
+        thinwire_protocol::voice_files::stored_video(&folder, file_id)
+    })
+    .await
+    .map_err(|_| ())?;
+    if let Some(path) = known {
+        return Ok(path);
+    }
+    let bytes = fetch().await?;
+    let folder = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        thinwire_protocol::voice_files::store_video(&folder, file_id, &bytes).map_err(|_| ())
+    })
+    .await
+    .map_err(|_| ())?
 }
 
 fn fail(events: &EventTx, detail: &str) {
@@ -5289,6 +5410,156 @@ mod tests {
             .is_none(),
             "no text and no attachment stays hidden"
         );
+    }
+
+    /// A video row has a handle and keeps its label. A GIF is a video. A
+    /// sticker message is a row with "[sticker]", and its image waits for
+    /// its chat. Before this change a sticker message did not show at all.
+    /// A message that this account sent from the phone shows the same way.
+    #[test]
+    fn a_video_and_a_sticker_message_show_with_their_media() {
+        use presage::libsignal_service::proto::SyncMessage;
+        use presage::libsignal_service::proto::data_message::Sticker;
+        use presage::libsignal_service::proto::sync_message::{Content as SyncContent, Sent};
+
+        let attachment = |content_type: &str, flags: u32| presage::proto::AttachmentPointer {
+            content_type: Some(content_type.into()),
+            flags: Some(flags),
+            size: Some(1_000),
+            width: Some(640),
+            height: Some(360),
+            ..Default::default()
+        };
+        let book = super::super::media::MediaBook::default();
+        let names = HashMap::new();
+        let row = |content: &Content| {
+            row_and_message(
+                content,
+                &names,
+                &HashMap::new(),
+                thinwire_protocol::Arrival::Live,
+                Some(&book),
+            )
+        };
+        for (flags, label) in [(0, "[video]"), (8, "[GIF]")] {
+            let clip = envelope(
+                Uuid::from_u128(7),
+                DataMessage {
+                    timestamp: Some(1_000 + u64::from(flags)),
+                    attachments: vec![attachment("video/mp4", flags)],
+                    ..Default::default()
+                },
+            );
+            let (conversation, message) = row(&clip).expect("a row");
+            assert_eq!(message.body, label);
+            assert_eq!(conversation.preview, label);
+            let video = message.video.expect("video");
+            assert_eq!(video.size(), (640, 360));
+            assert!(!video.is_note());
+            assert!(book.video(video.file_id()).is_some());
+        }
+
+        let sticker = || DataMessage {
+            sticker: Some(Sticker {
+                data: Some(attachment("image/webp", 0)),
+                emoji: Some("🙂".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let received = envelope(Uuid::from_u128(7), sticker());
+        let (conversation, message) = row(&received).expect("a sticker row");
+        assert_eq!(message.body, "[sticker]");
+        assert_eq!(conversation.preview, "[sticker]");
+        assert!(!message.outbound);
+        let jobs = book.take_jobs(&message.conversation_id);
+        assert_eq!(jobs.len(), 1, "the sticker image waits for its chat");
+        assert!(jobs[0].sticker);
+
+        let mut sent = envelope(Uuid::from_u128(7), DataMessage::default());
+        sent.body = ContentBody::SynchronizeMessage(SyncMessage {
+            content: Some(SyncContent::Sent(Sent {
+                message: Some(sticker()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let (_, message) = row(&sent).expect("a sent sticker row");
+        assert_eq!(message.body, "[sticker]");
+        assert!(message.outbound);
+    }
+
+    /// View-once media does not download and does not show: the row keeps
+    /// its label, with no photo, no video, and no handle.
+    #[test]
+    fn view_once_media_keeps_its_label() {
+        let attachment = |content_type: &str| presage::proto::AttachmentPointer {
+            content_type: Some(content_type.into()),
+            size: Some(1_000),
+            ..Default::default()
+        };
+        let book = super::super::media::MediaBook::default();
+        let names = HashMap::new();
+        for (content_type, label) in [("image/jpeg", "[photo]"), ("video/mp4", "[video]")] {
+            let once = envelope(
+                Uuid::from_u128(7),
+                DataMessage {
+                    attachments: vec![attachment(content_type)],
+                    is_view_once: Some(true),
+                    ..Default::default()
+                },
+            );
+            let (_, message) = row_and_message(
+                &once,
+                &names,
+                &HashMap::new(),
+                thinwire_protocol::Arrival::Live,
+                Some(&book),
+            )
+            .expect("a row");
+            assert_eq!(message.body, label);
+            assert!(message.photo.is_none() && message.video.is_none());
+            assert!(book.take_jobs(&message.conversation_id).is_empty());
+            assert!(
+                book.video(super::super::media::voice_file_id(&message.id))
+                    .is_none()
+            );
+        }
+    }
+
+    /// A video download writes a private file in the video folder and
+    /// gives its absolute path. The next request finds that file and does
+    /// not download again. A download that fails leaves no file.
+    #[tokio::test]
+    async fn a_video_download_writes_one_private_file() {
+        let dir =
+            std::env::temp_dir().join(format!("thinwire-signal-video-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = store_video(&dir, 7, || async { Ok(b"ftyp-video".to_vec()) })
+            .await
+            .expect("stored");
+        assert!(path.as_path().is_absolute());
+        assert_eq!(std::fs::read(path.as_path()).expect("file"), b"ftyp-video");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file = std::fs::metadata(path.as_path()).expect("file");
+            assert_eq!(file.permissions().mode() & 0o777, 0o600);
+            let folder = std::fs::metadata(&dir).expect("folder");
+            assert_eq!(folder.permissions().mode() & 0o777, 0o700);
+        }
+        let again = store_video(&dir, 7, || async { panic!("no second download") })
+            .await
+            .expect("the same file");
+        assert_eq!(again, path);
+        assert!(store_video(&dir, 8, || async { Err(()) }).await.is_err());
+        assert!(
+            store_video(&dir, 9, || async { Ok(Vec::new()) })
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&dir).expect("folder").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn events_of(end: LinkedEnd) -> Vec<AdapterEvent> {

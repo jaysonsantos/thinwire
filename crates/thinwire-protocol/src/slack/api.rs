@@ -322,12 +322,14 @@ pub trait SlackWebApi: Send + Sync + 'static {
         user: &str,
     ) -> impl Future<Output = Result<String, SlackApiError>> + Send;
 
-    /// GET one `files.slack.com` address. A transport failure is `Err`.
-    /// The status and the body are otherwise returned as Slack sent them.
+    /// GET one `files.slack.com` address. A transport failure is `Err`, and
+    /// a file larger than `max_bytes` is `Err`. The status and the body are
+    /// otherwise returned as Slack sent them.
     fn read_file<'a>(
         &'a self,
         token: &'a SlackBotToken,
         url: &'a FilesHostUrl,
+        max_bytes: usize,
     ) -> impl Future<Output = Result<FileRead, ()>> + Send;
 }
 

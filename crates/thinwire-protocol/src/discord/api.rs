@@ -76,6 +76,10 @@ pub(crate) struct MessageSummary {
     pub audio: Option<AudioSummary>,
     /// The CDN address of the first image attachment. The row shows it.
     pub image: Option<ImageSummary>,
+    /// The first video attachment that the player can download.
+    pub video: Option<VideoSummary>,
+    /// The first sticker. `stickers` counts all of them.
+    pub sticker: Option<StickerSummary>,
     /// The Unicode emoji reactions. A custom emoji is not shown.
     pub reactions: Vec<crate::Reaction>,
     /// The message that this one replies to.
@@ -93,6 +97,61 @@ pub(crate) struct ImageSummary {
 impl std::fmt::Debug for ImageSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ImageSummary(..)")
+    }
+}
+
+/// A video attachment of a message. `Debug` shows no URL.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct VideoSummary {
+    /// The CDN address of the file.
+    pub url: String,
+    /// Zero when Discord does not say.
+    pub duration_secs: u32,
+    /// Pixel size. Zero when Discord does not say.
+    pub width: u32,
+    pub height: u32,
+}
+
+impl std::fmt::Debug for VideoSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoSummary")
+            .field("duration_secs", &self.duration_secs)
+            .field("size", &(self.width, self.height))
+            .finish_non_exhaustive()
+    }
+}
+
+/// A sticker of a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StickerSummary {
+    pub id: u64,
+    pub format: StickerFormat,
+}
+
+/// The file format of a Discord sticker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StickerFormat {
+    Png,
+    /// An animated PNG. The app shows its first frame.
+    Apng,
+    /// A vector animation. The app does not draw it.
+    Lottie,
+    /// The image decoder of this build does not read GIF.
+    Gif,
+    Other,
+}
+
+impl StickerSummary {
+    /// The address of the sticker image on the Discord CDN. `None` for a
+    /// format that the app does not draw.
+    pub(crate) fn image_url(self) -> Option<String> {
+        match self.format {
+            StickerFormat::Png | StickerFormat::Apng => Some(format!(
+                "https://cdn.discordapp.com/stickers/{}.png",
+                self.id
+            )),
+            StickerFormat::Lottie | StickerFormat::Gif | StickerFormat::Other => None,
+        }
     }
 }
 
@@ -224,9 +283,9 @@ pub(crate) trait DiscordApi: Send + Sync {
         files: Vec<UploadFile>,
     ) -> ApiFuture<'_, MessageSummary>;
 
-    /// Download one attachment from the Discord CDN. A client with no HTTP
-    /// download refuses.
-    fn download(&self, _url: String) -> ApiFuture<'_, Vec<u8>> {
+    /// Download one file from the Discord CDN. A body larger than
+    /// `max_bytes` is an error. A client with no HTTP download refuses.
+    fn download(&self, _url: String, _max_bytes: usize) -> ApiFuture<'_, Vec<u8>> {
         Box::pin(async { Err(DiscordApiError::Transport) })
     }
 

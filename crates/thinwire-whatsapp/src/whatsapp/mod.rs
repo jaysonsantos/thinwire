@@ -1048,6 +1048,13 @@ impl ProtocolAdapter for WhatsAppAdapter {
                 self.session.download_voice(file_id, events);
                 Ok(())
             }
+            AdapterCommand::DownloadVideo {
+                protocol: ProtocolId::WhatsApp,
+                file_id,
+            } => {
+                self.session.download_video(file_id, events);
+                Ok(())
+            }
             AdapterCommand::Disconnect {
                 protocol: ProtocolId::WhatsApp,
             }

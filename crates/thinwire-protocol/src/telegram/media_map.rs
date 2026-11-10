@@ -1,4 +1,5 @@
-//! Turn a TDLib message into a caption, links, a photo, a voice note, or a document.
+//! Turn a TDLib message into a caption, links, a photo, a voice note, a clip,
+//! a sticker, or a document.
 //!
 //! Offsets from TDLib are UTF-16. [`crate::links_in`] stores UTF-8 indexes.
 
@@ -56,7 +57,15 @@ pub(super) fn map_content(content: &tdlib_rs::enums::MessageContent) -> Mapped {
                 scan,
             }
         }
-        tdlib_rs::enums::MessageContent::MessageSticker(_) => label("Sticker"),
+        tdlib_rs::enums::MessageContent::MessageSticker(message) => map_sticker(&message.sticker),
+        // Telegram draws one emoji as an animation. The app draws the emoji
+        // itself, large.
+        tdlib_rs::enums::MessageContent::MessageAnimatedEmoji(message)
+            if !message.emoji.trim().is_empty() =>
+        {
+            label(message.emoji.trim())
+        }
+        tdlib_rs::enums::MessageContent::MessageDice(dice) => map_dice(dice),
         tdlib_rs::enums::MessageContent::MessageVideo(message) => map_clip(
             &Clip {
                 label: "Video",
@@ -121,6 +130,122 @@ fn label(text: &str) -> Mapped {
         video: None,
         file: None,
         scan: false,
+    }
+}
+
+/// The longest side of a sticker in its row, in pixels. A photo fills a
+/// larger box.
+const STICKER_SIDE: u32 = 192;
+
+/// `true` for a thumbnail that the app draws as an image.
+fn is_image(format: &tdlib_rs::enums::ThumbnailFormat) -> bool {
+    matches!(
+        format,
+        tdlib_rs::enums::ThumbnailFormat::Jpeg
+            | tdlib_rs::enums::ThumbnailFormat::Png
+            | tdlib_rs::enums::ThumbnailFormat::Webp
+    )
+}
+
+/// A sticker. A static sticker is a WebP image: the row shows its file. An
+/// animated sticker (TGS) and a video sticker (WebM) show their thumbnail.
+/// A video sticker is also a clip that plays in its row. The emoji of the
+/// sticker is the text of the row. A sticker with no image that the app
+/// draws keeps the label "Sticker".
+fn map_sticker(sticker: &tdlib_rs::types::Sticker) -> Mapped {
+    let emoji = sticker.emoji.trim();
+    let named = if emoji.is_empty() {
+        "Sticker".to_string()
+    } else {
+        format!("{emoji} Sticker")
+    };
+    let mut mapped = label(&named);
+    let size = |value: i32| u32::try_from(value).unwrap_or(0);
+    let mut sizes: Vec<PhotoSize> = sticker
+        .thumbnail
+        .as_ref()
+        .filter(|thumbnail| is_image(&thumbnail.format))
+        .map(|thumbnail| PhotoSize {
+            width: size(thumbnail.width),
+            height: size(thumbnail.height),
+            file_id: (thumbnail.file.id > 0).then_some(thumbnail.file.id),
+            path: local_path(&thumbnail.file, false),
+            bytes: None,
+        })
+        .into_iter()
+        .collect();
+    let (width, height) = (size(sticker.width), size(sticker.height));
+    if matches!(sticker.format, tdlib_rs::enums::StickerFormat::Webp) && sticker.sticker.id > 0 {
+        sizes.push(PhotoSize {
+            width,
+            height,
+            file_id: Some(sticker.sticker.id),
+            path: local_path(&sticker.sticker, false),
+            bytes: None,
+        });
+    }
+    sizes.retain(|size| size.file_id.is_some() || size.path.is_some());
+    let (box_width, box_height) = sticker_box(width, height, &sizes);
+    if matches!(sticker.format, tdlib_rs::enums::StickerFormat::Webm) {
+        let local = sticker
+            .sticker
+            .local
+            .is_downloading_completed
+            .then(|| AudioPath::new(sticker.sticker.local.path.clone()))
+            .flatten();
+        // The clip has the size of the row picture, so the row does not
+        // move when the clip plays in the place of the thumbnail.
+        mapped.video = MessageVideo::new(0, box_width, box_height, sticker.sticker.id, local)
+            .map(MessageVideo::into_note);
+    }
+    if sizes.is_empty() {
+        return mapped;
+    }
+    mapped.photo = Some(MessagePhoto {
+        width: box_width,
+        height: box_height,
+        mini: None,
+        sizes,
+        has_spoiler: false,
+        is_secret: false,
+        failed: false,
+    });
+    // The image shows the sticker: only its emoji stays as the text.
+    mapped.text = emoji.to_string();
+    mapped
+}
+
+/// The size of the row picture of a sticker: its shape, with the longest
+/// side at [`STICKER_SIDE`] at most. A sticker with no size has the shape of
+/// its largest image.
+fn sticker_box(width: u32, height: u32, sizes: &[PhotoSize]) -> (u32, u32) {
+    let (width, height) = if width > 0 && height > 0 {
+        (width, height)
+    } else {
+        sizes
+            .iter()
+            .max_by_key(|size| u64::from(size.width) * u64::from(size.height))
+            .map_or((0, 0), |size| (size.width, size.height))
+    };
+    let long = width.max(height);
+    if long <= STICKER_SIDE {
+        return (width, height);
+    }
+    let scale = |side: u32| {
+        let scaled = u64::from(side) * u64::from(STICKER_SIDE) / u64::from(long);
+        u32::try_from(scaled).unwrap_or(STICKER_SIDE).max(1)
+    };
+    (scale(width), scale(height))
+}
+
+/// A dice message: its emoji and the value. The value is zero until the
+/// throw ends.
+fn map_dice(dice: &tdlib_rs::types::MessageDice) -> Mapped {
+    let emoji = dice.emoji.trim();
+    match (emoji.is_empty(), dice.value > 0) {
+        (true, _) => label("Message"),
+        (false, true) => label(&format!("{emoji} {}", dice.value)),
+        (false, false) => label(emoji),
     }
 }
 
@@ -191,14 +316,7 @@ fn map_clip(clip: &Clip<'_>, caption: Option<&tdlib_rs::types::FormattedText>) -
     let (width, height) = (size(clip.width), size(clip.height));
     let sizes: Vec<PhotoSize> = clip
         .thumbnail
-        .filter(|thumbnail| {
-            matches!(
-                thumbnail.format,
-                tdlib_rs::enums::ThumbnailFormat::Jpeg
-                    | tdlib_rs::enums::ThumbnailFormat::Png
-                    | tdlib_rs::enums::ThumbnailFormat::Webp
-            )
-        })
+        .filter(|thumbnail| is_image(&thumbnail.format))
         .map(|thumbnail| PhotoSize {
             width: size(thumbnail.width),
             height: size(thumbnail.height),
@@ -313,14 +431,7 @@ fn document_preview(doc: &tdlib_rs::types::Document) -> Option<MessagePhoto> {
     let thumb = doc
         .thumbnail
         .as_ref()
-        .filter(|thumbnail| {
-            matches!(
-                thumbnail.format,
-                tdlib_rs::enums::ThumbnailFormat::Jpeg
-                    | tdlib_rs::enums::ThumbnailFormat::Png
-                    | tdlib_rs::enums::ThumbnailFormat::Webp
-            )
-        })
+        .filter(|thumbnail| is_image(&thumbnail.format))
         .map(|thumbnail| PhotoSize {
             width: size(thumbnail.width),
             height: size(thumbnail.height),
@@ -601,6 +712,162 @@ mod tests {
         assert!(no_photo.photo.is_none(), "a GIF thumbnail is not drawn");
         assert!(no_photo.video.is_some());
         assert_eq!(no_photo.preview, "Video");
+    }
+
+    fn sticker(
+        format: tdlib_rs::enums::StickerFormat,
+        thumbnail: Option<tdlib_rs::enums::ThumbnailFormat>,
+    ) -> tdlib_rs::types::Sticker {
+        let file = |id: i32| tdlib_rs::types::File {
+            id,
+            ..tdlib_rs::types::File::default()
+        };
+        tdlib_rs::types::Sticker {
+            id: 1,
+            set_id: 2,
+            width: 512,
+            height: 256,
+            emoji: "\u{1F600}".into(),
+            format,
+            full_type: tdlib_rs::enums::StickerFullType::Regular(
+                tdlib_rs::types::StickerFullTypeRegular {
+                    premium_animation: None,
+                },
+            ),
+            thumbnail: thumbnail.map(|format| tdlib_rs::types::Thumbnail {
+                format,
+                width: 128,
+                height: 64,
+                file: file(52),
+            }),
+            sticker: file(51),
+        }
+    }
+
+    fn sticker_message(sticker: tdlib_rs::types::Sticker) -> tdlib_rs::enums::MessageContent {
+        tdlib_rs::enums::MessageContent::MessageSticker(tdlib_rs::types::MessageSticker {
+            sticker,
+            is_premium: false,
+        })
+    }
+
+    /// A static sticker is an image: its thumbnail and its WebP file are
+    /// the sizes. The row has the emoji as its text, and no label.
+    #[test]
+    fn a_static_sticker_is_an_image_with_its_emoji() {
+        use tdlib_rs::enums::{StickerFormat, ThumbnailFormat};
+
+        let mut webp = sticker(StickerFormat::Webp, Some(ThumbnailFormat::Webp));
+        let mapped = map_content(&sticker_message(webp.clone()));
+        assert_eq!(mapped.text, "\u{1F600}");
+        assert_eq!(mapped.preview, "\u{1F600} Sticker");
+        assert!(mapped.video.is_none());
+        assert!(mapped.links.is_empty() && !mapped.scan);
+        let photo = mapped.photo.expect("the sticker image");
+        // The shape of 512 x 256, with the longest side at 192.
+        assert_eq!((photo.width, photo.height), (192, 96));
+        let ids: Vec<_> = photo.sizes.iter().map(|size| size.file_id).collect();
+        assert_eq!(ids, vec![Some(52), Some(51)]);
+        assert_eq!((photo.sizes[1].width, photo.sizes[1].height), (512, 256));
+        assert!(photo.sizes.iter().all(|size| size.path.is_none()));
+        assert!(!photo.has_spoiler && !photo.is_secret);
+
+        // A downloaded file shows at once. No thumbnail is needed.
+        webp.thumbnail = None;
+        webp.sticker.local.is_downloading_completed = true;
+        webp.sticker.local.path = "/tmp/hidden-sticker.webp".into();
+        webp.emoji.clear();
+        let mapped = map_content(&sticker_message(webp));
+        assert_eq!(mapped.text, "");
+        assert_eq!(mapped.preview, "Sticker");
+        let photo = mapped.photo.expect("the sticker image");
+        assert_eq!(photo.sizes.len(), 1);
+        assert_eq!(
+            photo.sizes[0].path.as_ref().map(crate::ImagePath::as_str),
+            Some("/tmp/hidden-sticker.webp")
+        );
+        assert!(!format!("{photo:?}").contains("hidden-sticker"));
+    }
+
+    /// An animated sticker shows its thumbnail. A video sticker shows its
+    /// thumbnail and plays in its row. A sticker with no image that the app
+    /// draws keeps its label.
+    #[test]
+    fn an_animated_and_a_video_sticker_show_the_thumbnail() {
+        use tdlib_rs::enums::{StickerFormat, ThumbnailFormat};
+
+        let tgs = map_content(&sticker_message(sticker(
+            StickerFormat::Tgs,
+            Some(ThumbnailFormat::Webp),
+        )));
+        assert_eq!(tgs.text, "\u{1F600}");
+        let photo = tgs.photo.expect("the thumbnail");
+        assert_eq!(photo.sizes.len(), 1, "the TGS file is not an image");
+        assert_eq!(photo.sizes[0].file_id, Some(52));
+        assert_eq!((photo.width, photo.height), (192, 96));
+        assert!(tgs.video.is_none());
+
+        let webm = map_content(&sticker_message(sticker(
+            StickerFormat::Webm,
+            Some(ThumbnailFormat::Jpeg),
+        )));
+        assert_eq!(webm.text, "\u{1F600}");
+        let photo = webm.photo.expect("the thumbnail");
+        assert_eq!(photo.sizes.len(), 1, "the WebM file is not an image");
+        let clip = webm.video.expect("the video sticker plays");
+        assert!(clip.is_note(), "it plays in its row");
+        // The clip has the size of the thumbnail in the row.
+        assert_eq!((clip.file_id(), clip.size()), (51, (192, 96)));
+
+        // A TGS thumbnail is not an image: the label stays.
+        let bare = map_content(&sticker_message(sticker(
+            StickerFormat::Tgs,
+            Some(ThumbnailFormat::Tgs),
+        )));
+        assert!(bare.photo.is_none() && bare.video.is_none());
+        assert_eq!(bare.text, "\u{1F600} Sticker");
+        let none = map_content(&sticker_message(sticker(StickerFormat::Tgs, None)));
+        assert!(none.photo.is_none());
+        assert_eq!(none.text, "\u{1F600} Sticker");
+        // A video sticker with no thumbnail has its label and its clip.
+        let clip_only = map_content(&sticker_message(sticker(StickerFormat::Webm, None)));
+        assert!(clip_only.photo.is_none());
+        assert!(clip_only.video.is_some());
+        assert_eq!(clip_only.text, "\u{1F600} Sticker");
+    }
+
+    /// An animated emoji is its emoji, and a dice is its emoji and value.
+    #[test]
+    fn an_animated_emoji_and_a_dice_are_text() {
+        let emoji = tdlib_rs::enums::MessageContent::MessageAnimatedEmoji(
+            tdlib_rs::types::MessageAnimatedEmoji {
+                animated_emoji: tdlib_rs::types::AnimatedEmoji {
+                    sticker: None,
+                    sticker_width: 0,
+                    sticker_height: 0,
+                    fitzpatrick_type: 0,
+                    sound: None,
+                },
+                emoji: "\u{2764}\u{FE0F}".into(),
+            },
+        );
+        let mapped = map_content(&emoji);
+        assert_eq!(mapped.text, "\u{2764}\u{FE0F}");
+        assert_eq!(mapped.preview, "\u{2764}\u{FE0F}");
+        assert!(mapped.photo.is_none() && mapped.video.is_none());
+
+        let mut dice = tdlib_rs::types::MessageDice {
+            initial_state: None,
+            final_state: None,
+            emoji: "\u{1F3B2}".into(),
+            value: 0,
+            success_animation_frame_number: 0,
+        };
+        let thrown = map_content(&tdlib_rs::enums::MessageContent::MessageDice(dice.clone()));
+        assert_eq!(thrown.text, "\u{1F3B2}");
+        dice.value = 5;
+        let done = map_content(&tdlib_rs::enums::MessageContent::MessageDice(dice));
+        assert_eq!(done.text, "\u{1F3B2} 5");
     }
 
     fn document(

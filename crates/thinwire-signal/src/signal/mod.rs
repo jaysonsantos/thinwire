@@ -21,6 +21,8 @@ mod time;
 mod wake;
 
 #[cfg(feature = "signal-local")]
+mod blurhash;
+#[cfg(feature = "signal-local")]
 mod cipher;
 #[cfg(feature = "signal-local")]
 mod live;
@@ -816,6 +818,23 @@ impl ProtocolAdapter for SignalAdapter {
                         protocol: ProtocolId::Signal,
                         file_id,
                         stop: thinwire_protocol::VoiceStop::Unplayable,
+                    });
+                }
+                Ok(())
+            }
+            AdapterCommand::DownloadVideo {
+                protocol: ProtocolId::Signal,
+                file_id,
+            } => {
+                let queued = match &self.engine {
+                    Engine::Sync(_) => false,
+                    #[cfg(feature = "signal-local")]
+                    Engine::Live(session) => session.request_video(file_id),
+                };
+                if !queued {
+                    let _ = events.send(AdapterEvent::VideoFailed {
+                        protocol: ProtocolId::Signal,
+                        file_id,
                     });
                 }
                 Ok(())

@@ -141,8 +141,16 @@ enum Job {
     ClipDone {
         file_id: i32,
         epoch: u64,
+        kind: ClipKind,
         done: ClipResult,
     },
+}
+
+/// The player that asked for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipKind {
+    Audio,
+    Video,
 }
 
 enum ClipResult {
@@ -154,6 +162,7 @@ struct ClipFinish {
     jobs: UnboundedSender<Job>,
     file_id: i32,
     epoch: u64,
+    kind: ClipKind,
     sent: bool,
 }
 
@@ -165,6 +174,7 @@ impl Drop for ClipFinish {
         let _ = self.jobs.send(Job::ClipDone {
             file_id: self.file_id,
             epoch: self.epoch,
+            kind: self.kind,
             done: ClipResult::Failed(VoiceStop::Unplayable),
         });
     }
@@ -363,6 +373,8 @@ where
     /// Wall time of the last walk of every channel in `deduped`.
     dedup_swept_at: Option<i64>,
     clips: HashMap<i32, FilesHostUrl>,
+    /// The address of each video handle of a row.
+    videos: HashMap<i32, FilesHostUrl>,
     inflight: HashSet<i32>,
     downloads: Vec<tokio::task::JoinHandle<()>>,
     voice_epoch: u64,
@@ -397,6 +409,7 @@ where
             deduped: HashMap::new(),
             dedup_swept_at: None,
             clips: HashMap::new(),
+            videos: HashMap::new(),
             inflight: HashSet::new(),
             downloads: Vec::new(),
             voice_epoch: 0,
@@ -428,8 +441,9 @@ where
                 Job::ClipDone {
                     file_id,
                     epoch,
+                    kind,
                     done,
-                } => self.clip_done(file_id, epoch, done),
+                } => self.clip_done(file_id, epoch, kind, done),
             }
         }
         self.stop_live().await;
@@ -511,6 +525,10 @@ where
                 protocol: ProtocolId::Slack,
                 file_id,
             } => self.download_voice(file_id),
+            AdapterCommand::DownloadVideo {
+                protocol: ProtocolId::Slack,
+                file_id,
+            } => self.download_video(file_id),
             _ => self.status(
                 AdapterStatus::Error,
                 "command is not handled by the Slack workspace app",
@@ -802,6 +820,7 @@ where
             let _ = task.await;
         }
         self.clips.clear();
+        self.videos.clear();
         self.inflight.clear();
         if let Some(dir) = &self.voice_dir {
             let _ = begin_voice_clear(dir).await;
@@ -1733,6 +1752,13 @@ where
             self.clips.insert(clip.handle, clip.url);
             audio
         });
+        // The Slack model of this client has no thumbnail of a video: the
+        // row has the clip and no photo.
+        let video = shown.video.and_then(|clip| {
+            let video = crate::MessageVideo::new(0, 0, 0, clip.handle, None);
+            self.videos.insert(clip.handle, clip.url);
+            video
+        });
         Some(ChatMessage {
             protocol: ProtocolId::Slack,
             conversation_id: conversation_id(&post.channel),
@@ -1747,7 +1773,7 @@ where
             links: Vec::new(),
             photo: None,
             audio,
-            video: None,
+            video,
             file: None,
             reactions: Vec::new(),
             reply_to: None,
@@ -1756,19 +1782,33 @@ where
     }
 
     fn download_voice(&mut self, file_id: i32) {
+        self.download_clip(file_id, ClipKind::Audio);
+    }
+
+    /// Download the video `file_id` into the folder of the player files.
+    /// The answer is `VideoReady` or `VideoFailed`.
+    fn download_video(&mut self, file_id: i32) {
+        self.download_clip(file_id, ClipKind::Video);
+    }
+
+    fn download_clip(&mut self, file_id: i32, kind: ClipKind) {
         if self.inflight.contains(&file_id) {
             return;
         }
-        let Some(url) = self.clips.get(&file_id).cloned() else {
-            self.voice_stop(file_id, VoiceStop::Unplayable);
+        let known = match kind {
+            ClipKind::Audio => self.clips.get(&file_id),
+            ClipKind::Video => self.videos.get(&file_id),
+        };
+        let Some(url) = known.cloned() else {
+            self.clip_stop(file_id, kind, VoiceStop::Unplayable);
             return;
         };
         let Some(token) = self.live.as_ref().map(|live| live.token.clone()) else {
-            self.voice_stop(file_id, VoiceStop::Unplayable);
+            self.clip_stop(file_id, kind, VoiceStop::Unplayable);
             return;
         };
         let Some(dir) = self.voice_dir.clone() else {
-            self.voice_stop(file_id, VoiceStop::Unplayable);
+            self.clip_stop(file_id, kind, VoiceStop::Unplayable);
             return;
         };
         self.inflight.insert(file_id);
@@ -1781,13 +1821,15 @@ where
                 jobs: jobs.clone(),
                 file_id,
                 epoch,
+                kind,
                 sent: false,
             };
-            let done = fetch_clip(api.as_ref(), &token, &url, &dir, file_id).await;
+            let done = fetch_clip(api.as_ref(), &token, &url, &dir, file_id, kind).await;
             if jobs
                 .send(Job::ClipDone {
                     file_id,
                     epoch,
+                    kind,
                     done,
                 })
                 .is_ok()
@@ -1797,22 +1839,46 @@ where
         }));
     }
 
-    fn clip_done(&mut self, file_id: i32, epoch: u64, done: ClipResult) {
+    fn clip_done(&mut self, file_id: i32, epoch: u64, kind: ClipKind, done: ClipResult) {
         self.inflight.remove(&file_id);
         if epoch != self.voice_epoch {
             return;
         }
-        match done {
-            ClipResult::Ready(path) => {
+        match (done, kind) {
+            (ClipResult::Ready(path), ClipKind::Audio) => {
                 let _ = self.events.send(AdapterEvent::VoiceReady {
                     protocol: ProtocolId::Slack,
                     file_id,
                     path,
                 });
             }
-            ClipResult::Failed(stop) => {
+            (ClipResult::Ready(path), ClipKind::Video) => {
+                let _ = self.events.send(AdapterEvent::VideoReady {
+                    protocol: ProtocolId::Slack,
+                    file_id,
+                    path,
+                });
+            }
+            (ClipResult::Failed(stop), ClipKind::Audio) => {
                 tracing::debug!("a slack audio file did not download");
                 self.voice_stop(file_id, stop);
+            }
+            (ClipResult::Failed(stop), ClipKind::Video) => {
+                tracing::debug!("a slack video file did not download");
+                self.clip_stop(file_id, kind, stop);
+            }
+        }
+    }
+
+    /// Tell the player of `kind` that the file `file_id` does not come.
+    fn clip_stop(&self, file_id: i32, kind: ClipKind, stop: VoiceStop) {
+        match kind {
+            ClipKind::Audio => self.voice_stop(file_id, stop),
+            ClipKind::Video => {
+                let _ = self.events.send(AdapterEvent::VideoFailed {
+                    protocol: ProtocolId::Slack,
+                    file_id,
+                });
             }
         }
     }
@@ -1832,16 +1898,25 @@ async fn fetch_clip(
     url: &FilesHostUrl,
     dir: &std::path::Path,
     file_id: i32,
+    kind: ClipKind,
 ) -> ClipResult {
-    let read = match api.read_file(token, url).await {
+    let max = match kind {
+        ClipKind::Audio => crate::voice_files::VOICE_MAX_BYTES,
+        ClipKind::Video => crate::voice_files::VIDEO_MAX_BYTES,
+    };
+    let read = match api.read_file(token, url, max).await {
         Ok(read) => read,
         Err(()) => return ClipResult::Failed(VoiceStop::Unplayable),
     };
-    match audio::classify(read.status, &read.body) {
+    match audio::classify_capped(read.status, &read.body, max) {
         FetchClass::Audio(bytes) => {
             let dir = dir.to_path_buf();
             match tokio::task::spawn_blocking(move || {
-                crate::voice_files::store(&dir, file_id, &bytes).map_err(|_| ())
+                match kind {
+                    ClipKind::Audio => crate::voice_files::store(&dir, file_id, &bytes),
+                    ClipKind::Video => crate::voice_files::store_video(&dir, file_id, &bytes),
+                }
+                .map_err(|_| ())
             })
             .await
             {

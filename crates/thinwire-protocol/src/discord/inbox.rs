@@ -204,6 +204,14 @@ impl PreviewPause {
 /// The body of a message that has only an image.
 pub(crate) const IMAGE_LABEL: &str = "[image]";
 
+/// The body of a message that has only a sticker. A sticker that the app
+/// draws drops this label when its image is here.
+pub(crate) const STICKER_LABEL: &str = "[sticker]";
+
+/// The label of a video attachment. It stays: a build with no video player
+/// shows only this label for the clip.
+const VIDEO_LABEL: &str = "[video]";
+
 /// Visible text. Discord's REST `content` is kept as returned (the Message
 /// Content intent fills it for other people). A message with no content is
 /// labeled from what it does carry.
@@ -223,15 +231,19 @@ pub(crate) fn message_body(message: &MessageSummary) -> String {
             "[audio]"
         });
     }
-    // The audio attachment is one of the files.
-    if message.files > usize::from(message.audio.is_some()) {
+    if message.video.is_some() {
+        labels.push(VIDEO_LABEL);
+    }
+    // The audio attachment and the video attachment are two of the files.
+    let shown = usize::from(message.audio.is_some()) + usize::from(message.video.is_some());
+    if message.files > shown {
         labels.push("[attachment]");
     }
     if message.embeds > 0 {
         labels.push("[embed]");
     }
     if message.stickers > 0 {
-        labels.push("[sticker]");
+        labels.push(STICKER_LABEL);
     }
     if labels.is_empty() {
         "[no text]".into()
@@ -263,7 +275,15 @@ pub(crate) fn chat_message(
         audio: message.audio.as_ref().and_then(|audio| {
             crate::MessageAudio::new(audio.duration_secs, voice_file_id(message.id), None)
         }),
-        video: None,
+        video: message.video.as_ref().and_then(|video| {
+            crate::MessageVideo::new(
+                video.duration_secs,
+                video.width,
+                video.height,
+                video_file_id(message.id),
+                None,
+            )
+        }),
         file: None,
         reactions: message.reactions.clone(),
         reply_to: message
@@ -285,6 +305,16 @@ pub(crate) fn message_snowflake(message_id: &str) -> Option<u64> {
 pub(crate) fn voice_file_id(message_id: u64) -> i32 {
     use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
     let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(message_id);
+    let low = u32::try_from(hash & 0x7fff_ffff).unwrap_or(1);
+    i32::try_from(low).unwrap_or(1).max(1)
+}
+
+/// The handle of the video of one message for `DownloadVideo`. It is not
+/// the audio handle of the same message. Always positive.
+#[must_use]
+pub(crate) fn video_file_id(message_id: u64) -> i32 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one((message_id, "video"));
     let low = u32::try_from(hash & 0x7fff_ffff).unwrap_or(1);
     i32::try_from(low).unwrap_or(1).max(1)
 }
@@ -323,6 +353,8 @@ mod tests {
                 stickers: 0,
                 audio: None,
                 image: None,
+                video: None,
+                sticker: None,
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
@@ -359,6 +391,8 @@ mod tests {
             stickers: 0,
             audio: None,
             image: None,
+            video: None,
+            sticker: None,
             reactions: Vec::new(),
             reply_to: None,
             edited: false,
@@ -377,5 +411,62 @@ mod tests {
         assert_eq!(message_body(&row), "[sticker]");
         row.stickers = 0;
         assert_eq!(message_body(&row), "[no text]");
+    }
+
+    /// A video attachment is a clip of the row, with its own handle. Its
+    /// label does not count it as a second attachment.
+    #[test]
+    fn a_video_attachment_is_a_clip_of_the_row() {
+        use super::{message_body, video_file_id, voice_file_id};
+        use crate::discord::api::VideoSummary;
+
+        let mut message = crate::discord::fake_api::message(7, 3, "ada", "");
+        message.files = 1;
+        message.video = Some(VideoSummary {
+            url: "https://cdn.discordapp.com/attachments/1/2/hidden-clip.mp4".into(),
+            duration_secs: 0,
+            width: 1280,
+            height: 720,
+        });
+        assert_eq!(message_body(&message), "[video]");
+        let row = chat_message("discord:1:2", 9, &message);
+        let video = row.video.as_ref().expect("a clip");
+        assert_eq!(video.file_id(), video_file_id(7));
+        assert_ne!(video_file_id(7), voice_file_id(7));
+        assert!(video_file_id(7) > 0);
+        assert_eq!(video.size(), (1280, 720));
+        assert!(video.file().is_none());
+        assert!(!video.is_note());
+        assert!(row.audio.is_none());
+        assert!(!format!("{message:?}").contains("hidden-clip"));
+        // A second file that is not the clip keeps its label.
+        message.files = 2;
+        assert_eq!(message_body(&message), "[video] [attachment]");
+        // A caption is the body.
+        message.content = "look".into();
+        assert_eq!(message_body(&message), "look");
+        // A message with no video attachment has no clip.
+        message.video = None;
+        assert!(chat_message("discord:1:2", 9, &message).video.is_none());
+    }
+
+    /// A PNG or APNG sticker has an image address on the Discord CDN. A
+    /// Lottie or GIF sticker has none, and it keeps its label.
+    #[test]
+    fn only_a_png_sticker_has_an_image_address() {
+        use crate::discord::api::{StickerFormat, StickerSummary};
+
+        let sticker = |format| StickerSummary { id: 42, format };
+        assert_eq!(
+            sticker(StickerFormat::Png).image_url().as_deref(),
+            Some("https://cdn.discordapp.com/stickers/42.png")
+        );
+        assert_eq!(
+            sticker(StickerFormat::Apng).image_url().as_deref(),
+            Some("https://cdn.discordapp.com/stickers/42.png")
+        );
+        assert!(sticker(StickerFormat::Lottie).image_url().is_none());
+        assert!(sticker(StickerFormat::Gif).image_url().is_none());
+        assert!(sticker(StickerFormat::Other).image_url().is_none());
     }
 }

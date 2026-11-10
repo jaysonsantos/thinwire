@@ -21,7 +21,7 @@ mod permissions;
 mod session;
 mod token;
 
-/// The folder of the audio files of the player. Every Discord account uses
+/// The folder of the audio files and the video clips of the player. Every Discord account uses
 /// it: a file name is the handle of one message. A test writes in the temp
 /// folder, never in the cache folder of the user. Each test thread has its
 /// own folder: the tests of one process run at the same time, and the start
@@ -462,6 +462,18 @@ impl DiscordAdapter {
         false
     }
 
+    /// `false` when no session can download.
+    #[cfg(any(test, feature = "discord-bot"))]
+    fn download_video(&mut self, file_id: i32) -> bool {
+        self.session_mut()
+            .is_ok_and(|session| session.video(file_id))
+    }
+
+    #[cfg(not(any(test, feature = "discord-bot")))]
+    fn download_video(&mut self, _file_id: i32) -> bool {
+        false
+    }
+
     #[cfg(any(test, feature = "discord-bot"))]
     fn send_text(
         &mut self,
@@ -682,7 +694,7 @@ impl ProtocolAdapter for DiscordAdapter {
             bot_inbox = Self::bot_inbox_compiled(),
             "discord adapter start (bot/oauth inbox; self-bots refused)"
         );
-        // The audio files of an earlier run are plain audio.
+        // The audio files and the clips of an earlier run are plain files.
         #[cfg(feature = "discord-bot")]
         if let (Ok(dir), Ok(runtime)) = (voice_dir(), tokio::runtime::Handle::try_current()) {
             runtime.spawn_blocking(move || crate::voice_files::clear(&dir));
@@ -906,6 +918,18 @@ impl ProtocolAdapter for DiscordAdapter {
                         protocol: ProtocolId::Discord,
                         file_id,
                         stop: crate::media::VoiceStop::Unplayable,
+                    });
+                }
+                Ok(())
+            }
+            AdapterCommand::DownloadVideo {
+                protocol: ProtocolId::Discord,
+                file_id,
+            } => {
+                if !self.download_video(file_id) {
+                    let _ = events.send(crate::AdapterEvent::VideoFailed {
+                        protocol: ProtocolId::Discord,
+                        file_id,
                     });
                 }
                 Ok(())
@@ -1271,6 +1295,8 @@ mod tests {
                 stickers: 0,
                 audio: None,
                 image: None,
+                video: None,
+                sticker: None,
                 reactions: Vec::new(),
                 reply_to: None,
                 edited: false,
@@ -1689,6 +1715,203 @@ mod tests {
             .find(|row| row.id.ends_with(":2"))
             .expect("the row");
         assert!(row.photo.is_some(), "the cache shows it at once");
+    }
+
+    /// A video attachment in the history has a clip. Play downloads it from
+    /// the CDN into the folder of the player files. A clip that does not
+    /// download, and a handle with no history row, fail.
+    #[tokio::test]
+    async fn a_video_attachment_downloads_for_the_player() {
+        const URL: &str = "https://cdn.discordapp.com/attachments/1/2/lake.mp4";
+        const GONE: &str = "https://cdn.discordapp.com/attachments/1/3/gone.mp4";
+        let fake = FakeDiscordApi::guild_fixture();
+        {
+            let mut state = fake.state();
+            let history = state.history.get_mut(&GENERAL).expect("general");
+            let video = |url: &str| super::api::VideoSummary {
+                url: url.into(),
+                duration_secs: 0,
+                width: 640,
+                height: 360,
+            };
+            let row = history
+                .iter_mut()
+                .find(|message| message.id == 2)
+                .expect("the empty message");
+            row.files = 1;
+            row.video = Some(video(URL));
+            let mut gone = super::fake_api::message(9, 42, "ada", "the lake");
+            gone.files = 1;
+            gone.video = Some(video(GONE));
+            history.insert(0, gone);
+            state.downloads.insert(URL.into(), b"ftyp-clip".to_vec());
+        }
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::HistoryLoaded { conversation_id, .. } if conversation_id == &id
+            )
+        })
+        .await;
+        let rows = messages(&events);
+        let row = rows
+            .iter()
+            .find(|row| row.id.ends_with(":2"))
+            .expect("the video row");
+        assert_eq!(row.body, "[video]");
+        assert!(row.photo.is_none(), "Discord gives no thumbnail");
+        let clip = row.video.as_ref().expect("a clip");
+        assert_eq!(clip.file_id(), super::inbox::video_file_id(2));
+        assert_eq!(clip.size(), (640, 360));
+        let captioned = rows
+            .iter()
+            .find(|row| row.id.ends_with(":9"))
+            .expect("the row with a caption");
+        assert_eq!(captioned.body, "the lake");
+        let gone_id = captioned.video.as_ref().expect("a clip").file_id();
+        let play = |adapter: &mut DiscordAdapter, file_id: i32| {
+            adapter
+                .handle(
+                    AdapterCommand::DownloadVideo {
+                        protocol: ProtocolId::Discord,
+                        file_id,
+                    },
+                    &tx,
+                )
+                .expect("download");
+        };
+        let answer = |event: &AdapterEvent| {
+            matches!(
+                event,
+                AdapterEvent::VideoReady { .. } | AdapterEvent::VideoFailed { .. }
+            )
+        };
+        let file_id = clip.file_id();
+        play(&mut adapter, file_id);
+        let events = until(&mut rx, answer).await;
+        let path = events
+            .iter()
+            .find_map(|event| match event {
+                AdapterEvent::VideoReady {
+                    path,
+                    file_id: ready,
+                    ..
+                } if *ready == file_id => Some(path.clone()),
+                _ => None,
+            })
+            .expect("ready");
+        assert!(path.as_path().is_absolute());
+        assert_eq!(std::fs::read(path.as_path()).expect("file"), b"ftyp-clip");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file = std::fs::metadata(path.as_path()).expect("file");
+            assert_eq!(file.permissions().mode() & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(path.as_path());
+        // The CDN does not have this clip.
+        play(&mut adapter, gone_id);
+        let events = until(&mut rx, answer).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::VideoFailed { file_id, .. } if *file_id == gone_id
+        )));
+        // No history row has this handle. The audio handle of the row is
+        // not a video handle.
+        let voice_id = super::inbox::voice_file_id(2);
+        play(&mut adapter, voice_id);
+        let events = until(&mut rx, answer).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AdapterEvent::VideoFailed { file_id, .. } if *file_id == voice_id
+        )));
+    }
+
+    /// A row with only a PNG sticker shows "[sticker]" first. Its row then
+    /// comes again with the sticker image, and the label goes. A Lottie
+    /// sticker keeps its label: the app does not draw it.
+    #[tokio::test]
+    async fn a_png_sticker_shows_as_an_image_and_a_lottie_sticker_keeps_its_label() {
+        use super::api::{StickerFormat, StickerSummary};
+
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 0]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("png");
+        let fake = FakeDiscordApi::guild_fixture();
+        {
+            let mut state = fake.state();
+            let history = state.history.get_mut(&GENERAL).expect("general");
+            let row = history
+                .iter_mut()
+                .find(|message| message.id == 2)
+                .expect("the empty message");
+            row.stickers = 1;
+            let sticker = StickerSummary {
+                id: 77,
+                format: StickerFormat::Png,
+            };
+            row.sticker = Some(sticker);
+            let mut lottie = super::fake_api::message(9, 42, "ada", "");
+            lottie.stickers = 1;
+            lottie.sticker = Some(StickerSummary {
+                id: 78,
+                format: StickerFormat::Lottie,
+            });
+            history.insert(0, lottie);
+            state
+                .downloads
+                .insert(sticker.image_url().expect("png"), png.into_inner());
+        }
+        let (mut adapter, tx, mut rx, _) = connected(Arc::new(fake)).await;
+        let id = conversation_id(GUILD, GENERAL);
+        adapter
+            .handle(
+                AdapterCommand::OpenChat {
+                    protocol: ProtocolId::Discord,
+                    conversation_id: id.clone(),
+                },
+                &tx,
+            )
+            .expect("open");
+        let events = until(&mut rx, |event| {
+            matches!(
+                event,
+                AdapterEvent::MessageReceived { message } if message.photo.is_some()
+            )
+        })
+        .await;
+        let rows = messages(&events);
+        let first = rows
+            .iter()
+            .find(|row| row.id.ends_with(":2") && row.photo.is_none())
+            .expect("the row before its image");
+        assert_eq!(first.body, "[sticker]");
+        let shown = rows
+            .iter()
+            .find(|row| row.photo.is_some())
+            .expect("the row with its image");
+        assert!(shown.id.ends_with(":2"));
+        assert_eq!(shown.body, "");
+        let photo = shown.photo.as_ref().expect("photo");
+        assert_eq!((photo.width, photo.height), (8, 8));
+        let lottie = rows
+            .iter()
+            .find(|row| row.id.ends_with(":9"))
+            .expect("the lottie row");
+        assert_eq!(lottie.body, "[sticker]");
+        assert!(lottie.photo.is_none());
     }
 
     /// The top of the thread asks for the page older than its oldest row.

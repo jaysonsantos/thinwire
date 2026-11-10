@@ -123,10 +123,16 @@ pub(crate) fn voice_dir() -> Result<PathBuf, ()> {
     signal_session_path().map(|dir| dir.join("voice"))
 }
 
-/// Delete the audio files of an earlier run. Call it after
+/// The folder of the video files of the player, in the session folder.
+#[cfg_attr(not(feature = "signal-local"), allow(dead_code))]
+pub(crate) fn video_dir() -> Result<PathBuf, ()> {
+    signal_session_path().map(|dir| dir.join("video"))
+}
+
+/// Delete the audio and the video files of an earlier run. Call it after
 /// [`lock_session`]: no other helper of this account writes there then.
 pub fn clear_voice_files() {
-    if let Ok(dir) = voice_dir() {
+    for dir in [voice_dir(), video_dir()].into_iter().flatten() {
         thinwire_protocol::voice_files::clear(&dir);
     }
 }

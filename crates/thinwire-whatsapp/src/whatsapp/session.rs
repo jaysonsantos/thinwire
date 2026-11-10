@@ -90,6 +90,19 @@ pub(super) trait WhatsAppSender: Send + Sync {
         Box::pin(async { Err(()) })
     }
 
+    /// Download and decrypt the video `media` into the file of the handle
+    /// `file_id` in `dir`. The file never is in memory as a whole. Resolves
+    /// to the absolute path. A sender with no client has nothing to
+    /// download.
+    fn download_video<'a>(
+        &'a self,
+        _media: &'a MediaRef,
+        _dir: &'a std::path::Path,
+        _file_id: i32,
+    ) -> VideoFuture<'a> {
+        Box::pin(async { Err(()) })
+    }
+
     /// The subject of each group of the account, as `(jid, subject)`.
     fn group_names(&self) -> NamesFuture<'_> {
         Box::pin(async { Ok(Vec::new()) })
@@ -191,6 +204,10 @@ const AVATAR_LOOKUPS: usize = 2;
 /// Boxed media download. Resolves to the plain bytes. The error has no text.
 pub(super) type DownloadFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, ()>> + Send + 'a>>;
 
+/// Boxed video download. Resolves to the local file. The error has no text.
+pub(super) type VideoFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<thinwire_protocol::AudioPath, ()>> + Send + 'a>>;
+
 /// Sticker downloads that run at one time.
 const MEDIA_DOWNLOADS: usize = 4;
 
@@ -260,6 +277,9 @@ struct State {
     closed: bool,
     /// Limits the sticker downloads that run at one time.
     media_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// The video handles with a download that runs. A second Play of the
+    /// same clip waits for the answer of the first.
+    video_downloads: HashSet<i32>,
     /// This link fetched its chat pictures. A reconnect does not again.
     avatars_asked: bool,
     subjects_listed: bool,
@@ -576,6 +596,86 @@ impl Session {
                 }
                 Err(()) => {
                     tracing::debug!("whatsapp audio download failed");
+                    failed(&events);
+                }
+            }
+        });
+    }
+
+    /// Download the video `file_id` into the video folder. The answer is
+    /// `VideoReady`, or `VideoFailed` when the link is down, the message
+    /// left the cache, or the download or the write failed. A file of an
+    /// earlier download of this run answers at once.
+    pub(super) fn download_video(&self, file_id: i32, events: &EventTx) {
+        let failed = move |events: &EventTx| {
+            let _ = events.send(AdapterEvent::VideoFailed {
+                protocol: ProtocolId::WhatsApp,
+                file_id,
+            });
+        };
+        let mut state = self.lock();
+        if state.video_downloads.contains(&file_id) {
+            return;
+        }
+        let Some(media) = state.inbox.video_media(file_id) else {
+            drop(state);
+            failed(events);
+            return;
+        };
+        let (Ok(runtime), Ok(dir)) = (
+            tokio::runtime::Handle::try_current(),
+            super::path::video_dir(),
+        ) else {
+            drop(state);
+            failed(events);
+            return;
+        };
+        let sender = (!state.closed && state.connected)
+            .then(|| state.sender.clone())
+            .flatten();
+        let gate = state
+            .media_gate
+            .get_or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MEDIA_DOWNLOADS)))
+            .clone();
+        state.video_downloads.insert(file_id);
+        drop(state);
+        let session = self.clone();
+        let events = events.clone();
+        runtime.spawn(async move {
+            let lookup = dir.clone();
+            let known = tokio::task::spawn_blocking(move || {
+                thinwire_protocol::voice_files::stored_video(&lookup, file_id)
+            })
+            .await
+            .ok()
+            .flatten();
+            let stored = match (known, sender) {
+                (Some(path), _) => Ok(path),
+                (None, Some(sender)) => {
+                    let _permit = gate.acquire_owned().await.ok();
+                    sender.download_video(&media, &dir, file_id).await
+                }
+                (None, None) => Err(()),
+            };
+            let closed = {
+                let mut state = session.lock();
+                state.video_downloads.remove(&file_id);
+                state.closed
+            };
+            // No event follows `Stopped`.
+            if closed {
+                return;
+            }
+            match stored {
+                Ok(path) => {
+                    let _ = events.send(AdapterEvent::VideoReady {
+                        protocol: ProtocolId::WhatsApp,
+                        file_id,
+                        path,
+                    });
+                }
+                Err(()) => {
+                    tracing::debug!("whatsapp video download failed");
                     failed(&events);
                 }
             }
@@ -1251,7 +1351,7 @@ pub(super) mod fake {
 
     use super::{
         ActionFuture, DownloadFuture, HistoryAsk, MediaRef, NamesFuture, PhoneFuture, SendFailure,
-        SendFuture, SubjectFuture, TargetRef, WhatsAppSender,
+        SendFuture, SubjectFuture, TargetRef, VideoFuture, WhatsAppSender,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1311,6 +1411,19 @@ pub(super) mod fake {
             Box::pin(async move {
                 *self.downloads.lock().expect("fake lock") += 1;
                 self.media.clone().ok_or(())
+            })
+        }
+
+        fn download_video<'a>(
+            &'a self,
+            _media: &'a MediaRef,
+            dir: &'a std::path::Path,
+            file_id: i32,
+        ) -> VideoFuture<'a> {
+            Box::pin(async move {
+                *self.downloads.lock().expect("fake lock") += 1;
+                let bytes = self.media.clone().ok_or(())?;
+                thinwire_protocol::voice_files::store_video(dir, file_id, &bytes).map_err(|_| ())
             })
         }
 
@@ -1509,7 +1622,7 @@ mod tests {
         let voice = WaMessage {
             voice: Some(crate::whatsapp::inbox::Voice {
                 seconds: 7,
-                media: MediaRef::new("audio".to_string()),
+                media: MediaRef::fake(crate::whatsapp::inbox::MediaClass::Audio, "audio"),
             }),
             ..message(CHAT, "v1", "[voice message]", 5)
         };
@@ -1550,6 +1663,100 @@ mod tests {
             .expect("an answer");
         assert!(matches!(failed, Some(AdapterEvent::VoiceFailed { .. })));
         let _ = std::fs::remove_file(ready.as_path());
+    }
+
+    async fn video_answer(
+        rx: &mut UnboundedReceiver<AdapterEvent>,
+        file_id: i32,
+    ) -> Option<Result<thinwire_protocol::AudioPath, ()>> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(AdapterEvent::VideoReady {
+                        file_id: id, path, ..
+                    }) if id == file_id => return Some(Ok(path)),
+                    Some(AdapterEvent::VideoFailed { file_id: id, .. }) if id == file_id => {
+                        return Some(Err(()));
+                    }
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// A video row has a handle. Play downloads the file into the video
+    /// folder, one time: a second Play gets the same file with no download.
+    /// A handle with no message, and a download that fails, answer
+    /// `VideoFailed`.
+    #[tokio::test]
+    async fn a_video_downloads_into_the_video_folder() {
+        const VIDEO_CHAT: &str = "15550142@s.whatsapp.net";
+        let (session, tx, mut rx) = linked();
+        let sender = Arc::new(fake::FakeSender {
+            media: Some(b"ftyp-video".to_vec()),
+            ..Default::default()
+        });
+        assert!(session.attach_sender(1, sender.clone()));
+        let clip = crate::whatsapp::inbox::tests::video_message(VIDEO_CHAT, "clip-1", false);
+        session.apply(LinkEvent::Messages(vec![clip]), 1, &tx);
+        let mut video = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::MessageReceived { message } = event
+                && message.id == "clip-1"
+            {
+                video = message.video;
+            }
+        }
+        let video = video.expect("the row has a video");
+        let file_id = video.file_id();
+        assert_eq!(
+            *sender.downloads.lock().expect("lock"),
+            0,
+            "not before Play"
+        );
+        session.download_video(file_id, &tx);
+        let ready = video_answer(&mut rx, file_id)
+            .await
+            .expect("an answer")
+            .expect("ready");
+        assert!(ready.as_path().is_absolute());
+        assert_eq!(std::fs::read(ready.as_path()).expect("file"), b"ftyp-video");
+        assert_eq!(*sender.downloads.lock().expect("lock"), 1);
+
+        session.download_video(file_id, &tx);
+        let again = video_answer(&mut rx, file_id)
+            .await
+            .expect("an answer")
+            .expect("ready");
+        assert_eq!(again, ready);
+        assert_eq!(
+            *sender.downloads.lock().expect("lock"),
+            1,
+            "no new download"
+        );
+
+        let unknown = file_id.wrapping_add(1).max(1);
+        session.download_video(unknown, &tx);
+        assert_eq!(video_answer(&mut rx, unknown).await, Some(Err(())));
+        let _ = std::fs::remove_file(ready.as_path());
+
+        // A download that fails answers `VideoFailed`, and Play can ask
+        // again.
+        let (session, tx, mut rx) = linked();
+        let broken = Arc::new(fake::FakeSender::default());
+        assert!(session.attach_sender(1, broken.clone()));
+        let clip = crate::whatsapp::inbox::tests::video_message(VIDEO_CHAT, "clip-2", true);
+        session.apply(LinkEvent::Messages(vec![clip]), 1, &tx);
+        let file_id = crate::whatsapp::inbox::voice_file_id(VIDEO_CHAT, "clip-2");
+        for tries in 1..=2 {
+            session.download_video(file_id, &tx);
+            assert_eq!(video_answer(&mut rx, file_id).await, Some(Err(())));
+            assert_eq!(*broken.downloads.lock().expect("lock"), tries);
+        }
     }
 
     /// A connection asks for the group subjects and the chat pictures. A

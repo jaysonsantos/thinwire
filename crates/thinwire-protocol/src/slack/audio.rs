@@ -1,8 +1,6 @@
 use std::fmt;
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
-use crate::voice_files::VOICE_MAX_BYTES;
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct FilesHostUrl(String);
 
@@ -77,6 +75,8 @@ pub(super) struct Clip {
 pub(super) struct Shown {
     pub body: String,
     pub clip: Option<Clip>,
+    /// The first video file of the message, for the video player.
+    pub video: Option<Clip>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -106,8 +106,23 @@ pub(super) fn handle(channel: &str, ts: &str) -> i32 {
     i32::try_from(low).unwrap_or(1).max(1)
 }
 
+/// The handle of the video of one message. It is not the audio handle of
+/// the same message. Low 31 bits, and at least 1.
+pub(super) fn video_handle(channel: &str, ts: &str) -> i32 {
+    let mixed = BuildHasherDefault::<DefaultHasher>::default().hash_one((channel, ts, "video"));
+    let low = u32::try_from(mixed & 0x7fff_ffff).unwrap_or(1);
+    i32::try_from(low).unwrap_or(1).max(1)
+}
+
 pub(super) fn present(text: &str, channel: &str, ts: &str, files: &[IncomingFile]) -> Shown {
     let candidate = files.iter().find(|file| is_candidate(file));
+    let film = files.iter().find(|file| is_video(file));
+    let video = film.and_then(|file| {
+        file.url.clone().map(|url| Clip {
+            handle: video_handle(channel, ts),
+            url,
+        })
+    });
     let clip = candidate.and_then(|file| {
         file.url.clone().map(|url| Clip {
             handle: handle(channel, ts),
@@ -123,18 +138,23 @@ pub(super) fn present(text: &str, channel: &str, ts: &str, files: &[IncomingFile
         } else {
             "[audio]".to_string()
         }
+    } else if film.is_some() {
+        // The label stays: a build with no video player shows only it.
+        "[video]".to_string()
     } else if files.is_empty() {
         "(no text)".to_string()
     } else {
         "[file]".to_string()
     };
-    Shown { body, clip }
+    Shown { body, clip, video }
 }
 
-pub(super) fn classify(status: u16, body: &[u8]) -> FetchClass {
+/// The class of a file read. A body larger than `max` is a miss.
+/// `FetchClass::Audio` holds the bytes of the file, also for a video.
+pub(super) fn classify_capped(status: u16, body: &[u8], max: usize) -> FetchClass {
     if files_unread(status, body) {
         FetchClass::FilesUnread
-    } else if status == 200 && !body.is_empty() && body.len() <= VOICE_MAX_BYTES {
+    } else if status == 200 && !body.is_empty() && body.len() <= max {
         FetchClass::Audio(body.to_vec())
     } else {
         FetchClass::Miss
@@ -190,6 +210,12 @@ fn is_candidate(file: &IncomingFile) -> bool {
     audio_message_stem(&file.name) && (mime == "video/mp4" || mime == "video/webm")
 }
 
+/// A video file that is not a voice clip. Slack records a voice clip as
+/// `audio_message` with a video type.
+fn is_video(file: &IncomingFile) -> bool {
+    media_type(&file.mimetype).starts_with("video/") && !is_candidate(file)
+}
+
 fn is_voice(file: &IncomingFile) -> bool {
     let mime = media_type(&file.mimetype);
     audio_message_stem(&file.name)
@@ -206,6 +232,12 @@ fn audio_message_stem(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voice_files::VOICE_MAX_BYTES;
+
+    /// The class of an audio file read.
+    fn classify(status: u16, body: &[u8]) -> FetchClass {
+        classify_capped(status, body, VOICE_MAX_BYTES)
+    }
 
     fn file(mimetype: &str, filetype: &str, name: &str, url: Option<&str>) -> IncomingFile {
         IncomingFile {
@@ -288,8 +320,14 @@ mod tests {
             "1.2",
             &[file("video/mp4", "mp4", "vacation.mp4", Some(HOST))],
         );
-        assert_eq!(vacation.body, "[file]");
-        assert!(vacation.clip.is_none());
+        assert_eq!(vacation.body, "[video]");
+        assert!(vacation.clip.is_none(), "a video file is not audio");
+        let film = vacation.video.expect("a video clip");
+        assert_eq!(film.handle, video_handle("C1", "1.2"));
+        assert_ne!(film.handle, handle("C1", "1.2"));
+        assert!(film.handle > 0);
+        assert_eq!(film.url.as_str(), HOST);
+        assert!(mp4.video.is_none(), "a voice clip is not a video");
 
         let caption = present(
             "listen",
@@ -308,6 +346,31 @@ mod tests {
         );
         assert_eq!(pdf.body, "[file]");
         assert!(pdf.clip.is_none());
+        assert!(pdf.video.is_none());
+
+        // A video with a caption keeps the caption. An address on another
+        // host gives no clip, and the label stays.
+        let captioned = present(
+            "the lake",
+            "C1",
+            "1.2",
+            &[file("video/quicktime; x=1", "mov", "lake.mov", Some(HOST))],
+        );
+        assert_eq!(captioned.body, "the lake");
+        assert!(captioned.video.is_some());
+        let elsewhere = present(
+            "",
+            "C1",
+            "1.2",
+            &[file(
+                "video/mp4",
+                "mp4",
+                "lake.mp4",
+                Some("https://example.com/lake.mp4"),
+            )],
+        );
+        assert_eq!(elsewhere.body, "[video]");
+        assert!(elsewhere.video.is_none());
 
         assert_eq!(present("   ", "C1", "1.2", &[]).body, "(no text)");
         assert!(present("", "C1", "1.2", &[]).clip.is_none());
@@ -381,5 +444,15 @@ mod tests {
         assert!(matches!(classify(500, &long), FetchClass::Miss));
         let huge = vec![0u8; VOICE_MAX_BYTES + 1];
         assert!(matches!(classify(200, &huge), FetchClass::Miss));
+        // A video clip has a larger limit.
+        assert!(matches!(
+            classify_capped(200, &huge, crate::voice_files::VIDEO_MAX_BYTES),
+            FetchClass::Audio(_)
+        ));
+        assert!(matches!(classify_capped(200, b"abcd", 3), FetchClass::Miss));
+        assert!(matches!(
+            classify_capped(403, b"nope", 3),
+            FetchClass::FilesUnread
+        ));
     }
 }
